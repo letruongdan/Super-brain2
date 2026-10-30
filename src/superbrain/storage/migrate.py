@@ -10,6 +10,7 @@ import errno
 import os
 import shutil
 import sqlite3
+import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -27,7 +28,13 @@ from superbrain.storage.backup import (
 )
 from superbrain.storage.cas import blob_digests
 from superbrain.storage.layout import DataRoot
-from superbrain.storage.schema import Migration, code_version, read_schema_info
+from superbrain.storage.schema import (
+    POLICY_MIGRATIONS,
+    STORE_MIGRATIONS,
+    Migration,
+    code_version,
+    read_schema_info,
+)
 from superbrain.storage.sqlite import db_files
 from superbrain.storage.swap import stage_and_swap
 from superbrain.storage.writer import WriterLease
@@ -67,29 +74,60 @@ def _apply(db: sqlite3.Connection, pending: Sequence[Migration]) -> None:
     for migration in pending:
         db.execute("BEGIN IMMEDIATE")
         try:
-            migration.apply(db)
+            try:
+                migration.apply(db)
+            except sqlite3.Error as exc:
+                raise BrainError(
+                    ErrorCode.INTEGRITY_FAILURE, f"migration v{migration.to_version} failed: {exc}"
+                ) from exc
             db.execute("UPDATE meta SET value = ? WHERE key = 'schema_version'", (str(migration.to_version),))
             db.execute(
                 "UPDATE meta SET value = ? WHERE key = 'min_reader_version'", (str(migration.min_reader_version),)
             )
             db.execute("COMMIT")
-        except BaseException:
+        except BaseException as err:
             if db.in_transaction:
-                db.execute("ROLLBACK")
+                try:
+                    db.execute("ROLLBACK")
+                except sqlite3.Error as rollback:
+                    err.add_note(f"rolling back migration v{migration.to_version} also failed: {rollback}")
             raise
 
 
-def _migrate_file(path: Path, pending: Sequence[Migration]) -> None:
+def _configure(db: sqlite3.Connection, platform: str) -> None:
+    """The durability settings every database connection of this package uses (see ``sqlite.connect``)."""
+    db.execute("PRAGMA synchronous=FULL")
+    db.execute("PRAGMA foreign_keys=ON")
+    db.execute("PRAGMA secure_delete=ON")
+    if platform == "darwin":
+        db.execute("PRAGMA fullfsync=ON")
+        db.execute("PRAGMA checkpoint_fullfsync=ON")
+
+
+def _fsync(fd: int) -> None:
+    """``F_FULLFSYNC`` on macOS, where ``fsync`` does not reach stable storage; ``fsync`` elsewhere."""
+    if sys.platform == "darwin":
+        import fcntl
+
+        fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
+    else:
+        os.fsync(fd)
+
+
+def _integrity_report(db: sqlite3.Connection) -> str:
+    return "\n".join(str(row[0]) for row in db.execute("PRAGMA integrity_check"))
+
+
+def _migrate_file(path: Path, pending: Sequence[Migration], platform: str = sys.platform) -> None:
     """Recover the WAL of the staged copy ``path``, apply ``pending`` and leave one self-contained, durable file."""
     db = sqlite3.connect(path, isolation_level=None)
     try:
-        db.execute("PRAGMA synchronous=FULL")
-        db.execute("PRAGMA foreign_keys=ON")
+        _configure(db, platform)
         mode = db.execute("PRAGMA journal_mode=DELETE").fetchone()[0]
         if str(mode).lower() != "delete":
             raise BrainError(ErrorCode.IO_ERROR, f"{path.name}: journal_mode is {mode!r}, DELETE did not take effect")
         _apply(db, pending)
-        result = "\n".join(str(row[0]) for row in db.execute("PRAGMA integrity_check"))
+        result = _integrity_report(db)
         if result != "ok":
             raise BrainError(
                 ErrorCode.INTEGRITY_FAILURE, f"the migrated {path.name} failed its integrity check: {result}"
@@ -101,7 +139,7 @@ def _migrate_file(path: Path, pending: Sequence[Migration]) -> None:
         raise BrainError(ErrorCode.IO_ERROR, f"the migrated {path.name} kept companions {leftovers}")
     fd = os.open(path, os.O_RDWR | getattr(os, "O_BINARY", 0))
     try:
-        os.fsync(fd)
+        _fsync(fd)
     finally:
         os.close(fd)
 
@@ -112,7 +150,7 @@ def migrate_database(
     os_: OsAdapters,
     *,
     target: Literal["store", "policy"],
-    migrations: Sequence[Migration],
+    migrations: Sequence[Migration] | None = None,
     now: datetime,
 ) -> MigrationReport:
     """Migrate the closed ``target`` database to ``code_version(migrations)``.
@@ -128,6 +166,8 @@ def migrate_database(
     busy = sorted({"store", "policy"} & lease.open_handles())
     if busy:
         raise BrainError(ErrorCode.STORE_BUSY, f"close {' and '.join(busy)} before migrating the {target} database")
+    if migrations is None:
+        migrations = STORE_MIGRATIONS if target == "store" else POLICY_MIGRATIONS
     latest = code_version(migrations)
     source = root.store_db if target == "store" else root.policy_db
     info = read_schema_info(source)
