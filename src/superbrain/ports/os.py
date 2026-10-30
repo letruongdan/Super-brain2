@@ -38,6 +38,10 @@ class PermissionGuard(Protocol):
         """Recursively report entries under ``root`` (including ``root``) that others can access."""
         ...
 
+    def object_problems(self, path: Path) -> list[PermissionProblem]:
+        """Like ``problems``, for ``path`` itself only (never its children)."""
+        ...
+
     def check_ancestors(self, path: Path) -> list[PermissionProblem]:
         """Report ancestors of ``path`` where another account could rename, delete or replace entries."""
         ...

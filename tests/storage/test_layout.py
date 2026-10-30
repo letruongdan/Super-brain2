@@ -1,13 +1,15 @@
 import dataclasses
 import os
 import stat
+import sys
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
 
 from superbrain.adapters.os import os_adapters
 from superbrain.core.errors import BrainError, ErrorCode
-from superbrain.ports.os import OsAdapters, PermissionGuard, PermissionProblem
+from superbrain.ports.os import DurabilityReport, DurablePublisher, OsAdapters, PermissionGuard, PermissionProblem
 from superbrain.storage.layout import RESERVED_ENTRIES, DataRoot, prepare_data_root, secure_subdirectories
 from superbrain.storage.writer import acquire_writer
 from tests.support.fs import digest_tree, fake_link, modes_tree
@@ -40,6 +42,9 @@ class SpyGuard:
     def secure_file(self, path: Path) -> None:
         self.real.secure_file(path)
 
+    def object_problems(self, path: Path) -> list[PermissionProblem]:
+        return self.real.object_problems(path)
+
     def problems(self, root: Path) -> list[PermissionProblem]:
         if self.tree_problem:
             return [PermissionProblem(root, "injected")]
@@ -54,6 +59,67 @@ class SpyGuard:
 
 def with_guard(guard: SpyGuard) -> OsAdapters:
     return dataclasses.replace(os_adapters(), permissions=guard)
+
+
+class SyncSpy:
+    """Delegates to the real publisher and records every ``sync_directory`` call."""
+
+    def __init__(self, real: DurablePublisher) -> None:
+        self.real = real
+        self.synced: list[Path] = []
+
+    def write_new(self, path: Path, data: bytes) -> None:
+        self.real.write_new(path, data)
+
+    def publish(self, staging: Path, final: Path) -> None:
+        self.real.publish(staging, final)
+
+    def rename_dir(self, src: Path, dst: Path) -> None:
+        self.real.rename_dir(src, dst)
+
+    def sync_directory(self, directory: Path) -> None:
+        self.synced.append(directory)
+        self.real.sync_directory(directory)
+
+    def durability(self, directory: Path, env: Mapping[str, str]) -> DurabilityReport:
+        return self.real.durability(directory, env)
+
+
+def with_sync_spy(spy: SyncSpy) -> OsAdapters:
+    return dataclasses.replace(os_adapters(), publisher=spy)
+
+
+def loosen(path: Path) -> None:
+    """Grant others read access to ``path``."""
+    if sys.platform == "win32":
+        from tests.support.winacl import grant
+
+        grant(path, "S-1-1-0", 0x120089)  # Everyone: FILE_GENERIC_READ
+    else:
+        os.chmod(path, 0o755 if path.is_dir() else 0o644)
+
+
+def make_owner_only_dir(path: Path) -> None:
+    path.mkdir()  # on Windows it inherits the owner-only rules (mode=0o700 would add Administrators on 3.13+)
+    if sys.platform != "win32":
+        os.chmod(path, 0o700)
+
+
+def make_owner_only_file(path: Path, data: bytes = b"existing") -> None:
+    path.write_bytes(data)
+    if sys.platform != "win32":
+        os.chmod(path, 0o600)
+
+
+def existing_root(base: Path) -> Path:
+    """A root made by hand; on Windows its entries inherit owner-only rules instead of having them set."""
+    root = base / "r"
+    make_owner_only_dir(root)
+    make_owner_only_file(root / "writer.lock", b"")
+    make_owner_only_dir(root / "store")
+    make_owner_only_file(root / "store" / "x.db")
+    make_owner_only_dir(root / "store.x")
+    return root
 
 
 def test_reserved_entries() -> None:
@@ -172,6 +238,39 @@ def test_prepare_creates_and_secures_each_missing_directory(trusted_tmp: Path) -
     assert os_adapters().permissions.problems(a) == []
 
 
+def test_prepare_leaves_an_existing_root_untouched(trusted_tmp: Path) -> None:
+    root = existing_root(trusted_tmp)
+    before, modes = digest_tree(trusted_tmp), modes_tree(trusted_tmp)
+    assert prepare_data_root(root, os_adapters()).root == root
+    assert digest_tree(trusted_tmp) == before and modes_tree(trusted_tmp) == modes
+
+
+@pytest.mark.parametrize("loose", ["root", "writer.lock"])
+def test_prepare_refuses_an_existing_entry_others_can_access(trusted_tmp: Path, loose: str) -> None:
+    root = existing_root(trusted_tmp)
+    if loose == "root":
+        (root / "writer.lock").unlink()  # a missing lock would be created if the check came too late
+    loosen(root if loose == "root" else root / "writer.lock")
+    before, modes = digest_tree(trusted_tmp), modes_tree(trusted_tmp)
+    with pytest.raises(BrainError) as e:
+        prepare_data_root(root, os_adapters())
+    assert e.value.code == ErrorCode.INSECURE_PERMISSIONS
+    assert digest_tree(trusted_tmp) == before and modes_tree(trusted_tmp) == modes
+
+
+def test_prepare_syncs_the_parent_of_everything_it_creates(trusted_tmp: Path) -> None:
+    spy = SyncSpy(os_adapters().publisher)
+    a = trusted_tmp / "a"
+    prepare_data_root(a / "r", with_sync_spy(spy))
+    assert spy.synced == [trusted_tmp, a, a / "r"]  # after creating a, r, then writer.lock
+
+
+def test_prepare_syncs_nothing_for_an_existing_root(trusted_tmp: Path) -> None:
+    spy = SyncSpy(os_adapters().publisher)
+    prepare_data_root(existing_root(trusted_tmp), with_sync_spy(spy))
+    assert spy.synced == []
+
+
 @windows_only
 def test_created_directories_do_not_keep_inherited_takeover_aces(trusted_tmp: Path) -> None:
     # check_ancestors skips inherit-only ACEs, so a directory created below one would inherit them unless secured.
@@ -200,6 +299,40 @@ def test_subdirectories_are_secured_under_lease(trusted_tmp: Path) -> None:
         assert directory.is_dir()
     assert root.logs_dir.is_dir() and root.backups_dir.is_dir()
     assert os_adapters().permissions.problems(root.root) == []
+
+
+def test_secure_subdirectories_syncs_the_parent_of_each_new_directory(trusted_tmp: Path) -> None:
+    spy = SyncSpy(os_adapters().publisher)
+    root = prepare_data_root(trusted_tmp / "r", os_adapters())
+    with acquire_writer(root, os_adapters()) as lease:
+        secure_subdirectories(root, lease, with_sync_spy(spy))
+    r, store = root.root, root.store_dir
+    # policy, store, store/cas, store/staging, outbox, logs, backups
+    assert spy.synced == [r, r, store, store, r, r, r]
+
+
+def test_secure_subdirectories_leaves_existing_subdirectories_untouched(trusted_tmp: Path) -> None:
+    root = prepare_data_root(trusted_tmp / "r", os_adapters())
+    make_owner_only_dir(root.store_dir)
+    make_owner_only_file(root.store_dir / "x.db")
+    before, modes = digest_tree(root.store_dir), modes_tree(root.store_dir)
+    with acquire_writer(root, os_adapters()) as lease:
+        secure_subdirectories(root, lease, os_adapters())
+    after_digest, after_modes = digest_tree(root.store_dir), modes_tree(root.store_dir)
+    # cas/ and staging/ are new; everything that existed is unchanged.
+    assert {k: after_digest[k] for k in before} == before and {k: after_modes[k] for k in modes} == modes
+
+
+def test_secure_subdirectories_refuses_an_existing_loose_subdirectory(trusted_tmp: Path) -> None:
+    root = prepare_data_root(trusted_tmp / "r", os_adapters())
+    make_owner_only_dir(root.store_dir)
+    loosen(root.store_dir)
+    with acquire_writer(root, os_adapters()) as lease:
+        # writer.lock is not read here: on Windows its locked byte 0 is unreadable during the lease.
+        modes = modes_tree(root.root)
+        with pytest.raises(BrainError) as e:
+            secure_subdirectories(root, lease, os_adapters())
+        assert e.value.code == ErrorCode.INSECURE_PERMISSIONS and modes_tree(root.root) == modes
 
 
 def test_secure_subdirectories_rechecks_links(trusted_tmp: Path, monkeypatch: pytest.MonkeyPatch) -> None:

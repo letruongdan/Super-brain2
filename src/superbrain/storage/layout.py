@@ -1,8 +1,9 @@
 """Data-root layout (spec 5.5, 5.9): checks and creation of the root, ``writer.lock`` and, under a lease, the
 subdirectories.
 
-``prepare_data_root`` touches nothing but ``root`` (and missing directories above it) and ``writer.lock``; every
-``store*``/``policy*`` entry stays untouched until a ``WriterLease`` is held.
+``prepare_data_root`` creates and secures nothing but a missing ``root`` (and missing directories above it) and a
+missing ``writer.lock``; existing entries are only checked. Every ``store*``/``policy*`` entry stays untouched until
+a ``WriterLease`` is held.
 """
 
 import os
@@ -123,27 +124,53 @@ def _make_directory(path: Path) -> bool:
     return True
 
 
-def _create_lock_file(path: Path) -> None:
+def _create_lock_file(path: Path) -> bool:
+    """Create ``path`` exclusively; ``False`` if it already existed."""
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
         fd = os.open(path, flags, 0o600)
     except FileExistsError:
-        return
+        return False
     except OSError as err:
         raise BrainError(ErrorCode.IO_ERROR, f"cannot create lock file {path}: {err}") from err
     os.close(fd)
+    return True
+
+
+def _create_directory(directory: Path, os_: OsAdapters) -> bool:
+    """Create, secure and durably record ``directory``; ``False`` (and untouched) if it already existed."""
+    if not _make_directory(directory):
+        return False
+    os_.permissions.secure_directory(directory)
+    os_.publisher.sync_directory(directory.parent)
+    return True
+
+
+def _require_owner_only(path: Path, os_: OsAdapters) -> None:
+    # Existing entries are checked, never re-secured: securing an existing directory on Windows pushes the new
+    # DACL into every child, which would touch store*/policy* entries.
+    problems = os_.permissions.object_problems(path)
+    if problems:
+        raise _insecure(problems, f"existing {path} is not owner-only")
 
 
 def prepare_data_root(root: Path, os_: OsAdapters) -> DataRoot:
-    """Check ``root``, then create and secure it and ``writer.lock``. Nothing else is created or modified."""
+    """Check ``root``, then create and secure it and ``writer.lock`` if missing. Nothing else is modified."""
     os_.paths.reject_unsafe_path(str(root))
     root = Path(os.path.abspath(root))
+    lock = root / LOCK_NAME
     _reject_links(root, os_)
     ancestor_problems = os_.permissions.check_ancestors(root)
     if ancestor_problems:
         raise _insecure(ancestor_problems, "an ancestor of the data root is not trusted")
-    if os.path.lexists(root) and not root.is_dir():
+    root_existed = os.path.lexists(root)
+    if root_existed and not root.is_dir():
         raise BrainError(ErrorCode.INVALID_INPUT, f"data root {root} is not a directory")
+    if root_existed:
+        _require_owner_only(root, os_)
+    lock_existed = os.path.lexists(lock)
+    if lock_existed:
+        _require_owner_only(lock, os_)
 
     if sys.platform != "win32":
         os.umask(0o077)
@@ -152,28 +179,34 @@ def prepare_data_root(root: Path, os_: OsAdapters) -> DataRoot:
     while not os.path.lexists(candidate):
         missing.append(candidate)
         candidate = candidate.parent
-    created = False
-    for directory in reversed(missing):
-        # One at a time, each secured at once: a new directory may inherit ACEs that check_ancestors skips.
-        if _make_directory(directory):
-            created = True
-            os_.permissions.secure_directory(directory)
-    os_.permissions.secure_directory(root)
-    _create_lock_file(root / LOCK_NAME)
-    os_.permissions.secure_file(root / LOCK_NAME)
+    # One at a time, each secured at once: a new directory may inherit ACEs that check_ancestors skips.
+    created = [directory for directory in reversed(missing) if _create_directory(directory, os_)]
+    if not root_existed and root not in created:  # created concurrently by another process
+        _require_owner_only(root, os_)
+    if _create_lock_file(lock):
+        os_.permissions.secure_file(lock)
+        os_.publisher.sync_directory(root)
+    elif not lock_existed:
+        _require_owner_only(lock, os_)
 
     if created:
-        problems = os_.permissions.check_ancestors(root) + os_.permissions.problems(root)
+        problems = os_.permissions.check_ancestors(root)
+        if root in created:
+            problems += os_.permissions.problems(root)
         if problems:
             raise _insecure(problems, "the new data root is not owner-only")
     return DataRoot.at(root)
 
 
 def secure_subdirectories(root: DataRoot, lease: "WriterLease", os_: OsAdapters) -> None:
-    """Under the writer lease: re-check links, then create and secure every subdirectory of the layout."""
+    """Under the writer lease: re-check links and existing subdirectories, then create and secure missing ones."""
     if not lease.held or lease.root != root:
         raise AssertionError("secure_subdirectories needs a held writer lease for this data root")
     _reject_links(root.root, os_)
-    for directory in root.subdirectories():
-        _make_directory(directory)
-        os_.permissions.secure_directory(directory)
+    directories = root.subdirectories()
+    existing = [directory for directory in directories if os.path.lexists(directory)]
+    for directory in existing:
+        _require_owner_only(directory, os_)
+    for directory in directories:
+        if directory not in existing and not _create_directory(directory, os_):
+            _require_owner_only(directory, os_)

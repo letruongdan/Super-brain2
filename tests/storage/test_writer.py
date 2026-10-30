@@ -1,10 +1,13 @@
+import errno
 import json
+import signal
+import sys
 import zlib
 from pathlib import Path
 
 import pytest
 
-from superbrain.adapters.os import os_adapters
+from superbrain.adapters.os import locks, os_adapters
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.storage.layout import DataRoot, prepare_data_root
 from superbrain.storage.writer import LockState, acquire_writer
@@ -49,6 +52,9 @@ def test_lock_released_when_holder_process_is_killed(trusted_tmp: Path) -> None:
     root = fresh_root(trusted_tmp)
     with paused_child("acquire_writer_and_pause", "writer.held", root.root) as child:
         child.kill()
+    assert child.returncode != 0
+    if sys.platform != "win32":
+        assert child.returncode == -signal.SIGKILL
     with acquire_writer(root, os_adapters()) as lease:
         assert lease.epoch == 2
 
@@ -76,6 +82,36 @@ def test_epoch_is_durable_before_acquire_returns(trusted_tmp: Path) -> None:
         f.seek(1)  # on Windows byte 0 is the locked region, unreadable through another handle
         on_disk = f.read(256)
     assert on_disk == slot_bytes(1, 1, 0)
+
+
+def test_acquire_fails_without_a_lease_when_the_epoch_cannot_be_made_durable(
+    trusted_tmp: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = fresh_root(trusted_tmp)
+    with acquire_writer(root, os_adapters()):
+        pass
+
+    def failing_fsync(fd: int) -> None:
+        raise OSError(errno.EIO, "injected fsync failure")
+
+    monkeypatch.setattr(locks, "_full_fsync", failing_fsync)
+    with pytest.raises(BrainError) as e:
+        acquire_writer(root, os_adapters())
+    assert e.value.code == ErrorCode.IO_ERROR
+    monkeypatch.undo()
+    # The lock was released, and the epoch that never became durable was not issued.
+    with acquire_writer(root, os_adapters()) as lease:
+        assert lease.epoch == 2
+
+
+@pytest.mark.parametrize("value", [True, -1])
+def test_trust_hwm_must_be_a_non_negative_int(trusted_tmp: Path, value: int) -> None:
+    root = fresh_root(trusted_tmp)
+    with acquire_writer(root, os_adapters()) as lease:
+        with pytest.raises(BrainError) as e:
+            lease.raise_trust_hwm(value)
+        assert e.value.code == ErrorCode.INVALID_INPUT
+        assert lease.state().trust_generation_hwm == 0
 
 
 def test_trust_hwm_never_decreases(trusted_tmp: Path) -> None:

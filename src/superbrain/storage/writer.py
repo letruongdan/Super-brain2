@@ -105,6 +105,8 @@ class WriterLease:
 
     def raise_trust_hwm(self, value: int) -> None:
         """Persist ``value`` as the trust-generation high-water mark if it is higher; it never goes down."""
+        if type(value) is not int or value < 0:
+            raise BrainError(ErrorCode.INVALID_INPUT, "trust generation must be a non-negative integer")
         if value > self._current.trust_generation_hwm:
             self._write(self._current.writer_epoch, value)
         else:

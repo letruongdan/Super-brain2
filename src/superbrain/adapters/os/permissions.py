@@ -56,21 +56,21 @@ if sys.platform != "win32":
                 raise BrainError(ErrorCode.INSECURE_PERMISSIONS, f"cannot restrict {path}: {err}") from err
 
         def problems(self, root: Path) -> list[PermissionProblem]:
-            found: list[PermissionProblem] = []
-            euid = os.geteuid()
-            for path in _tree(root):
-                try:
-                    st = path.lstat()
-                except OSError as err:
-                    raise _inspect_error(path, err) from err
-                if stat.S_ISLNK(st.st_mode):
-                    continue
-                if st.st_mode & 0o077:
-                    mode = stat.S_IMODE(st.st_mode)
-                    found.append(PermissionProblem(path, f"mode {mode:04o} grants group/other access"))
-                elif st.st_uid != euid:
-                    found.append(PermissionProblem(path, f"owned by uid {st.st_uid}, not the current user"))
-            return found
+            return [problem for path in _tree(root) for problem in self.object_problems(path)]
+
+        def object_problems(self, path: Path) -> list[PermissionProblem]:
+            try:
+                st = path.lstat()
+            except OSError as err:
+                raise _inspect_error(path, err) from err
+            if stat.S_ISLNK(st.st_mode):
+                return []
+            if st.st_mode & 0o077:
+                mode = stat.S_IMODE(st.st_mode)
+                return [PermissionProblem(path, f"mode {mode:04o} grants group/other access")]
+            if st.st_uid != os.geteuid():
+                return [PermissionProblem(path, f"owned by uid {st.st_uid}, not the current user")]
+            return []
 
         def check_ancestors(self, path: Path) -> list[PermissionProblem]:
             found: list[PermissionProblem] = []
@@ -168,16 +168,17 @@ if sys.platform == "win32":
                 raise BrainError(ErrorCode.INSECURE_PERMISSIONS, f"cannot restrict {path}: {err}") from err
 
         def problems(self, root: Path) -> list[PermissionProblem]:
-            found: list[PermissionProblem] = []
             user = _current_user_sid()
-            allowed = {user, _SYSTEM_SID}
-            for path in _tree(root):
-                if path.is_symlink():
-                    continue
-                reason = self._entry_problem(path, user, allowed)
-                if reason:
-                    found.append(PermissionProblem(path, reason))
-            return found
+            return [problem for path in _tree(root) for problem in self._object_problems(path, user)]
+
+        def object_problems(self, path: Path) -> list[PermissionProblem]:
+            return self._object_problems(path, _current_user_sid())
+
+        def _object_problems(self, path: Path, user: str) -> list[PermissionProblem]:
+            if path.is_symlink():
+                return []
+            reason = self._entry_problem(path, user, {user, _SYSTEM_SID})
+            return [PermissionProblem(path, reason)] if reason else []
 
         @staticmethod
         def _entry_problem(path: Path, user: str, allowed: set[str]) -> str | None:

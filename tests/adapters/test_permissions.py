@@ -217,3 +217,14 @@ def test_fake_clock_refuses_naive_datetimes() -> None:
     clock = FakeClock(datetime(2026, 1, 1, tzinfo=UTC))
     with pytest.raises(AssertionError):
         clock.set(datetime(2026, 1, 1))
+
+
+def test_object_problems_checks_only_the_object_itself(tmp_path: Path, guard: PermissionGuard) -> None:
+    f = secured_file(tmp_path, guard)
+    if sys.platform != "win32":
+        os.chmod(f, 0o644)
+    else:
+        grant(f, "S-1-1-0", 0x120089)  # FILE_GENERIC_READ
+    assert guard.object_problems(f.parent) == []
+    assert [p.path for p in guard.object_problems(f)] == [f]
+    assert [p.path for p in guard.problems(f.parent)] == [f]
