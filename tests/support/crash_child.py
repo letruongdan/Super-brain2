@@ -5,6 +5,7 @@ Started through ``runpy`` under ``python -I``: it imports only ``superbrain`` an
 to stdout and exits 1; success exits 0. Later tasks add the operations their tests need to ``OPERATIONS``.
 """
 
+import sqlite3
 import sys
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
@@ -19,9 +20,12 @@ from superbrain.storage.backup import create_store_backup
 from superbrain.storage.cas import RetentionClass
 from superbrain.storage.kinds import CORE_KINDS, EntryKind, FieldType, KindRegistry
 from superbrain.storage.layout import prepare_data_root, secure_subdirectories
+from superbrain.storage.migrate import migrate_database
 from superbrain.storage.restore import restore_policy, restore_store
 from superbrain.storage.runtime import open_runtime
+from superbrain.storage.schema import STORE_MIGRATIONS, Migration
 from superbrain.storage.store import Store
+from superbrain.storage.swap import recover_interrupted_swaps
 from superbrain.storage.writer import acquire_writer
 
 # Mirrors tests/storage/conftest.py DEMO_KINDS (this file must not import tests).
@@ -165,6 +169,21 @@ def restore_policy_from_latest(data_root: Path, args: list[str]) -> None:
         runtime.close()
 
 
+def _add_table(db: sqlite3.Connection) -> None:
+    db.execute("CREATE TABLE added_in_v2(a)")
+
+
+def migrate_store_to_v2(data_root: Path, args: list[str]) -> None:
+    """Migrate the store to a v2 that adds a table, under a maintenance lease (no Store or PolicyStore is opened)."""
+    os_ = os_adapters()
+    root = prepare_data_root(data_root, os_)
+    v2 = Migration(to_version=2, min_reader_version=1, apply=_add_table)
+    with acquire_writer(root, os_) as lease:
+        recover_interrupted_swaps(root, lease, os_)
+        secure_subdirectories(root, lease, os_)
+        migrate_database(root, lease, os_, target="store", migrations=(*STORE_MIGRATIONS, v2), now=datetime.now(UTC))
+
+
 OPERATIONS: dict[str, Callable[[Path, list[str]], None]] = {
     "ping": ping,
     "acquire_writer": acquire_writer_once,
@@ -178,6 +197,7 @@ OPERATIONS: dict[str, Callable[[Path, list[str]], None]] = {
     "open_runtime": open_runtime_once,
     "restore_from_latest": restore_from_latest,
     "restore_policy_from_latest": restore_policy_from_latest,
+    "migrate_store_to_v2": migrate_store_to_v2,
 }
 
 
