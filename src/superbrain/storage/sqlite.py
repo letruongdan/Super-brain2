@@ -35,6 +35,30 @@ def remove_unfinished_creates(path: Path) -> None:
         raise BrainError(ErrorCode.IO_ERROR, f"cannot remove an unfinished create of {path.name}: {exc}") from exc
 
 
+def open_readonly(path: Path) -> sqlite3.Connection:
+    """Read-only open that never creates or changes any file.
+
+    Even ``mode=ro`` creates ``-wal``/``-shm`` when they are missing (observed on Windows), which would change a
+    database we promised only to look at. So ``mode=ro`` is used only when both ``-wal`` and ``-shm`` exist, which
+    means a live writer or one that died before checkpointing; the reader then sees the committed WAL frames (a
+    read-only connection never checkpoints or deletes the WAL). Otherwise the file is opened ``immutable=1``: no locks,
+    nothing written, any stale or empty ``-wal`` ignored. ``immutable`` is safe only when no writer is active: every
+    reader here runs under the writer lease or on a closed or copied database.
+
+    Limitation: stores are always in WAL mode. A rollback-journal database with a hot journal would not be recovered
+    by this read (``immutable`` ignores the journal), so such a file is not supported.
+    """
+    uri = path.absolute().as_uri()
+    live = path.with_name(path.name + "-wal").exists() and path.with_name(path.name + "-shm").exists()
+    return sqlite3.connect(f"{uri}?{'mode=ro' if live else 'immutable=1'}", uri=True, isolation_level=None)
+
+
+def open_immutable(path: Path) -> sqlite3.Connection:
+    """Open the closed, self-contained database file ``path`` with ``immutable=1``: no lock, no file created or
+    changed, and any ``-wal``/``-shm`` ignored. For backup snapshots, which never have companions."""
+    return sqlite3.connect(f"{path.absolute().as_uri()}?immutable=1", uri=True, isolation_level=None)
+
+
 def connect(path: Path, *, readonly: bool = False, platform: str = sys.platform) -> sqlite3.Connection:
     """Open ``path`` with the store's durability pragmas.
 

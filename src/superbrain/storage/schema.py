@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from superbrain.core.errors import BrainError, ErrorCode
+from superbrain.storage.sqlite import open_readonly
 
 _META_KEYS = ("schema_version", "min_reader_version", "store_id")
 
@@ -83,23 +84,6 @@ def code_version(migrations: Sequence[Migration]) -> int:
     return migrations[-1].to_version
 
 
-def _open_readonly(path: Path) -> sqlite3.Connection:
-    """Read-only open that never creates or changes any file.
-
-    Even ``mode=ro`` creates ``-wal``/``-shm`` when they are missing (observed on Windows), which would change a
-    database we promised only to look at. So ``mode=ro`` is used only when both ``-wal`` and ``-shm`` exist, which
-    means a live writer; the reader then sees the live WAL. Otherwise the file is opened ``immutable=1``: no locks,
-    nothing written, any stale or empty ``-wal`` ignored. ``immutable`` is safe only when no writer is active: every
-    reader here runs under the writer lease or on a closed or copied database.
-
-    Limitation: stores are always in WAL mode. A rollback-journal database with a hot journal would not be recovered
-    by this read (``immutable`` ignores the journal), so such a file is not supported.
-    """
-    uri = path.absolute().as_uri()
-    live = path.with_name(path.name + "-wal").exists() and path.with_name(path.name + "-shm").exists()
-    return sqlite3.connect(f"{uri}?{'mode=ro' if live else 'immutable=1'}", uri=True, isolation_level=None)
-
-
 def _version(path: Path, name: str, value: object) -> int:
     if not isinstance(value, str) or not (value.isascii() and value.isdigit()):
         raise BrainError(ErrorCode.INTEGRITY_FAILURE, f"{path}: meta {name} is not a plain decimal integer")
@@ -109,13 +93,13 @@ def _version(path: Path, name: str, value: object) -> int:
 def read_schema_info(path: Path) -> SchemaInfo | None:
     """The ``meta`` of the database at ``path`` without writing anything; ``None`` if the file does not exist.
 
-    Opens through ``_open_readonly``, so no file is created or modified.
+    Opens through ``open_readonly``, so no file is created or modified.
     """
     if not path.exists():
         return None
     db: sqlite3.Connection | None = None
     try:
-        db = _open_readonly(path)
+        db = open_readonly(path)
         if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'").fetchone() is None:
             raise BrainError(ErrorCode.INTEGRITY_FAILURE, f"{path}: not a store database (no meta)")
         columns = {row[1] for row in db.execute("PRAGMA table_info(meta)")}

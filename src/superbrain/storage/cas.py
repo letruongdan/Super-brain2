@@ -39,6 +39,7 @@ _CHUNK = 1 << 20
 _ERROR_DISK_FULL = 112  # Windows ERROR_DISK_FULL
 _BUSY_WINERRORS = frozenset({32, 5})  # ERROR_SHARING_VIOLATION, ERROR_ACCESS_DENIED: as in the durable adapter
 HOLDERS_TABLE = "p_cas_holders_"
+STAGING_SUFFIX = ".tmp"
 
 
 def _os_error(what: str, err: OSError) -> BrainError:
@@ -56,7 +57,7 @@ def blob_path(cas_dir: Path, digest: str) -> Path:
     return cas_dir / hex_[:2] / hex_
 
 
-def _file_digest(path: Path) -> str | None:
+def file_digest(path: Path) -> str | None:
     """The digest of the file at ``path``, read in chunks; ``None`` if there is no such file."""
     hasher = hashlib.sha256()
     try:
@@ -72,7 +73,44 @@ def _file_digest(path: Path) -> str | None:
 
 def blob_is_intact(cas_dir: Path, digest: str) -> bool:
     """The blob for ``digest`` exists and its bytes hash to ``digest``."""
-    return _file_digest(blob_path(cas_dir, digest)) == digest
+    return file_digest(blob_path(cas_dir, digest)) == digest
+
+
+def blob_digests(cas_dir: Path) -> set[str]:
+    """The digests of the blob files in ``cas_dir``: ``<aa>/<64 hex>`` regular files whose name starts with their
+    shard's; anything else (stray files, links, other names) is ignored."""
+    found: set[str] = set()
+    try:
+        with os.scandir(cas_dir) as entries:
+            shards = [s for s in entries if _SHARD_NAME.fullmatch(s.name) and s.is_dir(follow_symlinks=False)]
+        for shard in shards:
+            with os.scandir(shard.path) as blobs:
+                found.update(
+                    "sha256:" + blob.name
+                    for blob in blobs
+                    if _BLOB_NAME.fullmatch(blob.name)
+                    and blob.name.startswith(shard.name)
+                    and blob.is_file(follow_symlinks=False)
+                )
+    except OSError as err:
+        raise _os_error(f"cannot list the blobs in {cas_dir}", err) from err
+    return found
+
+
+def remove_staging_leftovers(staging: Path) -> None:
+    """Delete ``*.tmp`` files in ``staging``: the staging files of unfinished ``put``s, which nothing refers to."""
+    try:
+        names = sorted(os.listdir(staging))
+    except FileNotFoundError:
+        return  # no staging directory, so no leftovers
+    except OSError as exc:
+        raise BrainError(ErrorCode.IO_ERROR, f"cannot list {staging}: {exc}") from exc
+    for name in names:
+        if name.endswith(STAGING_SUFFIX):
+            try:
+                os.unlink(staging / name)
+            except OSError as exc:
+                raise BrainError(ErrorCode.IO_ERROR, f"cannot remove the staging leftover {name}: {exc}") from exc
 
 
 def held_digests(db: sqlite3.Connection, holder_kind: str, holder_id: str) -> list[str]:
@@ -180,20 +218,20 @@ class ContentStore:
         self._check()
         digest = digest_bytes(data)
         final = blob_path(self._cas_dir, digest)
-        found = _file_digest(final)
+        found = file_digest(final)
         if found is not None:
             if found != digest:
                 raise BrainError(ErrorCode.INTEGRITY_FAILURE, f"the stored blob {digest} does not match its digest")
             # An earlier put may have renamed it into place and failed before its directory entry was durable.
             self._os.publisher.sync_directory(final.parent)
             return digest
-        staging = self._staging_dir / f"{new_id()}.tmp"
+        staging = self._staging_dir / f"{new_id()}{STAGING_SUFFIX}"
         publisher = self._os.publisher
         try:
             try:
                 publisher.write_new(staging, data)
                 crashpoint("cas.after_staging_write")
-                if _file_digest(staging) != digest:
+                if file_digest(staging) != digest:
                     raise BrainError(ErrorCode.INTEGRITY_FAILURE, f"the staged bytes of {digest} do not match it")
                 self._ensure_shard(final.parent)
                 publisher.publish(staging, final)
@@ -261,7 +299,7 @@ class ContentStore:
     def orphans(self) -> list[str]:
         """Sorted digests of the blob files that no holder refers to."""
         self._check()
-        on_disk = self._blob_digests()
+        on_disk = blob_digests(self._cas_dir)
         held = {str(row[0]) for row in self._query(f"SELECT DISTINCT digest FROM {HOLDERS_TABLE}", ())}
         return sorted(on_disk - held)
 
@@ -315,24 +353,6 @@ class ContentStore:
             return self._db.execute(sql, params).fetchall()
         except sqlite3.Error as exc:
             raise io_error("cannot read the blob holders", exc) from exc
-
-    def _blob_digests(self) -> set[str]:
-        found: set[str] = set()
-        try:
-            with os.scandir(self._cas_dir) as entries:
-                shards = [s for s in entries if _SHARD_NAME.fullmatch(s.name) and s.is_dir(follow_symlinks=False)]
-            for shard in shards:
-                with os.scandir(shard.path) as blobs:
-                    found.update(
-                        "sha256:" + blob.name
-                        for blob in blobs
-                        if _BLOB_NAME.fullmatch(blob.name)
-                        and blob.name.startswith(shard.name)
-                        and blob.is_file(follow_symlinks=False)
-                    )
-        except OSError as err:
-            raise _os_error(f"cannot list the blobs in {self._cas_dir}", err) from err
-        return found
 
     def _ensure_shard(self, shard: Path) -> None:
         """Create a missing shard, secure it, and make its entry in ``cas/`` durable; an existing one is kept."""

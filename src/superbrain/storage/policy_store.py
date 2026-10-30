@@ -15,6 +15,7 @@ import sqlite3
 import threading
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from pathlib import Path
 
 from superbrain.core.canonical import canonical_json
 from superbrain.core.errors import BrainError, ErrorCode
@@ -23,6 +24,7 @@ from superbrain.core.ids import new_id
 from superbrain.core.jsonvalue import JsonValue
 from superbrain.ports.os import OsAdapters
 from superbrain.ports.policy import Intent, IntentKind
+from superbrain.storage import backup
 from superbrain.storage.kinds import CORE_KINDS, KindRegistry
 from superbrain.storage.layout import DataRoot
 from superbrain.storage.ledger import utc_timestamp
@@ -216,6 +218,16 @@ class PolicyStore:
             raise _io_error("cannot close the policy store", exc) from exc
         finally:
             self._lease.unregister_handle(_HANDLE)
+
+    @property
+    def root(self) -> DataRoot:
+        self._check()
+        return self._root
+
+    def snapshot_db(self, dest: Path) -> None:
+        """Copy the live database, as of now, into the new self-contained file ``dest`` (``backup._snapshot_db``)."""
+        self._check()
+        backup._snapshot_db(self._db, dest)
 
     # --- PolicySource --------------------------------------------------------------------------------------------
 

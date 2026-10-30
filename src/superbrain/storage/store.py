@@ -21,7 +21,15 @@ from superbrain.core.ids import new_id
 from superbrain.core.jsonvalue import JsonValue
 from superbrain.ports.os import OsAdapters
 from superbrain.ports.policy import IntentKind, PolicySource, PolicyView
-from superbrain.storage.cas import ContentStore, HolderProjection, RetentionClass, blob_is_intact, held_digests
+from superbrain.storage import backup
+from superbrain.storage.cas import (
+    ContentStore,
+    HolderProjection,
+    RetentionClass,
+    blob_is_intact,
+    held_digests,
+    remove_staging_leftovers,
+)
 from superbrain.storage.kinds import CORE_KINDS, KindRegistry
 from superbrain.storage.layout import DataRoot
 from superbrain.storage.ledger import (
@@ -44,7 +52,6 @@ _HANDLE = "store"
 _POLICY_ACTOR = "system:policy"
 _HANDLER_NAME = re.compile(r"[a-z][a-z0-9_]{0,31}")
 _REPLAY_BATCH = 256
-_STAGING_SUFFIX = ".tmp"
 
 
 def _quote(name: str) -> str:
@@ -158,22 +165,6 @@ def _create_live_tables(db: sqlite3.Connection, handlers: Sequence[ProjectionHan
             raise
     except sqlite3.Error as exc:
         raise io_error("cannot create projection tables", exc) from exc
-
-
-def _remove_staging_leftovers(staging: Path) -> None:
-    """Delete ``*.tmp`` files in ``staging``: the staging files of unfinished ``put``s, which nothing refers to."""
-    try:
-        names = sorted(os.listdir(staging))
-    except FileNotFoundError:
-        return  # no staging directory, so no leftovers
-    except OSError as exc:
-        raise BrainError(ErrorCode.IO_ERROR, f"cannot list {staging}: {exc}") from exc
-    for name in names:
-        if name.endswith(_STAGING_SUFFIX):
-            try:
-                os.unlink(staging / name)
-            except OSError as exc:
-                raise BrainError(ErrorCode.IO_ERROR, f"cannot remove the staging leftover {name}: {exc}") from exc
 
 
 def _replay(
@@ -369,7 +360,7 @@ class Store:
         for path in db_files(self._root.store_db):
             if path.exists():
                 self._os.permissions.secure_file(path)
-        _remove_staging_leftovers(self._root.staging_dir)
+        remove_staging_leftovers(self._root.staging_dir)
 
     @property
     def closed(self) -> bool:
@@ -391,6 +382,11 @@ class Store:
     def store_id(self) -> str:
         self._check()
         return self._store_id
+
+    @property
+    def root(self) -> DataRoot:
+        self._check()
+        return self._root
 
     # --- writing and reading -----------------------------------------------------------------------------------
 
@@ -492,6 +488,12 @@ class Store:
             except sqlite3.Error as exc:
                 raise io_error("cannot rebuild projections", exc) from exc
         return count
+
+    def snapshot_db(self, dest: Path) -> None:
+        """Copy the live database, as of now, into the new self-contained file ``dest`` (``backup._snapshot_db``)."""
+        self._check()
+        self._require_no_transaction()
+        backup._snapshot_db(self._db, dest)
 
     def db_integrity(self) -> str:
         """SQLite's ``integrity_check`` result: ``"ok"`` for a sound database."""

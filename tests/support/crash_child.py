@@ -7,6 +7,7 @@ to stdout and exits 1; success exits 0. Later tasks add the operations their tes
 
 import sys
 from collections.abc import Callable, Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 
 import superbrain
@@ -14,6 +15,7 @@ from superbrain.adapters.os import os_adapters
 from superbrain.core.errors import BrainError
 from superbrain.core.faults import pausepoint
 from superbrain.ports.policy import Intent, IntentKind
+from superbrain.storage.backup import create_store_backup
 from superbrain.storage.cas import RetentionClass
 from superbrain.storage.kinds import CORE_KINDS, EntryKind, FieldType, KindRegistry
 from superbrain.storage.layout import prepare_data_root, secure_subdirectories
@@ -113,6 +115,15 @@ def tombstone_event(data_root: Path, args: list[str]) -> None:
         runtime.close()
 
 
+def backup_store(data_root: Path, args: list[str]) -> None:
+    """Open the runtime and take a ``store`` backup (the crash tests stop it at a ``backup.*`` crashpoint)."""
+    runtime = open_runtime(data_root, os_adapters())
+    try:
+        create_store_backup(runtime.store, runtime.os_, datetime.now(UTC))
+    finally:
+        runtime.close()
+
+
 OPERATIONS: dict[str, Callable[[Path, list[str]], None]] = {
     "ping": ping,
     "acquire_writer": acquire_writer_once,
@@ -122,6 +133,7 @@ OPERATIONS: dict[str, Callable[[Path, list[str]], None]] = {
     "put_and_hold": put_and_hold,
     "seed_event": seed_event,
     "tombstone_event": tombstone_event,
+    "backup_store": backup_store,
 }
 
 
