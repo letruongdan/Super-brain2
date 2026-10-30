@@ -14,7 +14,11 @@
 
 **Spec:** `docs/superpowers/specs/2026-10-30-super-brain2-system-design.md` (rev 4, commit `92492f5`). Đợt này triển khai mục 4.2–4.3 và 5.3–5.9, trừ các bản ghi thuộc đợt sau.
 
-**Review đã xử lý:** `docs/reviews/2026-10-30-sp1-increment1-plan-review.md` (SP1-I1-01…14). Bản ánh xạ nằm ở cuối plan.
+**Review đã xử lý:**
+- `docs/reviews/2026-10-30-sp1-increment1-plan-review.md` (SP1-I1-01…14);
+- `docs/reviews/2026-10-30-sp1-increment1-plan-review-round2.md` (SP1-I1-R2-01…09).
+
+Bản ánh xạ nằm ở cuối plan.
 
 **Shell:** các lệnh trong plan dùng `&&`, nên chạy trong bash hoặc PowerShell 7. `scripts/gate.py` là runner Python chạy tuần tự, không phụ thuộc shell.
 
@@ -55,10 +59,15 @@ Các bảng credential, người ký, nonce, policy theo repo và trạng thái 
 | Quyền mở ghi (sửa I1-02) | Mở ghi chỉ khi `schema_version` **bằng đúng** version của code. Mới hơn → `unsupported_version`; cũ hơn → `migration_required`. Mở chỉ đọc khi `min_reader_version ≤ code`. Migration không bao giờ tự chạy |
 | Metadata của ledger (sửa I1-08) | Mỗi entry kind đăng ký một schema metadata có kiểu, thuộc các loại `uuid`, `digest`, `int`, `timestamp`, `enum`, `bool`. **Không có kiểu chuỗi tự do.** `actor` và `owner_id` theo mẫu định danh. Lý do (reason) là `enum` |
 | Ghi nhận đã áp intent (sửa I1-03) | Chỉ kho dữ liệu (bảng `applied_intents`) ghi nhận intent nào đã áp. Policy store không có cờ "đã áp". Mỗi lần mở store, store đối chiếu **mọi** intent trong policy store với `applied_intents` của chính nó |
-| GC và backup (sửa I1-12) | GC và backup chạy tuần tự qua một mutex bảo trì trong tiến trình (`Store.maintenance()`). Spec 5.5 bảo đảm chỉ có một tiến trình ghi, nên mutex trong tiến trình là đủ. Không có bảng pin bền vững, nên crash không để lại gì cần thu hồi |
-| Backup (sửa I1-04, I1-05) | Hai loại: `closure` (từ Store đang mở, chỉ chép blob đang có holder) và `full` (bảo trì, đọc theo đường dẫn, chép mọi blob, không cần mở Store theo version). Verifier **tự rút** `store_id`, `schema_version`, high-water và tập root từ chính DB snapshot rồi so với manifest |
+| Mô hình thực thi (sửa R2-09) | `Store` và `PolicyStore` thuộc về **một owner thread**, là thread đã mở chúng. Mọi method public kiểm tra `threading.get_ident()`; gọi từ thread khác → `AssertionError`. `connect` giữ `check_same_thread=True` mặc định. Daemon ở đợt 2 sẽ gửi mọi thao tác storage qua owner thread này |
+| Chuyển giao `put` → `hold` (sửa R2-03) | `Txn.hold` kiểm tra blob tồn tại và đúng digest **bên trong** transaction ghi (`BEGIN IMMEDIATE`). GC xóa blob cũng **bên trong** một transaction ghi, sau khi kiểm tra lại không còn holder. SQLite xếp hai transaction này tuần tự, nên không thể có holder trỏ tới blob đã mất. `hold` thấy blob đã mất → `NOT_FOUND`. `Store.store_content(...)` gói `put` + `hold`, thử lại đúng một lần khi gặp `NOT_FOUND` |
+| GC và backup (sửa I1-12) | Cùng chạy trên owner thread nên tự nhiên tuần tự. `Store.maintenance()` là cờ không lồng được: gọi GC khi backup đang chạy → `STORE_BUSY`. Không có bảng pin bền vững, nên crash không để lại gì cần thu hồi |
+| Backup (sửa I1-04, I1-05, R2-01, R2-07) | Ba loại: `store` (closure, từ Store đang mở, chỉ chép blob có holder), `store_full` (bảo trì, theo đường dẫn, chép mọi blob), `policy` (từ PolicyStore đang mở, hoặc theo đường dẫn khi bảo trì). Verifier **tự rút** `store_id`, `schema_version`, high-water và tập root từ chính DB snapshot. Với `store`: tập root **bằng đúng** `blobs`. Với `store_full` đọc được bằng code hiện tại: tập root **là tập con** của `blobs`, cho phép blob mồ côi thừa. Với `store_full` có schema lạ: chỉ kiểm vật lý, manifest ghi `logical_verified=false`, restore từ chối. Verifier luôn kiểm `kind` đúng loại được yêu cầu |
+| Thay policy (sửa R2-02) | Restore hay migrate **policy** yêu cầu cả handle `store` và `policy` đều đóng. Sau khi công bố, caller mở runtime mới, nên Store được gắn với policy mới và đối chiếu lại |
+| Mở theo bộ migration (sửa R2-05) | `open_runtime`, `Store.open`, `PolicyStore.open` nhận tham số `store_migrations` / `policy_migrations`, mặc định là `STORE_MIGRATIONS` / `POLICY_MIGRATIONS`. Đây là đường chính thức để binary có migration mới mở kho; test dùng chính đường này, không patch phần kiểm tra version |
+| Gate trên checkout niêm phong (sửa I1-10) | `scripts/gate.py` tạo `git worktree add --detach <tmp> HEAD`, chạy `uv sync` và mọi phase trong worktree đó, rồi gỡ worktree. Bytes được kiểm luôn đúng bằng commit |
 | Mức độ bền (sửa I1-06) | Chỉ báo `power_loss_durable` khi filesystem nằm trong **danh sách đã biết là bền** và lần ghi thử (probe) thành công. Mọi trường hợp khác là `process_crash_durable`, kèm lý do |
-| Quyền tổ tiên (sửa I1-07) | Mối đe dọa: tài khoản OS khác **đổi tên hoặc thay** cây thư mục của brain. POSIX: tổ tiên cho người khác ghi chỉ được chấp nhận khi có sticky bit. Sticky bit ngăn người khác đổi tên hay xóa entry không thuộc họ, nên tương đương với không có `FILE_DELETE_CHILD` trên Windows. **Đây là cách diễn giải chi tiết câu "thư mục cha cho người khác ghi thì từ chối" ở spec 5.9, cần chủ dự án xác nhận** |
+| Quyền tổ tiên (sửa I1-07, R2-08) | Mối đe dọa: tài khoản OS khác **đổi tên hoặc thay** cây thư mục của brain. POSIX: tổ tiên cho người khác ghi chỉ được chấp nhận khi có sticky bit; **chủ dự án đã xác nhận ngày 2026-10-30** và spec 5.9 đã ghi lại. Windows: mọi tổ tiên phải có owner thuộc nhóm tin cậy, và không ACE nào cấp quyền đổi tên/thay cho SID ngoài nhóm đó |
 | Subprocess cho crash test (sửa I1-09) | `python -I -c "import runpy,sys; runpy.run_path(sys.argv[1], run_name='__main__')" <đường dẫn tuyệt đối tới tests/support/crash_child.py> <operation> <data_root>`. Child chỉ import `superbrain`, đã được cài editable trong venv. Operation `ping` in ra `superbrain.__file__` để kiểm tra child dùng đúng source của checkout |
 | Crashpoint | `SUPERBRAIN_CRASHPOINT=<tên>`: ghi `CRASHPOINT_HIT <tên>` ra stderr, flush, rồi `os._exit(86)`. `SUPERBRAIN_PAUSEPOINT=<tên>`: ghi `PAUSED <tên>` ra stderr, rồi chặn tới khi đọc được một dòng trên stdin |
 | Python mới nhất | 3.14 là bản ổn định mới nhất tại thời điểm viết plan (2026-10-30), được ghim cho CI và gate. Nâng lên bản mới hơn là thay đổi có chủ đích |
@@ -144,7 +153,7 @@ src/superbrain/storage/cas.py        RetentionClass, ContentStore, HolderProject
 src/superbrain/storage/policy_store.py  PolicyStore
 src/superbrain/storage/runtime.py    Runtime, open_runtime
 src/superbrain/storage/retention.py  RetentionPolicy, ExpiryReport, default_expiry, expire_due
-src/superbrain/storage/backup.py     BackupManifest, create_store_backup, create_full_backup,
+src/superbrain/storage/backup.py     BackupManifest, create_store_backup, create_maintenance_backup,
                                      create_policy_backup, verify_backup, prune_backups
 src/superbrain/storage/restore.py    RestoreReport, restore_store, restore_policy
 src/superbrain/storage/migrate.py    MigrationReport, migrate_database
@@ -170,10 +179,11 @@ tests/architecture/…, tests/core/…, tests/adapters/…, tests/storage/…
 
 - [ ] **Step 1: Tạo `pyproject.toml`**
 
+- `[build-system]`: `requires = ["hatchling>=1.26,<2"]`, `build-backend = "hatchling.build"`. `[tool.hatch.build.targets.wheel] packages = ["src/superbrain"]`. Nhờ có build system, `uv sync` cài chính project dạng editable vào `.venv` (sửa R2-06).
 - `[project]`: `name = "super-brain2"`, `requires-python = ">=3.11"`, dependency `pywin32>=311; sys_platform == 'win32'`.
 - `[dependency-groups] dev`: `pytest`, `mypy`, `ruff`, `import-linter`. Thêm bằng `uv add --dev`.
 - `[tool.ruff]`: `target-version = "py311"`, `line-length = 120`, `lint.select = ["E","F","W","I","B","UP","BLE","S110","S112"]`.
-- `[tool.mypy]`: `strict = true`, `files = ["src","tests","scripts"]`.
+- `[tool.mypy]`: `strict = true`, `files = ["src","tests"]`. Task 17 thêm `"scripts"` khi tạo `scripts/gate.py`.
 - `[tool.pytest.ini_options]`: `testpaths = ["tests"]`, `addopts = ["--import-mode=importlib","-p","no:cacheprovider"]`.
 - `[tool.importlinter]`: `root_package = "superbrain"`, kèm hai contract:
   - contract `layers`: `superbrain.composition`, `superbrain.mcp | superbrain.cli_api | superbrain.review_web | superbrain.workers`, `superbrain.application`, `superbrain.domain`, `superbrain.storage | superbrain.adapters`, `superbrain.ports`, `superbrain.core`;
@@ -221,12 +231,17 @@ Expected: FAIL, `NameError: find_violations`.
 
 `find_violations` duyệt AST mọi `.py`, lấy **mọi** `Import` và `ImportFrom` ở mọi độ sâu, resolve import tương đối theo tên module, chỉ xét tên bắt đầu bằng `superbrain.`.
 
-- [ ] **Step 5: Chạy toàn bộ kiểm tra**
+- [ ] **Step 5: Cài project và kiểm tra interpreter sạch dùng đúng checkout**
+
+Run: `uv sync && uv run python -I -c "import superbrain, pathlib; print(pathlib.Path(superbrain.__file__).resolve())"`
+Expected: in ra đường dẫn nằm dưới `<repo>/src/superbrain/`. Chạy với `-I`, nên kết quả không phụ thuộc cwd hay `PYTHONPATH`.
+
+- [ ] **Step 6: Chạy toàn bộ kiểm tra**
 
 Run: `uv run pytest tests/architecture -v && uv run lint-imports && uv run ruff check src tests && uv run mypy`
 Expected: PASS; lint-imports báo `2 kept, 0 broken`.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add pyproject.toml uv.lock .gitignore src tests
@@ -416,7 +431,7 @@ Commit message ghi nguồn `ownership.py` (blob `d28475c`) và `test_runtime_pat
 | `secure_directory` | chmod `0o700` | DACL được bảo vệ (tắt kế thừa), chỉ hai ACE `FILE_ALL_ACCESS` kèm `OBJECT_INHERIT_ACE \| CONTAINER_INHERIT_ACE` cho SID của user hiện tại và `S-1-5-18`; đặt owner là user hiện tại |
 | `secure_file` | chmod `0o600` | Như trên, không có cờ kế thừa |
 | `problems` | `mode & 0o077 != 0`, hoặc `st_uid != geteuid()` | Có ACE cho phép truy cập tới SID khác hai SID trên; hoặc owner SID khác user hiện tại |
-| `check_ancestors` | Mọi tổ tiên tới `/`: cho group/other ghi mà không có sticky bit → báo; owner khác root và khác user → báo | Mọi tổ tiên tới gốc ổ đĩa: có ACE cấp `FILE_DELETE_CHILD`, `WRITE_DAC`, `WRITE_OWNER` hoặc `GENERIC_ALL`/`FILE_ALL_ACCESS` cho SID khác {user, SYSTEM, Administrators `S-1-5-32-544`, TrustedInstaller `S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464`} → báo. Quyền `FILE_ADD_FILE`/`FILE_ADD_SUBDIRECTORY` không bị tính, vì chúng không cho đổi tên hay xóa entry của người khác |
+| `check_ancestors` | Mọi tổ tiên tới `/`: cho group/other ghi mà không có sticky bit → báo; owner khác root và khác user → báo | Gọi nhóm tin cậy là {user, SYSTEM, Administrators `S-1-5-32-544`, TrustedInstaller `S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464`}. Với mọi tổ tiên tới gốc ổ đĩa: **owner SID ngoài nhóm tin cậy → báo**, vì owner luôn tự sửa được DACL (sửa R2-08); có ACE cấp `FILE_DELETE_CHILD`, `WRITE_DAC`, `WRITE_OWNER` hoặc `GENERIC_ALL`/`FILE_ALL_ACCESS` cho SID ngoài nhóm tin cậy → báo. `FILE_ADD_FILE`/`FILE_ADD_SUBDIRECTORY` không bị tính, vì chúng không cho đổi tên hay xóa entry của người khác |
 
 Administrators, SYSTEM và TrustedInstaller được chấp nhận vì chúng đã có toàn quyền trên máy. Đây là giới hạn đã công bố ở spec 5.9 và 11.3.
 
@@ -442,6 +457,16 @@ def test_everyone_ace_is_reported(tmp_path, guard):
 def test_ancestor_with_delete_child_for_users_is_reported(tmp_path, guard):
     parent = tmp_path / "p"; parent.mkdir(); grant(parent, "S-1-5-32-545", FILE_DELETE_CHILD)
     assert guard.check_ancestors(parent / "root") != []
+
+@windows_only
+def test_foreign_owned_ancestor_with_safe_looking_dacl_is_reported(tmp_path, guard, monkeypatch):
+    parent = tmp_path / "p"; parent.mkdir(); guard.secure_directory(parent)
+    fake_owner(monkeypatch, parent, "S-1-5-21-1-2-3-1001")         # owner là tài khoản khác; DACL vẫn chỉ có user + SYSTEM
+    assert [x.path for x in guard.check_ancestors(parent / "root") if x.path == parent] == [parent]
+
+@windows_only
+def test_trusted_owner_chain_is_accepted(tmp_path, guard):
+    assert [x for x in guard.check_ancestors(tmp_path / "root") if x.path.is_relative_to(tmp_path)] == []
 
 @posix_only
 def test_world_writable_ancestor_without_sticky_is_reported(tmp_path, guard):
@@ -787,10 +812,10 @@ Expected: PASS.
   - `class PolicySource(PolicyView, Protocol)`: `intents() -> Sequence[Intent]`, `store_id: str` (property).
 - Produces (`storage/kinds.py`):
   - `class FieldType(StrEnum)`: `UUID`, `DIGEST`, `INT`, `TIMESTAMP`, `BOOL`, `ENUM`.
-  - `@dataclass(frozen=True) class EntryKind`: `kind: str`, `handler_version: int`, `fields: Mapping[str, FieldType]`, `enums: Mapping[str, frozenset[str]]`, `required: frozenset[str]`.
+  - `@dataclass(frozen=True) class EntryKind`: `kind: str`, `handler_version: int`, `fields: Mapping[str, FieldType]`, `enums: Mapping[str, frozenset[str]]`, `nullable: frozenset[str] = frozenset()`. Mọi trường trong `fields` là bắt buộc phải có mặt; trường thuộc `nullable` được phép mang giá trị `null`.
   - `class KindRegistry`: `__init__(self, kinds: Iterable[EntryKind])`, `get(kind: str) -> EntryKind` (không có → `INVALID_INPUT`), `validate(kind: str, meta: Mapping[str, JsonValue]) -> None`.
   - `CORE_KINDS: tuple[EntryKind, ...]`, gồm:
-    - `cas.hold` với `{digest: DIGEST, holder_kind: ENUM, holder_id: UUID, retention: ENUM, expires_at: TIMESTAMP}`;
+    - `cas.hold` với `{digest: DIGEST, holder_kind: ENUM, holder_id: UUID, retention: ENUM, expires_at: TIMESTAMP}`, trong đó `expires_at` nullable;
     - `cas.release` với `{digest: DIGEST, holder_kind: ENUM, holder_id: UUID, reason: ENUM}`;
     - `policy.quarantine` với `{digest: DIGEST, intent_id: UUID}`;
     - `policy.tombstone` với `{holder_kind: ENUM, holder_id: UUID, intent_id: UUID}`.
@@ -803,7 +828,8 @@ Expected: PASS.
     - `DIGEST` theo mẫu `^sha256:[0-9a-f]{64}$`;
     - `TIMESTAMP` dạng ISO-8601 UTC có `Z`;
     - `actor` theo mẫu `^(user|system|principal):[a-z0-9][a-z0-9._:-]{0,63}$`;
-    - `owner_id` theo mẫu `^[a-z0-9][a-z0-9._-]{0,63}$`.
+    - `owner_id` theo mẫu `^[a-z0-9][a-z0-9._-]{0,63}$`;
+    - mỗi phần tử của `refs` theo mẫu `DIGEST`; `refs` không có phần tử trùng.
 - Produces (`storage/ledger.py`):
   - `@dataclass(frozen=True) class LedgerEntry`: `sequence: int`, `entry_id: str`, `kind: str`, `schema_version: int`, `handler_version: int`, `writer_epoch: int`, `actor: str`, `owner_id: str | None`, `recorded_at: str`, `meta: Mapping[str, JsonValue]`, `refs: tuple[str, ...]`.
   - `class ProjectionHandler(Protocol)`:
@@ -816,16 +842,17 @@ Expected: PASS.
     - thuộc tính `db: sqlite3.Connection`.
 - Produces (`storage/store.py`): `class Store`.
   - Hàm khởi tạo và đóng:
-    - `create(root: DataRoot, lease: WriterLease, os_: OsAdapters, policy: PolicySource, handlers: Sequence[ProjectionHandler], kinds: KindRegistry) -> Store` (classmethod): tạo DB mới với `store_id = policy.store_id`;
-    - `open(...)` (classmethod, cùng tham số): gọi `ensure_writable`; `store_id` trong DB khác `policy.store_id` → `INTEGRITY_FAILURE`; `lease.register_handle("store")`;
+    - `create(root: DataRoot, lease: WriterLease, os_: OsAdapters, policy: PolicySource, handlers: Sequence[ProjectionHandler], kinds: KindRegistry, *, migrations: Sequence[Migration] = STORE_MIGRATIONS) -> Store` (classmethod): tạo DB mới với `store_id = policy.store_id`;
+    - `open(...)` (classmethod, cùng tham số): gọi `ensure_writable(info, migrations)`; `store_id` trong DB khác `policy.store_id` → `INTEGRITY_FAILURE`; `lease.register_handle("store")`;
     - `close() -> None`: `unregister_handle`. Sau khi đóng, mọi lời gọi → `AssertionError("store closed")`.
+    - Owner thread là thread gọi `create`/`open`. Mọi method public gọi từ thread khác → `AssertionError("store used off its owner thread")` (sửa R2-09).
   - Ghi và đọc:
     - `transaction() -> AbstractContextManager[Txn]`;
     - `entries(after: int = 0) -> Iterator[LedgerEntry]`;
     - `rebuild_projections() -> int`;
     - `db_integrity() -> str`;
     - `store_id: str` (property).
-  - Bảo trì: `maintenance() -> AbstractContextManager[None]`, mutex trong tiến trình (I1-12).
+  - Bảo trì: `maintenance() -> AbstractContextManager[None]`, cờ không lồng được. Gọi `maintenance()` khi cờ đang bật → `BrainError(STORE_BUSY)`.
   - Phụ trợ tạm thời: `reconcile_policy() -> int` ở task này chỉ là chỗ móc rỗng trả 0; Task 11 cài đặt thật. Thuộc tính `cas` được Task 9 thêm vào.
 
 Thứ tự transaction:
@@ -863,6 +890,17 @@ def test_meta_outside_schema_is_rejected_before_write(store_factory, meta):     
         with store.transaction() as t: t.append("demo.count", actor="user:cli", owner_id="dan", meta=meta)
     assert e.value.code == ErrorCode.INVALID_INPUT and list(store.entries()) == []
 
+@pytest.mark.parametrize("refs", [["tiny-secret-7f3a"], [D, D], ["sha256:XYZ"]])
+def test_refs_must_be_unique_digests(store_factory, refs):
+    with pytest.raises(BrainError):
+        with store_factory().transaction() as t: t.append("demo.count", actor="user:cli", owner_id="dan", meta={"n": 1}, refs=refs)
+
+def test_nullable_field_accepts_null_but_must_be_present(store_factory):
+    hold = {"digest": D, "holder_kind": "lesson", "holder_id": U, "retention": "durable"}
+    with store_factory().transaction() as t: t.append("cas.hold", actor="system:worker:x", owner_id="dan", meta={**hold, "expires_at": None})
+    with pytest.raises(BrainError):
+        with store_factory().transaction() as t: t.append("cas.hold", actor="system:worker:x", owner_id="dan", meta=hold)
+
 def test_free_text_payload_cannot_enter_ledger(store_factory):
     with pytest.raises(BrainError):
         with store_factory().transaction() as t:
@@ -895,6 +933,18 @@ def test_store_id_mismatch_with_policy_is_refused(tmp_path): ...
 def test_closed_store_cannot_be_used(store_factory):
     store = store_factory(); store.close()
     with pytest.raises(AssertionError): store.transaction()
+
+def test_store_refuses_use_from_another_thread(store_factory):
+    store = store_factory(); errors: list[BaseException] = []
+    t = threading.Thread(target=lambda: capture(errors, lambda: list(store.entries()))); t.start(); t.join()
+    assert len(errors) == 1 and isinstance(errors[0], AssertionError)
+
+def test_maintenance_cannot_nest(store_factory):
+    store = store_factory()
+    with store.maintenance():
+        with pytest.raises(BrainError) as e:
+            with store.maintenance(): pass
+    assert e.value.code == ErrorCode.STORE_BUSY
 
 def test_crash_after_commit_keeps_entry(tmp_path):                                     # tình huống 5 (phần ledger)
     seed_store(tmp_path); run_until_crash("append_demo", "ledger.after_commit", tmp_path)
@@ -941,8 +991,9 @@ Expected: PASS.
     - `holders(digest: str) -> list[tuple[str, str, RetentionClass]]`;
     - `orphans() -> list[str]`.
   - Trên `Txn`:
-    - `hold(digest: str, holder_kind: str, holder_id: str, retention: RetentionClass, expires_at: datetime | None) -> None`, ghi `cas.hold`;
+    - `hold(digest: str, holder_kind: str, holder_id: str, retention: RetentionClass, expires_at: datetime | None) -> None`. **Bên trong** transaction ghi, hàm kiểm tra file blob tồn tại và sha256 đúng; không đạt → `BrainError(NOT_FOUND)` và không ghi gì. Đạt thì ghi `cas.hold`;
     - `release(digest: str, holder_kind: str, holder_id: str, reason: str) -> None`, ghi `cas.release`.
+  - `Store.store_content(data: bytes, holder_kind: str, holder_id: str, retention: RetentionClass, expires_at: datetime | None) -> str`: `put`, rồi `hold` trong một transaction. Gặp `NOT_FOUND` (GC vừa xóa blob) thì `put` lại và thử đúng một lần nữa; lần hai vẫn lỗi thì raise lỗi đó.
   - `HolderProjection` (name `cas_holders`): bảng `p_cas_holders_(digest, holder_kind, holder_id, retention_class, expires_at, PRIMARY KEY(holder_kind, holder_id, digest))`. Entry `cas.hold` có `(holder_kind, holder_id)` đang `is_tombstoned` thì bị bỏ qua.
 
 Trình tự `put`:
@@ -979,6 +1030,11 @@ def test_crash_after_rename_before_hold_leaves_orphan_only(tmp_path):      # tì
     store = reopen(tmp_path)
     assert store.cas.orphans() == [digest_bytes(b"payload")] and store.cas.holders(digest_bytes(b"payload")) == []
 
+def test_hold_of_missing_blob_is_refused(store):
+    with pytest.raises(BrainError) as e:
+        with store.transaction() as t: t.hold(digest_bytes(b"never-put"), "event", E1, RetentionClass.EVENT_PAYLOAD, None)
+    assert e.value.code == ErrorCode.NOT_FOUND and list(store.entries()) == []
+
 def test_crash_after_staging_write_leaves_no_blob(tmp_path):
     seed_store(tmp_path); run_until_crash("put_and_hold", "cas.after_staging_write", tmp_path)
     assert not reopen(tmp_path).cas.exists(digest_bytes(b"payload"))
@@ -1012,8 +1068,8 @@ Expected: PASS.
 - Produces:
   - `@dataclass(frozen=True) class GcReport`: `deleted: tuple[str, ...]`, `kept_young: tuple[str, ...]`.
   - `ContentStore.collect_garbage(*, now: datetime, grace: timedelta = timedelta(hours=24)) -> GcReport`:
-    - chạy **trong** `store.maintenance()`;
-    - xóa blob không có holder và có mtime cũ hơn `grace`;
+    - chạy **trong** `store.maintenance()`; gọi khi cờ đang bật (ví dụ đang backup) → `STORE_BUSY`;
+    - với mỗi blob ứng viên (không holder, mtime cũ hơn `grace`): mở một transaction ghi (`BEGIN IMMEDIATE`), kiểm tra lại không có holder, xóa file, làm bền thư mục, rồi commit. Kiểm tra và xóa nằm trong cùng transaction ghi với `Txn.hold`, nên hai bên được SQLite xếp tuần tự (sửa R2-03);
     - không bao giờ xóa blob còn holder;
     - không xóa thư mục con.
 
@@ -1023,12 +1079,25 @@ Expected: PASS.
 def test_gc_deletes_old_orphan_only(store, clock): ...
 def test_gc_keeps_young_orphan(store, clock): ...
 
-def test_gc_waits_for_maintenance_holder(store, clock):
-    orphan = store.cas.put(b"orphan"); started = threading.Event(); done = threading.Event()
+def test_gc_is_refused_while_maintenance_is_active(store, clock):
+    orphan = store.cas.put(b"orphan")
     with store.maintenance():
-        t = threading.Thread(target=lambda: (started.set(), store.cas.collect_garbage(now=clock.now() + timedelta(days=2)), done.set()))
-        t.start(); started.wait(); assert not done.wait(0.2)
-    t.join(); assert not store.cas.exists(orphan)
+        with pytest.raises(BrainError) as e: store.cas.collect_garbage(now=clock.now() + timedelta(days=2))
+    assert e.value.code == ErrorCode.STORE_BUSY and store.cas.exists(orphan)
+
+def test_gc_between_put_of_aged_existing_blob_and_hold_never_leaves_dangling_ref(store, clock):   # sửa R2-03
+    aged = store.cas.put(b"dedup-me"); set_mtime(blob_path(store, aged), clock.now() - timedelta(days=3))
+    d = store.cas.put(b"dedup-me")                         # bytes đã có: put trả digest ngay, không ghi lại file
+    store.cas.collect_garbage(now=clock.now())             # GC xóa blob mồ côi đã cũ
+    with pytest.raises(BrainError) as e:
+        with store.transaction() as t: t.hold(d, "event", E1, RetentionClass.EVENT_PAYLOAD, None)
+    assert e.value.code == ErrorCode.NOT_FOUND and store.cas.holders(d) == []
+
+def test_store_content_republishes_after_gc_race(store, clock, monkeypatch):
+    aged = store.cas.put(b"dedup-me"); set_mtime(blob_path(store, aged), clock.now() - timedelta(days=3))
+    gc_once_before_first_hold(monkeypatch, store, now=clock.now())          # chèn GC đúng một lần giữa put và hold
+    d = store.store_content(b"dedup-me", "event", E1, RetentionClass.EVENT_PAYLOAD, None)
+    assert store.cas.read(d) == b"dedup-me" and [h[1] for h in store.cas.holders(d)] == [E1]
 ```
 
 - [ ] **Step 2: Chạy test, xác nhận fail**
@@ -1051,16 +1120,19 @@ Expected: PASS.
 
 **Files:**
 - Create: `src/superbrain/storage/policy_store.py`, `src/superbrain/storage/runtime.py`
-- Modify: `src/superbrain/storage/store.py` (cài đặt thật `reconcile_policy`, gọi nó trong `open`), `tests/storage/conftest.py` (thêm fixture `env` dùng `open_runtime`)
+- Modify:
+  - `src/superbrain/storage/store.py`: cài đặt thật `reconcile_policy` và gọi nó trong `open`.
+  - `tests/storage/conftest.py`: thêm fixture `env` dùng `open_runtime`, và helper `maintenance_lease(path) -> AbstractContextManager[tuple[DataRoot, WriterLease]]`. Helper này làm đủ chuỗi `prepare_data_root` → `acquire_writer` → `recover_interrupted_swaps` (từ Task 14; trước đó bỏ qua) → `secure_subdirectories`, và không mở Store hay PolicyStore. Lệnh `brain migrate` ở đợt 2 sẽ dùng cùng trình tự.
 - Test: `tests/storage/test_policy_store.py`, `tests/storage/test_reconcile.py`, `tests/storage/test_runtime.py`
 
 **Interfaces:**
 - Consumes: `IntentKind`, `Intent`, `PolicySource` (Task 8), `WriterLease` (Task 6), `connect`/`schema` (Task 7).
 - Produces (`policy_store.py`): `class PolicyStore`, cài `PolicySource`.
   - Khởi tạo và đóng:
-    - `create(root: DataRoot, lease: WriterLease, os_: OsAdapters, *, store_id: str) -> PolicyStore` (classmethod);
-    - `open(root: DataRoot, lease: WriterLease, os_: OsAdapters) -> PolicyStore` (classmethod): gọi `ensure_writable`; `lease.register_handle("policy")`;
-    - `close() -> None`.
+    - `create(root: DataRoot, lease: WriterLease, os_: OsAdapters, *, store_id: str, migrations: Sequence[Migration] = POLICY_MIGRATIONS) -> PolicyStore` (classmethod);
+    - `open(root: DataRoot, lease: WriterLease, os_: OsAdapters, *, migrations: Sequence[Migration] = POLICY_MIGRATIONS) -> PolicyStore` (classmethod): gọi `ensure_writable`; `lease.register_handle("policy")`;
+    - `close() -> None`;
+    - quy tắc owner thread như `Store`.
   - Intent:
     - `record_intent(kind: IntentKind, payload: Mapping[str, JsonValue]) -> Intent`;
     - `intents() -> Sequence[Intent]`;
@@ -1074,7 +1146,7 @@ Expected: PASS.
   Sau commit: `crashpoint("intents.after_store_apply")`. Hàm trả số intent đã áp. **Không có thao tác nào ghi ngược vào policy store** (I1-03).
 - Produces (`runtime.py`):
   - `@dataclass class Runtime`: `root: DataRoot`, `lease: WriterLease`, `policy: PolicyStore`, `store: Store`, `os_: OsAdapters`, `close() -> None`.
-  - `open_runtime(path: Path, os_: OsAdapters, *, handlers: Sequence[ProjectionHandler] = (), kinds: KindRegistry | None = None) -> Runtime`. Thứ tự:
+  - `open_runtime(path: Path, os_: OsAdapters, *, handlers: Sequence[ProjectionHandler] = (), kinds: KindRegistry | None = None, store_migrations: Sequence[Migration] = STORE_MIGRATIONS, policy_migrations: Sequence[Migration] = POLICY_MIGRATIONS) -> Runtime`. Hai tham số migration được truyền thẳng xuống `PolicyStore` và `Store` (sửa R2-05). Thứ tự:
     1. `prepare_data_root`;
     2. `acquire_writer`;
     3. `recover_interrupted_swaps(root, lease, os_)`. Task 14 thêm bước này; trước đó không có gì;
@@ -1241,25 +1313,36 @@ Expected: PASS.
     6. ghi `manifest.json` sau cùng.
 
     Đích: `backups/store-<UTC>-<id>/`.
-  - `create_full_backup(root: DataRoot, lease: WriterLease, os_: OsAdapters, now: datetime) -> Path`: loại `store_full`, dùng cho migration. Điều kiện trước: `lease.open_handles()` không chứa `"store"`, nếu có → `STORE_BUSY`. Hàm mở DB **chỉ đọc theo đường dẫn**, không qua `Store.open` nên không cần đúng version. Hàm chép mọi blob trong `cas/`; `schema_version` và `store_id` lấy từ `read_schema_info`.
-  - `create_policy_backup(policy: PolicyStore, os_: OsAdapters, now: datetime) -> Path`: loại `policy`.
-  - `verify_backup(path: Path, *, expected_store_id: str) -> BackupManifest`. Với mọi loại, `INTEGRITY_FAILURE` khi bất kỳ điều sau xảy ra:
+  - `create_policy_backup(policy: PolicyStore, os_: OsAdapters, now: datetime) -> Path`: loại `policy`, từ PolicyStore đang mở.
+  - `create_maintenance_backup(root: DataRoot, lease: WriterLease, os_: OsAdapters, *, target: Literal["store", "policy"], now: datetime) -> Path` (sửa R2-07). Dùng cho migration và cho bảo trì. Điều kiện trước: `target not in lease.open_handles()`, nếu có → `STORE_BUSY`. Hàm mở DB **chỉ đọc theo đường dẫn**, không qua `Store.open`/`PolicyStore.open`, nên không cần đúng version.
+    - `target="store"` tạo loại `store_full`: snapshot DB và **mọi** blob trong `cas/`.
+    - `target="policy"` tạo loại `policy`: snapshot `policy.db`.
+
+    `schema_version` và `store_id` lấy từ `read_schema_info`; `trust_generation` đọc từ bảng `trust` nếu bảng đó có.
+  - `verify_backup(path: Path, *, expected_kind: Literal["store", "store_full", "policy"] | frozenset[str], expected_store_id: str, migrations: Sequence[Migration]) -> BackupManifest`. `migrations` cho biết code hiện tại đọc được schema nào. Với mọi loại, `INTEGRITY_FAILURE` khi bất kỳ điều sau xảy ra:
     - thiếu manifest;
+    - `kind` của manifest không thuộc `expected_kind`;
     - digest file DB khác `db_digest`;
     - `PRAGMA integrity_check` khác `ok`;
     - giá trị **rút từ DB snapshot** (`store_id`, `schema_version`, `max(sequence)`, và `trust_generation` với loại policy) khác manifest;
     - `store_id` khác `expected_store_id`;
-    - với `store`: tập root rút từ `p_cas_holders_` của snapshot **khác đúng** tập `blobs` của manifest, thiếu hay thừa đều sai;
-    - với `store_full`: tập file trong `cas/` của backup khác `blobs`;
-    - có file blob mà sha256 khác tên;
-    - có file lạ trong `cas/`.
+    - có file blob mà sha256 khác tên, hoặc có file lạ trong `cas/` mà không có trong `blobs`.
+
+    Quy tắc riêng theo loại:
+    - `store`: tập root rút từ `p_cas_holders_` của snapshot **bằng đúng** `blobs`;
+    - `store_full` có schema đọc được (`ensure_readable` qua): tập root **là tập con** của `blobs`, cho phép blob mồ côi thừa (sửa R2-01). Manifest trả về có `logical_verified=True`;
+    - `store_full` có schema code hiện tại không đọc được: chỉ kiểm vật lý, trả `logical_verified=False`.
 
     Holder đã bị tombstone thì không còn trong projection của snapshot, nên không phải root.
+  - Thêm vào `BackupManifest` trường `logical_verified: bool`. Trường này do verifier điền, không đọc từ file.
   - `prune_backups(backups_dir: Path, *, keep: int = 7, now: datetime) -> list[Path]`. Mỗi loại giữ `keep` bản hoàn tất mới nhất và xóa phần còn lại. Bản thiếu manifest cũ hơn 24 giờ được đổi tên thành `*.incomplete`, không xóa.
 
 - [ ] **Step 1: Viết test**
 
 ```python
+# Trong các test dưới đây (và ở Task 14), `verify_backup(path, expected_store_id=X)` là viết tắt của helper test
+# `verify_store(path, X) = verify_backup(path, expected_kind="store", expected_store_id=X, migrations=STORE_MIGRATIONS)`.
+# Production API không có giá trị mặc định cho expected_kind/migrations.
 def test_store_backup_round_trips_and_survives_live_gc(env, clock):            # tình huống 7, 25
     d = hold_event(env.store, clock); path = create_store_backup(env.store, env.os_, clock.now())
     expire_due(env.store, env.policy, clock.now() + timedelta(days=91))
@@ -1283,9 +1366,37 @@ def test_policy_backup_round_trip_and_corruption(env, clock):
     flip_byte(path / "policy.db")
     with pytest.raises(BrainError): verify_backup(path, expected_store_id=env.policy.store_id)
 
-def test_full_backup_requires_store_closed(env, clock):
-    with pytest.raises(BrainError) as e: create_full_backup(env.root, env.lease, env.os_, clock.now())
+def test_maintenance_backup_requires_target_closed(env, clock):
+    with pytest.raises(BrainError) as e:
+        create_maintenance_backup(env.root, env.lease, env.os_, target="store", now=clock.now())
     assert e.value.code == ErrorCode.STORE_BUSY
+
+def test_full_backup_missing_held_root_is_rejected(tmp_path, clock):                  # sửa R2-01
+    d = seed_held_blob(tmp_path)
+    with maintenance_lease(tmp_path) as (root, lease):
+        path = create_maintenance_backup(root, lease, os_adapters(), target="store", now=clock.now())
+    delete_blob_and_manifest_entry(path, d)
+    with pytest.raises(BrainError) as e:
+        verify_backup(path, expected_kind="store_full", expected_store_id=store_id_of(tmp_path), migrations=STORE_MIGRATIONS)
+    assert e.value.code == ErrorCode.INTEGRITY_FAILURE
+
+def test_full_backup_with_extra_orphan_blob_is_accepted(tmp_path, clock):
+    seed_held_blob(tmp_path); seed_orphan_blob(tmp_path)
+    with maintenance_lease(tmp_path) as (root, lease):
+        path = create_maintenance_backup(root, lease, os_adapters(), target="store", now=clock.now())
+    m = verify_backup(path, expected_kind="store_full", expected_store_id=store_id_of(tmp_path), migrations=STORE_MIGRATIONS)
+    assert m.logical_verified is True
+
+def test_kind_mismatch_is_rejected(env, clock):
+    path = create_policy_backup(env.policy, env.os_, clock.now())
+    with pytest.raises(BrainError):
+        verify_backup(path, expected_kind="store", expected_store_id=env.policy.store_id, migrations=STORE_MIGRATIONS)
+
+def test_policy_backup_by_path_round_trips(tmp_path, clock):                          # sửa R2-07
+    open_runtime(tmp_path, os_adapters()).close()
+    with maintenance_lease(tmp_path) as (root, lease):
+        path = create_maintenance_backup(root, lease, os_adapters(), target="policy", now=clock.now())
+    assert verify_backup(path, expected_kind="policy", expected_store_id=store_id_of(tmp_path), migrations=POLICY_MIGRATIONS).trust_generation == 1
 
 def test_crash_mid_backup_leaves_incomplete_backup_that_never_verifies(tmp_path):
     seed_event(tmp_path); run_until_crash("backup_store", "backup.after_blob_copy", tmp_path)
@@ -1339,13 +1450,14 @@ Expected: PASS.
     Hàm không bao giờ xóa gì.
 - Produces (`restore.py`):
   - `@dataclass(frozen=True) class RestoreReport`: `restored_from: Path`, `replaced_dir: Path`, `new_epoch: int`, `trust_generation: int | None`.
-  - `restore_store(root: DataRoot, lease: WriterLease, os_: OsAdapters, backup: Path, policy: PolicyStore, now: datetime) -> RestoreReport`:
-    - `verify_backup(expected_store_id=policy.store_id)`, chạy trước mọi thao tác;
+  - `restore_store(root: DataRoot, lease: WriterLease, os_: OsAdapters, backup: Path, policy: PolicyStore, now: datetime, *, migrations: Sequence[Migration] = STORE_MIGRATIONS) -> RestoreReport`:
+    - `verify_backup(expected_kind=frozenset({"store", "store_full"}), expected_store_id=policy.store_id, migrations=migrations)`, chạy trước mọi thao tác. Kết quả có `logical_verified=False` → từ chối với `UNSUPPORTED_VERSION` trước khi dựng stage (sửa R2-01);
     - `stage_and_swap(target="store", purpose="restoring", build=...)`, trong đó `build` chép DB và blob vào stage rồi làm bền.
 
     `build` **không** mở Store và **không** đối chiếu policy. Việc đối chiếu chạy khi Store được mở lại trên bản đã công bố, qua `reconcile_policy`; đối chiếu dựa trên `applied_intents` của chính snapshot (I1-03).
-  - `restore_policy(root: DataRoot, lease: WriterLease, os_: OsAdapters, backup: Path, *, store_id: str, now: datetime) -> RestoreReport`:
-    - `verify_backup`;
+  - `restore_policy(root: DataRoot, lease: WriterLease, os_: OsAdapters, backup: Path, *, store_id: str, now: datetime, migrations: Sequence[Migration] = POLICY_MIGRATIONS) -> RestoreReport`:
+    - **Điều kiện trước:** `lease.open_handles()` không chứa `"store"` lẫn `"policy"`, nếu có → `STORE_BUSY` trước khi dựng stage (sửa R2-02). Sau khi công bố, caller mở runtime mới để Store gắn với policy mới;
+    - `verify_backup(expected_kind="policy", expected_store_id=store_id, migrations=migrations)`;
     - `build` chép `policy.db` vào stage, tính `new_gen = max(lease.state().trust_generation_hwm, manifest.trust_generation) + 1`, ghi `new_gen` vào DB đã dựng, làm bền, rồi `crashpoint("restoring.policy.after_generation_persist")`;
     - swap;
     - `crashpoint("restoring.policy.before_hwm_update")`;
@@ -1400,6 +1512,27 @@ def test_restore_with_store_open_is_refused(env, clock):
     with pytest.raises(BrainError) as e: restore_store(env.root, env.lease, env.os_, latest_backup(env), env.policy, clock.now())
     assert e.value.code == ErrorCode.STORE_BUSY
 
+def test_policy_restore_with_store_still_open_is_refused(env, clock):                  # sửa R2-02
+    path = create_policy_backup(env.policy, env.os_, clock.now()); env.policy.close()     # store vẫn mở
+    before = digest_tree(env.root.policy_dir)
+    with pytest.raises(BrainError) as e:
+        restore_policy(env.root, env.lease, env.os_, path, store_id=env.store.store_id, now=clock.now())
+    assert e.value.code == ErrorCode.STORE_BUSY and digest_tree(env.root.policy_dir) == before
+
+def test_after_policy_restore_new_runtime_binds_new_policy(tmp_path, clock):
+    g0 = generation_of(tmp_path); path = policy_backup_of(tmp_path)
+    with maintenance_lease(tmp_path) as (root, lease):
+        restore_policy(root, lease, os_adapters(), path, store_id=store_id_of(tmp_path), now=clock.now())
+    rt = open_runtime(tmp_path, os_adapters())
+    assert rt.policy.trust_generation() > g0 and rt.store.reconcile_policy() == 0
+
+def test_unverifiable_full_backup_is_not_restored(tmp_path, clock):
+    path = full_backup_with_schema(tmp_path, schema_version=99)
+    with maintenance_lease(tmp_path) as (root, lease), pytest.raises(BrainError) as e:
+        rt_policy = open_policy_only(root, lease)
+        restore_store(root, lease, os_adapters(), path, rt_policy, clock.now())
+    assert e.value.code == ErrorCode.UNSUPPORTED_VERSION
+
 def test_restore_of_wrong_store_is_refused_before_touching_store_dir(tmp_path, other_backup): ...
 
 @pytest.mark.parametrize("point", ["restoring.policy.after_generation_persist", "restoring.policy.after_stage",
@@ -1436,11 +1569,11 @@ Expected: PASS.
 - Test: `tests/storage/test_migrate.py`
 
 **Interfaces:**
-- Consumes: `stage_and_swap` (Task 14), `create_full_backup`, `create_policy_backup`, `verify_backup` (Task 13), `Migration`, `read_schema_info`, `code_version` (Task 7).
+- Consumes: `stage_and_swap` (Task 14), `create_maintenance_backup`, `verify_backup` (Task 13), `Migration`, `read_schema_info`, `code_version` (Task 7), `maintenance_lease` (Task 11).
 - Produces:
   - `@dataclass(frozen=True) class MigrationReport`: `target: str`, `from_version: int`, `to_version: int`, `backup: Path`, `replaced_dir: Path`.
-  - `migrate_database(root: DataRoot, lease: WriterLease, os_: OsAdapters, *, target: Literal["store", "policy"], migrations: Sequence[Migration], now: datetime) -> MigrationReport`. Điều kiện trước: `target not in lease.open_handles()`, nếu có → `STORE_BUSY`. Các bước:
-    1. backup đầy đủ (`store_full`, hoặc backup policy theo đường dẫn), rồi `verify_backup`. Lỗi thì dừng;
+  - `migrate_database(root: DataRoot, lease: WriterLease, os_: OsAdapters, *, target: Literal["store", "policy"], migrations: Sequence[Migration], now: datetime) -> MigrationReport`. Điều kiện trước: `lease.open_handles()` không chứa `"store"` lẫn `"policy"`, nếu có → `STORE_BUSY`. Cả hai phải đóng, vì Store giữ tham chiếu tới policy (sửa R2-02). Các bước:
+    1. `create_maintenance_backup(target=target)`, rồi `verify_backup` với `migrations` **của schema cũ** (tức `migrations` cắt tới `schema_version` hiện tại). Lỗi thì dừng, không chạm vào bản gốc;
     2. `stage_and_swap(purpose="migrating", build=...)`. `build` chép DB (và `cas/` nếu target là store) vào stage, áp mọi migration có `to_version > schema_version` theo thứ tự, mỗi migration một transaction, cập nhật `meta`, kiểm tra `integrity_check == ok`.
 
     `build` raise lỗi thì stage bị đổi tên thành `.abandoned-…`, kho gốc giữ nguyên, lỗi được raise lại.
@@ -1453,15 +1586,31 @@ V2 = Migration(to_version=2, min_reader_version=1, apply=lambda db: db.execute("
 
 def test_new_binary_meets_old_store_then_migrates(tmp_path):                         # sửa I1-05
     open_runtime(tmp_path, os_adapters()).close()                                    # kho tạo bởi code v1
-    with pytest.raises(BrainError) as e: open_runtime_with(tmp_path, store_migrations=(*STORE_MIGRATIONS, V2))
+    with pytest.raises(BrainError) as e: open_runtime(tmp_path, os_adapters(), store_migrations=(*STORE_MIGRATIONS, V2))
     assert e.value.code == ErrorCode.MIGRATION_REQUIRED
     with maintenance_lease(tmp_path) as (root, lease):                                # không có Store nào đang mở
         report = migrate_database(root, lease, os_adapters(), target="store", migrations=(*STORE_MIGRATIONS, V2), now=NOW)
-    verify_backup(report.backup, expected_store_id=store_id_of(tmp_path))
-    rt = open_runtime_with(tmp_path, store_migrations=(*STORE_MIGRATIONS, V2))
+    verify_backup(report.backup, expected_kind="store_full", expected_store_id=store_id_of(tmp_path), migrations=STORE_MIGRATIONS)
+    rt = open_runtime(tmp_path, os_adapters(), store_migrations=(*STORE_MIGRATIONS, V2))
     assert read_schema_info(rt.root.store_db).schema_version == 2
 
-def test_policy_store_migrates_the_same_way(tmp_path): ...                          # target="policy"
+def test_new_binary_meets_old_policy_then_migrates(tmp_path):                         # sửa R2-07
+    P2 = Migration(to_version=2, min_reader_version=1, apply=lambda db: db.execute("CREATE TABLE added_in_v2(a)"))
+    open_runtime(tmp_path, os_adapters()).close()
+    with pytest.raises(BrainError) as e: open_runtime(tmp_path, os_adapters(), policy_migrations=(*POLICY_MIGRATIONS, P2))
+    assert e.value.code == ErrorCode.MIGRATION_REQUIRED
+    with maintenance_lease(tmp_path) as (root, lease):
+        report = migrate_database(root, lease, os_adapters(), target="policy", migrations=(*POLICY_MIGRATIONS, P2), now=NOW)
+    verify_backup(report.backup, expected_kind="policy", expected_store_id=store_id_of(tmp_path), migrations=POLICY_MIGRATIONS)
+    rt = open_runtime(tmp_path, os_adapters(), policy_migrations=(*POLICY_MIGRATIONS, P2))
+    assert read_schema_info(rt.root.policy_db).schema_version == 2
+
+def test_failed_policy_backup_leaves_policy_untouched(tmp_path, monkeypatch):
+    open_runtime(tmp_path, os_adapters()).close(); before = digest_tree(layout(tmp_path).policy_dir)
+    monkeypatch.setattr(sqlite3.Connection, "backup", raising(OSError(errno.ENOSPC, "full")))
+    with maintenance_lease(tmp_path) as (root, lease), pytest.raises(BrainError):
+        migrate_database(root, lease, os_adapters(), target="policy", migrations=(*POLICY_MIGRATIONS, P2_ANY), now=NOW)
+    assert digest_tree(layout(tmp_path).policy_dir) == before
 
 def test_migration_with_open_store_is_refused(env):
     with pytest.raises(BrainError) as e:
@@ -1482,7 +1631,7 @@ def test_interrupted_migration_recovers(tmp_path, point, expected_version):
         assert read_schema_info(root.store_db).schema_version == expected_version
 ```
 
-`maintenance_lease(path) -> AbstractContextManager[tuple[DataRoot, WriterLease]]` (thêm vào `tests/storage/conftest.py`) gồm: `prepare_data_root`, `acquire_writer`, `recover_interrupted_swaps`, `secure_subdirectories`. Nó không mở Store hay PolicyStore. Đây cũng là trình tự mà lệnh `brain migrate` ở đợt 2 sẽ dùng.
+`maintenance_lease` được định nghĩa ở Task 11. `P2_ANY` là một migration v2 bất kỳ của policy, vì test này dừng trước khi migration được áp.
 
 - [ ] **Step 2: Chạy test, xác nhận fail**
 
@@ -1511,7 +1660,8 @@ Expected: PASS.
 - Produces: `@dataclass(frozen=True) class CrashCase` với các trường:
   - `operation: str`, `crashpoint: str`;
   - `seed: Callable[[Path], SeedState]`: dựng trạng thái đã ACK trước crash và trả lại những gì cần kiểm;
-  - `expect: Callable[[Runtime, SeedState], None]`: assert trạng thái **cụ thể** sau phục hồi, gồm entry ledger, holder, tác dụng của policy, generation và thư mục snapshot.
+  - `expect: Callable[[Runtime, SeedState], None]`: assert trạng thái **cụ thể** sau phục hồi, gồm entry ledger, holder, tác dụng của policy, generation và thư mục snapshot;
+  - `store_migrations: Sequence[Migration] = STORE_MIGRATIONS`, `policy_migrations: Sequence[Migration] = POLICY_MIGRATIONS`: bộ migration mà matrix truyền vào `open_runtime` sau phục hồi (sửa R2-05). Ca `migrating.*.between_renames` đã công bố v2, nên khai bộ có v2. Ca `migrating.*.after_stage` chưa công bố, nên khai bộ v1. Ca `after_stage` cũng được kiểm thêm: mở bằng bộ có v2 phải trả `MIGRATION_REQUIRED`. Không ca nào được nới `ensure_writable`.
 
   `CRASH_CASES: tuple[CrashCase, ...]` nằm trong `tests/support/crash_cases.py`.
 
@@ -1538,7 +1688,7 @@ Mỗi dòng của `sp1-crash-table.md` gồm:
 - **Mất điện:** dựa trên ngữ nghĩa OS ở Task 5, **không** được chứng minh bằng test kill tiến trình.
 
 Bảng ghi rõ thêm hai điều:
-- GC và backup chạy tuần tự qua mutex trong tiến trình, nên không có trạng thái pin bền vững nào cần phục hồi;
+- GC và backup cùng chạy trên owner thread và không lồng được nhau qua cờ `maintenance()`, nên không có trạng thái pin bền vững nào cần phục hồi;
 - ApplyJournal thuộc đợt 3.
 
 - [ ] **Step 1: Viết test**
@@ -1552,7 +1702,7 @@ def test_every_known_crashpoint_has_a_case_and_a_doc_row():
 def test_crash_case(tmp_path, case):
     seeded = case.seed(tmp_path)
     result = run_until_crash(case.operation, case.crashpoint, tmp_path)   # assert exit 86 và đúng điểm
-    rt = open_runtime(tmp_path, os_adapters())
+    rt = open_runtime(tmp_path, os_adapters(), store_migrations=case.store_migrations, policy_migrations=case.policy_migrations)
     case.expect(rt, seeded)
     assert rt.store.db_integrity() == "ok"                               # kiểm tra bổ sung, không phải oracle chính
 
@@ -1583,7 +1733,8 @@ Expected: PASS.
 
 **Files:**
 - Create: `scripts/gate.py`
-- Modify: `.github/workflows/ci.yml` (tạo mới: ma trận 3 OS × {3.11, 3.14}; mỗi job chạy `uv sync` rồi `uv run python scripts/gate.py --ci`)
+- Create: `.github/workflows/ci.yml` (ma trận 3 OS × {3.11, 3.14}; mỗi job chạy `uv run python scripts/gate.py --python <version>`)
+- Modify: `pyproject.toml` (`[tool.mypy] files` thêm `"scripts"`)
 - Test: `tests/architecture/test_gate_receipt.py`
 
 **Interfaces:**
@@ -1594,6 +1745,8 @@ Expected: PASS.
   - `REQUIRED_PHASES = ("ruff", "mypy", "lint-imports", "pytest")`.
   - `@dataclass(frozen=True) class PhaseResult`: `name: str`, `exit_code: int | None` (`None` khi timeout), `duration_s: float`.
   - `build_receipt(*, start: SourceIdentity, end: SourceIdentity, phases: Sequence[PhaseResult], collected_ids: Sequence[str], junit_ids: Sequence[str], junit_outcomes: Mapping[str, str], python: str, implementation: str, platform: str, time_budget_s: float = 300.0) -> dict[str, JsonValue]`.
+  - `TERMINAL_OUTCOMES = {"passed", "failed", "error", "skipped", "xfailed", "xpassed"}`; `NON_FAILING = {"passed", "skipped", "xfailed"}`.
+  - `parse_junit(path: Path) -> tuple[list[str], dict[str, str]]`. Gặp testcase trùng ID thì raise `ValueError`, không ghi đè.
   - `accepted` chỉ `True` khi **đủ tất cả**:
     - `start == end`;
     - `start.tree_clean`;
@@ -1602,16 +1755,20 @@ Expected: PASS.
     - phase pytest có `duration_s <= time_budget_s`;
     - `collected_ids` không trùng;
     - `sorted(collected_ids) == sorted(junit_ids)`;
-    - không outcome nào là `failed` hay `error`.
+    - **tập khóa của `junit_outcomes` bằng đúng tập `collected_ids`** (sửa R2-04);
+    - mọi giá trị thuộc `TERMINAL_OUTCOMES` và thuộc `NON_FAILING`;
+    - tổng các count bằng `len(collected_ids)`.
 
     Skip được đếm và báo, không bị ẩn.
   - Receipt gồm: `start`, `end`, `test_inventory_digest = digest_bytes(canonical_json(sorted(collected_ids)))`, số lượng theo outcome, các phase, `python`, `implementation`, `platform`, `accepted`, và `reasons` (lý do không được chấp nhận).
-  - `scripts/gate.py`:
-    1. lấy `SourceIdentity`;
-    2. chạy từng phase với timeout (pytest 300 s): `pytest --collect-only -q` để lấy inventory, rồi pytest với `--junitxml`;
-    3. lấy lại `SourceIdentity`;
-    4. ghi `.gate/receipt-<commit[:12]>-<implementation><python>-<platform>-<lock_digest[7:19]>.json`;
-    5. thoát với mã 0 chỉ khi `accepted`.
+  - `scripts/gate.py --python <version>`:
+    1. từ chối nếu working tree hiện tại không sạch;
+    2. `git worktree add --detach <scratch>/gate-<id> HEAD`, tạo checkout niêm phong;
+    3. trong checkout đó: lấy `SourceIdentity`, `uv sync --python <version>`, chạy từng phase với timeout (pytest 300 s) — `pytest --collect-only -q` lấy inventory, rồi pytest với `--junitxml`;
+    4. lấy lại `SourceIdentity` của checkout niêm phong;
+    5. ghi receipt vào `.gate/receipt-<commit[:12]>-<implementation><python>-<platform>-<lock_digest[7:19]>.json` của repo chính;
+    6. gỡ worktree (`git worktree remove --force`);
+    7. thoát với mã 0 chỉ khi `accepted`.
 
     `.gate/` nằm trong `.gitignore`. CI và máy local dùng chung script này.
 
@@ -1628,6 +1785,12 @@ def test_over_budget_is_not_accepted(): assert build_receipt(**ok(phases=with_py
 def test_junit_not_matching_inventory_is_not_accepted(): assert build_receipt(**ok(junit_ids=["a"]))["accepted"] is False
 def test_duplicate_test_ids_are_not_accepted(): assert build_receipt(**ok(collected_ids=["a", "a"], junit_ids=["a", "a"]))["accepted"] is False
 def test_failure_is_not_accepted(): assert build_receipt(**ok(junit_outcomes={"a": "failed"}))["accepted"] is False
+def test_missing_outcome_is_not_accepted(): assert build_receipt(**ok(collected_ids=["a", "b"], junit_ids=["a", "b"], junit_outcomes={"a": "passed"}))["accepted"] is False
+def test_empty_outcomes_are_not_accepted(): assert build_receipt(**ok(collected_ids=["a"], junit_ids=["a"], junit_outcomes={}))["accepted"] is False
+def test_extra_outcome_id_is_not_accepted(): assert build_receipt(**ok(collected_ids=["a"], junit_ids=["a"], junit_outcomes={"a": "passed", "z": "passed"}))["accepted"] is False
+def test_unknown_outcome_value_is_not_accepted(): assert build_receipt(**ok(junit_outcomes={"a": "maybe"}))["accepted"] is False
+def test_parse_junit_rejects_duplicate_testcase(tmp_path):
+    with pytest.raises(ValueError): parse_junit(write_junit(tmp_path, [("t::a", "passed"), ("t::a", "failed")]))
 def test_skips_are_reported(): assert build_receipt(**ok(junit_outcomes={"a": "passed", "b": "skipped"}))["counts"]["skipped"] == 1
 def test_inventory_digest_is_order_independent(): ...
 ```
@@ -1647,13 +1810,13 @@ Expected: PASS.
 - [ ] **Step 5: Commit gate và CI** (bắt buộc commit **trước** khi chạy gate thật)
 
 ```bash
-git add scripts/gate.py .github/workflows/ci.yml tests/architecture/test_gate_receipt.py
+git add scripts/gate.py .github/workflows/ci.yml pyproject.toml tests/architecture/test_gate_receipt.py
 git commit -m "build: add gate runner with source-bound receipts"
 ```
 
 - [ ] **Step 6: Chạy gate thật trên working tree sạch, cả hai Python**
 
-Run: `git status --porcelain` (phải rỗng), rồi `uv run --python 3.11 python scripts/gate.py`, rồi `uv run --python 3.14 python scripts/gate.py`.
+Run: `git status --porcelain` (phải rỗng), rồi `uv run python scripts/gate.py --python 3.11`, rồi `uv run python scripts/gate.py --python 3.14`.
 Expected: hai receipt có `"accepted": true` và cùng `start.commit` bằng HEAD. Receipt **không** được commit.
 
 ---
@@ -1684,14 +1847,14 @@ Không ghi "verified" cho các phần này.
 | SP1-I1-02 quyền đọc bị dùng làm quyền ghi; handler lạ được append | Task 7 (`ensure_writable` / `ensure_readable`), Task 8 (registry kind; `handler_version` do registry quyết định; lịch sử ngoại lai được seed bằng SQL thô) |
 | SP1-I1-03 stage xác nhận intent của policy đang dùng | Quyết định "Ghi nhận đã áp intent"; Task 11 (`reconcile_policy` không ghi vào policy), Task 14 (`build` không mở Store; test stage bị bỏ) |
 | SP1-I1-04 verifier tin manifest | Task 13 (rút thông tin từ snapshot; so khớp chính xác tập root; 9 kiểu hỏng) |
-| SP1-I1-05 migration không mở được nguồn cũ; handle còn sống | Task 13 (`create_full_backup` theo đường dẫn), Task 6 (`open_handles`), Task 14 và 15 (`STORE_BUSY`), Task 15 (đường đi thật: binary mới gặp kho cũ; migrate cả policy) |
+| SP1-I1-05 migration không mở được nguồn cũ; handle còn sống | Task 13 (`create_maintenance_backup` theo đường dẫn), Task 6 (`open_handles`), Task 14 và 15 (`STORE_BUSY`), Task 15 (đường đi thật: binary mới gặp kho cũ; migrate cả policy) |
 | SP1-I1-06 blacklist suy ra bền khi mất điện | Task 5 (danh sách cho phép cộng probe; tmpfs, fs lạ, remote) |
 | SP1-I1-07 path safety và quyền tổ tiên | Task 3 (`entries`, junction thật), Task 4 (owner SID, chuỗi tổ tiên, `FILE_DELETE_CHILD`), Task 6 (kiểm tra trước mọi chmod; test đích ngoài root không đổi). Ngoại lệ sticky bit được ghi trong Quyết định, chờ chủ dự án xác nhận |
 | SP1-I1-08 metadata tự do | Task 8 (schema có kiểu, không có chuỗi tự do; test free text bị từ chối) |
 | SP1-I1-09 crash test không chạy được hoặc oracle yếu | Quyết định "Subprocess"; Task 6 (`ping`, `run_until_crash` assert exit 86 và đúng điểm), Task 16 (`CrashCase` có seed/expect cụ thể; test bỏ crashpoint thì fail) |
 | SP1-I1-10 gate chạy trước commit; receipt yếu | Task 17 (commit trước rồi mới chạy; danh tính đầu–cuối; phase bắt buộc; khớp inventory; timeout và budget) |
 | SP1-I1-11 interface có trước khi được dùng; storage không import adapter | Port nằm ở task tiêu thụ đầu tiên (Task 3, 4, 5, 6, 8); `PathSafety` thuộc `OsAdapters`; `PolicySource` trong `ports`; `cas` thêm ở Task 9; `open_runtime` chốt cách gắn `store_id` |
-| SP1-I1-12 pin GC sau crash | Quyết định "GC và backup": mutex trong tiến trình, không có pin bền vững |
+| SP1-I1-12 pin GC sau crash | Quyết định "GC và backup": owner thread cộng cờ `maintenance()`, không có pin bền vững |
 | SP1-I1-13 expiry bỏ qua cấu hình | Task 12 (dùng `event_payload_days`, kiểm tra khoảng, test 7 ngày); Bàn giao ghi tình huống 35 chỉ phủ Event |
 | SP1-I1-14 crash case riêng cho restore policy | Task 14 (4 crashpoint riêng của policy), Task 16 (`CrashCase` theo cặp operation và crashpoint) |
 | Mục 4: attribution | Global Constraints: attribution theo người hoặc công cụ thực sự tham gia |
@@ -1699,3 +1862,20 @@ Không ghi "verified" cho các phần này.
 | Mục 4: "bản mới nhất" của Python | Quyết định "Python mới nhất" |
 | Mục 4: `&&` | Ghi chú Shell ở đầu plan; gate là runner Python |
 | Mục 4: backup policy, migration policy | Task 13 (round-trip và hỏng), Task 15 (`target="policy"`) |
+
+### Review vòng 2
+
+| Review | Đã sửa ở |
+|---|---|
+| SP1-I1-R2-01 `store_full` thiếu blob đang có holder | Quyết định "Backup"; Task 13 (tập root là tập con của `blobs`, `logical_verified`, kiểm `kind`; test bỏ root, test blob mồ côi thừa, test sai loại), Task 14 (restore từ chối backup không kiểm được logic) |
+| SP1-I1-R2-02 Store giữ policy cũ khi thay policy | Quyết định "Thay policy"; Task 14 (`restore_policy` yêu cầu cả store và policy đóng; runtime mới gắn policy mới), Task 15 (`migrate_database` cũng vậy) |
+| SP1-I1-R2-03 GC chen giữa `put` và `hold` | Quyết định "Chuyển giao `put` → `hold`"; Task 9 (`hold` kiểm blob trong transaction ghi, `store_content` thử lại), Task 10 (GC xóa trong transaction ghi; test blob trùng đã cũ) |
+| SP1-I1-R2-04 receipt thiếu outcome vẫn được chấp nhận | Task 17 (khóa outcome bằng đúng inventory, giá trị thuộc tập terminal, tổng count bằng mẫu số, parser từ chối testcase trùng) |
+| SP1-I1-R2-05 matrix mở schema v2 bằng runtime v1 | Quyết định "Mở theo bộ migration"; Task 11 (`open_runtime` nhận bộ migration), Task 16 (`CrashCase` khai bộ migration) |
+| SP1-I1-R2-06 package chưa được cài; mypy thiếu input | Task 1 (`[build-system]` hatchling, `uv sync`, kiểm tra `-I` dùng đúng checkout; mypy chỉ `src`/`tests`), Task 17 (thêm `scripts`) |
+| SP1-I1-R2-07 không có API backup policy theo đường dẫn | Task 13 (`create_maintenance_backup(target="policy")`), Task 15 (test binary mới gặp policy cũ; backup lỗi không chạm bản gốc) |
+| SP1-I1-R2-08 owner của tổ tiên trên Windows | Quyết định "Quyền tổ tiên"; Task 4 (owner SID ngoài nhóm tin cậy bị báo; test DACL nhìn an toàn nhưng owner lạ); spec 5.9 |
+| SP1-I1-R2-09 thread của connection | Quyết định "Mô hình thực thi"; Task 8 (owner thread; test gọi từ thread khác; test `maintenance()` lồng nhau), Task 10 (bỏ test GC đa luồng) |
+| Mục 4: refs và `expires_at` nullable | Task 8 (`refs` là digest không trùng; `nullable`) |
+| Mục 4: source ổn định trong lúc chạy gate | Quyết định "Gate trên checkout niêm phong"; Task 17 |
+| Mục 4: sticky bit | Chủ dự án đã xác nhận (a); spec 5.9 và Quyết định "Quyền tổ tiên" |

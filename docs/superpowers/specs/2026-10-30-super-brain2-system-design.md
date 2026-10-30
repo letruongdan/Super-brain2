@@ -315,6 +315,9 @@ Mọi bản ghi mang `owner_id`, `actor` (principal hoặc tác nhân hệ thố
   - **Windows:** ACL chỉ cho user hiện tại (cộng SYSTEM khi OS bắt buộc).
   - **Unix:** thư mục `0700`, file `0600`; daemon đặt `umask 077`.
 - Khi data root bị ghi đè đường dẫn, hoặc khi xuất backup ra chỗ khác, brain kiểm tra cả thư mục cha. Thư mục cha cho người khác ghi thì từ chối.
+  - Mối đe dọa cần chặn là tài khoản OS khác **đổi tên hoặc thay** cây thư mục của brain.
+  - **POSIX:** thư mục cha cho người khác ghi nhưng có sticky bit (ví dụ `/tmp`) được chấp nhận, vì sticky bit ngăn người khác đổi tên hay xóa entry không thuộc họ. Chủ dự án xác nhận ngày 2026-10-30.
+  - **Windows:** tương đương là không có SID ngoài nhóm tin cậy (user, SYSTEM, Administrators, TrustedInstaller) được cấp `FILE_DELETE_CHILD`, `WRITE_DAC`, `WRITE_OWNER` trên thư mục cha, và owner của thư mục cha phải thuộc nhóm tin cậy.
 - `doctor` kiểm tra quyền của kho tách riêng với quyền của credential.
 - **Phạm vi bảo vệ:** ngăn tài khoản OS khác vô tình đọc được. Không chống tiến trình chạy cùng tài khoản (giới hạn đã công bố ở mục 11.3).
 
