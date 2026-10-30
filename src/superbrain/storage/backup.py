@@ -26,7 +26,7 @@ import sys
 from collections.abc import Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
@@ -39,26 +39,30 @@ from superbrain.ports.os import OsAdapters
 from superbrain.storage.cas import HOLDERS_TABLE, blob_digests, blob_path, file_digest
 from superbrain.storage.layout import DataRoot
 from superbrain.storage.ledger import utc_timestamp
+from superbrain.storage.prune import MANIFEST_NAME, backup_dir_name, prune_backups
 from superbrain.storage.schema import Migration, SchemaInfo, ensure_readable, read_schema_info
-from superbrain.storage.sqlite import db_files, open_immutable, open_readonly
+from superbrain.storage.sqlite import db_files, open_immutable
 from superbrain.storage.writer import WriterLease
 
 if TYPE_CHECKING:
     from superbrain.storage.policy_store import PolicyStore
     from superbrain.storage.store import Store
 
+__all__ = [
+    "BackupKind",
+    "BackupManifest",
+    "create_maintenance_backup",
+    "create_policy_backup",
+    "create_store_backup",
+    "prune_backups",
+    "verify_backup",
+]
+
 BackupKind = Literal["store", "store_full", "policy"]
 FORMAT_VERSION = 1
-MANIFEST_NAME = "manifest.json"
-INCOMPLETE_SUFFIX = ".incomplete"
 _KINDS: tuple[BackupKind, ...] = ("store", "store_full", "policy")
 _SNAPSHOT_NAME: dict[str, str] = {"store": "brain.db", "store_full": "brain.db", "policy": "policy.db"}
 _CAS = "cas"
-_STAMP_FORMAT = "%Y%m%dT%H%M%SZ"
-_DIR_NAME = re.compile(
-    r"(store|store_full|policy)-([0-9]{8}T[0-9]{6}Z)-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
-)
-_INCOMPLETE_AFTER = timedelta(hours=24)
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 _TIMESTAMP = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}Z")
 _SHARD_NAME = re.compile(r"[0-9a-f]{2}")
@@ -85,7 +89,7 @@ class BackupManifest:
     ledger_high_water: int
     """``max(sequence)`` of the snapshot's ledger, 0 when it is empty; always 0 for ``policy``."""
     trust_generation: int | None
-    """The policy snapshot's trust generation; ``None`` for store kinds."""
+    """The policy snapshot's trust generation (required for ``policy``); always ``None`` for store kinds."""
     created_at: str
     db_digest: str
     blobs: tuple[str, ...]
@@ -197,10 +201,10 @@ def _high_water(db: sqlite3.Connection) -> int:
     return value
 
 
-def _trust_generation(db: sqlite3.Connection) -> int | None:
-    """The ``trust`` row's generation; ``None`` when the snapshot has no ``trust`` table."""
+def _trust_generation(db: sqlite3.Connection) -> int:
+    """The policy snapshot's ``trust`` row generation; a missing table or row is ``INTEGRITY_FAILURE``."""
     if not _has_table(db, "trust_generation", "trust"):
-        return None
+        raise _fail("trust_generation", "the snapshot has no trust table: it is not a policy store")
     rows = _query(db, "trust_generation", "SELECT generation FROM trust WHERE id = 1")
     if len(rows) != 1 or type(rows[0][0]) is not int or rows[0][0] < 1:
         raise _fail("trust_generation", "the snapshot has no valid trust generation")
@@ -231,7 +235,7 @@ def _new_directory(path: Path, os_: OsAdapters) -> None:
 
 
 def _new_backup_dir(backups_dir: Path, kind: BackupKind, now: datetime, os_: OsAdapters) -> Path:
-    path = backups_dir / f"{kind}-{now.astimezone(UTC).strftime(_STAMP_FORMAT)}-{new_id()}"
+    path = backups_dir / backup_dir_name(kind, now)
     _new_directory(path, os_)
     return path
 
@@ -330,14 +334,43 @@ def create_policy_backup(policy: "PolicyStore", os_: OsAdapters, now: datetime) 
     return directory
 
 
+def _snapshot_closed_db(source: Path, work: Path, snapshot: Path, os_: OsAdapters) -> None:
+    """Snapshot the closed database ``source`` without opening it: copy it and its ``-wal`` (never the ``-shm``,
+    which SQLite rebuilds) into the private directory ``work``, open the copy writable so SQLite recovers the WAL
+    into it, run ``_snapshot_db`` from there, then close the copy and remove ``work``."""
+    _new_directory(work, os_)
+    copy = work / source.name
+    wal = db_files(source)[1]
+    try:
+        shutil.copyfile(source, copy)
+        if os.path.lexists(wal):
+            shutil.copyfile(wal, db_files(copy)[1])
+    except OSError as err:
+        raise BrainError(ErrorCode.IO_ERROR, f"cannot copy {source.name} for a maintenance backup: {err}") from err
+    try:
+        db = sqlite3.connect(copy, isolation_level=None)
+    except sqlite3.Error as exc:
+        raise _sqlite_error(f"cannot open the copy of {source.name}", exc) from exc
+    try:
+        _snapshot_db(db, snapshot)
+    finally:
+        db.close()
+    try:
+        shutil.rmtree(work)
+    except OSError as err:
+        raise BrainError(ErrorCode.IO_ERROR, f"cannot remove the work directory {work.name}: {err}") from err
+    os_.publisher.sync_directory(work.parent)
+
+
 def create_maintenance_backup(
     root: DataRoot, lease: WriterLease, os_: OsAdapters, *, target: Literal["store", "policy"], now: datetime
 ) -> Path:
     """Back up the closed ``target`` database by path, for migration and maintenance; any schema version works.
 
     ``target="store"`` makes a ``store_full`` backup (the snapshot and every blob file in ``cas/``),
-    ``target="policy"`` a ``policy`` one. An open ``target`` handle is ``STORE_BUSY``. The database is read through
-    ``open_readonly``, which creates and changes nothing; a WAL left by a writer that died is read, not ignored.
+    ``target="policy"`` a ``policy`` one. An open ``target`` handle is ``STORE_BUSY``. The source files are only
+    copied, never opened by SQLite (``_snapshot_closed_db``), so they stay byte-for-byte unchanged, and a WAL left
+    by a writer that died is recovered into the snapshot, not ignored.
     """
     if not lease.held or lease.root != root:
         raise AssertionError("a maintenance backup needs a held writer lease for this data root")
@@ -352,14 +385,7 @@ def create_maintenance_backup(
         raise BrainError(ErrorCode.NOT_FOUND, f"no {target} database at {source}")
     directory = _new_backup_dir(root.backups_dir, kind, now, os_)
     snapshot = directory / _SNAPSHOT_NAME[kind]
-    try:
-        db = open_readonly(source)
-    except sqlite3.Error as exc:
-        raise BrainError(ErrorCode.IO_ERROR, f"cannot open {source}: {exc}") from exc
-    try:
-        _snapshot_db(db, snapshot)
-    finally:
-        db.close()
+    _snapshot_closed_db(source, directory / f".work-{new_id()}", snapshot, os_)
     _secure_snapshot(snapshot, os_)
     crashpoint("backup.after_db_snapshot")
     blobs: list[str] = []
@@ -403,8 +429,10 @@ def _load_manifest(path: Path) -> BackupManifest:
         raise _fail("manifest", f"unknown kind {kind!r}")
     if not isinstance(store_id, str) or not store_id:
         raise _fail("manifest", "store_id must be a non-empty string")
-    if trust is not None and (type(trust) is not int or trust < 1):
-        raise _fail("manifest", "trust_generation must be null or an integer >= 1")
+    if kind == "policy" and (type(trust) is not int or trust < 1):
+        raise _fail("manifest", "a policy backup's trust_generation must be an integer >= 1")
+    if kind != "policy" and trust is not None:
+        raise _fail("manifest", "a store backup's trust_generation must be null")
     if not isinstance(created_at, str) or not _TIMESTAMP.fullmatch(created_at):
         raise _fail("manifest", "created_at must be a canonical UTC timestamp")
     if not isinstance(db_digest, str) or not _DIGEST.fullmatch(db_digest):
@@ -548,53 +576,3 @@ def verify_backup(
     if readable and manifest.kind == "store_full" and not roots <= set(manifest.blobs):
         raise _fail("roots", f"the snapshot's roots {sorted(roots - set(manifest.blobs))} are not in the backup")
     return replace(manifest, logical_verified=readable)
-
-
-# --- pruning -----------------------------------------------------------------------------------------------------
-
-
-def prune_backups(backups_dir: Path, *, os_: OsAdapters, keep: int = 7, now: datetime) -> list[Path]:
-    """Keep the ``keep`` newest complete backups of each kind and delete the rest; returns what it changed, sorted.
-
-    Complete means the directory has a ``manifest.json``; age and order come from the timestamp in the name, never
-    from mtime. An incomplete backup older than 24 hours is renamed to ``<name>.incomplete``, never deleted.
-    Entries whose names are not backup names are left alone.
-    """
-    if type(keep) is not int or keep < 1:
-        raise BrainError(ErrorCode.INVALID_INPUT, "keep must be an integer >= 1")
-    _require_aware(now)
-    try:
-        names = sorted(os.listdir(backups_dir))
-    except OSError as err:
-        raise BrainError(ErrorCode.IO_ERROR, f"cannot list {backups_dir}: {err}") from err
-    complete: dict[str, list[tuple[datetime, str]]] = {}
-    changed: list[Path] = []
-    for name in names:
-        match = _DIR_NAME.fullmatch(name)
-        path = backups_dir / name
-        if match is None or path.is_symlink() or not path.is_dir():
-            continue
-        try:
-            created = datetime.strptime(match.group(2), _STAMP_FORMAT).replace(tzinfo=UTC)
-        except ValueError:
-            continue  # not a real date, so not a backup name
-        if (path / MANIFEST_NAME).is_file():
-            complete.setdefault(match.group(1), []).append((created, name))
-        elif created < now - _INCOMPLETE_AFTER:
-            try:
-                os_.publisher.rename_dir(path, path.with_name(name + INCOMPLETE_SUFFIX))
-            except FileExistsError as err:
-                raise BrainError(ErrorCode.IO_ERROR, f"cannot set aside {path}: the target exists") from err
-            changed.append(path)
-    deleted = False
-    for found in complete.values():
-        for _, name in sorted(found, reverse=True)[keep:]:
-            try:
-                shutil.rmtree(backups_dir / name)
-            except OSError as err:
-                raise BrainError(ErrorCode.IO_ERROR, f"cannot delete the old backup {name}: {err}") from err
-            changed.append(backups_dir / name)
-            deleted = True
-    if deleted:
-        os_.publisher.sync_directory(backups_dir)
-    return sorted(changed)

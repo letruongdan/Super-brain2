@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 import sqlite3
 from collections.abc import Callable, Iterator
 from datetime import timedelta
@@ -352,6 +353,46 @@ def test_policy_manifest_trust_generation_must_match_the_snapshot(env: Env, cloc
     assert e.value.code == ErrorCode.INTEGRITY_FAILURE and "trust_generation" in e.value.message
 
 
+@pytest.mark.parametrize("trust", [None, 1])
+def test_store_backup_relabelled_as_policy_is_rejected(env: Env, clock: FakeClock, trust: int | None) -> None:
+    path = create_store_backup(env.store, env.os_, clock.now())
+    (path / "brain.db").rename(path / "policy.db")
+    shutil.rmtree(path / "cas")
+    rewrite_manifest(path, kind="policy", blobs=[], ledger_high_water=0, trust_generation=trust)
+    with pytest.raises(BrainError) as e:
+        verify_backup(path, expected_kind="policy", expected_store_id=env.store.store_id, migrations=POLICY_MIGRATIONS)
+    assert e.value.code == ErrorCode.INTEGRITY_FAILURE and "trust_generation" in e.value.message
+
+
+@pytest.mark.parametrize(("kind", "trust"), [("policy", None), ("store", 1)])
+def test_trust_generation_must_suit_the_kind(env: Env, clock: FakeClock, kind: str, trust: int | None) -> None:
+    if kind == "policy":
+        path = create_policy_backup(env.policy, env.os_, clock.now())
+        expected, migrations = "policy", POLICY_MIGRATIONS
+    else:
+        path = create_store_backup(env.store, env.os_, clock.now())
+        expected, migrations = "store", STORE_MIGRATIONS
+    rewrite_manifest(path, trust_generation=trust)
+    with pytest.raises(BrainError) as e:
+        verify_backup(path, expected_kind=expected, expected_store_id=env.store.store_id, migrations=migrations)  # type: ignore[arg-type]
+    assert e.value.code == ErrorCode.INTEGRITY_FAILURE  # refused by the manifest check itself, before any derivation
+    assert "check manifest" in e.value.message and "trust_generation" in e.value.message
+
+
+def test_policy_backup_of_a_db_without_trust_is_refused(trusted_tmp: Path, clock: FakeClock) -> None:
+    open_runtime(trusted_tmp, os_adapters()).close()
+    db = sqlite3.connect(trusted_tmp / "policy" / "policy.db", isolation_level=None)
+    try:
+        db.execute("DROP TABLE trust")
+    finally:
+        db.close()
+    with maintenance_lease(trusted_tmp) as (root, lease), pytest.raises(BrainError) as e:
+        create_maintenance_backup(root, lease, os_adapters(), target="policy", now=clock.now())
+    assert e.value.code == ErrorCode.INTEGRITY_FAILURE and "trust_generation" in e.value.message
+    (partial,) = (trusted_tmp / "backups").iterdir()
+    assert not (partial / "manifest.json").exists()
+
+
 def test_kind_mismatch_is_rejected(env: Env, clock: FakeClock) -> None:
     path = create_policy_backup(env.policy, env.os_, clock.now())
     with pytest.raises(BrainError) as e:
@@ -434,18 +475,33 @@ def test_full_backup_of_unreadable_schema_checks_physical_facts_only(trusted_tmp
     path = full_backup(trusted_tmp, clock)
     m = verify_full(path, store_id_of(trusted_tmp))
     assert m.logical_verified is False and m.schema_version == 2
+    good = (path / "manifest.json").read_bytes()
+    rewrite_manifest(path, trust_generation=1)  # store kinds never carry one, readable schema or not
+    with pytest.raises(BrainError) as e:
+        verify_full(path, store_id_of(trusted_tmp))
+    assert e.value.code == ErrorCode.INTEGRITY_FAILURE and "trust_generation" in e.value.message
+    (path / "manifest.json").write_bytes(good)
     add_blob(path, b"unlisted")
     with pytest.raises(BrainError) as e:
         verify_full(path, store_id_of(trusted_tmp))
     assert e.value.code == ErrorCode.INTEGRITY_FAILURE
 
 
-def test_full_backup_includes_committed_wal_of_a_crashed_writer(trusted_tmp: Path, clock: FakeClock) -> None:
+@pytest.mark.parametrize("shm", ["kept", "deleted"])
+def test_full_backup_includes_committed_wal_of_a_crashed_writer(trusted_tmp: Path, clock: FakeClock, shm: str) -> None:
     run_until_crash("seed_event", "ledger.after_commit", trusted_tmp)
-    assert (trusted_tmp / "store" / "brain.db-wal").exists()
+    store = trusted_tmp / "store"
+    assert (store / "brain.db-wal").exists() and (store / "brain.db-shm").exists()
+    if shm == "deleted":
+        (store / "brain.db-shm").unlink()
+    sources = [p for p in (store / "brain.db", store / "brain.db-wal", store / "brain.db-shm") if p.exists()]
+    before = {p.name: p.read_bytes() for p in sources}
     path = full_backup(trusted_tmp, clock)
+    assert {p.name: p.read_bytes() for p in sources} == before  # the source files are only copied
+    assert sorted(p.name for p in store.iterdir() if p.name.startswith("brain.db")) == sorted(before)
     m = verify_full(path, store_id_of(trusted_tmp))
-    assert m.ledger_high_water >= 1 and digest_bytes(b"event payload") in m.blobs
+    assert m.ledger_high_water == 1 and digest_bytes(b"event payload") in m.blobs
+    assert sorted(p.name for p in path.iterdir()) == ["brain.db", "cas", "manifest.json"]  # work directory gone
 
 
 @pytest.mark.parametrize("crashpoint", ["backup.after_db_snapshot", "backup.after_blob_copy"])
@@ -487,7 +543,7 @@ def test_prune_keeps_seven_complete_per_kind(trusted_tmp: Path, clock: FakeClock
     young_partial = fake_backup(backups, "policy", 23, complete=False)
     (backups / "unrelated").mkdir()
     changed = prune_backups(backups, os_=os_adapters(), now=clock.now())
-    assert sorted(changed) == sorted([stores[7], stores[8], old_partial])
+    assert changed == sorted([stores[7], stores[8], old_partial.with_name(old_partial.name + ".incomplete")])
     left = sorted(p.name for p in backups.iterdir())
     expected = [p.name for p in (*stores[:7], *policies, full, young_partial)]
     assert left == sorted([*expected, old_partial.name + ".incomplete", "unrelated"])
@@ -502,6 +558,41 @@ def test_prune_honours_keep(trusted_tmp: Path, clock: FakeClock) -> None:
     with pytest.raises(BrainError) as e:
         prune_backups(backups, os_=os_adapters(), keep=0, now=clock.now())
     assert e.value.code == ErrorCode.INVALID_INPUT
+
+
+def test_failed_prune_leaves_no_half_deleted_backup_that_looks_complete(
+    trusted_tmp: Path, clock: FakeClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backups = trusted_tmp / "backups"
+    backups.mkdir()
+    stores = [fake_backup(backups, "store", h) for h in range(1, 9)]
+    real_rmtree = shutil.rmtree
+
+    def half_rmtree(path: str | os.PathLike[str], *args: object, **kwargs: object) -> None:
+        (Path(path) / "brain.db").write_bytes(b"left behind")
+        (Path(path) / "manifest.json").unlink()  # part of the tree goes, then the removal fails
+        raise PermissionError("injected rmtree failure")
+
+    monkeypatch.setattr(shutil, "rmtree", half_rmtree)
+    with pytest.raises(BrainError) as e:
+        prune_backups(backups, os_=os_adapters(), now=clock.now())
+    assert e.value.code == ErrorCode.IO_ERROR
+    assert not stores[7].exists()
+    (doomed,) = [p for p in backups.iterdir() if ".deleting-" in p.name]
+    assert doomed.name.startswith(stores[7].name + ".deleting-")
+    monkeypatch.setattr(shutil, "rmtree", real_rmtree)
+    assert prune_backups(backups, os_=os_adapters(), now=clock.now()) == []  # .deleting-* is not counted
+    assert doomed.exists() and all(p.exists() for p in stores[:7])
+
+
+def test_prune_does_not_count_deleting_entries(trusted_tmp: Path, clock: FakeClock) -> None:
+    backups = trusted_tmp / "backups"
+    backups.mkdir()
+    stores = [fake_backup(backups, "store", h) for h in range(1, 8)]
+    leftover = fake_backup(backups, "store", 50)
+    leftover = leftover.rename(leftover.with_name(leftover.name + ".deleting-0192f3a4-5b6c-7d8e-9f01-000000000001"))
+    assert prune_backups(backups, os_=os_adapters(), now=clock.now()) == []
+    assert leftover.exists() and all(p.exists() for p in stores)
 
 
 def test_backup_directory_is_owner_only(env: Env, clock: FakeClock) -> None:
