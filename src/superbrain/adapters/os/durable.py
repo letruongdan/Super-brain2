@@ -50,8 +50,11 @@ def _is_disk_full(err: OSError) -> bool:
     return err.errno == errno.ENOSPC or _winerror(err) == _ERROR_DISK_FULL
 
 
-def _storage_full(what: str) -> BrainError:
-    return BrainError(ErrorCode.STORAGE_FULL, f"no space left while {what}")
+def _map_os_error(err: OSError, what: str) -> BrainError:
+    """Translate an OS failure; the caller chains it with ``from err``."""
+    if _is_disk_full(err):
+        return BrainError(ErrorCode.STORAGE_FULL, f"no space left while {what}")
+    return BrainError(ErrorCode.IO_ERROR, f"I/O error while {what}: {err}")
 
 
 def _full_fsync(fd: int) -> None:
@@ -266,13 +269,21 @@ class _BasePublisher:
             raise FileExistsError(errno.EEXIST, "target directory exists", str(dst))
         os.rename(src, dst)
 
-    def sync_directory(self, directory: Path) -> None:
+    def _sync_dir(self, directory: Path) -> None:
         _fsync_directory(directory)
 
     # -- public operations
+    def sync_directory(self, directory: Path) -> None:
+        self._guard(lambda: self._sync_dir(directory), f"syncing directory {directory}")
+
     def write_new(self, path: Path, data: bytes) -> None:
         flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0)
-        fd = os.open(path, flags, 0o600)  # FileExistsError propagates; nothing was created
+        try:
+            fd = os.open(path, flags, 0o600)
+        except FileExistsError:
+            raise  # port contract: callers translate it; nothing was created
+        except OSError as err:
+            raise _map_os_error(err, f"creating {path}") from err
         try:
             try:
                 view = memoryview(data)
@@ -285,25 +296,25 @@ class _BasePublisher:
         except BaseException as err:
             with contextlib.suppress(OSError):
                 path.unlink()
-            if isinstance(err, OSError) and _is_disk_full(err):
-                raise _storage_full(f"writing {path.name}") from err
+            if isinstance(err, OSError):
+                raise _map_os_error(err, f"writing {path}") from err
             raise
 
     def publish(self, staging: Path, final: Path) -> None:
-        self._guard_full(lambda: self._replace(staging, final), f"publishing {final.name}")
+        self._guard(lambda: self._replace(staging, final), f"publishing {staging} to {final}")
         self.sync_directory(final.parent)
 
     def rename_dir(self, src: Path, dst: Path) -> None:
-        self._guard_full(lambda: self._rename_dir(src, dst), f"renaming {src.name}")
+        self._guard(lambda: self._rename_dir(src, dst), f"renaming directory {src} to {dst}")
         self.sync_directory(dst.parent)
 
-    def _guard_full(self, action: Callable[[], None], what: str) -> None:
+    def _guard(self, action: Callable[[], None], what: str) -> None:
         try:
             action()
-        except OSError as err:
-            if _is_disk_full(err):
-                raise _storage_full(what) from err
+        except FileExistsError:
             raise
+        except OSError as err:
+            raise _map_os_error(err, what) from err
 
     def durability(self, directory: Path, env: Mapping[str, str]) -> DurabilityReport:
         if not directory.is_dir():
@@ -334,9 +345,12 @@ class _BasePublisher:
             self.write_new(staging, b"durability probe")
             self.publish(staging, final)
             self.sync_directory(directory)
-        except OSError as err:
+        except FileExistsError as err:
             return f"sync probe failed: {errno.errorcode.get(err.errno or 0, err.errno)}"
         except BrainError as err:
+            cause = err.__cause__
+            if isinstance(cause, OSError):
+                return f"sync probe failed: {errno.errorcode.get(cause.errno or 0, cause.errno)}"
             return f"sync probe failed: {err.code.value}"
         finally:
             for leftover in (staging, final):
@@ -378,7 +392,7 @@ class WindowsPublisher(_BasePublisher):
                 raise FileExistsError(errno.EEXIST, "target directory exists", str(dst)) from err
             raise
 
-    def sync_directory(self, directory: Path) -> None:
+    def _sync_dir(self, directory: Path) -> None:
         """No separate operation: ``MOVEFILE_WRITE_THROUGH`` makes the rename durable."""
 
     def _move(self, src: Path, dst: Path, flags: int) -> None:

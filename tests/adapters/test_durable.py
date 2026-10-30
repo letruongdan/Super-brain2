@@ -18,7 +18,7 @@ from superbrain.adapters.os.durable import (
 )
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.ports.os import DurabilityTier, DurablePublisher, FsInfo
-from tests.support.platform import windows_only
+from tests.support.platform import posix_only, windows_only
 
 if sys.platform == "win32":
     KNOWN_GOOD_FS = FsInfo("NTFS", False)
@@ -109,16 +109,6 @@ def test_disk_full_maps_to_storage_full(
     assert not (tmp_path / "x").exists()
 
 
-def test_other_write_error_removes_partial_file_and_reraises(
-    tmp_path: Path, publisher: DurablePublisher, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(os, "fsync", raising(OSError(errno.EIO, "io")))
-    with pytest.raises(OSError, match="io") as e:
-        publisher.write_new(tmp_path / "x", b"data")
-    assert e.value.errno == errno.EIO
-    assert not (tmp_path / "x").exists()
-
-
 def test_write_new_loops_over_short_writes(
     tmp_path: Path, publisher: DurablePublisher, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -186,6 +176,72 @@ def test_detect_fs_reports_this_machine(tmp_path: Path) -> None:
 
 def test_detect_fs_never_raises_for_missing_path(tmp_path: Path) -> None:
     assert detect_fs(tmp_path / "a" / "b").fs_type != ""
+
+
+def assert_io_error(err: pytest.ExceptionInfo[BrainError]) -> None:
+    assert err.value.code == ErrorCode.IO_ERROR
+    assert isinstance(err.value.__cause__, OSError)
+
+
+def test_write_new_io_error_is_brain_error(
+    tmp_path: Path, publisher: DurablePublisher, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(os, "fsync", raising(OSError(errno.EIO, "io")))
+    with pytest.raises(BrainError) as e:
+        publisher.write_new(tmp_path / "x", b"data")
+    assert_io_error(e)
+    assert not (tmp_path / "x").exists()
+
+
+def test_write_new_open_failure_is_brain_error(tmp_path: Path, publisher: DurablePublisher) -> None:
+    with pytest.raises(BrainError) as e:
+        publisher.write_new(tmp_path / "missing" / "x", b"data")
+    assert_io_error(e)
+
+
+def test_publish_io_error_is_brain_error(
+    tmp_path: Path, publisher: DurablePublisher, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(os, "replace", raising(OSError(errno.EIO, "io")))
+    monkeypatch.setattr(durable, "_move_file_ex", raising(OSError(errno.EIO, "io")))
+    with pytest.raises(BrainError) as e:
+        publisher.publish(staged(tmp_path), tmp_path / "f")
+    assert_io_error(e)
+
+
+def test_rename_dir_io_error_is_brain_error(
+    tmp_path: Path, publisher: DurablePublisher, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "s").mkdir()
+    monkeypatch.setattr(os, "rename", raising(OSError(errno.EIO, "io")))
+    monkeypatch.setattr(durable, "_move_file_ex", raising(OSError(errno.EIO, "io")))
+    with pytest.raises(BrainError) as e:
+        publisher.rename_dir(tmp_path / "s", tmp_path / "d")
+    assert_io_error(e)
+
+
+@posix_only
+def test_sync_directory_io_error_is_brain_error(
+    tmp_path: Path, publisher: DurablePublisher, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(os, "fsync", raising(OSError(errno.EIO, "io")))
+    with pytest.raises(BrainError) as e:
+        publisher.sync_directory(tmp_path)
+    assert_io_error(e)
+
+
+def test_sync_directory_missing_directory_is_brain_error_on_posix(tmp_path: Path) -> None:
+    if sys.platform == "win32":
+        pytest.skip("Windows has no separate directory sync")
+    with pytest.raises(BrainError) as e:
+        publisher_for(sys.platform).sync_directory(tmp_path / "nope")
+    assert_io_error(e)
+
+
+def test_probe_io_error_reports_errno_without_raising(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(os, "fsync", raising(OSError(errno.EIO, "io")))
+    report = publisher_with(KNOWN_GOOD_FS).durability(tmp_path, {})
+    assert "sync probe failed: EIO" in report.reasons
 
 
 MOUNTINFO = """\
@@ -256,12 +312,15 @@ def test_windows_disk_full_maps_to_storage_full(tmp_path: Path, monkeypatch: pyt
 
 
 @windows_only
-def test_windows_unrelated_move_error_is_not_retried(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_windows_unrelated_move_error_is_io_error_and_not_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     fake = FlakyMoveFileEx(failures=99, winerror=2)
     monkeypatch.setattr(durable, "_move_file_ex", fake)
-    with pytest.raises(OSError, match="simulated") as e:
+    with pytest.raises(BrainError) as e:
         WindowsPublisher(sleep=lambda s: None).publish(staged(tmp_path), tmp_path / "f")
-    assert getattr(e.value, "winerror", None) == 2
+    assert e.value.code == ErrorCode.IO_ERROR
+    assert isinstance(e.value.__cause__, OSError)
     assert fake.calls == 1
 
 

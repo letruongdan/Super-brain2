@@ -23,6 +23,7 @@ class ErrorCode(StrEnum):
     INTEGRITY_FAILURE = "integrity_failure"
     STORAGE_FULL = "storage_full"
     FILESYSTEM_BUSY = "filesystem_busy"
+    IO_ERROR = "io_error"
 
 
 class BrainError(Exception):
