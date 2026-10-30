@@ -1,4 +1,7 @@
-from datetime import timedelta
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -22,18 +25,25 @@ def hold(store: Store, digest: str, holder_id: str = E1) -> None:
         t.hold(digest, "event", holder_id, RetentionClass.EVENT_PAYLOAD, None)
 
 
-def gc_once_before_first_hold(monkeypatch: pytest.MonkeyPatch, store: Store, now: object) -> None:
+@dataclass
+class GcRace:
+    reports: list[GcReport] = field(default_factory=list)
+    hold_calls: int = 0
+
+
+def gc_once_before_first_hold(monkeypatch: pytest.MonkeyPatch, store: Store, now: datetime) -> GcRace:
     """Run GC exactly once, after ``put`` and before the transaction of the first ``store_content`` hold."""
     original = Store._hold
-    calls: list[str] = []
+    race = GcRace()
 
-    def hold_after_gc(self: Store, *args: object, **kwargs: object) -> None:
-        if not calls:
-            calls.append("gc")
-            store.cas.collect_garbage(now=now)  # type: ignore[arg-type]
-        original(self, *args, **kwargs)  # type: ignore[arg-type]
+    def hold_after_gc(self: Store, *args: Any, **kwargs: Any) -> None:
+        race.hold_calls += 1
+        if race.hold_calls == 1:
+            race.reports.append(store.cas.collect_garbage(now=now))
+        original(self, *args, **kwargs)
 
     monkeypatch.setattr(Store, "_hold", hold_after_gc)
+    return race
 
 
 def test_gc_deletes_old_orphan_only(store: Store, clock: FakeClock) -> None:
@@ -106,8 +116,9 @@ def test_store_content_republishes_after_gc_race(
 ) -> None:
     aged = store.cas.put(b"dedup-me")
     set_mtime(blob_file(store, aged), clock.now() - timedelta(days=3))
-    gc_once_before_first_hold(monkeypatch, store, now=clock.now())
+    race = gc_once_before_first_hold(monkeypatch, store, now=clock.now())
     d = store.store_content(b"dedup-me", "event", E1, RetentionClass.EVENT_PAYLOAD, None)
+    assert [r.deleted for r in race.reports] == [(aged,)] and race.hold_calls == 2
     assert store.cas.read(d) == b"dedup-me" and [h[1] for h in store.cas.holders(d)] == [E1]
 
 
@@ -124,3 +135,49 @@ def test_gc_ignores_files_that_are_not_blobs(store: Store, clock: FakeClock) -> 
     stray.write_bytes(b"keep")
     store.cas.collect_garbage(now=clock.now() + timedelta(days=2))
     assert stray.read_bytes() == b"keep" and store_dir(store).is_dir()
+
+
+def test_gc_rejects_a_naive_now(store: Store) -> None:
+    orphan = store.cas.put(b"orphan")
+    with pytest.raises(BrainError) as e:
+        store.cas.collect_garbage(now=datetime(2026, 10, 30, 12, 0))
+    assert e.value.code == ErrorCode.INVALID_INPUT and store.cas.exists(orphan)
+
+
+def test_gc_grace_boundary_is_exclusive(store: Store) -> None:
+    now = datetime(2026, 10, 30, 12, 0, 0, tzinfo=UTC)
+    edge = store.cas.put(b"edge")
+    older = store.cas.put(b"older")
+    set_mtime(blob_file(store, edge), now - timedelta(hours=24))
+    set_mtime(blob_file(store, older), now - timedelta(hours=24, seconds=1))
+    report = store.cas.collect_garbage(now=now)
+    assert report == GcReport(deleted=(older,), kept_young=(edge,))
+
+
+class _Busy(OSError):
+    winerror = 32
+
+
+@pytest.mark.parametrize(
+    ("raised", "code"),
+    [(_Busy(13, "sharing violation"), ErrorCode.FILESYSTEM_BUSY), (OSError(5, "boom"), ErrorCode.IO_ERROR)],
+)
+def test_gc_maps_unlink_failures(
+    store: Store, clock: FakeClock, monkeypatch: pytest.MonkeyPatch, raised: OSError, code: ErrorCode
+) -> None:
+    d = store.cas.put(b"orphan")
+    set_mtime(blob_file(store, d), clock.now() - timedelta(days=3))
+
+    def fail(self: Path, *args: object, **kwargs: object) -> None:
+        raise raised
+
+    monkeypatch.setattr(Path, "unlink", fail)
+    with pytest.raises(BrainError) as e:
+        store.cas.collect_garbage(now=clock.now())
+    monkeypatch.undo()
+    assert e.value.code == code
+    assert store.cas.read(d) == b"orphan" and store.cas.holders(d) == []
+    with store.transaction():
+        pass
+    with store.maintenance():
+        pass

@@ -37,6 +37,7 @@ _SHARD_NAME = re.compile(r"[0-9a-f]{2}")
 _BLOB_NAME = re.compile(r"[0-9a-f]{64}")
 _CHUNK = 1 << 20
 _ERROR_DISK_FULL = 112  # Windows ERROR_DISK_FULL
+_BUSY_WINERRORS = frozenset({32, 5})  # ERROR_SHARING_VIOLATION, ERROR_ACCESS_DENIED: as in the durable adapter
 HOLDERS_TABLE = "p_cas_holders_"
 
 
@@ -237,6 +238,8 @@ class ContentStore:
         two, so a holder never points at a deleted blob. Shard directories are kept; GC adds no ledger entry.
         """
         self._check()
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise BrainError(ErrorCode.INVALID_INPUT, "now must be timezone-aware")
         cutoff = (now - grace).timestamp()
         with self._maintenance():
             deleted: list[str] = []
@@ -265,6 +268,8 @@ class ContentStore:
             except FileNotFoundError:
                 return False
             except OSError as err:
+                if getattr(err, "winerror", None) in _BUSY_WINERRORS:  # no retry: a write transaction is open
+                    raise BrainError(ErrorCode.FILESYSTEM_BUSY, f"blob {digest} is held by another process") from err
                 raise _os_error(f"cannot delete blob {digest}", err) from err
             self._os.publisher.sync_directory(path.parent)
             return True
