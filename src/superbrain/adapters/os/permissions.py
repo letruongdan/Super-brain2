@@ -125,10 +125,14 @@ if sys.platform == "win32":
         if dacl is None:
             return None
         aces: list[tuple[int, int, str]] = []
-        for index in range(dacl.GetAceCount()):
-            (ace_type, flags), mask, sid = dacl.GetAce(index)[:3]
-            if ace_type == ntsecuritycon.ACCESS_ALLOWED_ACE_TYPE:
-                aces.append((flags, mask, str(win32security.ConvertSidToStringSid(sid))))
+        try:
+            for index in range(dacl.GetAceCount()):
+                (ace_type, flags), mask, sid = dacl.GetAce(index)[:3]
+                if ace_type == ntsecuritycon.ACCESS_ALLOWED_ACE_TYPE:
+                    aces.append((flags, mask, str(win32security.ConvertSidToStringSid(sid))))
+        except (NotImplementedError, pywintypes.error, OSError) as err:
+            # e.g. conditional/callback ACEs, which pywin32 cannot decode
+            raise _inspect_error(path, err) from err
         return aces
 
 

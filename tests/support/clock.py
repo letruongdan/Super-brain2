@@ -1,11 +1,11 @@
 """Deterministic clock for tests."""
 
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 
 def _require_aware(value: datetime) -> datetime:
     assert value.tzinfo is not None and value.utcoffset() is not None, "FakeClock requires timezone-aware datetimes"
-    return value
+    return value.astimezone(UTC)
 
 
 class FakeClock:

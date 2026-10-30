@@ -11,7 +11,7 @@ from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.ports.os import PermissionGuard
 from tests.support.clock import FakeClock
 from tests.support.platform import posix_only, windows_only
-from tests.support.winacl import fake_owner, grant
+from tests.support.winacl import fake_owner, fake_unsupported_ace, grant
 
 
 @pytest.fixture
@@ -99,13 +99,33 @@ def test_foreign_owner_is_reported_even_with_safe_dacl(
 
 
 @windows_only
-def test_ancestor_with_delete_child_for_users_is_reported(tmp_path: Path, guard: PermissionGuard) -> None:
+@pytest.mark.parametrize("right", ["FILE_DELETE_CHILD", "DELETE"])
+def test_ancestor_with_takeover_right_for_users_is_reported(
+    trusted_tmp: Path, guard: PermissionGuard, right: str
+) -> None:
     import ntsecuritycon
 
-    parent = tmp_path / "p"
+    parent = trusted_tmp / "p"
     parent.mkdir()
-    grant(parent, "S-1-5-32-545", ntsecuritycon.FILE_DELETE_CHILD)
-    assert guard.check_ancestors(parent / "root") != []
+    guard.secure_directory(parent)
+    assert [x for x in guard.check_ancestors(parent / "root") if x.path == parent] == []  # baseline
+    grant(parent, "S-1-5-32-545", getattr(ntsecuritycon, right))
+    assert [x.path for x in guard.check_ancestors(parent / "root") if x.path == parent] == [parent]
+
+
+@windows_only
+def test_unsupported_ace_type_becomes_brain_error(
+    tmp_path: Path, guard: PermissionGuard, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    f = secured_file(tmp_path, guard)
+    fake_unsupported_ace(monkeypatch)
+    with pytest.raises(BrainError) as err:
+        guard.problems(f.parent)
+    assert err.value.code is ErrorCode.INSECURE_PERMISSIONS
+    assert isinstance(err.value.__cause__, NotImplementedError)
+    with pytest.raises(BrainError) as err2:
+        guard.check_ancestors(f.parent / "root")
+    assert err2.value.code is ErrorCode.INSECURE_PERMISSIONS
 
 
 @windows_only
@@ -127,16 +147,6 @@ def test_foreign_owned_ancestor_with_safe_looking_dacl_is_reported(
     parent.mkdir()
     guard.secure_directory(parent)
     fake_owner(monkeypatch, parent, "S-1-5-21-1-2-3-1001")  # owner is another account; DACL is still user + SYSTEM
-    assert [x.path for x in guard.check_ancestors(parent / "root") if x.path == parent] == [parent]
-
-
-@windows_only
-def test_ancestor_with_delete_for_users_is_reported(tmp_path: Path, guard: PermissionGuard) -> None:
-    import ntsecuritycon
-
-    parent = tmp_path / "p"
-    parent.mkdir()
-    grant(parent, "S-1-5-32-545", ntsecuritycon.DELETE)
     assert [x.path for x in guard.check_ancestors(parent / "root") if x.path == parent] == [parent]
 
 
@@ -171,17 +181,6 @@ def test_protected_subtree_chain_is_accepted(tmp_path: Path, guard: PermissionGu
     assert [x for x in problems if x.path.is_relative_to(base)] == []
 
 
-@windows_only
-def test_directory_under_machine_temp_is_reported_when_temp_has_untrusted_takeover_ace(
-    guard: PermissionGuard,
-) -> None:
-    temp = Path(os.environ["LOCALAPPDATA"]) / "Temp"
-    reported = [x.path for x in guard.check_ancestors(temp / "root")]
-    if temp not in reported:
-        pytest.skip("this machine's Temp carries no untrusted takeover ACE")
-    assert temp in reported
-
-
 @posix_only
 def test_world_writable_ancestor_without_sticky_is_reported(tmp_path: Path, guard: PermissionGuard) -> None:
     p = tmp_path / "open"
@@ -209,6 +208,7 @@ def test_fake_clock_advances_and_sets() -> None:
     assert clock.now() == datetime(2026, 1, 1, 0, 0, 5, tzinfo=UTC)
     clock.set(datetime(2027, 1, 1, tzinfo=timezone(timedelta(hours=7))))
     assert clock.now() == datetime(2026, 12, 31, 17, tzinfo=UTC)
+    assert clock.now().tzinfo is UTC
 
 
 def test_fake_clock_refuses_naive_datetimes() -> None:

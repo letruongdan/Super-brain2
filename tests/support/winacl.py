@@ -37,3 +37,32 @@ def fake_owner(monkeypatch: pytest.MonkeyPatch, path: Path, sid_string: str) -> 
         return str(original(candidate))
 
     monkeypatch.setattr(permissions, "_owner_sid", owner_sid)
+
+
+def fake_unsupported_ace(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make every DACL read raise ``NotImplementedError`` from ``GetAce``, like a callback ACE does in pywin32."""
+    if sys.platform != "win32":
+        raise AssertionError("Windows-only helper")
+    import win32security
+
+    from superbrain.adapters.os import permissions
+
+    original = permissions._security_descriptor
+
+    class _Dacl:
+        def GetAceCount(self) -> int:  # noqa: N802 (mirrors the pywin32 API)
+            return 1
+
+        def GetAce(self, index: int) -> object:  # noqa: N802
+            raise NotImplementedError("unsupported ACE type 9")
+
+    class _Descriptor:
+        def GetSecurityDescriptorDacl(self) -> _Dacl:  # noqa: N802
+            return _Dacl()
+
+    def descriptor(path: Path, info: int) -> object:
+        if info == win32security.DACL_SECURITY_INFORMATION:
+            return _Descriptor()
+        return original(path, info)
+
+    monkeypatch.setattr(permissions, "_security_descriptor", descriptor)
