@@ -12,7 +12,7 @@ import sys
 import time
 import uuid
 from collections.abc import Callable, Mapping
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.ports.os import DurabilityReport, DurabilityTier, DurablePublisher, FsInfo
@@ -100,35 +100,39 @@ def _move_file_ex(src: str, dst: str, flags: int) -> None:
 # Filesystem detection
 
 
-def _unescape_mountinfo(field: str) -> str:
+def _unescape_mountinfo(field: bytes) -> bytes:
     out = bytearray()
     i = 0
-    raw = field.encode()
-    while i < len(raw):
-        if raw[i] == 0x5C and i + 4 <= len(raw) and raw[i + 1 : i + 4].isdigit():
-            out.append(int(raw[i + 1 : i + 4], 8))
+    while i < len(field):
+        if field[i] == 0x5C and i + 4 <= len(field) and field[i + 1 : i + 4].isdigit():
+            out.append(int(field[i + 1 : i + 4], 8) & 0xFF)
             i += 4
         else:
-            out.append(raw[i])
+            out.append(field[i])
             i += 1
-    return out.decode(errors="replace")
+    return bytes(out)
 
 
-def _fs_from_mountinfo(text: str, path: str) -> FsInfo:
-    """Return the fs of the longest mount point that is a path prefix of ``path`` (Linux mountinfo)."""
-    target = PurePosixPath(path)
+def _components(path: bytes) -> list[bytes]:
+    return [part for part in path.split(b"/") if part]
+
+
+def _fs_from_mountinfo(data: bytes, path: bytes) -> FsInfo:
+    """Return the fs of the longest mount point that is a path prefix of ``path`` (Linux mountinfo).
+
+    Works on bytes so a mount point that is not valid UTF-8 can never be mis-matched.
+    """
+    target = _components(path)
     best: tuple[int, str] | None = None
-    for line in text.splitlines():
-        head, separator, tail = line.partition(" - ")
+    for line in data.splitlines():
+        head, separator, tail = line.partition(b" - ")
         fields = head.split()
         tail_fields = tail.split()
         if not separator or len(fields) < 5 or not tail_fields:
             continue
-        mount_point = PurePosixPath(_unescape_mountinfo(fields[4]))
-        if (mount_point == target or mount_point in target.parents) and (
-            best is None or len(mount_point.parts) >= best[0]
-        ):
-            best = (len(mount_point.parts), tail_fields[0])
+        mount = _components(_unescape_mountinfo(fields[4]))
+        if target[: len(mount)] == mount and (best is None or len(mount) >= best[0]):
+            best = (len(mount), tail_fields[0].decode("ascii", errors="replace"))
     if best is None:
         return FsInfo("unknown", False)
     fs_type = best[1]
@@ -143,8 +147,8 @@ def _existing_ancestor(path: Path) -> Path:
 
 
 def _detect_linux(path: Path) -> FsInfo:
-    with open("/proc/self/mountinfo", encoding="utf-8", errors="replace") as handle:
-        return _fs_from_mountinfo(handle.read(), str(_existing_ancestor(path)))
+    with open("/proc/self/mountinfo", "rb") as handle:
+        return _fs_from_mountinfo(handle.read(), os.fsencode(_existing_ancestor(path)))
 
 
 def _detect_darwin(path: Path) -> FsInfo:
@@ -236,7 +240,7 @@ def detect_fs(path: Path) -> FsInfo:
         if sys.platform == "darwin":
             return _detect_darwin(path)
         return _detect_linux(path)
-    except (OSError, ValueError, AttributeError):
+    except (OSError, RuntimeError, ValueError, AttributeError):
         return FsInfo("unknown", False)
 
 
@@ -317,7 +321,12 @@ class _BasePublisher:
             raise _map_os_error(err, what) from err
 
     def durability(self, directory: Path, env: Mapping[str, str]) -> DurabilityReport:
-        if not directory.is_dir():
+        try:
+            exists = directory.is_dir()
+        except (OSError, RuntimeError) as err:
+            reason = f"cannot inspect directory: {type(err).__name__}"
+            return DurabilityReport(DurabilityTier.PROCESS_CRASH, (reason,))
+        if not exists:
             return DurabilityReport(DurabilityTier.PROCESS_CRASH, ("directory does not exist",))
         reasons: list[str] = []
         info = self._fs_info(directory)
@@ -327,8 +336,7 @@ class _BasePublisher:
             reasons.append(f"volatile filesystem {info.fs_type}")
         elif info.fs_type not in self._durable_fs:
             reasons.append(f"unknown filesystem {info.fs_type}")
-        if _in_onedrive(directory, env):
-            reasons.append("cloud-synced folder (OneDrive)")
+        reasons.extend(_onedrive_reasons(directory, env))
         if not reasons:
             probe_reason = self._probe(directory)
             if probe_reason is not None:
@@ -359,13 +367,24 @@ class _BasePublisher:
         return None
 
 
-def _in_onedrive(directory: Path, env: Mapping[str, str]) -> bool:
-    resolved = directory.resolve()
+def _onedrive_reasons(directory: Path, env: Mapping[str, str]) -> list[str]:
+    try:
+        resolved = directory.resolve()
+    except (OSError, RuntimeError) as err:
+        return [f"cannot inspect directory: {type(err).__name__}"]
+    reasons: list[str] = []
     for key in _ONEDRIVE_VARS:
         value = env.get(key)
-        if value and resolved.is_relative_to(Path(value).resolve()):
-            return True
-    return False
+        if not value:
+            continue
+        try:
+            inside = resolved.is_relative_to(Path(value).resolve())
+        except (OSError, RuntimeError) as err:
+            reasons.append(f"cannot inspect {key} path: {type(err).__name__}")
+            continue
+        if inside and "cloud-synced folder (OneDrive)" not in reasons:
+            reasons.append("cloud-synced folder (OneDrive)")
+    return reasons
 
 
 class PosixPublisher(_BasePublisher):

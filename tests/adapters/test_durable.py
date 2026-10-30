@@ -37,7 +37,7 @@ def publisher() -> DurablePublisher:
     return publisher_for(sys.platform)
 
 
-def raising(err: OSError) -> Callable[..., NoReturn]:
+def raising(err: Exception) -> Callable[..., NoReturn]:
     def fn(*_args: object, **_kwargs: object) -> NoReturn:
         raise err
 
@@ -155,7 +155,7 @@ def test_missing_directory_is_process_crash_and_not_created(tmp_path: Path) -> N
 
 
 def test_failed_probe_is_process_crash(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(os, "fsync", raising(OSError(errno.EINVAL, "no")))
+    monkeypatch.setattr(durable, "_full_fsync", raising(OSError(errno.EINVAL, "no")))
     report = publisher_with(KNOWN_GOOD_FS).durability(tmp_path, {})
     assert report.tier == DurabilityTier.PROCESS_CRASH
     assert any(r.startswith("sync probe failed: ") for r in report.reasons)
@@ -174,6 +174,20 @@ def test_detect_fs_reports_this_machine(tmp_path: Path) -> None:
     assert info.fs_type != ""
 
 
+def test_platform_detector_reports_a_real_filesystem(tmp_path: Path) -> None:
+    # Calls the private detector directly: unlike detect_fs it cannot hide a broken implementation.
+    if sys.platform == "win32":
+        info = durable._detect_windows(tmp_path)
+        assert info.fs_type in {"NTFS", "ReFS"}
+    elif sys.platform == "darwin":
+        info = durable._detect_darwin(tmp_path)
+        assert info.fs_type in {"apfs", "hfs"}
+    else:
+        info = durable._detect_linux(tmp_path)
+        assert info.fs_type not in {"", "unknown"}  # CI may use overlay or another local fs
+    assert info.remote is False
+
+
 def test_detect_fs_never_raises_for_missing_path(tmp_path: Path) -> None:
     assert detect_fs(tmp_path / "a" / "b").fs_type != ""
 
@@ -186,7 +200,7 @@ def assert_io_error(err: pytest.ExceptionInfo[BrainError]) -> None:
 def test_write_new_io_error_is_brain_error(
     tmp_path: Path, publisher: DurablePublisher, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(os, "fsync", raising(OSError(errno.EIO, "io")))
+    monkeypatch.setattr(durable, "_full_fsync", raising(OSError(errno.EIO, "io")))
     with pytest.raises(BrainError) as e:
         publisher.write_new(tmp_path / "x", b"data")
     assert_io_error(e)
@@ -224,7 +238,7 @@ def test_rename_dir_io_error_is_brain_error(
 def test_sync_directory_io_error_is_brain_error(
     tmp_path: Path, publisher: DurablePublisher, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(os, "fsync", raising(OSError(errno.EIO, "io")))
+    monkeypatch.setattr(durable, "_full_fsync", raising(OSError(errno.EIO, "io")))
     with pytest.raises(BrainError) as e:
         publisher.sync_directory(tmp_path)
     assert_io_error(e)
@@ -239,12 +253,12 @@ def test_sync_directory_missing_directory_is_brain_error_on_posix(tmp_path: Path
 
 
 def test_probe_io_error_reports_errno_without_raising(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(os, "fsync", raising(OSError(errno.EIO, "io")))
+    monkeypatch.setattr(durable, "_full_fsync", raising(OSError(errno.EIO, "io")))
     report = publisher_with(KNOWN_GOOD_FS).durability(tmp_path, {})
     assert "sync probe failed: EIO" in report.reasons
 
 
-MOUNTINFO = """\
+MOUNTINFO = b"""\
 24 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw
 30 24 0:25 / /run rw - tmpfs tmpfs rw
 31 24 0:26 / /mnt/with\\040space rw - xfs /dev/sdb1 rw
@@ -265,7 +279,7 @@ MOUNTINFO = """\
     ],
 )
 def test_parse_mountinfo(path: str, expected: FsInfo) -> None:
-    assert durable._fs_from_mountinfo(MOUNTINFO, path) == expected
+    assert durable._fs_from_mountinfo(MOUNTINFO, path.encode()) == expected
 
 
 class FlakyMoveFileEx:
@@ -346,3 +360,41 @@ def test_windows_flags_use_write_through(tmp_path: Path, monkeypatch: pytest.Mon
     publisher.publish(staged(tmp_path), tmp_path / "f")
     publisher.rename_dir(tmp_path / "d1", tmp_path / "d2")
     assert seen == [0x1 | 0x8, 0x8]
+
+
+def test_non_utf8_mount_point_is_matched_as_bytes() -> None:
+    data = b"1 0 8:1 / / rw - ext4 /dev/sda1 rw\n2 1 0:5 / /mnt/\xff rw - tmpfs tmpfs rw\n"
+    assert durable._fs_from_mountinfo(data, b"/mnt/\xff/data") == FsInfo("tmpfs", False)
+    assert durable._fs_from_mountinfo(data, b"/mnt/other") == FsInfo("ext4", False)
+
+
+def test_durability_never_raises_when_directory_cannot_be_inspected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(Path, "is_dir", raising(PermissionError(errno.EACCES, "denied")))
+    report = publisher_with(KNOWN_GOOD_FS).durability(tmp_path, {})
+    assert report.tier == DurabilityTier.PROCESS_CRASH
+    assert "cannot inspect directory: PermissionError" in report.reasons
+
+
+def test_durability_never_raises_on_symlink_loop_in_onedrive_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_resolve = Path.resolve
+
+    def resolve(self: Path, strict: bool = False) -> Path:
+        if self.name == "loop":
+            raise RuntimeError("Symlink loop")
+        return real_resolve(self, strict)
+
+    monkeypatch.setattr(Path, "resolve", resolve)
+    report = publisher_with(KNOWN_GOOD_FS).durability(tmp_path, {"OneDrive": str(tmp_path / "loop")})
+    assert report.tier == DurabilityTier.PROCESS_CRASH
+    assert "cannot inspect OneDrive path: RuntimeError" in report.reasons
+
+
+def test_durability_never_raises_when_directory_resolve_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(Path, "resolve", raising(RuntimeError("Symlink loop")))
+    report = publisher_with(KNOWN_GOOD_FS).durability(tmp_path, {"OneDrive": str(tmp_path)})
+    assert report.tier == DurabilityTier.PROCESS_CRASH
+    assert "cannot inspect directory: RuntimeError" in report.reasons
