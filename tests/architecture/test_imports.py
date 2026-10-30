@@ -101,10 +101,23 @@ def find_violations(root: Path, rules: Mapping[str, frozenset[str]]) -> list[tup
 
 
 def find_package_cycles(root: Path) -> list[list[str]]:
-    """Return cycles in the top-level package (layer) import graph."""
+    """Return import cycles between Python packages (directories with ``__init__.py``).
+
+    Each module maps to the package containing it; edges inside one package are ignored.
+    """
+    modules = {_module_name(root, p): p.name == "__init__.py" for p in root.rglob("*.py")}
+
+    def package_of(name: str) -> str | None:
+        parts = name.split(".")
+        for end in range(len(parts), 0, -1):
+            candidate = ".".join(parts[:end])
+            if candidate in modules:
+                return candidate if modules[candidate] else candidate.rpartition(".")[0]
+        return None
+
     graph: dict[str, set[str]] = {}
     for module, imported in _edges(root):
-        source, target = _layer(module), _layer(imported)
+        source, target = package_of(module), package_of(imported)
         if source is None or target is None or source == target:
             continue
         graph.setdefault(source, set()).add(target)
@@ -167,3 +180,36 @@ def test_package_graph_is_acyclic() -> None:
 def test_report_files_over_600_lines() -> None:
     for path, count in files_over(SRC, 600):
         warnings.warn(f"{path} has {count} lines (>600)", stacklevel=1)
+
+
+def test_checker_detects_cycle_between_packages_in_one_layer(tmp_path: Path) -> None:
+    pkg = make_package(
+        tmp_path,
+        {
+            "superbrain/__init__.py": "",
+            "superbrain/domain/__init__.py": "",
+            "superbrain/domain/a/__init__.py": "",
+            "superbrain/domain/a/x.py": "from superbrain.domain.b import y\n",
+            "superbrain/domain/b/__init__.py": "",
+            "superbrain/domain/b/y.py": "def f():\n    import superbrain.domain.a.x\n",
+        },
+    )
+    assert find_package_cycles(pkg / "superbrain") == [
+        ["superbrain.domain.a", "superbrain.domain.b", "superbrain.domain.a"]
+    ]
+
+
+def test_checker_reports_no_cycle_for_one_way_package_import(tmp_path: Path) -> None:
+    pkg = make_package(
+        tmp_path,
+        {
+            "superbrain/__init__.py": "",
+            "superbrain/domain/__init__.py": "",
+            "superbrain/domain/a/__init__.py": "",
+            "superbrain/domain/a/x.py": "from superbrain.domain.b import y\n",
+            "superbrain/domain/b/__init__.py": "",
+            "superbrain/domain/b/y.py": "from superbrain.domain.b import z\n",
+            "superbrain/domain/b/z.py": "",
+        },
+    )
+    assert find_package_cycles(pkg / "superbrain") == []
