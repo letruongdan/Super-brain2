@@ -1,13 +1,14 @@
 # Super-brain2: thiết kế hệ thống tổng thể
 
 - **Ngày:** 2026-10-30
-- **Phiên bản:** rev 3. Rev 1 là commit `7a1825e`, rev 2 là `3ca76f6`.
-- **Trạng thái:** chờ chủ dự án duyệt rev 3.
+- **Phiên bản:** rev 4. Rev 1 là commit `7a1825e`, rev 2 là `3ca76f6`, rev 3 là `929d009`.
+- **Trạng thái:** chờ chủ dự án duyệt rev 4.
 - **Quy trình:** superpowers:brainstorming, nhánh kiến trúc.
   - Các phần thiết kế 1–12 đã được duyệt lần lượt trong hội thoại ngày 2026-10-29/30.
   - Rev 2 xử lý review `docs/reviews/2026-10-30-system-design-review.md` (SB2-S01…S18) và thêm Q17–Q19.
   - Rev 3 xử lý review `docs/reviews/2026-10-30-system-design-rev2-review.md` (SB2-R2-01…R2-15), chốt lại Q18 và thêm Q20.
-  - Mục 21 ánh xạ từng phát hiện của cả hai review tới chỗ đã sửa.
+  - Rev 4 xử lý review `docs/reviews/2026-10-30-system-design-rev3-review.md`: hai yêu cầu SB2-R3-01, R3-02, và các nghĩa vụ A–C cùng checklist cho plan SP1.
+  - Mục 21 ánh xạ từng phát hiện của cả ba review tới chỗ đã sửa.
 - **Thay thế:** mọi tài liệu thiết kế của repo cũ `D:\ensemble-agents\Super-brain`. Tài liệu cũ chỉ còn là tham chiếu (xem mục 16).
 
 ---
@@ -175,7 +176,7 @@ Mọi bản ghi mang `owner_id`, `actor` (principal hoặc tác nhân hệ thố
 
 | Bản ghi | Nội dung chính | Tạo bởi |
 |---|---|---|
-| Event | Sự kiện hook/transcript đã lọc; `producer_stream` + `sequence`; payload lớn nằm trong CAS | capture |
+| Event | Sự kiện hook/transcript đã lọc; `producer_stream` + `sequence`; payload (mọi kích thước) nằm trong CAS | capture |
 | CaptureGap | Khoảng sự kiện bị mất: lý do, khoảng thời gian, số lượng ước tính; không chứa nội dung | capture, outbox |
 | Evidence | Bằng chứng có kiểu (lần chạy lệnh, exit code, digest output, diff); `source` do server gán theo kênh nhận (mục 8.2) | capture, `submit_episode`, CLI |
 | Episode | Một task (hoặc một phần task) kèm các evidence; trạng thái `open`, `checkpointed`, `closed` | `submit_episode`, capture |
@@ -194,12 +195,17 @@ Mọi bản ghi mang `owner_id`, `actor` (principal hoặc tác nhân hệ thố
 | NativeHostReceipt | Bằng chứng một host thật đã gọi shim (mục 17.3) | shim, adapter |
 | DoctorRun | Kết quả từng mục kiểm tra của `doctor` | doctor |
 
-**Policy store** (mục 5.7) giữ riêng các bản ghi bảo mật: credential và trạng thái thu hồi, người ký, danh sách quarantine, tombstone, policy theo repo, nonce của approval, trạng thái lớp 2.
+**Policy store** (mục 5.7) giữ riêng các bản ghi bảo mật: credential và trạng thái thu hồi, người ký, danh sách quarantine, tombstone, policy theo repo, nonce của approval, `trust_generation`, trạng thái lớp 2.
+
+**Ledger không chứa nội dung có thời hạn lưu.** Ledger bất biến chỉ giữ metadata, ID và ref. Mọi payload thuộc lớp có thời hạn lưu (Event, Evidence, nội dung `manual_submission`) đều nằm trong CAS, bất kể kích thước, để hết hạn và quarantine có hiệu lực mà không phải sửa ledger.
 
 ### 5.4 Commit, ACK, độ bền và replay
 
 - **Một transaction SQLite** gồm: ledger append, cập nhật projection (bảng trạng thái hiện tại), bản ghi idempotency và kết quả trả về. Hoặc tất cả cùng commit, hoặc không gì cả.
-- **Trạng thái bảo mật đi trước.** Hành động thay đổi trạng thái bảo mật (thu hồi, quarantine, tombstone, đổi policy) ghi vào policy store **trước**, rồi mới áp vào kho dữ liệu. Crash ở giữa thì nội dung đã bị chặn, và việc áp vào kho chạy lại khi khởi động (idempotent).
+- **Trạng thái bảo mật đi trước.** Hành động thay đổi trạng thái bảo mật (thu hồi, quarantine, tombstone, đổi policy) ghi vào policy store **trước**, dưới dạng một intent có ID, rồi mới áp vào kho dữ liệu.
+  - Việc áp vào kho được khóa theo intent ID, nên chạy lại bao nhiêu lần cũng chỉ có một hiệu lực.
+  - Crash ở giữa thì nội dung đã bị chặn, và việc áp vào kho chạy lại khi khởi động.
+  - Phục hồi chỉ hoàn tất đúng intent đã được cho phép, không tạo thêm authority hay mutation nào khác.
 - **SQLite:** WAL với `synchronous=FULL`; trên macOS bật thêm `PRAGMA fullfsync=ON` và `checkpoint_fullfsync=ON`.
 - **Đưa blob vào CAS** qua port `durable_publish`:
 
@@ -223,6 +229,7 @@ Mọi bản ghi mang `owner_id`, `actor` (principal hoặc tác nhân hệ thố
   - Replay tôn trọng tombstone và quarantine trong policy store (mục 5.6).
   - Gặp `handler_version` không biết thì dừng replay và báo lỗi, không đoán (mục 5.8).
 - **Bảng điểm crash** là deliverable của plan SP1.
+  - Bảng phủ: DB chính, policy store, khoảng giữa commit policy store và commit kho, CAS publish, lease chặn GC của backup, hoán đổi `store/`, ApplyJournal.
   - Bảng nêu trạng thái trước/sau từng bước, ACK và retry, **tách riêng tiến trình chết và mất điện**.
   - Fault-injection test (kill tiến trình) chứng minh trường hợp tiến trình chết.
   - Trường hợp mất điện dựa trên ngữ nghĩa đã công bố của OS. Test kill tiến trình không được coi là bằng chứng cho mất điện.
@@ -286,6 +293,9 @@ Mọi bản ghi mang `owner_id`, `actor` (principal hoặc tác nhân hệ thố
 
   Không ghi đè bản backup nguồn. Snapshot thiếu blob hoặc sai subject bị từ chối trước khi đụng vào dữ liệu đang dùng.
 - **Restore policy store** là một hành động riêng, rủi ro cao. Trước khi duyệt, brain hiện chính xác trạng thái nào bị quay lui: credential nào sống lại, người ký nào, quarantine nào bị gỡ.
+  - Mỗi lần restore policy store, `trust_generation` **tăng lên** so với giá trị lớn nhất từng có. Giá trị này được ghi cả trong `writer.lock`, vốn không bao giờ bị hoán đổi.
+  - Approval message mang `trust_generation`. Approval và nonce của thế hệ cũ đều mất hiệu lực, nên chữ ký cũ không thể dùng lại sau restore dù nonce trong snapshot đang ở trạng thái chưa dùng.
+  - Bảo đảm này áp dụng cho mọi tổ hợp restore: chỉ kho, chỉ policy store, hay cả hai.
 
 ### 5.8 Phiên bản và migration
 
@@ -424,6 +434,7 @@ hook/transcript → adapter dịch sang envelope v2 → privacy filter → outbo
   - Ưu tiên bản bàn giao do agent gửi qua `submit_episode`.
   - Nếu không có thì trích xuất theo luật.
 - **Phạm vi:** gắn với **checkout** (mục 5.2). Được đưa vào `prepare_task` của phiên kế tiếp trên checkout đó, với bất kỳ harness nào.
+- **Lineage:** continuity, checkpoint và bản bàn giao mang lineage của task tạo ra chúng (mục 14.2). Khi được đưa vào task mới, task mới kế thừa lineage đó.
 
 ## 8. Bài học và thư viện kinh nghiệm
 
@@ -596,7 +607,10 @@ Câu chữ do agent viết, brain gom evidence. Mức rủi ro do server xếp (
   - `brain review list|show|approve|reject`
   - `brain apply`
   - `brain rollback <change>`
-- **Trang review local** (`review_web`): xem diff và duyệt bằng passkey.
+- **Trang review local** (`review_web`): xem diff và duyệt bằng passkey. Nội dung proposal (diff, lý do, resource) là **input không đáng tin**, nằm cùng trang có quyền tạo approval. Vì vậy:
+  - **Hiển thị như dữ liệu trơ.** Không render HTML hay Markdown chủ động từ proposal; mọi nội dung được escape. Không tự tải URL hay ảnh từ nội dung. Content-Security-Policy chặt: chỉ script của chính trang, không inline script, không nguồn bên ngoài.
+  - **Subject hiển thị khóa với approval message.** Trang dựng phần tóm tắt (action, proposal, revision, file đích, digest, mức rủi ro) **từ chính approval message** được dùng làm challenge. Subject đổi thì challenge đổi, và trang hiện subject mới.
+  - **API của trang có xác thực.** Phiên duyệt mở bằng URL chứa token một lần do `brain review` cấp. Daemon kiểm tra header `Origin` và `Host` (chống DNS rebinding) và CSRF token trên mọi request. Chỉ nghe trên loopback là chưa đủ.
 - Approval khóa chặt subject theo mục 11.3. File đích đổi sau khi duyệt → từ chối apply, phải duyệt lại.
 - **Quyền sở hữu nội dung trong file dùng chung, theo định dạng:**
   - **Markdown:** khối có đánh dấu `<!-- ensemble-brain:begin … end -->`.
@@ -616,10 +630,15 @@ Câu chữ do agent viết, brain gom evidence. Mức rủi ro do server xếp (
     - tất cả bằng digest dự kiến → chạy kiểm tra bắt buộc, rồi `applied`;
     - tất cả bằng digest gốc → quay về `approved`;
     - lẫn lộn → `partially_applied`.
-  - Từ `partially_applied`, approval hiện có cho phép:
+  - **Approval và recovery grant là hai thứ khác nhau.**
+    - Thời hạn (`expires_at`) và nonce chỉ được kiểm tra **một lần**, lúc daemon nhận approval đã ký.
+    - Khi được chấp nhận, ApprovalReceipt trở thành một **recovery grant** gắn với ApplyJournal của đúng proposal đó. Grant còn hiệu lực tới khi journal vào trạng thái cuối (`applied` hoặc `rolled_back`), và mất hiệu lực khi `trust_generation` đổi.
+    - Dùng grant không phải nộp lại nonce, nên hết 10 phút trong lúc crash không chặn việc phục hồi.
+  - Từ `partially_applied`, recovery grant cho phép:
     - **tiếp tục**, nếu mọi file chưa ghi vẫn đúng digest gốc;
     - **rollback** các file đã ghi về backup, nếu chúng vẫn đúng digest dự kiến.
   - File nào bị người dùng sửa giữa chừng → `recovery_required`. Cần approval mới; không tự ghi đè.
+  - **Rollback thông thường** (`brain rollback` sau khi đã `applied`) là một action riêng, cần approval mới.
   - Chỉ báo "đã cài xong / sẵn sàng" khi mọi file đích đúng digest đã duyệt **và** kiểm tra bắt buộc đã qua (ví dụ `doctor` nhóm Harness).
 - **Bootstrap:** lần cài đặt đầu tiên cho mỗi harness (MCP config, hook, rule lớp 1–2) là một ChangeProposal rủi ro cao. Bản review/apply tối thiểu thuộc **SP1**. SP6 bổ sung tự sinh proposal và đo lường.
 
@@ -659,7 +678,7 @@ Còn lại là **thấp**: khối hướng dẫn c1/c4/c6 không kéo theo scrip
 | `terminal`: gõ lại mã hiện trên màn hình | `confirm_only` | Chỉ thấp, và chỉ khi lớp 2 của **mọi** harness có shell đang kết nối ở trạng thái `verified`. Không đạt thì đòi kênh mạnh hơn; không âm thầm hạ cấp |
 
 **Approval message chuẩn.** Đây là thứ được ký hoặc dùng làm challenge của WebAuthn:
-- `store_id`, `owner_id`;
+- `store_id`, `owner_id`, `trust_generation`;
 - `action ∈ {approve, reject, apply, rollback, lesson_confirm, signer_enroll, signer_revoke, policy_change, credential_revoke, restore, workspace_link}`;
 - `subject_id`, `subject_revision`, digest nội dung của toàn bộ resource đi kèm;
 - danh sách file đích kèm digest bản gốc;
@@ -722,7 +741,7 @@ Mỗi số liệu kèm **độ phủ quan sát**: tầng capture, CaptureGap, m�
   - seed, phiên bản policy;
   - revision chính xác của bài học;
   - assignment;
-  - exposure: ReadAck nếu có, nếu không thì ServedReceipt, nếu không nữa thì `unknown`;
+  - exposure, kèm loại bằng chứng tường minh `exposure_evidence ∈ {read_ack, served_only, unknown}`. `served_only` chỉ là proxy: nó chứng minh server đã gửi, không chứng minh client nhận đủ. Không gộp các loại này thành một cờ "đã nhận". Phân tích theo exposure dùng proxy phải ghi rõ giả định và độ phủ;
   - độ đầy đủ quan sát.
 - Báo cáo chính theo nhóm được gán (intent-to-treat). Phân tích theo exposure là phần bổ sung, ghi rõ giả định.
 - Chỉ ghi nhãn "nhân quả" khi thiết kế và các cổng chất lượng dữ liệu đạt. Không chỉ vì bản ghi có tên holdout.
@@ -801,6 +820,8 @@ Mọi con số được ghi nhãn "nhân quả" (holdout đạt điều kiện) 
 | Skill bên thứ ba độc hại | Không chạy script; nhập skill phải qua review, approval bao gồm toàn bộ resource đi kèm, rủi ro xếp theo toàn bộ resource; ghi nguồn gốc và license; gộp skill không làm mất provenance |
 | Tiến trình lạ gọi daemon | Chỉ nghe trên loopback; credential riêng cho từng harness; danh tính suy từ credential; dữ liệu owner-only trên đĩa (mục 5.9) |
 | Agent tự duyệt thay đổi | Cổng ba lớp, có công bố giới hạn và mức bảo đảm (mục 11.3) |
+| Nội dung proposal tấn công trang duyệt | Hiển thị như dữ liệu trơ, CSP chặt, subject dựng từ approval message, token phiên, kiểm tra Origin/Host, CSRF (mục 11.2) |
+| Dùng lại chữ ký sau restore | `trust_generation` tăng mỗi lần restore policy store (mục 5.7) |
 | Retry làm lộ nội dung đã bị chặn | Idempotency chỉ lưu ref; mỗi lần phục vụ lại đều kiểm tra policy hiện hành (mục 6.3) |
 | Restore làm sống lại quyền đã thu hồi | Policy store tách khỏi restore kho dữ liệu (mục 5.7) |
 | Path traversal | Ranh giới filesystem ở mục 10 |
@@ -836,11 +857,21 @@ Filter duyệt cả object và list lồng nhau. **Filter lỗi thì không lưu
 **Lưu trữ.** Log, trace và dead-letter không chứa payload thô; chỉ ID, loại và digest.
 
 **Lineage do server lập.**
-- Mọi Episode, Evidence và bài học tạo ra trong một task tự động có nguồn gốc là:
+- **Mỗi task có lineage**, gồm:
   - repo của task;
-  - mọi bài học, artifact và context đã được phục vụ trong task đó (theo Delivery và ServedReceipt).
+  - mọi bài học, artifact, context, continuity/checkpoint/bản bàn giao đã được phục vụ trong task đó (theo Delivery và ServedReceipt).
+
+  Lineage của task chỉ tăng thêm, không bao giờ bớt.
+- **Mọi nội dung do brain quản lý hoặc chuẩn bị gửi đi mang lineage**, gồm:
+  - Episode, Evidence, bài học;
+  - trạng thái task, continuity, checkpoint, bản bàn giao;
+  - cửa sổ hội thoại dùng để phân loại lời sửa;
+  - **từng trường** của payload gửi cho Jev.
+
+  Nội dung tạo trong task kế thừa lineage của task tại thời điểm tạo. Một trường gửi đi (ví dụ mô tả task trong `prepare_task` thứ hai của cùng task) mang lineage hiện tại của task, không chỉ repo.
+- **Phục vụ sang task mới chuyển cả lineage.** Continuity rút từ task T1 được đưa vào T2 thì T2 kế thừa lineage của T1.
 - Client có thể khai thêm nguồn, **không thể bỏ** nguồn do server đã ghi.
-- Nội dung không rõ nguồn được xử lý bảo thủ (coi như `provider_egress` tắt), trừ khi owner gỡ hạn chế bằng `policy_change`.
+- **Trường không xác định được nguồn thì không được gửi ra ngoài.** Nội dung không rõ nguồn được xử lý bảo thủ (coi như `provider_egress` tắt), trừ khi owner gỡ hạn chế bằng `policy_change`.
 - **Giới hạn được công bố:** brain chỉ theo dõi được nguồn gốc của những gì đi qua nó. Brain không chứng minh được nguồn ngữ nghĩa của nội dung mà agent đã chép từ ngoài vào, và không hứa theo dõi lây lan toàn diện (universal taint tracking).
 
 **Đi ra ngoài.** Jev là đích ra ngoài duy nhất.
@@ -887,8 +918,17 @@ Mỗi dự án con có plan riêng (superpowers:writing-plans) dựa trên spec 
 - privacy filter cho mọi đường vào;
 - `doctor` cơ bản;
 - bootstrap review/apply tối thiểu với ApplyJournal;
-- cổng duyệt ba lớp: passkey, SSH, terminal, đăng ký người ký, framework trạng thái lớp 2;
+- cổng duyệt ba lớp: passkey, SSH, terminal, đăng ký người ký, framework trạng thái lớp 2, trang review an toàn;
+- model lineage cho task và cho từng trường gửi đi (ref/record; việc lan truyền và kiểm tra egress đầy đủ thuộc SP2–SP4);
 - CI đa OS và hàng rào.
+
+**Plan SP1 chia thành các đợt, mỗi đợt có gate nội bộ:**
+1. `core`, `ports`, storage, policy store, `durable_publish`, độ bền.
+2. Daemon, shim, khóa ghi, contract v2, idempotency, job, phục hồi sau crash.
+3. Review/apply, ApplyJournal, cổng duyệt, `review_web`.
+4. `doctor` và integration trên 3 OS.
+
+Mọi phần đã giao cho SP1 ở trên đều phải nằm trong một đợt. Không phần nào bị bỏ chỉ vì SP1 được gọi là "kernel".
 
 ### Các mốc và điều kiện nghiệm thu
 
@@ -1031,6 +1071,16 @@ Plan SP1 phải biến mỗi tình huống dưới đây thành test, hoặc ghi
 28. File trong data root có quyền rộng hơn owner-only bị `doctor` báo FAIL, và `--fix` sửa lại được.
 29. Bài học sinh ra trong task đã được phục vụ bài học local-only mang lineage tới bài đó, kể cả khi client không khai; đổi `provider_egress` của nguồn có hiệu lực ngay với lần egress kế tiếp (kiểm tra đầy đủ ở SP3/SP4).
 
+**Từ review rev 3:**
+
+30. Bài học local-only từ repo A → task T1 ở repo B → continuity → task T2 ở repo B → mọi payload Jev của T2 bị chặn với nội dung có nguồn A. Request mới trong task đã nhận A cũng giữ hạn chế đó (model và ref trong SP1, kiểm tra đầy đủ ở SP2–SP4).
+31. Proposal chứa HTML, script, event handler hoặc URL chỉ hiện như văn bản trên trang review. Request khác origin, sai `Host`, thiếu CSRF token hoặc thiếu token phiên không tạo được approval. Subject đổi thì challenge đổi và trang hiện subject mới.
+32. Backup policy store → dùng approval → restore policy store → nộp lại chữ ký cũ bị từ chối. Điều này đúng với mọi tổ hợp restore (chỉ kho, chỉ policy, cả hai).
+33. Approval được nhận trước khi hết hạn, crash giữa apply, khởi động lại sau khi đã hết hạn: tiếp tục hoặc rollback trong phạm vi recovery grant vẫn chạy được. Action ngoài phạm vi đó cần approval mới; file bị người dùng sửa không bị ghi đè.
+34. Crash giữa commit policy store và commit kho: khởi động lại hoàn tất đúng intent một lần, không tạo mutation trùng.
+35. Event và Evidence có payload nhỏ vẫn hết hạn đúng hạn; ledger không chứa nội dung của chúng.
+36. Delivery chỉ có ServedReceipt được ghi `exposure_evidence=served_only`, không bao giờ là `read_ack`.
+
 ## 21. Ánh xạ review → spec
 
 **Review rev 1** (`2026-10-30-system-design-review.md`):
@@ -1075,3 +1125,16 @@ Plan SP1 phải biến mỗi tình huống dưới đây thành test, hoặc ghi
 | SB2-R2-13 phiên bản, migration | Mục 1 (hạ lời hứa), 5.8 |
 | SB2-R2-14 quyền file toàn kho | Mục 5.9, 13 |
 | SB2-R2-15 apply nhiều file | Mục 11.2 (ApplyJournal) |
+
+**Review rev 3** (`2026-10-30-system-design-rev3-review.md`):
+
+| Review | Đã xử lý ở |
+|---|---|
+| SB2-R3-01 lineage qua continuity và trường gửi đi | Mục 7.3, 14.2; SP1 (model), tình huống 30 |
+| SB2-R3-02 an toàn trang review | Mục 11.2, 14.1; tình huống 31 |
+| Nghĩa vụ A: nonce sống qua restore policy, crash giữa hai kho | Mục 5.4 (intent), 5.7 (`trust_generation`); tình huống 32, 34 |
+| Nghĩa vụ B: approval khác recovery grant | Mục 11.2; tình huống 33 |
+| Nghĩa vụ C: ServedReceipt chỉ là proxy | Mục 12.2 (`exposure_evidence`); tình huống 36 |
+| Checklist 3: phạm vi bảng crash | Mục 5.4 |
+| Checklist 4: payload có thời hạn nằm ngoài ledger | Mục 5.3; tình huống 35 |
+| Checklist 6: chia SP1 thành đợt | Mục 15 |
