@@ -1,0 +1,66 @@
+[build-system]
+requires = ["hatchling>=1.26,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "super-brain2"
+version = "0.1.0"
+description = "Super-brain2: local-first knowledge store with layered architecture"
+requires-python = ">=3.11"
+dependencies = [
+    "pywin32>=311; sys_platform == 'win32'",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/superbrain"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "BLE", "S110", "S112"]
+
+[tool.mypy]
+strict = true
+files = ["src", "tests"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["--import-mode=importlib", "-p", "no:cacheprovider"]
+
+[tool.importlinter]
+root_package = "superbrain"
+
+[[tool.importlinter.contracts]]
+name = "layers"
+type = "layers"
+layers = [
+    "superbrain.composition",
+    "superbrain.mcp | superbrain.cli_api | superbrain.review_web | superbrain.workers",
+    "superbrain.application",
+    "superbrain.domain",
+    "superbrain.storage | superbrain.adapters",
+    "superbrain.ports",
+    "superbrain.core",
+]
+
+[[tool.importlinter.contracts]]
+name = "forbidden"
+type = "forbidden"
+source_modules = ["superbrain.cli"]
+forbidden_modules = [
+    "superbrain.storage",
+    "superbrain.domain",
+    "superbrain.application",
+    "superbrain.adapters",
+    "superbrain.ports",
+]
+
+[dependency-groups]
+dev = [
+    "import-linter>=2.15",
+    "mypy>=2.4.1",
+    "pytest>=9.2.0",
+    "ruff>=0.17.3",
+]
