@@ -6,15 +6,37 @@ to stdout and exits 1; success exits 0. Later tasks add the operations their tes
 """
 
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import superbrain
 from superbrain.adapters.os import os_adapters
 from superbrain.core.errors import BrainError
 from superbrain.core.faults import pausepoint
-from superbrain.storage.layout import prepare_data_root
+from superbrain.ports.policy import Intent
+from superbrain.storage.kinds import CORE_KINDS, EntryKind, FieldType, KindRegistry
+from superbrain.storage.layout import prepare_data_root, secure_subdirectories
+from superbrain.storage.store import Store
 from superbrain.storage.writer import acquire_writer
+
+# Mirrors tests/storage/conftest.py DEMO_KINDS (this file must not import tests).
+_DEMO_KINDS = (*CORE_KINDS, EntryKind("demo.count", 1, {"n": FieldType.INT}, {}))
+
+
+class _Policy:
+    """A ``PolicySource`` with nothing quarantined, tombstoned or queued."""
+
+    def __init__(self, store_id: str) -> None:
+        self.store_id = store_id
+
+    def is_quarantined(self, digest: str) -> bool:
+        return False
+
+    def is_tombstoned(self, holder_kind: str, holder_id: str) -> bool:
+        return False
+
+    def intents(self) -> Sequence[Intent]:
+        return ()
 
 
 def ping(data_root: Path, args: list[str]) -> None:
@@ -35,10 +57,33 @@ def acquire_writer_and_pause(data_root: Path, args: list[str]) -> None:
         pausepoint("writer.held")
 
 
+def create_store(data_root: Path, args: list[str]) -> None:
+    """args: ``<store_id>``. Create an empty store with no projection handlers."""
+    os_ = os_adapters()
+    root = prepare_data_root(data_root, os_)
+    with acquire_writer(root, os_) as lease:
+        secure_subdirectories(root, lease, os_)
+        Store.create(root, lease, os_, _Policy(args[0]), [], KindRegistry(_DEMO_KINDS)).close()
+
+
+def append_demo(data_root: Path, args: list[str]) -> None:
+    """args: ``<store_id>``. Open the store and append one ``demo.count`` entry with ``n = 1``."""
+    os_ = os_adapters()
+    root = prepare_data_root(data_root, os_)
+    with acquire_writer(root, os_) as lease:
+        secure_subdirectories(root, lease, os_)
+        store = Store.open(root, lease, os_, _Policy(args[0]), [], KindRegistry(_DEMO_KINDS))
+        with store.transaction() as txn:
+            txn.append("demo.count", actor="user:cli", owner_id="dan", meta={"n": 1})
+        store.close()
+
+
 OPERATIONS: dict[str, Callable[[Path, list[str]], None]] = {
     "ping": ping,
     "acquire_writer": acquire_writer_once,
     "acquire_writer_and_pause": acquire_writer_and_pause,
+    "create_store": create_store,
+    "append_demo": append_demo,
 }
 
 

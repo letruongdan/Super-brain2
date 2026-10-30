@@ -32,7 +32,26 @@ class Migration:
 
 
 def _store_v1(db: sqlite3.Connection) -> None:
-    """Main store v1 DDL (ledger, applied_intents). Task 8 fills this in; ``meta`` is written by ``initialize``."""
+    """Main store v1 DDL: ``ledger`` and ``applied_intents``; ``meta`` is written by ``initialize``.
+
+    ``ledger.meta`` and ``ledger.refs`` hold canonical JSON bytes. Projection tables are not part of the schema:
+    each handler creates its own ``p_<name>_*`` tables when the store is created or opened.
+    """
+    db.execute(
+        "CREATE TABLE ledger ("
+        "sequence INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "entry_id TEXT UNIQUE NOT NULL, "
+        "kind TEXT NOT NULL, "
+        "schema_version INTEGER NOT NULL, "
+        "handler_version INTEGER NOT NULL, "
+        "writer_epoch INTEGER NOT NULL, "
+        "actor TEXT NOT NULL, "
+        "owner_id TEXT, "
+        "recorded_at TEXT NOT NULL, "
+        "meta BLOB NOT NULL, "
+        "refs BLOB NOT NULL)"
+    )
+    db.execute("CREATE TABLE applied_intents (intent_id TEXT PRIMARY KEY, applied_sequence INTEGER NOT NULL)")
 
 
 def _policy_v1(db: sqlite3.Connection) -> None:
