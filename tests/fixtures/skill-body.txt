@@ -1,0 +1,15 @@
+# Caller-aware parser repair — synthetic design fixture
+
+This text is an original contract fixture, not an installed or evaluated skill.
+
+Apply when changing a parser or default that has multiple callers.
+Do not apply solely because a task contains the word "parser".
+
+1. Identify direct and indirect callers before changing the shared behavior.
+2. Distinguish a missing value from valid zero, false, or empty values.
+3. State the intended contract for each caller and patch the smallest shared seam.
+4. Verify the affected callers using an independent test oracle.
+5. Report untested callers and uncertainty; a successful test is not proof of broader effectiveness.
+
+Required capabilities: complete file reading, caller search, file editing and local test execution.
+Do not invent unavailable tools or execute code outside the approved fixture/workspace.
