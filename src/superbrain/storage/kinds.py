@@ -12,7 +12,7 @@ import re
 import uuid
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime
 from enum import StrEnum
 
 from superbrain.core.errors import BrainError, ErrorCode
@@ -22,6 +22,9 @@ _DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 _ACTOR = re.compile(r"(user|system|principal):[a-z0-9][a-z0-9._:-]{0,63}")
 _OWNER_ID = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 _KIND_NAME = re.compile(r"[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+")
+_TIMESTAMP = re.compile(r"([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})(\.[0-9]{1,6})?Z")
+# INT is SQLite's signed 64-bit range, so every value a handler stores fits a column.
+_INT_MIN, _INT_MAX = -(2**63), 2**63 - 1
 
 
 class FieldType(StrEnum):
@@ -70,13 +73,18 @@ def _check_uuid(value: object) -> bool:
 
 
 def _check_timestamp(value: object) -> bool:
-    if type(value) is not str or not value.isascii() or not value.endswith("Z"):
+    """Exactly ``YYYY-MM-DDTHH:MM:SS[.f{1,6}]Z`` naming a real instant: one spelling, so timestamps compare."""
+    if type(value) is not str:
         return False
+    match = _TIMESTAMP.fullmatch(value)
+    if match is None:
+        return False
+    year, month, day, hour, minute, second = (int(part) for part in match.groups()[:6])
     try:
-        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+        datetime(year, month, day, hour, minute, second, tzinfo=UTC)
     except ValueError:
         return False
-    return parsed.utcoffset() == timedelta(0)
+    return True
 
 
 def _check_digest(value: object) -> bool:
@@ -89,7 +97,7 @@ def _matches(ftype: FieldType, value: object, allowed: frozenset[str]) -> bool:
     if ftype is FieldType.DIGEST:
         return _check_digest(value)
     if ftype is FieldType.INT:
-        return type(value) is int
+        return type(value) is int and _INT_MIN <= value <= _INT_MAX
     if ftype is FieldType.TIMESTAMP:
         return _check_timestamp(value)
     if ftype is FieldType.BOOL:

@@ -122,6 +122,22 @@ def _swap_in_rebuilt(db: sqlite3.Connection, handler: ProjectionHandler) -> None
         db.execute(new_sql)
 
 
+def _create_live_tables(db: sqlite3.Connection, handlers: Sequence[ProjectionHandler]) -> None:
+    """Create every handler's live tables in a new, still empty database, in one transaction."""
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            for handler in handlers:
+                _create_tables(db, handler, live_prefix(handler))
+            db.execute("COMMIT")
+        except BaseException:
+            if db.in_transaction:
+                db.execute("ROLLBACK")
+            raise
+    except sqlite3.Error as exc:
+        raise io_error("cannot create projection tables", exc) from exc
+
+
 def _remove_unfinished_creates(path: Path) -> None:
     """Delete ``<brain.db>.creating-*`` leftovers (with their ``-wal``/``-shm``) of a failed or interrupted create."""
     prefix = path.name + _CREATING
@@ -203,9 +219,10 @@ class Store:
     ) -> "Store":
         """Create a new store database with ``store_id = policy.store_id``, then open it.
 
-        The database is built at ``brain.db.creating-<id>``, closed (so its WAL is checkpointed away) and only then
-        published as ``brain.db``: a failed or interrupted create never leaves a ``brain.db`` behind. Leftover
-        ``brain.db.creating-*`` files are never live data and are removed first.
+        The database, with every handler's live tables, is built at ``brain.db.creating-<id>``, closed (so its WAL
+        is checkpointed away) and only then published as ``brain.db``: a failure before the publish never leaves a
+        ``brain.db`` behind, and one after it (while opening) leaves a complete, valid empty store that ``open``
+        accepts. Leftover ``brain.db.creating-*`` files are never live data and are removed first.
         """
         _check_lease(root, lease)
         _check_handlers(handlers, kinds)
@@ -219,6 +236,7 @@ class Store:
             db = connect(staging)
             try:
                 initialize(db, migrations, store_id=policy.store_id)
+                _create_live_tables(db, handlers)
             finally:
                 db.close()
             if any(os.path.lexists(p) for p in _db_files(staging)[1:]):
@@ -445,7 +463,7 @@ class Store:
         try:
             self._db.execute("BEGIN IMMEDIATE")
         except sqlite3.Error as exc:
-            if exc.sqlite_errorcode & 0xFF in _BUSY_CODES:
+            if getattr(exc, "sqlite_errorcode", 0) & 0xFF in _BUSY_CODES:
                 raise BrainError(ErrorCode.STORE_BUSY, f"the store database is busy: {exc}") from exc
             raise io_error("cannot begin a store transaction", exc) from exc
         try:

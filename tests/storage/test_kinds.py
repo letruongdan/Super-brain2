@@ -85,6 +85,22 @@ def test_every_field_type_accepts_its_values() -> None:
     registry = KindRegistry([ALL_TYPES])
     registry.validate("demo.all", VALID_ALL)
     registry.validate("demo.all", {**VALID_ALL, "t": "2026-10-30T12:00:00.123456Z", "b": False, "i": -5})
+    registry.validate("demo.all", {**VALID_ALL, "t": "2024-02-29T23:59:59.5Z"})
+
+
+@pytest.mark.parametrize("n", [-(2**63), 2**63 - 1, 0])
+def test_int_accepts_the_signed_64_bit_range(n: int) -> None:
+    KindRegistry([ALL_TYPES]).validate("demo.all", {**VALID_ALL, "i": n})
+
+
+@pytest.mark.parametrize(
+    "n",
+    [-(2**63) - 1, 2**63, 2**70, 10**5000, -(10**5000)],
+    ids=["min-1", "max+1", "2**70", "10**5000", "-10**5000"],
+)
+def test_int_outside_the_signed_64_bit_range_is_rejected(n: int) -> None:
+    with invalid():
+        KindRegistry([ALL_TYPES]).validate("demo.all", {**VALID_ALL, "i": n})
 
 
 @pytest.mark.parametrize(
@@ -107,6 +123,20 @@ def test_every_field_type_accepts_its_values() -> None:
         ("t", "2026-10-30T12:00:00+01:00Z"),
         ("t", "yesterday Z"),
         ("t", "2026-13-30T12:00:00Z"),
+        ("t", "2026-02-30T12:00:00Z"),
+        ("t", "2026-10-30 12:00:00Z"),
+        ("t", "20261030T120000Z"),
+        ("t", "2026-W44-5T12:00:00Z"),
+        ("t", "2026-10-30T12Z"),
+        ("t", "2026-10-30T12:00Z"),
+        ("t", "2026-10-30T12:00:00,5Z"),
+        ("t", "2026-10-30T24:00:00Z"),
+        ("t", "2026-10-30T12:00:00.1234567Z"),
+        ("t", "2026-10-30T12:00:00.Z"),
+        ("t", "2026-10-30T12:00:00z"),
+        ("t", "2026-10-30T12:00:00Z\n"),
+        ("t", "2026-10-30T12:00:00ZZ"),
+        ("t", "2026-10-30T12:00:0٠Z"),
         ("t", 0),
         ("b", 1),
         ("b", "true"),

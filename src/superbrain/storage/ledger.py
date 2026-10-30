@@ -4,6 +4,7 @@ One SQLite transaction holds the ledger append and every projection update (and,
 all of it commits or none of it does. ``Txn`` is only handed out by ``Store.transaction()``.
 """
 
+import dataclasses
 import json
 import sqlite3
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -19,6 +20,7 @@ from superbrain.ports.clock import Clock
 from superbrain.ports.policy import PolicyView
 from superbrain.storage.kinds import KindRegistry, is_uuid, validate_envelope
 
+_SAVEPOINT = "ledger_entry"
 _COLUMNS = (
     "sequence, entry_id, kind, schema_version, handler_version, writer_epoch, actor, owner_id, recorded_at, meta, refs"
 )
@@ -138,6 +140,12 @@ def apply_to_handlers(
             handler.apply(db, prefix(handler), entry, policy)
         except sqlite3.Error as exc:
             raise io_error(f"projection {handler.name} failed on entry {entry.sequence}", exc) from exc
+        except BrainError:
+            raise
+        except Exception as exc:
+            raise BrainError(
+                ErrorCode.INTEGRITY_FAILURE, f"projection {handler.name} failed on entry {entry.sequence}: {exc!r}"
+            ) from exc
 
 
 class Txn:
@@ -250,30 +258,8 @@ class Txn:
             raise AssertionError("the clock must return timezone-aware datetimes")
         recorded_at = now.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
         entry_id = new_id()
-        meta_value = dict(meta)
-        try:
-            cursor = self._db.execute(
-                "INSERT INTO ledger (entry_id, kind, schema_version, handler_version, writer_epoch, actor, owner_id,"
-                " recorded_at, meta, refs) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    entry_id,
-                    kind,
-                    self._schema_version,
-                    spec.handler_version,
-                    self._writer_epoch,
-                    actor,
-                    owner_id,
-                    recorded_at,
-                    canonical_json(meta_value),
-                    canonical_json(list(checked_refs)),
-                ),
-            )
-        except sqlite3.Error as exc:
-            raise io_error("cannot append to the ledger", exc) from exc
-        sequence = cursor.lastrowid
-        assert sequence is not None
-        entry = LedgerEntry(
-            sequence=sequence,
+        pending = LedgerEntry(
+            sequence=0,
             entry_id=entry_id,
             kind=kind,
             schema_version=self._schema_version,
@@ -282,10 +268,45 @@ class Txn:
             actor=actor,
             owner_id=owner_id,
             recorded_at=recorded_at,
-            meta=meta_value,
+            meta=dict(meta),
             refs=checked_refs,
         )
-        apply_to_handlers(self._db, self._handlers, entry, self._policy, live_prefix)
+        meta_bytes, refs_bytes = canonical_json(pending.meta), canonical_json(list(checked_refs))
+        # One append is all-or-nothing even if the caller catches its error and goes on to commit the transaction.
+        try:
+            self._db.execute(f"SAVEPOINT {_SAVEPOINT}")
+        except sqlite3.Error as exc:
+            raise io_error("cannot start the append", exc) from exc
+        try:
+            cursor = self._db.execute(
+                "INSERT INTO ledger (entry_id, kind, schema_version, handler_version, writer_epoch, actor, owner_id,"
+                " recorded_at, meta, refs) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    pending.entry_id,
+                    pending.kind,
+                    pending.schema_version,
+                    pending.handler_version,
+                    pending.writer_epoch,
+                    pending.actor,
+                    pending.owner_id,
+                    pending.recorded_at,
+                    meta_bytes,
+                    refs_bytes,
+                ),
+            )
+            assert cursor.lastrowid is not None
+            entry = dataclasses.replace(pending, sequence=cursor.lastrowid)
+            apply_to_handlers(self._db, self._handlers, entry, self._policy, live_prefix)
+            self._db.execute(f"RELEASE {_SAVEPOINT}")
+        except BaseException as err:
+            try:
+                self._db.execute(f"ROLLBACK TO {_SAVEPOINT}")
+                self._db.execute(f"RELEASE {_SAVEPOINT}")
+            except sqlite3.Error as exc:
+                raise io_error("cannot undo the failed append", exc) from exc
+            if isinstance(err, sqlite3.Error):
+                raise io_error("cannot append to the ledger", err) from err
+            raise
         return entry
 
 

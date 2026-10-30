@@ -1,8 +1,9 @@
 import ast
+import dataclasses
 import sqlite3
 import threading
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
 import pytest
@@ -10,7 +11,7 @@ import pytest
 import superbrain.storage.store as store_module
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.jsonvalue import JsonValue
-from superbrain.ports.os import OsAdapters
+from superbrain.ports.os import DurabilityReport, DurablePublisher, OsAdapters
 from superbrain.ports.policy import PolicyView
 from superbrain.storage.kinds import KindRegistry
 from superbrain.storage.layout import prepare_data_root, secure_subdirectories
@@ -223,6 +224,51 @@ def test_failing_projection_rolls_back_the_entry(store_factory: StoreFactory) ->
         with store.transaction() as t:
             t.append("demo.count", actor="user:cli", owner_id="dan", meta={"n": 1})
     assert e.value.code == ErrorCode.INTEGRITY_FAILURE
+    assert list(store.entries()) == [] and counter(store) == 0
+
+
+class PickyProjection:
+    """Records each ``n`` it accepts and refuses ``n == 2``."""
+
+    name = "picky"
+    handler_version = 1
+    kinds = frozenset({"demo.count"})
+
+    def create_tables(self, db: sqlite3.Connection, prefix: str) -> None:
+        db.execute(f"CREATE TABLE {prefix}rows (n INTEGER NOT NULL)")
+
+    def apply(self, db: sqlite3.Connection, prefix: str, entry: LedgerEntry, policy: PolicyView) -> None:
+        if entry.meta["n"] == 2:
+            raise BrainError(ErrorCode.INVALID_INPUT, "picky refuses n = 2")
+        db.execute(f"INSERT INTO {prefix}rows (n) VALUES (?)", (entry.meta["n"],))
+
+
+def test_caught_projection_failure_undoes_only_that_append(store_factory: StoreFactory) -> None:
+    store = store_factory(handlers=[CounterProjection(), PickyProjection()])
+    with store.transaction() as t:
+        t.append("demo.count", actor="user:cli", owner_id="dan", meta={"n": 1})
+        with pytest.raises(BrainError, match="picky"):
+            t.append("demo.count", actor="user:cli", owner_id="dan", meta={"n": 2})
+    assert [e.meta["n"] for e in store.entries()] == [1] and counter(store) == 1
+    with store.transaction() as t:
+        assert t.db.execute("SELECT n FROM p_picky_rows").fetchall() == [(1,)]
+    assert store.rebuild_projections() == 1 and counter(store) == 1
+
+
+class OverflowingProjection(CounterProjection):
+    name = "overflowing"
+
+    def apply(self, db: sqlite3.Connection, prefix: str, entry: LedgerEntry, policy: PolicyView) -> None:
+        super().apply(db, prefix, entry, policy)
+        raise OverflowError("handler bug")
+
+
+def test_non_brain_error_from_a_projection_is_integrity_failure(store_factory: StoreFactory) -> None:
+    store = store_factory(handlers=[CounterProjection(), OverflowingProjection()])
+    with store.transaction() as t:
+        with pytest.raises(BrainError) as e:
+            t.append("demo.count", actor="user:cli", owner_id="dan", meta={"n": 1})
+    assert e.value.code == ErrorCode.INTEGRITY_FAILURE and isinstance(e.value.__cause__, OverflowError)
     assert list(store.entries()) == [] and counter(store) == 0
 
 
@@ -527,6 +573,44 @@ def test_failed_create_leaves_no_store_and_can_be_retried(
         assert counter(store) == 1 and store.db_integrity() == "ok"
         assert not [p.name for p in root.store_dir.iterdir() if p.name.startswith("brain.db.creating-")]
         store.close()
+
+
+class TablesAtPublish:
+    """Publisher spy: records the tables of the staged database as it is published, then delegates."""
+
+    def __init__(self, real: DurablePublisher) -> None:
+        self.real = real
+        self.tables: list[str] = []
+
+    def write_new(self, path: Path, data: bytes) -> None:
+        self.real.write_new(path, data)
+
+    def rename_dir(self, src: Path, dst: Path) -> None:
+        self.real.rename_dir(src, dst)
+
+    def sync_directory(self, directory: Path) -> None:
+        self.real.sync_directory(directory)
+
+    def durability(self, directory: Path, env: Mapping[str, str]) -> DurabilityReport:
+        return self.real.durability(directory, env)
+
+    def publish(self, staging: Path, final: Path) -> None:
+        db = sqlite3.connect(f"{staging.absolute().as_uri()}?immutable=1", uri=True)
+        try:
+            self.tables = sorted(r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type = 'table'"))
+        finally:
+            db.close()
+        self.real.publish(staging, final)
+
+
+def test_handler_tables_exist_before_the_store_is_published(trusted_tmp: Path, os_: OsAdapters) -> None:
+    spy = TablesAtPublish(os_.publisher)
+    os_ = dataclasses.replace(os_, publisher=spy)
+    root = prepare_data_root(trusted_tmp / "r", os_)
+    with acquire_writer(root, os_) as lease:
+        secure_subdirectories(root, lease, os_)
+        Store.create(root, lease, os_, StaticPolicy(), [CounterProjection()], KindRegistry(DEMO_KINDS)).close()
+    assert "p_counter_state" in spy.tables and "ledger" in spy.tables
 
 
 def test_store_id_mismatch_with_policy_is_refused(trusted_tmp: Path, os_: OsAdapters) -> None:
