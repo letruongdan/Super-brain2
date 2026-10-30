@@ -125,3 +125,25 @@ def test_inspection_failure_fails_closed(tmp_path: Path, monkeypatch: pytest.Mon
         OsPathSafety().reject_links(root, entries=[blocked])
     assert e.value.code == ErrorCode.UNSAFE_PATH
     assert isinstance(e.value.__cause__, PermissionError)
+
+
+def test_not_a_directory_is_treated_as_missing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = tmp_path / "runtime"
+    root.mkdir()
+    impossible = root / "file" / "child"
+    original_lstat = Path.lstat
+    original_is_symlink = Path.is_symlink
+
+    def lstat(self: Path, *args: Any, **kwargs: Any) -> Any:
+        if self == impossible:
+            raise NotADirectoryError("parent is not a directory")
+        return original_lstat(self, *args, **kwargs)
+
+    def is_symlink(self: Path) -> bool:
+        if self == impossible:
+            return bool(lstat(self))
+        return original_is_symlink(self)
+
+    monkeypatch.setattr(Path, "lstat", lstat)
+    monkeypatch.setattr(Path, "is_symlink", is_symlink)
+    OsPathSafety().reject_links(root, entries=[impossible])

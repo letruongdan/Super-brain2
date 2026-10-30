@@ -16,7 +16,8 @@ def _is_link(path: Path) -> bool:
         if path.is_symlink():
             return True
         attributes = getattr(path.lstat(), "st_file_attributes", 0)
-    except FileNotFoundError:
+    except (FileNotFoundError, NotADirectoryError):
+        # ENOTDIR: a parent is not a directory, so the path cannot exist.
         return False
     except OSError as err:
         raise BrainError(ErrorCode.UNSAFE_PATH, f"cannot inspect path for links: {err}") from err
