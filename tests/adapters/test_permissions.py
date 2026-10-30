@@ -131,9 +131,37 @@ def test_foreign_owned_ancestor_with_safe_looking_dacl_is_reported(
 
 
 @windows_only
-def test_trusted_owner_chain_is_accepted(tmp_path: Path, guard: PermissionGuard) -> None:
-    # Hermetic: the chain below ``base`` is protected and owned by the current user. Whatever ACEs the machine's
-    # temp directory carries (for example a sandbox account) must not influence the result.
+def test_ancestor_with_delete_for_users_is_reported(tmp_path: Path, guard: PermissionGuard) -> None:
+    import ntsecuritycon
+
+    parent = tmp_path / "p"
+    parent.mkdir()
+    grant(parent, "S-1-5-32-545", ntsecuritycon.DELETE)
+    assert [x.path for x in guard.check_ancestors(parent / "root") if x.path == parent] == [parent]
+
+
+@windows_only
+def test_inherit_only_ace_does_not_count_for_the_ancestor_itself(tmp_path: Path, guard: PermissionGuard) -> None:
+    import ntsecuritycon
+
+    parent = tmp_path / "p"
+    parent.mkdir()
+    guard.secure_directory(parent)
+    inherit_only = (
+        ntsecuritycon.INHERIT_ONLY_ACE | ntsecuritycon.OBJECT_INHERIT_ACE | ntsecuritycon.CONTAINER_INHERIT_ACE
+    )
+    grant(parent, "S-1-5-32-545", ntsecuritycon.FILE_DELETE_CHILD | ntsecuritycon.DELETE, inherit_only)
+    assert [x for x in guard.check_ancestors(parent / "root") if x.path == parent] == []
+
+
+@windows_only
+def test_trusted_owner_chain_is_accepted(trusted_tmp: Path, guard: PermissionGuard) -> None:
+    assert guard.check_ancestors(trusted_tmp / "root") == []
+
+
+@windows_only
+def test_protected_subtree_chain_is_accepted(tmp_path: Path, guard: PermissionGuard) -> None:
+    # Hermetic: whatever ACEs the machine's temp directory carries must not influence the part below ``base``.
     base = tmp_path / "base"
     base.mkdir()
     guard.secure_directory(base)
@@ -141,6 +169,17 @@ def test_trusted_owner_chain_is_accepted(tmp_path: Path, guard: PermissionGuard)
     nested.mkdir()
     problems = guard.check_ancestors(nested / "root")
     assert [x for x in problems if x.path.is_relative_to(base)] == []
+
+
+@windows_only
+def test_directory_under_machine_temp_is_reported_when_temp_has_untrusted_takeover_ace(
+    guard: PermissionGuard,
+) -> None:
+    temp = Path(os.environ["LOCALAPPDATA"]) / "Temp"
+    reported = [x.path for x in guard.check_ancestors(temp / "root")]
+    if temp not in reported:
+        pytest.skip("this machine's Temp carries no untrusted takeover ACE")
+    assert temp in reported
 
 
 @posix_only

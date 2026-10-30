@@ -192,9 +192,11 @@ if sys.platform == "win32":
             return None
 
         def check_ancestors(self, path: Path) -> list[PermissionProblem]:
-            # Rights that let a holder rename/delete other accounts' entries or rewrite the DACL or owner.
+            # Rights that let a holder rename/delete the ancestor or its entries, or rewrite its DACL or owner.
+            # DELETE on the ancestor itself suffices to rename it away (given add-subdirectory elsewhere).
             takeover = (
-                ntsecuritycon.FILE_DELETE_CHILD
+                ntsecuritycon.DELETE
+                | ntsecuritycon.FILE_DELETE_CHILD
                 | ntsecuritycon.WRITE_DAC
                 | ntsecuritycon.WRITE_OWNER
                 | ntsecuritycon.GENERIC_ALL

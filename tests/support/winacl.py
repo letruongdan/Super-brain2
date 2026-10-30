@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 
-def grant(path: Path, sid_string: str, access_mask: int) -> None:
+def grant(path: Path, sid_string: str, access_mask: int, flags: int = 0) -> None:
     """Add an access-allowed ACE for ``sid_string`` to the existing DACL of ``path``."""
     assert sys.platform == "win32"
     import win32security
@@ -16,7 +16,7 @@ def grant(path: Path, sid_string: str, access_mask: int) -> None:
         str(path), win32security.SE_FILE_OBJECT, win32security.DACL_SECURITY_INFORMATION
     )
     dacl = sd.GetSecurityDescriptorDacl()
-    dacl.AddAccessAllowedAce(win32security.ACL_REVISION_DS, access_mask, sid)
+    dacl.AddAccessAllowedAceEx(win32security.ACL_REVISION_DS, flags, access_mask, sid)
     win32security.SetNamedSecurityInfo(
         str(path), win32security.SE_FILE_OBJECT, win32security.DACL_SECURITY_INFORMATION, None, None, dacl, None
     )
