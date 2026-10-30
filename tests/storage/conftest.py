@@ -1,5 +1,7 @@
-"""Storage fixtures: a FakeClock-backed ``os_``, a ``StaticPolicy`` double, a demo projection and store factories."""
+"""Storage fixtures: a FakeClock-backed ``os_``, a ``StaticPolicy`` double, a demo projection, store factories,
+the ``env`` runtime fixture and ``maintenance_lease``."""
 
+import contextlib
 import sqlite3
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
@@ -12,8 +14,10 @@ from superbrain.adapters.os import os_adapters
 from superbrain.ports.os import OsAdapters
 from superbrain.ports.policy import Intent, PolicyView
 from superbrain.storage.kinds import CORE_KINDS, EntryKind, FieldType, KindRegistry
-from superbrain.storage.layout import prepare_data_root, secure_subdirectories
+from superbrain.storage.layout import DataRoot, prepare_data_root, secure_subdirectories
 from superbrain.storage.ledger import LedgerEntry, ProjectionHandler
+from superbrain.storage.policy_store import PolicyStore
+from superbrain.storage.runtime import Runtime, open_runtime
 from superbrain.storage.store import Store
 from superbrain.storage.writer import WriterLease, acquire_writer
 from tests.support.clock import FakeClock
@@ -143,3 +147,55 @@ def reopen(os_: OsAdapters, _opened: _Opened) -> Callable[..., Store]:
         return store
 
     return open_
+
+
+@dataclass(frozen=True)
+class Env:
+    """A runtime opened by ``open_runtime`` on a FakeClock, with that clock."""
+
+    runtime: Runtime
+    clock: FakeClock
+
+    @property
+    def root(self) -> DataRoot:
+        return self.runtime.root
+
+    @property
+    def lease(self) -> WriterLease:
+        return self.runtime.lease
+
+    @property
+    def store(self) -> Store:
+        return self.runtime.store
+
+    @property
+    def policy(self) -> PolicyStore:
+        return self.runtime.policy
+
+    @property
+    def os_(self) -> OsAdapters:
+        return self.runtime.os_
+
+
+@pytest.fixture
+def env(trusted_tmp: Path, os_: OsAdapters, clock: FakeClock) -> Iterator[Env]:
+    """A fresh data root opened with ``open_runtime`` (``DEMO_KINDS``), closed at teardown."""
+    runtime = open_runtime(trusted_tmp / "root", os_, kinds=KindRegistry(DEMO_KINDS))
+    try:
+        yield Env(runtime, clock)
+    finally:
+        runtime.close()
+
+
+@contextlib.contextmanager
+def maintenance_lease(path: Path, os_: OsAdapters | None = None) -> Iterator[tuple[DataRoot, WriterLease]]:
+    """The maintenance start-up sequence without opening Store or PolicyStore: ``prepare_data_root`` ->
+    ``acquire_writer`` -> (``recover_interrupted_swaps``, added by Task 14) -> ``secure_subdirectories``.
+
+    Yields ``(root, lease)``; the lease is released on exit.
+    """
+    adapters = os_ if os_ is not None else os_adapters()
+    root = prepare_data_root(path, adapters)
+    with acquire_writer(root, adapters) as lease:
+        secure_subdirectories(root, lease, adapters)
+        yield root, lease

@@ -13,16 +13,19 @@ import superbrain
 from superbrain.adapters.os import os_adapters
 from superbrain.core.errors import BrainError
 from superbrain.core.faults import pausepoint
-from superbrain.ports.policy import Intent
+from superbrain.ports.policy import Intent, IntentKind
 from superbrain.storage.cas import RetentionClass
 from superbrain.storage.kinds import CORE_KINDS, EntryKind, FieldType, KindRegistry
 from superbrain.storage.layout import prepare_data_root, secure_subdirectories
+from superbrain.storage.runtime import open_runtime
 from superbrain.storage.store import Store
 from superbrain.storage.writer import acquire_writer
 
 # Mirrors tests/storage/conftest.py DEMO_KINDS (this file must not import tests).
 _DEMO_KINDS = (*CORE_KINDS, EntryKind("demo.count", 1, {"n": FieldType.INT}, {}))
 PUT_AND_HOLD_ID = "0192f3a4-5b6c-7d8e-9f01-0000000000aa"
+EVENT_ID = "0192f3a4-5b6c-7d8e-9f01-000000000e01"
+EVENT_PAYLOAD = b"event payload"
 
 
 class _Policy:
@@ -91,6 +94,25 @@ def put_and_hold(data_root: Path, args: list[str]) -> None:
         store.close()
 
 
+def seed_event(data_root: Path, args: list[str]) -> None:
+    """Create the runtime and ``store_content(EVENT_PAYLOAD)`` held by ``("event", EVENT_ID)``."""
+    runtime = open_runtime(data_root, os_adapters())
+    try:
+        runtime.store.store_content(EVENT_PAYLOAD, "event", EVENT_ID, RetentionClass.EVENT_PAYLOAD, None)
+    finally:
+        runtime.close()
+
+
+def tombstone_event(data_root: Path, args: list[str]) -> None:
+    """Open the runtime, record a TOMBSTONE intent for ``("event", EVENT_ID)``, then reconcile the store."""
+    runtime = open_runtime(data_root, os_adapters())
+    try:
+        runtime.policy.record_intent(IntentKind.TOMBSTONE, {"holder_kind": "event", "holder_id": EVENT_ID})
+        runtime.store.reconcile_policy()
+    finally:
+        runtime.close()
+
+
 OPERATIONS: dict[str, Callable[[Path, list[str]], None]] = {
     "ping": ping,
     "acquire_writer": acquire_writer_once,
@@ -98,6 +120,8 @@ OPERATIONS: dict[str, Callable[[Path, list[str]], None]] = {
     "create_store": create_store,
     "append_demo": append_demo,
     "put_and_hold": put_and_hold,
+    "seed_event": seed_event,
+    "tombstone_event": tombstone_event,
 }
 
 

@@ -55,7 +55,21 @@ def _store_v1(db: sqlite3.Connection) -> None:
 
 
 def _policy_v1(db: sqlite3.Connection) -> None:
-    """Policy store v1 DDL. Task 11 fills this in; ``meta`` is written by ``initialize``."""
+    """Policy store v1 DDL: ``intents``, their effect tables and ``trust``; ``meta`` is written by ``initialize``.
+
+    ``intents.payload`` holds canonical JSON bytes and ``created_at`` a canonical UTC timestamp. There is no
+    "applied" flag: only the main store records which intents it has applied (``applied_intents``).
+    """
+    db.execute(
+        "CREATE TABLE intents (intent_id TEXT PRIMARY KEY, kind TEXT NOT NULL, payload BLOB NOT NULL,"
+        " created_at TEXT NOT NULL)"
+    )
+    db.execute(
+        "CREATE TABLE tombstones (holder_kind TEXT NOT NULL, holder_id TEXT NOT NULL, intent_id TEXT NOT NULL,"
+        " PRIMARY KEY (holder_kind, holder_id))"
+    )
+    db.execute("CREATE TABLE quarantine (digest TEXT PRIMARY KEY, intent_id TEXT NOT NULL)")
+    db.execute("CREATE TABLE trust (id INTEGER PRIMARY KEY CHECK (id = 1), generation INTEGER NOT NULL)")
 
 
 STORE_MIGRATIONS: tuple[Migration, ...] = (Migration(to_version=1, min_reader_version=1, apply=_store_v1),)

@@ -1,5 +1,7 @@
-"""SQLite connection factory shared by the main store, the policy store and backup verification."""
+"""SQLite connection factory and database-file helpers shared by the main store, the policy store and backup
+verification."""
 
+import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -7,6 +9,30 @@ from pathlib import Path
 from superbrain.core.errors import BrainError, ErrorCode
 
 _BUSY_TIMEOUT_MS = 5000
+_BUSY_CODES = frozenset({sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED})
+CREATING = ".creating-"
+"""A new database is built at ``<name>.creating-<id>`` and published to ``<name>`` only once complete."""
+
+
+def db_files(path: Path) -> tuple[Path, Path, Path]:
+    """``path`` and its ``-wal`` and ``-shm`` companions, whether or not they exist."""
+    return (path, path.with_name(path.name + "-wal"), path.with_name(path.name + "-shm"))
+
+
+def is_busy(exc: sqlite3.Error) -> bool:
+    """``exc`` reports another connection holding the database (``SQLITE_BUSY``/``SQLITE_LOCKED``)."""
+    return getattr(exc, "sqlite_errorcode", 0) & 0xFF in _BUSY_CODES
+
+
+def remove_unfinished_creates(path: Path) -> None:
+    """Delete ``<path>.creating-*`` leftovers (with their ``-wal``/``-shm``) of a failed or interrupted create."""
+    prefix = path.name + CREATING
+    try:
+        for name in sorted(os.listdir(path.parent)):
+            if name.startswith(prefix):
+                os.unlink(path.parent / name)
+    except OSError as exc:
+        raise BrainError(ErrorCode.IO_ERROR, f"cannot remove an unfinished create of {path.name}: {exc}") from exc
 
 
 def connect(path: Path, *, readonly: bool = False, platform: str = sys.platform) -> sqlite3.Connection:

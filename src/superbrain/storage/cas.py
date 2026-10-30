@@ -75,6 +75,18 @@ def blob_is_intact(cas_dir: Path, digest: str) -> bool:
     return _file_digest(blob_path(cas_dir, digest)) == digest
 
 
+def held_digests(db: sqlite3.Connection, holder_kind: str, holder_id: str) -> list[str]:
+    """Sorted digests that ``(holder_kind, holder_id)`` currently holds, per the holder projection."""
+    try:
+        rows = db.execute(
+            f"SELECT digest FROM {HOLDERS_TABLE} WHERE holder_kind = ? AND holder_id = ? ORDER BY digest",
+            (holder_kind, holder_id),
+        ).fetchall()
+    except sqlite3.Error as exc:
+        raise io_error("cannot read the holders", exc) from exc
+    return [str(row[0]) for row in rows]
+
+
 def _meta_text(entry: LedgerEntry, name: str) -> str:
     value = entry.meta.get(name)
     if not isinstance(value, str):

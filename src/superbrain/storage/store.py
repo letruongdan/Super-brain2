@@ -18,9 +18,10 @@ from superbrain.core.canonical import digest_bytes
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.faults import crashpoint
 from superbrain.core.ids import new_id
+from superbrain.core.jsonvalue import JsonValue
 from superbrain.ports.os import OsAdapters
-from superbrain.ports.policy import PolicySource, PolicyView
-from superbrain.storage.cas import ContentStore, HolderProjection, RetentionClass, blob_is_intact
+from superbrain.ports.policy import IntentKind, PolicySource, PolicyView
+from superbrain.storage.cas import ContentStore, HolderProjection, RetentionClass, blob_is_intact, held_digests
 from superbrain.storage.kinds import CORE_KINDS, KindRegistry
 from superbrain.storage.layout import DataRoot
 from superbrain.storage.ledger import (
@@ -36,23 +37,18 @@ from superbrain.storage.ledger import (
     rebuild_prefix,
 )
 from superbrain.storage.schema import STORE_MIGRATIONS, Migration, ensure_writable, initialize, read_schema_info
-from superbrain.storage.sqlite import connect
+from superbrain.storage.sqlite import CREATING, connect, db_files, is_busy, remove_unfinished_creates
 from superbrain.storage.writer import WriterLease
 
 _HANDLE = "store"
+_POLICY_ACTOR = "system:policy"
 _HANDLER_NAME = re.compile(r"[a-z][a-z0-9_]{0,31}")
-_BUSY_CODES = frozenset({sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED})
 _REPLAY_BATCH = 256
-_CREATING = ".creating-"
 _STAGING_SUFFIX = ".tmp"
 
 
 def _quote(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
-
-
-def _db_files(path: Path) -> tuple[Path, ...]:
-    return (path, path.with_name(path.name + "-wal"), path.with_name(path.name + "-shm"))
 
 
 def _check_lease(root: DataRoot, lease: WriterLease) -> None:
@@ -164,17 +160,6 @@ def _create_live_tables(db: sqlite3.Connection, handlers: Sequence[ProjectionHan
         raise io_error("cannot create projection tables", exc) from exc
 
 
-def _remove_unfinished_creates(path: Path) -> None:
-    """Delete ``<brain.db>.creating-*`` leftovers (with their ``-wal``/``-shm``) of a failed or interrupted create."""
-    prefix = path.name + _CREATING
-    try:
-        for name in sorted(os.listdir(path.parent)):
-            if name.startswith(prefix):
-                os.unlink(path.parent / name)
-    except OSError as exc:
-        raise BrainError(ErrorCode.IO_ERROR, f"cannot remove an unfinished store create: {exc}") from exc
-
-
 def _remove_staging_leftovers(staging: Path) -> None:
     """Delete ``*.tmp`` files in ``staging``: the staging files of unfinished ``put``s, which nothing refers to."""
     try:
@@ -281,19 +266,19 @@ class Store:
         handlers, kinds = _with_defaults(handlers, kinds)
         _check_handlers(handlers, kinds)
         path = root.store_db
-        if any(os.path.lexists(p) for p in _db_files(path)):
+        if any(os.path.lexists(p) for p in db_files(path)):
             raise BrainError(ErrorCode.INVALID_INPUT, f"a store database already exists at {path}")
         lease.register_handle(_HANDLE)
         try:
-            _remove_unfinished_creates(path)
-            staging = path.with_name(f"{path.name}{_CREATING}{new_id()}")
+            remove_unfinished_creates(path)
+            staging = path.with_name(f"{path.name}{CREATING}{new_id()}")
             db = connect(staging)
             try:
                 initialize(db, migrations, store_id=policy.store_id)
                 _create_live_tables(db, handlers)
             finally:
                 db.close()
-            if any(os.path.lexists(p) for p in _db_files(staging)[1:]):
+            if any(os.path.lexists(p) for p in db_files(staging)[1:]):
                 raise BrainError(ErrorCode.IO_ERROR, f"{staging}: the WAL was not checkpointed away on close")
             os_.permissions.secure_file(staging)
             os_.publisher.publish(staging, path)
@@ -317,7 +302,7 @@ class Store:
         """Open the existing store for writing; its schema must equal the code's and its id ``policy.store_id``.
 
         Like ``create``, it always registers ``HolderProjection`` and ``CORE_KINDS``. Leftover staging files of
-        unfinished ``put``s are removed.
+        unfinished ``put``s are removed. Both end with ``reconcile_policy``, so every pending intent is applied.
         """
         _check_lease(root, lease)
         handlers, kinds = _with_defaults(handlers, kinds)
@@ -362,6 +347,7 @@ class Store:
                 store_id=info.store_id,
             )
             store._prepare()
+            store.reconcile_policy()
         except BaseException:
             db.close()
             raise
@@ -380,7 +366,7 @@ class Store:
                     _replay(db, fresh, self._policy, live_prefix)
             except sqlite3.Error as exc:
                 raise io_error("cannot create projection tables", exc) from exc
-        for path in _db_files(self._root.store_db):
+        for path in db_files(self._root.store_db):
             if path.exists():
                 self._os.permissions.secure_file(path)
         _remove_staging_leftovers(self._root.staging_dir)
@@ -517,12 +503,37 @@ class Store:
         return "\n".join(str(row[0]) for row in rows)
 
     def reconcile_policy(self) -> int:
-        """Apply policy intents not yet in ``applied_intents``; returns how many were applied.
+        """Apply every policy intent not yet in ``applied_intents``, in recorded order; returns how many it applied.
 
-        Placeholder: Task 11 implements it (and ``open`` will call it then). Until then it applies nothing.
+        Each intent gets one transaction: it is marked applied, then its effect is appended (a ``policy.tombstone``
+        plus a ``cas.release`` with reason ``tombstoned`` for every blob the holder still holds, or a
+        ``policy.quarantine``). The mark and the effect commit together, so a crash applies an intent fully or not at
+        all, and it is applied exactly once. Nothing is ever written to the policy store.
         """
         self._check()
-        return 0
+        self._require_no_transaction()
+        try:
+            done = {str(row[0]) for row in self._db.execute("SELECT intent_id FROM applied_intents").fetchall()}
+        except sqlite3.Error as exc:
+            raise io_error("cannot read the applied intents", exc) from exc
+        applied = 0
+        for intent in self._policy.intents():
+            if intent.intent_id in done:
+                continue
+            with self.transaction() as txn:
+                if not txn.mark_intent_applied(intent.intent_id):
+                    continue
+                meta: dict[str, JsonValue] = {**intent.payload, "intent_id": intent.intent_id}
+                if intent.kind is IntentKind.TOMBSTONE:
+                    txn._append_reserved("policy.tombstone", actor=_POLICY_ACTOR, owner_id=None, meta=meta)
+                    holder_kind, holder_id = str(meta["holder_kind"]), str(meta["holder_id"])  # validated above
+                    for digest in held_digests(txn.db, holder_kind, holder_id):
+                        txn.release(digest, holder_kind, holder_id, reason="tombstoned")
+                else:
+                    txn._append_reserved("policy.quarantine", actor=_POLICY_ACTOR, owner_id=None, meta=meta)
+            applied += 1
+            crashpoint("intents.after_store_apply")
+        return applied
 
     # --- maintenance -------------------------------------------------------------------------------------------
 
@@ -564,7 +575,7 @@ class Store:
         try:
             self._db.execute("BEGIN IMMEDIATE")
         except sqlite3.Error as exc:
-            if getattr(exc, "sqlite_errorcode", 0) & 0xFF in _BUSY_CODES:
+            if is_busy(exc):
                 raise BrainError(ErrorCode.STORE_BUSY, f"the store database is busy: {exc}") from exc
             raise io_error("cannot begin a store transaction", exc) from exc
         try:

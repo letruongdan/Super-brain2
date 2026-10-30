@@ -148,8 +148,7 @@ def test_reserved_kinds_cannot_be_appended_directly(store_factory: StoreFactory,
 
 
 def test_reserved_append_is_only_called_from_its_helpers() -> None:
-    # Task 11 tightens this to equality once every helper exists.
-    assert callers_of("_append_reserved", SRC / "superbrain") <= RESERVED_HELPERS
+    assert callers_of("_append_reserved", SRC / "superbrain") == RESERVED_HELPERS
     # The shared writer behind append and _append_reserved is no side door around the reserved check.
     assert callers_of("_write_entry", SRC / "superbrain") == {"Txn.append", "Txn._append_reserved"}
 
@@ -718,7 +717,7 @@ def test_maintenance_cannot_nest(store_factory: StoreFactory) -> None:
         pass
 
 
-def test_reconcile_policy_is_a_noop_until_task_11(store_factory: StoreFactory) -> None:
+def test_reconcile_policy_without_intents_applies_nothing(store_factory: StoreFactory) -> None:
     store = store_factory()
     assert store.reconcile_policy() == 0 and list(store.entries()) == []
 
