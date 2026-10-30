@@ -26,13 +26,20 @@ def connect(path: Path, *, readonly: bool = False, platform: str = sys.platform)
     try:
         db.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
         if not readonly:
-            db.execute("PRAGMA journal_mode=WAL")
+            mode = db.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+            if str(mode).lower() != "wal":
+                raise BrainError(ErrorCode.IO_ERROR, f"{path}: journal_mode is {mode!r}, WAL did not take effect")
         db.execute("PRAGMA synchronous=FULL")
+        if not readonly and db.execute("PRAGMA synchronous").fetchone()[0] != 2:
+            raise BrainError(ErrorCode.IO_ERROR, f"{path}: synchronous=FULL did not take effect")
         db.execute("PRAGMA foreign_keys=ON")
         db.execute("PRAGMA secure_delete=ON")
         if platform == "darwin":
             db.execute("PRAGMA fullfsync=ON")
             db.execute("PRAGMA checkpoint_fullfsync=ON")
+    except BrainError:
+        db.close()
+        raise
     except sqlite3.Error as exc:
         db.close()
         raise BrainError(ErrorCode.IO_ERROR, f"cannot configure database {path}: {exc}") from exc

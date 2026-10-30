@@ -27,6 +27,8 @@ class Migration:
     to_version: int
     min_reader_version: int
     apply: Callable[[sqlite3.Connection], None]
+    """Runs inside ``initialize``'s transaction. It must not call ``executescript``: that issues an implicit COMMIT
+    and would break the single transaction."""
 
 
 def _store_v1(db: sqlite3.Connection) -> None:
@@ -49,40 +51,60 @@ def code_version(migrations: Sequence[Migration]) -> int:
 
 
 def _open_readonly(path: Path) -> sqlite3.Connection:
-    """Read-only open that never creates or changes ``-wal``/``-shm``.
+    """Read-only open that never creates or changes any file.
 
-    Even ``mode=ro`` creates ``-wal``/``-shm`` when it opens a WAL database that has none (observed on Windows), which
-    would change the bytes of a database we promised only to look at. So: if a ``-wal`` file exists, open ``mode=ro``
-    (it sees the live WAL); if not, there is nothing to replay and the file is opened with ``immutable=1``, which
-    takes no locks and writes nothing. ``immutable`` is safe only when no writer is active: every reader here runs
-    under the writer lease or on a closed or copied database.
+    Even ``mode=ro`` creates ``-wal``/``-shm`` when they are missing (observed on Windows), which would change a
+    database we promised only to look at. So ``mode=ro`` is used only when both ``-wal`` and ``-shm`` exist, which
+    means a live writer; the reader then sees the live WAL. Otherwise the file is opened ``immutable=1``: no locks,
+    nothing written, any stale or empty ``-wal`` ignored. ``immutable`` is safe only when no writer is active: every
+    reader here runs under the writer lease or on a closed or copied database.
+
+    Limitation: stores are always in WAL mode. A rollback-journal database with a hot journal would not be recovered
+    by this read (``immutable`` ignores the journal), so such a file is not supported.
     """
     uri = path.absolute().as_uri()
-    mode = "mode=ro" if path.with_name(path.name + "-wal").exists() else "immutable=1"
-    return sqlite3.connect(f"{uri}?{mode}", uri=True, isolation_level=None)
+    live = path.with_name(path.name + "-wal").exists() and path.with_name(path.name + "-shm").exists()
+    return sqlite3.connect(f"{uri}?{'mode=ro' if live else 'immutable=1'}", uri=True, isolation_level=None)
+
+
+def _version(path: Path, name: str, value: object) -> int:
+    if not isinstance(value, str) or not (value.isascii() and value.isdigit()):
+        raise BrainError(ErrorCode.INTEGRITY_FAILURE, f"{path}: meta {name} is not a plain decimal integer")
+    return int(value)
 
 
 def read_schema_info(path: Path) -> SchemaInfo | None:
-    """The ``meta`` of the database at ``path`` without writing anything; ``None`` if the file does not exist."""
+    """The ``meta`` of the database at ``path`` without writing anything; ``None`` if the file does not exist.
+
+    Opens through ``_open_readonly``, so no file is created or modified.
+    """
     if not path.exists():
         return None
     db: sqlite3.Connection | None = None
     try:
         db = _open_readonly(path)
+        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'").fetchone() is None:
+            raise BrainError(ErrorCode.INTEGRITY_FAILURE, f"{path}: not a store database (no meta)")
+        columns = {row[1] for row in db.execute("PRAGMA table_info(meta)")}
+        if not {"key", "value"} <= columns:
+            raise BrainError(ErrorCode.INTEGRITY_FAILURE, f"{path}: meta has the wrong shape")
         rows = dict(db.execute("SELECT key, value FROM meta").fetchall())
         if any(k not in rows for k in _META_KEYS):
             raise BrainError(ErrorCode.INTEGRITY_FAILURE, f"{path}: meta is missing required keys")
-        return SchemaInfo(int(rows["schema_version"]), int(rows["min_reader_version"]), str(rows["store_id"]))
+        store_id = rows["store_id"]
+        if not isinstance(store_id, str):
+            raise BrainError(ErrorCode.INTEGRITY_FAILURE, f"{path}: meta store_id is not text")
+        schema_version = _version(path, "schema_version", rows["schema_version"])
+        min_reader = _version(path, "min_reader_version", rows["min_reader_version"])
+        if schema_version < 1 or min_reader > schema_version:
+            raise BrainError(ErrorCode.INTEGRITY_FAILURE, f"{path}: meta versions are inconsistent")
+        return SchemaInfo(schema_version, min_reader, store_id)
     except BrainError:
         raise
     except sqlite3.OperationalError as exc:
-        if "no such table" in str(exc):
-            raise BrainError(ErrorCode.INTEGRITY_FAILURE, f"{path}: not a store database (no meta)") from exc
         raise BrainError(ErrorCode.IO_ERROR, f"cannot read {path}: {exc}") from exc
     except sqlite3.DatabaseError as exc:
         raise BrainError(ErrorCode.INTEGRITY_FAILURE, f"{path}: not a valid database: {exc}") from exc
-    except ValueError as exc:
-        raise BrainError(ErrorCode.INTEGRITY_FAILURE, f"{path}: malformed meta values") from exc
     except (sqlite3.Error, OSError) as exc:
         raise BrainError(ErrorCode.IO_ERROR, f"cannot read {path}: {exc}") from exc
     finally:
