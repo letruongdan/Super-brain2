@@ -66,3 +66,9 @@ def modes_tree(path: Path) -> dict[str, str]:
         else:
             found[rel] = oct(os.lstat(entry).st_mode)
     return found
+
+
+def db_files(path: Path) -> list[Path]:
+    """``[db, db-wal, db-shm]``, only those that exist."""
+    candidates = [path, path.with_name(path.name + "-wal"), path.with_name(path.name + "-shm")]
+    return [p for p in candidates if p.exists()]
