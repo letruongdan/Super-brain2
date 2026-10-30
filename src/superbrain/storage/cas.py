@@ -234,6 +234,20 @@ class ContentStore:
         except ValueError as err:
             raise BrainError(ErrorCode.INTEGRITY_FAILURE, f"a holder of {digest} has an unknown retention") from err
 
+    def due_holders(self, cutoff: str) -> list[tuple[str, str]]:
+        """Sorted distinct ``(holder_kind, holder_id)`` of the non-durable holds expiring at or before ``cutoff``.
+
+        ``cutoff`` is a canonical ``YYYY-MM-DDTHH:MM:SS.ffffffZ`` timestamp, compared as text.
+        """
+        self._check()
+        rows = self._query(
+            f"SELECT DISTINCT holder_kind, holder_id FROM {HOLDERS_TABLE}"
+            " WHERE retention_class != ? AND expires_at IS NOT NULL AND expires_at <= ?"
+            " ORDER BY holder_kind, holder_id",
+            (RetentionClass.DURABLE.value, cutoff),
+        )
+        return [(str(kind), str(holder)) for kind, holder in rows]
+
     def orphans(self) -> list[str]:
         """Sorted digests of the blob files that no holder refers to."""
         self._check()
