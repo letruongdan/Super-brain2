@@ -13,6 +13,7 @@ from superbrain.storage.schema import STORE_MIGRATIONS, Migration
 from superbrain.storage.store import Store
 from tests.storage.conftest import DEMO_KINDS, CounterProjection, counter, maintenance_lease
 from tests.support.crash import run_child
+from tests.support.fs import digest_tree
 
 STORE_V2 = (*STORE_MIGRATIONS, Migration(to_version=2, min_reader_version=1, apply=lambda db: None))
 
@@ -56,14 +57,19 @@ def test_open_runtime_on_fresh_root_binds_store_to_policy(trusted_tmp: Path) -> 
     rt.close()
 
 
-def test_store_of_another_policy_is_refused(trusted_tmp: Path) -> None:
+def test_missing_policy_store_next_to_an_existing_store_is_refused_before_creating(trusted_tmp: Path) -> None:
     open_runtime(trusted_tmp / "r", os_adapters()).close()
     with maintenance_lease(trusted_tmp / "r") as (root, _lease):
-        for path in root.policy_dir.iterdir():
-            path.unlink()
+        for path in (root.policy_db, *(root.policy_dir / f"policy.db{s}" for s in ("-wal", "-shm"))):
+            path.unlink(missing_ok=True)
+        store_before = digest_tree(root.store_dir)
     with pytest.raises(BrainError) as e:
         open_runtime(trusted_tmp / "r", os_adapters())
-    assert e.value.code == ErrorCode.INTEGRITY_FAILURE and writer_is_free(trusted_tmp / "r")
+    assert e.value.code == ErrorCode.INTEGRITY_FAILURE
+    assert e.value.message == "policy store missing for an existing data store; restore a policy backup"
+    assert list(root.policy_dir.iterdir()) == []  # no policy.db, no creating-* leftover
+    assert digest_tree(root.store_dir) == store_before
+    assert writer_is_free(trusted_tmp / "r")
 
 
 def test_runtime_forwards_handlers_and_kinds(trusted_tmp: Path) -> None:

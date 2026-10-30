@@ -10,7 +10,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from superbrain.core.errors import BrainError
+from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.ids import new_id
 from superbrain.ports.os import OsAdapters
 from superbrain.storage.kinds import KindRegistry
@@ -56,7 +56,8 @@ def open_runtime(
 ) -> Runtime:
     """Open (creating what is missing) the data root at ``path`` for writing.
 
-    A missing policy store is created with a new store id, a missing main store with the policy store's id.
+    A missing policy store is created with a new store id, a missing main store with the policy store's id. A
+    missing policy store next to an existing main store is ``INTEGRITY_FAILURE``, raised before anything is created.
     ``Store.open`` and ``Store.create`` reconcile the policy intents. The migration sequences are passed straight
     to ``PolicyStore`` and ``Store``. On any failure, whatever was opened is closed and the lease released before
     the error propagates.
@@ -70,6 +71,11 @@ def open_runtime(
         secure_subdirectories(root, lease, os_)
         if os.path.lexists(root.policy_db):
             policy = PolicyStore.open(root, lease, os_, migrations=policy_migrations)
+        elif os.path.lexists(root.store_db):
+            # A new policy store would silently reset trust, quarantine and tombstones for existing data.
+            raise BrainError(
+                ErrorCode.INTEGRITY_FAILURE, "policy store missing for an existing data store; restore a policy backup"
+            )
         else:
             policy = PolicyStore.create(root, lease, os_, store_id=new_id(), migrations=policy_migrations)
         registry = kinds if kinds is not None else KindRegistry(())
