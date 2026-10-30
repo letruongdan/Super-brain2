@@ -7,9 +7,10 @@ A restored store is never opened here. The next ``open_runtime`` opens the publi
 reconciles every intent of the live policy store against the snapshot's own ``applied_intents``, so tombstones and
 quarantines recorded after the backup are applied again (I1-03).
 
-A restored policy store gets a trust generation above every earlier one, ``max(hwm, backup's) + 1``, written into
-the staged copy before it is published; then the lock's high-water mark is raised. A crash between the two is
-reconciled by ``PolicyStore.open``, which raises the mark to a generation above it.
+A restored policy store gets a trust generation above every earlier one, ``max(hwm, backup's, live's) + 1``,
+written into the staged copy before it is published; then the lock's high-water mark is raised. A crash between the
+two is reconciled by ``PolicyStore.open``, which raises the mark to a generation above it. Until then the live
+policy store is ahead of the mark, which is why its own generation is part of the maximum.
 """
 
 import os
@@ -28,6 +29,7 @@ from superbrain.storage.backup import BackupManifest, copy_blobs, new_directory,
 from superbrain.storage.layout import DataRoot
 from superbrain.storage.policy_store import PolicyStore
 from superbrain.storage.schema import POLICY_MIGRATIONS, STORE_MIGRATIONS, Migration
+from superbrain.storage.sqlite import open_readonly
 from superbrain.storage.swap import stage_and_swap
 from superbrain.storage.writer import WriterLease
 
@@ -129,6 +131,27 @@ def _write_generation(path: Path, generation: int) -> None:
         raise BrainError(ErrorCode.IO_ERROR, f"cannot make the staged policy store durable: {err}") from err
 
 
+def _live_generation(root: DataRoot) -> int:
+    """The trust generation of the closed live ``policy.db``, read without creating or changing any file; 0 if
+    there is none. A ``policy.db`` that cannot be read is ``INTEGRITY_FAILURE``: guessing could reuse a generation."""
+    path = root.policy_db
+    if not os.path.lexists(path):
+        return 0
+    try:
+        db = open_readonly(path)
+        try:
+            rows = db.execute("SELECT generation FROM trust WHERE id = 1").fetchall()
+        finally:
+            db.close()
+    except sqlite3.Error as exc:
+        raise BrainError(
+            ErrorCode.INTEGRITY_FAILURE, f"cannot read the trust generation of the live policy store: {exc}"
+        ) from exc
+    if len(rows) != 1 or type(rows[0][0]) is not int or rows[0][0] < 1:
+        raise BrainError(ErrorCode.INTEGRITY_FAILURE, "the live policy store has no valid trust generation")
+    return rows[0][0]
+
+
 def restore_policy(
     root: DataRoot,
     lease: WriterLease,
@@ -141,8 +164,10 @@ def restore_policy(
 ) -> RestoreReport:
     """Replace ``policy/`` with the ``policy`` backup at ``backup``, under a trust generation above every earlier one.
 
-    An open ``store`` or ``policy`` handle is ``STORE_BUSY``, then the backup must verify against ``store_id``;
-    both before anything is staged. Afterwards the caller opens a new runtime, so the store binds to the restored
+    An open ``store`` or ``policy`` handle is ``STORE_BUSY``, then the backup must verify against ``store_id`` and
+    the live ``policy.db``, if any, must be readable (``INTEGRITY_FAILURE``); all before anything is staged. The new
+    generation is above the lock's mark, the backup's and the live store's: after a crash before the mark was
+    raised, the live store is ahead of it. Afterwards the caller opens a new runtime, so the store binds to the restored
     policy store and reconciles against it.
     """
     _check_lease(root, lease)
@@ -152,7 +177,7 @@ def restore_policy(
     manifest = verify_backup(backup, expected_kind="policy", expected_store_id=store_id, migrations=migrations)
     if manifest.trust_generation is None:  # verify_backup requires it for a policy backup
         raise AssertionError("a verified policy backup has a trust generation")
-    generation = max(lease.state().trust_generation_hwm, manifest.trust_generation) + 1
+    generation = max(lease.state().trust_generation_hwm, manifest.trust_generation, _live_generation(root)) + 1
 
     def build(stage: Path) -> None:
         staged = stage / "policy.db"

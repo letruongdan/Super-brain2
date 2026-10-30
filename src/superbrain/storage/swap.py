@@ -2,7 +2,8 @@
 
 A swap replaces ``store/`` or ``policy/`` (the target) with a directory built beside it, by renaming only:
 
-1. build the new content in ``<target>.<purpose>/`` (the stage), created fresh and owner-only;
+1. build the new content in ``<target>.<purpose>/`` (the stage), created fresh and owner-only; no stage of
+   the target, for any purpose, may exist already;
 2. write the ``READY`` marker and make it durable;
 3. rename ``<target>/`` to ``<target>.replaced-<UTC>-<id>/``;
 4. rename the stage to ``<target>/`` (its ``READY`` marker stays inside), then bump the writer epoch.
@@ -62,7 +63,8 @@ def _rename(src: Path, dst: Path, os_: OsAdapters) -> None:
         raise BrainError(ErrorCode.IO_ERROR, f"cannot rename {src.name}: {dst.name} already exists") from err
 
 
-def _new_stage(stage: Path, os_: OsAdapters) -> None:
+def _make_stage(stage: Path) -> None:
+    """Create ``stage``; securing it and recording it durably happen under the abandon path of the caller."""
     try:
         stage.mkdir(mode=0o700)
     except FileExistsError as err:
@@ -71,8 +73,6 @@ def _new_stage(stage: Path, os_: OsAdapters) -> None:
         ) from err
     except OSError as err:
         raise BrainError(ErrorCode.IO_ERROR, f"cannot create {stage.name}: {err}") from err
-    os_.permissions.secure_directory(stage)
-    os_.publisher.sync_directory(stage.parent)
 
 
 def _mark_ready(stage: Path, os_: OsAdapters) -> None:
@@ -97,10 +97,11 @@ def stage_and_swap(
 ) -> Path:
     """Replace ``<target>/`` with the directory ``build`` fills, by renames only; returns the ``*.replaced-*`` path.
 
-    An open ``target`` handle is ``STORE_BUSY`` and an existing stage ``INTEGRITY_FAILURE``, both before anything is
-    created. If ``build`` (or writing ``READY``) fails, the stage is renamed to ``*.abandoned-*`` and the original
-    error propagates, with a note if that rename fails too (recovery then sets the stage aside). The ``<UTC>`` in
-    the new names comes from ``now``, which must be timezone-aware.
+    An open ``target`` handle is ``STORE_BUSY``, and an existing stage of the target, for either purpose, is
+    ``INTEGRITY_FAILURE`` (start-up must never find two stages for one target); both before anything is created.
+    If anything fails once the stage exists (securing it, ``build``, writing ``READY``), the stage is renamed to
+    ``*.abandoned-*`` and the original error propagates, with a note if that rename fails too (recovery then sets
+    the stage aside). The ``<UTC>`` in the new names comes from ``now``, which must be timezone-aware.
     """
     _check_lease(root, lease)
     if target not in TARGETS or purpose not in PURPOSES:
@@ -112,8 +113,15 @@ def stage_and_swap(
     live, stage = _target_dir(root, target), _stage_dir(root, target, purpose)
     if not live.is_dir():
         raise BrainError(ErrorCode.NOT_FOUND, f"there is no {live.name} directory to replace")
-    _new_stage(stage, os_)
+    left = [s.name for s in (_stage_dir(root, target, p) for p in PURPOSES) if os.path.lexists(s)]
+    if left:
+        raise BrainError(
+            ErrorCode.INTEGRITY_FAILURE, f"{', '.join(left)} already exists; recovery should have set it aside"
+        )
+    _make_stage(stage)
     try:
+        os_.permissions.secure_directory(stage)
+        os_.publisher.sync_directory(stage.parent)
         build(stage)
         _mark_ready(stage, os_)
     except BaseException as err:

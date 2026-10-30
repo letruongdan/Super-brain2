@@ -133,10 +133,13 @@ def test_create_on_a_fresh_lock_starts_at_one_and_raises_the_hwm(trusted_tmp: Pa
 
 def test_generation_above_the_hwm_raises_the_hwm_on_open(trusted_tmp: Path, os_: OsAdapters) -> None:
     with maintenance_lease(trusted_tmp / "r", os_) as (root, lease):
-        policy = PolicyStore.create(root, lease, os_, store_id=STORE_ID)
-        policy.set_trust_generation(20)
-        assert policy.trust_generation() == 20 and lease.state().trust_generation_hwm == 1
-        policy.close()
+        PolicyStore.create(root, lease, os_, store_id=STORE_ID).close()
+        db = sqlite3.connect(root.policy_db, isolation_level=None)
+        try:
+            db.execute("UPDATE trust SET generation = 20 WHERE id = 1")  # as a restored policy store has it
+        finally:
+            db.close()
+        assert lease.state().trust_generation_hwm == 1
         policy = PolicyStore.open(root, lease, os_)
         assert policy.trust_generation() == 20 and lease.state().trust_generation_hwm == 20
         policy.close()
@@ -147,20 +150,6 @@ def test_generation_equal_to_the_hwm_is_kept(trusted_tmp: Path, os_: OsAdapters)
         PolicyStore.create(root, lease, os_, store_id=STORE_ID).close()
         policy = PolicyStore.open(root, lease, os_)
         assert policy.trust_generation() == 1 and lease.state().trust_generation_hwm == 1
-        policy.close()
-
-
-def test_set_trust_generation_writes_any_valid_value(trusted_tmp: Path, os_: OsAdapters) -> None:
-    with maintenance_lease(trusted_tmp / "r", os_) as (root, lease):
-        policy = PolicyStore.create(root, lease, os_, store_id=STORE_ID)
-        policy.set_trust_generation(7)
-        policy.set_trust_generation(3)
-        assert policy.trust_generation() == 3
-        for bad in (0, -1, True, "4", 2.0):
-            with pytest.raises(BrainError) as e:
-                policy.set_trust_generation(bad)  # type: ignore[arg-type]
-            assert e.value.code == ErrorCode.INVALID_INPUT
-        assert policy.trust_generation() == 3
         policy.close()
 
 
@@ -286,7 +275,6 @@ def test_closed_policy_store_cannot_be_used(env: Env) -> None:
         policy.intents,
         policy.tombstones,
         policy.trust_generation,
-        lambda: policy.set_trust_generation(2),
         lambda: policy.record_intent(IntentKind.QUARANTINE, {"digest": D}),
         lambda: policy.is_quarantined(D),
         lambda: policy.is_tombstoned("event", E1),

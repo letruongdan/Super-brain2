@@ -54,12 +54,6 @@ def _check_lease(root: DataRoot, lease: WriterLease) -> None:
         raise AssertionError("the policy store needs a held writer lease for this data root")
 
 
-def _check_generation(value: object) -> int:
-    if type(value) is not int or value < 1:
-        raise BrainError(ErrorCode.INVALID_INPUT, "a trust generation must be an integer >= 1")
-    return value
-
-
 def _validated_payload(kind: object, payload: object, intent_id: str) -> dict[str, JsonValue]:
     """The payload of an intent of ``kind``, checked against its effect's ledger schema; else ``INVALID_INPUT``.
 
@@ -301,12 +295,6 @@ class PolicyStore:
         if len(rows) != 1 or type(rows[0][0]) is not int or rows[0][0] < 1:
             raise BrainError(ErrorCode.INTEGRITY_FAILURE, "the policy store has no valid trust generation")
         return rows[0][0]
-
-    def set_trust_generation(self, value: int) -> None:
-        """Write ``value`` (an integer >= 1) as the trust generation, unconditionally. Only restore uses it, on the
-        copy it is building; the lock's high-water mark is not touched."""
-        self._check()
-        self._write_generation(_check_generation(value))
 
     # --- internals ---------------------------------------------------------------------------------------------
 

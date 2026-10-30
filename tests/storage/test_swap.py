@@ -106,16 +106,36 @@ def test_swap_with_the_target_open_is_refused_before_staging(held: tuple[DataRoo
     assert siblings(root, "store.") == [] and digest_tree(root.store_dir) == before
 
 
-def test_existing_stage_is_an_integrity_failure(held: tuple[DataRoot, WriterLease]) -> None:
+@pytest.mark.parametrize("left", ["restoring", "migrating"])
+@pytest.mark.parametrize("purpose", ["restoring", "migrating"])
+def test_any_existing_stage_of_the_target_is_an_integrity_failure(
+    held: tuple[DataRoot, WriterLease], left: str, purpose: str
+) -> None:
+    """A stage of either purpose blocks a new swap of that target, so start-up never sees two stages at once."""
     root, lease = held
-    write_file(root.root / "store.restoring", "data", b"left over")
+    write_file(root.root / f"store.{left}", "data", b"left over")
     with pytest.raises(BrainError) as e:
         stage_and_swap(
-            root, lease, os_adapters(), target="store", purpose="restoring", build=builder(b"new"), now=CLOCK_START
+            root, lease, os_adapters(), target="store", purpose=purpose, build=builder(b"new"), now=CLOCK_START  # type: ignore[arg-type]
         )
-    assert e.value.code == ErrorCode.INTEGRITY_FAILURE
-    assert (root.root / "store.restoring" / "data").read_bytes() == b"left over"
-    assert (root.store_dir / "data").read_bytes() == b"old store" and siblings(root, "store.") == ["store.restoring"]
+    assert e.value.code == ErrorCode.INTEGRITY_FAILURE and f"store.{left}" in e.value.message
+    assert (root.root / f"store.{left}" / "data").read_bytes() == b"left over"
+    assert (root.store_dir / "data").read_bytes() == b"old store" and siblings(root, "store.") == [f"store.{left}"]
+
+
+@pytest.mark.parametrize("failing", ["secure_directory", "sync_directory"])
+def test_stage_that_cannot_be_secured_is_set_aside(
+    held: tuple[DataRoot, WriterLease], monkeypatch: pytest.MonkeyPatch, failing: str
+) -> None:
+    root, lease = held
+    os_ = os_adapters()
+    owner = os_.permissions if failing == "secure_directory" else os_.publisher
+    monkeypatch.setattr(owner, failing, raising(BrainError(ErrorCode.IO_ERROR, "injected")))
+    with pytest.raises(BrainError, match="injected"):
+        stage_and_swap(root, lease, os_, target="store", purpose="restoring", build=builder(b"new"), now=CLOCK_START)
+    (aside,) = siblings(root, "store.")
+    assert re.fullmatch(rf"store\.restoring\.abandoned-{STAMP}-{UUID}", aside)
+    assert (root.store_dir / "data").read_bytes() == b"old store"
 
 
 def test_missing_target_is_refused_before_staging(held: tuple[DataRoot, WriterLease]) -> None:

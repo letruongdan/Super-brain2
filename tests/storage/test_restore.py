@@ -26,6 +26,7 @@ from superbrain.storage.restore import RestoreReport, restore_policy, restore_st
 from superbrain.storage.retention import expire_due
 from superbrain.storage.runtime import Runtime, open_runtime
 from superbrain.storage.schema import read_schema_info
+from superbrain.storage.sqlite import open_immutable
 from superbrain.storage.store import Store
 from superbrain.storage.swap import READY
 from tests.storage.conftest import Env, maintenance_lease
@@ -414,6 +415,45 @@ def test_policy_restore_crash_never_lowers_generation(trusted_tmp: Path, point: 
         assert (g1 > g0) == published and g1 >= g0 and rt.lease.state().trust_generation_hwm == g1
     finally:
         rt.close()
+
+
+def generation_in(policy_db: Path) -> int:
+    db = open_immutable(policy_db)
+    try:
+        (generation,) = db.execute("SELECT generation FROM trust WHERE id = 1").fetchone()
+    finally:
+        db.close()
+    assert type(generation) is int
+    return generation
+
+
+@pytest.mark.parametrize("point", ["restoring.policy.between_renames", "restoring.policy.before_hwm_update"])
+def test_restore_after_a_crash_before_the_hwm_update_never_reuses_a_generation(trusted_tmp: Path, point: str) -> None:
+    """The published policy store is ahead of the lock's mark; a restore under a lease that never opened it (a
+    maintenance lease) must still go above it."""
+    seed_policy_backup(trusted_tmp)
+    run_until_crash("restore_policy_from_latest", point, trusted_tmp)
+    path = max(p for p in (trusted_tmp / "backups").iterdir() if p.name.startswith("policy-"))
+    with maintenance_lease(trusted_tmp) as (root, lease):
+        live = generation_in(root.policy_db)
+        assert live > lease.state().trust_generation_hwm  # the crash left the mark behind
+        report = restore_policy(root, lease, os_adapters(), path, store_id=store_id_of(trusted_tmp), now=now())
+    assert generation_in(report.replaced_dir / "policy.db") == live
+    assert report.trust_generation is not None and report.trust_generation > live
+    assert generation_of(trusted_tmp) == report.trust_generation
+
+
+def test_unreadable_live_policy_store_fails_closed(trusted_tmp: Path) -> None:
+    path = policy_backup_of(trusted_tmp)
+    with maintenance_lease(trusted_tmp) as (root, lease):
+        root.policy_db.write_bytes(b"not a database")
+        for companion in ("policy.db-wal", "policy.db-shm"):
+            (root.policy_dir / companion).unlink(missing_ok=True)
+        before = digest_tree(root.policy_dir)
+        with pytest.raises(BrainError) as e:
+            restore_policy(root, lease, os_adapters(), path, store_id=store_id_of(trusted_tmp), now=now())
+        assert e.value.code == ErrorCode.INTEGRITY_FAILURE and digest_tree(root.policy_dir) == before
+        assert not any(name.startswith("policy.") for name in os.listdir(root.root))
 
 
 def test_successive_policy_restores_strictly_increase_generation(trusted_tmp: Path) -> None:
