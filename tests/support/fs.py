@@ -4,6 +4,7 @@ import hashlib
 import os
 import sys
 from collections.abc import Iterable
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -72,3 +73,9 @@ def db_files(path: Path) -> list[Path]:
     """``[db, db-wal, db-shm]``, only those that exist."""
     candidates = [path, path.with_name(path.name + "-wal"), path.with_name(path.name + "-shm")]
     return [p for p in candidates if p.exists()]
+
+
+def set_mtime(path: Path, when: datetime) -> None:
+    """Set the access and modification time of ``path`` to ``when`` (timezone-aware)."""
+    stamp = when.timestamp()
+    os.utime(path, (stamp, stamp))

@@ -244,7 +244,15 @@ class Store:
         self._closed = False
         self._txn_active = False
         self._maintenance = False
-        self._cas = ContentStore(root=root, os_=os_, policy=policy, db=db, check=self._check)
+        self._cas = ContentStore(
+            root=root,
+            os_=os_,
+            policy=policy,
+            db=db,
+            check=self._check,
+            maintenance=self.maintenance,
+            transaction=self.transaction,
+        )
 
     # --- lifecycle ---------------------------------------------------------------------------------------------
 

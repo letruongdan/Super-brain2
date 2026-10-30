@@ -17,6 +17,9 @@ import os
 import re
 import sqlite3
 from collections.abc import Callable
+from contextlib import AbstractContextManager
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from superbrain.core.canonical import digest_bytes
@@ -27,7 +30,7 @@ from superbrain.ports.os import OsAdapters
 from superbrain.ports.policy import PolicyView
 from superbrain.storage.kinds import RetentionClass as RetentionClass
 from superbrain.storage.layout import DataRoot
-from superbrain.storage.ledger import LedgerEntry, io_error
+from superbrain.storage.ledger import LedgerEntry, Txn, io_error
 
 _DIGEST = re.compile(r"sha256:([0-9a-f]{64})")
 _SHARD_NAME = re.compile(r"[0-9a-f]{2}")
@@ -114,6 +117,14 @@ class HolderProjection:
         )
 
 
+@dataclass(frozen=True)
+class GcReport:
+    """Digests ``collect_garbage`` deleted, and orphans it kept because they are younger than the grace period."""
+
+    deleted: tuple[str, ...]
+    kept_young: tuple[str, ...]
+
+
 class ContentStore:
     """The blobs of one ``Store``; obtain it as ``Store.cas``. It checks the store's owner thread, like the store."""
 
@@ -125,6 +136,8 @@ class ContentStore:
         policy: PolicyView,
         db: sqlite3.Connection,
         check: Callable[[], None],
+        maintenance: Callable[[], AbstractContextManager[None]],
+        transaction: Callable[[], AbstractContextManager[Txn]],
     ) -> None:
         self._cas_dir = root.cas_dir
         self._staging_dir = root.staging_dir
@@ -132,6 +145,8 @@ class ContentStore:
         self._policy = policy
         self._db = db
         self._check = check
+        self._maintenance = maintenance
+        self._transaction = transaction
 
     def put(self, data: bytes) -> str:
         """Publish ``data`` durably and return its digest; an existing blob is verified, never rewritten.
@@ -212,6 +227,47 @@ class ContentStore:
         on_disk = self._blob_digests()
         held = {str(row[0]) for row in self._query(f"SELECT DISTINCT digest FROM {HOLDERS_TABLE}", ())}
         return sorted(on_disk - held)
+
+    def collect_garbage(self, *, now: datetime, grace: timedelta = timedelta(hours=24)) -> GcReport:
+        """Delete the blobs no holder refers to whose file is older than ``now - grace``; runs in maintenance.
+
+        While maintenance is already active (a backup, say) this is ``STORE_BUSY``. Each deletion has a write
+        transaction of its own that re-checks for a holder, removes the file and makes its directory durable
+        before committing. ``Txn.hold`` re-checks the blob in a write transaction too, and SQLite serialises the
+        two, so a holder never points at a deleted blob. Shard directories are kept; GC adds no ledger entry.
+        """
+        self._check()
+        cutoff = (now - grace).timestamp()
+        with self._maintenance():
+            deleted: list[str] = []
+            young: list[str] = []
+            for digest in self.orphans():
+                path = blob_path(self._cas_dir, digest)
+                try:
+                    modified = path.stat().st_mtime
+                except FileNotFoundError:
+                    continue
+                except OSError as err:
+                    raise _os_error(f"cannot stat blob {digest}", err) from err
+                if modified >= cutoff:
+                    young.append(digest)
+                elif self._delete_if_unheld(digest, path):
+                    deleted.append(digest)
+            return GcReport(deleted=tuple(sorted(deleted)), kept_young=tuple(sorted(young)))
+
+    def _delete_if_unheld(self, digest: str, path: Path) -> bool:
+        """In one write transaction: no holder -> unlink the blob and sync its directory. True if it deleted."""
+        with self._transaction():
+            if self._query(f"SELECT 1 FROM {HOLDERS_TABLE} WHERE digest = ? LIMIT 1", (digest,)):
+                return False
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                return False
+            except OSError as err:
+                raise _os_error(f"cannot delete blob {digest}", err) from err
+            self._os.publisher.sync_directory(path.parent)
+            return True
 
     def _query(self, sql: str, params: tuple[str, ...]) -> list[tuple[object, ...]]:
         try:
