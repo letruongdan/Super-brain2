@@ -1,6 +1,7 @@
 import subprocess
 from collections.abc import Mapping
 from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
+from typing import Any
 
 import pytest
 
@@ -91,3 +92,36 @@ def test_vietnamese_and_space_path_is_accepted(tmp_path: Path) -> None:
     root = tmp_path / "thư mục có dấu" / "Lê Trung"
     root.mkdir(parents=True)
     OsPathSafety().reject_links(root)
+
+
+@pytest.mark.parametrize(
+    "platform,env,missing",
+    [
+        ("win32", {}, "LOCALAPPDATA"),
+        ("linux", {}, "HOME"),
+        ("darwin", {}, "HOME"),
+    ],
+)
+def test_default_data_root_missing_variable(platform: str, env: Mapping[str, str], missing: str) -> None:
+    with pytest.raises(BrainError) as e:
+        default_data_root(env, platform)
+    assert e.value.code == ErrorCode.INVALID_INPUT
+    assert missing in e.value.message
+
+
+def test_inspection_failure_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = tmp_path / "runtime"
+    root.mkdir()
+    blocked = root / "store"
+    original = Path.lstat
+
+    def lstat(self: Path, *args: Any, **kwargs: Any) -> Any:
+        if self == blocked:
+            raise PermissionError("denied")
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "lstat", lstat)
+    with pytest.raises(BrainError) as e:
+        OsPathSafety().reject_links(root, entries=[blocked])
+    assert e.value.code == ErrorCode.UNSAFE_PATH
+    assert isinstance(e.value.__cause__, PermissionError)

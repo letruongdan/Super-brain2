@@ -12,12 +12,14 @@ _APP_DIR = "ensemble-brain"
 
 def _is_link(path: Path) -> bool:
     # Checked without resolving, so a link is detected before it is ever followed.
-    if path.is_symlink():
-        return True
     try:
+        if path.is_symlink():
+            return True
         attributes = getattr(path.lstat(), "st_file_attributes", 0)
     except FileNotFoundError:
         return False
+    except OSError as err:
+        raise BrainError(ErrorCode.UNSAFE_PATH, f"cannot inspect path for links: {err}") from err
     return bool(attributes & _REPARSE_POINT)
 
 
@@ -39,6 +41,13 @@ class OsPathSafety:
                 raise BrainError(ErrorCode.UNSAFE_PATH, "path must not contain symlink or reparse points")
 
 
+def _required(env: Mapping[str, str], name: str) -> str:
+    value = env.get(name)
+    if not value:
+        raise BrainError(ErrorCode.INVALID_INPUT, f"environment variable {name} is not set")
+    return value
+
+
 def default_data_root(env: Mapping[str, str], platform: str) -> PurePath:
     """Pure path in the flavor of ``platform``; callers wrap it in ``Path`` for the running host."""
     home = env.get("SUPERBRAIN_HOME")
@@ -46,10 +55,11 @@ def default_data_root(env: Mapping[str, str], platform: str) -> PurePath:
     if home:
         pure = PureWindowsPath(home) if platform == "win32" else PurePosixPath(home)
     elif platform == "win32":
-        pure = PureWindowsPath(env["LOCALAPPDATA"]) / _APP_DIR
+        pure = PureWindowsPath(_required(env, "LOCALAPPDATA")) / _APP_DIR
     elif platform == "darwin":
-        pure = PurePosixPath(env["HOME"]) / "Library" / "Application Support" / _APP_DIR
+        pure = PurePosixPath(_required(env, "HOME")) / "Library" / "Application Support" / _APP_DIR
     else:
         xdg = env.get("XDG_DATA_HOME")
-        pure = PurePosixPath(xdg) / _APP_DIR if xdg else PurePosixPath(env["HOME"]) / ".local" / "share" / _APP_DIR
+        base = PurePosixPath(xdg) if xdg else PurePosixPath(_required(env, "HOME")) / ".local" / "share"
+        pure = base / _APP_DIR
     return pure
