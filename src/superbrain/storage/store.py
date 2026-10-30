@@ -8,14 +8,15 @@ import os
 import re
 import sqlite3
 import threading
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from pathlib import Path
 
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.faults import crashpoint
+from superbrain.core.ids import new_id
 from superbrain.ports.os import OsAdapters
-from superbrain.ports.policy import PolicySource
+from superbrain.ports.policy import PolicySource, PolicyView
 from superbrain.storage.kinds import KindRegistry
 from superbrain.storage.layout import DataRoot
 from superbrain.storage.ledger import (
@@ -37,6 +38,7 @@ _HANDLE = "store"
 _HANDLER_NAME = re.compile(r"[a-z][a-z0-9_]{0,31}")
 _BUSY_CODES = frozenset({sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED})
 _REPLAY_BATCH = 256
+_CREATING = ".creating-"
 
 
 def _quote(name: str) -> str:
@@ -120,6 +122,43 @@ def _swap_in_rebuilt(db: sqlite3.Connection, handler: ProjectionHandler) -> None
         db.execute(new_sql)
 
 
+def _remove_unfinished_creates(path: Path) -> None:
+    """Delete ``<brain.db>.creating-*`` leftovers (with their ``-wal``/``-shm``) of a failed or interrupted create."""
+    prefix = path.name + _CREATING
+    try:
+        for name in sorted(os.listdir(path.parent)):
+            if name.startswith(prefix):
+                os.unlink(path.parent / name)
+    except OSError as exc:
+        raise BrainError(ErrorCode.IO_ERROR, f"cannot remove an unfinished store create: {exc}") from exc
+
+
+def _replay(
+    db: sqlite3.Connection,
+    handlers: Sequence[ProjectionHandler],
+    policy: PolicyView,
+    prefix: Callable[[ProjectionHandler], str],
+) -> int:
+    """Apply every ledger entry, in sequence order, to ``handlers`` under ``prefix``; returns the entry count.
+
+    An entry written by a newer version of a handler than the one given is ``UNSUPPORTED_VERSION``.
+    """
+    count = after = 0
+    while page := read_entries(db, after, _REPLAY_BATCH):
+        for entry in page:
+            for handler in handlers:
+                if entry.kind in handler.kinds and entry.handler_version > handler.handler_version:
+                    raise BrainError(
+                        ErrorCode.UNSUPPORTED_VERSION,
+                        f"entry {entry.sequence} ({entry.kind}) needs handler version {entry.handler_version}, "
+                        f"projection {handler.name} is version {handler.handler_version}",
+                    )
+            apply_to_handlers(db, handlers, entry, policy, prefix)
+        count += len(page)
+        after = page[-1].sequence
+    return count
+
+
 class Store:
     def __init__(
         self,
@@ -162,7 +201,12 @@ class Store:
         *,
         migrations: Sequence[Migration] = STORE_MIGRATIONS,
     ) -> "Store":
-        """Create a new store database with ``store_id = policy.store_id``."""
+        """Create a new store database with ``store_id = policy.store_id``, then open it.
+
+        The database is built at ``brain.db.creating-<id>``, closed (so its WAL is checkpointed away) and only then
+        published as ``brain.db``: a failed or interrupted create never leaves a ``brain.db`` behind. Leftover
+        ``brain.db.creating-*`` files are never live data and are removed first.
+        """
         _check_lease(root, lease)
         _check_handlers(handlers, kinds)
         path = root.store_db
@@ -170,33 +214,21 @@ class Store:
             raise BrainError(ErrorCode.INVALID_INPUT, f"a store database already exists at {path}")
         lease.register_handle(_HANDLE)
         try:
-            db = connect(path)
+            _remove_unfinished_creates(path)
+            staging = path.with_name(f"{path.name}{_CREATING}{new_id()}")
+            db = connect(staging)
             try:
                 initialize(db, migrations, store_id=policy.store_id)
-                try:
-                    row = db.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
-                except sqlite3.Error as exc:
-                    raise io_error("cannot read the new store's meta", exc) from exc
-                store = cls(
-                    root=root,
-                    lease=lease,
-                    os_=os_,
-                    policy=policy,
-                    handlers=handlers,
-                    kinds=kinds,
-                    db=db,
-                    schema_version=int(row[0]),
-                    store_id=policy.store_id,
-                )
-                store._prepare()
-                os_.publisher.sync_directory(root.store_dir)
-            except BaseException:
+            finally:
                 db.close()
-                raise
+            if any(os.path.lexists(p) for p in _db_files(staging)[1:]):
+                raise BrainError(ErrorCode.IO_ERROR, f"{staging}: the WAL was not checkpointed away on close")
+            os_.permissions.secure_file(staging)
+            os_.publisher.publish(staging, path)
+            return cls._open_registered(root, lease, os_, policy, handlers, kinds, migrations)
         except BaseException:
             lease.unregister_handle(_HANDLE)
             raise
-        return store
 
     @classmethod
     def open(
@@ -215,42 +247,60 @@ class Store:
         _check_handlers(handlers, kinds)
         lease.register_handle(_HANDLE)
         try:
-            path = root.store_db
-            info = read_schema_info(path)
-            if info is None:
-                raise BrainError(ErrorCode.NOT_FOUND, f"no store database at {path}")
-            ensure_writable(info, migrations)
-            if info.store_id != policy.store_id:
-                raise BrainError(ErrorCode.INTEGRITY_FAILURE, "the store belongs to a different policy store")
-            db = connect(path)
-            try:
-                store = cls(
-                    root=root,
-                    lease=lease,
-                    os_=os_,
-                    policy=policy,
-                    handlers=handlers,
-                    kinds=kinds,
-                    db=db,
-                    schema_version=info.schema_version,
-                    store_id=info.store_id,
-                )
-                store._prepare()
-            except BaseException:
-                db.close()
-                raise
+            return cls._open_registered(root, lease, os_, policy, handlers, kinds, migrations)
         except BaseException:
             lease.unregister_handle(_HANDLE)
+            raise
+
+    @classmethod
+    def _open_registered(
+        cls,
+        root: DataRoot,
+        lease: WriterLease,
+        os_: OsAdapters,
+        policy: PolicySource,
+        handlers: Sequence[ProjectionHandler],
+        kinds: KindRegistry,
+        migrations: Sequence[Migration],
+    ) -> "Store":
+        """``open`` once the ``store`` handle is registered; the caller unregisters it on failure."""
+        path = root.store_db
+        info = read_schema_info(path)
+        if info is None:
+            raise BrainError(ErrorCode.NOT_FOUND, f"no store database at {path}")
+        ensure_writable(info, migrations)
+        if info.store_id != policy.store_id:
+            raise BrainError(ErrorCode.INTEGRITY_FAILURE, "the store belongs to a different policy store")
+        db = connect(path)
+        try:
+            store = cls(
+                root=root,
+                lease=lease,
+                os_=os_,
+                policy=policy,
+                handlers=handlers,
+                kinds=kinds,
+                db=db,
+                schema_version=info.schema_version,
+                store_id=info.store_id,
+            )
+            store._prepare()
+        except BaseException:
+            db.close()
             raise
         return store
 
     def _prepare(self) -> None:
-        """Create the live tables of every handler that has none, then secure the database files."""
+        """Give every handler without live tables new ones, filled from the whole ledger in the same transaction
+        (a handler registered after entries of its kinds were written must not start empty), then secure the
+        database files. Handlers whose live tables exist are not replayed."""
         with self._immediate() as db:
             try:
-                for handler in self._handlers:
-                    if not _tables_with_prefix(db, live_prefix(handler)):
-                        _create_tables(db, handler, live_prefix(handler))
+                fresh = [h for h in self._handlers if not _tables_with_prefix(db, live_prefix(h))]
+                for handler in fresh:
+                    _create_tables(db, handler, live_prefix(handler))
+                if fresh:
+                    _replay(db, fresh, self._policy, live_prefix)
             except sqlite3.Error as exc:
                 raise io_error("cannot create projection tables", exc) from exc
         for path in _db_files(self._root.store_db):
@@ -325,34 +375,18 @@ class Store:
         """
         self._check()
         self._require_no_transaction()
-        count = 0
         with self._immediate() as db:
             try:
                 for handler in self._handlers:
                     for table in _tables_with_prefix(db, rebuild_prefix(handler)):
                         db.execute(f"DROP TABLE {_quote(table)}")
                     _create_tables(db, handler, rebuild_prefix(handler))
-                after = 0
-                while page := read_entries(db, after, _REPLAY_BATCH):
-                    for entry in page:
-                        self._require_supported(entry)
-                        apply_to_handlers(db, self._handlers, entry, self._policy, rebuild_prefix)
-                    count += len(page)
-                    after = page[-1].sequence
+                count = _replay(db, self._handlers, self._policy, rebuild_prefix)
                 for handler in self._handlers:
                     _swap_in_rebuilt(db, handler)
             except sqlite3.Error as exc:
                 raise io_error("cannot rebuild projections", exc) from exc
         return count
-
-    def _require_supported(self, entry: LedgerEntry) -> None:
-        for handler in self._handlers:
-            if entry.kind in handler.kinds and entry.handler_version > handler.handler_version:
-                raise BrainError(
-                    ErrorCode.UNSUPPORTED_VERSION,
-                    f"entry {entry.sequence} ({entry.kind}) needs handler version {entry.handler_version}, "
-                    f"projection {handler.name} is version {handler.handler_version}",
-                )
 
     def db_integrity(self) -> str:
         """SQLite's ``integrity_check`` result: ``"ok"`` for a sound database."""

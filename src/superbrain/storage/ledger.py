@@ -209,7 +209,11 @@ class Txn:
         return self._write_entry(kind, actor=actor, owner_id=owner_id, meta=meta, refs=refs)
 
     def mark_intent_applied(self, intent_id: str) -> bool:
-        """Record that ``intent_id`` took effect at the current ledger high-water; ``False`` if already recorded."""
+        """Record that ``intent_id`` has been applied; ``False`` (and nothing changes) if it already was.
+
+        ``applied_sequence`` is the ledger high-water at marking time: ``MAX(sequence)`` (0 for an empty ledger),
+        including entries appended earlier in this transaction.
+        """
         self._check()
         if not is_uuid(intent_id):
             raise BrainError(ErrorCode.INVALID_INPUT, "intent_id must be a canonical UUID")

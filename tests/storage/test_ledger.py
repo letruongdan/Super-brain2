@@ -2,11 +2,12 @@ import ast
 import sqlite3
 import threading
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import pytest
 
+import superbrain.storage.store as store_module
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.jsonvalue import JsonValue
 from superbrain.ports.os import OsAdapters
@@ -14,7 +15,7 @@ from superbrain.ports.policy import PolicyView
 from superbrain.storage.kinds import KindRegistry
 from superbrain.storage.layout import prepare_data_root, secure_subdirectories
 from superbrain.storage.ledger import LedgerEntry, Txn
-from superbrain.storage.schema import STORE_MIGRATIONS, Migration
+from superbrain.storage.schema import STORE_MIGRATIONS, Migration, initialize
 from superbrain.storage.store import Store
 from superbrain.storage.writer import acquire_writer
 from tests.storage.conftest import (
@@ -457,14 +458,74 @@ def test_reopen_keeps_entries_and_projection(trusted_tmp: Path, os_: OsAdapters)
         store.close()
 
 
-def test_open_creates_tables_of_a_new_handler(trusted_tmp: Path, os_: OsAdapters) -> None:
+def test_handler_added_later_is_filled_from_the_ledger(trusted_tmp: Path, os_: OsAdapters) -> None:
+    root = prepare_data_root(trusted_tmp / "r", os_)
+    kinds = KindRegistry(DEMO_KINDS)
+    with acquire_writer(root, os_) as lease:
+        secure_subdirectories(root, lease, os_)
+        store = Store.create(root, lease, os_, StaticPolicy(), [], kinds)
+        append_n(store, 3)
+        store.close()
+        recorder = PolicyRecorder()
+        policy = StaticPolicy()
+        store = Store.open(root, lease, os_, policy, [CounterProjection(), recorder], kinds)
+        assert counter(store) == 3
+        assert [s for s, _ in recorder.seen] == [1, 2, 3] and all(p is policy for _, p in recorder.seen)
+        store.close()
+        store = Store.open(root, lease, os_, StaticPolicy(), [CounterProjection(), recorder], kinds)
+        assert counter(store) == 3 and len(recorder.seen) == 3
+        append_n(store, 1)
+        assert counter(store) == 4
+        store.close()
+        # A new handler next to existing ones: only the new one is replayed.
+        store = Store.open(root, lease, os_, StaticPolicy(), [CounterProjection(), IndexedProjection()], kinds)
+        assert counter(store) == 4
+        with store.transaction() as t:
+            assert t.db.execute("SELECT count(*) FROM p_indexed_rows").fetchone()[0] == 4
+        store.close()
+
+
+def test_handler_added_later_refuses_history_from_a_newer_handler(trusted_tmp: Path, os_: OsAdapters) -> None:
     root = prepare_data_root(trusted_tmp / "r", os_)
     with acquire_writer(root, os_) as lease:
         secure_subdirectories(root, lease, os_)
-        Store.create(root, lease, os_, StaticPolicy(), [], KindRegistry(DEMO_KINDS)).close()
-        store = Store.open(root, lease, os_, StaticPolicy(), [CounterProjection()], KindRegistry(DEMO_KINDS))
+        store = Store.create(root, lease, os_, StaticPolicy(), [], KindRegistry(DEMO_KINDS))
+        insert_raw_ledger_row(store, kind="demo.count", handler_version=9)
+        store.close()
+        with pytest.raises(BrainError) as e:
+            Store.open(root, lease, os_, StaticPolicy(), [CounterProjection()], KindRegistry(DEMO_KINDS))
+        assert e.value.code == ErrorCode.UNSUPPORTED_VERSION and lease.open_handles() == frozenset()
+        store = Store.open(root, lease, os_, StaticPolicy(), [], KindRegistry(DEMO_KINDS))
+        assert not [n for n in table_names(store) if n.startswith("p_counter_")]
+        store.close()
+
+
+def test_failed_create_leaves_no_store_and_can_be_retried(
+    trusted_tmp: Path, os_: OsAdapters, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = 0
+    real = initialize
+
+    def initialize_failing_once(db: sqlite3.Connection, migrations: Sequence[Migration], *, store_id: str) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise BrainError(ErrorCode.IO_ERROR, "injected initialize failure")
+        real(db, migrations, store_id=store_id)
+
+    monkeypatch.setattr(store_module, "initialize", initialize_failing_once)
+    root = prepare_data_root(trusted_tmp / "r", os_)
+    with acquire_writer(root, os_) as lease:
+        secure_subdirectories(root, lease, os_)
+        with pytest.raises(BrainError, match="injected"):
+            Store.create(root, lease, os_, StaticPolicy(), [], KindRegistry(DEMO_KINDS))
+        assert lease.open_handles() == frozenset()
+        assert not root.store_db.exists()
+        assert [p.name for p in root.store_dir.iterdir() if p.name.startswith("brain.db.creating-")]
+        store = Store.create(root, lease, os_, StaticPolicy(), [CounterProjection()], KindRegistry(DEMO_KINDS))
         append_n(store, 1)
-        assert counter(store) == 1
+        assert counter(store) == 1 and store.db_integrity() == "ok"
+        assert not [p.name for p in root.store_dir.iterdir() if p.name.startswith("brain.db.creating-")]
         store.close()
 
 
