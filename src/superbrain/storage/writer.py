@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from types import TracebackType
 
 from superbrain.core.errors import BrainError, ErrorCode
-from superbrain.core.faults import crashpoint, pausepoint
+from superbrain.core.faults import crashpoint
 from superbrain.ports.os import LockHandle, OsAdapters
 from superbrain.storage.layout import DataRoot
 
@@ -153,7 +153,6 @@ class WriterLease:
         raw = slot.encode()
         offset = _SLOT_OFFSETS[self._target]
         handle.write_payload(offset, raw[:_TORN_AT])
-        pausepoint("writer.mid_slot_write")
         crashpoint("writer.mid_slot_write")
         handle.write_payload(offset + _TORN_AT, raw[_TORN_AT:])
         self._current = slot

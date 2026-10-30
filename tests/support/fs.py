@@ -36,6 +36,22 @@ def digest_tree(path: Path) -> dict[str, str]:
     return found
 
 
+def digest_data_root(path: Path) -> dict[str, str]:
+    """``digest_tree`` of a tree holding a data root, except that ``writer.lock`` is digested from byte 1: on
+    Windows the writer locks byte 0, and reading it through another handle fails while the lock is held."""
+    found: dict[str, str] = {}
+    for directory, dirnames, filenames in os.walk(path):
+        base = Path(directory)
+        for name in dirnames:
+            found[(base / name).relative_to(path).as_posix()] = "<dir>"
+        for name in filenames:
+            entry = base / name
+            with entry.open("rb") as f:
+                f.seek(1 if name == "writer.lock" else 0)
+                found[entry.relative_to(path).as_posix()] = hashlib.sha256(f.read()).hexdigest()
+    return found
+
+
 def file_identity(path: Path) -> tuple[int, int]:
     """``(st_dev, st_ino)`` of ``path``: equal identities mean the same file, not just equal content."""
     st = os.stat(path, follow_symlinks=False)

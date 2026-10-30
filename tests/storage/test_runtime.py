@@ -162,3 +162,51 @@ def test_maintenance_lease_opens_no_database(trusted_tmp: Path) -> None:
         assert not root.policy_db.exists() and not root.store_db.exists()
         assert run_child("acquire_writer", trusted_tmp / "r").error_code == ErrorCode.WRITER_HELD.value
     assert not lease.held and writer_is_free(trusted_tmp / "r")
+
+
+@pytest.mark.parametrize("failing", ["store", "policy"])
+def test_failed_close_keeps_the_writer_lock(trusted_tmp: Path, monkeypatch: pytest.MonkeyPatch, failing: str) -> None:
+    rt = open_runtime(trusted_tmp / "r", os_adapters())
+    handle = rt.store if failing == "store" else rt.policy
+    monkeypatch.setattr(handle, "close", raising(BrainError(ErrorCode.IO_ERROR, "injected")))
+    with pytest.raises(BrainError, match="injected"):
+        rt.close()
+    # A handle may still be open: another process must not become the writer.
+    assert rt.lease.held and run_child("acquire_writer", trusted_tmp / "r").error_code == ErrorCode.WRITER_HELD.value
+    assert rt.store.closed == (failing == "policy") and rt.policy.closed == (failing == "store")
+    monkeypatch.undo()
+    rt.close()
+    assert rt.store.closed and rt.policy.closed and not rt.lease.held and writer_is_free(trusted_tmp / "r")
+    rt.close()
+
+
+def test_failed_open_releases_the_lease_even_when_closing_the_policy_store_breaks(
+    trusted_tmp: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    open_runtime(trusted_tmp / "r", os_adapters()).close()
+    real_close = PolicyStore.close
+
+    def close(self: PolicyStore) -> None:
+        real_close(self)
+        raise RuntimeError("close bug")
+
+    monkeypatch.setattr(Store, "open", raising(BrainError(ErrorCode.INTEGRITY_FAILURE, "original")))
+    monkeypatch.setattr(PolicyStore, "close", close)
+    with pytest.raises(RuntimeError, match="close bug") as e:
+        open_runtime(trusted_tmp / "r", os_adapters())
+    original = e.value.__context__
+    assert isinstance(original, BrainError) and original.message == "original"
+    assert writer_is_free(trusted_tmp / "r")
+
+
+def test_missing_policy_store_is_refused_before_any_subdirectory_is_created(trusted_tmp: Path) -> None:
+    open_runtime(trusted_tmp / "r", os_adapters()).close()
+    with maintenance_lease(trusted_tmp / "r") as (root, _lease):
+        for path in (root.policy_db, *(root.policy_dir / f"policy.db{s}" for s in ("-wal", "-shm"))):
+            path.unlink(missing_ok=True)
+        for directory in (root.outbox_dir, root.logs_dir):
+            directory.rmdir()
+    with pytest.raises(BrainError) as e:
+        open_runtime(trusted_tmp / "r", os_adapters())
+    assert e.value.code == ErrorCode.INTEGRITY_FAILURE
+    assert not root.outbox_dir.exists() and not root.logs_dir.exists()

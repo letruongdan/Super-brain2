@@ -51,11 +51,14 @@ if TYPE_CHECKING:
 __all__ = [
     "BackupKind",
     "BackupManifest",
+    "copy_blobs",
     "create_maintenance_backup",
     "create_policy_backup",
     "create_store_backup",
+    "new_directory",
     "prune_backups",
     "verify_backup",
+    "write_new_file",
 ]
 
 BackupKind = Literal["store", "store_full", "policy"]
@@ -224,7 +227,7 @@ def _roots(db: sqlite3.Connection) -> frozenset[str]:
 # --- creating ----------------------------------------------------------------------------------------------------
 
 
-def _new_directory(path: Path, os_: OsAdapters) -> None:
+def new_directory(path: Path, os_: OsAdapters) -> None:
     """Create ``path`` (which must not exist), secure it and make its entry in the parent durable."""
     try:
         path.mkdir(mode=0o700)
@@ -236,7 +239,7 @@ def _new_directory(path: Path, os_: OsAdapters) -> None:
 
 def _new_backup_dir(backups_dir: Path, kind: BackupKind, now: datetime, os_: OsAdapters) -> Path:
     path = backups_dir / backup_dir_name(kind, now)
-    _new_directory(path, os_)
+    new_directory(path, os_)
     return path
 
 
@@ -245,7 +248,8 @@ def _secure_snapshot(snapshot: Path, os_: OsAdapters) -> None:
     os_.publisher.sync_directory(snapshot.parent)
 
 
-def _write_new(path: Path, data: bytes, os_: OsAdapters) -> None:
+def write_new_file(path: Path, data: bytes, os_: OsAdapters) -> None:
+    """Create ``path`` (which must not exist) holding ``data``, durable and owner-only."""
     try:
         os_.publisher.write_new(path, data)
     except FileExistsError as err:
@@ -253,25 +257,25 @@ def _write_new(path: Path, data: bytes, os_: OsAdapters) -> None:
     os_.permissions.secure_file(path)
 
 
-def _copy_blobs(source_cas: Path, dest_cas: Path, digests: Iterable[str], os_: OsAdapters) -> None:
+def copy_blobs(source_cas: Path, dest_cas: Path, digests: Iterable[str], os_: OsAdapters) -> None:
     """Copy each blob into ``dest_cas`` (created here) after checking its bytes; every directory made durable."""
-    _new_directory(dest_cas, os_)
+    new_directory(dest_cas, os_)
     shards: set[Path] = set()
     for digest in sorted(digests):
         source = blob_path(source_cas, digest)
         try:
             data = source.read_bytes()
         except FileNotFoundError as err:
-            raise BrainError(ErrorCode.INTEGRITY_FAILURE, f"the blob {digest} is missing from the store") from err
+            raise BrainError(ErrorCode.INTEGRITY_FAILURE, f"the blob {digest} is missing from {source_cas}") from err
         except OSError as err:
             raise BrainError(ErrorCode.IO_ERROR, f"cannot read blob {digest}: {err}") from err
         if digest_bytes(data) != digest:
-            raise BrainError(ErrorCode.INTEGRITY_FAILURE, f"the stored blob {digest} does not match its digest")
+            raise BrainError(ErrorCode.INTEGRITY_FAILURE, f"the blob {digest} does not match its digest")
         dest = blob_path(dest_cas, digest)
         if dest.parent not in shards:
-            _new_directory(dest.parent, os_)
+            new_directory(dest.parent, os_)
             shards.add(dest.parent)
-        _write_new(dest, data, os_)
+        write_new_file(dest, data, os_)
     for shard in sorted(shards):
         os_.publisher.sync_directory(shard)
 
@@ -296,7 +300,7 @@ def _write_manifest(directory: Path, kind: BackupKind, blobs: Sequence[str], now
         "blobs": listed,
     }
     staging = directory / f"{MANIFEST_NAME}.tmp-{new_id()}"
-    _write_new(staging, canonical_json(fields), os_)
+    write_new_file(staging, canonical_json(fields), os_)
     os_.publisher.publish(staging, directory / MANIFEST_NAME)
 
 
@@ -316,7 +320,7 @@ def create_store_backup(store: "Store", os_: OsAdapters, now: datetime) -> Path:
         crashpoint("backup.after_db_snapshot")
         with _open_snapshot(snapshot) as db:
             roots = _roots(db)
-        _copy_blobs(root.cas_dir, directory / _CAS, roots, os_)
+        copy_blobs(root.cas_dir, directory / _CAS, roots, os_)
         crashpoint("backup.after_blob_copy")
         _write_manifest(directory, "store", sorted(roots), now, os_)
     return directory
@@ -358,7 +362,7 @@ def _snapshot_closed_db(source: Path, work: Path, snapshot: Path, os_: OsAdapter
     """Snapshot the closed database ``source`` without opening it, through a recovered copy in the private
     directory ``work``. ``work`` is removed whether this succeeds or fails; a failure to remove it after another
     failure is attached to that error as a note, never hiding it."""
-    _new_directory(work, os_)
+    new_directory(work, os_)
     try:
         _recover_and_snapshot(source, work / source.name, snapshot)
     except BaseException as err:
@@ -403,7 +407,7 @@ def create_maintenance_backup(
     blobs: list[str] = []
     if kind == "store_full":
         blobs = sorted(blob_digests(root.cas_dir))
-        _copy_blobs(root.cas_dir, directory / _CAS, blobs, os_)
+        copy_blobs(root.cas_dir, directory / _CAS, blobs, os_)
         crashpoint("backup.after_blob_copy")
     _write_manifest(directory, kind, blobs, now, os_)
     return directory

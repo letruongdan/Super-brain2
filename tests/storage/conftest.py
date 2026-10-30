@@ -19,6 +19,7 @@ from superbrain.storage.ledger import LedgerEntry, ProjectionHandler
 from superbrain.storage.policy_store import PolicyStore
 from superbrain.storage.runtime import Runtime, open_runtime
 from superbrain.storage.store import Store
+from superbrain.storage.swap import recover_interrupted_swaps
 from superbrain.storage.writer import WriterLease, acquire_writer
 from tests.support.clock import FakeClock
 from tests.support.crash import run_child
@@ -190,12 +191,13 @@ def env(trusted_tmp: Path, os_: OsAdapters, clock: FakeClock) -> Iterator[Env]:
 @contextlib.contextmanager
 def maintenance_lease(path: Path, os_: OsAdapters | None = None) -> Iterator[tuple[DataRoot, WriterLease]]:
     """The maintenance start-up sequence without opening Store or PolicyStore: ``prepare_data_root`` ->
-    ``acquire_writer`` -> (``recover_interrupted_swaps``, added by Task 14) -> ``secure_subdirectories``.
+    ``acquire_writer`` -> ``recover_interrupted_swaps`` -> ``secure_subdirectories``.
 
     Yields ``(root, lease)``; the lease is released on exit.
     """
     adapters = os_ if os_ is not None else os_adapters()
     root = prepare_data_root(path, adapters)
     with acquire_writer(root, adapters) as lease:
+        recover_interrupted_swaps(root, lease, adapters)
         secure_subdirectories(root, lease, adapters)
         yield root, lease

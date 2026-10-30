@@ -29,7 +29,9 @@ KNOWN_PAUSEPOINTS: frozenset[str] = KNOWN_CRASHPOINTS | {"writer.held"}
 
 
 def crashpoint(name: str) -> None:
+    """Every crashpoint is also a pausepoint of the same name: it pauses first, then crashes if selected."""
     assert name in KNOWN_CRASHPOINTS, f"unregistered crashpoint {name!r}"
+    pausepoint(name)
     if os.environ.get("SUPERBRAIN_CRASHPOINT") == name:
         sys.stderr.write(f"CRASHPOINT_HIT {name}\n")
         sys.stderr.flush()

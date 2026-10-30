@@ -238,3 +238,11 @@ def test_released_lease_refuses_further_writes(trusted_tmp: Path) -> None:
         lease.raise_trust_hwm(1)
     with pytest.raises(AssertionError):
         lease.bump_epoch()
+
+
+def test_mid_slot_write_pauses_once_per_write(trusted_tmp: Path) -> None:
+    root = fresh_root(trusted_tmp)
+    # stdin is /dev/null, so each pause returns at once; acquire_writer writes exactly one slot.
+    result = run_child("acquire_writer", root.root, env={"SUPERBRAIN_PAUSEPOINT": "writer.mid_slot_write"})
+    assert result.returncode == 0
+    assert result.stderr.count("PAUSED writer.mid_slot_write") == 1

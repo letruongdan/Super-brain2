@@ -74,3 +74,25 @@ def test_pausepoint_blocks_until_a_line_arrives_on_stdin() -> None:
 def test_pausepoint_is_inert_without_matching_env() -> None:
     r = run_python(PAUSE, env={"SUPERBRAIN_PAUSEPOINT": "cas.after_rename"})
     assert r.returncode == 0 and r.stdout.strip() == "resumed" and "PAUSED" not in r.stderr
+
+
+def test_every_crashpoint_is_also_a_pausepoint() -> None:
+    proc = subprocess.Popen(
+        [sys.executable, "-I", "-c", SAME],
+        env={**os.environ, "SUPERBRAIN_PAUSEPOINT": "cas.after_rename"},
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    try:
+        assert proc.stderr is not None and proc.stdin is not None and proc.stdout is not None
+        assert proc.stderr.readline().strip() == "PAUSED cas.after_rename"
+        assert proc.poll() is None
+        proc.stdin.write("go\n")
+        proc.stdin.flush()
+        assert proc.wait(timeout=60) == 0  # resumed, and the crashpoint itself stayed inert
+        assert proc.stdout.read().strip() == "alive" and "CRASHPOINT_HIT" not in proc.stderr.read()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        for stream in (proc.stdin, proc.stdout, proc.stderr):
+            if stream is not None:
+                stream.close()

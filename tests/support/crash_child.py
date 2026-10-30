@@ -19,6 +19,7 @@ from superbrain.storage.backup import create_store_backup
 from superbrain.storage.cas import RetentionClass
 from superbrain.storage.kinds import CORE_KINDS, EntryKind, FieldType, KindRegistry
 from superbrain.storage.layout import prepare_data_root, secure_subdirectories
+from superbrain.storage.restore import restore_policy, restore_store
 from superbrain.storage.runtime import open_runtime
 from superbrain.storage.store import Store
 from superbrain.storage.writer import acquire_writer
@@ -124,6 +125,46 @@ def backup_store(data_root: Path, args: list[str]) -> None:
         runtime.close()
 
 
+def open_runtime_once(data_root: Path, args: list[str]) -> None:
+    open_runtime(data_root, os_adapters()).close()
+
+
+def _latest_backup(backups_dir: Path, kinds: tuple[str, ...]) -> Path:
+    """The newest complete backup of one of ``kinds``: names are ``<kind>-<UTC stamp>-<UUIDv7>``."""
+    found = []
+    for entry in backups_dir.iterdir():
+        kind, _, stamp_and_id = entry.name.partition("-")
+        if kind in kinds and "." not in entry.name and (entry / "manifest.json").is_file():
+            found.append((stamp_and_id, entry))
+    if not found:
+        raise AssertionError(f"no {kinds} backup in {backups_dir}")
+    return max(found)[1]
+
+
+def restore_from_latest(data_root: Path, args: list[str]) -> None:
+    """Open the runtime, close its store and restore the newest ``store``/``store_full`` backup under its lease."""
+    runtime = open_runtime(data_root, os_adapters())
+    try:
+        runtime.store.close()
+        backup = _latest_backup(runtime.root.backups_dir, ("store", "store_full"))
+        restore_store(runtime.root, runtime.lease, runtime.os_, backup, runtime.policy, datetime.now(UTC))
+    finally:
+        runtime.close()
+
+
+def restore_policy_from_latest(data_root: Path, args: list[str]) -> None:
+    """Open the runtime, close both stores and restore the newest ``policy`` backup under its lease."""
+    runtime = open_runtime(data_root, os_adapters())
+    try:
+        store_id = runtime.store.store_id
+        runtime.store.close()
+        runtime.policy.close()
+        backup = _latest_backup(runtime.root.backups_dir, ("policy",))
+        restore_policy(runtime.root, runtime.lease, runtime.os_, backup, store_id=store_id, now=datetime.now(UTC))
+    finally:
+        runtime.close()
+
+
 OPERATIONS: dict[str, Callable[[Path, list[str]], None]] = {
     "ping": ping,
     "acquire_writer": acquire_writer_once,
@@ -134,6 +175,9 @@ OPERATIONS: dict[str, Callable[[Path, list[str]], None]] = {
     "seed_event": seed_event,
     "tombstone_event": tombstone_event,
     "backup_store": backup_store,
+    "open_runtime": open_runtime_once,
+    "restore_from_latest": restore_from_latest,
+    "restore_policy_from_latest": restore_policy_from_latest,
 }
 
 

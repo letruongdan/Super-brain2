@@ -1,0 +1,168 @@
+"""Restore of the main store and of the policy store from a verified backup (spec 5.7).
+
+Both verify the backup and check the open handles before anything is staged, then publish the copy with
+``stage_and_swap``: the current directory is kept as ``*.replaced-*`` and nothing is deleted.
+
+A restored store is never opened here. The next ``open_runtime`` opens the published copy, and ``Store.open``
+reconciles every intent of the live policy store against the snapshot's own ``applied_intents``, so tombstones and
+quarantines recorded after the backup are applied again (I1-03).
+
+A restored policy store gets a trust generation above every earlier one, ``max(hwm, backup's) + 1``, written into
+the staged copy before it is published; then the lock's high-water mark is raised. A crash between the two is
+reconciled by ``PolicyStore.open``, which raises the mark to a generation above it.
+"""
+
+import os
+import sqlite3
+import sys
+from collections.abc import Sequence
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+
+from superbrain.core.canonical import digest_bytes
+from superbrain.core.errors import BrainError, ErrorCode
+from superbrain.core.faults import crashpoint
+from superbrain.ports.os import OsAdapters
+from superbrain.storage.backup import BackupManifest, copy_blobs, new_directory, verify_backup, write_new_file
+from superbrain.storage.layout import DataRoot
+from superbrain.storage.policy_store import PolicyStore
+from superbrain.storage.schema import POLICY_MIGRATIONS, STORE_MIGRATIONS, Migration
+from superbrain.storage.swap import stage_and_swap
+from superbrain.storage.writer import WriterLease
+
+
+@dataclass(frozen=True)
+class RestoreReport:
+    restored_from: Path
+    replaced_dir: Path
+    """Where the previous ``store/`` or ``policy/`` was kept."""
+    new_epoch: int
+    trust_generation: int | None
+    """The restored policy store's new trust generation; ``None`` for a store restore."""
+
+
+def _check_lease(root: DataRoot, lease: WriterLease) -> None:
+    if not lease.held or lease.root != root:
+        raise AssertionError("a restore needs a held writer lease for this data root")
+
+
+def _copy_snapshot(backup: Path, name: str, manifest: BackupManifest, dest: Path, os_: OsAdapters) -> None:
+    """Copy the backup's snapshot ``name`` to the new file ``dest``, durable and owner-only, checking that its
+    bytes are still the verified ones."""
+    try:
+        data = (backup / name).read_bytes()
+    except OSError as err:
+        raise BrainError(ErrorCode.IO_ERROR, f"cannot read the snapshot of {backup.name}: {err}") from err
+    if digest_bytes(data) != manifest.db_digest:
+        raise BrainError(ErrorCode.INTEGRITY_FAILURE, f"the snapshot of {backup.name} changed after verification")
+    write_new_file(dest, data, os_)
+
+
+def restore_store(
+    root: DataRoot,
+    lease: WriterLease,
+    os_: OsAdapters,
+    backup: Path,
+    policy: PolicyStore,
+    now: datetime,
+    *,
+    migrations: Sequence[Migration] = STORE_MIGRATIONS,
+) -> RestoreReport:
+    """Replace ``store/`` with the ``store`` or ``store_full`` backup at ``backup``.
+
+    The backup must verify against ``policy.store_id`` (``INTEGRITY_FAILURE`` otherwise) and be logically verified:
+    a ``store_full`` whose schema ``migrations`` cannot read is ``UNSUPPORTED_VERSION``. An open ``store`` handle is
+    ``STORE_BUSY``. All three are checked before anything is staged. The stage receives ``brain.db``, every listed
+    blob under ``cas/`` and an empty ``staging/``; it is not opened, and reconciliation happens when the next
+    ``open_runtime`` opens the published store.
+    """
+    _check_lease(root, lease)
+    kinds = frozenset({"store", "store_full"})
+    manifest = verify_backup(backup, expected_kind=kinds, expected_store_id=policy.store_id, migrations=migrations)
+    if not manifest.logical_verified:
+        raise BrainError(
+            ErrorCode.UNSUPPORTED_VERSION,
+            f"the backup {backup.name} has schema {manifest.schema_version}, which this version cannot verify",
+        )
+    if "store" in lease.open_handles():
+        raise BrainError(ErrorCode.STORE_BUSY, "the store is open; close it before restoring it")
+
+    def build(stage: Path) -> None:
+        _copy_snapshot(backup, "brain.db", manifest, stage / "brain.db", os_)
+        copy_blobs(backup / "cas", stage / "cas", manifest.blobs, os_)
+        new_directory(stage / "staging", os_)
+
+    replaced = stage_and_swap(root, lease, os_, target="store", purpose="restoring", build=build, now=now)
+    return RestoreReport(restored_from=backup, replaced_dir=replaced, new_epoch=lease.epoch, trust_generation=None)
+
+
+def _write_generation(path: Path, generation: int) -> None:
+    """Set the trust generation of the closed policy database ``path`` and make the file durable."""
+    try:
+        db = sqlite3.connect(path, isolation_level=None)
+    except sqlite3.Error as exc:
+        raise BrainError(ErrorCode.IO_ERROR, f"cannot open the staged policy store: {exc}") from exc
+    try:
+        try:
+            db.execute("PRAGMA synchronous=FULL")
+            if sys.platform == "darwin":
+                db.execute("PRAGMA fullfsync=ON")
+            rows = db.execute("UPDATE trust SET generation = ? WHERE id = 1", (generation,)).rowcount
+        except sqlite3.Error as exc:
+            raise BrainError(ErrorCode.IO_ERROR, f"cannot write the staged trust generation: {exc}") from exc
+        if rows != 1:
+            raise BrainError(ErrorCode.INTEGRITY_FAILURE, "the staged policy store has no trust row")
+    finally:
+        db.close()
+    companions = (path.with_name(f"{path.name}-journal"), path.with_name(f"{path.name}-wal"))
+    leftovers = [p.name for p in companions if p.exists()]
+    if leftovers:
+        raise BrainError(ErrorCode.IO_ERROR, f"the staged policy store kept {leftovers} after closing")
+    try:
+        fd = os.open(path, os.O_RDWR | getattr(os, "O_BINARY", 0))
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError as err:
+        raise BrainError(ErrorCode.IO_ERROR, f"cannot make the staged policy store durable: {err}") from err
+
+
+def restore_policy(
+    root: DataRoot,
+    lease: WriterLease,
+    os_: OsAdapters,
+    backup: Path,
+    *,
+    store_id: str,
+    now: datetime,
+    migrations: Sequence[Migration] = POLICY_MIGRATIONS,
+) -> RestoreReport:
+    """Replace ``policy/`` with the ``policy`` backup at ``backup``, under a trust generation above every earlier one.
+
+    An open ``store`` or ``policy`` handle is ``STORE_BUSY``, then the backup must verify against ``store_id``;
+    both before anything is staged. Afterwards the caller opens a new runtime, so the store binds to the restored
+    policy store and reconciles against it.
+    """
+    _check_lease(root, lease)
+    busy = sorted({"store", "policy"} & lease.open_handles())
+    if busy:
+        raise BrainError(ErrorCode.STORE_BUSY, f"close {' and '.join(busy)} before restoring the policy store")
+    manifest = verify_backup(backup, expected_kind="policy", expected_store_id=store_id, migrations=migrations)
+    if manifest.trust_generation is None:  # verify_backup requires it for a policy backup
+        raise AssertionError("a verified policy backup has a trust generation")
+    generation = max(lease.state().trust_generation_hwm, manifest.trust_generation) + 1
+
+    def build(stage: Path) -> None:
+        staged = stage / "policy.db"
+        _copy_snapshot(backup, "policy.db", manifest, staged, os_)
+        _write_generation(staged, generation)
+        crashpoint("restoring.policy.after_generation_persist")
+
+    replaced = stage_and_swap(root, lease, os_, target="policy", purpose="restoring", build=build, now=now)
+    crashpoint("restoring.policy.before_hwm_update")
+    lease.raise_trust_hwm(generation)
+    return RestoreReport(
+        restored_from=backup, replaced_dir=replaced, new_epoch=lease.epoch, trust_generation=generation
+    )
