@@ -94,6 +94,9 @@ def _meta_text(entry: LedgerEntry, name: str) -> str:
     return value
 
 
+_CANONICAL_TIMESTAMP = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}Z")
+
+
 class HolderProjection:
     """``p_cas_holders_``: one row per (holder, digest) currently held."""
 
@@ -122,6 +125,11 @@ class HolderProjection:
         expires_at = entry.meta.get("expires_at")
         if expires_at is not None and not isinstance(expires_at, str):
             raise BrainError(ErrorCode.INTEGRITY_FAILURE, f"ledger entry {entry.sequence}: expires_at is not text")
+        if expires_at is not None and not _CANONICAL_TIMESTAMP.fullmatch(expires_at):
+            raise BrainError(
+                ErrorCode.INTEGRITY_FAILURE,
+                f"ledger entry {entry.sequence}: expires_at is not a canonical fixed-width timestamp",
+            )
         db.execute(
             f"INSERT INTO {prefix} (digest, holder_kind, holder_id, retention_class, expires_at)"
             " VALUES (?, ?, ?, ?, ?) ON CONFLICT (holder_kind, holder_id, digest)"
@@ -235,15 +243,17 @@ class ContentStore:
             raise BrainError(ErrorCode.INTEGRITY_FAILURE, f"a holder of {digest} has an unknown retention") from err
 
     def due_holders(self, cutoff: str) -> list[tuple[str, str]]:
-        """Sorted distinct ``(holder_kind, holder_id)`` of the non-durable holds expiring at or before ``cutoff``.
+        """Sorted ``(holder_kind, holder_id)`` of the holders whose every hold is non-durable, has an expiry and
+        expires at or before ``cutoff``.
 
-        ``cutoff`` is a canonical ``YYYY-MM-DDTHH:MM:SS.ffffffZ`` timestamp, compared as text.
+        A holder with any durable, never-expiring or not yet due hold is left out: a tombstone acts on the whole
+        holder. ``cutoff`` is a canonical ``YYYY-MM-DDTHH:MM:SS.ffffffZ`` timestamp, compared as text.
         """
         self._check()
         rows = self._query(
-            f"SELECT DISTINCT holder_kind, holder_id FROM {HOLDERS_TABLE}"
-            " WHERE retention_class != ? AND expires_at IS NOT NULL AND expires_at <= ?"
-            " ORDER BY holder_kind, holder_id",
+            f"SELECT holder_kind, holder_id FROM {HOLDERS_TABLE} GROUP BY holder_kind, holder_id"
+            " HAVING SUM(CASE WHEN retention_class != ? AND expires_at IS NOT NULL AND expires_at <= ?"
+            " THEN 0 ELSE 1 END) = 0 ORDER BY holder_kind, holder_id",
             (RetentionClass.DURABLE.value, cutoff),
         )
         return [(str(kind), str(holder)) for kind, holder in rows]

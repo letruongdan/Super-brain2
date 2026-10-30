@@ -50,14 +50,22 @@ def default_expiry(retention: RetentionClass, now: datetime, policy: RetentionPo
 
 
 def expire_due(store: Store, policy: PolicyStore, now: datetime) -> ExpiryReport:
-    """Record one tombstone intent per holder with a non-durable hold expiring at or before ``now``, then reconcile.
+    """Record one tombstone intent per due holder, then reconcile; returns the holders it expired.
 
-    A ``now`` earlier than every expiry (a clock that went backwards) expires nothing.
+    A tombstone acts on a whole holder, so a holder is due only when every one of its holds is non-durable, has an
+    expiry and is due at ``now``; a holder with any durable, never-expiring or not yet due hold is skipped entirely
+    and left out of the report. A ``now`` earlier than every expiry (a clock that went backwards) expires nothing.
+
+    If ``reconcile_policy`` fails after the intents were recorded, they stay pending and the next ``expire_due`` or
+    ``Store.open`` applies each exactly once. A holder that is already tombstoned but not yet reconciled still shows
+    as due, but no second intent is recorded for it; the pending one is applied by the same reconcile.
     """
     if now.tzinfo is None or now.utcoffset() is None:
         raise BrainError(ErrorCode.INVALID_INPUT, "now must be timezone-aware")
     due = store.cas.due_holders(utc_timestamp(now))
     for holder_kind, holder_id in due:
+        if policy.is_tombstoned(holder_kind, holder_id):
+            continue
         policy.record_intent(IntentKind.TOMBSTONE, {"holder_kind": holder_kind, "holder_id": holder_id})
     if due:
         store.reconcile_policy()
