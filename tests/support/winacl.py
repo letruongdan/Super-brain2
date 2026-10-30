@@ -66,3 +66,14 @@ def fake_unsupported_ace(monkeypatch: pytest.MonkeyPatch) -> None:
         return original(path, info)
 
     monkeypatch.setattr(permissions, "_security_descriptor", descriptor)
+
+
+def security_sddl(path: Path) -> str:
+    """Owner and DACL of ``path`` as an SDDL string, for "unchanged" comparisons."""
+    assert sys.platform == "win32"
+    import win32security
+
+    info = win32security.OWNER_SECURITY_INFORMATION | win32security.DACL_SECURITY_INFORMATION
+    sd = win32security.GetNamedSecurityInfo(str(path), win32security.SE_FILE_OBJECT, info)
+    sddl = win32security.ConvertSecurityDescriptorToStringSecurityDescriptor(sd, win32security.SDDL_REVISION_1, info)
+    return str(sddl)

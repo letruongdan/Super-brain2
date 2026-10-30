@@ -6,6 +6,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Protocol
 
+from superbrain.ports.clock import Clock
+
 
 class PathSafety(Protocol):
     def reject_unsafe_path(self, raw: str) -> None:
@@ -78,3 +80,34 @@ class DurablePublisher(Protocol):
     def durability(self, directory: Path, env: Mapping[str, str]) -> DurabilityReport:
         """Report the tier ``directory`` can honestly claim, with reasons for anything below power-loss."""
         ...
+
+
+class LockHandle(Protocol):
+    """An exclusive inter-process lock on a lock file, plus its payload (the bytes after the lock region)."""
+
+    def read_payload(self) -> bytes:
+        """The whole payload; payload offset 0 is the first byte after the lock region (empty for a new file)."""
+        ...
+
+    def write_payload(self, offset: int, data: bytes) -> None:
+        """Write ``data`` at payload ``offset`` and make it durable before returning."""
+        ...
+
+    def release(self) -> None:
+        """Unlock and close; never deletes the lock file. Idempotent."""
+        ...
+
+
+class LockFactory(Protocol):
+    def acquire(self, path: Path) -> LockHandle:
+        """Lock the existing file ``path`` without waiting; ``BrainError(WRITER_HELD)`` if another holder has it."""
+        ...
+
+
+@dataclass(frozen=True)
+class OsAdapters:
+    paths: PathSafety
+    permissions: PermissionGuard
+    publisher: DurablePublisher
+    locks: LockFactory
+    clock: Clock
