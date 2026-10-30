@@ -334,12 +334,9 @@ def create_policy_backup(policy: "PolicyStore", os_: OsAdapters, now: datetime) 
     return directory
 
 
-def _snapshot_closed_db(source: Path, work: Path, snapshot: Path, os_: OsAdapters) -> None:
-    """Snapshot the closed database ``source`` without opening it: copy it and its ``-wal`` (never the ``-shm``,
-    which SQLite rebuilds) into the private directory ``work``, open the copy writable so SQLite recovers the WAL
-    into it, run ``_snapshot_db`` from there, then close the copy and remove ``work``."""
-    _new_directory(work, os_)
-    copy = work / source.name
+def _recover_and_snapshot(source: Path, copy: Path, snapshot: Path) -> None:
+    """Copy ``source`` and its ``-wal`` (never the ``-shm``, which SQLite rebuilds) to ``copy``, open the copy
+    writable so SQLite recovers the WAL into it, and run ``_snapshot_db`` from there; the copy is always closed."""
     wal = db_files(source)[1]
     try:
         shutil.copyfile(source, copy)
@@ -355,6 +352,21 @@ def _snapshot_closed_db(source: Path, work: Path, snapshot: Path, os_: OsAdapter
         _snapshot_db(db, snapshot)
     finally:
         db.close()
+
+
+def _snapshot_closed_db(source: Path, work: Path, snapshot: Path, os_: OsAdapters) -> None:
+    """Snapshot the closed database ``source`` without opening it, through a recovered copy in the private
+    directory ``work``. ``work`` is removed whether this succeeds or fails; a failure to remove it after another
+    failure is attached to that error as a note, never hiding it."""
+    _new_directory(work, os_)
+    try:
+        _recover_and_snapshot(source, work / source.name, snapshot)
+    except BaseException as err:
+        try:
+            shutil.rmtree(work)
+        except OSError as cleanup:
+            err.add_note(f"the work directory {work} could not be removed: {cleanup}")
+        raise
     try:
         shutil.rmtree(work)
     except OSError as err:

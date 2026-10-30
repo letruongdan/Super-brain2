@@ -439,6 +439,41 @@ def test_full_backup_physical_completeness(trusted_tmp: Path, clock: FakeClock, 
     assert e.value.code == ErrorCode.INTEGRITY_FAILURE
 
 
+@pytest.mark.parametrize("failure", ["copy", "snapshot", "snapshot_and_cleanup"])
+def test_failed_maintenance_backup_removes_its_work_directory(
+    trusted_tmp: Path, clock: FakeClock, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    seed_held_blob(trusted_tmp)
+    boom = BrainError(ErrorCode.IO_ERROR, "injected snapshot failure")
+    if failure == "copy":
+        monkeypatch.setattr(shutil, "copyfile", raising(OSError(28, "injected: no space left")))
+    else:
+        monkeypatch.setattr(backup_module, "_snapshot_db", raising(boom))
+    if failure == "snapshot_and_cleanup":
+        monkeypatch.setattr(shutil, "rmtree", raising(PermissionError("injected: cannot remove")))
+    with maintenance_lease(trusted_tmp) as (root, lease), pytest.raises(BrainError) as e:
+        create_maintenance_backup(root, lease, os_adapters(), target="store", now=clock.now())
+    monkeypatch.undo()
+    leftovers = [p.relative_to(trusted_tmp).as_posix() for p in (trusted_tmp / "backups").rglob(".work-*")]
+    if failure == "copy":
+        assert e.value.code == ErrorCode.IO_ERROR and "cannot copy" in e.value.message and leftovers == []
+    elif failure == "snapshot":
+        assert e.value is boom and leftovers == []
+    else:  # the original error propagates; the failed cleanup is attached to it, not hidden
+        assert e.value is boom and len(leftovers) == 1
+        assert any("could not be removed" in note for note in getattr(e.value, "__notes__", []))
+
+
+def test_finished_backup_with_a_leftover_work_directory_is_rejected(trusted_tmp: Path, clock: FakeClock) -> None:
+    seed_held_blob(trusted_tmp)
+    path = full_backup(trusted_tmp, clock)
+    (path / ".work-0192f3a4-5b6c-7d8e-9f01-000000000001").mkdir()
+    (path / ".work-0192f3a4-5b6c-7d8e-9f01-000000000001" / "brain.db").write_bytes(b"copy")
+    with pytest.raises(BrainError) as e:
+        verify_full(path, store_id_of(trusted_tmp))
+    assert e.value.code == ErrorCode.INTEGRITY_FAILURE and "entries" in e.value.message
+
+
 def test_maintenance_backup_requires_target_closed(env: Env, clock: FakeClock) -> None:
     for target in ("store", "policy"):
         with pytest.raises(BrainError) as e:
