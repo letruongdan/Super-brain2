@@ -2,9 +2,10 @@
 
 Every payload lives in ``store/cas/<aa>/<64 hex>``, named by the sha256 of its bytes; the ledger carries only the
 digest. ``ContentStore.put`` publishes a blob durably *before* anything refers to it: staging write (durable),
-then, for a new shard, create + secure it and make its entry in ``cas/`` durable, then an atomic rename into the
-shard (whose entry is made durable too). Only after ``put`` returns does ``Txn.hold`` record a holder, inside a
-write transaction that first re-checks the blob, so a crash in between leaves an orphan, never a dangling holder.
+a re-hash of the staged file, then, for a new shard, create + secure it and make its entry in ``cas/`` durable,
+then an atomic rename into the shard (whose entry is made durable too). Only after ``put`` returns does
+``Txn.hold`` record a holder, inside a write transaction that first re-checks the blob, so a crash in between
+leaves an orphan, never a dangling holder.
 
 Holders are the ``cas_holders`` projection of the reserved ``cas.hold``/``cas.release`` entries; a ``cas.hold``
 for a tombstoned holder is skipped, so a replay applies tombstones recorded since.
@@ -16,7 +17,6 @@ import os
 import re
 import sqlite3
 from collections.abc import Callable
-from enum import StrEnum
 from pathlib import Path
 
 from superbrain.core.canonical import digest_bytes
@@ -25,6 +25,7 @@ from superbrain.core.faults import crashpoint
 from superbrain.core.ids import new_id
 from superbrain.ports.os import OsAdapters
 from superbrain.ports.policy import PolicyView
+from superbrain.storage.kinds import RetentionClass as RetentionClass
 from superbrain.storage.layout import DataRoot
 from superbrain.storage.ledger import LedgerEntry, io_error
 
@@ -34,12 +35,6 @@ _BLOB_NAME = re.compile(r"[0-9a-f]{64}")
 _CHUNK = 1 << 20
 _ERROR_DISK_FULL = 112  # Windows ERROR_DISK_FULL
 HOLDERS_TABLE = "p_cas_holders_"
-
-
-class RetentionClass(StrEnum):
-    EVENT_PAYLOAD = "event_payload"
-    EVIDENCE = "evidence"
-    DURABLE = "durable"
 
 
 def _os_error(what: str, err: OSError) -> BrainError:
@@ -141,8 +136,10 @@ class ContentStore:
     def put(self, data: bytes) -> str:
         """Publish ``data`` durably and return its digest; an existing blob is verified, never rewritten.
 
-        An existing blob whose bytes do not match is ``INTEGRITY_FAILURE``. On any failure the staging file is
-        removed and the error propagates. ``put`` adds no holder: call ``Txn.hold`` once it has returned.
+        An existing blob whose bytes do not match is ``INTEGRITY_FAILURE``; a matching one has its directory entry
+        made durable again. The staging file is re-hashed before publishing: a mismatch is ``INTEGRITY_FAILURE``.
+        On any failure the staging file is removed and the error propagates. ``put`` adds no holder: call
+        ``Txn.hold`` once it has returned.
         """
         self._check()
         digest = digest_bytes(data)
@@ -151,6 +148,8 @@ class ContentStore:
         if found is not None:
             if found != digest:
                 raise BrainError(ErrorCode.INTEGRITY_FAILURE, f"the stored blob {digest} does not match its digest")
+            # An earlier put may have renamed it into place and failed before its directory entry was durable.
+            self._os.publisher.sync_directory(final.parent)
             return digest
         staging = self._staging_dir / f"{new_id()}.tmp"
         publisher = self._os.publisher
@@ -158,6 +157,8 @@ class ContentStore:
             try:
                 publisher.write_new(staging, data)
                 crashpoint("cas.after_staging_write")
+                if _file_digest(staging) != digest:
+                    raise BrainError(ErrorCode.INTEGRITY_FAILURE, f"the staged bytes of {digest} do not match it")
                 self._ensure_shard(final.parent)
                 publisher.publish(staging, final)
             except FileExistsError as err:

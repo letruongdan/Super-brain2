@@ -27,6 +27,14 @@ _TIMESTAMP = re.compile(r"([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2})
 _INT_MIN, _INT_MAX = -(2**63), 2**63 - 1
 
 
+class RetentionClass(StrEnum):
+    """How long a blob holder keeps its blob; the ``retention`` enum of ``cas.hold``."""
+
+    EVENT_PAYLOAD = "event_payload"
+    EVIDENCE = "evidence"
+    DURABLE = "durable"
+
+
 class FieldType(StrEnum):
     UUID = "uuid"
     DIGEST = "digest"
@@ -175,7 +183,7 @@ CORE_KINDS: tuple[EntryKind, ...] = (
             "retention": FieldType.ENUM,
             "expires_at": FieldType.TIMESTAMP,
         },
-        {"holder_kind": _HOLDER_KINDS, "retention": frozenset({"event_payload", "evidence", "durable"})},
+        {"holder_kind": _HOLDER_KINDS, "retention": frozenset(v.value for v in RetentionClass)},
         nullable=frozenset({"expires_at"}),
         reserved=True,
     ),

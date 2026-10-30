@@ -10,7 +10,7 @@ import sqlite3
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Protocol
+from typing import Protocol
 
 from superbrain.core.canonical import canonical_json
 from superbrain.core.errors import BrainError, ErrorCode
@@ -18,10 +18,7 @@ from superbrain.core.ids import new_id
 from superbrain.core.jsonvalue import JsonValue
 from superbrain.ports.clock import Clock
 from superbrain.ports.policy import PolicyView
-from superbrain.storage.kinds import KindRegistry, is_uuid, validate_envelope
-
-if TYPE_CHECKING:
-    from superbrain.storage.cas import RetentionClass
+from superbrain.storage.kinds import KindRegistry, RetentionClass, is_uuid, validate_envelope
 
 _SAVEPOINT = "ledger_entry"
 _CAS_ACTOR = "system:cas"
@@ -79,6 +76,24 @@ def utc_timestamp(moment: datetime) -> str:
     if moment.tzinfo is None or moment.utcoffset() is None:
         raise AssertionError("timestamps must be timezone-aware datetimes")
     return moment.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def cas_hold_meta(
+    digest: str, holder_kind: str, holder_id: str, retention: RetentionClass, expires_at: datetime | None
+) -> dict[str, JsonValue]:
+    """The ``cas.hold`` meta for these arguments, not yet validated against the kind's schema.
+
+    ``expires_at`` must be ``None`` or a datetime (anything else is ``INVALID_INPUT``); a naive one is a bug.
+    """
+    if expires_at is not None and not isinstance(expires_at, datetime):
+        raise BrainError(ErrorCode.INVALID_INPUT, "expires_at must be a timezone-aware datetime or None")
+    return {
+        "digest": digest,
+        "holder_kind": holder_kind,
+        "holder_id": holder_id,
+        "retention": str(retention),
+        "expires_at": None if expires_at is None else utc_timestamp(expires_at),
+    }
 
 
 def _malformed(sequence: object, what: str) -> BrainError:
@@ -234,7 +249,7 @@ class Txn:
         digest: str,
         holder_kind: str,
         holder_id: str,
-        retention: "RetentionClass",
+        retention: RetentionClass,
         expires_at: datetime | None,
     ) -> None:
         """Record that ``(holder_kind, holder_id)`` holds the blob ``digest`` until ``expires_at`` (``None``: no
@@ -244,13 +259,7 @@ class Txn:
         is missing or does not hash to ``digest`` is ``NOT_FOUND`` and nothing is written.
         """
         self._check()
-        meta: dict[str, JsonValue] = {
-            "digest": digest,
-            "holder_kind": holder_kind,
-            "holder_id": holder_id,
-            "retention": str(retention),
-            "expires_at": None if expires_at is None else utc_timestamp(expires_at),
-        }
+        meta = cas_hold_meta(digest, holder_kind, holder_id, retention, expires_at)
         self._kinds.validate("cas.hold", meta)
         if not self._blob_intact(digest):
             raise BrainError(ErrorCode.NOT_FOUND, f"blob {digest} is missing or does not match its digest")

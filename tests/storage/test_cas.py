@@ -13,9 +13,12 @@ from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.ports.os import OsAdapters
 from superbrain.storage.cas import ContentStore, HolderProjection, RetentionClass
 from superbrain.storage.kinds import CORE_KINDS, EntryKind, FieldType, KindRegistry
+from superbrain.storage.kinds import RetentionClass as KindsRetentionClass
+from superbrain.storage.layout import prepare_data_root, secure_subdirectories
 from superbrain.storage.ledger import Txn
 from superbrain.storage.store import Store
-from tests.storage.conftest import CLOCK_START, STORE_ID, StaticPolicy, StoreFactory, seed_store
+from superbrain.storage.writer import acquire_writer
+from tests.storage.conftest import CLOCK_START, DEMO_KINDS, STORE_ID, StaticPolicy, StoreFactory, seed_store
 from tests.support.crash import run_child, run_until_crash
 from tests.support.fs import corrupt_bytes
 
@@ -133,6 +136,30 @@ def test_disk_full_leaves_no_blob_or_staging(store: Store, monkeypatch: pytest.M
     assert list(staging_dir(store).iterdir()) == [] and not store.cas.exists(digest_bytes(b"x" * 1000))
 
 
+def test_staging_file_that_does_not_hash_to_the_digest_is_never_published(
+    store: Store, os_: OsAdapters, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = os_.publisher.write_new
+    published: list[Path] = []
+    monkeypatch.setattr(os_.publisher, "write_new", lambda path, data: real(path, data + b"bit rot"))
+    monkeypatch.setattr(os_.publisher, "publish", lambda staging, final: published.append(final))
+    with pytest.raises(BrainError) as e:
+        store.cas.put(b"intended")
+    assert e.value.code == ErrorCode.INTEGRITY_FAILURE and published == []
+    assert list(staging_dir(store).iterdir()) == [] and not store.cas.exists(digest_bytes(b"intended"))
+
+
+def test_put_of_an_existing_blob_makes_its_shard_entry_durable_again(
+    store: Store, os_: OsAdapters, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    d = store.cas.put(b"again")
+    synced: list[Path] = []
+    monkeypatch.setattr(os_.publisher, "sync_directory", synced.append)
+    monkeypatch.setattr(os_.publisher, "write_new", raising(AssertionError("an existing blob is not rewritten")))
+    assert store.cas.put(b"again") == d
+    assert synced == [blob_file(store, d).parent]
+
+
 def test_failed_publish_removes_staging_and_raises_the_original_error(
     store: Store, os_: OsAdapters, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -232,6 +259,15 @@ def test_hold_with_a_naive_expiry_is_refused(store: Store) -> None:
     assert list(store.entries()) == []
 
 
+@pytest.mark.parametrize("expires_at", ["2027-01-01T00:00:00Z", 1700000000, T0.date()])
+def test_hold_with_a_non_datetime_expiry_is_invalid_input(store: Store, expires_at: object) -> None:
+    d = store.cas.put(b"typed")
+    with pytest.raises(BrainError) as e:
+        with store.transaction() as t:
+            t.hold(d, "event", E1, RetentionClass.EVENT_PAYLOAD, expires_at)  # type: ignore[arg-type]
+    assert e.value.code == ErrorCode.INVALID_INPUT and list(store.entries()) == []
+
+
 def test_hold_of_missing_blob_is_refused(store: Store) -> None:
     with pytest.raises(BrainError) as e:
         with store.transaction() as t:
@@ -316,6 +352,31 @@ def test_store_content_puts_and_holds(store: Store) -> None:
     assert store.cas.holders(d) == [("artifact", E1, RetentionClass.DURABLE)] and store.cas.orphans() == []
 
 
+@pytest.mark.parametrize(
+    "fields",
+    [
+        ("unknown", E1, RetentionClass.EVENT_PAYLOAD, None),
+        ("event", "not-a-uuid", RetentionClass.EVENT_PAYLOAD, None),
+        ("event", E1, "forever", None),
+        ("event", E1, RetentionClass.EVENT_PAYLOAD, "tomorrow"),
+    ],
+)
+def test_store_content_with_invalid_holder_fields_stores_nothing(
+    store: Store, fields: tuple[str, str, RetentionClass, datetime | None]
+) -> None:
+    with pytest.raises(BrainError) as e:
+        store.store_content(b"never stored", *fields)
+    assert e.value.code == ErrorCode.INVALID_INPUT
+    assert store.cas.orphans() == [] and not store.cas.exists(digest_bytes(b"never stored"))
+    assert list(store.entries()) == []
+
+
+def test_store_content_with_a_naive_expiry_stores_nothing(store: Store) -> None:
+    with pytest.raises(AssertionError):
+        store.store_content(b"naive", "event", E1, RetentionClass.EVENT_PAYLOAD, datetime(2027, 1, 1))
+    assert store.cas.orphans() == [] and list(store.entries()) == []
+
+
 def _vanishing_put(store: Store, monkeypatch: pytest.MonkeyPatch, times: int) -> list[str]:
     """Make the first ``times`` puts lose their blob right after returning, as a concurrent GC would."""
     real = store.cas.put
@@ -347,6 +408,12 @@ def test_store_content_gives_up_after_the_second_failure(store: Store, monkeypat
 
 
 # --- registration --------------------------------------------------------------------------------------------
+
+
+def test_retention_enum_of_cas_hold_is_the_retention_class() -> None:
+    hold = next(k for k in CORE_KINDS if k.kind == "cas.hold")
+    assert RetentionClass is KindsRetentionClass
+    assert hold.enums["retention"] == frozenset(v.value for v in RetentionClass)
 
 
 def test_holders_and_core_kinds_are_registered_by_default(store_factory: StoreFactory) -> None:
@@ -388,6 +455,31 @@ def test_conflicting_core_kind_or_holder_name_is_refused(store_factory: StoreFac
 
 
 # --- open and crashes ----------------------------------------------------------------------------------------
+
+
+def test_store_without_holder_table_replays_holders_on_open(trusted_tmp: Path, os_: OsAdapters) -> None:
+    root = prepare_data_root(trusted_tmp / "r", os_)
+    with acquire_writer(root, os_) as lease:
+        secure_subdirectories(root, lease, os_)
+        store = Store.create(root, lease, os_, StaticPolicy(), [], KindRegistry(DEMO_KINDS))
+        kept, released = store.cas.put(b"kept"), store.cas.put(b"released")
+        with store.transaction() as t:
+            t.hold(kept, "evidence", V1, RetentionClass.EVIDENCE, T0)
+            t.hold(released, "event", E1, RetentionClass.EVENT_PAYLOAD, None)
+            t.release(released, "event", E1, reason="expired")
+        # A store from before the holder projection: cas.* entries in the ledger, no p_cas_holders_ table.
+        with store.transaction() as t:
+            t.db.execute("DROP TABLE p_cas_holders_")
+            tables = t.db.execute("SELECT name FROM sqlite_master WHERE name LIKE 'p_cas_holders_%'").fetchall()
+        assert tables == []
+        store.close()
+        store = Store.open(root, lease, os_, StaticPolicy(), [], KindRegistry(DEMO_KINDS))
+        assert store.cas.holders(kept) == [("evidence", V1, RetentionClass.EVIDENCE)]
+        assert store.cas.holders(released) == [] and store.cas.orphans() == [released]
+        with store.transaction() as t:
+            expiry = t.db.execute("SELECT expires_at FROM p_cas_holders_").fetchall()
+        assert expiry == [("2026-10-30T12:00:00.000000Z",)]
+        store.close()
 
 
 def test_open_removes_unfinished_staging_files(trusted_tmp: Path, reopen: Callable[..., Store]) -> None:

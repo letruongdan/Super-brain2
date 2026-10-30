@@ -14,6 +14,7 @@ from contextlib import AbstractContextManager, contextmanager
 from datetime import datetime
 from pathlib import Path
 
+from superbrain.core.canonical import digest_bytes
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.faults import crashpoint
 from superbrain.core.ids import new_id
@@ -27,6 +28,7 @@ from superbrain.storage.ledger import (
     ProjectionHandler,
     Txn,
     apply_to_handlers,
+    cas_hold_meta,
     io_error,
     iter_entries,
     live_prefix,
@@ -445,11 +447,14 @@ class Store:
     ) -> str:
         """``put`` ``data``, then ``hold`` it in a transaction of its own; returns the digest.
 
+        The holder fields are validated first, so invalid ones store nothing (no orphan blob).
         A ``NOT_FOUND`` from ``hold`` means the blob vanished between the two (GC removed it as an orphan): the
         ``put`` and ``hold`` are retried exactly once, and a second failure propagates.
         """
         self._check()
         self._require_no_transaction()
+        meta = cas_hold_meta(digest_bytes(data), holder_kind, holder_id, retention, expires_at)
+        self._kinds.validate("cas.hold", meta)
         digest = self._cas.put(data)
         try:
             self._hold(digest, holder_kind, holder_id, retention, expires_at)
