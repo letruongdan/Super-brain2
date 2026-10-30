@@ -9,8 +9,8 @@ import json
 import sqlite3
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC
-from typing import Protocol
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Protocol
 
 from superbrain.core.canonical import canonical_json
 from superbrain.core.errors import BrainError, ErrorCode
@@ -20,7 +20,11 @@ from superbrain.ports.clock import Clock
 from superbrain.ports.policy import PolicyView
 from superbrain.storage.kinds import KindRegistry, is_uuid, validate_envelope
 
+if TYPE_CHECKING:
+    from superbrain.storage.cas import RetentionClass
+
 _SAVEPOINT = "ledger_entry"
+_CAS_ACTOR = "system:cas"
 _COLUMNS = (
     "sequence, entry_id, kind, schema_version, handler_version, writer_epoch, actor, owner_id, recorded_at, meta, refs"
 )
@@ -68,6 +72,13 @@ def rebuild_prefix(handler: ProjectionHandler) -> str:
 
 def io_error(what: str, exc: sqlite3.Error) -> BrainError:
     return BrainError(ErrorCode.IO_ERROR, f"{what}: {exc}")
+
+
+def utc_timestamp(moment: datetime) -> str:
+    """``moment`` as the canonical TIMESTAMP ``YYYY-MM-DDTHH:MM:SS.ffffffZ``; a naive datetime is a bug."""
+    if moment.tzinfo is None or moment.utcoffset() is None:
+        raise AssertionError("timestamps must be timezone-aware datetimes")
+    return moment.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 def _malformed(sequence: object, what: str) -> BrainError:
@@ -162,8 +173,10 @@ class Txn:
         schema_version: int,
         clock: Clock,
         check_owner: Callable[[], None],
+        blob_intact: Callable[[str], bool],
     ) -> None:
         self._db = db
+        self._blob_intact = blob_intact
         self._kinds = kinds
         self._handlers = tuple(handlers)
         self._policy = policy
@@ -216,6 +229,44 @@ class Txn:
             raise AssertionError(f"{kind} is not reserved; use append")
         return self._write_entry(kind, actor=actor, owner_id=owner_id, meta=meta, refs=refs)
 
+    def hold(
+        self,
+        digest: str,
+        holder_kind: str,
+        holder_id: str,
+        retention: "RetentionClass",
+        expires_at: datetime | None,
+    ) -> None:
+        """Record that ``(holder_kind, holder_id)`` holds the blob ``digest`` until ``expires_at`` (``None``: no
+        expiry).
+
+        The blob is checked inside this write transaction, which GC's delete cannot interleave with: a blob that
+        is missing or does not hash to ``digest`` is ``NOT_FOUND`` and nothing is written.
+        """
+        self._check()
+        meta: dict[str, JsonValue] = {
+            "digest": digest,
+            "holder_kind": holder_kind,
+            "holder_id": holder_id,
+            "retention": str(retention),
+            "expires_at": None if expires_at is None else utc_timestamp(expires_at),
+        }
+        self._kinds.validate("cas.hold", meta)
+        if not self._blob_intact(digest):
+            raise BrainError(ErrorCode.NOT_FOUND, f"blob {digest} is missing or does not match its digest")
+        self._append_reserved("cas.hold", actor=_CAS_ACTOR, owner_id=None, meta=meta)
+
+    def release(self, digest: str, holder_kind: str, holder_id: str, reason: str) -> None:
+        """Record that ``(holder_kind, holder_id)`` no longer holds ``digest``; the blob itself is not checked."""
+        self._check()
+        meta: dict[str, JsonValue] = {
+            "digest": digest,
+            "holder_kind": holder_kind,
+            "holder_id": holder_id,
+            "reason": reason,
+        }
+        self._append_reserved("cas.release", actor=_CAS_ACTOR, owner_id=None, meta=meta)
+
     def mark_intent_applied(self, intent_id: str) -> bool:
         """Record that ``intent_id`` has been applied; ``False`` (and nothing changes) if it already was.
 
@@ -253,10 +304,7 @@ class Txn:
         checked_refs = validate_envelope(actor, owner_id, refs)
         spec = self._kinds.get(kind)
         self._kinds.validate(kind, meta)
-        now = self._clock.now()
-        if now.tzinfo is None:
-            raise AssertionError("the clock must return timezone-aware datetimes")
-        recorded_at = now.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        recorded_at = utc_timestamp(self._clock.now())
         entry_id = new_id()
         pending = LedgerEntry(
             sequence=0,

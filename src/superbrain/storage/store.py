@@ -4,12 +4,14 @@ Every public method checks that the store is open and that it runs on the owner 
 ``create``/``open``); the ``Txn`` from ``transaction()`` checks the same.
 """
 
+import functools
 import os
 import re
 import sqlite3
 import threading
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import AbstractContextManager, contextmanager
+from datetime import datetime
 from pathlib import Path
 
 from superbrain.core.errors import BrainError, ErrorCode
@@ -17,7 +19,8 @@ from superbrain.core.faults import crashpoint
 from superbrain.core.ids import new_id
 from superbrain.ports.os import OsAdapters
 from superbrain.ports.policy import PolicySource, PolicyView
-from superbrain.storage.kinds import KindRegistry
+from superbrain.storage.cas import ContentStore, HolderProjection, RetentionClass, blob_is_intact
+from superbrain.storage.kinds import CORE_KINDS, KindRegistry
 from superbrain.storage.layout import DataRoot
 from superbrain.storage.ledger import (
     LedgerEntry,
@@ -39,6 +42,7 @@ _HANDLER_NAME = re.compile(r"[a-z][a-z0-9_]{0,31}")
 _BUSY_CODES = frozenset({sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED})
 _REPLAY_BATCH = 256
 _CREATING = ".creating-"
+_STAGING_SUFFIX = ".tmp"
 
 
 def _quote(name: str) -> str:
@@ -52,6 +56,26 @@ def _db_files(path: Path) -> tuple[Path, ...]:
 def _check_lease(root: DataRoot, lease: WriterLease) -> None:
     if not lease.held or lease.root != root:
         raise AssertionError("the store needs a held writer lease for this data root")
+
+
+def _with_defaults(
+    handlers: Sequence[ProjectionHandler], kinds: KindRegistry
+) -> tuple[tuple[ProjectionHandler, ...], KindRegistry]:
+    """``handlers`` plus ``HolderProjection`` and ``kinds`` plus ``CORE_KINDS``, each added only if absent.
+
+    A caller kind named like a core kind must be that core kind; a caller handler named ``cas_holders`` that is no
+    ``HolderProjection`` is left in place, so the duplicate-name check refuses it.
+    """
+    extra_kinds = []
+    for core in CORE_KINDS:
+        if core.kind not in kinds.kinds():
+            extra_kinds.append(core)
+        elif kinds.get(core.kind) != core:
+            raise BrainError(ErrorCode.INVALID_INPUT, f"core entry kind {core.kind!r} cannot be redefined")
+    merged_kinds = KindRegistry([*(kinds.get(name) for name in sorted(kinds.kinds())), *extra_kinds])
+    if any(isinstance(handler, HolderProjection) for handler in handlers):
+        return tuple(handlers), merged_kinds
+    return (HolderProjection(), *handlers), merged_kinds
 
 
 def _check_handlers(handlers: Sequence[ProjectionHandler], kinds: KindRegistry) -> None:
@@ -149,6 +173,22 @@ def _remove_unfinished_creates(path: Path) -> None:
         raise BrainError(ErrorCode.IO_ERROR, f"cannot remove an unfinished store create: {exc}") from exc
 
 
+def _remove_staging_leftovers(staging: Path) -> None:
+    """Delete ``*.tmp`` files in ``staging``: the staging files of unfinished ``put``s, which nothing refers to."""
+    try:
+        names = sorted(os.listdir(staging))
+    except FileNotFoundError:
+        return  # no staging directory, so no leftovers
+    except OSError as exc:
+        raise BrainError(ErrorCode.IO_ERROR, f"cannot list {staging}: {exc}") from exc
+    for name in names:
+        if name.endswith(_STAGING_SUFFIX):
+            try:
+                os.unlink(staging / name)
+            except OSError as exc:
+                raise BrainError(ErrorCode.IO_ERROR, f"cannot remove the staging leftover {name}: {exc}") from exc
+
+
 def _replay(
     db: sqlite3.Connection,
     handlers: Sequence[ProjectionHandler],
@@ -202,6 +242,7 @@ class Store:
         self._closed = False
         self._txn_active = False
         self._maintenance = False
+        self._cas = ContentStore(root=root, os_=os_, policy=policy, db=db, check=self._check)
 
     # --- lifecycle ---------------------------------------------------------------------------------------------
 
@@ -223,8 +264,11 @@ class Store:
         is checkpointed away) and only then published as ``brain.db``: a failure before the publish never leaves a
         ``brain.db`` behind, and one after it (while opening) leaves a complete, valid empty store that ``open``
         accepts. Leftover ``brain.db.creating-*`` files are never live data and are removed first.
+
+        ``HolderProjection`` and ``CORE_KINDS`` are always registered, in addition to ``handlers`` and ``kinds``.
         """
         _check_lease(root, lease)
+        handlers, kinds = _with_defaults(handlers, kinds)
         _check_handlers(handlers, kinds)
         path = root.store_db
         if any(os.path.lexists(p) for p in _db_files(path)):
@@ -260,8 +304,13 @@ class Store:
         *,
         migrations: Sequence[Migration] = STORE_MIGRATIONS,
     ) -> "Store":
-        """Open the existing store for writing; its schema must equal the code's and its id ``policy.store_id``."""
+        """Open the existing store for writing; its schema must equal the code's and its id ``policy.store_id``.
+
+        Like ``create``, it always registers ``HolderProjection`` and ``CORE_KINDS``. Leftover staging files of
+        unfinished ``put``s are removed.
+        """
         _check_lease(root, lease)
+        handlers, kinds = _with_defaults(handlers, kinds)
         _check_handlers(handlers, kinds)
         lease.register_handle(_HANDLE)
         try:
@@ -311,7 +360,7 @@ class Store:
     def _prepare(self) -> None:
         """Give every handler without live tables new ones, filled from the whole ledger in the same transaction
         (a handler registered after entries of its kinds were written must not start empty), then secure the
-        database files. Handlers whose live tables exist are not replayed."""
+        database files and remove staging leftovers. Handlers whose live tables exist are not replayed."""
         with self._immediate() as db:
             try:
                 fresh = [h for h in self._handlers if not _tables_with_prefix(db, live_prefix(h))]
@@ -324,6 +373,7 @@ class Store:
         for path in _db_files(self._root.store_db):
             if path.exists():
                 self._os.permissions.secure_file(path)
+        _remove_staging_leftovers(self._root.staging_dir)
 
     @property
     def closed(self) -> bool:
@@ -370,6 +420,7 @@ class Store:
                     schema_version=self._schema_version,
                     clock=self._os.clock,
                     check_owner=self._check,
+                    blob_intact=functools.partial(blob_is_intact, self._root.cas_dir),
                 )
                 try:
                     yield txn
@@ -377,6 +428,43 @@ class Store:
                     txn._end()
         finally:
             self._txn_active = False
+
+    @property
+    def cas(self) -> ContentStore:
+        """The store's blobs."""
+        self._check()
+        return self._cas
+
+    def store_content(
+        self,
+        data: bytes,
+        holder_kind: str,
+        holder_id: str,
+        retention: RetentionClass,
+        expires_at: datetime | None,
+    ) -> str:
+        """``put`` ``data``, then ``hold`` it in a transaction of its own; returns the digest.
+
+        A ``NOT_FOUND`` from ``hold`` means the blob vanished between the two (GC removed it as an orphan): the
+        ``put`` and ``hold`` are retried exactly once, and a second failure propagates.
+        """
+        self._check()
+        self._require_no_transaction()
+        digest = self._cas.put(data)
+        try:
+            self._hold(digest, holder_kind, holder_id, retention, expires_at)
+        except BrainError as err:
+            if err.code is not ErrorCode.NOT_FOUND:
+                raise
+            digest = self._cas.put(data)
+            self._hold(digest, holder_kind, holder_id, retention, expires_at)
+        return digest
+
+    def _hold(
+        self, digest: str, holder_kind: str, holder_id: str, retention: RetentionClass, expires_at: datetime | None
+    ) -> None:
+        with self.transaction() as txn:
+            txn.hold(digest, holder_kind, holder_id, retention, expires_at)
 
     def entries(self, after: int = 0) -> Iterator[LedgerEntry]:
         """Every ledger entry with ``sequence > after``, in sequence order."""

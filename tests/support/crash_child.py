@@ -14,6 +14,7 @@ from superbrain.adapters.os import os_adapters
 from superbrain.core.errors import BrainError
 from superbrain.core.faults import pausepoint
 from superbrain.ports.policy import Intent
+from superbrain.storage.cas import RetentionClass
 from superbrain.storage.kinds import CORE_KINDS, EntryKind, FieldType, KindRegistry
 from superbrain.storage.layout import prepare_data_root, secure_subdirectories
 from superbrain.storage.store import Store
@@ -21,6 +22,7 @@ from superbrain.storage.writer import acquire_writer
 
 # Mirrors tests/storage/conftest.py DEMO_KINDS (this file must not import tests).
 _DEMO_KINDS = (*CORE_KINDS, EntryKind("demo.count", 1, {"n": FieldType.INT}, {}))
+PUT_AND_HOLD_ID = "0192f3a4-5b6c-7d8e-9f01-0000000000aa"
 
 
 class _Policy:
@@ -78,12 +80,24 @@ def append_demo(data_root: Path, args: list[str]) -> None:
         store.close()
 
 
+def put_and_hold(data_root: Path, args: list[str]) -> None:
+    """args: ``<store_id>``. Open the store and ``store_content(b"payload")`` held by event ``PUT_AND_HOLD_ID``."""
+    os_ = os_adapters()
+    root = prepare_data_root(data_root, os_)
+    with acquire_writer(root, os_) as lease:
+        secure_subdirectories(root, lease, os_)
+        store = Store.open(root, lease, os_, _Policy(args[0]), [], KindRegistry(_DEMO_KINDS))
+        store.store_content(b"payload", "event", PUT_AND_HOLD_ID, RetentionClass.EVENT_PAYLOAD, None)
+        store.close()
+
+
 OPERATIONS: dict[str, Callable[[Path, list[str]], None]] = {
     "ping": ping,
     "acquire_writer": acquire_writer_once,
     "acquire_writer_and_pause": acquire_writer_and_pause,
     "create_store": create_store,
     "append_demo": append_demo,
+    "put_and_hold": put_and_hold,
 }
 
 
