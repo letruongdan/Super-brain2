@@ -26,7 +26,7 @@ from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.faults import crashpoint
 from superbrain.ports.os import OsAdapters
 from superbrain.storage.backup import BackupManifest, copy_blobs, new_directory, verify_backup, write_new_file
-from superbrain.storage.errors import os_error, sqlite_error
+from superbrain.storage.errors import sqlite_error
 from superbrain.storage.layout import DataRoot
 from superbrain.storage.policy_store import PolicyStore
 from superbrain.storage.schema import POLICY_MIGRATIONS, STORE_MIGRATIONS, Migration
@@ -100,8 +100,9 @@ def restore_store(
     return RestoreReport(restored_from=backup, replaced_dir=replaced, new_epoch=lease.epoch, trust_generation=None)
 
 
-def _write_generation(path: Path, generation: int) -> None:
-    """Set the trust generation of the closed policy database ``path`` and make the file durable."""
+def _write_generation(path: Path, generation: int, os_: OsAdapters) -> None:
+    """Set the trust generation of the closed policy database ``path`` and make the file durable
+    (``os_.publisher.flush_file``)."""
     try:
         db = sqlite3.connect(path, isolation_level=None)
     except sqlite3.Error as exc:
@@ -122,14 +123,7 @@ def _write_generation(path: Path, generation: int) -> None:
     leftovers = [p.name for p in companions if p.exists()]
     if leftovers:
         raise BrainError(ErrorCode.IO_ERROR, f"the staged policy store kept {leftovers} after closing")
-    try:
-        fd = os.open(path, os.O_RDWR | getattr(os, "O_BINARY", 0))
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-    except OSError as err:
-        raise os_error("cannot make the staged policy store durable", err) from err
+    os_.publisher.flush_file(path)
 
 
 def _live_generation(root: DataRoot) -> int:
@@ -183,7 +177,7 @@ def restore_policy(
     def build(stage: Path) -> None:
         staged = stage / "policy.db"
         _copy_snapshot(backup, "policy.db", manifest, staged, os_)
-        _write_generation(staged, generation)
+        _write_generation(staged, generation, os_)
         crashpoint("restoring.policy.after_generation_persist")
 
     replaced = stage_and_swap(root, lease, os_, target="policy", purpose="restoring", build=build, now=now)

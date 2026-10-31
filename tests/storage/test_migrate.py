@@ -10,6 +10,7 @@ import pytest
 
 from superbrain.adapters.os import os_adapters
 from superbrain.core.errors import BrainError, ErrorCode
+from superbrain.ports.os import OsAdapters
 from superbrain.storage import backup as backup_module
 from superbrain.storage import migrate as migrate_module
 from superbrain.storage.backup import verify_backup
@@ -103,7 +104,7 @@ def test_failed_policy_backup_leaves_policy_untouched(trusted_tmp: Path, monkeyp
     before = digest_tree(policy_dir)
     calls: list[Path] = []
 
-    def full(source: sqlite3.Connection, dest: Path) -> None:
+    def full(source: sqlite3.Connection, dest: Path, os_: OsAdapters) -> None:
         calls.append(dest)
         raise OSError(errno.ENOSPC, "full")
 

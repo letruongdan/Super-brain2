@@ -62,11 +62,16 @@ def with_guard(guard: SpyGuard) -> OsAdapters:
 
 
 class SyncSpy:
-    """Delegates to the real publisher and records every ``sync_directory`` call."""
+    """Delegates to the real publisher and records every ``sync_directory`` and ``flush_file`` call."""
 
     def __init__(self, real: DurablePublisher) -> None:
         self.real = real
         self.synced: list[Path] = []
+        self.flushed: list[Path] = []
+
+    def flush_file(self, path: Path) -> None:
+        self.flushed.append(path)
+        self.real.flush_file(path)
 
     def write_new(self, path: Path, data: bytes) -> None:
         self.real.write_new(path, data)

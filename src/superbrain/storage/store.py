@@ -492,7 +492,7 @@ class Store:
         """Copy the live database, as of now, into the new self-contained file ``dest`` (``backup._snapshot_db``)."""
         self._check()
         self._require_no_transaction()
-        backup._snapshot_db(self._db, dest)
+        backup._snapshot_db(self._db, dest, self._os)
 
     def db_integrity(self) -> str:
         """SQLite's ``integrity_check`` result: ``"ok"`` for a sound database."""

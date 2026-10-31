@@ -6,8 +6,6 @@ reference to the policy store). It takes a verified maintenance backup first, bu
 and swaps it in with ``stage_and_swap``. A failure before the swap leaves the original untouched.
 """
 
-import os
-import shutil
 import sqlite3
 import sys
 from collections.abc import Sequence
@@ -21,6 +19,7 @@ from superbrain.ports.os import OsAdapters
 from superbrain.storage.backup import (
     BackupKind,
     copy_blobs,
+    copy_database,
     create_maintenance_backup,
     new_directory,
     verify_backup,
@@ -51,17 +50,6 @@ class MigrationReport:
     """The verified maintenance backup taken before the migration."""
     replaced_dir: Path
     """Where the pre-migration ``store/`` or ``policy/`` directory was kept."""
-
-
-def _copy_database(source: Path, dest: Path) -> None:
-    """Copy ``source`` and its ``-wal`` (never the ``-shm``) beside each other, so opening the copy recovers it."""
-    wal = db_files(source)[1]
-    try:
-        shutil.copyfile(source, dest)
-        if os.path.lexists(wal):
-            shutil.copyfile(wal, db_files(dest)[1])
-    except OSError as err:
-        raise os_error(f"cannot copy {source.name} into the migration stage", err) from err
 
 
 def _apply(db: sqlite3.Connection, pending: Sequence[Migration]) -> None:
@@ -98,22 +86,13 @@ def _configure(db: sqlite3.Connection, platform: str) -> None:
         db.execute("PRAGMA checkpoint_fullfsync=ON")
 
 
-def _fsync(fd: int) -> None:
-    """``F_FULLFSYNC`` on macOS, where ``fsync`` does not reach stable storage; ``fsync`` elsewhere."""
-    if sys.platform == "darwin":
-        import fcntl
-
-        fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
-    else:
-        os.fsync(fd)
-
-
 def _integrity_report(db: sqlite3.Connection) -> str:
     return "\n".join(str(row[0]) for row in db.execute("PRAGMA integrity_check"))
 
 
-def _migrate_file(path: Path, pending: Sequence[Migration], platform: str = sys.platform) -> None:
-    """Recover the WAL of the staged copy ``path``, apply ``pending`` and leave one self-contained, durable file."""
+def _migrate_file(path: Path, pending: Sequence[Migration], os_: OsAdapters, platform: str = sys.platform) -> None:
+    """Recover the WAL of the staged copy ``path``, apply ``pending`` and leave one self-contained file, made durable
+    with ``os_.publisher.flush_file``."""
     db = sqlite3.connect(path, isolation_level=None)
     try:
         _configure(db, platform)
@@ -131,11 +110,7 @@ def _migrate_file(path: Path, pending: Sequence[Migration], platform: str = sys.
     leftovers = [p.name for p in (*db_files(path)[1:], path.with_name(path.name + "-journal")) if p.exists()]
     if leftovers:
         raise BrainError(ErrorCode.IO_ERROR, f"the migrated {path.name} kept companions {leftovers}")
-    fd = os.open(path, os.O_RDWR | getattr(os, "O_BINARY", 0))
-    try:
-        _fsync(fd)
-    finally:
-        os.close(fd)
+    os_.publisher.flush_file(path)
 
 
 def migrate_database(
@@ -186,13 +161,11 @@ def migrate_database(
     name = source.name
 
     def build(stage: Path) -> None:
-        _copy_database(source, stage / name)
+        copy_database(source, stage / name, "into the migration stage")
         try:
-            _migrate_file(stage / name, pending)
+            _migrate_file(stage / name, pending, os_)
         except sqlite3.Error as exc:
             raise sqlite_error(f"cannot migrate the {target} database", exc) from exc
-        except OSError as err:
-            raise os_error(f"cannot make the migrated {name} durable", err) from err
         if target == "store":
             copy_blobs(root.cas_dir, stage / "cas", sorted(blob_digests(root.cas_dir)), os_)
             new_directory(stage / "staging", os_)

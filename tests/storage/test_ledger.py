@@ -590,6 +590,9 @@ class TablesAtPublish:
     def sync_directory(self, directory: Path) -> None:
         self.real.sync_directory(directory)
 
+    def flush_file(self, path: Path) -> None:
+        self.real.flush_file(path)
+
     def durability(self, directory: Path, env: Mapping[str, str]) -> DurabilityReport:
         return self.real.durability(directory, env)
 

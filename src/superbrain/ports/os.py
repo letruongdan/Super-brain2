@@ -81,6 +81,10 @@ class DurablePublisher(Protocol):
         """Make the entries of ``directory`` durable (a no-op where the OS does that on rename)."""
         ...
 
+    def flush_file(self, path: Path) -> None:
+        """Make the content of the existing file ``path``, which nothing else is writing, durable."""
+        ...
+
     def durability(self, directory: Path, env: Mapping[str, str]) -> DurabilityReport:
         """Report the tier ``directory`` can honestly claim, with reasons for anything below power-loss."""
         ...

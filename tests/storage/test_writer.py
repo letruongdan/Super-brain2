@@ -92,10 +92,10 @@ def test_acquire_fails_without_a_lease_when_the_epoch_cannot_be_made_durable(
     with acquire_writer(root, os_adapters()):
         pass
 
-    def failing_fsync(fd: int) -> None:
+    def failing_fsync(fd: int) -> bool:
         raise OSError(errno.EIO, "injected fsync failure")
 
-    monkeypatch.setattr(locks, "_full_fsync", failing_fsync)
+    monkeypatch.setattr(locks, "full_fsync", failing_fsync)
     with pytest.raises(BrainError) as e:
         acquire_writer(root, os_adapters())
     assert e.value.code == ErrorCode.IO_ERROR

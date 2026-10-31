@@ -11,7 +11,7 @@ import os
 import sys
 from pathlib import Path
 
-from superbrain.adapters.os.durable import _full_fsync, map_os_error
+from superbrain.adapters.os.durable import full_fsync, map_os_error
 from superbrain.core.errors import BrainError, ErrorCode
 
 _LOCK_REGION = 1  # byte 0; the payload starts right after it
@@ -71,7 +71,7 @@ class _OsLockHandle:
             view = memoryview(data)
             while view:
                 view = view[os.write(fd, view) :]
-            _full_fsync(fd)
+            full_fsync(fd)
         except OSError as err:
             raise map_os_error(err, "writing the lock payload") from err
 

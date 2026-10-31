@@ -156,7 +156,7 @@ def test_missing_directory_is_process_crash_and_not_created(tmp_path: Path) -> N
 
 
 def test_failed_probe_is_process_crash(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(durable, "_full_fsync", raising(OSError(errno.EINVAL, "no")))
+    monkeypatch.setattr(durable, "full_fsync", raising(OSError(errno.EINVAL, "no")))
     report = publisher_with(KNOWN_GOOD_FS).durability(tmp_path, {})
     assert report.tier == DurabilityTier.PROCESS_CRASH
     assert any(r.startswith("sync probe failed: ") for r in report.reasons)
@@ -201,7 +201,7 @@ def assert_io_error(err: pytest.ExceptionInfo[BrainError]) -> None:
 def test_write_new_io_error_is_brain_error(
     tmp_path: Path, publisher: DurablePublisher, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(durable, "_full_fsync", raising(OSError(errno.EIO, "io")))
+    monkeypatch.setattr(durable, "full_fsync", raising(OSError(errno.EIO, "io")))
     with pytest.raises(BrainError) as e:
         publisher.write_new(tmp_path / "x", b"data")
     assert_io_error(e)
@@ -239,7 +239,7 @@ def test_rename_dir_io_error_is_brain_error(
 def test_sync_directory_io_error_is_brain_error(
     tmp_path: Path, publisher: DurablePublisher, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(durable, "_full_fsync", raising(OSError(errno.EIO, "io")))
+    monkeypatch.setattr(durable, "full_fsync", raising(OSError(errno.EIO, "io")))
     with pytest.raises(BrainError) as e:
         publisher.sync_directory(tmp_path)
     assert_io_error(e)
@@ -254,7 +254,7 @@ def test_sync_directory_missing_directory_is_brain_error_on_posix(tmp_path: Path
 
 
 def test_probe_io_error_reports_errno_without_raising(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(durable, "_full_fsync", raising(OSError(errno.EIO, "io")))
+    monkeypatch.setattr(durable, "full_fsync", raising(OSError(errno.EIO, "io")))
     report = publisher_with(KNOWN_GOOD_FS).durability(tmp_path, {})
     assert "sync probe failed: EIO" in report.reasons
 
@@ -399,3 +399,180 @@ def test_durability_never_raises_when_directory_resolve_fails(tmp_path: Path, mo
     report = publisher_with(KNOWN_GOOD_FS).durability(tmp_path, {"OneDrive": str(tmp_path)})
     assert report.tier == DurabilityTier.PROCESS_CRASH
     assert "cannot inspect directory: RuntimeError" in report.reasons
+
+
+# --- full fsync, directory fsync and flush_file ------------------------------------------------------------------
+
+
+class FakeFcntl:
+    """Stands in for macOS ``fcntl``: ``fcntl(fd, F_FULLFSYNC)`` fails with ``err``, if given."""
+
+    F_FULLFSYNC = 51
+
+    def __init__(self, err: OSError | None) -> None:
+        self.err = err
+        self.calls: list[int] = []
+
+    def fcntl(self, fd: int, command: int) -> int:
+        self.calls.append(command)
+        if self.err is not None:
+            raise self.err
+        return 0
+
+
+def file_fd(tmp_path: Path) -> int:
+    path = tmp_path / f"f-{uuid.uuid4().hex}"
+    path.write_bytes(b"payload")
+    return os.open(path, os.O_RDWR | getattr(os, "O_BINARY", 0))
+
+
+def spy_fsync(monkeypatch: pytest.MonkeyPatch, err: OSError | None = None) -> list[int]:
+    calls: list[int] = []
+
+    def fsync(fd: int) -> None:
+        calls.append(fd)
+        if err is not None:
+            raise err
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    return calls
+
+
+def test_darwin_full_fsync_uses_f_fullfsync(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = FakeFcntl(None)
+    monkeypatch.setitem(sys.modules, "fcntl", fake)
+    fd = file_fd(tmp_path)
+    try:
+        synced = spy_fsync(monkeypatch)
+        assert durable.full_fsync(fd, platform="darwin") is True
+    finally:
+        os.close(fd)
+    assert fake.calls == [FakeFcntl.F_FULLFSYNC] and synced == []
+
+
+@pytest.mark.parametrize("code", [errno.ENOTSUP, errno.EINVAL, errno.ENOTTY])
+def test_darwin_full_fsync_falls_back_to_fsync_where_unsupported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, code: int
+) -> None:
+    fake = FakeFcntl(OSError(code, "unsupported"))
+    monkeypatch.setitem(sys.modules, "fcntl", fake)
+    fd = file_fd(tmp_path)
+    try:
+        synced = spy_fsync(monkeypatch)
+        assert durable.full_fsync(fd, platform="darwin") is False  # degraded, not failed
+    finally:
+        os.close(fd)
+    assert fake.calls == [FakeFcntl.F_FULLFSYNC] and synced == [fd]
+
+
+@pytest.mark.parametrize("code", [errno.EIO, errno.ENOSPC])
+def test_darwin_full_fsync_failure_still_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, code: int) -> None:
+    monkeypatch.setitem(sys.modules, "fcntl", FakeFcntl(OSError(code, "injected")))
+    fd = file_fd(tmp_path)
+    try:
+        synced = spy_fsync(monkeypatch)
+        with pytest.raises(OSError) as e:
+            durable.full_fsync(fd, platform="darwin")
+    finally:
+        os.close(fd)
+    assert e.value.errno == code and synced == []
+
+
+def test_full_fsync_elsewhere_is_fsync(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    fd = file_fd(tmp_path)
+    try:
+        synced = spy_fsync(monkeypatch)
+        assert durable.full_fsync(fd, platform="linux") is True
+        spy_fsync(monkeypatch, OSError(errno.EIO, "injected"))
+        with pytest.raises(OSError):
+            durable.full_fsync(fd, platform="linux")
+    finally:
+        os.close(fd)
+    assert synced == [fd]
+
+
+def directory_fd_from_a_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Make ``os.open`` return a regular file's descriptor (Windows cannot open a directory with it)."""
+    opened: list[int] = []
+    real_open = os.open
+    target = tmp_path / "stand-in"
+    target.write_bytes(b"")
+
+    def open_(path: object, flags: int, *args: object) -> int:
+        fd = real_open(target, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+        opened.append(fd)
+        return fd
+
+    monkeypatch.setattr(os, "open", open_)
+    return opened
+
+
+@pytest.mark.parametrize("code", [errno.EINVAL, errno.ENOTSUP, errno.ENOSYS, errno.EBADF])
+def test_unsupported_directory_fsync_is_skipped(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, code: int) -> None:
+    opened = directory_fd_from_a_file(tmp_path, monkeypatch)
+    synced = spy_fsync(monkeypatch, OSError(code, "unsupported"))
+    assert durable._fsync_directory(tmp_path, nt=False) is False
+    assert synced == opened and len(opened) == 1
+
+
+@pytest.mark.parametrize("code", [errno.EIO, errno.ENOSPC])
+def test_directory_fsync_failure_still_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, code: int) -> None:
+    directory_fd_from_a_file(tmp_path, monkeypatch)
+    spy_fsync(monkeypatch, OSError(code, "injected"))
+    with pytest.raises(OSError) as e:
+        durable._fsync_directory(tmp_path, nt=False)
+    assert e.value.errno == code
+
+
+def test_sync_directory_continues_past_an_unsupported_directory_fsync(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(durable, "_fsync_directory", lambda path: False)
+    PosixPublisher().sync_directory(tmp_path)
+
+
+def test_probe_reports_an_unsupported_directory_fsync(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(durable, "_fsync_directory", lambda path: False)
+    report = PosixPublisher(fs_info=lambda _p: FsInfo("ext4", False)).durability(tmp_path, {})
+    assert report.tier == DurabilityTier.PROCESS_CRASH
+    assert any("directory" in r for r in report.reasons) and list(tmp_path.iterdir()) == []
+
+
+def test_probe_reports_a_degraded_full_fsync(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(durable, "full_fsync", lambda fd: False)
+    report = DarwinPublisher(fs_info=lambda _p: FsInfo("apfs", False)).durability(tmp_path, {})
+    assert report.tier == DurabilityTier.PROCESS_CRASH
+    assert any("F_FULLFSYNC" in r for r in report.reasons) and list(tmp_path.iterdir()) == []
+
+
+def test_flush_file_full_fsyncs_the_whole_file(
+    tmp_path: Path, publisher: DurablePublisher, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    flushed: list[int] = []
+    real = durable.full_fsync
+
+    def spy(fd: int) -> bool:
+        flushed.append(os.fstat(fd).st_size)
+        return real(fd)
+
+    monkeypatch.setattr(durable, "full_fsync", spy)
+    publisher.flush_file(staged(tmp_path, b"seven b"))
+    assert flushed == [7]
+
+
+@pytest.mark.parametrize(
+    ("code", "expected"), [(errno.EIO, ErrorCode.IO_ERROR), (errno.ENOSPC, ErrorCode.STORAGE_FULL)]
+)
+def test_flush_file_failure_is_brain_error(
+    tmp_path: Path, publisher: DurablePublisher, monkeypatch: pytest.MonkeyPatch, code: int, expected: ErrorCode
+) -> None:
+    monkeypatch.setattr(durable, "full_fsync", raising(OSError(code, "injected")))
+    with pytest.raises(BrainError) as e:
+        publisher.flush_file(staged(tmp_path))
+    assert e.value.code == expected and isinstance(e.value.__cause__, OSError)
+
+
+def test_flush_file_of_a_missing_file_is_io_error(tmp_path: Path, publisher: DurablePublisher) -> None:
+    with pytest.raises(BrainError) as e:
+        publisher.flush_file(tmp_path / "missing")
+    assert_io_error(e)

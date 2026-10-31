@@ -283,11 +283,11 @@ def test_store_backup_holds_maintenance_while_it_runs(
     seen: list[ErrorCode] = []
     original = backup_module._snapshot_db
 
-    def snapshot(source: sqlite3.Connection, dest: Path) -> None:
+    def snapshot(source: sqlite3.Connection, dest: Path, os_: OsAdapters) -> None:
         with pytest.raises(BrainError) as e:
             env.store.cas.collect_garbage(now=clock.now())
         seen.append(e.value.code)
-        original(source, dest)
+        original(source, dest, os_)
 
     monkeypatch.setattr(backup_module, "_snapshot_db", snapshot)
     create_store_backup(env.store, env.os_, clock.now())

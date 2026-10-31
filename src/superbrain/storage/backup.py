@@ -13,7 +13,8 @@ derives ``store_id``, ``schema_version``, the ledger high-water, the trust gener
 snapshot itself and compares them with the manifest, and it checks the blob files independently of the roots.
 
 Every snapshot is taken by ``_snapshot_db``, the only caller of ``sqlite3.Connection.backup``; tests inject faults by
-patching it, so it is always called through this module's global.
+patching it, so it is always called through this module's global. ``copy_database`` is the one copy of a closed
+database with its ``-wal``, shared with migration.
 """
 
 import json
@@ -53,6 +54,7 @@ __all__ = [
     "BackupKind",
     "BackupManifest",
     "copy_blobs",
+    "copy_database",
     "create_maintenance_backup",
     "create_policy_backup",
     "create_store_backup",
@@ -115,11 +117,12 @@ def _require_aware(now: datetime) -> None:
 # --- the snapshot ------------------------------------------------------------------------------------------------
 
 
-def _snapshot_db(source: sqlite3.Connection, dest: Path) -> None:
+def _snapshot_db(source: sqlite3.Connection, dest: Path, os_: OsAdapters) -> None:
     """Copy ``source``, as of now, into the new file ``dest`` and make it self-contained and durable.
 
     The only caller of ``Connection.backup``. The copy is switched to ``journal_mode=DELETE`` (no ``-wal``), closed
-    and fsynced, so the snapshot is one file with no companions. ``dest`` and its companions must not exist.
+    and flushed with ``os_.publisher.flush_file``, so the snapshot is one file with no companions. ``dest`` and its
+    companions must not exist.
     """
     if any(os.path.lexists(p) for p in (*db_files(dest), dest.with_name(dest.name + "-journal"))):
         raise BrainError(ErrorCode.IO_ERROR, f"the snapshot {dest} already exists")
@@ -143,14 +146,7 @@ def _snapshot_db(source: sqlite3.Connection, dest: Path) -> None:
     leftovers = [p.name for p in (*db_files(dest)[1:], dest.with_name(dest.name + "-journal")) if p.exists()]
     if leftovers:
         raise BrainError(ErrorCode.IO_ERROR, f"the snapshot {dest} kept companions {leftovers}")
-    try:
-        fd = os.open(dest, os.O_RDWR | getattr(os, "O_BINARY", 0))
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-    except OSError as err:
-        raise os_error(f"cannot make the snapshot {dest} durable", err) from err
+    os_.publisher.flush_file(dest)
 
 
 @contextmanager
@@ -333,22 +329,28 @@ def create_policy_backup(policy: "PolicyStore", os_: OsAdapters, now: datetime) 
     return directory
 
 
-def _recover_and_snapshot(source: Path, copy: Path, snapshot: Path) -> None:
-    """Copy ``source`` and its ``-wal`` (never the ``-shm``, which SQLite rebuilds) to ``copy``, open the copy
-    writable so SQLite recovers the WAL into it, and run ``_snapshot_db`` from there; the copy is always closed."""
+def copy_database(source: Path, dest: Path, purpose: str) -> None:
+    """Copy the closed database ``source`` and its ``-wal`` (never the ``-shm``, which SQLite rebuilds) to ``dest``
+    and its ``-wal``, so opening the copy writable recovers the WAL into it. ``purpose`` ends the error message."""
     wal = db_files(source)[1]
     try:
-        shutil.copyfile(source, copy)
+        shutil.copyfile(source, dest)
         if os.path.lexists(wal):
-            shutil.copyfile(wal, db_files(copy)[1])
+            shutil.copyfile(wal, db_files(dest)[1])
     except OSError as err:
-        raise os_error(f"cannot copy {source.name} for a maintenance backup", err) from err
+        raise os_error(f"cannot copy {source.name} {purpose}", err) from err
+
+
+def _recover_and_snapshot(source: Path, copy: Path, snapshot: Path, os_: OsAdapters) -> None:
+    """``copy_database`` ``source`` to ``copy``, open the copy writable so SQLite recovers the WAL into it, and run
+    ``_snapshot_db`` from there; the copy is always closed."""
+    copy_database(source, copy, "for a maintenance backup")
     try:
         db = sqlite3.connect(copy, isolation_level=None)
     except sqlite3.Error as exc:
         raise sqlite_error(f"cannot open the copy of {source.name}", exc) from exc
     try:
-        _snapshot_db(db, snapshot)
+        _snapshot_db(db, snapshot, os_)
     finally:
         db.close()
 
@@ -359,7 +361,7 @@ def _snapshot_closed_db(source: Path, work: Path, snapshot: Path, os_: OsAdapter
     failure is attached to that error as a note, never hiding it."""
     new_directory(work, os_)
     try:
-        _recover_and_snapshot(source, work / source.name, snapshot)
+        _recover_and_snapshot(source, work / source.name, snapshot, os_)
     except BaseException as err:
         try:
             shutil.rmtree(work)

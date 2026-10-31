@@ -7,6 +7,7 @@ is reported only for an allow-listed local filesystem, outside a cloud-synced fo
 
 import contextlib
 import errno
+import importlib
 import os
 import sys
 import time
@@ -24,6 +25,11 @@ _ERROR_ALREADY_EXISTS = 183
 _ERROR_DISK_FULL = 112
 _BUSY_WINERRORS = frozenset({_ERROR_SHARING_VIOLATION, _ERROR_ACCESS_DENIED})
 _RETRY_DELAYS = (0.05, 0.1, 0.2, 0.4, 0.8)
+# F_FULLFSYNC unsupported by the filesystem (SMB, FAT, some FUSE mounts): fall back to fsync.
+_FULLFSYNC_UNSUPPORTED = frozenset({errno.ENOTSUP, errno.EOPNOTSUPP, errno.EINVAL, errno.ENOTTY})
+# fsync of a directory descriptor unsupported by the OS or filesystem. EBADF counts too: the descriptor was just
+# opened here, so EBADF can only mean the platform cannot fsync a directory opened read-only.
+_DIR_FSYNC_UNSUPPORTED = frozenset({errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP, errno.ENOSYS, errno.EBADF})
 
 MOVEFILE_REPLACE_EXISTING = 0x1
 MOVEFILE_WRITE_THROUGH = 0x8
@@ -58,26 +64,45 @@ def map_os_error(err: OSError, what: str) -> BrainError:
     return BrainError(ErrorCode.IO_ERROR, f"I/O error while {what}: {err}")
 
 
-def _full_fsync(fd: int) -> None:
-    """Flush ``fd`` as hard as the platform allows (``F_FULLFSYNC`` on macOS)."""
-    if sys.platform == "darwin":
-        import fcntl
+def full_fsync(fd: int, *, platform: str = sys.platform) -> bool:
+    """Flush ``fd`` as hard as the platform allows; ``False`` if only a weaker flush was possible.
 
-        fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
-    else:
-        os.fsync(fd)
-
-
-def _fsync_directory(path: Path) -> None:
-    """Persist directory entries (extracted from the old ``_fsync_directory``, blob b0bb49c).
-
-    Windows cannot open directory handles through ``os.open``; there ``MOVEFILE_WRITE_THROUGH`` does the job.
+    On macOS ``fsync`` does not reach stable storage, so this uses ``F_FULLFSYNC``; where the filesystem does not
+    support it (``ENOTSUP``/``EINVAL``/``ENOTTY``) it falls back to ``fsync`` and returns ``False``. Elsewhere it is
+    ``fsync``. Any other error propagates.
     """
-    if os.name == "nt":
-        return
+    if platform == "darwin":
+        fcntl = importlib.import_module("fcntl")  # macOS-only names, so not a static import
+        try:
+            fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
+            return True
+        except OSError as err:
+            if err.errno not in _FULLFSYNC_UNSUPPORTED:
+                raise
+        os.fsync(fd)
+        return False
+    os.fsync(fd)
+    return True
+
+
+def _fsync_directory(path: Path, *, nt: bool = os.name == "nt") -> bool:
+    """Persist directory entries (extracted from the old ``_fsync_directory``, blob b0bb49c); ``False`` if the
+    entries could not be flushed as hard as a file.
+
+    Windows cannot open directory handles through ``os.open``; there ``MOVEFILE_WRITE_THROUGH`` does the job. Where
+    the OS or filesystem cannot fsync a directory (``EINVAL``/``ENOTSUP``/``ENOSYS``/``EBADF``) this returns ``False``
+    and the caller continues; ``durability()`` reports such a filesystem below power-loss. ``EIO``, ``ENOSPC`` and
+    every other error propagate.
+    """
+    if nt:
+        return True
     descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
     try:
-        _full_fsync(descriptor)
+        return full_fsync(descriptor)
+    except OSError as err:
+        if err.errno in _DIR_FSYNC_UNSUPPORTED:
+            return False
+        raise
     finally:
         os.close(descriptor)
 
@@ -274,12 +299,15 @@ class _BasePublisher:
             raise FileExistsError(errno.EEXIST, "target directory exists", str(dst))
         os.rename(src, dst)
 
-    def _sync_dir(self, directory: Path) -> None:
-        _fsync_directory(directory)
+    def _sync_dir(self, directory: Path) -> bool:
+        return _fsync_directory(directory)
 
     # -- public operations
     def sync_directory(self, directory: Path) -> None:
-        self._guard(lambda: self._sync_dir(directory), f"syncing directory {directory}")
+        self._synced(directory)
+
+    def flush_file(self, path: Path) -> None:
+        self._flushed(path)
 
     def write_new(self, path: Path, data: bytes) -> None:
         flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0)
@@ -295,7 +323,7 @@ class _BasePublisher:
                 while view:
                     written = os.write(fd, view)
                     view = view[written:]
-                _full_fsync(fd)
+                full_fsync(fd)
             finally:
                 os.close(fd)
         except BaseException as err:
@@ -312,6 +340,28 @@ class _BasePublisher:
     def rename_dir(self, src: Path, dst: Path) -> None:
         self._guard(lambda: self._rename_dir(src, dst), f"renaming directory {src} to {dst}")
         self.sync_directory(dst.parent)
+
+    def _synced(self, directory: Path) -> bool:
+        """``sync_directory``; ``False`` if the directory could not be flushed as hard as a file."""
+        try:
+            return self._sync_dir(directory)
+        except OSError as err:
+            raise map_os_error(err, f"syncing directory {directory}") from err
+
+    def _flushed(self, path: Path) -> bool:
+        """``flush_file``; ``False`` if only a weaker flush than the platform's full one was possible. Opened for
+        writing because Windows flushes (``FlushFileBuffers``) only through a handle with write access."""
+        try:
+            fd = os.open(path, os.O_RDWR | getattr(os, "O_BINARY", 0))
+        except OSError as err:
+            raise map_os_error(err, f"opening {path} to flush it") from err
+        try:
+            try:
+                return full_fsync(fd)
+            finally:
+                os.close(fd)
+        except OSError as err:
+            raise map_os_error(err, f"flushing {path}") from err
 
     def _guard(self, action: Callable[[], None], what: str) -> None:
         try:
@@ -353,7 +403,10 @@ class _BasePublisher:
         try:
             self.write_new(staging, b"durability probe")
             self.publish(staging, final)
-            self.sync_directory(directory)
+            if not self._flushed(final):
+                return "sync probe: no F_FULLFSYNC on this filesystem, only fsync"
+            if not self._synced(directory):
+                return "sync probe: this filesystem cannot fsync a directory"
         except FileExistsError as err:
             return f"sync probe failed: {errno.errorcode.get(err.errno or 0, err.errno)}"
         except BrainError as err:
@@ -393,7 +446,8 @@ class PosixPublisher(_BasePublisher):
 
 
 class DarwinPublisher(_BasePublisher):
-    """macOS: ``fsync`` does not reach stable storage, so ``_full_fsync`` uses ``F_FULLFSYNC``."""
+    """macOS. The class only names the durable filesystems: ``F_FULLFSYNC`` (``fsync`` does not reach stable storage
+    there) is chosen by the module-level ``full_fsync`` from the platform, for every publisher and the lock file."""
 
     _durable_fs = frozenset({"apfs", "hfs"})
 
@@ -412,8 +466,9 @@ class WindowsPublisher(_BasePublisher):
                 raise FileExistsError(errno.EEXIST, "target directory exists", str(dst)) from err
             raise
 
-    def _sync_dir(self, directory: Path) -> None:
+    def _sync_dir(self, directory: Path) -> bool:
         """No separate operation: ``MOVEFILE_WRITE_THROUGH`` makes the rename durable."""
+        return True
 
     def _move(self, src: Path, dst: Path, flags: int) -> None:
         for attempt in range(len(_RETRY_DELAYS) + 1):
