@@ -26,7 +26,14 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from superbrain.adapters.os import environment as environment_facts
+from superbrain.adapters.os.environment import EnvironmentFacts as EnvironmentFacts
+from superbrain.adapters.os.environment import EnvironmentProbe as EnvironmentProbe
+from superbrain.adapters.os.environment import OsEnvironmentProbe as OsEnvironmentProbe
+from superbrain.adapters.os.environment import PathFacts as PathFacts
+from superbrain.adapters.os.paths import default_data_root
 from superbrain.core.canonical import canonical_json, digest_bytes
+from superbrain.core.errors import BrainError
 from superbrain.core.jsonvalue import JsonValue
 
 REQUIRED_PHASES = ("ruff", "mypy", "lint-imports", "pytest")
@@ -70,6 +77,32 @@ class InterpreterInfo:
     package_file: str
 
 
+# --- acceptance environment (spec 4.3 owner policy of 2026-10-31, spec 5.9) ----------------------------
+
+TRUSTED_TEST_ROOT = "trusted_test_root"
+DEFAULT_DATA_ROOT = "default_data_root"
+
+
+def acceptance_paths(env: Mapping[str, str], platform: str) -> dict[str, Path]:
+    """The test trusted root (where ``tests/conftest.py::trusted_tmp`` and pytest's ``tmp_path`` live) and the data
+    root the code defaults to (``SUPERBRAIN_HOME`` honoured)."""
+    if platform == "win32":
+        trusted = Path(env["LOCALAPPDATA"]) / "superbrain-tests"
+    else:
+        trusted = Path(next((env[name] for name in ("TMPDIR", "TEMP", "TMP") if env.get(name)), "/tmp"))
+    return {TRUSTED_TEST_ROOT: trusted, DEFAULT_DATA_ROOT: Path(default_data_root(env, platform))}
+
+
+def collect_environment(probe: EnvironmentProbe, *, env: Mapping[str, str], platform: str) -> EnvironmentFacts:
+    """The token facts and, for each ``acceptance_paths`` role, the physical path and its ancestor check."""
+    return environment_facts.collect(probe, acceptance_paths(env, platform), platform)
+
+
+def assess_environment(facts: EnvironmentFacts) -> dict[str, JsonValue]:
+    """The receipt's ``environment`` section: the facts, every problem found, and ``accepted`` (no problem)."""
+    return environment_facts.assess(facts, required=(TRUSTED_TEST_ROOT, DEFAULT_DATA_ROOT))
+
+
 # --- receipt ------------------------------------------------------------------------------------------
 
 
@@ -97,9 +130,19 @@ def build_receipt(
     time_budget_s: float = 300.0,
     cleanup_error: str | None = None,
     extra_reasons: Sequence[str] = (),
+    environment: Mapping[str, JsonValue] | None = None,
 ) -> dict[str, JsonValue]:
-    """Judge a run. The interpreter binding is mandatory: ``interpreter=None`` means the preflight failed."""
+    """Judge a run. The interpreter binding is mandatory: ``interpreter=None`` means the preflight failed.
+
+    ``environment`` is the ``assess_environment`` section; each of its problems is a reason.
+    """
     reasons: list[str] = list(extra_reasons)
+    if environment is not None:
+        problems = environment.get("problems")
+        if not isinstance(problems, list):
+            reasons.append("environment: the section has no problem list")
+        else:
+            reasons.extend(f"environment: {problem}" for problem in problems)
     if start != end:
         reasons.append("source identity changed between start and end of the run")
     if not start.tree_clean:
@@ -163,6 +206,7 @@ def build_receipt(
         "platform": platform,
         "interpreter": asdict(interpreter) if interpreter is not None else None,
         "requested_python": requested_python,
+        "environment": dict(environment) if environment is not None else None,
         "accepted": not reasons,
         "reasons": list(reasons),
     }
@@ -381,6 +425,12 @@ def run_gate(repo: Path, python: str) -> tuple[dict[str, JsonValue], str]:
     cleanup_error: str | None = None
     junit = worktree.parent / f"{worktree.name}-junit.xml"
     pytest_output = ""
+    environment: dict[str, JsonValue] | None = None
+    try:
+        facts = collect_environment(OsEnvironmentProbe(), env=os.environ, platform=sys.platform)
+        environment = assess_environment(facts)
+    except (OSError, KeyError, ValueError, RuntimeError, BrainError) as err:
+        extra.append(f"environment preflight failed: {type(err).__name__}: {err}")
     try:
         start = source_identity(worktree)
         code, output, _ = run(
@@ -468,6 +518,7 @@ def run_gate(repo: Path, python: str) -> tuple[dict[str, JsonValue], str]:
         requested_python=python,
         cleanup_error=cleanup_error,
         extra_reasons=extra,
+        environment=environment,
     )
     return receipt, "\n".join(log)
 
