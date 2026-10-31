@@ -37,7 +37,7 @@ from superbrain.core.faults import crashpoint
 from superbrain.core.ids import new_id
 from superbrain.core.jsonvalue import JsonValue
 from superbrain.ports.os import OsAdapters
-from superbrain.storage.cas import HOLDERS_TABLE, blob_digests, blob_path, check_blob_location, file_digest
+from superbrain.storage.cas import HOLDERS_TABLE, blob_digests, blob_path, check_blob_location, file_digest, is_link
 from superbrain.storage.errors import os_error, sqlite_error
 from superbrain.storage.layout import DataRoot
 from superbrain.storage.ledger import utc_timestamp
@@ -490,17 +490,19 @@ def _check_entries(path: Path, kind: BackupKind) -> None:
 
 
 def _blob_files(cas: Path) -> set[str]:
-    """Digests of the blob files in the backup's ``cas/``; any other entry there is ``INTEGRITY_FAILURE``."""
+    """Digests of the blob files in the backup's ``cas/``; any other entry there, a link or reparse point included
+    (a Windows junction lists as a directory), is ``INTEGRITY_FAILURE`` and is never entered."""
     found: set[str] = set()
     unexpected: list[str] = []
     try:
         if not os.path.lexists(cas):
             return found
-        if not stat.S_ISDIR(os.lstat(cas).st_mode):
+        if is_link(os.lstat(cas)) or not stat.S_ISDIR(os.lstat(cas).st_mode):
             raise _fail("blob files", "cas is not a directory")
         with os.scandir(cas) as shards:
             for shard in shards:
-                if not (_SHARD_NAME.fullmatch(shard.name) and shard.is_dir(follow_symlinks=False)):
+                linked = is_link(shard.stat(follow_symlinks=False))
+                if linked or not (_SHARD_NAME.fullmatch(shard.name) and shard.is_dir(follow_symlinks=False)):
                     unexpected.append(shard.name)
                     continue
                 with os.scandir(shard.path) as blobs:
@@ -509,6 +511,7 @@ def _blob_files(cas: Path) -> set[str]:
                             _BLOB_NAME.fullmatch(blob.name)
                             and blob.name.startswith(shard.name)
                             and blob.is_file(follow_symlinks=False)
+                            and not is_link(blob.stat(follow_symlinks=False))
                         ):
                             found.add("sha256:" + blob.name)
                         else:

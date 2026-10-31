@@ -37,6 +37,7 @@ _DIGEST = re.compile(r"sha256:([0-9a-f]{64})")
 _SHARD_NAME = re.compile(r"[0-9a-f]{2}")
 _BLOB_NAME = re.compile(r"[0-9a-f]{64}")
 _CHUNK = 1 << 20
+_REPARSE_POINT = 0x400  # FILE_ATTRIBUTE_REPARSE_POINT; st_file_attributes exists on Windows only
 HOLDERS_TABLE = "p_cas_holders_"
 STAGING_SUFFIX = ".tmp"
 
@@ -62,6 +63,12 @@ def file_digest(path: Path) -> str | None:
     except OSError as err:
         raise os_error(f"cannot read blob {path}", err) from err
     return "sha256:" + hasher.hexdigest()
+
+
+def is_link(st: os.stat_result) -> bool:
+    """Whether the ``lstat`` result ``st`` (never followed) is a symlink or a Windows reparse point (a junction
+    included, which ``DirEntry.is_dir(follow_symlinks=False)`` reports as a directory)."""
+    return stat.S_ISLNK(st.st_mode) or bool(getattr(st, "st_file_attributes", 0) & _REPARSE_POINT)
 
 
 def check_blob_location(blob: Path, os_: OsAdapters) -> None:
