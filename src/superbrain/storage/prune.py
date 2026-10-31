@@ -8,12 +8,18 @@ from the name, never from mtime.
 import os
 import re
 import shutil
+from collections.abc import Collection
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.ids import new_id
 from superbrain.ports.os import OsAdapters
+from superbrain.storage.errors import os_error
+
+if TYPE_CHECKING:
+    from superbrain.storage.writer import WriterLease
 
 MANIFEST_NAME = "manifest.json"
 INCOMPLETE_SUFFIX = ".incomplete"
@@ -37,8 +43,29 @@ def _rename(os_: OsAdapters, path: Path, target: Path) -> None:
         raise BrainError(ErrorCode.IO_ERROR, f"cannot rename {path}: {target.name} exists") from err
 
 
-def prune_backups(backups_dir: Path, *, os_: OsAdapters, keep: int = 7, now: datetime) -> list[Path]:
+def has_complete_backup(backups_dir: Path, kinds: Collection[str]) -> bool:
+    """Whether ``backups_dir`` (which may not exist) holds a complete backup (one with a manifest) of one of
+    ``kinds``."""
+    try:
+        names = sorted(os.listdir(backups_dir))
+    except FileNotFoundError:
+        return False
+    except OSError as err:
+        raise os_error(f"cannot list {backups_dir}", err) from err
+    for name in names:
+        match = _DIR_NAME.fullmatch(name)
+        path = backups_dir / name
+        if match and match.group(1) in kinds and not path.is_symlink() and (path / MANIFEST_NAME).is_file():
+            return True
+    return False
+
+
+def prune_backups(
+    backups_dir: Path, *, lease: "WriterLease", os_: OsAdapters, keep: int = 7, now: datetime
+) -> list[Path]:
     """Keep the ``keep`` newest complete backups of each kind and delete the rest; returns what it changed, sorted.
+
+    It deletes, so it runs only under ``lease``, held for the data root whose ``backups/`` is ``backups_dir``.
 
     Complete means the directory has a ``manifest.json``; age and order come from the timestamp in the name, never
     from mtime. A backup to delete is first renamed to ``<name>.deleting-<id>`` and only then removed, so a failed
@@ -46,6 +73,8 @@ def prune_backups(backups_dir: Path, *, os_: OsAdapters, keep: int = 7, now: dat
     backup older than 24 hours is renamed to ``<name>.incomplete`` (its new path is returned), never deleted.
     Entries whose names are not backup names are left alone.
     """
+    if not lease.held or lease.root.backups_dir != backups_dir:
+        raise AssertionError("pruning backups needs the held writer lease of their data root")
     if type(keep) is not int or keep < 1:
         raise BrainError(ErrorCode.INVALID_INPUT, "keep must be an integer >= 1")
     if now.tzinfo is None or now.utcoffset() is None:

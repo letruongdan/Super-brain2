@@ -1,4 +1,5 @@
 from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import NoReturn
 
@@ -6,7 +7,10 @@ import pytest
 
 from superbrain.adapters.os import os_adapters
 from superbrain.core.errors import BrainError, ErrorCode
+from superbrain.ports.policy import IntentKind
+from superbrain.storage.backup import create_maintenance_backup, create_policy_backup, create_store_backup
 from superbrain.storage.kinds import KindRegistry
+from superbrain.storage.layout import DataRoot
 from superbrain.storage.policy_store import PolicyStore
 from superbrain.storage.runtime import open_runtime
 from superbrain.storage.schema import STORE_MIGRATIONS, Migration
@@ -247,3 +251,68 @@ def test_stores_refuse_work_once_their_lease_was_released(trusted_tmp: Path) -> 
         rt.store._db.close()
         rt.policy._db.close()
     assert writer_is_free(trusted_tmp / "r")
+
+
+# --- missing data store next to history (M9) -------------------------------------------------------------------
+
+E1 = "0192f3a4-5b6c-7d8e-9f01-000000000001"
+NOW = datetime(2026, 10, 30, 12, 0, tzinfo=UTC)
+
+
+def lose_the_data_store(data_root: Path) -> DataRoot:
+    """Delete ``brain.db`` (and its ``-wal``/``-shm``) plus two subdirectories, so a re-creation would show."""
+    with maintenance_lease(data_root) as (root, _lease):
+        for path in (root.store_db, *(root.store_dir / f"brain.db{s}" for s in ("-wal", "-shm"))):
+            path.unlink(missing_ok=True)
+        for directory in (root.outbox_dir, root.logs_dir):
+            directory.rmdir()
+    return root
+
+
+def assert_refused_before_creating(data_root: Path, root: DataRoot) -> None:
+    before = digest_tree(root.policy_dir)
+    with pytest.raises(BrainError) as e:
+        open_runtime(data_root, os_adapters())
+    assert e.value.code == ErrorCode.INTEGRITY_FAILURE
+    assert "data store missing for a policy store with history; restore a store backup" in e.value.message
+    assert not root.store_db.exists() and not root.outbox_dir.exists() and not root.logs_dir.exists()
+    assert digest_tree(root.policy_dir) == before and writer_is_free(data_root)
+
+
+def test_missing_data_store_next_to_policy_intents_is_refused(trusted_tmp: Path) -> None:
+    rt = open_runtime(trusted_tmp / "r", os_adapters())
+    try:
+        rt.policy.record_intent(IntentKind.TOMBSTONE, {"holder_kind": "event", "holder_id": E1})
+    finally:
+        rt.close()
+    assert_refused_before_creating(trusted_tmp / "r", lose_the_data_store(trusted_tmp / "r"))
+
+
+@pytest.mark.parametrize("kind", ["store", "store_full"])
+def test_missing_data_store_next_to_a_complete_store_backup_is_refused(trusted_tmp: Path, kind: str) -> None:
+    rt = open_runtime(trusted_tmp / "r", os_adapters())
+    try:
+        if kind == "store":
+            create_store_backup(rt.store, rt.os_, NOW)
+    finally:
+        rt.close()
+    if kind == "store_full":
+        with maintenance_lease(trusted_tmp / "r") as (root, lease):
+            create_maintenance_backup(root, lease, os_adapters(), target="store", now=NOW)
+    assert_refused_before_creating(trusted_tmp / "r", lose_the_data_store(trusted_tmp / "r"))
+
+
+def test_missing_data_store_without_history_is_created(trusted_tmp: Path) -> None:
+    rt = open_runtime(trusted_tmp / "r", os_adapters())
+    try:
+        create_policy_backup(rt.policy, rt.os_, NOW)  # a policy backup is not store history
+        store_id = rt.store.store_id
+    finally:
+        rt.close()
+    root = lose_the_data_store(trusted_tmp / "r")
+    (root.backups_dir / f"store-20261030T120000Z-{E1}").mkdir()  # incomplete: no manifest
+    rt = open_runtime(trusted_tmp / "r", os_adapters())
+    try:
+        assert rt.store.store_id == store_id and list(rt.store.entries()) == []
+    finally:
+        rt.close()

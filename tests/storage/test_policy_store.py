@@ -115,11 +115,12 @@ def test_policy_store_is_a_policy_source(env: Env) -> None:
 # --- trust generation ------------------------------------------------------------------------------------------
 
 
-def test_create_starts_at_the_lock_hwm(trusted_tmp: Path, os_: OsAdapters) -> None:
+def test_create_starts_strictly_above_the_lock_hwm(trusted_tmp: Path, os_: OsAdapters) -> None:
+    # 5 may already have been issued (to a policy store since replaced): a new store must never reuse it.
     with maintenance_lease(trusted_tmp / "r", os_) as (root, lease):
         lease.raise_trust_hwm(5)
         policy = PolicyStore.create(root, lease, os_, store_id=STORE_ID)
-        assert policy.trust_generation() == 5 and lease.state().trust_generation_hwm == 5
+        assert policy.trust_generation() == 6 and lease.state().trust_generation_hwm == 6
         policy.close()
 
 

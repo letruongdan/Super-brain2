@@ -31,6 +31,7 @@ from superbrain.storage.retention import expire_due
 from superbrain.storage.runtime import open_runtime
 from superbrain.storage.schema import POLICY_MIGRATIONS, STORE_MIGRATIONS, read_schema_info
 from superbrain.storage.store import Store
+from superbrain.storage.writer import WriterLease
 from tests.storage.conftest import CLOCK_START, DEMO_KINDS, Env, maintenance_lease
 from tests.storage.test_retention import hold_event
 from tests.support.clock import FakeClock
@@ -557,6 +558,13 @@ def test_crash_mid_backup_leaves_incomplete_backup_that_never_verifies(trusted_t
 # --- pruning and permissions -------------------------------------------------------------------------------------
 
 
+@pytest.fixture
+def pruning(trusted_tmp: Path) -> Iterator[tuple[Path, WriterLease]]:
+    """``(backups_dir, lease)`` of a data root under its writer lease, with no database open."""
+    with maintenance_lease(trusted_tmp) as (root, lease):
+        yield root.backups_dir, lease
+
+
 def fake_backup(backups: Path, kind: str, hours_ago: int, *, complete: bool = True) -> Path:
     stamp = (CLOCK_START - timedelta(hours=hours_ago)).strftime("%Y%m%dT%H%M%SZ")
     path = backups / f"{kind}-{stamp}-0192f3a4-5b6c-7d8e-9f01-{hours_ago:012d}"
@@ -568,38 +576,39 @@ def fake_backup(backups: Path, kind: str, hours_ago: int, *, complete: bool = Tr
     return path
 
 
-def test_prune_keeps_seven_complete_per_kind(trusted_tmp: Path, clock: FakeClock) -> None:
-    backups = trusted_tmp / "backups"
-    backups.mkdir()
+def test_prune_keeps_seven_complete_per_kind(
+    pruning: tuple[Path, WriterLease], clock: FakeClock
+) -> None:
+    backups, lease = pruning
     stores = [fake_backup(backups, "store", h) for h in range(1, 10)]
     policies = [fake_backup(backups, "policy", h) for h in (100, 200)]
     full = fake_backup(backups, "store_full", 300)
     old_partial = fake_backup(backups, "store", 25, complete=False)
     young_partial = fake_backup(backups, "policy", 23, complete=False)
     (backups / "unrelated").mkdir()
-    changed = prune_backups(backups, os_=os_adapters(), now=clock.now())
+    changed = prune_backups(backups, lease=lease, os_=os_adapters(), now=clock.now())
     assert changed == sorted([stores[7], stores[8], old_partial.with_name(old_partial.name + ".incomplete")])
     left = sorted(p.name for p in backups.iterdir())
     expected = [p.name for p in (*stores[:7], *policies, full, young_partial)]
     assert left == sorted([*expected, old_partial.name + ".incomplete", "unrelated"])
-    assert prune_backups(backups, os_=os_adapters(), now=clock.now()) == []
+    assert prune_backups(backups, lease=lease, os_=os_adapters(), now=clock.now()) == []
 
 
-def test_prune_honours_keep(trusted_tmp: Path, clock: FakeClock) -> None:
-    backups = trusted_tmp / "backups"
-    backups.mkdir()
+def test_prune_honours_keep(
+    pruning: tuple[Path, WriterLease], clock: FakeClock
+) -> None:
+    backups, lease = pruning
     stores = [fake_backup(backups, "store", h) for h in (1, 2, 3)]
-    assert sorted(prune_backups(backups, os_=os_adapters(), keep=1, now=clock.now())) == sorted(stores[1:])
+    assert sorted(prune_backups(backups, lease=lease, os_=os_adapters(), keep=1, now=clock.now())) == sorted(stores[1:])
     with pytest.raises(BrainError) as e:
-        prune_backups(backups, os_=os_adapters(), keep=0, now=clock.now())
+        prune_backups(backups, lease=lease, os_=os_adapters(), keep=0, now=clock.now())
     assert e.value.code == ErrorCode.INVALID_INPUT
 
 
 def test_failed_prune_leaves_no_half_deleted_backup_that_looks_complete(
-    trusted_tmp: Path, clock: FakeClock, monkeypatch: pytest.MonkeyPatch
+    pruning: tuple[Path, WriterLease], clock: FakeClock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    backups = trusted_tmp / "backups"
-    backups.mkdir()
+    backups, lease = pruning
     stores = [fake_backup(backups, "store", h) for h in range(1, 9)]
     real_rmtree = shutil.rmtree
 
@@ -610,23 +619,33 @@ def test_failed_prune_leaves_no_half_deleted_backup_that_looks_complete(
 
     monkeypatch.setattr(shutil, "rmtree", half_rmtree)
     with pytest.raises(BrainError) as e:
-        prune_backups(backups, os_=os_adapters(), now=clock.now())
+        prune_backups(backups, lease=lease, os_=os_adapters(), now=clock.now())
     assert e.value.code == ErrorCode.IO_ERROR
     assert not stores[7].exists()
     (doomed,) = [p for p in backups.iterdir() if ".deleting-" in p.name]
     assert doomed.name.startswith(stores[7].name + ".deleting-")
     monkeypatch.setattr(shutil, "rmtree", real_rmtree)
-    assert prune_backups(backups, os_=os_adapters(), now=clock.now()) == []  # .deleting-* is not counted
+    assert prune_backups(backups, lease=lease, os_=os_adapters(), now=clock.now()) == []  # .deleting-* is not counted
     assert doomed.exists() and all(p.exists() for p in stores[:7])
 
 
-def test_prune_does_not_count_deleting_entries(trusted_tmp: Path, clock: FakeClock) -> None:
-    backups = trusted_tmp / "backups"
-    backups.mkdir()
+def test_prune_needs_the_held_lease_of_its_data_root(trusted_tmp: Path, clock: FakeClock) -> None:
+    with maintenance_lease(trusted_tmp / "other") as (_root, other):
+        with maintenance_lease(trusted_tmp / "r") as (root, lease):
+            with pytest.raises(AssertionError, match="lease"):
+                prune_backups(root.backups_dir, lease=other, os_=os_adapters(), now=clock.now())
+        with pytest.raises(AssertionError, match="lease"):
+            prune_backups(root.backups_dir, lease=lease, os_=os_adapters(), now=clock.now())
+
+
+def test_prune_does_not_count_deleting_entries(
+    pruning: tuple[Path, WriterLease], clock: FakeClock
+) -> None:
+    backups, lease = pruning
     stores = [fake_backup(backups, "store", h) for h in range(1, 8)]
     leftover = fake_backup(backups, "store", 50)
     leftover = leftover.rename(leftover.with_name(leftover.name + ".deleting-0192f3a4-5b6c-7d8e-9f01-000000000001"))
-    assert prune_backups(backups, os_=os_adapters(), now=clock.now()) == []
+    assert prune_backups(backups, lease=lease, os_=os_adapters(), now=clock.now()) == []
     assert leftover.exists() and all(p.exists() for p in stores)
 
 

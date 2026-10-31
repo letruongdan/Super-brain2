@@ -111,7 +111,8 @@ class PolicyStore:
     ) -> "PolicyStore":
         """Create a new policy store bound to the main store ``store_id``, then open it.
 
-        As in ``Store.create``, the database (with its trust row, ``generation = max(1, hwm)``) is built at
+        As in ``Store.create``, the database (with its trust row, ``generation = hwm + 1``, or 1 on a fresh lock, so
+        strictly above every generation already issued) is built at
         ``policy.db.creating-<id>``, closed and only then published as ``policy.db``; leftover ``creating-*``
         files are removed first. An existing ``policy.db`` (or ``-wal``/``-shm``) is ``INVALID_INPUT``.
         """
@@ -128,7 +129,8 @@ class PolicyStore:
             db = connect(staging)
             try:
                 initialize(db, migrations, store_id=store_id)
-                generation = max(1, lease.state().trust_generation_hwm)
+                hwm = lease.state().trust_generation_hwm
+                generation = hwm + 1 if hwm >= 1 else 1
                 try:
                     db.execute("INSERT INTO trust (id, generation) VALUES (1, ?)", (generation,))
                 except sqlite3.Error as exc:
