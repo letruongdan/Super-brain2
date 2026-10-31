@@ -33,7 +33,6 @@ from superbrain.adapters.os.environment import OsEnvironmentProbe as OsEnvironme
 from superbrain.adapters.os.environment import PathFacts as PathFacts
 from superbrain.adapters.os.paths import default_data_root
 from superbrain.core.canonical import canonical_json, digest_bytes
-from superbrain.core.errors import BrainError
 from superbrain.core.jsonvalue import JsonValue
 
 REQUIRED_PHASES = ("ruff", "mypy", "lint-imports", "pytest")
@@ -429,7 +428,7 @@ def run_gate(repo: Path, python: str) -> tuple[dict[str, JsonValue], str]:
     try:
         facts = collect_environment(OsEnvironmentProbe(), env=os.environ, platform=sys.platform)
         environment = assess_environment(facts)
-    except (OSError, KeyError, ValueError, RuntimeError, BrainError) as err:
+    except Exception as err:  # noqa: BLE001 - never swallowed: any failure is a reason, the receipt is not accepted
         extra.append(f"environment preflight failed: {type(err).__name__}: {err}")
     try:
         start = source_identity(worktree)
