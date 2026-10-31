@@ -22,7 +22,7 @@ import time
 import uuid
 import xml.etree.ElementTree as ET
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -222,6 +222,42 @@ def _outcome(case: ET.Element) -> str:
     return "passed"
 
 
+_XPASS_PREFIX = "XPASS "
+_FINAL_SUMMARY = re.compile(r"^=*\s*\d+ [a-z]+(, \d+ [a-z]+)* in [0-9.]+s\b")
+_XPASSED = re.compile(r"\b(\d+) xpassed\b")
+
+
+def parse_xpassed(text: str, ids: Iterable[str]) -> tuple[list[str], list[str]]:
+    """The tests the ``-rX`` short summary of pytest's terminal output reports as XPASS, and any problem.
+
+    A non-strict XPASS looks like a pass in JUnit (no child element), so the terminal summary is the evidence.
+    Each ``XPASS <node id>[ - <reason>]`` line must name one of ``ids``, and their number must equal the
+    ``N xpassed`` of pytest's final summary line.
+    """
+    known = sorted(set(ids), key=len, reverse=True)
+    found: list[str] = []
+    problems: list[str] = []
+    final: str | None = None
+    for line in text.splitlines():
+        line = line.rstrip()
+        if _FINAL_SUMMARY.match(line):
+            final = line
+        if not line.startswith(_XPASS_PREFIX):
+            continue
+        rest = line[len(_XPASS_PREFIX) :]
+        match = next((i for i in known if rest == i or rest.startswith(f"{i} - ")), None)
+        if match is None:
+            problems.append(f"an XPASS line names no collected test: {rest[:200]}")
+        else:
+            found.append(match)
+    counted = _XPASSED.search(final) if final is not None else None
+    reported = int(counted.group(1)) if counted else 0
+    lines = len(found) + len(problems)
+    if reported != lines:
+        problems.append(f"pytest reports {reported} xpassed but {lines} XPASS lines were found")
+    return found, problems
+
+
 def parse_junit(path: Path, *, root: Path | None = None) -> tuple[list[str], dict[str, str]]:
     """Map every JUnit testcase to its ``--collect-only -q`` node ID and terminal outcome.
 
@@ -344,6 +380,7 @@ def run_gate(repo: Path, python: str) -> tuple[dict[str, JsonValue], str]:
     start = end = None
     cleanup_error: str | None = None
     junit = worktree.parent / f"{worktree.name}-junit.xml"
+    pytest_output = ""
     try:
         start = source_identity(worktree)
         code, output, _ = run(
@@ -370,7 +407,7 @@ def run_gate(repo: Path, python: str) -> tuple[dict[str, JsonValue], str]:
                 "ruff": _uv(worktree, python, "ruff", "check", "src", "tests", "scripts"),
                 "mypy": _uv(worktree, python, "mypy"),
                 "lint-imports": _uv(worktree, python, "lint-imports"),
-                "pytest": _uv(worktree, python, "pytest", f"--junitxml={junit}", "-q"),
+                "pytest": _uv(worktree, python, "pytest", f"--junitxml={junit}", "-q", "-rfEX"),
             }
             code, output, _ = run(
                 _uv(worktree, python, "pytest", "--collect-only", "-q"), cwd=worktree, timeout_s=COLLECT_TIMEOUT_S
@@ -386,6 +423,8 @@ def run_gate(repo: Path, python: str) -> tuple[dict[str, JsonValue], str]:
             for name in REQUIRED_PHASES:
                 code, output, seconds = run(commands[name], cwd=worktree, timeout_s=PHASE_TIMEOUTS_S[name])
                 phases.append(PhaseResult(name, code, seconds))
+                if name == "pytest":
+                    pytest_output = output
                 if KILL_HANG_MARKER in output:
                     extra.append(f"phase {name} did not exit after being killed")
                 if code != 0:
@@ -395,6 +434,13 @@ def run_gate(repo: Path, python: str) -> tuple[dict[str, JsonValue], str]:
                     junit_ids, outcomes = parse_junit(junit, root=worktree)
                 except (ValueError, ET.ParseError) as err:
                     extra.append(f"junit: {err}")
+                xpassed, problems = parse_xpassed(pytest_output, outcomes)
+                extra.extend(f"xpass: {problem}" for problem in problems)
+                for node in xpassed:  # JUnit shows a non-strict XPASS as a pass; the terminal summary does not
+                    if outcomes[node] == "passed":
+                        outcomes[node] = "xpassed"
+                    else:
+                        extra.append(f"xpass: {node} is XPASS in the terminal but {outcomes[node]} in JUnit")
             else:
                 extra.append("pytest wrote no JUnit report")
         end = source_identity(worktree)
