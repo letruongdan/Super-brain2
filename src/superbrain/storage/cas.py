@@ -219,12 +219,14 @@ class ContentStore:
         self._check = check
         self._maintenance = maintenance
         self._transaction = transaction
+        self._durable_shards: set[str] = set()
+        """Shards whose entry in ``cas/`` this store made durable: created here, or synced again on first reuse."""
 
     def put(self, data: bytes) -> str:
         """Publish ``data`` durably and return its digest; an existing blob is verified, never rewritten.
 
         The blob's location is checked first (``check_blob_location``). An existing blob whose bytes do not match is
-        ``INTEGRITY_FAILURE``; a matching one has its directory entry made durable again. The staging file is
+        ``INTEGRITY_FAILURE``; a matching one has its directory entries made durable again. The staging file is
         re-hashed before publishing: a mismatch is ``INTEGRITY_FAILURE``. On any failure the staging file is removed
         and the error propagates. ``put`` adds no holder: call ``Txn.hold`` once it has returned.
         """
@@ -235,7 +237,8 @@ class ContentStore:
         if found is not None:
             if found != digest:
                 raise BrainError(ErrorCode.INTEGRITY_FAILURE, f"the stored blob {digest} does not match its digest")
-            # An earlier put may have renamed it into place and failed before its directory entry was durable.
+            # An earlier put may have renamed it into place and failed before its directory entries were durable.
+            self._sync_reused_shard(final.parent)
             self._os.publisher.sync_directory(final.parent)
             return digest
         staging = self._staging_dir / f"{new_id()}{STAGING_SUFFIX}"
@@ -379,12 +382,23 @@ class ContentStore:
 
     def _ensure_shard(self, shard: Path) -> None:
         """Create a missing shard, secure it, and make its entry in ``cas/`` durable; an existing one (already
-        checked by ``check_blob_location``) is kept."""
+        checked by ``check_blob_location``) is kept and goes through ``_sync_reused_shard``."""
         try:
             shard.mkdir(mode=0o700)
         except FileExistsError:
+            self._sync_reused_shard(shard)
             return
         except OSError as err:
             raise os_error(f"cannot create the blob shard {shard}", err) from err
         self._os.permissions.secure_directory(shard)
         self._os.publisher.sync_directory(self._cas_dir)
+        self._durable_shards.add(shard.name)
+
+    def _sync_reused_shard(self, shard: Path) -> None:
+        """Sync ``cas/`` the first time this store reuses ``shard``: the put that created it (here or in an earlier
+        process) may have failed or died before its entry in ``cas/`` was durable (spec 5.4 step 5 before the ref).
+        A failed sync propagates and the next reuse tries again; an OS that cannot sync a directory at all is the
+        publisher's degraded tier, not an error."""
+        if shard.name not in self._durable_shards:
+            self._os.publisher.sync_directory(self._cas_dir)
+            self._durable_shards.add(shard.name)
