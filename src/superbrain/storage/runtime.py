@@ -15,7 +15,7 @@ from pathlib import Path
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.ids import new_id
 from superbrain.ports.os import OsAdapters
-from superbrain.storage.errors import sqlite_error
+from superbrain.storage.errors import os_error, sqlite_error
 from superbrain.storage.kinds import KindRegistry
 from superbrain.storage.layout import DataRoot, prepare_data_root, secure_subdirectories
 from superbrain.storage.ledger import ProjectionHandler
@@ -71,9 +71,27 @@ def _has_intents(policy_db: Path) -> bool:
         raise sqlite_error(f"cannot read the intents of {policy_db}", exc) from exc
 
 
+def _cas_has_content(cas_dir: Path) -> bool:
+    """Whether ``cas/`` holds any entry. Shards and blobs are only created by ``put`` on an open store, and a blob
+    is published before its ref is written and ACKed (spec 5.4): any entry shows that a ``brain.db`` existed and was
+    written to. Fail closed: which of its entries were ACKed is unknowable once it is lost."""
+    try:
+        with os.scandir(cas_dir) as entries:
+            return any(True for _ in entries)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise os_error(f"cannot list {cas_dir}", exc) from exc
+
+
 def _store_has_history(root: DataRoot) -> bool:
-    """A policy store with intents, or a complete store backup: a new, empty ``brain.db`` would lose that data."""
-    return _has_intents(root.policy_db) or has_complete_backup(root.backups_dir, ("store", "store_full"))
+    """History a new, empty ``brain.db`` would silently lose or orphan: a policy store with intents, a complete
+    store backup, or content in ``cas/`` (whose holders were in the lost database)."""
+    return (
+        _has_intents(root.policy_db)
+        or has_complete_backup(root.backups_dir, ("store", "store_full"))
+        or _cas_has_content(root.cas_dir)
+    )
 
 
 def open_runtime(
@@ -89,12 +107,12 @@ def open_runtime(
 
     Under the lease, swaps a crash interrupted are recovered first. Then a missing policy store next to an existing
     main store is ``INTEGRITY_FAILURE``, and so is a missing main store next to history: a policy store with intents,
-    or a complete ``store``/``store_full`` backup. Both are raised before any subdirectory or database is created.
-    Otherwise a missing policy store is created with a new store id, a missing main store with the policy store's
-    id. ``Store.open`` and ``Store.create`` reconcile the policy intents. The migration sequences are passed straight
-    to ``PolicyStore`` and ``Store``. On any failure, whatever was opened is closed and the lease released before the
-    error propagates; a ``BrainError`` from that close is attached to it as a note (and a handle that could not be
-    closed keeps the lease held).
+    a complete ``store``/``store_full`` backup, or content in ``cas/``. Both are raised before any subdirectory or
+    database is created. Otherwise a missing policy store is created with a new store id, a missing main store with
+    the policy store's id. ``Store.open`` and ``Store.create`` reconcile the policy intents. The migration sequences
+    are passed straight to ``PolicyStore`` and ``Store``. On any failure, whatever was opened is closed and the lease
+    released before the error propagates; a ``BrainError`` from that close is attached to it as a note (and a handle
+    that could not be closed keeps the lease held).
     """
     root = prepare_data_root(path, os_)
     lease = acquire_writer(root, os_)
