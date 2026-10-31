@@ -43,7 +43,14 @@ from superbrain.storage.ledger import (
     read_entries,
     rebuild_prefix,
 )
-from superbrain.storage.schema import STORE_MIGRATIONS, Migration, ensure_writable, initialize, read_schema_info
+from superbrain.storage.schema import (
+    STORE_MIGRATIONS,
+    Migration,
+    ensure_writable,
+    initialize,
+    read_schema_info,
+    readmit_writable,
+)
 from superbrain.storage.sqlite import CREATING, connect, db_files, remove_unfinished_creates
 from superbrain.storage.writer import WriterLease
 
@@ -325,6 +332,7 @@ class Store:
             raise BrainError(ErrorCode.INTEGRITY_FAILURE, "the store belongs to a different policy store")
         db = connect(path)
         try:
+            readmit_writable(db, path, info, migrations)
             store = cls(
                 root=root,
                 lease=lease,

@@ -91,32 +91,38 @@ def _version(path: Path, name: str, value: object) -> int:
     return int(value)
 
 
-def read_schema_info(path: Path) -> SchemaInfo | None:
-    """The ``meta`` of the database at ``path`` without writing anything; ``None`` if the file does not exist.
+def _meta(db: sqlite3.Connection, path: Path) -> SchemaInfo:
+    """The ``meta`` of ``db`` (the database at ``path``); ``sqlite3.Error`` propagates."""
+    if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'").fetchone() is None:
+        raise BrainError(ErrorCode.INTEGRITY_FAILURE, f"{path}: not a store database (no meta)")
+    columns = {row[1] for row in db.execute("PRAGMA table_info(meta)")}
+    if not {"key", "value"} <= columns:
+        raise BrainError(ErrorCode.INTEGRITY_FAILURE, f"{path}: meta has the wrong shape")
+    rows = dict(db.execute("SELECT key, value FROM meta").fetchall())
+    if any(k not in rows for k in _META_KEYS):
+        raise BrainError(ErrorCode.INTEGRITY_FAILURE, f"{path}: meta is missing required keys")
+    store_id = rows["store_id"]
+    if not isinstance(store_id, str):
+        raise BrainError(ErrorCode.INTEGRITY_FAILURE, f"{path}: meta store_id is not text")
+    schema_version = _version(path, "schema_version", rows["schema_version"])
+    min_reader = _version(path, "min_reader_version", rows["min_reader_version"])
+    if schema_version < 1 or min_reader > schema_version:
+        raise BrainError(ErrorCode.INTEGRITY_FAILURE, f"{path}: meta versions are inconsistent")
+    return SchemaInfo(schema_version, min_reader, store_id)
 
-    Opens through ``open_readonly``, so no file is created or modified.
+
+def read_schema_info(path: Path) -> SchemaInfo | None:
+    """The committed ``meta`` of the database at ``path``; ``None`` if the file does not exist.
+
+    Reads through ``open_readonly``, so committed WAL frames count even without a ``-shm``, and the database files
+    are never modified.
     """
     if not path.exists():
         return None
     db: sqlite3.Connection | None = None
     try:
         db = open_readonly(path)
-        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'").fetchone() is None:
-            raise BrainError(ErrorCode.INTEGRITY_FAILURE, f"{path}: not a store database (no meta)")
-        columns = {row[1] for row in db.execute("PRAGMA table_info(meta)")}
-        if not {"key", "value"} <= columns:
-            raise BrainError(ErrorCode.INTEGRITY_FAILURE, f"{path}: meta has the wrong shape")
-        rows = dict(db.execute("SELECT key, value FROM meta").fetchall())
-        if any(k not in rows for k in _META_KEYS):
-            raise BrainError(ErrorCode.INTEGRITY_FAILURE, f"{path}: meta is missing required keys")
-        store_id = rows["store_id"]
-        if not isinstance(store_id, str):
-            raise BrainError(ErrorCode.INTEGRITY_FAILURE, f"{path}: meta store_id is not text")
-        schema_version = _version(path, "schema_version", rows["schema_version"])
-        min_reader = _version(path, "min_reader_version", rows["min_reader_version"])
-        if schema_version < 1 or min_reader > schema_version:
-            raise BrainError(ErrorCode.INTEGRITY_FAILURE, f"{path}: meta versions are inconsistent")
-        return SchemaInfo(schema_version, min_reader, store_id)
+        return _meta(db, path)
     except BrainError:
         raise
     except sqlite3.OperationalError as exc:
@@ -136,6 +142,22 @@ def ensure_writable(info: SchemaInfo, migrations: Sequence[Migration]) -> None:
         raise BrainError(ErrorCode.UNSUPPORTED_VERSION, f"schema {info.schema_version} is newer than code {code}")
     if info.schema_version < code:
         raise BrainError(ErrorCode.MIGRATION_REQUIRED, f"schema {info.schema_version} needs migration to {code}")
+
+
+def readmit_writable(db: sqlite3.Connection, path: Path, admitted: SchemaInfo, migrations: Sequence[Migration]) -> None:
+    """Admission again on the writable connection ``db`` to ``path``, before anything is written through it.
+
+    ``admitted`` is what ``read_schema_info`` read before opening. ``db`` reads the state SQLite recovered, so a
+    schema this code cannot write is refused here too (``ensure_writable``), and meta that differs from ``admitted``
+    is ``INTEGRITY_FAILURE``.
+    """
+    try:
+        live = _meta(db, path)
+    except sqlite3.Error as exc:
+        raise sqlite_error(f"cannot read the meta of {path}", exc) from exc
+    ensure_writable(live, migrations)
+    if live != admitted:
+        raise BrainError(ErrorCode.INTEGRITY_FAILURE, f"{path}: meta changed between admission and opening")
 
 
 def ensure_readable(info: SchemaInfo, migrations: Sequence[Migration]) -> None:

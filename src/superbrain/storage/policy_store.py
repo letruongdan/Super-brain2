@@ -30,7 +30,14 @@ from superbrain.storage.errors import sqlite_error
 from superbrain.storage.kinds import CORE_KINDS, KindRegistry
 from superbrain.storage.layout import DataRoot
 from superbrain.storage.ledger import utc_timestamp
-from superbrain.storage.schema import POLICY_MIGRATIONS, Migration, ensure_writable, initialize, read_schema_info
+from superbrain.storage.schema import (
+    POLICY_MIGRATIONS,
+    Migration,
+    ensure_writable,
+    initialize,
+    read_schema_info,
+    readmit_writable,
+)
 from superbrain.storage.sqlite import CREATING, connect, db_files, remove_unfinished_creates
 from superbrain.storage.writer import WriterLease
 
@@ -180,6 +187,7 @@ class PolicyStore:
         ensure_writable(info, migrations)
         db = connect(path)
         try:
+            readmit_writable(db, path, info, migrations)
             policy = cls(root=root, lease=lease, os_=os_, db=db, store_id=info.store_id)
             for file in db_files(path):
                 if file.exists():

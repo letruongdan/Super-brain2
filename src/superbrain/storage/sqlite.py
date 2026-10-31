@@ -2,16 +2,22 @@
 verification."""
 
 import os
+import shutil
 import sqlite3
 import sys
 from pathlib import Path
 
 from superbrain.core.errors import BrainError, ErrorCode
+from superbrain.core.ids import new_id
 from superbrain.storage.errors import os_error, sqlite_error
 
 _BUSY_TIMEOUT_MS = 5000
 CREATING = ".creating-"
 """A new database is built at ``<name>.creating-<id>`` and published to ``<name>`` only once complete."""
+READING = ".reading-"
+"""``open_readonly`` recovers a WAL in a private ``<name>.reading-<id>/`` directory, removed before it returns."""
+WAL_HEADER_SIZE = 32
+"""A ``-wal`` no longer than its header holds no frame, so nothing committed."""
 
 
 def db_files(path: Path) -> tuple[Path, Path, Path]:
@@ -30,22 +36,86 @@ def remove_unfinished_creates(path: Path) -> None:
         raise os_error(f"cannot remove an unfinished create of {path.name}", exc) from exc
 
 
+def _wal_size(wal: Path) -> int:
+    try:
+        return os.stat(wal).st_size
+    except FileNotFoundError:
+        return 0
+    except OSError as exc:
+        raise os_error(f"cannot inspect {wal.name}", exc) from exc
+
+
+def _recovered_copy(path: Path) -> sqlite3.Connection:
+    """An in-memory copy of what SQLite itself recovers from ``path`` plus its ``-wal`` (no ``-shm``).
+
+    Both files are copied into a new private directory next to ``path`` (it inherits the owner-only access of the
+    database's own directory), the copy is opened writable so SQLite recovers the WAL into it, then it is backed up
+    into a ``:memory:`` connection and the directory is removed. ``path`` and its ``-wal`` are only read. SQLite
+    decides which WAL frames are committed: a WAL with no valid header or checksum adds nothing.
+    """
+    work = path.with_name(f"{path.name}{READING}{new_id()}")
+    try:
+        work.mkdir(mode=0o700)
+    except OSError as exc:
+        raise os_error(f"cannot create a private copy of {path.name}", exc) from exc
+    try:
+        copy = work / path.name
+        try:
+            shutil.copyfile(path, copy)
+            shutil.copyfile(db_files(path)[1], db_files(copy)[1])
+        except OSError as exc:
+            raise os_error(f"cannot copy {path.name} to recover its WAL", exc) from exc
+        source = sqlite3.connect(copy, isolation_level=None)
+        try:
+            memory = sqlite3.connect(":memory:", isolation_level=None)
+            try:
+                source.backup(memory)
+            except BaseException:
+                memory.close()
+                raise
+        finally:
+            source.close()
+    except BaseException as err:
+        try:
+            shutil.rmtree(work)
+        except OSError as cleanup:
+            err.add_note(f"the private copy {work} could not be removed: {cleanup}")
+        raise
+    try:
+        shutil.rmtree(work)
+    except OSError as exc:
+        memory.close()
+        raise os_error(f"cannot remove the private copy {work}", exc) from exc
+    return memory
+
+
 def open_readonly(path: Path) -> sqlite3.Connection:
-    """Read-only open that never creates or changes any file.
+    """A read-only view of the committed state of the closed (or leased) database ``path``.
 
     Even ``mode=ro`` creates ``-wal``/``-shm`` when they are missing (observed on Windows), which would change a
-    database we promised only to look at. So ``mode=ro`` is used only when both ``-wal`` and ``-shm`` exist, which
-    means a live writer or one that died before checkpointing; the reader then sees the committed WAL frames (a
-    read-only connection never checkpoints or deletes the WAL). Otherwise the file is opened ``immutable=1``: no locks,
-    nothing written, any stale or empty ``-wal`` ignored. ``immutable`` is safe only when no writer is active: every
-    reader here runs under the writer lease or on a closed or copied database.
+    database we promised only to look at. So:
+
+    * ``-wal`` and ``-shm`` both exist (a live writer, or one that died before checkpointing): ``mode=ro``, which
+      sees the committed WAL frames and never checkpoints or deletes the WAL.
+    * a ``-wal`` that may hold frames (longer than its header) but no ``-shm``: the ``-shm`` is only a rebuildable
+      index, so its absence says nothing about the WAL; the WAL is committed state. ``_recovered_copy`` returns what
+      SQLite recovers from a private copy, in memory. ``path``, its ``-wal`` and the absent ``-shm`` stay as they were.
+    * otherwise (no WAL, or an empty or header-only one, which holds no frame): ``immutable=1``, no locks, nothing
+      written.
+
+    ``immutable`` is safe only when no writer is active: every reader here runs under the writer lease or on a
+    closed or copied database. ``sqlite3.Error`` propagates; a failure to copy is a ``BrainError`` (``os_error``).
 
     Limitation: stores are always in WAL mode. A rollback-journal database with a hot journal would not be recovered
     by this read (``immutable`` ignores the journal), so such a file is not supported.
     """
     uri = path.absolute().as_uri()
-    live = path.with_name(path.name + "-wal").exists() and path.with_name(path.name + "-shm").exists()
-    return sqlite3.connect(f"{uri}?{'mode=ro' if live else 'immutable=1'}", uri=True, isolation_level=None)
+    _, wal, shm = db_files(path)
+    if os.path.exists(wal) and os.path.exists(shm):
+        return sqlite3.connect(f"{uri}?mode=ro", uri=True, isolation_level=None)
+    if _wal_size(wal) > WAL_HEADER_SIZE:
+        return _recovered_copy(path)
+    return sqlite3.connect(f"{uri}?immutable=1", uri=True, isolation_level=None)
 
 
 def open_immutable(path: Path) -> sqlite3.Connection:
