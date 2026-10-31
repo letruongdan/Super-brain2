@@ -4,6 +4,7 @@ verification."""
 import os
 import shutil
 import sqlite3
+import stat
 import sys
 from pathlib import Path
 
@@ -16,6 +17,7 @@ CREATING = ".creating-"
 """A new database is built at ``<name>.creating-<id>`` and published to ``<name>`` only once complete."""
 READING = ".reading-"
 """``open_readonly`` recovers a WAL in a private ``<name>.reading-<id>/`` directory, removed before it returns."""
+_REPARSE_POINT = 0x400  # FILE_ATTRIBUTE_REPARSE_POINT; st_file_attributes exists on Windows only
 WAL_HEADER_SIZE = 32
 """A ``-wal`` no longer than its header holds no frame, so nothing committed."""
 
@@ -34,6 +36,30 @@ def remove_unfinished_creates(path: Path) -> None:
                 os.unlink(path.parent / name)
     except OSError as exc:
         raise os_error(f"cannot remove an unfinished create of {path.name}", exc) from exc
+
+
+def remove_unfinished_reads(path: Path) -> None:
+    """Under the writer lease: delete ``<path>.reading-*`` directories that a reader killed mid-way left behind.
+
+    Every ``open_readonly`` of a live database runs under the lease, so none is in use. Only real directories are
+    removed; a link, junction or other reparse point with that name is never followed or touched (``rmtree`` does
+    not descend into links). A missing parent directory means there is nothing to remove.
+    """
+    prefix = path.name + READING
+    try:
+        names = sorted(n for n in os.listdir(path.parent) if n.startswith(prefix))
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise os_error(f"cannot list {path.parent}", exc) from exc
+    for name in names:
+        leftover = path.parent / name
+        try:
+            st = os.lstat(leftover)
+            if stat.S_ISDIR(st.st_mode) and not getattr(st, "st_file_attributes", 0) & _REPARSE_POINT:
+                shutil.rmtree(leftover)
+        except OSError as exc:
+            raise os_error(f"cannot remove the unfinished read copy {name}", exc) from exc
 
 
 def _wal_size(wal: Path) -> int:

@@ -22,7 +22,7 @@ from superbrain.storage.ledger import ProjectionHandler
 from superbrain.storage.policy_store import STORE_PUBLISHED, PolicyStore
 from superbrain.storage.prune import has_complete_backup
 from superbrain.storage.schema import POLICY_MIGRATIONS, STORE_MIGRATIONS, Migration
-from superbrain.storage.sqlite import open_readonly
+from superbrain.storage.sqlite import open_readonly, remove_unfinished_reads
 from superbrain.storage.store import Store
 from superbrain.storage.swap import recover_interrupted_swaps
 from superbrain.storage.writer import WriterLease, acquire_writer
@@ -111,15 +111,16 @@ def open_runtime(
 ) -> Runtime:
     """Open (creating what is missing) the data root at ``path`` for writing.
 
-    Under the lease, swaps a crash interrupted are recovered first. Then a missing policy store next to an existing
-    main store is ``INTEGRITY_FAILURE``, and so is a missing main store next to history: a policy store with intents
-    or with ``meta.store_published``, a complete ``store``/``store_full`` backup, or content in ``cas/``. Both are
-    raised before any subdirectory or database is created. Otherwise a missing policy store is created with a new
-    store id, a missing main store with the policy store's id. ``Store.open`` and ``Store.create`` reconcile the
-    policy intents; once either succeeded the policy store is marked durably (``PolicyStore.mark_store_published``,
-    idempotent). The migration sequences are passed straight to ``PolicyStore`` and ``Store``. On any failure,
-    whatever was opened is closed and the lease released before the error propagates; a ``BrainError`` from that
-    close is attached to it as a note (and a handle that could not be closed keeps the lease held).
+    Under the lease, swaps a crash interrupted are recovered first and ``open_readonly`` copies a crash left behind
+    are removed. Then a missing policy store next to an existing main store is ``INTEGRITY_FAILURE``, and so is a
+    missing main store next to history: a policy store with intents or with ``meta.store_published``, a complete
+    ``store``/``store_full`` backup, or content in ``cas/``. Both are raised before any subdirectory or database is
+    created. Otherwise a missing policy store is created with a new store id, a missing main store with the policy
+    store's id. ``Store.open`` and ``Store.create`` reconcile the policy intents; once either succeeded the policy
+    store is marked durably (``PolicyStore.mark_store_published``, idempotent). The migration sequences are passed
+    straight to ``PolicyStore`` and ``Store``. On any failure, whatever was opened is closed and the lease released
+    before the error propagates; a ``BrainError`` from that close is attached to it as a note (and a handle that
+    could not be closed keeps the lease held).
     """
     root = prepare_data_root(path, os_)
     lease = acquire_writer(root, os_)
@@ -127,6 +128,8 @@ def open_runtime(
     store: Store | None = None
     try:
         recover_interrupted_swaps(root, lease, os_)
+        remove_unfinished_reads(root.policy_db)
+        remove_unfinished_reads(root.store_db)
         if not os.path.lexists(root.policy_db) and os.path.lexists(root.store_db):
             # A new policy store would silently reset trust, quarantine and tombstones for existing data.
             raise BrainError(
