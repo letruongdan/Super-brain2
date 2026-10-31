@@ -7,6 +7,7 @@ import pytest
 
 from superbrain.adapters.os import os_adapters
 from superbrain.core.errors import BrainError, ErrorCode
+from superbrain.core.ids import new_id
 from superbrain.ports.policy import IntentKind
 from superbrain.storage.backup import create_maintenance_backup, create_policy_backup, create_store_backup
 from superbrain.storage.kinds import KindRegistry
@@ -303,13 +304,20 @@ def test_missing_data_store_next_to_a_complete_store_backup_is_refused(trusted_t
 
 
 def test_missing_data_store_without_history_is_created(trusted_tmp: Path) -> None:
-    rt = open_runtime(trusted_tmp / "r", os_adapters())
-    try:
-        create_policy_backup(rt.policy, rt.os_, NOW)  # a policy backup is not store history
-        store_id = rt.store.store_id
-    finally:
-        rt.close()
-    root = lose_the_data_store(trusted_tmp / "r")
+    """A store that was never published has no history: a policy backup and an incomplete store backup do not count.
+
+    Round 2 (controller ruling of 2026-10-31 on C02): once a store was published, losing ``brain.db`` is refused even
+    without other evidence (``test_remediation_c02_lost_main_db.py``). So the policy store here is created on its own
+    and ``brain.db`` was never published; before the ruling this test published a store and then deleted it.
+    """
+    with maintenance_lease(trusted_tmp / "r") as (root, lease):
+        policy = PolicyStore.create(root, lease, os_adapters(), store_id=new_id())
+        try:
+            create_policy_backup(policy, os_adapters(), NOW)  # a policy backup is not store history
+            store_id = policy.store_id
+        finally:
+            policy.close()
+    assert not root.store_db.exists()
     (root.backups_dir / f"store-20261030T120000Z-{E1}").mkdir()  # incomplete: no manifest
     rt = open_runtime(trusted_tmp / "r", os_adapters())
     try:
