@@ -100,9 +100,12 @@ Mục này chỉ ghi hành vi và giới hạn đã biết. Nó không phải cl
   Khi `brain.db` mất mà marker đã có, hoặc còn intent, backup kho đầy đủ hay nội dung trong `cas/`, thì `open_runtime`
   từ chối với `integrity_failure` và không tạo DB thay thế. Crash sau khi công bố nhưng trước khi ghi marker vẫn mở
   được ở lần khởi động sau, và lần đó ghi marker.
-  **Giới hạn:** nếu mất **cả** `policy.db` lẫn `brain.db` thì data root trông như mới. Trường hợp này không phát hiện
-  được nếu không có backup, vì mọi tín hiệu bền nằm trong hai DB đó. Policy store khôi phục từ một backup chụp trước
-  lần công bố đầu tiên cũng chưa có marker, cho tới lần `Store.open` thành công kế tiếp.
+  **Giới hạn:** nếu mất **cả** `policy.db` lẫn `brain.db` thì marker và intent mất theo. Khi đó chỉ còn nội dung trong
+  `cas/` hoặc một backup kho đầy đủ (`store`/`store_full`) chặn được việc tạo DB mới. Nếu không còn tín hiệu nào trong
+  số đó, data root trông như mới và trường hợp này không phát hiện được.
+  `restore_policy` không mang `meta.store_published` sang policy store được khôi phục: policy store khôi phục từ một
+  backup chụp trước lần công bố đầu tiên mất tín hiệu này, cho tới lần `Store.open` thành công kế tiếp. Việc này để
+  lại cho đợt 2 (quyết định của controller trong ledger).
 - **Bản sao đọc tạm `<db>.reading-*` (C01).** Khi có `-wal` mà thiếu `-shm`, `open_readonly` đọc qua một bản sao
   riêng cạnh DB rồi xóa nó. Nếu tiến trình chết giữa chừng, bản sao còn lại. `open_runtime` xóa các bản sao này dưới
   lease ở lần mở sau, chỉ xóa thư mục thật, không đi theo link.
