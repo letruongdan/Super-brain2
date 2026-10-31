@@ -26,4 +26,5 @@ jobs:
         with:
           name: gate-receipt-${{ matrix.os }}-${{ matrix.python }}
           path: .gate/
-          if-no-files-found: warn
+          include-hidden-files: true
+          if-no-files-found: error

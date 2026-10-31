@@ -36,6 +36,8 @@ PHASE_TIMEOUTS_S = {"ruff": 120.0, "mypy": 300.0, "lint-imports": 120.0, "pytest
 GIT_TIMEOUT_S = 120.0
 SYNC_TIMEOUT_S = 600.0
 COLLECT_TIMEOUT_S = 300.0
+KILL_GRACE_S = 30.0
+KILL_HANG_MARKER = "<process did not exit after being killed; output lost>"
 
 PREFLIGHT_CODE = (
     "import json, sys, superbrain; "
@@ -89,14 +91,14 @@ def build_receipt(
     python: str,
     implementation: str,
     platform: str,
+    interpreter: InterpreterInfo | None,
+    worktree: str,
+    requested_python: str,
     time_budget_s: float = 300.0,
-    interpreter: InterpreterInfo | None = None,
-    worktree: str | None = None,
-    requested_python: str | None = None,
     cleanup_error: str | None = None,
     extra_reasons: Sequence[str] = (),
 ) -> dict[str, JsonValue]:
-    """Judge a run. ``interpreter``/``worktree``/``requested_python`` are given together by the real gate."""
+    """Judge a run. The interpreter binding is mandatory: ``interpreter=None`` means the preflight failed."""
     reasons: list[str] = list(extra_reasons)
     if start != end:
         reasons.append("source identity changed between start and end of the run")
@@ -138,16 +140,13 @@ def build_receipt(
     if sum(counted.values()) != len(collected_ids):
         reasons.append(f"outcome counts sum to {sum(counted.values())}, inventory has {len(collected_ids)}")
 
-    if worktree is not None:
-        if interpreter is None:
-            reasons.append("the interpreter preflight did not produce a result")
-        else:
-            if not _under(interpreter.package_file, Path(worktree) / "src"):
-                reasons.append(f"superbrain was imported from {interpreter.package_file}, outside the sealed worktree")
-            if requested_python is not None and not re.match(
-                re.escape(requested_python) + r"(?![0-9])", interpreter.version
-            ):
-                reasons.append(f"interpreter {interpreter.version!r} does not match --python {requested_python}")
+    if interpreter is None:
+        reasons.append("the interpreter preflight did not produce a result")
+    else:
+        if not _under(interpreter.package_file, Path(worktree) / "src"):
+            reasons.append(f"superbrain was imported from {interpreter.package_file}, outside the sealed worktree")
+        if not re.match(re.escape(requested_python) + r"(?![0-9])", interpreter.version):
+            reasons.append(f"interpreter {interpreter.version!r} does not match --python {requested_python}")
     if cleanup_error is not None:
         reasons.append(f"sealed worktree was not removed: {cleanup_error}")
 
@@ -155,6 +154,7 @@ def build_receipt(
         "start": asdict(start),
         "end": asdict(end),
         "test_inventory_digest": digest_bytes(canonical_json(sorted(collected_ids))),
+        "junit_inventory_digest": digest_bytes(canonical_json(sorted(junit_ids))),
         "test_count": len(collected_ids),
         "counts": counts,
         "phases": [asdict(p) for p in phases],
@@ -216,6 +216,8 @@ def _outcome(case: ET.Element) -> str:
     if "skipped" in kinds:
         skipped = case.find("skipped")
         kind = (skipped.get("type") if skipped is not None else None) or ""
+        # pytest writes <skipped type="pytest.xfail"> for an expected failure and <skipped type="pytest.skip">
+        # for a skip; anything else is reported as a (counted, visible) skip.
         return "xfailed" if kind == "pytest.xfail" else "skipped"
     return "passed"
 
@@ -288,7 +290,10 @@ def run(cmd: Sequence[str], *, cwd: Path, timeout_s: float) -> tuple[int | None,
         return proc.returncode, output, time.monotonic() - began
     except subprocess.TimeoutExpired:
         _kill_tree(proc)
-        output, _ = proc.communicate()
+        try:
+            output, _ = proc.communicate(timeout=KILL_GRACE_S)
+        except subprocess.TimeoutExpired:
+            output = KILL_HANG_MARKER
         return None, output or "", time.monotonic() - began
 
 
@@ -338,6 +343,7 @@ def run_gate(repo: Path, python: str) -> tuple[dict[str, JsonValue], str]:
     outcomes: dict[str, str] = {}
     start = end = None
     cleanup_error: str | None = None
+    junit = worktree.parent / f"{worktree.name}-junit.xml"
     try:
         start = source_identity(worktree)
         code, output, _ = run(
@@ -350,13 +356,16 @@ def run_gate(repo: Path, python: str) -> tuple[dict[str, JsonValue], str]:
             code, output, _ = run(
                 _uv(worktree, python, "python", "-I", "-c", PREFLIGHT_CODE), cwd=worktree, timeout_s=120.0
             )
-            try:
-                interpreter = InterpreterInfo(**json.loads(output.strip().splitlines()[-1]))
-            except (ValueError, TypeError, IndexError):
-                extra.append("interpreter preflight output was not understood")
+            if code != 0:
+                extra.append(f"interpreter preflight exited with {code}")
                 log.append(output)
+            else:
+                try:
+                    interpreter = InterpreterInfo(**json.loads(output.strip().splitlines()[-1]))
+                except (ValueError, TypeError, IndexError):
+                    extra.append("interpreter preflight output was not understood")
+                    log.append(output)
 
-            junit = worktree.parent / f"{worktree.name}-junit.xml"
             commands: dict[str, list[str]] = {
                 "ruff": _uv(worktree, python, "ruff", "check", "src", "tests", "scripts"),
                 "mypy": _uv(worktree, python, "mypy"),
@@ -377,6 +386,8 @@ def run_gate(repo: Path, python: str) -> tuple[dict[str, JsonValue], str]:
             for name in REQUIRED_PHASES:
                 code, output, seconds = run(commands[name], cwd=worktree, timeout_s=PHASE_TIMEOUTS_S[name])
                 phases.append(PhaseResult(name, code, seconds))
+                if KILL_HANG_MARKER in output:
+                    extra.append(f"phase {name} did not exit after being killed")
                 if code != 0:
                     log.append(f"--- {name} (exit {code}) ---\n{output[-4000:]}")
             if junit.is_file():
@@ -384,11 +395,11 @@ def run_gate(repo: Path, python: str) -> tuple[dict[str, JsonValue], str]:
                     junit_ids, outcomes = parse_junit(junit, root=worktree)
                 except (ValueError, ET.ParseError) as err:
                     extra.append(f"junit: {err}")
-                junit.unlink()
             else:
                 extra.append("pytest wrote no JUnit report")
         end = source_identity(worktree)
     finally:
+        junit.unlink(missing_ok=True)
         try:
             _git(repo, "worktree", "remove", "--force", str(worktree))
         except RuntimeError as err:

@@ -1,14 +1,20 @@
 """The gate receipt accepts only a complete, source-bound, fully-accounted run."""
 
+import json
+import shutil
 import subprocess
 import sys
+import tempfile
 import textwrap
+import time
+from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from scripts import gate
 from scripts.gate import (
     REQUIRED_PHASES,
     InterpreterInfo,
@@ -21,6 +27,13 @@ from scripts.gate import (
 from superbrain.core.canonical import canonical_json, digest_bytes
 
 CLEAN = SourceIdentity("c" * 40, True, "sha256:" + "1" * 64, "sha256:" + "2" * 64, "sha256:" + "3" * 64)
+WORKTREE = str(Path(tempfile.gettempdir()) / "superbrain-gate-fixture")
+GOOD_INTERPRETER = InterpreterInfo(
+    executable=str(Path(WORKTREE) / ".venv" / "python"),
+    version="3.14.3 (main, Feb  3 2026)",
+    implementation="cpython",
+    package_file=str(Path(WORKTREE) / "src" / "superbrain" / "__init__.py"),
+)
 PHASES = tuple(PhaseResult(name, 0, 1.0) for name in REQUIRED_PHASES)
 
 
@@ -35,6 +48,9 @@ def ok(**overrides: Any) -> dict[str, Any]:
         "python": "3.14.3",
         "implementation": "cpython",
         "platform": "win32",
+        "interpreter": GOOD_INTERPRETER,
+        "worktree": WORKTREE,
+        "requested_python": "3.14",
     }
     args.update(overrides)
     return args
@@ -295,3 +311,186 @@ def test_parse_collected_ignores_summary_lines_and_checks_the_count() -> None:
     assert parse_collected(text) == ["a/test_x.py::test_a", "a/test_x.py::T::test_b[1-2]"]
     with pytest.raises(ValueError):
         parse_collected("a/test_x.py::test_a\n\n5 tests collected in 0.01s\n")
+
+
+def test_junit_inventory_digest_is_reported_and_tracks_junit_ids() -> None:
+    receipt = build_receipt(**ok())
+    assert receipt["junit_inventory_digest"] == receipt["test_inventory_digest"]
+    other = build_receipt(**ok(junit_ids=["a", "z"]))
+    assert other["junit_inventory_digest"] != other["test_inventory_digest"]
+
+
+def test_interpreter_is_a_required_argument() -> None:
+    args = ok()
+    del args["interpreter"]
+    with pytest.raises(TypeError):
+        build_receipt(**args)
+
+
+# --- orchestration: run_gate with a fake command runner ------------------------------------------------
+
+SYNC_KEY = "sync"
+JUNIT_XML = '<testsuites><testsuite><testcase classname="t.test_a" name="test_a"/></testsuite></testsuites>'
+
+
+class FakeRunner:
+    """Stands in for ``gate.run``: records commands, creates and removes the worktree directory."""
+
+    def __init__(self, tmp_path: Path, *, codes: dict[str, int | None], remove_fails: bool = False) -> None:
+        self.tmp_path = tmp_path
+        self.codes = codes
+        self.remove_fails = remove_fails
+        self.calls: list[list[str]] = []
+        self.removed: list[str] = []
+        self.worktree: Path | None = None
+
+    @staticmethod
+    def key(cmd: list[str]) -> str:
+        if cmd[:2] == ["uv", "sync"]:
+            return SYNC_KEY
+        if cmd[0] == "git":
+            return "git"
+        tool = cmd[cmd.index("--python") + 2 :]
+        if tool[:1] == ["python"]:
+            return "preflight"
+        if tool[:1] == ["pytest"] and "--collect-only" in tool:
+            return "collect"
+        return tool[0]
+
+    def __call__(self, cmd: Sequence[str], *, cwd: Path, timeout_s: float) -> tuple[int | None, str, float]:
+        argv = list(cmd)
+        self.calls.append(argv)
+        key = self.key(argv)
+        if key == "git":
+            sub = argv[3:]
+            if sub[:2] == ["worktree", "add"]:
+                self.worktree = Path(sub[3])
+                (self.worktree / "src" / "superbrain").mkdir(parents=True)
+                (self.worktree / "t").mkdir()
+                (self.worktree / "t" / "test_a.py").write_text("")
+                (self.worktree / "uv.lock").write_text("lock")
+                (self.worktree / "pyproject.toml").write_text("cfg")
+                return 0, "", 0.0
+            if sub[:2] == ["worktree", "remove"]:
+                if self.remove_fails:
+                    return 1, "locked", 0.0
+                self.removed.append(sub[3])
+                shutil.rmtree(sub[3])
+                return 0, "", 0.0
+            if sub[0] == "rev-parse":
+                return 0, "a" * 40 + "\n", 0.0
+            return 0, "", 0.0  # status --porcelain (clean) and ls-files -s
+        if key == "preflight":
+            assert self.worktree is not None
+            info = {
+                "executable": str(self.worktree / ".venv" / "python"),
+                "version": "3.14.3 (main)",
+                "implementation": "cpython",
+                "package_file": str(self.worktree / "src" / "superbrain" / "__init__.py"),
+            }
+            return self.codes.get(key, 0), json.dumps(info) + "\n", 0.0
+        if key == "collect":
+            return self.codes.get(key, 0), "t/test_a.py::test_a\n\n1 test collected in 0.01s\n", 0.0
+        if key == "pytest":
+            junit = next(a for a in argv if a.startswith("--junitxml=")).split("=", 1)[1]
+            Path(junit).write_text(JUNIT_XML)
+        return self.codes.get(key, 0), "output", 1.0
+
+
+def run_with(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake: FakeRunner) -> dict[str, Any]:
+    monkeypatch.setattr(gate, "run", fake)
+    monkeypatch.setattr(gate.tempfile, "gettempdir", lambda: str(tmp_path))
+    receipt, _ = gate.run_gate(tmp_path / "repo", "3.14")
+    return dict(receipt)
+
+
+def test_run_gate_all_green_with_fakes_is_accepted_and_removes_the_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeRunner(tmp_path, codes={})
+    receipt = run_with(tmp_path, monkeypatch, fake)
+    assert receipt["accepted"] is True, receipt["reasons"]
+    assert len(fake.removed) == 1 and not Path(fake.removed[0]).exists()
+
+
+def test_phase_failure_is_not_accepted_and_worktree_is_removed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeRunner(tmp_path, codes={"mypy": 1})
+    receipt = run_with(tmp_path, monkeypatch, fake)
+    assert receipt["accepted"] is False
+    assert any("mypy" in r for r in receipt["reasons"])
+    assert len(fake.removed) == 1
+
+
+def test_phase_timeout_is_recorded_as_none_and_worktree_is_removed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeRunner(tmp_path, codes={"pytest": None})
+    receipt = run_with(tmp_path, monkeypatch, fake)
+    assert receipt["accepted"] is False
+    pytest_phase = next(p for p in receipt["phases"] if p["name"] == "pytest")
+    assert pytest_phase["exit_code"] is None
+    assert any("timed out" in r for r in receipt["reasons"])
+    assert len(fake.removed) == 1
+
+
+def test_failed_worktree_removal_is_reported_and_not_accepted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeRunner(tmp_path, codes={}, remove_fails=True)
+    receipt = run_with(tmp_path, monkeypatch, fake)
+    assert receipt["accepted"] is False
+    assert any("not removed" in r for r in receipt["reasons"])
+
+
+def test_failed_uv_sync_is_not_accepted_and_worktree_is_removed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeRunner(tmp_path, codes={SYNC_KEY: 1})
+    receipt = run_with(tmp_path, monkeypatch, fake)
+    assert receipt["accepted"] is False
+    assert any("uv sync" in r for r in receipt["reasons"])
+    assert len(fake.removed) == 1
+    assert not any(fake.key(c) == "ruff" for c in fake.calls)
+
+
+def test_failed_preflight_is_not_accepted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = FakeRunner(tmp_path, codes={"preflight": 3})
+    receipt = run_with(tmp_path, monkeypatch, fake)
+    assert receipt["accepted"] is False
+    assert any("preflight exited with 3" in r for r in receipt["reasons"])
+
+
+def test_junit_temp_file_is_removed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    run_with(tmp_path, monkeypatch, FakeRunner(tmp_path, codes={"pytest": None}))
+    assert not list(tmp_path.glob("*-junit.xml"))
+
+
+def test_run_kills_a_process_that_exceeds_its_timeout(tmp_path: Path) -> None:
+    marker = tmp_path / "survived.txt"
+    code = f"import time; time.sleep(6); open({str(marker)!r}, 'w').write('x')"
+    began = time.monotonic()
+    exit_code, _, _ = gate.run([sys.executable, "-c", code], cwd=tmp_path, timeout_s=1.0)
+    assert exit_code is None
+    assert time.monotonic() - began < 5
+    time.sleep(6)
+    assert not marker.exists()
+
+
+def test_run_does_not_wait_forever_for_a_killed_process(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    class Hung:
+        pid = 0
+        returncode = None
+
+        def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+            raise subprocess.TimeoutExpired("cmd", timeout or 0)
+
+        def kill(self) -> None:
+            pass
+
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: Hung())
+    monkeypatch.setattr(gate, "_kill_tree", lambda proc: None)
+    monkeypatch.setattr(gate, "KILL_GRACE_S", 0.01)
+    exit_code, output, _ = gate.run(["x"], cwd=tmp_path, timeout_s=0.01)
+    assert exit_code is None and gate.KILL_HANG_MARKER in output
