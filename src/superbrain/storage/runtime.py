@@ -95,6 +95,9 @@ def open_runtime(
         except BrainError as cleanup:
             err.add_note(f"closing the policy store after the failure also failed: {cleanup}")
         finally:
-            lease.release()
+            if lease.open_handles():  # never release under an open handle; the lock stays held instead
+                err.add_note(f"the writer lock stays held: {sorted(lease.open_handles())} could not be closed")
+            else:
+                lease.release()
         raise
     return Runtime(root=root, lease=lease, policy=policy, store=store, os_=os_)

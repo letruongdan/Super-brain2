@@ -228,6 +228,7 @@ def test_handle_registry(trusted_tmp: Path) -> None:
         assert lease.open_handles() == frozenset({"policy"})
         with pytest.raises(AssertionError):
             lease.unregister_handle("store")
+        lease.unregister_handle("policy")  # the lease is released on exit, which needs every handle closed
 
 
 def test_released_lease_refuses_further_writes(trusted_tmp: Path) -> None:
@@ -246,3 +247,14 @@ def test_mid_slot_write_pauses_once_per_write(trusted_tmp: Path) -> None:
     result = run_child("acquire_writer", root.root, env={"SUPERBRAIN_PAUSEPOINT": "writer.mid_slot_write"})
     assert result.returncode == 0
     assert result.stderr.count("PAUSED writer.mid_slot_write") == 1
+
+
+def test_release_with_open_handles_is_refused_and_keeps_the_lock(trusted_tmp: Path) -> None:
+    root = fresh_root(trusted_tmp)
+    with acquire_writer(root, os_adapters()) as lease:
+        lease.register_handle("store")
+        with pytest.raises(AssertionError, match="open handles"):
+            lease.release()
+        assert lease.held and run_child("acquire_writer", root.root).error_code == "writer_held"
+        lease.unregister_handle("store")
+    assert not lease.held and run_child("acquire_writer", root.root).error_code is None

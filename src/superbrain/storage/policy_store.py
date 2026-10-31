@@ -6,7 +6,8 @@ store applies the intent's ledger effects later, in ``Store.reconcile_policy``, 
 an intent as applied: nothing here knows or stores whether an intent has been applied.
 
 ``trust_generation`` never goes back: ``writer.lock`` keeps its high-water mark and every open re-aligns the two.
-Like ``Store``, a ``PolicyStore`` belongs to the thread that created or opened it.
+Like ``Store``, a ``PolicyStore`` belongs to the thread that created or opened it and refuses work once its lease
+was released.
 """
 
 import json
@@ -301,6 +302,8 @@ class PolicyStore:
     def _check(self) -> None:
         if self._closed:
             raise AssertionError("policy store closed")
+        if not self._lease.held:
+            raise AssertionError("policy store used after its writer lease was released")
         if threading.get_ident() != self._owner:
             raise AssertionError("policy store used off its owner thread")
 

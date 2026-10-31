@@ -210,3 +210,40 @@ def test_missing_policy_store_is_refused_before_any_subdirectory_is_created(trus
         open_runtime(trusted_tmp / "r", os_adapters())
     assert e.value.code == ErrorCode.INTEGRITY_FAILURE
     assert not root.outbox_dir.exists() and not root.logs_dir.exists()
+
+
+# --- single writer across modules ------------------------------------------------------------------------------
+
+
+def test_releasing_the_lease_under_open_stores_is_refused(trusted_tmp: Path) -> None:
+    rt = open_runtime(trusted_tmp / "r", os_adapters(), kinds=KindRegistry(DEMO_KINDS))
+    try:
+        with pytest.raises(AssertionError, match="open handles"):
+            rt.lease.release()
+        assert rt.lease.held
+        assert run_child("acquire_writer", trusted_tmp / "r").error_code == ErrorCode.WRITER_HELD.value
+        with rt.store.transaction() as t:
+            t.append("demo.count", actor="user:cli", owner_id="dan", meta={"n": 1})
+    finally:
+        rt.close()
+    assert not rt.lease.held and writer_is_free(trusted_tmp / "r")
+
+
+def test_stores_refuse_work_once_their_lease_was_released(trusted_tmp: Path) -> None:
+    rt = open_runtime(trusted_tmp / "r", os_adapters(), kinds=KindRegistry(DEMO_KINDS))
+    for name in ("store", "policy"):
+        rt.lease.unregister_handle(name)  # the only way around the release guard: forge a closed bookkeeping
+    rt.lease.release()
+    try:
+        with pytest.raises(AssertionError, match="lease"):
+            rt.store.transaction()
+        with pytest.raises(AssertionError, match="lease"):
+            rt.store.entries()
+        with pytest.raises(AssertionError, match="lease"):
+            rt.policy.intents()
+        with pytest.raises(AssertionError, match="lease"):
+            rt.policy.trust_generation()
+    finally:
+        rt.store._db.close()
+        rt.policy._db.close()
+    assert writer_is_free(trusted_tmp / "r")

@@ -117,6 +117,10 @@ class WriterLease:
         return self._current.writer_epoch
 
     def release(self) -> None:
+        """Unlock; idempotent. Refused while a store or policy handle is open under the lease, which would keep
+        writing with no lock held (another process could become the writer meanwhile)."""
+        if self._handles:
+            raise AssertionError(f"cannot release the writer lease with open handles {sorted(self._handles)}")
         handle, self._handle = self._handle, None
         if handle is not None:
             handle.release()

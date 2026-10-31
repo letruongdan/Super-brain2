@@ -1,8 +1,7 @@
 """The main store (spec 5.4, 5.8): one long-lived connection under the writer lease, owned by one thread.
 
-Every public method checks that the store is open and that it runs on the owner thread (the thread that called
-``create``/``open``); the ``Txn`` from ``transaction()`` checks the same.
-"""
+Every public method, and the ``Txn`` from ``transaction()``, checks that the store is open, that its writer lease is
+still held and that it runs on the owner thread (the thread that called ``create``/``open``)."""
 
 import functools
 import os
@@ -564,6 +563,8 @@ class Store:
     def _check(self) -> None:
         if self._closed:
             raise AssertionError("store closed")
+        if not self._lease.held:
+            raise AssertionError("store used after its writer lease was released")
         if threading.get_ident() != self._owner:
             raise AssertionError("store used off its owner thread")
 
