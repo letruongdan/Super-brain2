@@ -253,10 +253,10 @@ def test_hold_records_a_canonical_expiry(store: Store) -> None:
 
 def test_hold_with_a_naive_expiry_is_refused(store: Store) -> None:
     d = store.cas.put(b"naive")
-    with pytest.raises(AssertionError):
+    with pytest.raises(BrainError) as e:
         with store.transaction() as t:
             t.hold(d, "event", E1, RetentionClass.EVENT_PAYLOAD, datetime(2027, 1, 1))
-    assert list(store.entries()) == []
+    assert e.value.code is ErrorCode.INVALID_INPUT and list(store.entries()) == []
 
 
 @pytest.mark.parametrize("expires_at", ["2027-01-01T00:00:00Z", 1700000000, T0.date()])
@@ -372,8 +372,9 @@ def test_store_content_with_invalid_holder_fields_stores_nothing(
 
 
 def test_store_content_with_a_naive_expiry_stores_nothing(store: Store) -> None:
-    with pytest.raises(AssertionError):
+    with pytest.raises(BrainError) as e:
         store.store_content(b"naive", "event", E1, RetentionClass.EVENT_PAYLOAD, datetime(2027, 1, 1))
+    assert e.value.code is ErrorCode.INVALID_INPUT
     assert store.cas.orphans() == [] and list(store.entries()) == []
 
 

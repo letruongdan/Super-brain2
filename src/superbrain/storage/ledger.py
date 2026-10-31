@@ -80,9 +80,12 @@ def cas_hold_meta(
 ) -> dict[str, JsonValue]:
     """The ``cas.hold`` meta for these arguments, not yet validated against the kind's schema.
 
-    ``expires_at`` must be ``None`` or a datetime (anything else is ``INVALID_INPUT``); a naive one is a bug.
+    ``expires_at`` must be ``None`` or a timezone-aware datetime; anything else, a naive datetime included, is
+    ``INVALID_INPUT`` (it comes from a public API: ``Txn.hold``, ``Store.store_content``).
     """
-    if expires_at is not None and not isinstance(expires_at, datetime):
+    if expires_at is not None and (
+        not isinstance(expires_at, datetime) or expires_at.tzinfo is None or expires_at.utcoffset() is None
+    ):
         raise BrainError(ErrorCode.INVALID_INPUT, "expires_at must be a timezone-aware datetime or None")
     return {
         "digest": digest,

@@ -47,8 +47,9 @@ def test_naive_now_is_rejected(env: Env) -> None:
     with pytest.raises(BrainError) as err:
         expire_due(env.store, env.policy, datetime(2026, 1, 1))  # noqa: DTZ001
     assert err.value.code is ErrorCode.INVALID_INPUT
-    with pytest.raises(AssertionError):
+    with pytest.raises(BrainError) as err:
         default_expiry(RetentionClass.EVENT_PAYLOAD, datetime(2026, 1, 1), RetentionPolicy())  # noqa: DTZ001
+    assert err.value.code is ErrorCode.INVALID_INPUT
 
 
 def test_small_event_payload_expires_and_never_reaches_ledger(env: Env, clock: FakeClock) -> None:

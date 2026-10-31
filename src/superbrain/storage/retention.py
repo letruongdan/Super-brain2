@@ -41,9 +41,10 @@ class ExpiryReport:
 
 
 def default_expiry(retention: RetentionClass, now: datetime, policy: RetentionPolicy) -> datetime | None:
-    """When a hold of this class expires if taken at ``now``; ``None`` means never. A naive ``now`` is a bug."""
+    """When a hold of this class expires if taken at ``now``; ``None`` means never. A naive ``now`` is
+    ``INVALID_INPUT``."""
     if now.tzinfo is None or now.utcoffset() is None:
-        raise AssertionError("now must be a timezone-aware datetime")
+        raise BrainError(ErrorCode.INVALID_INPUT, "now must be timezone-aware")
     if retention is RetentionClass.EVENT_PAYLOAD:
         return now + timedelta(days=policy.event_payload_days)
     return None
