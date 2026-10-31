@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.ports.os import OsAdapters, PermissionProblem
+from superbrain.storage.errors import os_error
 
 if TYPE_CHECKING:
     from superbrain.storage.writer import WriterLease
@@ -120,7 +121,7 @@ def _make_directory(path: Path) -> bool:
     except FileExistsError:
         return False
     except OSError as err:
-        raise BrainError(ErrorCode.IO_ERROR, f"cannot create directory {path}: {err}") from err
+        raise os_error(f"cannot create directory {path}", err) from err
     return True
 
 
@@ -132,7 +133,7 @@ def _create_lock_file(path: Path) -> bool:
     except FileExistsError:
         return False
     except OSError as err:
-        raise BrainError(ErrorCode.IO_ERROR, f"cannot create lock file {path}: {err}") from err
+        raise os_error(f"cannot create lock file {path}", err) from err
     os.close(fd)
     return True
 

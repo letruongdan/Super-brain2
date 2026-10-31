@@ -47,11 +47,12 @@ def _winerror(err: OSError) -> int | None:
 
 
 def _is_disk_full(err: OSError) -> bool:
-    return err.errno == errno.ENOSPC or _winerror(err) == _ERROR_DISK_FULL
+    return err.errno in (errno.ENOSPC, errno.EDQUOT) or _winerror(err) == _ERROR_DISK_FULL
 
 
-def _map_os_error(err: OSError, what: str) -> BrainError:
-    """Translate an OS failure; the caller chains it with ``from err``."""
+def map_os_error(err: OSError, what: str) -> BrainError:
+    """Translate an OS failure for the adapters (``storage.errors.os_error`` is the storage twin, which
+    ``storage`` uses because it never imports ``adapters``); the caller chains it with ``from err``."""
     if _is_disk_full(err):
         return BrainError(ErrorCode.STORAGE_FULL, f"no space left while {what}")
     return BrainError(ErrorCode.IO_ERROR, f"I/O error while {what}: {err}")
@@ -287,7 +288,7 @@ class _BasePublisher:
         except FileExistsError:
             raise  # port contract: callers translate it; nothing was created
         except OSError as err:
-            raise _map_os_error(err, f"creating {path}") from err
+            raise map_os_error(err, f"creating {path}") from err
         try:
             try:
                 view = memoryview(data)
@@ -301,7 +302,7 @@ class _BasePublisher:
             with contextlib.suppress(OSError):
                 path.unlink()
             if isinstance(err, OSError):
-                raise _map_os_error(err, f"writing {path}") from err
+                raise map_os_error(err, f"writing {path}") from err
             raise
 
     def publish(self, staging: Path, final: Path) -> None:
@@ -318,7 +319,7 @@ class _BasePublisher:
         except FileExistsError:
             raise
         except OSError as err:
-            raise _map_os_error(err, what) from err
+            raise map_os_error(err, what) from err
 
     def durability(self, directory: Path, env: Mapping[str, str]) -> DurabilityReport:
         try:

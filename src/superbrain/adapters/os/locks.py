@@ -11,7 +11,7 @@ import os
 import sys
 from pathlib import Path
 
-from superbrain.adapters.os.durable import _full_fsync
+from superbrain.adapters.os.durable import _full_fsync, map_os_error
 from superbrain.core.errors import BrainError, ErrorCode
 
 _LOCK_REGION = 1  # byte 0; the payload starts right after it
@@ -42,10 +42,6 @@ else:
         fcntl.flock(fd, fcntl.LOCK_UN)
 
 
-def _io_error(err: OSError, what: str) -> BrainError:
-    return BrainError(ErrorCode.IO_ERROR, f"I/O error while {what}: {err}")
-
-
 class _OsLockHandle:
     def __init__(self, fd: int) -> None:
         self._fd: int | None = fd
@@ -63,7 +59,7 @@ class _OsLockHandle:
             while chunk := os.read(fd, 4096):
                 chunks.append(chunk)
         except OSError as err:
-            raise _io_error(err, "reading the lock payload") from err
+            raise map_os_error(err, "reading the lock payload") from err
         return b"".join(chunks)
 
     def write_payload(self, offset: int, data: bytes) -> None:
@@ -77,7 +73,7 @@ class _OsLockHandle:
                 view = view[os.write(fd, view) :]
             _full_fsync(fd)
         except OSError as err:
-            raise _io_error(err, "writing the lock payload") from err
+            raise map_os_error(err, "writing the lock payload") from err
 
     def release(self) -> None:
         fd, self._fd = self._fd, None
@@ -86,7 +82,7 @@ class _OsLockHandle:
         try:
             _unlock(fd)
         except OSError as err:
-            raise _io_error(err, "unlocking the writer lock") from err
+            raise map_os_error(err, "unlocking the writer lock") from err
         finally:
             os.close(fd)
 
@@ -97,12 +93,12 @@ class OsLockFactory:
         try:
             fd = os.open(path, flags)
         except OSError as err:
-            raise _io_error(err, f"opening the lock file {path}") from err
+            raise map_os_error(err, f"opening the lock file {path}") from err
         try:
             _lock(fd)
         except OSError as err:
             os.close(fd)
             if err.errno in _HELD_ERRNOS:
                 raise BrainError(ErrorCode.WRITER_HELD, "another process holds the writer lock") from err
-            raise _io_error(err, "locking the writer lock") from err
+            raise map_os_error(err, "locking the writer lock") from err
         return _OsLockHandle(fd)

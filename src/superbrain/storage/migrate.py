@@ -6,7 +6,6 @@ reference to the policy store). It takes a verified maintenance backup first, bu
 and swaps it in with ``stage_and_swap``. A failure before the swap leaves the original untouched.
 """
 
-import errno
 import os
 import shutil
 import sqlite3
@@ -27,6 +26,7 @@ from superbrain.storage.backup import (
     verify_backup,
 )
 from superbrain.storage.cas import blob_digests
+from superbrain.storage.errors import os_error, sqlite_error
 from superbrain.storage.layout import DataRoot
 from superbrain.storage.schema import (
     POLICY_MIGRATIONS,
@@ -53,12 +53,6 @@ class MigrationReport:
     """Where the pre-migration ``store/`` or ``policy/`` directory was kept."""
 
 
-def _io_error(what: str, err: OSError) -> BrainError:
-    if err.errno == errno.ENOSPC:
-        return BrainError(ErrorCode.STORAGE_FULL, f"no space left: {what}")
-    return BrainError(ErrorCode.IO_ERROR, f"{what}: {err}")
-
-
 def _copy_database(source: Path, dest: Path) -> None:
     """Copy ``source`` and its ``-wal`` (never the ``-shm``) beside each other, so opening the copy recovers it."""
     wal = db_files(source)[1]
@@ -67,7 +61,7 @@ def _copy_database(source: Path, dest: Path) -> None:
         if os.path.lexists(wal):
             shutil.copyfile(wal, db_files(dest)[1])
     except OSError as err:
-        raise _io_error(f"cannot copy {source.name} into the migration stage", err) from err
+        raise os_error(f"cannot copy {source.name} into the migration stage", err) from err
 
 
 def _apply(db: sqlite3.Connection, pending: Sequence[Migration]) -> None:
@@ -181,7 +175,7 @@ def migrate_database(
     try:
         backup = create_maintenance_backup(root, lease, os_, target=target, now=now)
     except OSError as err:
-        raise _io_error(f"cannot back up the {target} database before migrating it", err) from err
+        raise os_error(f"cannot back up the {target} database before migrating it", err) from err
     verify_backup(
         backup,
         expected_kind=kind,
@@ -196,9 +190,9 @@ def migrate_database(
         try:
             _migrate_file(stage / name, pending)
         except sqlite3.Error as exc:
-            raise BrainError(ErrorCode.IO_ERROR, f"cannot migrate the {target} database: {exc}") from exc
+            raise sqlite_error(f"cannot migrate the {target} database", exc) from exc
         except OSError as err:
-            raise _io_error(f"cannot make the migrated {name} durable", err) from err
+            raise os_error(f"cannot make the migrated {name} durable", err) from err
         if target == "store":
             copy_blobs(root.cas_dir, stage / "cas", sorted(blob_digests(root.cas_dir)), os_)
             new_directory(stage / "staging", os_)

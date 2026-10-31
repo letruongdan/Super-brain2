@@ -456,7 +456,7 @@ def test_failed_maintenance_backup_removes_its_work_directory(
     monkeypatch.undo()
     leftovers = [p.relative_to(trusted_tmp).as_posix() for p in (trusted_tmp / "backups").rglob(".work-*")]
     if failure == "copy":
-        assert e.value.code == ErrorCode.IO_ERROR and "cannot copy" in e.value.message and leftovers == []
+        assert e.value.code == ErrorCode.STORAGE_FULL and "cannot copy" in e.value.message and leftovers == []
     elif failure == "snapshot":
         assert e.value is boom and leftovers == []
     else:  # the original error propagates; the failed cleanup is attached to it, not hidden

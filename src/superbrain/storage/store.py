@@ -29,6 +29,7 @@ from superbrain.storage.cas import (
     held_digests,
     remove_staging_leftovers,
 )
+from superbrain.storage.errors import sqlite_error
 from superbrain.storage.kinds import CORE_KINDS, KindRegistry
 from superbrain.storage.layout import DataRoot
 from superbrain.storage.ledger import (
@@ -37,14 +38,13 @@ from superbrain.storage.ledger import (
     Txn,
     apply_to_handlers,
     cas_hold_meta,
-    io_error,
     iter_entries,
     live_prefix,
     read_entries,
     rebuild_prefix,
 )
 from superbrain.storage.schema import STORE_MIGRATIONS, Migration, ensure_writable, initialize, read_schema_info
-from superbrain.storage.sqlite import CREATING, connect, db_files, is_busy, remove_unfinished_creates
+from superbrain.storage.sqlite import CREATING, connect, db_files, remove_unfinished_creates
 from superbrain.storage.writer import WriterLease
 
 _HANDLE = "store"
@@ -119,7 +119,7 @@ def _create_tables(db: sqlite3.Connection, handler: ProjectionHandler, prefix: s
     try:
         handler.create_tables(db, prefix)
     except sqlite3.Error as exc:
-        raise io_error(f"projection {handler.name} could not create its tables", exc) from exc
+        raise sqlite_error(f"projection {handler.name} could not create its tables", exc) from exc
     stray = sorted(
         name
         for kind, name in _objects(db) - before
@@ -163,7 +163,7 @@ def _create_live_tables(db: sqlite3.Connection, handlers: Sequence[ProjectionHan
                 db.execute("ROLLBACK")
             raise
     except sqlite3.Error as exc:
-        raise io_error("cannot create projection tables", exc) from exc
+        raise sqlite_error("cannot create projection tables", exc) from exc
 
 
 def _replay(
@@ -355,7 +355,7 @@ class Store:
                 if fresh:
                     _replay(db, fresh, self._policy, live_prefix)
             except sqlite3.Error as exc:
-                raise io_error("cannot create projection tables", exc) from exc
+                raise sqlite_error("cannot create projection tables", exc) from exc
         for path in db_files(self._root.store_db):
             if path.exists():
                 self._os.permissions.secure_file(path)
@@ -373,7 +373,7 @@ class Store:
         try:
             self._db.close()
         except sqlite3.Error as exc:
-            raise io_error("cannot close the store", exc) from exc
+            raise sqlite_error("cannot close the store", exc) from exc
         finally:
             self._lease.unregister_handle(_HANDLE)
 
@@ -485,7 +485,7 @@ class Store:
                 for handler in self._handlers:
                     _swap_in_rebuilt(db, handler)
             except sqlite3.Error as exc:
-                raise io_error("cannot rebuild projections", exc) from exc
+                raise sqlite_error("cannot rebuild projections", exc) from exc
         return count
 
     def snapshot_db(self, dest: Path) -> None:
@@ -500,7 +500,7 @@ class Store:
         try:
             rows = self._db.execute("PRAGMA integrity_check").fetchall()
         except sqlite3.Error as exc:
-            raise io_error("cannot check database integrity", exc) from exc
+            raise sqlite_error("cannot check database integrity", exc) from exc
         return "\n".join(str(row[0]) for row in rows)
 
     def reconcile_policy(self) -> int:
@@ -516,7 +516,7 @@ class Store:
         try:
             done = {str(row[0]) for row in self._db.execute("SELECT intent_id FROM applied_intents").fetchall()}
         except sqlite3.Error as exc:
-            raise io_error("cannot read the applied intents", exc) from exc
+            raise sqlite_error("cannot read the applied intents", exc) from exc
         applied = 0
         for intent in self._policy.intents():
             if intent.intent_id in done:
@@ -578,9 +578,7 @@ class Store:
         try:
             self._db.execute("BEGIN IMMEDIATE")
         except sqlite3.Error as exc:
-            if is_busy(exc):
-                raise BrainError(ErrorCode.STORE_BUSY, f"the store database is busy: {exc}") from exc
-            raise io_error("cannot begin a store transaction", exc) from exc
+            raise sqlite_error("cannot begin a store transaction", exc, busy=True) from exc
         try:
             yield self._db
             if crashpoints:
@@ -588,13 +586,13 @@ class Store:
             try:
                 self._db.execute("COMMIT")
             except sqlite3.Error as exc:
-                raise io_error("cannot commit the store transaction", exc) from exc
+                raise sqlite_error("cannot commit the store transaction", exc) from exc
         except BaseException:
             if self._db.in_transaction:
                 try:
                     self._db.execute("ROLLBACK")
                 except sqlite3.Error as exc:
-                    raise io_error("cannot roll back the store transaction", exc) from exc
+                    raise sqlite_error("cannot roll back the store transaction", exc) from exc
             raise
         if crashpoints:
             crashpoint("ledger.after_commit")

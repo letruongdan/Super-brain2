@@ -7,9 +7,9 @@ import sys
 from pathlib import Path
 
 from superbrain.core.errors import BrainError, ErrorCode
+from superbrain.storage.errors import os_error, sqlite_error
 
 _BUSY_TIMEOUT_MS = 5000
-_BUSY_CODES = frozenset({sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED})
 CREATING = ".creating-"
 """A new database is built at ``<name>.creating-<id>`` and published to ``<name>`` only once complete."""
 
@@ -17,11 +17,6 @@ CREATING = ".creating-"
 def db_files(path: Path) -> tuple[Path, Path, Path]:
     """``path`` and its ``-wal`` and ``-shm`` companions, whether or not they exist."""
     return (path, path.with_name(path.name + "-wal"), path.with_name(path.name + "-shm"))
-
-
-def is_busy(exc: sqlite3.Error) -> bool:
-    """``exc`` reports another connection holding the database (``SQLITE_BUSY``/``SQLITE_LOCKED``)."""
-    return getattr(exc, "sqlite_errorcode", 0) & 0xFF in _BUSY_CODES
 
 
 def remove_unfinished_creates(path: Path) -> None:
@@ -32,7 +27,7 @@ def remove_unfinished_creates(path: Path) -> None:
             if name.startswith(prefix):
                 os.unlink(path.parent / name)
     except OSError as exc:
-        raise BrainError(ErrorCode.IO_ERROR, f"cannot remove an unfinished create of {path.name}: {exc}") from exc
+        raise os_error(f"cannot remove an unfinished create of {path.name}", exc) from exc
 
 
 def open_readonly(path: Path) -> sqlite3.Connection:
@@ -64,7 +59,7 @@ def connect(path: Path, *, readonly: bool = False, platform: str = sys.platform)
 
     ``readonly`` opens ``file:<path>?mode=ro`` and leaves ``journal_mode`` untouched (changing it needs a write).
     ``platform`` selects the macOS ``fullfsync`` pragmas; it is a parameter so tests can exercise it anywhere.
-    Every ``sqlite3.Error`` is mapped to ``BrainError(IO_ERROR)``; the connection is closed on failure.
+    Every ``sqlite3.Error`` is mapped by ``sqlite_error``; the connection is closed on failure.
     """
     try:
         if readonly:
@@ -72,7 +67,7 @@ def connect(path: Path, *, readonly: bool = False, platform: str = sys.platform)
         else:
             db = sqlite3.connect(path, isolation_level=None)
     except sqlite3.Error as exc:
-        raise BrainError(ErrorCode.IO_ERROR, f"cannot open database {path}: {exc}") from exc
+        raise sqlite_error(f"cannot open database {path}", exc) from exc
     try:
         db.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
         if not readonly:
@@ -92,5 +87,5 @@ def connect(path: Path, *, readonly: bool = False, platform: str = sys.platform)
         raise
     except sqlite3.Error as exc:
         db.close()
-        raise BrainError(ErrorCode.IO_ERROR, f"cannot configure database {path}: {exc}") from exc
+        raise sqlite_error(f"cannot configure database {path}", exc) from exc
     return db

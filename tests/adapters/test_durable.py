@@ -98,10 +98,11 @@ def test_rename_dir_refuses_existing_target(tmp_path: Path, publisher: DurablePu
     assert (tmp_path / "src").is_dir()
 
 
+@pytest.mark.parametrize("code", [errno.ENOSPC, errno.EDQUOT])
 def test_disk_full_maps_to_storage_full(
-    tmp_path: Path, publisher: DurablePublisher, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, publisher: DurablePublisher, monkeypatch: pytest.MonkeyPatch, code: int
 ) -> None:
-    monkeypatch.setattr(os, "write", raising(OSError(errno.ENOSPC, "full")))
+    monkeypatch.setattr(os, "write", raising(OSError(code, "full")))
     with pytest.raises(BrainError) as e:
         publisher.write_new(tmp_path / "x", b"data")
     assert e.value.code == ErrorCode.STORAGE_FULL

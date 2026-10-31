@@ -1,5 +1,6 @@
 import errno
 import json
+import os
 import signal
 import sys
 import zlib
@@ -102,6 +103,22 @@ def test_acquire_fails_without_a_lease_when_the_epoch_cannot_be_made_durable(
     # The lock was released, and the epoch that never became durable was not issued.
     with acquire_writer(root, os_adapters()) as lease:
         assert lease.epoch == 2
+
+
+@pytest.mark.parametrize("code", [errno.ENOSPC, errno.EDQUOT])
+def test_disk_full_while_writing_the_lock_payload_is_storage_full(
+    trusted_tmp: Path, monkeypatch: pytest.MonkeyPatch, code: int
+) -> None:
+    def full(fd: int, data: bytes) -> int:
+        raise OSError(code, "injected: full")
+
+    root = fresh_root(trusted_tmp)
+    with acquire_writer(root, os_adapters()) as lease:
+        monkeypatch.setattr(os, "write", full)
+        with pytest.raises(BrainError) as e:
+            lease.bump_epoch()
+        monkeypatch.undo()
+    assert e.value.code == ErrorCode.STORAGE_FULL and isinstance(e.value.__cause__, OSError)
 
 
 @pytest.mark.parametrize("value", [True, -1])

@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from superbrain.core.errors import BrainError, ErrorCode
+from superbrain.storage.errors import sqlite_error
 from superbrain.storage.sqlite import open_readonly
 
 _META_KEYS = ("schema_version", "min_reader_version", "store_id")
@@ -171,4 +172,4 @@ def initialize(db: sqlite3.Connection, migrations: Sequence[Migration], *, store
                 db.execute("ROLLBACK")
             raise
     except sqlite3.Error as exc:
-        raise BrainError(ErrorCode.IO_ERROR, f"cannot initialize database: {exc}") from exc
+        raise sqlite_error("cannot initialize database", exc) from exc

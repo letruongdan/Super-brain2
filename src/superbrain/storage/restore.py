@@ -26,6 +26,7 @@ from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.faults import crashpoint
 from superbrain.ports.os import OsAdapters
 from superbrain.storage.backup import BackupManifest, copy_blobs, new_directory, verify_backup, write_new_file
+from superbrain.storage.errors import os_error, sqlite_error
 from superbrain.storage.layout import DataRoot
 from superbrain.storage.policy_store import PolicyStore
 from superbrain.storage.schema import POLICY_MIGRATIONS, STORE_MIGRATIONS, Migration
@@ -104,7 +105,7 @@ def _write_generation(path: Path, generation: int) -> None:
     try:
         db = sqlite3.connect(path, isolation_level=None)
     except sqlite3.Error as exc:
-        raise BrainError(ErrorCode.IO_ERROR, f"cannot open the staged policy store: {exc}") from exc
+        raise sqlite_error("cannot open the staged policy store", exc) from exc
     try:
         try:
             db.execute("PRAGMA synchronous=FULL")
@@ -112,7 +113,7 @@ def _write_generation(path: Path, generation: int) -> None:
                 db.execute("PRAGMA fullfsync=ON")
             rows = db.execute("UPDATE trust SET generation = ? WHERE id = 1", (generation,)).rowcount
         except sqlite3.Error as exc:
-            raise BrainError(ErrorCode.IO_ERROR, f"cannot write the staged trust generation: {exc}") from exc
+            raise sqlite_error("cannot write the staged trust generation", exc) from exc
         if rows != 1:
             raise BrainError(ErrorCode.INTEGRITY_FAILURE, "the staged policy store has no trust row")
     finally:
@@ -128,7 +129,7 @@ def _write_generation(path: Path, generation: int) -> None:
         finally:
             os.close(fd)
     except OSError as err:
-        raise BrainError(ErrorCode.IO_ERROR, f"cannot make the staged policy store durable: {err}") from err
+        raise os_error("cannot make the staged policy store durable", err) from err
 
 
 def _live_generation(root: DataRoot) -> int:

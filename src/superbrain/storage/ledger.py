@@ -18,6 +18,7 @@ from superbrain.core.ids import new_id
 from superbrain.core.jsonvalue import JsonValue
 from superbrain.ports.clock import Clock
 from superbrain.ports.policy import PolicyView
+from superbrain.storage.errors import sqlite_error
 from superbrain.storage.kinds import KindRegistry, RetentionClass, is_uuid, validate_envelope
 
 _SAVEPOINT = "ledger_entry"
@@ -65,10 +66,6 @@ def live_prefix(handler: ProjectionHandler) -> str:
 
 def rebuild_prefix(handler: ProjectionHandler) -> str:
     return f"r_{handler.name}_"
-
-
-def io_error(what: str, exc: sqlite3.Error) -> BrainError:
-    return BrainError(ErrorCode.IO_ERROR, f"{what}: {exc}")
 
 
 def utc_timestamp(moment: datetime) -> str:
@@ -148,7 +145,7 @@ def read_entries(db: sqlite3.Connection, after: int, limit: int) -> list[LedgerE
             f"SELECT {_COLUMNS} FROM ledger WHERE sequence > ? ORDER BY sequence LIMIT ?", (after, limit)
         ).fetchall()
     except sqlite3.Error as exc:
-        raise io_error("cannot read the ledger", exc) from exc
+        raise sqlite_error("cannot read the ledger", exc) from exc
     return [_decode(row) for row in rows]
 
 
@@ -165,7 +162,7 @@ def apply_to_handlers(
         try:
             handler.apply(db, prefix(handler), entry, policy)
         except sqlite3.Error as exc:
-            raise io_error(f"projection {handler.name} failed on entry {entry.sequence}", exc) from exc
+            raise sqlite_error(f"projection {handler.name} failed on entry {entry.sequence}", exc) from exc
         except BrainError:
             raise
         except Exception as exc:
@@ -293,13 +290,15 @@ class Txn:
                 (intent_id,),
             )
         except sqlite3.Error as exc:
-            raise io_error("cannot record the applied intent", exc) from exc
+            raise sqlite_error("cannot record the applied intent", exc) from exc
         return cursor.rowcount == 1
 
     def _check(self) -> None:
         self._check_owner()
         if not self._active:
             raise AssertionError("transaction is no longer active")
+        if not self._db.in_transaction:  # SQLite rolled it all back (SQLITE_FULL, say): later writes would autocommit
+            raise AssertionError("transaction is no longer active: SQLite rolled it back")
 
     def _write_entry(
         self,
@@ -333,7 +332,7 @@ class Txn:
         try:
             self._db.execute(f"SAVEPOINT {_SAVEPOINT}")
         except sqlite3.Error as exc:
-            raise io_error("cannot start the append", exc) from exc
+            raise sqlite_error("cannot start the append", exc) from exc
         try:
             cursor = self._db.execute(
                 "INSERT INTO ledger (entry_id, kind, schema_version, handler_version, writer_epoch, actor, owner_id,"
@@ -357,12 +356,13 @@ class Txn:
             self._db.execute(f"RELEASE {_SAVEPOINT}")
         except BaseException as err:
             try:
-                self._db.execute(f"ROLLBACK TO {_SAVEPOINT}")
-                self._db.execute(f"RELEASE {_SAVEPOINT}")
+                if self._db.in_transaction:  # else SQLite already rolled the whole transaction back
+                    self._db.execute(f"ROLLBACK TO {_SAVEPOINT}")
+                    self._db.execute(f"RELEASE {_SAVEPOINT}")
             except sqlite3.Error as exc:
-                raise io_error("cannot undo the failed append", exc) from exc
+                raise sqlite_error("cannot undo the failed append", exc) from exc
             if isinstance(err, sqlite3.Error):
-                raise io_error("cannot append to the ledger", err) from err
+                raise sqlite_error("cannot append to the ledger", err) from err
             raise
         return entry
 

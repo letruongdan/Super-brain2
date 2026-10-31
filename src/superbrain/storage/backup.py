@@ -37,6 +37,7 @@ from superbrain.core.ids import new_id
 from superbrain.core.jsonvalue import JsonValue
 from superbrain.ports.os import OsAdapters
 from superbrain.storage.cas import HOLDERS_TABLE, blob_digests, blob_path, file_digest
+from superbrain.storage.errors import os_error, sqlite_error
 from superbrain.storage.layout import DataRoot
 from superbrain.storage.ledger import utc_timestamp
 from superbrain.storage.prune import MANIFEST_NAME, backup_dir_name, prune_backups
@@ -114,12 +115,6 @@ def _require_aware(now: datetime) -> None:
 # --- the snapshot ------------------------------------------------------------------------------------------------
 
 
-def _sqlite_error(what: str, exc: sqlite3.Error) -> BrainError:
-    if getattr(exc, "sqlite_errorcode", 0) & 0xFF == sqlite3.SQLITE_FULL:
-        return BrainError(ErrorCode.STORAGE_FULL, f"no space left: {what}")
-    return BrainError(ErrorCode.IO_ERROR, f"{what}: {exc}")
-
-
 def _snapshot_db(source: sqlite3.Connection, dest: Path) -> None:
     """Copy ``source``, as of now, into the new file ``dest`` and make it self-contained and durable.
 
@@ -131,7 +126,7 @@ def _snapshot_db(source: sqlite3.Connection, dest: Path) -> None:
     try:
         target = sqlite3.connect(dest, isolation_level=None)
     except sqlite3.Error as exc:
-        raise _sqlite_error(f"cannot create the snapshot {dest}", exc) from exc
+        raise sqlite_error(f"cannot create the snapshot {dest}", exc) from exc
     try:
         try:
             target.execute("PRAGMA synchronous=FULL")
@@ -140,7 +135,7 @@ def _snapshot_db(source: sqlite3.Connection, dest: Path) -> None:
             source.backup(target)
             mode = target.execute("PRAGMA journal_mode=DELETE").fetchone()[0]
         except sqlite3.Error as exc:
-            raise _sqlite_error(f"cannot snapshot the database into {dest}", exc) from exc
+            raise sqlite_error(f"cannot snapshot the database into {dest}", exc) from exc
         if str(mode).lower() != "delete":
             raise BrainError(ErrorCode.IO_ERROR, f"{dest}: journal_mode is {mode!r}, DELETE did not take effect")
     finally:
@@ -155,7 +150,7 @@ def _snapshot_db(source: sqlite3.Connection, dest: Path) -> None:
         finally:
             os.close(fd)
     except OSError as err:
-        raise BrainError(ErrorCode.IO_ERROR, f"cannot make the snapshot {dest} durable: {err}") from err
+        raise os_error(f"cannot make the snapshot {dest} durable", err) from err
 
 
 @contextmanager
@@ -232,7 +227,7 @@ def new_directory(path: Path, os_: OsAdapters) -> None:
     try:
         path.mkdir(mode=0o700)
     except OSError as err:
-        raise BrainError(ErrorCode.IO_ERROR, f"cannot create directory {path}: {err}") from err
+        raise os_error(f"cannot create directory {path}", err) from err
     os_.permissions.secure_directory(path)
     os_.publisher.sync_directory(path.parent)
 
@@ -347,11 +342,11 @@ def _recover_and_snapshot(source: Path, copy: Path, snapshot: Path) -> None:
         if os.path.lexists(wal):
             shutil.copyfile(wal, db_files(copy)[1])
     except OSError as err:
-        raise BrainError(ErrorCode.IO_ERROR, f"cannot copy {source.name} for a maintenance backup: {err}") from err
+        raise os_error(f"cannot copy {source.name} for a maintenance backup", err) from err
     try:
         db = sqlite3.connect(copy, isolation_level=None)
     except sqlite3.Error as exc:
-        raise _sqlite_error(f"cannot open the copy of {source.name}", exc) from exc
+        raise sqlite_error(f"cannot open the copy of {source.name}", exc) from exc
     try:
         _snapshot_db(db, snapshot)
     finally:

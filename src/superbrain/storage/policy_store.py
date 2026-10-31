@@ -26,11 +26,12 @@ from superbrain.core.jsonvalue import JsonValue
 from superbrain.ports.os import OsAdapters
 from superbrain.ports.policy import Intent, IntentKind
 from superbrain.storage import backup
+from superbrain.storage.errors import sqlite_error
 from superbrain.storage.kinds import CORE_KINDS, KindRegistry
 from superbrain.storage.layout import DataRoot
 from superbrain.storage.ledger import utc_timestamp
 from superbrain.storage.schema import POLICY_MIGRATIONS, Migration, ensure_writable, initialize, read_schema_info
-from superbrain.storage.sqlite import CREATING, connect, db_files, is_busy, remove_unfinished_creates
+from superbrain.storage.sqlite import CREATING, connect, db_files, remove_unfinished_creates
 from superbrain.storage.writer import WriterLease
 
 _HANDLE = "policy"
@@ -44,10 +45,6 @@ _EFFECT_KIND: dict[IntentKind, str] = {
     IntentKind.QUARANTINE: "policy.quarantine",
 }
 _CORE = KindRegistry(CORE_KINDS)
-
-
-def _io_error(what: str, exc: sqlite3.Error) -> BrainError:
-    return BrainError(ErrorCode.IO_ERROR, f"{what}: {exc}")
 
 
 def _check_lease(root: DataRoot, lease: WriterLease) -> None:
@@ -135,7 +132,7 @@ class PolicyStore:
                 try:
                     db.execute("INSERT INTO trust (id, generation) VALUES (1, ?)", (generation,))
                 except sqlite3.Error as exc:
-                    raise _io_error("cannot write the trust generation", exc) from exc
+                    raise sqlite_error("cannot write the trust generation", exc) from exc
             finally:
                 db.close()
             if any(os.path.lexists(p) for p in db_files(staging)[1:]):
@@ -210,7 +207,7 @@ class PolicyStore:
         try:
             self._db.close()
         except sqlite3.Error as exc:
-            raise _io_error("cannot close the policy store", exc) from exc
+            raise sqlite_error("cannot close the policy store", exc) from exc
         finally:
             self._lease.unregister_handle(_HANDLE)
 
@@ -320,28 +317,26 @@ class PolicyStore:
         try:
             return self._db.execute(sql, params).fetchall()
         except sqlite3.Error as exc:
-            raise _io_error("cannot read the policy store", exc) from exc
+            raise sqlite_error("cannot read the policy store", exc) from exc
 
     @contextmanager
     def _immediate(self) -> Iterator[sqlite3.Connection]:
-        """``BEGIN IMMEDIATE`` ... ``COMMIT``: busy is ``STORE_BUSY``, other SQLite errors ``IO_ERROR``; any
-        exception rolls back."""
+        """``BEGIN IMMEDIATE`` ... ``COMMIT``: SQLite errors are mapped by ``sqlite_error`` (a busy ``BEGIN`` is
+        ``STORE_BUSY``); any exception rolls back."""
         try:
             self._db.execute("BEGIN IMMEDIATE")
         except sqlite3.Error as exc:
-            if is_busy(exc):
-                raise BrainError(ErrorCode.STORE_BUSY, f"the policy database is busy: {exc}") from exc
-            raise _io_error("cannot begin a policy transaction", exc) from exc
+            raise sqlite_error("cannot begin a policy transaction", exc, busy=True) from exc
         try:
             try:
                 yield self._db
                 self._db.execute("COMMIT")
             except sqlite3.Error as exc:
-                raise _io_error("cannot write the policy store", exc) from exc
+                raise sqlite_error("cannot write the policy store", exc) from exc
         except BaseException:
             if self._db.in_transaction:
                 try:
                     self._db.execute("ROLLBACK")
                 except sqlite3.Error as exc:
-                    raise _io_error("cannot roll back the policy transaction", exc) from exc
+                    raise sqlite_error("cannot roll back the policy transaction", exc) from exc
             raise

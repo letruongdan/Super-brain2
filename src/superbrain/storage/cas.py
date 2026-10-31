@@ -11,7 +11,6 @@ Holders are the ``cas_holders`` projection of the reserved ``cas.hold``/``cas.re
 for a tombstoned holder is skipped, so a replay applies tombstones recorded since.
 """
 
-import errno
 import hashlib
 import os
 import re
@@ -28,24 +27,17 @@ from superbrain.core.faults import crashpoint
 from superbrain.core.ids import new_id
 from superbrain.ports.os import OsAdapters
 from superbrain.ports.policy import PolicyView
+from superbrain.storage.errors import os_error, sqlite_error
 from superbrain.storage.kinds import RetentionClass as RetentionClass
 from superbrain.storage.layout import DataRoot
-from superbrain.storage.ledger import LedgerEntry, Txn, io_error
+from superbrain.storage.ledger import LedgerEntry, Txn
 
 _DIGEST = re.compile(r"sha256:([0-9a-f]{64})")
 _SHARD_NAME = re.compile(r"[0-9a-f]{2}")
 _BLOB_NAME = re.compile(r"[0-9a-f]{64}")
 _CHUNK = 1 << 20
-_ERROR_DISK_FULL = 112  # Windows ERROR_DISK_FULL
-_BUSY_WINERRORS = frozenset({32, 5})  # ERROR_SHARING_VIOLATION, ERROR_ACCESS_DENIED: as in the durable adapter
 HOLDERS_TABLE = "p_cas_holders_"
 STAGING_SUFFIX = ".tmp"
-
-
-def _os_error(what: str, err: OSError) -> BrainError:
-    if err.errno == errno.ENOSPC or getattr(err, "winerror", None) == _ERROR_DISK_FULL:
-        return BrainError(ErrorCode.STORAGE_FULL, f"no space left: {what}")
-    return BrainError(ErrorCode.IO_ERROR, f"{what}: {err}")
 
 
 def blob_path(cas_dir: Path, digest: str) -> Path:
@@ -67,7 +59,7 @@ def file_digest(path: Path) -> str | None:
     except FileNotFoundError:
         return None
     except OSError as err:
-        raise _os_error(f"cannot read blob {path}", err) from err
+        raise os_error(f"cannot read blob {path}", err) from err
     return "sha256:" + hasher.hexdigest()
 
 
@@ -93,7 +85,7 @@ def blob_digests(cas_dir: Path) -> set[str]:
                     and blob.is_file(follow_symlinks=False)
                 )
     except OSError as err:
-        raise _os_error(f"cannot list the blobs in {cas_dir}", err) from err
+        raise os_error(f"cannot list the blobs in {cas_dir}", err) from err
     return found
 
 
@@ -104,13 +96,13 @@ def remove_staging_leftovers(staging: Path) -> None:
     except FileNotFoundError:
         return  # no staging directory, so no leftovers
     except OSError as exc:
-        raise BrainError(ErrorCode.IO_ERROR, f"cannot list {staging}: {exc}") from exc
+        raise os_error(f"cannot list {staging}", exc) from exc
     for name in names:
         if name.endswith(STAGING_SUFFIX):
             try:
                 os.unlink(staging / name)
             except OSError as exc:
-                raise BrainError(ErrorCode.IO_ERROR, f"cannot remove the staging leftover {name}: {exc}") from exc
+                raise os_error(f"cannot remove the staging leftover {name}", exc) from exc
 
 
 def held_digests(db: sqlite3.Connection, holder_kind: str, holder_id: str) -> list[str]:
@@ -121,7 +113,7 @@ def held_digests(db: sqlite3.Connection, holder_kind: str, holder_id: str) -> li
             (holder_kind, holder_id),
         ).fetchall()
     except sqlite3.Error as exc:
-        raise io_error("cannot read the holders", exc) from exc
+        raise sqlite_error("cannot read the holders", exc) from exc
     return [str(row[0]) for row in rows]
 
 
@@ -257,7 +249,7 @@ class ContentStore:
         except FileNotFoundError as err:
             raise BrainError(ErrorCode.NOT_FOUND, f"no blob {digest}") from err
         except OSError as err:
-            raise _os_error(f"cannot read blob {digest}", err) from err
+            raise os_error(f"cannot read blob {digest}", err) from err
         if digest_bytes(data) != digest:
             raise BrainError(ErrorCode.INTEGRITY_FAILURE, f"the stored blob {digest} does not match its digest")
         return data
@@ -325,7 +317,7 @@ class ContentStore:
                 except FileNotFoundError:
                     continue
                 except OSError as err:
-                    raise _os_error(f"cannot stat blob {digest}", err) from err
+                    raise os_error(f"cannot stat blob {digest}", err) from err
                 if modified >= cutoff:
                     young.append(digest)
                 elif self._delete_if_unheld(digest, path):
@@ -341,10 +333,8 @@ class ContentStore:
                 path.unlink()
             except FileNotFoundError:
                 return False
-            except OSError as err:
-                if getattr(err, "winerror", None) in _BUSY_WINERRORS:  # no retry: a write transaction is open
-                    raise BrainError(ErrorCode.FILESYSTEM_BUSY, f"blob {digest} is held by another process") from err
-                raise _os_error(f"cannot delete blob {digest}", err) from err
+            except OSError as err:  # no retry on a sharing violation: a write transaction is open
+                raise os_error(f"cannot delete blob {digest}", err, sharing_busy=True) from err
             self._os.publisher.sync_directory(path.parent)
             return True
 
@@ -352,7 +342,7 @@ class ContentStore:
         try:
             return self._db.execute(sql, params).fetchall()
         except sqlite3.Error as exc:
-            raise io_error("cannot read the blob holders", exc) from exc
+            raise sqlite_error("cannot read the blob holders", exc) from exc
 
     def _ensure_shard(self, shard: Path) -> None:
         """Create a missing shard, secure it, and make its entry in ``cas/`` durable; an existing one is kept."""
@@ -361,6 +351,6 @@ class ContentStore:
         except FileExistsError:
             return
         except OSError as err:
-            raise _os_error(f"cannot create the blob shard {shard}", err) from err
+            raise os_error(f"cannot create the blob shard {shard}", err) from err
         self._os.permissions.secure_directory(shard)
         self._os.publisher.sync_directory(self._cas_dir)
