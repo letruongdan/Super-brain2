@@ -23,7 +23,7 @@ select = ["E", "F", "W", "I", "B", "UP", "BLE", "S110", "S112"]
 
 [tool.mypy]
 strict = true
-files = ["src", "tests"]
+files = ["src", "tests", "scripts"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
