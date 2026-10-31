@@ -10,6 +10,7 @@ import sys
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Literal
 
 import superbrain
 from superbrain.adapters.os import os_adapters
@@ -23,7 +24,7 @@ from superbrain.storage.layout import prepare_data_root, secure_subdirectories
 from superbrain.storage.migrate import migrate_database
 from superbrain.storage.restore import restore_policy, restore_store
 from superbrain.storage.runtime import open_runtime
-from superbrain.storage.schema import STORE_MIGRATIONS, Migration
+from superbrain.storage.schema import POLICY_MIGRATIONS, STORE_MIGRATIONS, Migration
 from superbrain.storage.store import Store
 from superbrain.storage.swap import recover_interrupted_swaps
 from superbrain.storage.writer import acquire_writer
@@ -173,15 +174,24 @@ def _add_table(db: sqlite3.Connection) -> None:
     db.execute("CREATE TABLE added_in_v2(a)")
 
 
-def migrate_store_to_v2(data_root: Path, args: list[str]) -> None:
-    """Migrate the store to a v2 that adds a table, under a maintenance lease (no Store or PolicyStore is opened)."""
+def _migrate_to_v2(data_root: Path, target: Literal["store", "policy"]) -> None:
+    """Migrate ``target`` to a v2 that adds a table, under a maintenance lease (no Store or PolicyStore is opened)."""
     os_ = os_adapters()
     root = prepare_data_root(data_root, os_)
     v2 = Migration(to_version=2, min_reader_version=1, apply=_add_table)
+    base = STORE_MIGRATIONS if target == "store" else POLICY_MIGRATIONS
     with acquire_writer(root, os_) as lease:
         recover_interrupted_swaps(root, lease, os_)
         secure_subdirectories(root, lease, os_)
-        migrate_database(root, lease, os_, target="store", migrations=(*STORE_MIGRATIONS, v2), now=datetime.now(UTC))
+        migrate_database(root, lease, os_, target=target, migrations=(*base, v2), now=datetime.now(UTC))
+
+
+def migrate_store_to_v2(data_root: Path, args: list[str]) -> None:
+    _migrate_to_v2(data_root, "store")
+
+
+def migrate_policy_to_v2(data_root: Path, args: list[str]) -> None:
+    _migrate_to_v2(data_root, "policy")
 
 
 OPERATIONS: dict[str, Callable[[Path, list[str]], None]] = {
@@ -198,6 +208,7 @@ OPERATIONS: dict[str, Callable[[Path, list[str]], None]] = {
     "restore_from_latest": restore_from_latest,
     "restore_policy_from_latest": restore_policy_from_latest,
     "migrate_store_to_v2": migrate_store_to_v2,
+    "migrate_policy_to_v2": migrate_policy_to_v2,
 }
 
 

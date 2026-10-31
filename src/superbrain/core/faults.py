@@ -29,8 +29,16 @@ KNOWN_PAUSEPOINTS: frozenset[str] = KNOWN_CRASHPOINTS | {"writer.held"}
 
 
 def crashpoint(name: str) -> None:
-    """Every crashpoint is also a pausepoint of the same name: it pauses first, then crashes if selected."""
+    """Every crashpoint is also a pausepoint of the same name: it pauses first, then crashes if selected.
+
+    For testing the crash harness only: a name listed in ``SUPERBRAIN_DISABLE_CRASHPOINTS_FOR_TEST`` (comma
+    separated) is skipped entirely, neither pausing nor crashing, as if its call had been removed from the code. The
+    crash-matrix test uses it to show the matrix fails when a crashpoint stops firing. Unset, it changes nothing.
+    """
     assert name in KNOWN_CRASHPOINTS, f"unregistered crashpoint {name!r}"
+    disabled = os.environ.get("SUPERBRAIN_DISABLE_CRASHPOINTS_FOR_TEST")
+    if disabled is not None and name in {part.strip() for part in disabled.split(",")}:
+        return
     pausepoint(name)
     if os.environ.get("SUPERBRAIN_CRASHPOINT") == name:
         sys.stderr.write(f"CRASHPOINT_HIT {name}\n")

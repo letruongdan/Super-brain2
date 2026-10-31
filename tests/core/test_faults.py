@@ -13,6 +13,7 @@ def run_python(code: str, env: dict[str, str] | None = None) -> subprocess.Compl
     return subprocess.run(
         [sys.executable, "-I", "-c", code],
         env={**os.environ, **(env or {})},
+        stdin=subprocess.DEVNULL,  # a pause reads end-of-file at once instead of blocking the test
         capture_output=True,
         text=True,
         timeout=60,
@@ -28,6 +29,21 @@ def test_crashpoint_reports_hit_and_exits_86() -> None:
 def test_crashpoint_is_inert_for_other_names() -> None:
     r = run_python(SAME, env={"SUPERBRAIN_CRASHPOINT": "ledger.after_commit"})
     assert r.returncode == 0 and r.stdout.strip() == "alive"
+
+
+DISABLE = "SUPERBRAIN_DISABLE_CRASHPOINTS_FOR_TEST"
+
+
+def test_disabled_crashpoint_neither_pauses_nor_crashes() -> None:
+    selected = {"SUPERBRAIN_CRASHPOINT": "cas.after_rename", "SUPERBRAIN_PAUSEPOINT": "cas.after_rename"}
+    r = run_python(SAME, env={**selected, DISABLE: "ledger.after_commit, cas.after_rename"})
+    assert r.returncode == 0 and r.stdout.strip() == "alive"
+    assert "PAUSED" not in r.stderr and "CRASHPOINT_HIT" not in r.stderr
+
+
+def test_disabling_other_crashpoints_changes_nothing() -> None:
+    r = run_python(SAME, env={"SUPERBRAIN_CRASHPOINT": "cas.after_rename", DISABLE: "cas.after_staging_write"})
+    assert r.returncode == 86 and "CRASHPOINT_HIT cas.after_rename" in r.stderr and "alive" not in r.stdout
 
 
 def test_unregistered_crashpoint_is_a_programming_error() -> None:
