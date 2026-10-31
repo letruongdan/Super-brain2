@@ -42,6 +42,8 @@ from superbrain.storage.sqlite import CREATING, connect, db_files, remove_unfini
 from superbrain.storage.writer import WriterLease
 
 _HANDLE = "policy"
+STORE_PUBLISHED = "store_published"
+"""``meta`` key set to ``'1'`` once the main store bound to this policy store was published (C02 lifecycle marker)."""
 # The payload of each intent kind, and the reserved ledger kind whose schema (plus ``intent_id``) validates it.
 _PAYLOAD_FIELDS: dict[IntentKind, tuple[str, ...]] = {
     IntentKind.TOMBSTONE: ("holder_kind", "holder_id"),
@@ -296,6 +298,28 @@ class PolicyStore:
                 )
         crashpoint("policy.after_intent_commit")
         return intent
+
+    def mark_store_published(self) -> None:
+        """Record durably that the main store bound to this policy store was published (``meta.store_published``).
+
+        Idempotent: once set it is never written again or cleared. ``open_runtime`` calls it after every successful
+        ``Store.create``/``Store.open``, and refuses to re-create a missing ``brain.db`` once it is set (C02).
+        The commit is durable (``synchronous=FULL``); the one-time write is then checkpointed so the WAL is empty
+        again, as after ``create``, and later reads leave the database files as they are.
+        """
+        self._check()
+        if self.store_published():
+            return
+        with self._immediate() as db:
+            db.execute("INSERT INTO meta (key, value) VALUES (?, '1')", (STORE_PUBLISHED,))
+        try:
+            self._db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+        except sqlite3.Error as exc:
+            raise sqlite_error("cannot checkpoint the policy store", exc) from exc
+
+    def store_published(self) -> bool:
+        self._check()
+        return self._exists("SELECT 1 FROM meta WHERE key = ? AND value = '1'", (STORE_PUBLISHED,))
 
     def trust_generation(self) -> int:
         self._check()

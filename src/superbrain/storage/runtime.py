@@ -19,7 +19,7 @@ from superbrain.storage.errors import os_error, sqlite_error
 from superbrain.storage.kinds import KindRegistry
 from superbrain.storage.layout import DataRoot, prepare_data_root, secure_subdirectories
 from superbrain.storage.ledger import ProjectionHandler
-from superbrain.storage.policy_store import PolicyStore
+from superbrain.storage.policy_store import STORE_PUBLISHED, PolicyStore
 from superbrain.storage.prune import has_complete_backup
 from superbrain.storage.schema import POLICY_MIGRATIONS, STORE_MIGRATIONS, Migration
 from superbrain.storage.sqlite import open_readonly
@@ -55,20 +55,25 @@ class Runtime:
         self.lease.release()
 
 
-def _has_intents(policy_db: Path) -> bool:
-    """Whether the closed ``policy_db`` (if any) records an intent; read without creating or changing a file."""
+def _policy_has_history(policy_db: Path) -> bool:
+    """Whether the closed ``policy_db`` (if any) records an intent or ``meta.store_published`` (the main store was
+    published, C02); its committed state is read through ``open_readonly``, nothing is changed."""
     if not os.path.lexists(policy_db):
         return False
     try:
         db = open_readonly(policy_db)
         try:
-            if not db.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'intents'").fetchone():
+            tables = {str(row[0]) for row in db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+            if not {"intents", "meta"} <= tables:
                 return False  # not a policy schema this code knows; PolicyStore.open reports it
-            return db.execute("SELECT 1 FROM intents LIMIT 1").fetchone() is not None
+            if db.execute("SELECT 1 FROM intents LIMIT 1").fetchone() is not None:
+                return True
+            published = "SELECT 1 FROM meta WHERE key = ? AND value = '1'"
+            return db.execute(published, (STORE_PUBLISHED,)).fetchone() is not None
         finally:
             db.close()
     except sqlite3.Error as exc:
-        raise sqlite_error(f"cannot read the intents of {policy_db}", exc) from exc
+        raise sqlite_error(f"cannot read the history of {policy_db}", exc) from exc
 
 
 def _cas_has_content(cas_dir: Path) -> bool:
@@ -85,10 +90,11 @@ def _cas_has_content(cas_dir: Path) -> bool:
 
 
 def _store_has_history(root: DataRoot) -> bool:
-    """History a new, empty ``brain.db`` would silently lose or orphan: a policy store with intents, a complete
-    store backup, or content in ``cas/`` (whose holders were in the lost database)."""
+    """History a new, empty ``brain.db`` would silently lose or orphan: a policy store with intents or the
+    published-store marker, a complete store backup, or content in ``cas/`` (whose holders were in the lost
+    database). If ``policy.db`` and ``brain.db`` are both lost, nothing here remains and the root looks fresh."""
     return (
-        _has_intents(root.policy_db)
+        _policy_has_history(root.policy_db)
         or has_complete_backup(root.backups_dir, ("store", "store_full"))
         or _cas_has_content(root.cas_dir)
     )
@@ -106,17 +112,19 @@ def open_runtime(
     """Open (creating what is missing) the data root at ``path`` for writing.
 
     Under the lease, swaps a crash interrupted are recovered first. Then a missing policy store next to an existing
-    main store is ``INTEGRITY_FAILURE``, and so is a missing main store next to history: a policy store with intents,
-    a complete ``store``/``store_full`` backup, or content in ``cas/``. Both are raised before any subdirectory or
-    database is created. Otherwise a missing policy store is created with a new store id, a missing main store with
-    the policy store's id. ``Store.open`` and ``Store.create`` reconcile the policy intents. The migration sequences
-    are passed straight to ``PolicyStore`` and ``Store``. On any failure, whatever was opened is closed and the lease
-    released before the error propagates; a ``BrainError`` from that close is attached to it as a note (and a handle
-    that could not be closed keeps the lease held).
+    main store is ``INTEGRITY_FAILURE``, and so is a missing main store next to history: a policy store with intents
+    or with ``meta.store_published``, a complete ``store``/``store_full`` backup, or content in ``cas/``. Both are
+    raised before any subdirectory or database is created. Otherwise a missing policy store is created with a new
+    store id, a missing main store with the policy store's id. ``Store.open`` and ``Store.create`` reconcile the
+    policy intents; once either succeeded the policy store is marked durably (``PolicyStore.mark_store_published``,
+    idempotent). The migration sequences are passed straight to ``PolicyStore`` and ``Store``. On any failure,
+    whatever was opened is closed and the lease released before the error propagates; a ``BrainError`` from that
+    close is attached to it as a note (and a handle that could not be closed keeps the lease held).
     """
     root = prepare_data_root(path, os_)
     lease = acquire_writer(root, os_)
     policy: PolicyStore | None = None
+    store: Store | None = None
     try:
         recover_interrupted_swaps(root, lease, os_)
         if not os.path.lexists(root.policy_db) and os.path.lexists(root.store_db):
@@ -140,7 +148,13 @@ def open_runtime(
             store = Store.open(root, lease, os_, policy, handlers, registry, migrations=store_migrations)
         else:
             store = Store.create(root, lease, os_, policy, handlers, registry, migrations=store_migrations)
+        policy.mark_store_published()
     except BaseException as err:
+        try:
+            if store is not None and not store.closed:
+                store.close()
+        except BrainError as cleanup:
+            err.add_note(f"closing the store after the failure also failed: {cleanup}")
         try:
             if policy is not None and not policy.closed:
                 policy.close()
