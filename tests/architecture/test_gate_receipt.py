@@ -399,7 +399,7 @@ class FakeRunner:
 
 def run_with(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake: FakeRunner) -> dict[str, Any]:
     monkeypatch.setattr(gate, "run", fake)
-    monkeypatch.setattr(gate.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
     receipt, _ = gate.run_gate(tmp_path / "repo", "3.14")
     return dict(receipt)
 
