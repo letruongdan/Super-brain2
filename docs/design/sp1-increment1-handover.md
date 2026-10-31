@@ -1,5 +1,13 @@
 # Bàn giao SP1 đợt 1: nền tảng storage
 
+> **Trạng thái (2026-10-31): CHƯA ĐÓNG NGHIỆM THU.**
+>
+> Review triển khai `docs/reviews/2026-10-31-sp1-increment1-implementation-review.md` đã tái hiện bảy lỗi, SP1-C01 đến C07, trong đó bốn lỗi P1. Review này chạy trên Windows và trên Linux (WSL).
+>
+> Gate chạy lại trong môi trường Codex trên Windows **không được chấp nhận**. Gate trên Linux cũng **không được chấp nhận**, vì `mypy` fail.
+>
+> Các receipt `accepted: true` liệt kê bên dưới chỉ chứng minh những lần chạy trước đó, trong môi trường lúc ấy. Chúng không đóng được nghiệm thu đợt 1. Đợt 1 chỉ đóng khi việc khắc phục C01 đến C07 qua đủ RED, GREEN, mutation, review độc lập và các gate bắt buộc, với snapshot source khớp.
+
 Tài liệu này làm theo mục "Bàn giao đợt 1" của plan
 `docs/superpowers/plans/2026-10-30-sp1-increment1-storage-foundation.md`. Nó tách rõ phần **đã nghiệm thu**, có bằng
 chứng đi kèm, với phần **chưa nghiệm thu**. Phần chưa nghiệm thu không được ghi là "verified" ở bất kỳ đâu.

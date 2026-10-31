@@ -140,7 +140,14 @@ Mỗi package được phân công cho một dự án con (mục 15). Một dự
   - **Khóa độc quyền:** `LockFileEx` trên Windows, `fcntl.flock` trên Unix.
   - **Quyền truy cập file:** mục 5.9.
   - **Làm bền dữ liệu:** mục 5.4.
-  - **Tự khởi động daemon:** mặc định trên mọi OS là chạy khi cần (shim khởi động daemon nếu chưa có). Tự khởi động lúc đăng nhập là tùy chọn, chốt trong plan SP1 (O7).
+  - **Tự khởi động daemon:** tự khởi động lúc đăng nhập là tùy chọn, chốt trong plan SP1 (O7). Cơ chế "shim khởi động daemon khi cần" **chưa đủ** để bảo đảm daemon chạy ngoài sandbox của harness (xem chính sách bên dưới).
+- **Chính sách daemon, data root và sandbox của harness** (chủ dự án xác nhận ngày 2026-10-31):
+  - Daemon chạy bằng tài khoản user thông thường, dùng **một data root chung đã xác minh**.
+  - Daemon tự quyết định data root dựa trên cấu hình đã được xác nhận. Không có harness nào chọn data root theo môi trường riêng của nó.
+  - Mọi shim kết nối tới đúng daemon và đúng `store_id`. Không kết nối được thì shim báo lỗi rõ ràng, **không tự tạo kho riêng** theo môi trường của harness.
+  - Giữ nguyên nhóm SID tin cậy ở mục 5.9. Chưa có allowlist bổ sung.
+  - Môi trường nghiệm thu phải được kiểm tra trên thực tế: token của tiến trình, đường dẫn vật lý và ACL thật của data root cùng các thư mục cha. Việc chạy trong một terminal user thông thường không tự chứng minh môi trường đạt yêu cầu.
+  - Đợt 2 của SP1 phải giải quyết cơ chế khởi động daemon bên ngoài sandbox. Đợt này cũng phải thử kết nối shim → daemon trên từng harness thật, rồi mới xác định cấu hình cần thiết (ví dụ loopback exemption). Không mặc định một cấu hình nào là bắt buộc trước khi thử.
 - Đường dẫn trong dữ liệu lưu dạng chuẩn hóa: dấu `/`, phân biệt hoa thường theo filesystem thực tế.
 - **CI đa OS chỉ chứng minh code chạy đúng trên ba OS.** Nó không chứng minh khả năng native của từng harness trên từng OS, cũng không chứng minh độ bền khi mất điện trên mọi filesystem. Các claim này có gate riêng (mục 17).
 
