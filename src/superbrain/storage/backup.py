@@ -37,7 +37,7 @@ from superbrain.core.faults import crashpoint
 from superbrain.core.ids import new_id
 from superbrain.core.jsonvalue import JsonValue
 from superbrain.ports.os import OsAdapters
-from superbrain.storage.cas import HOLDERS_TABLE, blob_digests, blob_path, file_digest
+from superbrain.storage.cas import HOLDERS_TABLE, blob_digests, blob_path, check_blob_location, file_digest
 from superbrain.storage.errors import os_error, sqlite_error
 from superbrain.storage.layout import DataRoot
 from superbrain.storage.ledger import utc_timestamp
@@ -249,11 +249,13 @@ def write_new_file(path: Path, data: bytes, os_: OsAdapters) -> None:
 
 
 def copy_blobs(source_cas: Path, dest_cas: Path, digests: Iterable[str], os_: OsAdapters) -> None:
-    """Copy each blob into ``dest_cas`` (created here) after checking its bytes; every directory made durable."""
+    """Copy each blob into ``dest_cas`` (created here) after checking its location (``check_blob_location``) and its
+    bytes; every directory made durable."""
     new_directory(dest_cas, os_)
     shards: set[Path] = set()
     for digest in sorted(digests):
         source = blob_path(source_cas, digest)
+        check_blob_location(source, os_)
         try:
             data = source.read_bytes()
         except FileNotFoundError as err:

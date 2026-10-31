@@ -3,7 +3,6 @@
 Every public method, and the ``Txn`` from ``transaction()``, checks that the store is open, that its writer lease is
 still held and that it runs on the owner thread (the thread that called ``create``/``open``)."""
 
-import functools
 import os
 import sqlite3
 import threading
@@ -23,7 +22,6 @@ from superbrain.storage import backup
 from superbrain.storage.cas import (
     ContentStore,
     RetentionClass,
-    blob_is_intact,
     held_digests,
     remove_staging_leftovers,
 )
@@ -376,7 +374,7 @@ class Store:
                     schema_version=self._schema_version,
                     clock=self._os.clock,
                     check_owner=self._check,
-                    blob_intact=functools.partial(blob_is_intact, self._root.cas_dir),
+                    blob_intact=self._cas.blob_intact,
                     history_versions=self._history_versions,
                 )
                 try:

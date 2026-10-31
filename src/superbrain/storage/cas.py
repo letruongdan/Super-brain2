@@ -15,6 +15,7 @@ import hashlib
 import os
 import re
 import sqlite3
+import stat
 from collections.abc import Callable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
@@ -63,9 +64,29 @@ def file_digest(path: Path) -> str | None:
     return "sha256:" + hasher.hexdigest()
 
 
-def blob_is_intact(cas_dir: Path, digest: str) -> bool:
-    """The blob for ``digest`` exists and its bytes hash to ``digest``."""
-    return file_digest(blob_path(cas_dir, digest)) == digest
+def check_blob_location(blob: Path, os_: OsAdapters) -> None:
+    """Check ``cas/<aa>/<64 hex>`` before it is read, reused or written through (spec 5.5, 5.9).
+
+    Neither the blob, its shard nor any directory above them may be a link or reparse point (``UNSAFE_PATH``), so the
+    path stays inside the data root ``prepare_data_root`` checked. An existing shard must be a directory and an
+    existing blob a regular file (``INTEGRITY_FAILURE``), each owner-only (``INSECURE_PERMISSIONS``). Missing ones are
+    fine: ``put`` creates them. Nothing is changed or re-secured, inside the root or outside it.
+    """
+    os_.paths.reject_links(blob)
+    for path, directory in ((blob.parent, True), (blob, False)):
+        try:
+            mode = os.lstat(path).st_mode
+        except (FileNotFoundError, NotADirectoryError):
+            return
+        except OSError as err:
+            raise os_error(f"cannot inspect {path}", err) from err
+        if not (stat.S_ISDIR(mode) if directory else stat.S_ISREG(mode)):
+            expected = "a directory" if directory else "a regular file"
+            raise BrainError(ErrorCode.INTEGRITY_FAILURE, f"the CAS entry {path} is not {expected}")
+        problems = os_.permissions.object_problems(path)
+        if problems:
+            detail = "; ".join(f"{p.path}: {p.reason}" for p in problems)
+            raise BrainError(ErrorCode.INSECURE_PERMISSIONS, f"existing {path} is not owner-only: {detail}")
 
 
 def blob_digests(cas_dir: Path) -> set[str]:
@@ -202,14 +223,14 @@ class ContentStore:
     def put(self, data: bytes) -> str:
         """Publish ``data`` durably and return its digest; an existing blob is verified, never rewritten.
 
-        An existing blob whose bytes do not match is ``INTEGRITY_FAILURE``; a matching one has its directory entry
-        made durable again. The staging file is re-hashed before publishing: a mismatch is ``INTEGRITY_FAILURE``.
-        On any failure the staging file is removed and the error propagates. ``put`` adds no holder: call
-        ``Txn.hold`` once it has returned.
+        The blob's location is checked first (``check_blob_location``). An existing blob whose bytes do not match is
+        ``INTEGRITY_FAILURE``; a matching one has its directory entry made durable again. The staging file is
+        re-hashed before publishing: a mismatch is ``INTEGRITY_FAILURE``. On any failure the staging file is removed
+        and the error propagates. ``put`` adds no holder: call ``Txn.hold`` once it has returned.
         """
         self._check()
         digest = digest_bytes(data)
-        final = blob_path(self._cas_dir, digest)
+        final = self._checked(digest)
         found = file_digest(final)
         if found is not None:
             if found != digest:
@@ -244,6 +265,7 @@ class ContentStore:
         path = blob_path(self._cas_dir, digest)
         if self._policy.is_quarantined(digest):
             raise BrainError(ErrorCode.QUARANTINED, f"blob {digest} is quarantined")
+        check_blob_location(path, self._os)
         try:
             data = path.read_bytes()
         except FileNotFoundError as err:
@@ -256,7 +278,12 @@ class ContentStore:
 
     def exists(self, digest: str) -> bool:
         self._check()
-        return blob_path(self._cas_dir, digest).is_file()
+        return self._checked(digest).is_file()
+
+    def blob_intact(self, digest: str) -> bool:
+        """The blob for ``digest`` passes ``check_blob_location``, exists and its bytes hash to ``digest``."""
+        self._check()
+        return file_digest(self._checked(digest)) == digest
 
     def holders(self, digest: str) -> list[tuple[str, str, RetentionClass]]:
         """``(holder_kind, holder_id, retention)`` of every holder of ``digest``, ordered by kind and id."""
@@ -329,6 +356,7 @@ class ContentStore:
         with self._transaction():
             if self._query(f"SELECT 1 FROM {HOLDERS_TABLE} WHERE digest = ? LIMIT 1", (digest,)):
                 return False
+            check_blob_location(path, self._os)
             try:
                 path.unlink()
             except FileNotFoundError:
@@ -344,8 +372,14 @@ class ContentStore:
         except sqlite3.Error as exc:
             raise sqlite_error("cannot read the blob holders", exc) from exc
 
+    def _checked(self, digest: str) -> Path:
+        path = blob_path(self._cas_dir, digest)
+        check_blob_location(path, self._os)
+        return path
+
     def _ensure_shard(self, shard: Path) -> None:
-        """Create a missing shard, secure it, and make its entry in ``cas/`` durable; an existing one is kept."""
+        """Create a missing shard, secure it, and make its entry in ``cas/`` durable; an existing one (already
+        checked by ``check_blob_location``) is kept."""
         try:
             shard.mkdir(mode=0o700)
         except FileExistsError:
