@@ -89,13 +89,17 @@ def check_blob_location(blob: Path, os_: OsAdapters) -> None:
             raise BrainError(ErrorCode.INSECURE_PERMISSIONS, f"existing {path} is not owner-only: {detail}")
 
 
-def blob_digests(cas_dir: Path) -> set[str]:
+def blob_digests(cas_dir: Path, os_: OsAdapters) -> set[str]:
     """The digests of the blob files in ``cas_dir``: ``<aa>/<64 hex>`` regular files whose name starts with their
-    shard's; anything else (stray files, links, other names) is ignored."""
+    shard's; anything else (stray files, blob links, other names) is ignored. A shard-named link or reparse point
+    (a Windows junction lists as a directory) is ``UNSAFE_PATH``, as in ``check_blob_location``: nothing outside the
+    data root is listed, so nothing there is copied or collected."""
     found: set[str] = set()
     try:
         with os.scandir(cas_dir) as entries:
-            shards = [s for s in entries if _SHARD_NAME.fullmatch(s.name) and s.is_dir(follow_symlinks=False)]
+            named = [s for s in entries if _SHARD_NAME.fullmatch(s.name)]
+        os_.paths.reject_links(cas_dir, entries=[Path(s.path) for s in named])
+        shards = [s for s in named if s.is_dir(follow_symlinks=False)]
         for shard in shards:
             with os.scandir(shard.path) as blobs:
                 found.update(
@@ -321,7 +325,7 @@ class ContentStore:
     def orphans(self) -> list[str]:
         """Sorted digests of the blob files that no holder refers to."""
         self._check()
-        on_disk = blob_digests(self._cas_dir)
+        on_disk = blob_digests(self._cas_dir, self._os)
         held = {str(row[0]) for row in self._query(f"SELECT DISTINCT digest FROM {HOLDERS_TABLE}", ())}
         return sorted(on_disk - held)
 

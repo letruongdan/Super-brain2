@@ -405,7 +405,7 @@ def create_maintenance_backup(
     crashpoint("backup.after_db_snapshot")
     blobs: list[str] = []
     if kind == "store_full":
-        blobs = sorted(blob_digests(root.cas_dir))
+        blobs = sorted(blob_digests(root.cas_dir, os_))
         copy_blobs(root.cas_dir, directory / _CAS, blobs, os_)
         crashpoint("backup.after_blob_copy")
     _write_manifest(directory, kind, blobs, now, os_)

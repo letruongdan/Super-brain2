@@ -167,7 +167,7 @@ def migrate_database(
         except sqlite3.Error as exc:
             raise sqlite_error(f"cannot migrate the {target} database", exc) from exc
         if target == "store":
-            copy_blobs(root.cas_dir, stage / "cas", sorted(blob_digests(root.cas_dir)), os_)
+            copy_blobs(root.cas_dir, stage / "cas", sorted(blob_digests(root.cas_dir, os_)), os_)
             new_directory(stage / "staging", os_)
 
     replaced = stage_and_swap(root, lease, os_, target=target, purpose="migrating", build=build, now=now)
