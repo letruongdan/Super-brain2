@@ -23,10 +23,21 @@ ERROR_DISK_FULL = 112
 STORE_V2 = (*STORE_MIGRATIONS, Migration(to_version=2, min_reader_version=1, apply=lambda db: None))
 
 
+class FakeWindowsError(OSError):
+    """An ``OSError`` that carries a Windows ``winerror`` on every platform.
+
+    ``OSError.winerror`` exists (and is typed) only on Windows; this subclass declares it so strict typing holds on
+    Linux and macOS too, while the mapping under test still reads it through ``getattr(err, "winerror")``.
+    """
+
+    winerror: int
+
+
 def os_err(code: int, winerror: int | None = None) -> OSError:
-    err = OSError(code, "injected")
-    if winerror is not None:
-        err.winerror = winerror  # settable; simulates Windows on every platform
+    if winerror is None:
+        return OSError(code, "injected")
+    err = FakeWindowsError(code, "injected")
+    err.winerror = winerror  # settable; simulates Windows on every platform
     return err
 
 
