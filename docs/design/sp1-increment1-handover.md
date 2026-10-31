@@ -1,12 +1,19 @@
 # Bàn giao SP1 đợt 1: nền tảng storage
 
-> **Trạng thái (2026-10-31): CHƯA ĐÓNG NGHIỆM THU.**
+> **Trạng thái (2026-10-31): ĐÃ NGHIỆM THU trên Windows 11 và WSL Ubuntu (ext4), tại commit `6617afa`.** Phạm vi nghiệm thu chỉ gồm hai môi trường này.
 >
-> Review triển khai `docs/reviews/2026-10-31-sp1-increment1-implementation-review.md` đã tái hiện bảy lỗi, SP1-C01 đến C07, trong đó bốn lỗi P1. Review này chạy trên Windows và trên Linux (WSL).
+> Review triển khai `docs/reviews/2026-10-31-sp1-increment1-implementation-review.md` đã tái hiện bảy lỗi, SP1-C01 đến C07. Đợt khắc phục theo quy trình bug-proof-testing đã sửa bảy lỗi này và thêm C08, kiểm môi trường nghiệm thu của gate. Quy trình có đủ:
+> - test author độc lập, niêm phong test (seal r5 `sha256:a7bf659e…b54f`, 56 file);
+> - RED trên code gốc, GREEN và mutation trong bản sao cô lập;
+> - ba vòng review độc lập.
 >
-> Gate chạy lại trong môi trường Codex trên Windows **không được chấp nhận**. Gate trên Linux cũng **không được chấp nhận**, vì `mypy` fail.
+> Kết luận cuối: C01–C08 đều fixed, và không còn mutant sống sót nào liên quan đến yêu cầu. Ledger: `.superpowers/sdd/sp1-inc1-remediation/` (gitignored).
 >
-> Các receipt `accepted: true` liệt kê bên dưới chỉ chứng minh những lần chạy trước đó, trong môi trường lúc ấy. Chúng không đóng được nghiệm thu đợt 1. Đợt 1 chỉ đóng khi việc khắc phục C01 đến C07 qua đủ RED, GREEN, mutation, review độc lập và các gate bắt buộc, với snapshot source khớp.
+> Chưa nghiệm thu: macOS, một host Linux riêng hoặc CI, và độ bền khi mất điện (xem mục 2). Hai việc chuyển sang đợt 2:
+> - quét toàn bộ ledger mỗi lần mở (hiệu năng, C03);
+> - `restore_policy` giữ marker `meta.store_published`.
+>
+> Các receipt ở commit `1dfd9e5`, mục 1.1, là receipt cũ trước đợt khắc phục. Chúng chỉ còn giá trị lịch sử.
 
 Tài liệu này làm theo mục "Bàn giao đợt 1" của plan
 `docs/superpowers/plans/2026-10-30-sp1-increment1-storage-foundation.md`. Nó tách rõ phần **đã nghiệm thu**, có bằng
@@ -19,8 +26,20 @@ chứng đi kèm, với phần **chưa nghiệm thu**. Phần chưa nghiệm thu
 Gate chạy bằng `scripts/gate.py` trên Windows 11, trong một worktree niêm phong tại đúng commit, với working tree
 sạch. Gate gồm bốn phase bắt buộc: `ruff`, `mypy`, `lint-imports`, `pytest`.
 
-Hai receipt dưới đây gắn với commit **`1dfd9e5118f09d96047ba44708afc9cffc258a5e`**. Đó là commit cuối cùng có thay
-đổi code hoặc test của đợt 1.
+**Receipt nghiệm thu hiện hành (sau khắc phục C01–C08), commit `6617afa`:**
+
+| Môi trường | Receipt | `accepted` | Kết quả test |
+|---|---|---|---|
+| Windows 11, CPython 3.14.3 | `.gate/receipt-6617afa3808d-cpython3.14.3-win32-8e5b9291a873.json` | `true` | 856 passed, 20 skipped |
+| Windows 11, CPython 3.11.9 | `.gate/receipt-6617afa3808d-cpython3.11.9-win32-8e5b9291a873.json` | `true` | 856 passed, 20 skipped |
+| WSL Ubuntu (ext4, clone mới), CPython 3.14.4 | do reviewer độc lập chạy, ghi ở `review.md` vòng 3 | `true` | 834 passed, 42 skipped |
+
+Ở vòng 2, tại commit `a2f573d`, WSL với CPython 3.11.15 cũng được chấp nhận: 831 passed, 41 skipped. Code sản phẩm từ
+`a2f573d` đến `6617afa` không đổi. Receipt Windows có thêm mục môi trường (C08): `app_container` false, integrity
+medium, không có vấn đề nào.
+
+**Receipt cũ (lịch sử, trước đợt khắc phục).** Hai receipt dưới đây gắn với commit
+**`1dfd9e5118f09d96047ba44708afc9cffc258a5e`**.
 
 | Python | Receipt | `accepted` | `reasons` | Kết quả test |
 |---|---|---|---|---|
@@ -87,7 +106,7 @@ Các mục review cuối đã sửa, mỗi mục có test đỏ trước khi s�
 
 ### 1.5. Ghi chú hành vi và giới hạn sau khắc phục C01–C08
 
-Mục này chỉ ghi hành vi và giới hạn đã biết. Nó không phải claim nghiệm thu: đợt 1 vẫn chưa đóng (xem đầu tài liệu).
+Mục này ghi hành vi và giới hạn đã biết sau đợt khắc phục. Phạm vi nghiệm thu được ghi ở đầu tài liệu.
 
 - **Restore từ chối blob backup không owner-only (C04).** Mọi blob được đọc hay chép (`put`, `read`, GC, `copy_blobs`,
   kể cả khi restore từ `backup/cas`) phải là file thường, không phải link/junction/reparse point, và chỉ owner truy
@@ -117,8 +136,9 @@ Mục này chỉ ghi hành vi và giới hạn đã biết. Nó không phải cl
 
 Các mục dưới đây **chưa nghiệm thu**. Không mục nào được coi là "verified".
 
-- **CI trên macOS và Linux.** Repo chưa có remote, nên `.github/workflows/ci.yml` chưa từng chạy. Mọi receipt ở mục
-  1.1 chỉ là của Windows.
+- **CI trên macOS và Linux.** Repo chưa có remote, nên `.github/workflows/ci.yml` chưa từng chạy. Linux mới chỉ được
+  chạy qua WSL Ubuntu (ext4) trên cùng máy Windows, xem mục 1.1. Chưa có host Linux riêng và chưa có CI. macOS chưa
+  từng chạy.
 - **Độ bền khi mất điện.** Chỉ có lập luận theo ngữ nghĩa OS, ghi ở `docs/design/sp1-crash-table.md`. Chưa có phép thử
   mất điện nào. Riêng rename trong cùng volume trên Windows dựa vào `MOVEFILE_WRITE_THROUGH` cộng với journal của NTFS.
   Đó là cơ sở lập luận, không phải bảo đảm.
@@ -126,8 +146,9 @@ Các mục dưới đây **chưa nghiệm thu**. Không mục nào được coi 
 - **Tình huống 32, phần nonce và chữ ký:** thuộc đợt 2–3. Đợt 1 chỉ phủ `trust_generation`.
 - **Tình huống 35, phần Evidence:** chính sách tham chiếu evidence thuộc SP2/SP3. Đợt 1 chỉ phủ Event.
 - **Tình huống 28, phần `doctor` và `--fix`:** thuộc đợt 4. Đợt 1 chỉ có hàm kiểm tra quyền.
-- **Mọi nhánh POSIX chưa từng được chạy ở bất kỳ đâu.** Máy duy nhất đã chạy test là Windows, và chưa có CI. Code
-  POSIX có trong repo, nhưng chưa có lần chạy nào chứng minh nó đúng:
+- **Nhánh POSIX mới chỉ chạy trên Linux qua WSL; macOS chưa chạy.** Đợt khắc phục đã chạy gate đầy đủ trên WSL Ubuntu
+  (ext4), và các nhánh Linux dưới đây đã chạy ở đó. Các nhánh riêng của macOS (`statfs`, `F_FULLFSYNC` thật) vẫn chưa
+  từng chạy. Danh sách gốc, trước đợt khắc phục:
   - `PosixPermissionGuard` (chmod `0700`/`0600`, kiểm tổ tiên ghi được cho người khác, ngoại lệ sticky bit);
   - khóa `flock` của `writer.lock`;
   - fsync thư mục thật trên POSIX, gồm cả cách xử lý `EINVAL`/`ENOTSUP`/`ENOSYS`/`EBADF`;
