@@ -85,6 +85,31 @@ Các mục review cuối đã sửa, mỗi mục có test đỏ trước khi s�
 - **M3:** `prune_backups` cần lease.
 - **M9:** mất `brain.db` khi còn lịch sử (intent, hoặc backup kho đầy đủ) thì bị từ chối.
 
+### 1.5. Ghi chú hành vi và giới hạn sau khắc phục C01–C08
+
+Mục này chỉ ghi hành vi và giới hạn đã biết. Nó không phải claim nghiệm thu: đợt 1 vẫn chưa đóng (xem đầu tài liệu).
+
+- **Restore từ chối blob backup không owner-only (C04).** Mọi blob được đọc hay chép (`put`, `read`, GC, `copy_blobs`,
+  kể cả khi restore từ `backup/cas`) phải là file thường, không phải link/junction/reparse point, và chỉ owner truy
+  cập được (mục 5.9: toàn bộ data root, gồm `backups/`). Backup do brain tạo luôn owner-only. Backup được chép vào từ
+  nơi khác với ACL/mode của người khác (ví dụ `cp -p`, `robocopy /COPYALL`) bị từ chối với `insecure_permissions`.
+  Brain không tự sửa quyền: người dùng phải đặt lại quyền owner-only rồi chạy lại. `verify_backup` cũng từ chối
+  backup có shard hoặc blob là link/junction/reparse point (`integrity_failure`), và không đọc gì ngoài backup.
+- **Mất `brain.db` (C02).** Policy store giữ marker bền `meta.store_published`. Marker được ghi sau lần
+  `Store.create` công bố thành công đầu tiên, và được ghi lại (idempotent) sau mỗi lần `Store.open` thành công.
+  Khi `brain.db` mất mà marker đã có, hoặc còn intent, backup kho đầy đủ hay nội dung trong `cas/`, thì `open_runtime`
+  từ chối với `integrity_failure` và không tạo DB thay thế. Crash sau khi công bố nhưng trước khi ghi marker vẫn mở
+  được ở lần khởi động sau, và lần đó ghi marker.
+  **Giới hạn:** nếu mất **cả** `policy.db` lẫn `brain.db` thì data root trông như mới. Trường hợp này không phát hiện
+  được nếu không có backup, vì mọi tín hiệu bền nằm trong hai DB đó. Policy store khôi phục từ một backup chụp trước
+  lần công bố đầu tiên cũng chưa có marker, cho tới lần `Store.open` thành công kế tiếp.
+- **Bản sao đọc tạm `<db>.reading-*` (C01).** Khi có `-wal` mà thiếu `-shm`, `open_readonly` đọc qua một bản sao
+  riêng cạnh DB rồi xóa nó. Nếu tiến trình chết giữa chừng, bản sao còn lại. `open_runtime` xóa các bản sao này dưới
+  lease ở lần mở sau, chỉ xóa thư mục thật, không đi theo link.
+- **TODO đợt 2 (C03, hiệu năng):** mỗi lần mở, `check_history` chạy `GROUP BY kind` trên toàn ledger (cột `kind`
+  chưa có index). Chấp nhận được với kích thước đợt 1. Đợt 2 xem xét index `(kind, handler_version)` hoặc high-water
+  theo kind giữ trong `meta`, cập nhật trong transaction append.
+
 ## 2. Chưa nghiệm thu
 
 Các mục dưới đây **chưa nghiệm thu**. Không mục nào được coi là "verified".
