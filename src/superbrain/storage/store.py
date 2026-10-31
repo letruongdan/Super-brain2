@@ -5,7 +5,6 @@ still held and that it runs on the owner thread (the thread that called ``create
 
 import functools
 import os
-import re
 import sqlite3
 import threading
 from collections.abc import Callable, Iterator, Sequence
@@ -23,14 +22,14 @@ from superbrain.ports.policy import IntentKind, PolicySource, PolicyView
 from superbrain.storage import backup
 from superbrain.storage.cas import (
     ContentStore,
-    HolderProjection,
     RetentionClass,
     blob_is_intact,
     held_digests,
     remove_staging_leftovers,
 )
 from superbrain.storage.errors import sqlite_error
-from superbrain.storage.kinds import CORE_KINDS, KindRegistry
+from superbrain.storage.handlers import check_handlers, check_history, with_defaults
+from superbrain.storage.kinds import KindRegistry
 from superbrain.storage.layout import DataRoot
 from superbrain.storage.ledger import (
     LedgerEntry,
@@ -56,7 +55,6 @@ from superbrain.storage.writer import WriterLease
 
 _HANDLE = "store"
 _POLICY_ACTOR = "system:policy"
-_HANDLER_NAME = re.compile(r"[a-z][a-z0-9_]{0,31}")
 _REPLAY_BATCH = 256
 
 
@@ -67,49 +65,6 @@ def _quote(name: str) -> str:
 def _check_lease(root: DataRoot, lease: WriterLease) -> None:
     if not lease.held or lease.root != root:
         raise AssertionError("the store needs a held writer lease for this data root")
-
-
-def _with_defaults(
-    handlers: Sequence[ProjectionHandler], kinds: KindRegistry
-) -> tuple[tuple[ProjectionHandler, ...], KindRegistry]:
-    """``handlers`` plus ``HolderProjection`` and ``kinds`` plus ``CORE_KINDS``, each added only if absent.
-
-    A caller kind named like a core kind must be that core kind; a caller handler named ``cas_holders`` that is no
-    ``HolderProjection`` is left in place, so the duplicate-name check refuses it.
-    """
-    extra_kinds = []
-    for core in CORE_KINDS:
-        if core.kind not in kinds.kinds():
-            extra_kinds.append(core)
-        elif kinds.get(core.kind) != core:
-            raise BrainError(ErrorCode.INVALID_INPUT, f"core entry kind {core.kind!r} cannot be redefined")
-    merged_kinds = KindRegistry([*(kinds.get(name) for name in sorted(kinds.kinds())), *extra_kinds])
-    if any(isinstance(handler, HolderProjection) for handler in handlers):
-        return tuple(handlers), merged_kinds
-    return (HolderProjection(), *handlers), merged_kinds
-
-
-def _check_handlers(handlers: Sequence[ProjectionHandler], kinds: KindRegistry) -> None:
-    names = [handler.name for handler in handlers]
-    for name in names:
-        if not isinstance(name, str) or _HANDLER_NAME.fullmatch(name) is None:
-            raise BrainError(ErrorCode.INVALID_INPUT, f"projection handler name {name!r} is not a valid identifier")
-    if len(set(names)) != len(names):
-        raise BrainError(ErrorCode.INVALID_INPUT, "projection handler names must be unique")
-    for a in names:
-        for b in names:
-            if a != b and f"{b}_".startswith(f"{a}_"):
-                raise BrainError(ErrorCode.INVALID_INPUT, f"projection handlers {a!r} and {b!r} share a table prefix")
-    registered = kinds.kinds()
-    for handler in handlers:
-        unknown = sorted(handler.kinds - registered)
-        if unknown:
-            raise BrainError(ErrorCode.INVALID_INPUT, f"projection {handler.name} handles unregistered kinds {unknown}")
-        for kind in sorted(handler.kinds):
-            if kinds.get(kind).handler_version > handler.handler_version:
-                raise BrainError(
-                    ErrorCode.UNSUPPORTED_VERSION, f"projection {handler.name} is older than entry kind {kind}"
-                )
 
 
 def _objects(db: sqlite3.Connection) -> set[tuple[str, str]]:
@@ -226,6 +181,7 @@ class Store:
         self._closed = False
         self._txn_active = False
         self._maintenance = False
+        self._history_versions: dict[str, int] = {}
         self._cas = ContentStore(
             root=root,
             os_=os_,
@@ -260,8 +216,8 @@ class Store:
         ``HolderProjection`` and ``CORE_KINDS`` are always registered, in addition to ``handlers`` and ``kinds``.
         """
         _check_lease(root, lease)
-        handlers, kinds = _with_defaults(handlers, kinds)
-        _check_handlers(handlers, kinds)
+        handlers, kinds = with_defaults(handlers, kinds)
+        check_handlers(handlers, kinds)
         path = root.store_db
         if any(os.path.lexists(p) for p in db_files(path)):
             raise BrainError(ErrorCode.INVALID_INPUT, f"a store database already exists at {path}")
@@ -302,8 +258,8 @@ class Store:
         unfinished ``put``s are removed. Both end with ``reconcile_policy``, so every pending intent is applied.
         """
         _check_lease(root, lease)
-        handlers, kinds = _with_defaults(handlers, kinds)
-        _check_handlers(handlers, kinds)
+        handlers, kinds = with_defaults(handlers, kinds)
+        check_handlers(handlers, kinds)
         lease.register_handle(_HANDLE)
         try:
             return cls._open_registered(root, lease, os_, policy, handlers, kinds, migrations)
@@ -355,6 +311,7 @@ class Store:
         """Give every handler without live tables new ones, filled from the whole ledger in the same transaction
         (a handler registered after entries of its kinds were written must not start empty), then secure the
         database files and remove staging leftovers. Handlers whose live tables exist are not replayed."""
+        self._history_versions = check_history(self._db, self._handlers)
         with self._immediate() as db:
             try:
                 fresh = [h for h in self._handlers if not _tables_with_prefix(db, live_prefix(h))]
@@ -420,6 +377,7 @@ class Store:
                     clock=self._os.clock,
                     check_owner=self._check,
                     blob_intact=functools.partial(blob_is_intact, self._root.cas_dir),
+                    history_versions=self._history_versions,
                 )
                 try:
                     yield txn

@@ -189,9 +189,11 @@ class Txn:
         clock: Clock,
         check_owner: Callable[[], None],
         blob_intact: Callable[[str], bool],
+        history_versions: Mapping[str, int],
     ) -> None:
         self._db = db
         self._blob_intact = blob_intact
+        self._history_versions = history_versions
         self._kinds = kinds
         self._handlers = tuple(handlers)
         self._policy = policy
@@ -315,6 +317,13 @@ class Txn:
         checked_refs = validate_envelope(actor, owner_id, refs)
         spec = self._kinds.get(kind)
         self._kinds.validate(kind, meta)
+        needed = self._history_versions.get(kind, 0)
+        if spec.handler_version < needed:  # spec 5.8: no downgrade
+            raise BrainError(
+                ErrorCode.UNSUPPORTED_VERSION,
+                f"the ledger holds {kind} entries of handler version {needed}, entry kind {kind} is version "
+                f"{spec.handler_version}",
+            )
         recorded_at = utc_timestamp(self._clock.now())
         entry_id = new_id()
         pending = LedgerEntry(
