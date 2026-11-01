@@ -564,10 +564,10 @@ def verify_backup(
     do not hash to their names, and roots (the snapshot's holders) that are not exactly ``blobs`` (``store``) or not
     a subset of them (``store_full``). A ``store``/``policy`` schema ``migrations`` cannot read is
     ``UNSUPPORTED_VERSION``; for such a ``store_full`` only the physical facts and ``meta`` are checked and
-    ``logical_verified`` is ``False``. First, before anything is read, the backup directory and its ``cas/`` must
-    pass ``cas.check_backup_containers`` with ``os_`` (owner-only, no link: ``INSECURE_PERMISSIONS``/``UNSAFE_PATH``).
+    ``logical_verified`` is ``False``. First, before anything is read, every file and directory of the backup must
+    pass ``cas.check_backup_tree`` with ``os_`` (owner-only, no link: ``INSECURE_PERMISSIONS``/``UNSAFE_PATH``).
     """
-    cas.check_backup_containers(path, os_)
+    cas.check_backup_tree(path, os_)
     expected = frozenset({expected_kind}) if isinstance(expected_kind, str) else expected_kind
     manifest = _load_manifest(path)
     if manifest.kind not in expected:

@@ -88,12 +88,34 @@ def check_container(directory: Path, os_: OsAdapters) -> None:
         raise BrainError(ErrorCode.INSECURE_PERMISSIONS, f"existing {directory} is not owner-only: {detail}")
 
 
-def check_backup_containers(backup: Path, os_: OsAdapters) -> None:
-    """``check_container`` on a backup directory and on its ``cas/`` (if any), before anything in the backup is read
-    or copied (spec 5.7, 5.9; C04). Shards and blobs are checked where they are listed or copied."""
+def check_backup_tree(backup: Path, os_: OsAdapters) -> None:
+    """Admit every entry of a backup before anything in it is read or copied (spec 5.7, 5.9; C04, ruling of review
+    round 4): the backup directory (``check_container``), then each entry below it, without following any link. A
+    link or reparse point is ``UNSAFE_PATH`` and is never entered or read; anything but a regular file or a directory
+    is ``INTEGRITY_FAILURE``; each must be owner-only with ``os_.permissions`` (``INSECURE_PERMISSIONS``). Only names
+    and metadata are read here; which entries a backup may hold is checked afterwards by ``verify_backup``."""
     check_container(backup, os_)
-    if os.path.lexists(backup / "cas"):
-        check_container(backup / "cas", os_)
+    pending = [backup]
+    while pending:
+        directory = pending.pop()
+        try:
+            with os.scandir(directory) as listing:
+                entries = sorted(listing, key=lambda entry: entry.name)
+            for entry in entries:
+                path, st = Path(entry.path), entry.stat(follow_symlinks=False)
+                if is_link(st):
+                    raise BrainError(ErrorCode.UNSAFE_PATH, f"the backup entry {path} is a link or reparse point")
+                if stat.S_ISDIR(st.st_mode):
+                    pending.append(path)
+                elif not stat.S_ISREG(st.st_mode):
+                    raise BrainError(ErrorCode.INTEGRITY_FAILURE, f"the backup entry {path} is not a file or directory")
+                problems = os_.permissions.object_problems(path)
+                if problems:
+                    detail = "; ".join(f"{p.path}: {p.reason}" for p in problems)
+                    message = f"the backup entry {path} is not owner-only: {detail}"
+                    raise BrainError(ErrorCode.INSECURE_PERMISSIONS, message)
+        except OSError as err:
+            raise os_error(f"cannot inspect the backup {backup}", err) from err
 
 
 def check_blob_location(blob: Path, os_: OsAdapters) -> None:
