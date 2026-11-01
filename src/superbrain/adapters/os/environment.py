@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Protocol
 
 from superbrain.adapters.os import os_adapters, token
+from superbrain.adapters.os.paths import is_link
 from superbrain.core.errors import BrainError
 from superbrain.core.jsonvalue import JsonValue
 
@@ -41,7 +42,7 @@ class EnvironmentProbe(Protocol):
         ...
 
     def check_root(self, path: Path, role: str) -> list[str] | None:
-        """``None`` if ``path`` does not exist; otherwise the problems of ``path`` itself, as text."""
+        """``None`` if the CONFIGURED (unresolved) ``path`` does not exist; otherwise its own problems, as text."""
         ...
 
 
@@ -65,14 +66,20 @@ class OsEnvironmentProbe:
         return [f"{problem.path}: {problem.reason}" for problem in problems]
 
     def check_root(self, path: Path, role: str) -> list[str] | None:
-        """The data root: no link, a directory, owner-only (``object_problems``), as ``prepare_data_root`` requires.
-        Any other role: no link, a directory, and the ancestor rule applied to the path itself (no takeover right
-        for an untrusted account; on POSIX group/world-writable only with the sticky bit), not owner-only."""
+        """``path`` is the configured path, never resolved, so a link or junction is seen (C08, ruling S1).
+
+        The data root: no link at the path or above it (``reject_links``, as ``prepare_data_root``), a directory,
+        owner-only (``object_problems``). Any other role (a shared parent such as ``/tmp``, whose own ancestors may
+        legitimately be links): the path itself is no link, a directory, and passes the ancestor rule (no takeover
+        right for an untrusted account; on POSIX group/world-writable only with the sticky bit), not owner-only."""
         if not os.path.lexists(path):
             return None
         guard = os_adapters().permissions
         try:
-            os_adapters().paths.reject_links(path)
+            if role == DATA_ROOT_ROLE:
+                os_adapters().paths.reject_links(path)
+            elif is_link(path):
+                return [f"{path}: is a link or reparse point"]
             if not path.is_dir():
                 return [f"{path}: not a directory"]
             if role == DATA_ROOT_ROLE:
@@ -116,7 +123,7 @@ def collect(probe: EnvironmentProbe, paths: Mapping[str, Path], platform: str) -
             found.append(PathFacts(role, str(configured), None, (), f"{type(err).__name__}: {err}"))
             continue
         ancestors = tuple(probe.check_ancestors(resolved))
-        itself = probe.check_root(resolved, role)
+        itself = probe.check_root(configured, role)  # the configured path: a link there is a problem (S1)
         found.append(
             PathFacts(
                 role,

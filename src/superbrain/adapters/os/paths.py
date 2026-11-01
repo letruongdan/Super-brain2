@@ -24,6 +24,11 @@ def _is_link(path: Path) -> bool:
     return bool(attributes & _REPARSE_POINT)
 
 
+def is_link(path: Path) -> bool:
+    """Whether ``path`` itself (not its parents) is a symlink or a reparse point such as a junction; never followed."""
+    return _is_link(path)
+
+
 class OsPathSafety:
     def reject_unsafe_path(self, raw: str) -> None:
         if sys.platform != "win32":
