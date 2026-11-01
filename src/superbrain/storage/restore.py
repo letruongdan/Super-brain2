@@ -26,6 +26,7 @@ from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.faults import crashpoint
 from superbrain.ports.os import OsAdapters
 from superbrain.storage.backup import BackupManifest, copy_blobs, new_directory, verify_backup, write_new_file
+from superbrain.storage.cas import check_container
 from superbrain.storage.errors import sqlite_error
 from superbrain.storage.layout import DataRoot
 from superbrain.storage.policy_store import STORE_PUBLISHED, PolicyStore
@@ -82,6 +83,7 @@ def restore_store(
     """
     _check_lease(root, lease)
     kinds = frozenset({"store", "store_full"})
+    _check_backup_directories(backup, os_)
     manifest = verify_backup(backup, expected_kind=kinds, expected_store_id=policy.store_id, migrations=migrations)
     if not manifest.logical_verified:
         raise BrainError(
@@ -98,6 +100,14 @@ def restore_store(
 
     replaced = stage_and_swap(root, lease, os_, target="store", purpose="restoring", build=build, now=now)
     return RestoreReport(restored_from=backup, replaced_dir=replaced, new_epoch=lease.epoch, trust_generation=None)
+
+
+def _check_backup_directories(backup: Path, os_: OsAdapters) -> None:
+    """The backup directory and its ``cas/`` container (if any) pass ``check_container`` before anything in the
+    backup is read or copied (spec 5.9: backups are owner-only; C04). Shards and blobs are checked by ``copy_blobs``."""
+    check_container(backup, os_)
+    if os.path.lexists(backup / "cas"):
+        check_container(backup / "cas", os_)
 
 
 def _write_generation(path: Path, generation: int, os_: OsAdapters, *, published: bool) -> None:
@@ -180,6 +190,7 @@ def restore_policy(
     busy = sorted({"store", "policy"} & lease.open_handles())
     if busy:
         raise BrainError(ErrorCode.STORE_BUSY, f"close {' and '.join(busy)} before restoring the policy store")
+    _check_backup_directories(backup, os_)
     manifest = verify_backup(backup, expected_kind="policy", expected_store_id=store_id, migrations=migrations)
     if manifest.trust_generation is None:  # verify_backup requires it for a policy backup
         raise AssertionError("a verified policy backup has a trust generation")

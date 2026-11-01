@@ -71,6 +71,23 @@ def is_link(st: os.stat_result) -> bool:
     return stat.S_ISLNK(st.st_mode) or bool(getattr(st, "st_file_attributes", 0) & _REPARSE_POINT)
 
 
+def check_container(directory: Path, os_: OsAdapters) -> None:
+    """Check an existing directory before anything in it is entered or copied (spec 5.9): neither it nor a directory
+    above it may be a link or reparse point (``UNSAFE_PATH``), it must be a directory (``INTEGRITY_FAILURE``) and
+    owner-only (``INSECURE_PERMISSIONS``, with the real ``PermissionGuard``). Nothing is changed or re-secured."""
+    os_.paths.reject_links(directory)
+    try:
+        mode = os.lstat(directory).st_mode
+    except OSError as err:
+        raise os_error(f"cannot inspect {directory}", err) from err
+    if not stat.S_ISDIR(mode):
+        raise BrainError(ErrorCode.INTEGRITY_FAILURE, f"{directory} is not a directory")
+    problems = os_.permissions.object_problems(directory)
+    if problems:
+        detail = "; ".join(f"{p.path}: {p.reason}" for p in problems)
+        raise BrainError(ErrorCode.INSECURE_PERMISSIONS, f"existing {directory} is not owner-only: {detail}")
+
+
 def check_blob_location(blob: Path, os_: OsAdapters) -> None:
     """Check ``cas/<aa>/<64 hex>`` before it is read, reused or written through (spec 5.5, 5.9).
 
