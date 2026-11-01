@@ -1,6 +1,17 @@
 # Bàn giao SP1 đợt 1: nền tảng storage
 
-> **Trạng thái (2026-10-31): ĐÃ NGHIỆM THU trên Windows 11 và WSL Ubuntu (ext4), tại commit `6617afa`.** Phạm vi nghiệm thu chỉ gồm hai môi trường này.
+> **Trạng thái (2026-11-01): CHƯA ĐÓNG NGHIỆM THU. Claim "đã nghiệm thu" ghi ngày 2026-10-31 bị rút lại.**
+>
+> Review lại `docs/reviews/2026-10-31-sp1-increment1-remediation-re-review.md`, tại HEAD `5e045b4`, tái hiện được ba lỗi còn mở:
+> - **C02 (P1):** `restore_policy` làm mất marker `meta.store_published`, và đường tạo DB rỗng mở lại.
+> - **C04 (P2):** restore không kiểm quyền của chính thư mục `backup/cas/`.
+> - **C08 (P2):** preflight không kiểm ACL của chính data root.
+>
+> C01, C03, C05, C06 và C07 vẫn giữ trạng thái fixed. Việc ghi "chuyển sang đợt 2" cho marker của `restore_policy` là sai: đó là phản ví dụ của chính C02. Phần dưới đây là ghi chép của lần đóng bị rút lại, giữ để làm lịch sử.
+>
+> ---
+>
+> *(Đã rút lại)* Trạng thái 2026-10-31: đã nghiệm thu trên Windows 11 và WSL Ubuntu (ext4), tại commit `6617afa`.
 >
 > Review triển khai `docs/reviews/2026-10-31-sp1-increment1-implementation-review.md` đã tái hiện bảy lỗi, SP1-C01 đến C07. Đợt khắc phục theo quy trình bug-proof-testing đã sửa bảy lỗi này và thêm C08, kiểm môi trường nghiệm thu của gate. Quy trình có đủ:
 > - test author độc lập, niêm phong test (seal r5 `sha256:a7bf659e…b54f`, 56 file);
