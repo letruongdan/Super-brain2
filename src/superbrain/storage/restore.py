@@ -135,9 +135,10 @@ def _write_generation(path: Path, generation: int, os_: OsAdapters, *, published
 
 
 def _live_policy(root: DataRoot) -> tuple[int, bool]:
-    """The trust generation and ``meta.store_published`` marker of the closed live ``policy.db``, read without
-    creating or changing any file; ``(0, False)`` if there is none. A ``policy.db`` that cannot be read is
-    ``INTEGRITY_FAILURE``: guessing could reuse a generation or drop the marker."""
+    """The trust generation of the closed live ``policy.db`` and whether it holds store history: the
+    ``meta.store_published`` marker or ANY intent (C02, ruling S5). Read without creating or changing any file;
+    ``(0, False)`` if there is none. A ``policy.db`` that cannot be read is ``INTEGRITY_FAILURE``: guessing could
+    reuse a generation or drop the history signal."""
     path = root.policy_db
     if not os.path.lexists(path):
         return 0, False
@@ -147,6 +148,7 @@ def _live_policy(root: DataRoot) -> tuple[int, bool]:
             rows = db.execute("SELECT generation FROM trust WHERE id = 1").fetchall()
             marked = "SELECT 1 FROM meta WHERE key = ? AND value = '1'"
             published = db.execute(marked, (STORE_PUBLISHED,)).fetchone() is not None
+            published = published or db.execute("SELECT 1 FROM intents LIMIT 1").fetchone() is not None
         finally:
             db.close()
     except sqlite3.Error as exc:
@@ -185,11 +187,11 @@ def restore_policy(
     manifest = verify_backup(backup, expected_kind="policy", expected_store_id=store_id, migrations=migrations, os_=os_)
     if manifest.trust_generation is None:  # verify_backup requires it for a policy backup
         raise AssertionError("a verified policy backup has a trust generation")
-    live_generation, live_published = _live_policy(root)
+    live_generation, live_history = _live_policy(root)
     generation = max(lease.state().trust_generation_hwm, manifest.trust_generation, live_generation) + 1
-    # C02: never roll the published-store marker back. The backup's own marker is copied with it; the live policy's,
-    # or a published brain.db, sets it in the stage, so it is atomic with the swap.
-    published = live_published or os.path.lexists(root.store_db)
+    # C02: never roll a store-history signal back. The backup's own marker is copied with it; the live policy's marker
+    # or intents, or a published brain.db, set it in the stage, so it is atomic with the swap.
+    published = live_history or os.path.lexists(root.store_db)
 
     def build(stage: Path) -> None:
         staged = stage / "policy.db"
