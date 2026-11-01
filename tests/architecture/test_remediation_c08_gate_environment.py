@@ -142,7 +142,10 @@ def test_a_clean_environment_has_no_problems_and_records_every_fact() -> None:
     assert section["app_container"] is False and section["integrity_level"] == "medium"
     paths = section["paths"]
     assert isinstance(paths, dict) and set(paths) == set(ROLES)
-    assert paths["trusted_test_root"] == {
+    trusted = paths["trusted_test_root"]
+    assert isinstance(trusted, dict)
+    # Round 6 adds "exists" and "root_problems" to each entry: the round-1 keys are checked, not the exact key set.
+    assert {k: trusted.get(k) for k in ("configured", "resolved", "ancestor_problems", "error")} == {
         "configured": "C:\\cfg\\trusted_test_root",
         "resolved": "C:\\phys\\trusted_test_root",
         "ancestor_problems": [],
@@ -242,6 +245,10 @@ class FakeProbe:
     def check_ancestors(self, path: Path) -> list[str]:
         self.checked.append(path)
         return [f"{path.parent}: writable by another account"] if path.name == "physical-data-root" else []
+
+    def check_root(self, path: Path, role: str) -> list[str] | None:
+        """Round-6 contract: the path itself; this double reports every path as existing and clean."""
+        return []
 
 
 def host_env(tmp_path: Path) -> dict[str, str]:
