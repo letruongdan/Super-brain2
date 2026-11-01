@@ -156,6 +156,7 @@ def migrate_database(
         expected_kind=kind,
         expected_store_id=info.store_id,
         migrations=migrations[: info.schema_version],
+        os_=os_,
     )
     pending = [m for m in migrations if m.to_version > info.schema_version]
     name = source.name

@@ -88,6 +88,14 @@ def check_container(directory: Path, os_: OsAdapters) -> None:
         raise BrainError(ErrorCode.INSECURE_PERMISSIONS, f"existing {directory} is not owner-only: {detail}")
 
 
+def check_backup_containers(backup: Path, os_: OsAdapters) -> None:
+    """``check_container`` on a backup directory and on its ``cas/`` (if any), before anything in the backup is read
+    or copied (spec 5.7, 5.9; C04). Shards and blobs are checked where they are listed or copied."""
+    check_container(backup, os_)
+    if os.path.lexists(backup / "cas"):
+        check_container(backup / "cas", os_)
+
+
 def check_blob_location(blob: Path, os_: OsAdapters) -> None:
     """Check ``cas/<aa>/<64 hex>`` before it is read, reused or written through (spec 5.5, 5.9).
 
