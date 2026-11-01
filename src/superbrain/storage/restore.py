@@ -28,7 +28,7 @@ from superbrain.ports.os import OsAdapters
 from superbrain.storage.backup import BackupManifest, copy_blobs, new_directory, verify_backup, write_new_file
 from superbrain.storage.errors import sqlite_error
 from superbrain.storage.layout import DataRoot
-from superbrain.storage.policy_store import PolicyStore
+from superbrain.storage.policy_store import STORE_PUBLISHED, PolicyStore
 from superbrain.storage.schema import POLICY_MIGRATIONS, STORE_MIGRATIONS, Migration
 from superbrain.storage.sqlite import open_readonly
 from superbrain.storage.swap import stage_and_swap
@@ -100,9 +100,10 @@ def restore_store(
     return RestoreReport(restored_from=backup, replaced_dir=replaced, new_epoch=lease.epoch, trust_generation=None)
 
 
-def _write_generation(path: Path, generation: int, os_: OsAdapters) -> None:
-    """Set the trust generation of the closed policy database ``path`` and make the file durable
-    (``os_.publisher.flush_file``)."""
+def _write_generation(path: Path, generation: int, os_: OsAdapters, *, published: bool) -> None:
+    """Set the trust generation of the closed policy database ``path`` and, if ``published``, its
+    ``meta.store_published`` marker (C02); then make the file durable (``os_.publisher.flush_file``). A marker the
+    copy already has is kept either way: a restore never clears it."""
     try:
         db = sqlite3.connect(path, isolation_level=None)
     except sqlite3.Error as exc:
@@ -113,6 +114,11 @@ def _write_generation(path: Path, generation: int, os_: OsAdapters) -> None:
             if sys.platform == "darwin":
                 db.execute("PRAGMA fullfsync=ON")
             rows = db.execute("UPDATE trust SET generation = ? WHERE id = 1", (generation,)).rowcount
+            if published:
+                db.execute(
+                    "INSERT INTO meta (key, value) VALUES (?, '1') ON CONFLICT (key) DO UPDATE SET value = '1'",
+                    (STORE_PUBLISHED,),
+                )
         except sqlite3.Error as exc:
             raise sqlite_error("cannot write the staged trust generation", exc) from exc
         if rows != 1:
@@ -126,16 +132,19 @@ def _write_generation(path: Path, generation: int, os_: OsAdapters) -> None:
     os_.publisher.flush_file(path)
 
 
-def _live_generation(root: DataRoot) -> int:
-    """The trust generation of the closed live ``policy.db``, read without creating or changing any file; 0 if
-    there is none. A ``policy.db`` that cannot be read is ``INTEGRITY_FAILURE``: guessing could reuse a generation."""
+def _live_policy(root: DataRoot) -> tuple[int, bool]:
+    """The trust generation and ``meta.store_published`` marker of the closed live ``policy.db``, read without
+    creating or changing any file; ``(0, False)`` if there is none. A ``policy.db`` that cannot be read is
+    ``INTEGRITY_FAILURE``: guessing could reuse a generation or drop the marker."""
     path = root.policy_db
     if not os.path.lexists(path):
-        return 0
+        return 0, False
     try:
         db = open_readonly(path)
         try:
             rows = db.execute("SELECT generation FROM trust WHERE id = 1").fetchall()
+            marked = "SELECT 1 FROM meta WHERE key = ? AND value = '1'"
+            published = db.execute(marked, (STORE_PUBLISHED,)).fetchone() is not None
         finally:
             db.close()
     except sqlite3.Error as exc:
@@ -144,7 +153,7 @@ def _live_generation(root: DataRoot) -> int:
         ) from exc
     if len(rows) != 1 or type(rows[0][0]) is not int or rows[0][0] < 1:
         raise BrainError(ErrorCode.INTEGRITY_FAILURE, "the live policy store has no valid trust generation")
-    return rows[0][0]
+    return rows[0][0], published
 
 
 def restore_policy(
@@ -162,8 +171,10 @@ def restore_policy(
     An open ``store`` or ``policy`` handle is ``STORE_BUSY``, then the backup must verify against ``store_id`` and
     the live ``policy.db``, if any, must be readable (``INTEGRITY_FAILURE``); all before anything is staged. The new
     generation is above the lock's mark, the backup's and the live store's: after a crash before the mark was
-    raised, the live store is ahead of it. Afterwards the caller opens a new runtime, so the store binds to the restored
-    policy store and reconciles against it.
+    raised, the live store is ahead of it. The staged copy also keeps ``meta.store_published`` (C02): it is set if the
+    backup, the live policy store or a published ``brain.db`` shows the store was published, and never invented on a
+    root whose store never was. Afterwards the caller opens a new runtime, so the store binds to the restored policy
+    store and reconciles against it.
     """
     _check_lease(root, lease)
     busy = sorted({"store", "policy"} & lease.open_handles())
@@ -172,12 +183,16 @@ def restore_policy(
     manifest = verify_backup(backup, expected_kind="policy", expected_store_id=store_id, migrations=migrations)
     if manifest.trust_generation is None:  # verify_backup requires it for a policy backup
         raise AssertionError("a verified policy backup has a trust generation")
-    generation = max(lease.state().trust_generation_hwm, manifest.trust_generation, _live_generation(root)) + 1
+    live_generation, live_published = _live_policy(root)
+    generation = max(lease.state().trust_generation_hwm, manifest.trust_generation, live_generation) + 1
+    # C02: never roll the published-store marker back. The backup's own marker is copied with it; the live policy's,
+    # or a published brain.db, sets it in the stage, so it is atomic with the swap.
+    published = live_published or os.path.lexists(root.store_db)
 
     def build(stage: Path) -> None:
         staged = stage / "policy.db"
         _copy_snapshot(backup, "policy.db", manifest, staged, os_)
-        _write_generation(staged, generation, os_)
+        _write_generation(staged, generation, os_, published=published)
         crashpoint("restoring.policy.after_generation_persist")
 
     replaced = stage_and_swap(root, lease, os_, target="policy", purpose="restoring", build=build, now=now)
