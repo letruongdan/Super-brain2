@@ -79,7 +79,7 @@ class InterpreterInfo:
 # --- acceptance environment (spec 4.3 owner policy of 2026-10-31, spec 5.9) ----------------------------
 
 TRUSTED_TEST_ROOT = "trusted_test_root"
-DEFAULT_DATA_ROOT = "default_data_root"
+DEFAULT_DATA_ROOT = environment_facts.DATA_ROOT_ROLE
 
 
 def acceptance_paths(env: Mapping[str, str], platform: str) -> dict[str, Path]:

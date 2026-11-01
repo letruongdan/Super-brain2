@@ -3,9 +3,12 @@
 "Môi trường nghiệm thu phải được kiểm tra trên thực tế: token của tiến trình, đường dẫn vật lý và ACL thật của data
 root cùng các thư mục cha." The probe reads the process token (AppContainer flag, integrity level), resolves each
 configured path to its physical path and runs the same ancestor check as ``prepare_data_root`` on it, with the
-trusted set of spec 5.9 unchanged. ``assess`` turns the facts into problems; nothing is allow-listed.
+trusted set of spec 5.9 unchanged. An existing path is checked itself too (``check_root``): the data root with the
+owner-only rule ``prepare_data_root`` applies, any other role (a shared parent such as the test trusted root or
+``/tmp``) with the ancestor rule. ``assess`` turns the facts into problems; nothing is allow-listed.
 """
 
+import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,6 +19,8 @@ from superbrain.core.errors import BrainError
 from superbrain.core.jsonvalue import JsonValue
 
 _LOW_INTEGRITY = ("untrusted", "low")
+DATA_ROOT_ROLE = "default_data_root"
+"""The role whose existing path must itself be owner-only; every other role is a shared parent."""
 
 
 class EnvironmentProbe(Protocol):
@@ -33,6 +38,10 @@ class EnvironmentProbe(Protocol):
 
     def check_ancestors(self, path: Path) -> list[str]:
         """``PermissionGuard.check_ancestors`` problems of ``path``, as text."""
+        ...
+
+    def check_root(self, path: Path, role: str) -> list[str] | None:
+        """``None`` if ``path`` does not exist; otherwise the problems of ``path`` itself, as text."""
         ...
 
 
@@ -55,6 +64,26 @@ class OsEnvironmentProbe:
             return [f"{path}: the ancestors could not be checked: {err}"]
         return [f"{problem.path}: {problem.reason}" for problem in problems]
 
+    def check_root(self, path: Path, role: str) -> list[str] | None:
+        """The data root: no link, a directory, owner-only (``object_problems``), as ``prepare_data_root`` requires.
+        Any other role: no link, a directory, and the ancestor rule applied to the path itself (no takeover right
+        for an untrusted account; on POSIX group/world-writable only with the sticky bit), not owner-only."""
+        if not os.path.lexists(path):
+            return None
+        guard = os_adapters().permissions
+        try:
+            os_adapters().paths.reject_links(path)
+            if not path.is_dir():
+                return [f"{path}: not a directory"]
+            if role == DATA_ROOT_ROLE:
+                found = guard.object_problems(path)
+            else:
+                itself = Path(os.path.abspath(path))
+                found = [p for p in guard.check_ancestors(itself / "child") if p.path == itself]
+        except BrainError as err:
+            return [f"{path}: {err}"]
+        return [f"{problem.path}: {problem.reason}" for problem in found]
+
 
 @dataclass(frozen=True)
 class PathFacts:
@@ -63,6 +92,8 @@ class PathFacts:
     resolved: str | None
     ancestor_problems: tuple[str, ...]
     error: str | None = None
+    exists: bool | None = None
+    root_problems: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -84,7 +115,18 @@ def collect(probe: EnvironmentProbe, paths: Mapping[str, Path], platform: str) -
         except OSError as err:
             found.append(PathFacts(role, str(configured), None, (), f"{type(err).__name__}: {err}"))
             continue
-        found.append(PathFacts(role, str(configured), str(resolved), tuple(probe.check_ancestors(resolved))))
+        ancestors = tuple(probe.check_ancestors(resolved))
+        itself = probe.check_root(resolved, role)
+        found.append(
+            PathFacts(
+                role,
+                str(configured),
+                str(resolved),
+                ancestors,
+                exists=itself is not None,
+                root_problems=tuple(itself or ()),
+            )
+        )
     failures: list[str] = []
     app_container: bool | None = None
     integrity: str | None = None
@@ -117,11 +159,14 @@ def assess(facts: EnvironmentFacts, *, required: Sequence[str]) -> dict[str, Jso
         if p.resolved is None:
             problems.append(f"{p.role}: {p.configured} was not resolved to a physical path: {p.error}")
         problems.extend(f"{p.role}: ancestor not trusted: {problem}" for problem in p.ancestor_problems)
+        problems.extend(f"{p.role}: {p.resolved} itself is not acceptable: {problem}" for problem in p.root_problems)
         paths[p.role] = {
             "configured": p.configured,
             "resolved": p.resolved,
             "ancestor_problems": list(p.ancestor_problems),
             "error": p.error,
+            "exists": p.exists,
+            "root_problems": list(p.root_problems),
         }
     return {
         "platform": facts.platform,
