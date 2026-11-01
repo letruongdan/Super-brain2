@@ -71,7 +71,9 @@ def backup_with_a_later_live_blob(data_root: Path) -> tuple[Path, str, str]:
         store_id = rt.store.store_id
     finally:
         rt.close()
-    verify_backup(backup, expected_kind="store", expected_store_id=store_id, migrations=STORE_MIGRATIONS)
+    verify_backup(
+        backup, expected_kind="store", expected_store_id=store_id, migrations=STORE_MIGRATIONS, os_=os_adapters()
+    )
     return backup, store_id, later
 
 
@@ -93,7 +95,9 @@ def test_verify_backup_refuses_a_backup_directory_that_is_not_owner_only(
     loosen_target(backup, target, variant)
 
     with pytest.raises(BrainError) as refused:
-        verify_backup(backup, expected_kind="store", expected_store_id=store_id, migrations=STORE_MIGRATIONS)
+        verify_backup(
+            backup, expected_kind="store", expected_store_id=store_id, migrations=STORE_MIGRATIONS, os_=os_adapters()
+        )
 
     assert refused.value.code in REFUSALS
 

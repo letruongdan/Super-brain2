@@ -48,11 +48,15 @@ ORPHAN = b"orphan payload"
 
 
 def verify_store(path: Path, store_id: str) -> BackupManifest:
-    return verify_backup(path, expected_kind="store", expected_store_id=store_id, migrations=STORE_MIGRATIONS)
+    return verify_backup(
+        path, expected_kind="store", expected_store_id=store_id, migrations=STORE_MIGRATIONS, os_=os_adapters()
+    )
 
 
 def verify_full(path: Path, store_id: str) -> BackupManifest:
-    return verify_backup(path, expected_kind="store_full", expected_store_id=store_id, migrations=STORE_MIGRATIONS)
+    return verify_backup(
+        path, expected_kind="store_full", expected_store_id=store_id, migrations=STORE_MIGRATIONS, os_=os_adapters()
+    )
 
 
 def put_and_hold(store: Store, data: bytes, holder_id: str = E2) -> str:
@@ -336,13 +340,25 @@ def test_unreadable_store_backup_is_unsupported_version(env: Env, clock: FakeClo
 
 def test_policy_backup_round_trip_and_corruption(env: Env, clock: FakeClock) -> None:  # R3-02
     path = create_policy_backup(env.policy, env.os_, clock.now())
-    m = verify_backup(path, expected_kind="policy", expected_store_id=env.policy.store_id, migrations=POLICY_MIGRATIONS)
+    m = verify_backup(
+        path,
+        expected_kind="policy",
+        expected_store_id=env.policy.store_id,
+        migrations=POLICY_MIGRATIONS,
+        os_=os_adapters(),
+    )
     assert m.trust_generation == env.policy.trust_generation()
     assert (m.kind, m.ledger_high_water, m.blobs) == ("policy", 0, ())
     assert path.name.startswith("policy-") and (path / "policy.db").is_file()
     corrupt_bytes(path / "policy.db", offsets=[200])
     with pytest.raises(BrainError) as e:
-        verify_backup(path, expected_kind="policy", expected_store_id=env.policy.store_id, migrations=POLICY_MIGRATIONS)
+        verify_backup(
+            path,
+            expected_kind="policy",
+            expected_store_id=env.policy.store_id,
+            migrations=POLICY_MIGRATIONS,
+            os_=os_adapters(),
+        )
     assert e.value.code == ErrorCode.INTEGRITY_FAILURE and "db_digest" in e.value.message
 
 
@@ -350,7 +366,13 @@ def test_policy_manifest_trust_generation_must_match_the_snapshot(env: Env, cloc
     path = create_policy_backup(env.policy, env.os_, clock.now())
     rewrite_manifest(path, trust_generation=env.policy.trust_generation() + 1)
     with pytest.raises(BrainError) as e:
-        verify_backup(path, expected_kind="policy", expected_store_id=env.policy.store_id, migrations=POLICY_MIGRATIONS)
+        verify_backup(
+            path,
+            expected_kind="policy",
+            expected_store_id=env.policy.store_id,
+            migrations=POLICY_MIGRATIONS,
+            os_=os_adapters(),
+        )
     assert e.value.code == ErrorCode.INTEGRITY_FAILURE and "trust_generation" in e.value.message
 
 
@@ -361,7 +383,13 @@ def test_store_backup_relabelled_as_policy_is_rejected(env: Env, clock: FakeCloc
     shutil.rmtree(path / "cas")
     rewrite_manifest(path, kind="policy", blobs=[], ledger_high_water=0, trust_generation=trust)
     with pytest.raises(BrainError) as e:
-        verify_backup(path, expected_kind="policy", expected_store_id=env.store.store_id, migrations=POLICY_MIGRATIONS)
+        verify_backup(
+            path,
+            expected_kind="policy",
+            expected_store_id=env.store.store_id,
+            migrations=POLICY_MIGRATIONS,
+            os_=os_adapters(),
+        )
     assert e.value.code == ErrorCode.INTEGRITY_FAILURE and "trust_generation" in e.value.message
 
 
@@ -375,7 +403,13 @@ def test_trust_generation_must_suit_the_kind(env: Env, clock: FakeClock, kind: s
         expected, migrations = "store", STORE_MIGRATIONS
     rewrite_manifest(path, trust_generation=trust)
     with pytest.raises(BrainError) as e:
-        verify_backup(path, expected_kind=expected, expected_store_id=env.store.store_id, migrations=migrations)  # type: ignore[arg-type]
+        verify_backup(
+            path,
+            expected_kind=expected,  # type: ignore[arg-type]
+            expected_store_id=env.store.store_id,
+            migrations=migrations,
+            os_=os_adapters(),
+        )
     assert e.value.code == ErrorCode.INTEGRITY_FAILURE  # refused by the manifest check itself, before any derivation
     assert "check manifest" in e.value.message and "trust_generation" in e.value.message
 
@@ -397,13 +431,20 @@ def test_policy_backup_of_a_db_without_trust_is_refused(trusted_tmp: Path, clock
 def test_kind_mismatch_is_rejected(env: Env, clock: FakeClock) -> None:
     path = create_policy_backup(env.policy, env.os_, clock.now())
     with pytest.raises(BrainError) as e:
-        verify_backup(path, expected_kind="store", expected_store_id=env.policy.store_id, migrations=STORE_MIGRATIONS)
+        verify_backup(
+            path,
+            expected_kind="store",
+            expected_store_id=env.policy.store_id,
+            migrations=STORE_MIGRATIONS,
+            os_=os_adapters(),
+        )
     assert e.value.code == ErrorCode.INTEGRITY_FAILURE and "kind" in e.value.message
     m = verify_backup(
         path,
         expected_kind=frozenset({"store", "policy"}),
         expected_store_id=env.policy.store_id,
         migrations=POLICY_MIGRATIONS,
+        os_=os_adapters(),
     )
     assert m.kind == "policy"
 
@@ -413,7 +454,11 @@ def test_policy_backup_by_path_round_trips(trusted_tmp: Path, clock: FakeClock) 
     with maintenance_lease(trusted_tmp) as (root, lease):
         path = create_maintenance_backup(root, lease, os_adapters(), target="policy", now=clock.now())
     m = verify_backup(
-        path, expected_kind="policy", expected_store_id=store_id_of(trusted_tmp), migrations=POLICY_MIGRATIONS
+        path,
+        expected_kind="policy",
+        expected_store_id=store_id_of(trusted_tmp),
+        migrations=POLICY_MIGRATIONS,
+        os_=os_adapters(),
     )
     assert m.trust_generation == 1 and sorted(p.name for p in path.iterdir()) == ["manifest.json", "policy.db"]
 

@@ -56,7 +56,9 @@ def test_verify_backup_refuses_a_backup_whose_cas_directory_is_a_link(trusted_tm
         store_id = rt.store.store_id
     finally:
         rt.close()
-    verify_backup(backup, expected_kind="store", expected_store_id=store_id, migrations=STORE_MIGRATIONS)
+    verify_backup(
+        backup, expected_kind="store", expected_store_id=store_id, migrations=STORE_MIGRATIONS, os_=os_adapters()
+    )
     outside = trusted_tmp / "outside"
     outside.mkdir()
     os_adapters().permissions.secure_directory(outside)
@@ -66,7 +68,9 @@ def test_verify_backup_refuses_a_backup_whose_cas_directory_is_a_link(trusted_tm
     outside_before = digest_tree(outside)
 
     with pytest.raises(BrainError) as refused:
-        verify_backup(backup, expected_kind="store", expected_store_id=store_id, migrations=STORE_MIGRATIONS)
+        verify_backup(
+            backup, expected_kind="store", expected_store_id=store_id, migrations=STORE_MIGRATIONS, os_=os_adapters()
+        )
 
     assert refused.value.code in LINK_REFUSALS
     assert digest_tree(outside) == outside_before

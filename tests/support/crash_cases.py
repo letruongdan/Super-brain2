@@ -292,7 +292,7 @@ def expect_migration(*, target: Literal["store", "policy"], published: bool) -> 
         kind: BackupKind = "store_full" if target == "store" else "policy"
         (backup,) = [p for p in rt.root.backups_dir.iterdir() if p.name.startswith(f"{kind}-")]
         base = STORE_MIGRATIONS if target == "store" else POLICY_MIGRATIONS
-        verify_backup(backup, expected_kind=kind, expected_store_id=seed.store_id, migrations=base)
+        verify_backup(backup, expected_kind=kind, expected_store_id=seed.store_id, migrations=base, os_=os_adapters())
         assert tuple(rt.store.entries()) == seed.entries
         if target == "store":
             check_event_held(rt)

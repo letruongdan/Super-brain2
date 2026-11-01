@@ -66,6 +66,7 @@ def test_new_binary_meets_old_store_then_migrates(trusted_tmp: Path) -> None:
         expected_kind="store_full",
         expected_store_id=store_id_of(trusted_tmp),
         migrations=STORE_MIGRATIONS,
+        os_=os_adapters(),
     )
     assert (report.replaced_dir / "brain.db").is_file()
     rt = open_runtime(trusted_tmp, os_adapters(), store_migrations=STORE_V2)
@@ -89,6 +90,7 @@ def test_new_binary_meets_old_policy_then_migrates(trusted_tmp: Path) -> None:
         expected_kind="policy",
         expected_store_id=store_id_of(trusted_tmp),
         migrations=POLICY_MIGRATIONS,
+        os_=os_adapters(),
     )
     rt = open_runtime(trusted_tmp, os_adapters(), policy_migrations=POLICY_V2)
     try:

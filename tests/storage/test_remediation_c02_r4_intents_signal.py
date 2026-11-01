@@ -7,15 +7,18 @@ policy store holds TOMBSTONE or QUARANTINE intents but ``meta.store_published`` 
 still refused with ``INTEGRITY_FAILURE`` and no replacement database is created.
 
 The state is built only through public APIs: the policy store and the store are created with the storage API
-(``PolicyStore.create``, ``Store.create``; the marker is ``open_runtime``'s, so it is not set yet), an intent is
-recorded and applied, and a policy backup is taken. A normal ``open_runtime`` then marks the store as published; the
-policy store is restored from the older backup (``restore_policy``), which brings back the intent without the
-marker; and ``brain.db`` is lost. No database is edited directly; the marker's absence is only checked, on a copy.
+(``PolicyStore.create``, ``Store.create``; the marker belongs to ``open_runtime``, which never runs here, so the marker
+is never set), an intent is recorded through ``PolicyStore.record_intent`` and applied, and ``brain.db`` is lost. No
+database is edited directly; the intent's presence and the marker's absence are only checked, on a copy.
+
+Round 7 (ruling of 2026-11-01, "Owner round 6", blocker 1): the round-4 version reached "intents without a marker"
+by restoring an older policy backup after ``open_runtime`` had set the marker. The round-6 ruling makes
+``restore_policy`` keep or set the marker whenever ``brain.db`` exists, so that route no longer yields the state. The
+state is now built on a root where the marker was never set; the oracle (refusal, no replacement) is unchanged.
 """
 
 import shutil
 import sqlite3
-from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -24,16 +27,13 @@ from superbrain.adapters.os import os_adapters
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.ids import new_id
 from superbrain.ports.policy import IntentKind
-from superbrain.storage.backup import create_policy_backup
 from superbrain.storage.kinds import KindRegistry
 from superbrain.storage.layout import DataRoot
 from superbrain.storage.policy_store import PolicyStore
-from superbrain.storage.restore import restore_policy
 from superbrain.storage.runtime import open_runtime
 from superbrain.storage.store import Store
 from tests.storage.conftest import maintenance_lease
 
-NOW = datetime(2026, 10, 31, 12, 0, tzinfo=UTC)
 INTENTS = {
     "tombstone": (IntentKind.TOMBSTONE, {"holder_kind": "event", "holder_id": "0192f3a4-5b6c-7d8e-9f01-0000000c0241"}),
     "quarantine": (IntentKind.QUARANTINE, {"digest": "sha256:" + "ab" * 32}),
@@ -64,8 +64,7 @@ def test_policy_intents_without_the_published_marker_still_block_a_lost_main_db(
     data_root = trusted_tmp / "r"
     kind, payload = INTENTS[intent]
     with maintenance_lease(data_root) as (root, lease):
-        # The store and policy store as created by the storage API alone (no ``open_runtime``, so no marker yet),
-        # an intent recorded and applied, and a policy backup of that state.
+        # The store and policy store as created by the storage API alone: no ``open_runtime``, so no marker ever.
         policy = PolicyStore.create(root, lease, os_adapters(), store_id=new_id())
         try:
             store = Store.create(root, lease, os_adapters(), policy, (), KindRegistry(()))
@@ -74,17 +73,13 @@ def test_policy_intents_without_the_published_marker_still_block_a_lost_main_db(
                 store.reconcile_policy()
             finally:
                 store.close()
-            backup = create_policy_backup(policy, os_adapters(), NOW)
-            store_id = policy.store_id
         finally:
             policy.close()
-    open_runtime(data_root, os_adapters()).close()  # a normal start: the store is now marked as published
-    with maintenance_lease(data_root) as (root, lease):
-        restore_policy(root, lease, os_adapters(), backup, store_id=store_id, now=NOW)
     root = DataRoot.at(data_root)
+    assert root.store_db.exists()  # the store was published
     assert committed_rows(root.policy_db, trusted_tmp / "intents", "SELECT kind FROM intents") == [(kind.value,)]
     marker = "SELECT value FROM meta WHERE key = 'store_published'"
-    assert committed_rows(root.policy_db, trusted_tmp / "marker", marker) == []  # restored: no marker
+    assert committed_rows(root.policy_db, trusted_tmp / "marker", marker) == []  # the marker was never set
     preserved = trusted_tmp / "preserved"
     preserved.mkdir()
     for path in store_db_files(root):

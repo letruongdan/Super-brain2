@@ -233,7 +233,9 @@ def test_verify_backup_refuses_a_backup_whose_shard_is_a_link(trusted_tmp: Path,
         store_id = rt.store.store_id
     finally:
         rt.close()
-    verify_backup(backup, expected_kind="store", expected_store_id=store_id, migrations=STORE_MIGRATIONS)
+    verify_backup(
+        backup, expected_kind="store", expected_store_id=store_id, migrations=STORE_MIGRATIONS, os_=os_adapters()
+    )
     shard = blob_path(backup / "cas", digest).parent
     outside = outside_directory(trusted_tmp)
     moved = outside / shard.name
@@ -242,7 +244,9 @@ def test_verify_backup_refuses_a_backup_whose_shard_is_a_link(trusted_tmp: Path,
     outside_before = digest_tree(outside)
 
     with pytest.raises(BrainError) as refused:
-        verify_backup(backup, expected_kind="store", expected_store_id=store_id, migrations=STORE_MIGRATIONS)
+        verify_backup(
+            backup, expected_kind="store", expected_store_id=store_id, migrations=STORE_MIGRATIONS, os_=os_adapters()
+        )
 
     assert refused.value.code in LINK_REFUSALS
     assert digest_tree(outside) == outside_before
