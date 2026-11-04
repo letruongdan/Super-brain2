@@ -61,6 +61,7 @@ from typing import Any
 import pytest
 
 from scripts import gate
+from superbrain.adapters.os.environment import RootFacts
 from superbrain.adapters.os.paths import default_data_root
 
 ROLES = ("trusted_test_root", "default_data_root")
@@ -246,9 +247,9 @@ class FakeProbe:
         self.checked.append(path)
         return [f"{path.parent}: writable by another account"] if path.name == "physical-data-root" else []
 
-    def check_root(self, path: Path, role: str) -> list[str] | None:
+    def check_root(self, path: Path, role: str) -> RootFacts:
         """Round-6 contract: the path itself; this double reports every path as existing and clean."""
-        return []
+        return RootFacts(True)
 
 
 def host_env(tmp_path: Path) -> dict[str, str]:
