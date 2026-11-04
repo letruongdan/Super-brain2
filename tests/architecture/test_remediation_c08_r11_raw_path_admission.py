@@ -9,6 +9,7 @@ remain accepted both absent and initialized. No production security is mocked.
 """
 
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -25,6 +26,7 @@ from tests.architecture.test_remediation_c08_r6_root_itself import (
     run_gate_with_real_preflight,
     secure_dir,
 )
+from tests.architecture.test_remediation_c08_r8_root_links import make_directory_link
 from tests.support.platform import windows_only
 
 
@@ -124,11 +126,12 @@ def test_an_absent_root_below_a_regular_file_is_not_accepted(
 
 
 @pytest.mark.parametrize("initialized", [False, True])
+@pytest.mark.parametrize("missing_parents", [0, 2])
 def test_an_ordinary_vietnamese_space_path_remains_accepted(
-    trusted_tmp: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, initialized: bool
+    trusted_tmp: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, initialized: bool, missing_parents: int
 ) -> None:
     redirect_trusted_root(trusted_tmp, monkeypatch)
-    configured = secure_dir(trusted_tmp / "Lê Trung") / "thư mục dữ liệu"
+    configured = secure_dir(trusted_tmp / "Lê Trung").joinpath(*(["missing"] * missing_parents), "thư mục dữ liệu")
     if initialized:
         open_runtime(configured, os_adapters()).close()
     monkeypatch.setenv("SUPERBRAIN_HOME", str(configured))
@@ -139,3 +142,27 @@ def test_an_ordinary_vietnamese_space_path_remains_accepted(
     assert environment_of(receipt)["accepted"] is True
     assert path_entry(receipt, "default_data_root")["exists"] is initialized
     open_runtime(configured, os_adapters()).close()
+
+
+def test_a_trusted_shared_root_below_a_linked_ancestor_remains_accepted(
+    trusted_tmp: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The shared-parent role may have linked ancestors, unlike the private data-root role."""
+    homes = secure_dir(trusted_tmp / "homes")
+    target = secure_dir(homes / "real-shared-parent")
+    linked = homes / "linked-shared-parent"
+    make_directory_link(linked, target)
+    if sys.platform == "win32":
+        secure_dir(target / "superbrain-tests")
+        monkeypatch.setenv("LOCALAPPDATA", str(linked))
+    else:
+        shared = secure_dir(target / "shared-tmp")
+        shared.chmod(0o1777)
+        monkeypatch.setenv("TMPDIR", str(linked / "shared-tmp"))
+    monkeypatch.setenv("SUPERBRAIN_HOME", str(homes / "absent-private-root"))
+
+    receipt = run_gate_with_real_preflight(tmp_path, monkeypatch)
+
+    assert receipt["accepted"] is True, receipt["reasons"]
+    assert environment_of(receipt)["accepted"] is True
+    assert path_entry(receipt, "trusted_test_root")["exists"] is True
