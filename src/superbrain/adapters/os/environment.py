@@ -26,9 +26,9 @@ DATA_ROOT_ROLE = "default_data_root"
 
 @dataclass(frozen=True)
 class RootFacts:
-    """Configured-path existence, including dangling links, independently of its admission problems."""
+    """Configured-path existence, including dangling links; ``None`` when unsafe syntax prevents inspection."""
 
-    exists: bool
+    exists: bool | None
     problems: tuple[str, ...] = ()
 
 
@@ -74,20 +74,28 @@ class OsEnvironmentProbe:
         return [f"{problem.path}: {problem.reason}" for problem in problems]
 
     def check_root(self, path: Path, role: str) -> RootFacts:
-        """``path`` is the configured path, never resolved, so a link or junction is seen (C08, ruling S1).
+        """Admit configured syntax before inspecting ``path``, and never resolve a rejected path.
 
         The data root: no link at the path or above it (``reject_links``, as ``prepare_data_root``), a directory,
         owner-only (``object_problems``). Any other role (a shared parent such as ``/tmp``, whose own ancestors may
         legitimately be links): the path itself is no link, a directory, and passes the ancestor rule (no takeover
-        right for an untrusted account; on POSIX group/world-writable only with the sticky bit), not owner-only."""
-        exists = os.path.lexists(path)
+        right for an untrusted account; on POSIX group/world-writable only with the sticky bit), not owner-only.
+        Missing paths require their nearest existing ancestor to be a directory; nothing is created here."""
+        exists: bool | None = None
         guard = os_adapters().permissions
         try:
+            os_adapters().paths.reject_unsafe_path(str(path))
+            exists = os.path.lexists(path)
             if role == DATA_ROOT_ROLE:
                 os_adapters().paths.reject_links(path)
             elif is_link(path):
                 return RootFacts(exists, (f"{path}: is a link or reparse point",))
             if not exists:
+                parent = path.parent
+                while not os.path.lexists(parent):
+                    parent = parent.parent
+                if not parent.is_dir():
+                    return RootFacts(False, (f"{path}: existing ancestor {parent} is not a directory",))
                 return RootFacts(False)
             if not path.is_dir():
                 return RootFacts(True, (f"{path}: not a directory",))
@@ -96,7 +104,7 @@ class OsEnvironmentProbe:
             else:
                 itself = Path(os.path.abspath(path))
                 found = [p for p in guard.check_ancestors(itself / "child") if p.path == itself]
-        except BrainError as err:
+        except (BrainError, OSError) as err:
             return RootFacts(exists, (f"{path}: {err}",))
         return RootFacts(exists, tuple(f"{problem.path}: {problem.reason}" for problem in found))
 
@@ -122,17 +130,33 @@ class EnvironmentFacts:
 
 
 def collect(probe: EnvironmentProbe, paths: Mapping[str, Path], platform: str) -> EnvironmentFacts:
-    """The token facts, and for each ``role -> configured path`` (in order) its physical path and the ancestor
-    check of that physical path. An ``OSError`` from a probe is recorded, never raised."""
+    """Check configured paths first, then collect physical-path ancestor and token facts for admitted paths.
+
+    Resolution and token-query ``OSError`` instances are recorded; other probe failures reach the gate's
+    fail-closed preflight boundary.
+    """
     found: list[PathFacts] = []
     for role, configured in paths.items():
+        itself = probe.check_root(configured, role)
+        if itself.problems:
+            found.append(
+                PathFacts(
+                    role,
+                    str(configured),
+                    None,
+                    (),
+                    "configured path failed admission",
+                    exists=itself.exists,
+                    root_problems=itself.problems,
+                )
+            )
+            continue
         try:
             resolved = probe.resolve(configured)
         except OSError as err:
             found.append(PathFacts(role, str(configured), None, (), f"{type(err).__name__}: {err}"))
             continue
         ancestors = tuple(probe.check_ancestors(resolved))
-        itself = probe.check_root(configured, role)  # the configured path: a link there is a problem (S1)
         found.append(
             PathFacts(
                 role,
@@ -175,7 +199,8 @@ def assess(facts: EnvironmentFacts, *, required: Sequence[str]) -> dict[str, Jso
         if p.resolved is None:
             problems.append(f"{p.role}: {p.configured} was not resolved to a physical path: {p.error}")
         problems.extend(f"{p.role}: ancestor not trusted: {problem}" for problem in p.ancestor_problems)
-        problems.extend(f"{p.role}: {p.resolved} itself is not acceptable: {problem}" for problem in p.root_problems)
+        subject = p.resolved or p.configured
+        problems.extend(f"{p.role}: {subject} itself is not acceptable: {problem}" for problem in p.root_problems)
         paths[p.role] = {
             "configured": p.configured,
             "resolved": p.resolved,
