@@ -76,6 +76,10 @@ def check_container(directory: Path, os_: OsAdapters) -> None:
     above it may be a link or reparse point (``UNSAFE_PATH``), it must be a directory (``INTEGRITY_FAILURE``) and
     owner-only (``INSECURE_PERMISSIONS``, with the real ``PermissionGuard``). Nothing is changed or re-secured."""
     os_.paths.reject_links(directory)
+    ancestor_problems = os_.permissions.check_ancestors(directory)
+    if ancestor_problems:
+        detail = "; ".join(f"{p.path}: {p.reason}" for p in ancestor_problems)
+        raise BrainError(ErrorCode.INSECURE_PERMISSIONS, f"an ancestor of {directory} is not trusted: {detail}")
     try:
         mode = os.lstat(directory).st_mode
     except OSError as err:
