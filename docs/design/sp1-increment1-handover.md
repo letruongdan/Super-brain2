@@ -6,7 +6,7 @@ Ngày cập nhật: 2026-11-04. Phạm vi nghiệm thu: nền storage của SP1 
 
 Đợt 1 gồm core/ports, adapter OS, một writer lease, SQLite/ledger/projection, CAS/holder/retention/GC, policy intent, backup/restore/migration, crash matrix và gate receipt. Không có daemon/shim/MCP v2, review/apply/ApplyJournal, approval UI hoặc doctor; các phần đó thuộc SP1 đợt 2–4.
 
-Nguồn sản phẩm cuối: `712bd329f1d42e839e24f07598d0e54849c4e973`. Claude đã commit phần sửa round 8; Codex tiếp quản cùng ledger, bổ sung RED oracle và sửa shared boundary cho C04/C08 qua `8cffa9d`, `9ebe0ff`, `712bd32`. Commit bàn giao chỉ đổi tài liệu; required receipts vẫn phải gắn đúng commit HEAD chứa tài liệu này. Lịch sử claim nghiệm thu đã rút lại giữ trong Git và bản sao ignored `handover-before-codex-20261104.md`; không đổi failed thành green.
+Nguồn sản phẩm cuối: `e09d8a0706c8d17df4b399658d714a8db22ac3b0`. Claude đã commit phần sửa round 8; Codex tiếp quản cùng ledger, bổ sung RED oracle và sửa shared boundary cho C04/C08 qua `8cffa9d`, `9ebe0ff`, `712bd32`, `e09d8a0`. Commit bàn giao chỉ đổi tài liệu; required receipts vẫn phải gắn đúng commit HEAD chứa tài liệu này. Lịch sử claim nghiệm thu đã rút lại giữ trong Git và bản sao ignored `handover-before-codex-20261104.md`; không đổi failed thành green.
 
 ## C01–C08 sau remediation
 
@@ -19,9 +19,9 @@ Nguồn sản phẩm cuối: `712bd329f1d42e839e24f07598d0e54849c4e973`. Claude 
 | C05 | Retry sau lỗi sync parent phải sync lại trước ACK; cache chỉ ghi sau sync thành công. |
 | C06 | XPASS không strict được phân loại từ terminal evidence và làm gate không accepted. |
 | C07 | Fake Windows errors có typing portable; strict mypy và mapping lỗi vẫn được kiểm. |
-| C08 | Preflight dùng token thật, physical paths và ACL thật; kiểm raw configured path trước resolve, từ chối cú pháp bị cấm/link/loose root/regular file hoặc cha là file. RootFacts giữ độc lập existence và admission problems; trusted temporary parent dùng ancestor/sticky rule. |
+| C08 | Preflight dùng token thật, physical paths và ACL thật; kiểm raw configured path trước resolve, từ chối cú pháp bị cấm/link/loose root/regular file hoặc cha là file. RootFacts giữ độc lập existence và admission problems; từ chối nhanh ổ đĩa không tồn tại thay vì lặp vô hạn; trusted temporary parent dùng ancestor/sticky rule. |
 
-Oracle cuối: `.superpowers/sdd/sp1-inc1-remediation/test-seal-r12.json`, **66 file**, digest `sha256:8ea5d0c73ed2482ca07f6aca9b316fa0b7da1d9e97b1973b629fe61594602d5d`, do independent test author giữ và root/reviewer đối chiếu. R8 (63 file) được giữ nguyên khi sửa lệnh chọn test mutation. Sau đó independent review tìm thêm counterexample thật, nên r9 bổ sung oracle cho ancestor backup và root vắng dưới link; r10 chỉ chuyển fake probe sang RootFacts, giữ mọi assertion. R11 bổ sung ma trận cú pháp/kiểu cha của configured path; R12 bổ sung đối chứng multiple-missing/Unicode và shared-parent linked ancestry. Mọi assertion cũ giữ nguyên; không tự reseal để chấp nhận mismatch. RED gốc, các reseal có review, failed receipts và mutation lịch sử vẫn ở cùng ledger.
+Oracle cuối: `.superpowers/sdd/sp1-inc1-remediation/test-seal-r13.json`, **67 file**, digest `sha256:3beaae0987f304789faf91a04dfdca2256928be3caa18b476a6e868ce6a86583`, do independent test author giữ và root/reviewer đối chiếu. R8 (63 file) được giữ nguyên khi sửa lệnh chọn test mutation. Sau đó independent review tìm thêm counterexample thật, nên r9 bổ sung oracle cho ancestor backup và root vắng dưới link; r10 chỉ chuyển fake probe sang RootFacts, giữ mọi assertion. R11 bổ sung ma trận cú pháp/kiểu cha của configured path; R12 bổ sung đối chứng multiple-missing/Unicode và shared-parent linked ancestry. R13 bổ sung ba native Windows boundary probes cho ổ đĩa không tồn tại, xác nhận imports/ENTERED trước deadline và kiểm cả launcher/worker đã kết thúc; cả runtime và preflight dùng parent traversal hữu hạn. Mọi assertion cũ giữ nguyên; không tự reseal để chấp nhận mismatch. RED gốc, các reseal có review, failed receipts và mutation lịch sử vẫn ở cùng ledger.
 
 Ca `C04-tree-dirs-only` cũ không phải mutant bỏ kiểm file: nó chèn `continue` trong nhánh directory. Selector cũ chỉ chạy r8 file tests nên để mutant sống. Tập oracle r6+r8 vốn đã niêm phong giết đúng mutant đó tại behavioral permission-refusal assertions trên Windows và WSL. Không đổi test chỉ để có pass; đây là sửa phạm vi lệnh mutation.
 
@@ -43,10 +43,10 @@ Baseline source `b9a49d5`: receipts/logs dưới `.gate/completion-20261104/base
 
 | Môi trường | Receipt dưới `.gate/completion-20261104/` |
 |---|---|
-| Native Windows, Python 3.11.9 | `final-windows-configured/gate-3.11.9.json` |
-| Native Windows, Python 3.14.3 | `final-windows-configured/gate-3.14.3.json` |
-| WSL Ubuntu/ext4, Python 3.11.15 | `final-linux/gate-3.11.15.json` |
-| WSL Ubuntu/ext4, Python 3.14.4 | `final-linux/gate-3.14.4.json` |
+| Native Windows, Python 3.11.9 | `final-r13-windows/3.11.9/gate-3.11.9.json` |
+| Native Windows, Python 3.14.3 | `final-r13-windows/3.14.3/gate-3.14.3.json` |
+| WSL Ubuntu/ext4, Python 3.11.15 | `final-r13-linux/gate-3.11.15.json` |
+| WSL Ubuntu/ext4, Python 3.14.4 | `final-r13-linux/gate-3.14.4.json` |
 
 `closure-summary.json` gắn HEAD, seal, source hashes, kết quả từng phase, test/JUnit inventory, crash cases và trạng thái cuối. Mỗi thư mục có command logs, JUnit, worker start/end và source manifest. Root/reviewer phải đọc receipt terminal, không lấy worker exit hoặc tên file làm bằng chứng pass. Receipt filename chuẩn theo commit/interpreter/lock digest có thể được chép từ kết quả quan sát, không sửa acceptance decision.
 
