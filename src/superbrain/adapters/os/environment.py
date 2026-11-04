@@ -24,6 +24,14 @@ DATA_ROOT_ROLE = "default_data_root"
 """The role whose existing path must itself be owner-only; every other role is a shared parent."""
 
 
+@dataclass(frozen=True)
+class RootFacts:
+    """Configured-path existence, including dangling links, independently of its admission problems."""
+
+    exists: bool
+    problems: tuple[str, ...] = ()
+
+
 class EnvironmentProbe(Protocol):
     def app_container(self) -> bool | None:
         """Windows ``TokenIsAppContainer``; ``None`` where not applicable or unknown."""
@@ -41,8 +49,8 @@ class EnvironmentProbe(Protocol):
         """``PermissionGuard.check_ancestors`` problems of ``path``, as text."""
         ...
 
-    def check_root(self, path: Path, role: str) -> list[str] | None:
-        """``None`` if the CONFIGURED (unresolved) ``path`` does not exist; otherwise its own problems, as text."""
+    def check_root(self, path: Path, role: str) -> RootFacts:
+        """Existence and admission problems of the CONFIGURED (unresolved) path, kept independent."""
         ...
 
 
@@ -65,31 +73,32 @@ class OsEnvironmentProbe:
             return [f"{path}: the ancestors could not be checked: {err}"]
         return [f"{problem.path}: {problem.reason}" for problem in problems]
 
-    def check_root(self, path: Path, role: str) -> list[str] | None:
+    def check_root(self, path: Path, role: str) -> RootFacts:
         """``path`` is the configured path, never resolved, so a link or junction is seen (C08, ruling S1).
 
         The data root: no link at the path or above it (``reject_links``, as ``prepare_data_root``), a directory,
         owner-only (``object_problems``). Any other role (a shared parent such as ``/tmp``, whose own ancestors may
         legitimately be links): the path itself is no link, a directory, and passes the ancestor rule (no takeover
         right for an untrusted account; on POSIX group/world-writable only with the sticky bit), not owner-only."""
-        if not os.path.lexists(path):
-            return None
+        exists = os.path.lexists(path)
         guard = os_adapters().permissions
         try:
             if role == DATA_ROOT_ROLE:
                 os_adapters().paths.reject_links(path)
             elif is_link(path):
-                return [f"{path}: is a link or reparse point"]
+                return RootFacts(exists, (f"{path}: is a link or reparse point",))
+            if not exists:
+                return RootFacts(False)
             if not path.is_dir():
-                return [f"{path}: not a directory"]
+                return RootFacts(True, (f"{path}: not a directory",))
             if role == DATA_ROOT_ROLE:
                 found = guard.object_problems(path)
             else:
                 itself = Path(os.path.abspath(path))
                 found = [p for p in guard.check_ancestors(itself / "child") if p.path == itself]
         except BrainError as err:
-            return [f"{path}: {err}"]
-        return [f"{problem.path}: {problem.reason}" for problem in found]
+            return RootFacts(exists, (f"{path}: {err}",))
+        return RootFacts(exists, tuple(f"{problem.path}: {problem.reason}" for problem in found))
 
 
 @dataclass(frozen=True)
@@ -130,8 +139,8 @@ def collect(probe: EnvironmentProbe, paths: Mapping[str, Path], platform: str) -
                 str(configured),
                 str(resolved),
                 ancestors,
-                exists=itself is not None,
-                root_problems=tuple(itself or ()),
+                exists=itself.exists,
+                root_problems=itself.problems,
             )
         )
     failures: list[str] = []
