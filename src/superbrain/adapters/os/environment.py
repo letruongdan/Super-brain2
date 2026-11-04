@@ -91,9 +91,11 @@ class OsEnvironmentProbe:
             elif is_link(path):
                 return RootFacts(exists, (f"{path}: is a link or reparse point",))
             if not exists:
-                parent = path.parent
-                while not os.path.lexists(parent):
-                    parent = parent.parent
+                for parent in path.parents:
+                    if os.path.lexists(parent):
+                        break
+                else:
+                    return RootFacts(False, (f"{path}: no existing directory ancestor is available",))
                 if not parent.is_dir():
                     return RootFacts(False, (f"{path}: existing ancestor {parent} is not a directory",))
                 return RootFacts(False)

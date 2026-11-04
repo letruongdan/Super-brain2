@@ -176,10 +176,12 @@ def prepare_data_root(root: Path, os_: OsAdapters) -> DataRoot:
     if sys.platform != "win32":
         os.umask(0o077)
     missing: list[Path] = []
-    candidate = root
-    while not os.path.lexists(candidate):
+    for candidate in (root, *root.parents):
+        if os.path.lexists(candidate):
+            break
         missing.append(candidate)
-        candidate = candidate.parent
+    else:
+        raise BrainError(ErrorCode.IO_ERROR, f"no existing directory ancestor is available for {root}")
     # One at a time, each secured at once: a new directory may inherit ACEs that check_ancestors skips.
     created = [directory for directory in reversed(missing) if _create_directory(directory, os_)]
     if not root_existed and root not in created:  # created concurrently by another process
