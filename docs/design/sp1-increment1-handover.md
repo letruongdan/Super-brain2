@@ -1,177 +1,69 @@
 # Bàn giao SP1 đợt 1: nền tảng storage
 
-> **Trạng thái (2026-11-01): CHƯA ĐÓNG NGHIỆM THU. Claim "đã nghiệm thu" ghi ngày 2026-10-31 bị rút lại.**
->
-> Review lại `docs/reviews/2026-10-31-sp1-increment1-remediation-re-review.md`, tại HEAD `5e045b4`, tái hiện được ba lỗi còn mở:
-> - **C02 (P1):** `restore_policy` làm mất marker `meta.store_published`, và đường tạo DB rỗng mở lại.
-> - **C04 (P2):** restore không kiểm quyền của chính thư mục `backup/cas/`.
-> - **C08 (P2):** preflight không kiểm ACL của chính data root.
->
-> C01, C03, C05, C06 và C07 vẫn giữ trạng thái fixed. Việc ghi "chuyển sang đợt 2" cho marker của `restore_policy` là sai: đó là phản ví dụ của chính C02. Phần dưới đây là ghi chép của lần đóng bị rút lại, giữ để làm lịch sử.
->
-> ---
->
-> *(Đã rút lại)* Trạng thái 2026-10-31: đã nghiệm thu trên Windows 11 và WSL Ubuntu (ext4), tại commit `6617afa`.
->
-> Review triển khai `docs/reviews/2026-10-31-sp1-increment1-implementation-review.md` đã tái hiện bảy lỗi, SP1-C01 đến C07. Đợt khắc phục theo quy trình bug-proof-testing đã sửa bảy lỗi này và thêm C08, kiểm môi trường nghiệm thu của gate. Quy trình có đủ:
-> - test author độc lập, niêm phong test (seal r5 `sha256:a7bf659e…b54f`, 56 file);
-> - RED trên code gốc, GREEN và mutation trong bản sao cô lập;
-> - ba vòng review độc lập.
->
-> Kết luận cuối: C01–C08 đều fixed, và không còn mutant sống sót nào liên quan đến yêu cầu. Ledger: `.superpowers/sdd/sp1-inc1-remediation/` (gitignored).
->
-> Chưa nghiệm thu: macOS, một host Linux riêng hoặc CI, và độ bền khi mất điện (xem mục 2). Hai việc chuyển sang đợt 2:
-> - quét toàn bộ ledger mỗi lần mở (hiệu năng, C03);
-> - `restore_policy` giữ marker `meta.store_published`.
->
-> Các receipt ở commit `1dfd9e5`, mục 1.1, là receipt cũ trước đợt khắc phục. Chúng chỉ còn giá trị lịch sử.
+Ngày cập nhật: 2026-11-04. Phạm vi nghiệm thu: nền storage của SP1 đợt 1 trên native Windows với data root cấu hình rõ, và WSL Ubuntu/ext4. Điều kiện đóng là các receipt `final-*` dưới đây có `accepted=true`, khớp đúng HEAD cuối, cùng review độc lập chấp thuận. Receipt cũ hoặc focused pass không thay được điều kiện này.
 
-Tài liệu này làm theo mục "Bàn giao đợt 1" của plan
-`docs/superpowers/plans/2026-10-30-sp1-increment1-storage-foundation.md`. Nó tách rõ phần **đã nghiệm thu**, có bằng
-chứng đi kèm, với phần **chưa nghiệm thu**. Phần chưa nghiệm thu không được ghi là "verified" ở bất kỳ đâu.
+## Phạm vi
 
-## 1. Đã nghiệm thu
+Đợt 1 gồm core/ports, adapter OS, một writer lease, SQLite/ledger/projection, CAS/holder/retention/GC, policy intent, backup/restore/migration, crash matrix và gate receipt. Không có daemon/shim/MCP v2, review/apply/ApplyJournal, approval UI hoặc doctor; các phần đó thuộc SP1 đợt 2–4.
 
-### 1.1. Receipt của gate mặc định
+Nguồn sản phẩm cuối: `712bd329f1d42e839e24f07598d0e54849c4e973`. Claude đã commit phần sửa round 8; Codex tiếp quản cùng ledger, bổ sung RED oracle và sửa shared boundary cho C04/C08 qua `8cffa9d`, `9ebe0ff`, `712bd32`. Commit bàn giao chỉ đổi tài liệu; required receipts vẫn phải gắn đúng commit HEAD chứa tài liệu này. Lịch sử claim nghiệm thu đã rút lại giữ trong Git và bản sao ignored `handover-before-codex-20261104.md`; không đổi failed thành green.
 
-Gate chạy bằng `scripts/gate.py` trên Windows 11, trong một worktree niêm phong tại đúng commit, với working tree
-sạch. Gate gồm bốn phase bắt buộc: `ruff`, `mypy`, `lint-imports`, `pytest`.
+## C01–C08 sau remediation
 
-**Receipt nghiệm thu hiện hành (sau khắc phục C01–C08), commit `6617afa`:**
+| ID | Hành vi cần nghiệm thu |
+|---|---|
+| C01 | Admission thấy committed WAL dù thiếu SHM; schema/policy readers cùng dùng committed state; cleanup bản sao reader sau crash. |
+| C02 | Mất main DB khi còn CAS, marker hoặc intent thì fail closed. Policy restore bảo toàn marker và mọi live intent history, kể cả WAL-only state và khi main đã mất. |
+| C03 | Từ chối handler/kind downgrade trước mutation dù live projection tồn tại. |
+| C04 | CAS và backup kiểm type, link/reparse và owner-only trước đọc/copy; backup bao gồm chính directory, manifest, snapshots, cas/, shards và blobs; source backup ngoài root phải có ancestor không thể bị tài khoản khác thay thế. |
+| C05 | Retry sau lỗi sync parent phải sync lại trước ACK; cache chỉ ghi sau sync thành công. |
+| C06 | XPASS không strict được phân loại từ terminal evidence và làm gate không accepted. |
+| C07 | Fake Windows errors có typing portable; strict mypy và mapping lỗi vẫn được kiểm. |
+| C08 | Preflight dùng token thật, physical paths và ACL thật; kiểm raw configured path trước resolve, từ chối cú pháp bị cấm/link/loose root/regular file hoặc cha là file. RootFacts giữ độc lập existence và admission problems; trusted temporary parent dùng ancestor/sticky rule. |
 
-| Môi trường | Receipt | `accepted` | Kết quả test |
-|---|---|---|---|
-| Windows 11, CPython 3.14.3 | `.gate/receipt-6617afa3808d-cpython3.14.3-win32-8e5b9291a873.json` | `true` | 856 passed, 20 skipped |
-| Windows 11, CPython 3.11.9 | `.gate/receipt-6617afa3808d-cpython3.11.9-win32-8e5b9291a873.json` | `true` | 856 passed, 20 skipped |
-| WSL Ubuntu (ext4, clone mới), CPython 3.14.4 | do reviewer độc lập chạy, ghi ở `review.md` vòng 3 | `true` | 834 passed, 42 skipped |
+Oracle cuối: `.superpowers/sdd/sp1-inc1-remediation/test-seal-r12.json`, **66 file**, digest `sha256:8ea5d0c73ed2482ca07f6aca9b316fa0b7da1d9e97b1973b629fe61594602d5d`, do independent test author giữ và root/reviewer đối chiếu. R8 (63 file) được giữ nguyên khi sửa lệnh chọn test mutation. Sau đó independent review tìm thêm counterexample thật, nên r9 bổ sung oracle cho ancestor backup và root vắng dưới link; r10 chỉ chuyển fake probe sang RootFacts, giữ mọi assertion. R11 bổ sung ma trận cú pháp/kiểu cha của configured path; R12 bổ sung đối chứng multiple-missing/Unicode và shared-parent linked ancestry. Mọi assertion cũ giữ nguyên; không tự reseal để chấp nhận mismatch. RED gốc, các reseal có review, failed receipts và mutation lịch sử vẫn ở cùng ledger.
 
-Ở vòng 2, tại commit `a2f573d`, WSL với CPython 3.11.15 cũng được chấp nhận: 831 passed, 41 skipped. Code sản phẩm từ
-`a2f573d` đến `6617afa` không đổi. Receipt Windows có thêm mục môi trường (C08): `app_container` false, integrity
-medium, không có vấn đề nào.
+Ca `C04-tree-dirs-only` cũ không phải mutant bỏ kiểm file: nó chèn `continue` trong nhánh directory. Selector cũ chỉ chạy r8 file tests nên để mutant sống. Tập oracle r6+r8 vốn đã niêm phong giết đúng mutant đó tại behavioral permission-refusal assertions trên Windows và WSL. Không đổi test chỉ để có pass; đây là sửa phạm vi lệnh mutation.
 
-**Receipt cũ (lịch sử, trước đợt khắc phục).** Hai receipt dưới đây gắn với commit
-**`1dfd9e5118f09d96047ba44708afc9cffc258a5e`**.
+## Môi trường và receipt
 
-| Python | Receipt | `accepted` | `reasons` | Kết quả test |
-|---|---|---|---|---|
-| CPython 3.11.9 | `.gate/receipt-1dfd9e5118f0-cpython3.11.9-win32-8e5b9291a873.json` | `true` | `[]` | 778 passed, 7 skipped, 0 failed, 0 error |
-| CPython 3.14.3 | `.gate/receipt-1dfd9e5118f0-cpython3.14.3-win32-8e5b9291a873.json` | `true` | `[]` | 778 passed, 7 skipped, 0 failed, 0 error |
+Gate thật là `scripts/gate.py`, bốn phase ruff, strict mypy, import-linter, pytest trong sealed worktree. Receipt phải khớp commit HEAD cuối, start=end, collected IDs=JUnit IDs; không lấy focused pass thay required suite.
 
-Cả hai receipt có `tree_clean: true`, cùng `lock_digest` `sha256:8e5b9291a873…`, cùng `test_count` 785. Mọi phase
-trả mã thoát 0.
+Windows nghiệm thu dùng cấu hình process riêng, native adapter và strict permission guard nguyên trạng:
+- Profile fixture riêng được tạo owner-only tại `C:/Users/letru/.sb2-acceptance-20261104-f037d591e8f1`.
+- `LOCALAPPDATA` của tiến trình test trỏ vào `local-app-data/` của fixture; `SUPERBRAIN_HOME` trỏ vào `data/` của fixture.
+- Không sửa environment cấp user/machine, ACL profile hiện hữu, trusted SID set hoặc production guard.
+- Preflight ghi actual configured/resolved paths, token và root/ancestor problems; phạm vi này là configured-root acceptance.
 
-**Commit chứa tài liệu này.** Commit đó là con trực tiếp của `1dfd9e5`, và chỉ thêm đúng file này. Gate được chạy lại
-trên chính commit chứa tài liệu này, cho cả hai bản Python. Receipt của lần chạy đó nằm ở
-`.gate/receipt-<12 ký tự đầu của commit chứa tài liệu này>-cpython3.11.9-win32-8e5b9291a873.json` và
-`…-cpython3.14.3-win32-8e5b9291a873.json`. Có thể kiểm lại bằng `git diff --stat 1dfd9e5 <commit>`: lệnh này chỉ
-liệt kê file này. Tài liệu không chép SHA của chính commit chứa nó, vì SHA đó phụ thuộc vào nội dung tài liệu. Báo
-cáo sửa cuối (`final-fix-report.md`) ghi lại SHA và hai receipt đó.
+Môi trường Windows mặc định của phiên Codex vẫn bị từ chối vì capability SID có takeover rights trên `AppData` và `AppData/Local`. Failed receipts mặc định ở `.gate/completion-20261104/baseline-windows-default/` được giữ nguyên. Kết quả configured-root không sửa hay nghiệm thu default-profile environment đó.
 
-`.gate/` nằm trong `.gitignore`, nên receipt chỉ có trên máy đã chạy gate. CI chưa chạy gate (xem mục 2).
+WSL Ubuntu dùng clone sạch trên ext4 và gate subprocess thật cho Python 3.11.15/3.14.4. Nó là bằng chứng POSIX trên WSL, không thay macOS hoặc remote CI.
 
-### 1.2. Bảng điểm crash
+Baseline source `b9a49d5`: receipts/logs dưới `.gate/completion-20261104/baseline-*`, chỉ có giá trị baseline. Required final-source receipts:
 
-- `docs/design/sp1-crash-table.md` có đúng một dòng cho mỗi crashpoint trong `KNOWN_CRASHPOINTS`.
-- `tests/support/crash_cases.py::CRASH_CASES` có đúng một ca cho mỗi crashpoint. Ca seed trạng thái đã ACK, giết
-  tiến trình con bằng mã thoát 86 đúng ở điểm đó, mở lại data root rồi assert trạng thái cụ thể.
-- `tests/storage/test_crash_matrix.py::test_every_known_crashpoint_has_a_case_and_a_doc_row` kiểm sự khớp giữa ba
-  nguồn trên. `test_crash_case` chạy mọi ca. `test_matrix_detects_a_removed_crashpoint` chứng minh ma trận phát hiện
-  một crashpoint bị gỡ.
-- Cột "Mất điện" của bảng chỉ là **lập luận**, không phải bằng chứng (xem mục 2).
+| Môi trường | Receipt dưới `.gate/completion-20261104/` |
+|---|---|
+| Native Windows, Python 3.11.9 | `final-windows-configured/gate-3.11.9.json` |
+| Native Windows, Python 3.14.3 | `final-windows-configured/gate-3.14.3.json` |
+| WSL Ubuntu/ext4, Python 3.11.15 | `final-linux/gate-3.11.15.json` |
+| WSL Ubuntu/ext4, Python 3.14.4 | `final-linux/gate-3.14.4.json` |
 
-### 1.3. Tình huống nghiệm thu được test phủ
+`closure-summary.json` gắn HEAD, seal, source hashes, kết quả từng phase, test/JUnit inventory, crash cases và trạng thái cuối. Mỗi thư mục có command logs, JUnit, worker start/end và source manifest. Root/reviewer phải đọc receipt terminal, không lấy worker exit hoặc tên file làm bằng chứng pass. Receipt filename chuẩn theo commit/interpreter/lock digest có thể được chép từ kết quả quan sát, không sửa acceptance decision.
 
-Đánh số theo spec mục 20. Mọi test dưới đây xanh trong cả hai receipt ở mục 1.1.
+## Bảng crash và các tình huống storage
 
-| Tình huống | Mức phủ | Test |
-|---|---|---|
-| 26: binary gặp schema mới hơn thì từ chối ghi | Phủ đủ | `test_schema.py::test_newer_schema_is_never_writable_even_if_readable`, `test_runtime.py::test_runtime_forwards_store_migrations` |
-| 34: crash giữa commit policy và commit kho | Phủ đủ | `test_reconcile.py::test_crash_between_policy_and_store_applies_exactly_once`; ca `policy.after_intent_commit` và `intents.after_store_apply` của ma trận crash |
-| 5: kill ở mọi điểm crash | Phần storage | `test_crash_matrix.py::test_crash_case` (mọi crashpoint), `test_ledger.py::test_crash_after_commit_keeps_entry`, `test_cas.py::test_crash_after_rename_before_hold_leaves_orphan_only` |
-| 6: replay không nhân đôi, không phục sinh | Phần storage | `test_ledger.py::test_rebuild_reproduces_projection_without_duplicates`, `test_retention.py::test_rebuild_does_not_resurrect_expired_holder`, `test_cas.py::test_tombstoned_holder_is_skipped_and_replay_applies_new_tombstones`, `test_cas.py::test_quarantine_is_checked_before_existence_and_hash` |
-| 7: snapshot đúng thì khôi phục, sai thì từ chối trước khi thay | Phần storage | `test_backup.py::test_store_backup_round_trips_and_survives_live_gc`, `test_restore.py::test_restore_of_wrong_store_is_refused_before_touching_store_dir`, `test_restore.py::test_unverifiable_full_backup_is_not_restored`, `test_restore.py::test_backup_changed_after_verification_is_not_published` |
-| 8: không bao giờ có hai chủ ghi hợp lệ | Phần storage | `test_writer.py::test_second_process_cannot_acquire_while_held`, `test_runtime.py::test_runtime_holds_the_writer_lock`, `test_runtime.py::test_maintenance_lease_opens_no_database`, `test_writer.py::test_release_with_open_handles_is_refused_and_keeps_the_lock`, `test_runtime.py::test_releasing_the_lease_under_open_stores_is_refused`, `test_runtime.py::test_stores_refuse_work_once_their_lease_was_released` |
-| 21: restore không thay `writer.lock`; tombstone và quarantine mới hơn được áp lại | Phần storage (tombstone/quarantine) | `test_restore.py::test_restore_reapplies_newer_tombstone_and_quarantine`, `test_restore.py::test_restore_keeps_lock_object_identity`, `test_restore.py::test_startup_of_second_process_never_touches_an_inflight_restore` |
-| 25: blob dùng chung; backup cũ restore được sau GC | Phần storage | `test_cas.py::test_shared_blob_has_independent_holders`, `test_backup.py::test_store_backup_round_trips_and_survives_live_gc` |
-| 28: quyền rộng hơn owner-only bị phát hiện | Phần storage (hàm kiểm tra quyền, nhánh Windows) | `test_permissions.py::test_everyone_ace_is_reported`, `test_permissions.py::test_unsecured_nested_entry_is_found_recursively`, `test_layout.py::test_prepare_refuses_an_existing_entry_others_can_access`, `test_layout.py::test_secure_subdirectories_refuses_an_existing_loose_subdirectory` |
-| 32: generation không bao giờ lùi hay bị dùng lại | Phần storage (`trust_generation`) | `test_restore.py::test_policy_restore_crash_never_lowers_generation`, `test_restore.py::test_restore_after_a_crash_before_the_hwm_update_never_reuses_a_generation`, `test_restore.py::test_successive_policy_restores_strictly_increase_generation`, `test_policy_store.py::test_create_starts_strictly_above_the_lock_hwm` |
-| 35: payload nhỏ hết hạn đúng hạn, không vào ledger | Phần Event | `test_retention.py::test_small_event_payload_expires_and_never_reaches_ledger` |
+`docs/design/sp1-crash-table.md`, `KNOWN_CRASHPOINTS`, `CRASH_CASES` và test parity được kiểm trong suite. Test giết child tại crashpoint là bằng chứng process-crash/replay; cột power-loss trong bảng là lập luận.
 
-Đường dẫn test tính từ `tests/storage/` hoặc `tests/adapters/`.
+Plan đợt 1 phủ đủ tình huống 26 (version admission), 34 (reconcile policy/store); phủ storage của 5,6,7,8,21,25,28,32,35 qua crash/replay/backup/writer/permission/generation/Event-retention tests. Credential/nonce/signature/Evidence/doctor vẫn thuộc các đợt/domain đã nêu trong plan.
 
-### 1.4. Đợt sửa cuối (review toàn nhánh)
+## Các giới hạn phải giữ khi đóng
 
-Các mục review cuối đã sửa, mỗi mục có test đỏ trước khi sửa và xanh sau khi sửa:
+- macOS và remote CI chưa chạy tại đây; repo chưa có remote được dùng cho CI. Không suy ra native macOS từ platform override của mypy.
+- Chưa thử mất điện; không có claim power-loss ngoài durability tier máy thật báo.
+- Windows file symlink bị skip khi tài khoản thiếu privilege; real junction và POSIX symlink là các ca riêng, không thay nhau một cách ngầm định.
+- Không nghiệm thu native harness hoặc khả năng học/hiệu quả/Jev. Không gửi project sang MCP namespace chưa enroll.
+- Hiệu năng quét history khi mở và các minor lịch sử không chặn invariant vẫn giữ trong ledger cho đợt 2; không deferred counterexample của C02/C04/C08 để đóng đợt 1.
 
-- **I1, một chủ ghi xuyên module:** `WriterLease.release()` từ chối khi còn handle mở. `Store` và `PolicyStore` từ
-  chối mọi thao tác khi lease đã nhả.
-- **I2, một cách ánh xạ đĩa đầy:** `storage/errors.py` gom `os_error` và `sqlite_error`. `ENOSPC`, `EDQUOT`,
-  `ERROR_DISK_FULL` và `SQLITE_FULL` đều thành `storage_full` ở mọi điểm review liệt kê.
-- **I3, fsync không được hỗ trợ:** nếu filesystem không hỗ trợ `F_FULLFSYNC` thì lùi về `fsync`. Nếu không fsync
-  được thư mục thì bỏ qua bước đó. Phép thử `durability()` báo cả hai trường hợp là `process_crash_durable`.
-- **I4, `expires_at` naive từ API public:** trả `invalid_input`.
-- **`flush_file`:** mọi lần làm bền file trong `backup`, `restore` và `migrate` đi qua port `DurablePublisher`.
-- **M1:** policy store mới bắt đầu ở `hwm + 1`.
-- **M3:** `prune_backups` cần lease.
-- **M9:** mất `brain.db` khi còn lịch sử (intent, hoặc backup kho đầy đủ) thì bị từ chối.
+## Bằng chứng và tiếp tục
 
-### 1.5. Ghi chú hành vi và giới hạn sau khắc phục C01–C08
-
-Mục này ghi hành vi và giới hạn đã biết sau đợt khắc phục. Phạm vi nghiệm thu được ghi ở đầu tài liệu.
-
-- **Restore từ chối blob backup không owner-only (C04).** Mọi blob được đọc hay chép (`put`, `read`, GC, `copy_blobs`,
-  kể cả khi restore từ `backup/cas`) phải là file thường, không phải link/junction/reparse point, và chỉ owner truy
-  cập được (mục 5.9: toàn bộ data root, gồm `backups/`). Backup do brain tạo luôn owner-only. Backup được chép vào từ
-  nơi khác với ACL/mode của người khác (ví dụ `cp -p`, `robocopy /COPYALL`) bị từ chối với `insecure_permissions`.
-  Brain không tự sửa quyền: người dùng phải đặt lại quyền owner-only rồi chạy lại. `verify_backup` cũng từ chối
-  backup có shard hoặc blob là link/junction/reparse point (`integrity_failure`), và không đọc gì ngoài backup.
-- **Mất `brain.db` (C02).** Policy store giữ marker bền `meta.store_published`. Marker được ghi sau lần
-  `Store.create` công bố thành công đầu tiên, và được ghi lại (idempotent) sau mỗi lần `Store.open` thành công.
-  Khi `brain.db` mất mà marker đã có, hoặc còn intent, backup kho đầy đủ hay nội dung trong `cas/`, thì `open_runtime`
-  từ chối với `integrity_failure` và không tạo DB thay thế. Crash sau khi công bố nhưng trước khi ghi marker vẫn mở
-  được ở lần khởi động sau, và lần đó ghi marker.
-  **Giới hạn:** nếu mất **cả** `policy.db` lẫn `brain.db` thì marker và intent mất theo. Khi đó chỉ còn nội dung trong
-  `cas/` hoặc một backup kho đầy đủ (`store`/`store_full`) chặn được việc tạo DB mới. Nếu không còn tín hiệu nào trong
-  số đó, data root trông như mới và trường hợp này không phát hiện được.
-  `restore_policy` không mang `meta.store_published` sang policy store được khôi phục: policy store khôi phục từ một
-  backup chụp trước lần công bố đầu tiên mất tín hiệu này, cho tới lần `Store.open` thành công kế tiếp. Việc này để
-  lại cho đợt 2 (quyết định của controller trong ledger).
-- **Bản sao đọc tạm `<db>.reading-*` (C01).** Khi có `-wal` mà thiếu `-shm`, `open_readonly` đọc qua một bản sao
-  riêng cạnh DB rồi xóa nó. Nếu tiến trình chết giữa chừng, bản sao còn lại. `open_runtime` xóa các bản sao này dưới
-  lease ở lần mở sau, chỉ xóa thư mục thật, không đi theo link.
-- **TODO đợt 2 (C03, hiệu năng):** mỗi lần mở, `check_history` chạy `GROUP BY kind` trên toàn ledger (cột `kind`
-  chưa có index). Chấp nhận được với kích thước đợt 1. Đợt 2 xem xét index `(kind, handler_version)` hoặc high-water
-  theo kind giữ trong `meta`, cập nhật trong transaction append.
-
-## 2. Chưa nghiệm thu
-
-Các mục dưới đây **chưa nghiệm thu**. Không mục nào được coi là "verified".
-
-- **CI trên macOS và Linux.** Repo chưa có remote, nên `.github/workflows/ci.yml` chưa từng chạy. Linux mới chỉ được
-  chạy qua WSL Ubuntu (ext4) trên cùng máy Windows, xem mục 1.1. Chưa có host Linux riêng và chưa có CI. macOS chưa
-  từng chạy.
-- **Độ bền khi mất điện.** Chỉ có lập luận theo ngữ nghĩa OS, ghi ở `docs/design/sp1-crash-table.md`. Chưa có phép thử
-  mất điện nào. Riêng rename trong cùng volume trên Windows dựa vào `MOVEFILE_WRITE_THROUGH` cộng với journal của NTFS.
-  Đó là cơ sở lập luận, không phải bảo đảm.
-- **Tình huống 21, phần credential:** thu hồi credential thuộc đợt 2–3.
-- **Tình huống 32, phần nonce và chữ ký:** thuộc đợt 2–3. Đợt 1 chỉ phủ `trust_generation`.
-- **Tình huống 35, phần Evidence:** chính sách tham chiếu evidence thuộc SP2/SP3. Đợt 1 chỉ phủ Event.
-- **Tình huống 28, phần `doctor` và `--fix`:** thuộc đợt 4. Đợt 1 chỉ có hàm kiểm tra quyền.
-- **Nhánh POSIX mới chỉ chạy trên Linux qua WSL; macOS chưa chạy.** Đợt khắc phục đã chạy gate đầy đủ trên WSL Ubuntu
-  (ext4), và các nhánh Linux dưới đây đã chạy ở đó. Các nhánh riêng của macOS (`statfs`, `F_FULLFSYNC` thật) vẫn chưa
-  từng chạy. Danh sách gốc, trước đợt khắc phục:
-  - `PosixPermissionGuard` (chmod `0700`/`0600`, kiểm tổ tiên ghi được cho người khác, ngoại lệ sticky bit);
-  - khóa `flock` của `writer.lock`;
-  - fsync thư mục thật trên POSIX, gồm cả cách xử lý `EINVAL`/`ENOTSUP`/`ENOSYS`/`EBADF`;
-  - phép dò filesystem qua `/proc/self/mountinfo` (Linux) và `statfs` (macOS), cùng `F_FULLFSYNC` thật trên macOS;
-  - 7 test bị skip trên Windows:
-    `test_durable.py::test_sync_directory_io_error_is_brain_error`,
-    `test_durable.py::test_sync_directory_missing_directory_is_brain_error_on_posix`,
-    `test_permissions.py::test_posix_secure_modes`,
-    `test_permissions.py::test_group_readable_file_is_reported`,
-    `test_permissions.py::test_world_writable_ancestor_without_sticky_is_reported`,
-    `test_permissions.py::test_sticky_world_writable_ancestor_is_accepted`,
-    `test_layout.py::test_prepare_sets_owner_only_umask`.
-
-  Một số test trên Windows giả lập lỗi của `fcntl`/`fsync` để kiểm logic lùi về `fsync` và bỏ qua fsync thư mục. Các
-  test đó chỉ kiểm logic ánh xạ lỗi. Chúng không chứng minh hành vi của hệ điều hành POSIX thật.
+Ledger chuẩn: `.superpowers/sdd/sp1-inc1-remediation/ledger.md`. Các báo cáo Codex cùng thư mục: `codex-test-author-report.md`, `codex-owner-report.md`, `codex-final-review.md` (pre-fix), `codex-scoped-review-r9.md` (pre-fix) và `codex-scoped-review-final.md` (candidate cuối); gate artifacts dưới `.gate/completion-20261104/`. Giữ chúng khi chuyển harness vì `.superpowers` và `.gate` là gitignored.
