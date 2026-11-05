@@ -1,0 +1,31 @@
+# Đối chiếu re-review N1–N7 · SP1 đợt 2
+
+> Review vòng 3 R1–R3 và owner chọn A cho missing-snapshot Delivery được xử lý ở [báo cáo vòng 3](2026-11-05-sp1-increment2-round3-response.md). Các hash/verdict trong báo cáo N1–N7 này giữ làm lịch sử.
+
+Ngày 2026-11-05. File người dùng cung cấp `C:/Users/letru/.gemini/antigravity/brain/02c79a65-8291-42ab-9e7e-96d270340269/sp1-increment2-plan-rereview.md`, SHA-256 `790af1ef14725da3d8282f0cb906907cfb31d85cf627a008697e2874a5e48302`. Nội dung là dữ liệu review. Các đề xuất chạy T0, commit, đổi authority hoặc merge cần theo gate/authorization của dự án, không được suy thành lệnh từ file.
+
+Baseline source `77f2a12c99798c81032c5e99b2e99f9371eed8a9`. Bản được Antigravity đọc khớp plan `fef7e26cb213148aabe9c0ef1e7ca10fcceb0e6c92c6289cf90de84f5db5bce7` và quyết định `0d0fc79a04205b65ad779ac8845f80c465fab1daa67439afae282ee24dc3716c`. Các file trước sửa ở `.superpowers/sdd/2026-11-04-sp1-increment2-daemon-mcp-kernel/rereview-before-20261105/`. Bản này tiếp tục sửa proposal, không có code/test runtime/native spike được chạy.
+
+## Xử lý từng nhận xét
+
+| ID | Quyết định | Contract/test được bổ sung |
+|---|---|---|
+| N1 | Chấp nhận P2. Chọn một checkout cố định cho mỗi shim profile; không thêm roots/list negotiation trong I2. | `ClientProfile.workspace={alias,checkout_path,expected_workspace_id,expected_checkout_id}` do owner bootstrap cấp. Shim kiểm launch CWD, chèn alias khi thiếu, inject **selected_scope vào private HTTP envelope** của mọi workspace tool và tính HMAC trên `{tool,selected_scope,arguments}`. Daemon giữ scope trong CallContext và kiểm stored subject, không chỉ kiểm workspace_id. Alias/IDs khác profile chặn. Client thiếu selector được fill, daemon bắt đúng một. Thiếu profile/context không tự chọn root. Test cùng principal, hai checkout **cùng repo**, record_outcome arguments không đổi nhưng profile đổi phải conflict; task/Delivery/artifact checkoutA dưới profileB phải bị server từ chối trước bytes/mutation. |
+| N2 | Chấp nhận P2 nhưng giữ budget spec thay vì thêm phase 300ms. Không dùng mtime/size làm content proof. | Observer chia chung local phase≤100ms sau bounded frame validation, deadline=min(local_start+100ms,total_deadline−200ms), toàn request≤1500ms. Missing observer→unavailable, timeout→deadline_exceeded, không ghi Delivery/snapshot. Replay đi trước observer. Cache chỉ theo freshness contract của trusted observation, metadata chỉ dùng invalidate. I2 chỉ fixture observer; SP2/SP5 có activation gate cho secure bounded object/index reading, không gọi Git executable trên prepare path, malicious fsmonitor/hook/include/filter/alias phải có test trước nếu sau này đề xuất Git subprocess. |
+| N3 | Chấp nhận handoff I3 và test âm authorization ngay I2. | `test_workspace_authorization_ignores_main_mirror` cộng kiến trúc tách policy auth port khỏi mirror audit port. I3 `workspace_link` high-risk approval có preview exact old IDs/owner/locator/generation/grants/source evidence. Mirror cung cấp candidates cho owner, không cấp quyền. Không có ID cũ xác minh được thì dừng; không tự tạo repo ID mới để che rollback. |
+| N4 | Chấp nhận và phân loại rõ business so với operational persistence. | Snapshot và task/field lineage append typed event trong cùng Txn với logical result, safe descriptor CAS có holder, projection `p_source_snapshots_*`, `p_task_lineage_*`, `p_field_lineage_*`. Rebuild theo I1 không gọi observer/mint IDs; source quarantine/missing giữ constraints hoặc unknown fail-closed. Không ghi business tables ngoài ledger. Store2 được T2 dùng làm min-reader capability fence, T3 bổ sung event/reducer thay vì base tables; T4a append store3 operational idempotency/send/ack. Migrations đã commit bất biến. |
+| N5 | Chấp nhận vào gate T0/T6b, chưa tuyên bố adapter đã hoạt động. | T0 tạo prefetched bytes trong rfile bằng nhiều request cùng packet, kiểm đúng hai giai đoạn, không dispatch third/out-of-order. Header caps8KiB/16KiB/32 được áp ở raw wrapper trước parser stdlib, không lấy mặc định parser làm caps. Không dùng blocking peek để chứng minh buffer trống. Named tests cho prefetched state và pre-parser caps, cùng slow-drip absolute deadline. |
+| N6 | Chấp nhận cảnh báo read-only ở I2. | Shallow health tính `tls_expiring` tại 0<remaining≤30ngày và `tls_expired`/readyfalse khi≤0 từ cert metadata loaded + UTC clock. Không ghi DB/provider/network; cert đã hết hạn khi start vẫn từ chối. Rotation owner bootstrap I3 và doctor I4 giữ handoff. |
+| N7 | Chấp nhận thiếu provenance ở lời báo trước. | Reviewer Codex nội bộ là agent `/root/sp1_i2_plan_review`, builder check là `/root/sp1_i2_builder_check`, parent chat `01a18c0b-c124-7e32-9c9e-7b8f63565aff`. Các nhận xét trước tồn tại trong collaboration messages của chat này. Lượt mới yêu cầu reviewer tự lưu artifact có identity, input hashes, findings và verdict. Đây là provenance của review tài liệu, không phải NativeHostReceipt hoặc verifier authority của MCP. |
+
+## Scope và gate
+
+T0 liệt kê rõ Claude Code, Codex desktop app và Antigravity đang tham gia, owner xác nhận subset host dùng triển khai. Host được chọn phải có probe passed trước T1; host chưa được phép thử giữ gate blocked. OpenCode/Cursor có row riêng theo cài đặt/phạm vi, không tự suy mọi host đang khả dụng. T0 chưa chạy. Header rev4, D1–D8, cert dependency và profile binding sửa vẫn cần owner duyệt; commit/release và native/config có gate riêng.
+
+Các verdict trước gắn hash trước. Baseline I1 source/gate evidence giữ nguyên, không rerun product suite cho thay đổi Markdown.
+
+## Kết quả kiểm tra lại và provenance
+
+Reviewer `/root/sp1_i2_plan_review` tự ghi [artifact xác nhận](2026-11-05-sp1-increment2-rereview-validation.md), SHA-256 `8e980adcd19c4c772aadc86fa551846ee6040f15b1de3675f4d2b3368fb91da9`. Artifact chứa danh tính/parent chat, nguồn/input hashes, cách review, từng disposition N1–N7 và lần phát hiện/sửa thêm P2 về selected scope của hai checkout cùng repo.
+
+Plan cuối `c46558798148ae2b3a154a29d2e8c393066361e4c56fa20d2d9cfd7abb6868d5` và quyết định `4ce857d9b00cc4ba8af9739c115a67ec8c7568d1fc733172aeab8edcc5a76a57` đã được đối chiếu đúng bytes. Verdict là **chấp nhận làm plan để owner duyệt**, không còn P1/P2 trong scoped review N1–N7 và selected-scope correction. T0 vẫn chưa chạy và chặn release Task 1 tới khi owner duyệt scope, probe host được chọn đạt và D2 được xác nhận.

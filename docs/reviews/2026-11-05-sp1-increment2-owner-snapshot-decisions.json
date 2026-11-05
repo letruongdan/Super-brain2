@@ -1,0 +1,32 @@
+{
+  "source": "manual transcription of actual request_user_input_async question/reply in parent chat",
+  "parent_chat": "01a18c0b-c124-7e32-9c9e-7b8f63565aff",
+  "occurred_local_date": "2026-11-05",
+  "occurred_at": null,
+  "timestamp_limit": "Exact original question/reply timestamps are not exposed in conversation context. No exact occurrence time inferred.",
+  "recorded_at": "2026-11-05T07:57:47.959252+00:00",
+  "records": [
+    {
+      "decision_id": "R2-missing-snapshot",
+      "question": "Khi `prepare_task` không lấy được snapshot trong ngân sách thời gian, bạn muốn hành vi nào? Mình đề xuất A vì spec chưa bắt buộc snapshot cho mọi Delivery. Đây là quyết định ảnh hưởng response schema cần chốt trước Task 1.",
+      "options": [
+        "A — Vẫn giao skill/bài học đủ điều kiện theo quyền và scope; ghi snapshot thiếu/quá hạn, lineage không rõ nguồn và chặn egress chưa chứng minh được quyền nguồn.",
+        "B — Từ chối Delivery cho tới khi có snapshot đáng tin; yêu cầu observer nền được kiểm chứng trước khi bật prepare_task production."
+      ],
+      "answer": "A — Vẫn giao skill/bài học đủ điều kiện theo quyền và scope; ghi snapshot thiếu/quá hạn, lineage không rõ nguồn và chặn egress chưa chứng minh được quyền nguồn.",
+      "question_tool_call_id": "call_c46f037363634940ac24c23b250cecf1",
+      "superseded_in_part_by": "S1-lineage-vs-snapshot"
+    },
+    {
+      "decision_id": "S1-lineage-vs-snapshot",
+      "question": "Bạn muốn chốt S1 theo hướng nào? Mình đề xuất A để tách đúng lineage khỏi snapshot và giữ Jev là selector chính theo spec. Lựa chọn trước đó vẫn được giữ trong lịch sử quyết định.",
+      "options": [
+        "A — Theo spec: thiếu snapshot vẫn giữ repo/lineage đã biết; chỉ đánh unknown cho nguồn thực sự không xác định. Jev tuân policy hiện hành, không bị tắt chỉ vì thiếu snapshot.",
+        "B — Giữ chính sách chặt hơn: thiếu snapshot luôn dùng local rules và chặn Jev cho request đó, nhưng vẫn giữ nguyên repo/lineage đã biết."
+      ],
+      "answer": "A — Theo spec: thiếu snapshot vẫn giữ repo/lineage đã biết; chỉ đánh unknown cho nguồn thực sự không xác định. Jev tuân policy hiện hành, không bị tắt chỉ vì thiếu snapshot.",
+      "question_tool_call_id": "call_8b49e917cbe2427a9f0b6464a6dc35f4",
+      "supersedes": "R2 interpretation that missing snapshot alone makes every task-derived source unknown and always selects local rules"
+    }
+  ]
+}
