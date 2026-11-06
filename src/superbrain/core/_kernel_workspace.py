@@ -65,6 +65,14 @@ DEFAULT_SENSITIVE_KEYS: frozenset[str] = frozenset(
         "secrets",
         "credentials",
         "cookies",
+        "signing_key",
+        "encryption_key",
+        "master_key",
+        "ssh_key",
+        "api_token",
+        "apitoken",
+        "github_token",
+        "githubtoken",
     }
 )
 DEFAULT_BLOCKED_PATH_PATTERNS: tuple[str, ...] = (

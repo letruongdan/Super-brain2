@@ -657,10 +657,18 @@ KEY_CORPUS_STRIP: tuple[str, ...] = (
     # round 4 joined single words and containment
     "accesstoken", "ACCESSTOKEN", "privatekey", "Privatekey", "clientsecret", "refreshtoken", "sessiontoken",
     "setcookie", "authtoken", "xapikey", "xauthtoken", "mypassword", "passwordhash",
+    # round 5 existing-behaviour locks
+    "token_budget_secret", "api_key_estimator", "password_tokenizer", "secret_token_estimator",
+    "client_secret_token_budget", "refresh_token_limit", "HTTPSProxySecret", "oauth2_client_secret", "v2Token",
+    "aws-secret-access-key", "ｄｂ＿ｐａｓｓｗｏｒｄ＿ｏｌｄ",
+    # round 5 vocabulary (word and joined forms)
+    "signing_key", "signingkey", "encryption_key", "encryptionkey", "master_key", "masterkey", "ssh_key",
+    "sshkey", "api_token", "apitoken", "github_token", "githubtoken",
 )  # fmt: skip
 KEY_CORPUS_KEEP: tuple[str, ...] = (
     "context_budget_tokens", "tokenizer", "token_estimator", "token_budget", "secretary", "description",
     "XMLHttpRequest", "sha256Digest", "IPv6Address",
+    "token_count",
 )  # fmt: skip
 
 
