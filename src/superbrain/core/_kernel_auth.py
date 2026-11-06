@@ -13,11 +13,8 @@ from datetime import datetime
 from pathlib import Path
 from types import MappingProxyType
 
-from superbrain.core.canonical import canonical_json, digest_bytes
-from superbrain.core.errors import BrainError, ErrorCode
-from superbrain.core.jsonvalue import JsonValue
-from superbrain.core.kernel import (
-    OPAQUE_ID_RE,
+from superbrain.core._kernel_base import (
+    GLOBAL_SCOPELESS_ACTIONS,
     Principal,
     Scope,
     is_strict_int,
@@ -25,16 +22,17 @@ from superbrain.core.kernel import (
     require_opaque_id,
     require_positive_int,
     require_sha256_digest,
-    require_workspace_hint,
+    require_workspace_alias,
 )
+from superbrain.core.canonical import canonical_json, digest_bytes
+from superbrain.core.errors import BrainError, ErrorCode
+from superbrain.core.jsonvalue import JsonValue
 
 _LOCATOR_SCHEME_RE = re.compile(r"^[a-z][a-z0-9+.-]{0,31}$")
 _BOOTSTRAP_ISSUER_RE = re.compile(r"^(owner|bootstrap):[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _BASE64URL_SECRET_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")
 _HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 _DUMMY_SECRET_DIGEST = "sha256:" + ("0" * 64)
-
-_GLOBAL_SCOPELESS_ACTIONS: frozenset[str] = frozenset({"get_health", "get_job", "global_read"})
 
 
 def _require_uuid_str(value: object) -> str:
@@ -226,9 +224,7 @@ class WorkspaceRegistration:
         require_opaque_id(self.owner_id, label="owner_id")
         require_opaque_id(self.principal_id, label="principal_id")
         require_opaque_id(self.machine_id, label="machine_id")
-        require_workspace_hint(self.alias)
-        if not OPAQUE_ID_RE.fullmatch(self.alias):
-            raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+        require_workspace_alias(self.alias)
         if (
             not isinstance(self.checkout_path, str)
             or not self.checkout_path
@@ -275,7 +271,7 @@ class WorkspaceBinding:
         require_opaque_id(self.repo_id, label="repo_id")
         require_opaque_id(self.checkout_id, label="checkout_id")
         require_opaque_id(self.machine_id, label="machine_id")
-        require_workspace_hint(self.alias)
+        require_workspace_alias(self.alias)
         if not isinstance(self.checkout_path, str) or not self.checkout_path:
             raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
         if self.locator_digest is not None:
@@ -364,7 +360,7 @@ class AuthSnapshot:
         if not has_active_cred:
             return False
         if scope is None:
-            return action in _GLOBAL_SCOPELESS_ACTIONS
+            return action in GLOBAL_SCOPELESS_ACTIONS
         repo_pol = self.repo_policies.get(scope.repo_id)
         if repo_pol is None or repo_pol.owner_id != principal.owner_id:
             return False

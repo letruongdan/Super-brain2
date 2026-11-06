@@ -7,6 +7,7 @@ import sqlite3
 
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.kernel import (
+    GLOBAL_SCOPELESS_ACTIONS,
     OPAQUE_ID_RE,
     SHA256_DIGEST_RE,
     AuthSnapshot,
@@ -24,7 +25,6 @@ from superbrain.storage.kernel_schema import KERNEL_POLICY_MIGRATIONS, POLICY_V2
 from superbrain.storage.kinds import is_uuid
 from superbrain.storage.schema import code_version
 
-_GLOBAL_SCOPELESS_ACTIONS: frozenset[str] = frozenset({"get_health", "get_job", "global_read"})
 _POLICY_V1_TABLES: frozenset[str] = frozenset({"meta", "intents", "tombstones", "quarantine", "trust"})
 _REQUIRED_POLICY_TABLES: frozenset[str] = _POLICY_V1_TABLES | POLICY_V2_TABLES
 _MAX_VERSION_DIGITS = 18
@@ -223,7 +223,7 @@ def policy_allows(
             return False
 
         if scope is None:
-            return action in _GLOBAL_SCOPELESS_ACTIONS
+            return action in GLOBAL_SCOPELESS_ACTIONS
 
         repo_row = db.execute(
             "SELECT owner_id, provider_egress_enabled FROM repo_policy WHERE repo_id = ?",

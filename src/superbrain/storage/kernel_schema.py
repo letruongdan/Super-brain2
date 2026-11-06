@@ -56,6 +56,76 @@ KERNEL_POLICY_KINDS: tuple[EntryKind, ...] = (
 )
 
 
+_SNAPSHOT_STATUSES = frozenset({"available", "unavailable", "deadline"})
+_SELECTOR_PATHS = frozenset({"rules", "jev"})
+_SELECTOR_REASONS = frozenset(
+    {"provider_unavailable", "egress_ineligible", "jev_selected", "jev_failed", "jev_deadline"}
+)
+_SOURCE_FIELDS: dict[str, FieldType] = {
+    "owner_id": FieldType.OPAQUE_ID,
+    "repo_id": FieldType.OPAQUE_ID,
+    "source_kind": FieldType.OPAQUE_ID,
+    "source_id": FieldType.OPAQUE_ID,
+    "source_revision": FieldType.INT,
+    "source_digest": FieldType.DIGEST,
+}
+
+KERNEL_WORKSPACE_KINDS: tuple[EntryKind, ...] = (
+    EntryKind(
+        "snapshot.observed",
+        1,
+        {
+            "snapshot_id": FieldType.UUID,
+            "owner_id": FieldType.OPAQUE_ID,
+            "repo_id": FieldType.OPAQUE_ID,
+            "checkout_id": FieldType.OPAQUE_ID,
+            "kind": FieldType.ENUM,
+            "dirty": FieldType.BOOL,
+            "descriptor_digest": FieldType.DIGEST,
+            "observed_at": FieldType.TIMESTAMP,
+        },
+        {"kind": frozenset({"git", "directory"})},
+    ),
+    EntryKind(
+        "lineage.task_bound",
+        1,
+        {
+            "task_id": FieldType.OPAQUE_ID,
+            "owner_id": FieldType.OPAQUE_ID,
+            "repo_id": FieldType.OPAQUE_ID,
+            "checkout_id": FieldType.OPAQUE_ID,
+            "delivery_id": FieldType.OPAQUE_ID,
+            "assignment_id": FieldType.OPAQUE_ID,
+            "source_snapshot_id": FieldType.UUID,
+            "snapshot_status": FieldType.ENUM,
+            "selector_path": FieldType.ENUM,
+            "selector_reason": FieldType.ENUM,
+        },
+        {
+            "snapshot_status": _SNAPSHOT_STATUSES,
+            "selector_path": _SELECTOR_PATHS,
+            "selector_reason": _SELECTOR_REASONS,
+        },
+        nullable=frozenset({"assignment_id", "source_snapshot_id"}),
+    ),
+    EntryKind("lineage.task_source_added", 1, {"task_id": FieldType.OPAQUE_ID, **_SOURCE_FIELDS}, {}),
+    EntryKind("lineage.task_unknown_marked", 1, {"task_id": FieldType.OPAQUE_ID}, {}),
+    EntryKind(
+        "lineage.field_source_added",
+        1,
+        {"task_id": FieldType.OPAQUE_ID, "field_path_digest": FieldType.DIGEST, **_SOURCE_FIELDS},
+        {},
+    ),
+    EntryKind(
+        "lineage.field_unknown_marked",
+        1,
+        {"task_id": FieldType.OPAQUE_ID, "field_path_digest": FieldType.DIGEST},
+        {},
+    ),
+)
+"""Task 3 event-sourced business kinds (no DDL): reducers in ``storage.workspaces`` build ``p_*`` tables."""
+
+
 def _policy_v2(db: sqlite3.Connection) -> None:
     """Policy store v2 DDL: principals, credentials, repo policies/grants, workspace registry, and request HMAC key."""
     db.execute(

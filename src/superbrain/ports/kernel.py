@@ -1,18 +1,34 @@
-"""Kernel policy authority port shared across storage and application layers."""
+"""Kernel ports shared across storage, adapters and application layers.
+
+``KernelPolicyPort`` is the only workspace authority (policy DB). ``WorkspaceMirrorReadPort`` reads the main-store
+registry mirror for audit/preview candidates and is deliberately disjoint from it: authorization code never takes
+the mirror port, so a stale or forged mirror row can neither grant access nor mint IDs.
+"""
 
 from __future__ import annotations
 
-from typing import Protocol
+from collections.abc import Callable, Mapping
+from typing import Protocol, TypeVar
 
 from superbrain.core.kernel import (
     AuthSnapshot,
     BootstrapAuthorization,
+    FieldLineage,
+    KernelRecord,
+    LineageRef,
+    LineageSet,
+    MirrorCandidate,
     Principal,
     Scope,
+    SnapshotObservation,
+    SourceSnapshot,
+    TaskBinding,
     WorkspaceBinding,
     WorkspaceRegistration,
 )
 from superbrain.ports.policy import Intent
+
+_T = TypeVar("_T")
 
 
 class KernelPolicyPort(Protocol):
@@ -44,4 +60,66 @@ class KernelPolicyPort(Protocol):
 
     def request_digest_key(self) -> tuple[str, bytes]:
         """Return the active ``(key_id, key_bytes)`` 32-byte per-store HMAC secret."""
+        ...
+
+
+class SnapshotObserver(Protocol):
+    """Optional, bounded observation of an approved binding; never runs project code, Git or the network."""
+
+    def observe(self, binding: WorkspaceBinding, deadline_ns: int) -> SnapshotObservation:
+        """Observe ``binding`` by monotonic ``deadline_ns``: ``DEADLINE`` when the budget ran out first."""
+        ...
+
+
+class KernelTx(Protocol):
+    """One business write transaction on the main store (``Store.transaction()``), typed records only."""
+
+    def append_record(self, record: KernelRecord) -> None:
+        """Validate and append ``record`` to the ledger, applying every projection in the same transaction."""
+        ...
+
+    def hold_blob(self, data: bytes, *, holder_id: str) -> str:
+        """Publish ``data`` durably (verified if already present), then hold it for ``holder_id``; its digest."""
+        ...
+
+    def blob_restricted(self, digest: str) -> bool:
+        """True iff policy blocks the blob ``digest`` (quarantined)."""
+        ...
+
+    def holder_tombstoned(self, holder_id: str) -> bool:
+        """True iff policy tombstoned the business holder ``holder_id`` (a snapshot, say)."""
+        ...
+
+    def find_source_snapshot(self, checkout_id: str, descriptor_digest: str) -> SourceSnapshot | None: ...
+
+    def read_source_snapshot(self, snapshot_id: str) -> SourceSnapshot | None: ...
+
+    def read_task_binding(self, task_id: str) -> TaskBinding | None: ...
+
+    def read_task_lineage(self, task_id: str) -> tuple[LineageSet, bool]:
+        """``(sources, unknown)`` of ``task_id``; both only ever grow."""
+        ...
+
+    def read_field_lineage(self, task_id: str) -> Mapping[str, FieldLineage]:
+        """Field lineage of ``task_id`` keyed by ``field_path_digest``."""
+        ...
+
+
+class KernelStorePort(Protocol):
+    def transact(self, operation: Callable[[KernelTx], _T]) -> _T:
+        """Run ``operation`` inside one ``Store.transaction()``: all of it commits or none of it does."""
+        ...
+
+
+class WorkspaceMirrorReadPort(Protocol):
+    """Main-store ``p_workspace_registry_*`` mirror: non-authoritative candidates for audit and I3 preview."""
+
+    def mirror_candidates(
+        self, *, alias: str | None = None, checkout_id: str | None = None
+    ) -> tuple[MirrorCandidate, ...]: ...
+
+
+class SourceRestrictionPort(Protocol):
+    def is_restricted(self, ref: LineageRef) -> bool:
+        """True iff the source of ``ref`` is quarantined, tombstoned or no longer resolvable."""
         ...

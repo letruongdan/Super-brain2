@@ -3,70 +3,86 @@
 from __future__ import annotations
 
 import copy
-import re
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import StrEnum
-from typing import TypeAlias
 
 from superbrain.core._json_parse import parse_json
-from superbrain.core.canonical import canonical_json, validate_json
+from superbrain.core._kernel_auth import (
+    AuthSnapshot,
+    BootstrapAuthorization,
+    CredentialRecord,
+    DaemonConfig,
+    DirectRefRecord,
+    RepoPolicy,
+    ResolvedCredential,
+    TlsMaterial,
+    TrustedLocator,
+    VerifiedServerTls,
+    WorkspaceBinding,
+    WorkspaceRegistration,
+    is_trusted_bootstrap_issuer,
+    parse_bearer_token,
+    verify_secret_digest,
+)
+from superbrain.core._kernel_base import (
+    GLOBAL_SCOPELESS_ACTIONS,
+    IDEMPOTENCY_KEY_PATTERN,
+    IDEMPOTENCY_KEY_RE,
+    OBJECT_KIND_PATTERN,
+    OBJECT_KIND_RE,
+    OPAQUE_ID_PATTERN,
+    OPAQUE_ID_RE,
+    SHA256_DIGEST_PATTERN,
+    SHA256_DIGEST_RE,
+    WORKSPACE_HINT_PATTERN,
+    WORKSPACE_HINT_RE,
+    LineagedField,
+    LineageRef,
+    LineageSet,
+    ObjectRef,
+    Principal,
+    Scope,
+    SnapshotStatus,
+    is_registrable_alias,
+    is_strict_int,
+    require_object_kind,
+    require_opaque_id,
+    require_positive_int,
+    require_sha256_digest,
+    require_workspace_alias,
+    require_workspace_hint,
+)
+from superbrain.core._kernel_workspace import (
+    COMMIT_RESERVE_NS,
+    DEFAULT_BLOCKED_PATH_PATTERNS,
+    DEFAULT_SENSITIVE_KEYS,
+    DEFAULT_STRUCTURAL_ID_FIELDS,
+    LOCAL_PHASE_BUDGET_NS,
+    SNAPSHOT_DEGRADED_CODES,
+    DeliveryItem,
+    FieldLineage,
+    FilterPolicy,
+    KernelRecord,
+    LabeledDelivery,
+    MirrorCandidate,
+    RepoFlags,
+    SafePayload,
+    SelectorPath,
+    SelectorReason,
+    SnapshotDescriptor,
+    SnapshotObservation,
+    SourceSnapshot,
+    TaskBinding,
+    binding_lineage_ref,
+    field_path_descriptor,
+    field_path_digest,
+    require_canonical_timestamp,
+    require_uuid,
+)
+from superbrain.core.canonical import canonical_json
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.jsonvalue import JsonValue
-
-OPAQUE_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
-OBJECT_KIND_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
-WORKSPACE_HINT_PATTERN = r"^[A-Za-z0-9._-]{1,128}$"
-IDEMPOTENCY_KEY_PATTERN = r"^[A-Za-z0-9_-]{16,128}$"
-SHA256_DIGEST_PATTERN = r"^sha256:[0-9a-f]{64}$"
-
-OPAQUE_ID_RE = re.compile(OPAQUE_ID_PATTERN)
-OBJECT_KIND_RE = re.compile(OBJECT_KIND_PATTERN)
-WORKSPACE_HINT_RE = re.compile(WORKSPACE_HINT_PATTERN)
-IDEMPOTENCY_KEY_RE = re.compile(IDEMPOTENCY_KEY_PATTERN)
-SHA256_DIGEST_RE = re.compile(SHA256_DIGEST_PATTERN)
-
-
-def is_strict_int(value: object) -> bool:
-    """True for ``int`` excluding ``bool``."""
-    return type(value) is int
-
-
-def require_opaque_id(value: object, *, label: str = "id") -> str:
-    if not isinstance(value, str) or not OPAQUE_ID_RE.fullmatch(value):
-        raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
-    return value
-
-
-def require_object_kind(value: object) -> str:
-    if not isinstance(value, str) or not OBJECT_KIND_RE.fullmatch(value):
-        raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
-    return value
-
-
-def require_workspace_hint(value: object) -> str:
-    if (
-        not isinstance(value, str)
-        or not WORKSPACE_HINT_RE.fullmatch(value)
-        or value in {".", ".."}
-        or ".." in value
-    ):
-        raise BrainError(ErrorCode.INVALID_INPUT, "mixed or invalid workspace selector")
-    return value
-
-
-def require_sha256_digest(value: object) -> str:
-    if not isinstance(value, str) or not SHA256_DIGEST_RE.fullmatch(value):
-        raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
-    return value
-
-
-def require_positive_int(value: object) -> int:
-    if isinstance(value, bool):
-        raise BrainError(ErrorCode.INVALID_INPUT, "boolean not allowed for integer")
-    if type(value) is not int or value < 1:
-        raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
-    return value
 
 
 class JobState(StrEnum):
@@ -84,73 +100,6 @@ class AccountingStatus(StrEnum):
     RESERVED = "reserved"
     SETTLED = "settled"
     OUTCOME_UNKNOWN = "outcome_unknown"
-
-
-class SnapshotStatus(StrEnum):
-    AVAILABLE = "available"
-    UNAVAILABLE = "unavailable"
-    DEADLINE = "deadline"
-
-
-@dataclass(frozen=True)
-class Principal:
-    principal_id: str
-    owner_id: str
-    harness_id: str
-    machine_id: str
-
-    def __post_init__(self) -> None:
-        require_opaque_id(self.principal_id, label="principal_id")
-        require_opaque_id(self.owner_id, label="owner_id")
-        require_opaque_id(self.harness_id, label="harness_id")
-        require_opaque_id(self.machine_id, label="machine_id")
-
-
-@dataclass(frozen=True)
-class Scope:
-    repo_id: str
-    checkout_id: str | None = None
-
-    def __post_init__(self) -> None:
-        require_opaque_id(self.repo_id, label="repo_id")
-        if self.checkout_id is not None:
-            require_opaque_id(self.checkout_id, label="checkout_id")
-
-    def to_dict(self) -> dict[str, JsonValue]:
-        return {"repo_id": self.repo_id, "checkout_id": self.checkout_id}
-
-
-@dataclass(frozen=True)
-class ObjectRef:
-    kind: str
-    id: str
-    revision: int
-    digest: str
-
-    def __post_init__(self) -> None:
-        require_object_kind(self.kind)
-        require_opaque_id(self.id)
-        require_positive_int(self.revision)
-        require_sha256_digest(self.digest)
-
-    def to_dict(self) -> dict[str, JsonValue]:
-        return {
-            "kind": self.kind,
-            "id": self.id,
-            "revision": self.revision,
-            "digest": self.digest,
-        }
-
-    @classmethod
-    def from_dict(cls, raw: Mapping[str, JsonValue]) -> ObjectRef:
-        if not isinstance(raw, Mapping) or set(raw) != {"kind", "id", "revision", "digest"}:
-            raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
-        return cls(
-            kind=require_object_kind(raw["kind"]),
-            id=require_opaque_id(raw["id"]),
-            revision=require_positive_int(raw["revision"]),
-            digest=require_sha256_digest(raw["digest"]),
-        )
 
 
 @dataclass(frozen=True)
@@ -265,36 +214,6 @@ class StoredResult:
             assignment_id=raw_assignment,
             refs=tuple(refs),
         )
-
-
-@dataclass(frozen=True)
-class LineageRef:
-    owner_id: str
-    repo_id: str
-    source: ObjectRef
-
-    def __post_init__(self) -> None:
-        require_opaque_id(self.owner_id, label="owner_id")
-        require_opaque_id(self.repo_id, label="repo_id")
-        if not isinstance(self.source, ObjectRef):
-            raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
-
-
-LineageSet: TypeAlias = frozenset[LineageRef]
-
-
-@dataclass(frozen=True)
-class LineagedField:
-    value: JsonValue
-    sources: frozenset[LineageRef] = field(default_factory=frozenset)
-    unknown_source: bool = False
-
-    def __post_init__(self) -> None:
-        validate_json(self.value)
-        if not isinstance(self.sources, frozenset) or not all(isinstance(s, LineageRef) for s in self.sources):
-            raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
-        if not isinstance(self.unknown_source, bool):
-            raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
 
 
 @dataclass(frozen=True)
@@ -445,40 +364,34 @@ class ToolCatalog:
         return [spec.to_mcp_tool() for spec in self.tools.values()]
 
 
-from superbrain.core._kernel_auth import (  # noqa: E402
-    AuthSnapshot,
-    BootstrapAuthorization,
-    CredentialRecord,
-    DaemonConfig,
-    DirectRefRecord,
-    RepoPolicy,
-    ResolvedCredential,
-    TlsMaterial,
-    TrustedLocator,
-    VerifiedServerTls,
-    WorkspaceBinding,
-    WorkspaceRegistration,
-    is_trusted_bootstrap_issuer,
-    parse_bearer_token,
-    verify_secret_digest,
-)
-
 __all__ = [
     "AccountingStatus",
     "AuthSnapshot",
     "BootstrapAuthorization",
+    "COMMIT_RESERVE_NS",
     "Call",
     "CallContext",
     "CredentialRecord",
+    "DEFAULT_BLOCKED_PATH_PATTERNS",
+    "DEFAULT_SENSITIVE_KEYS",
+    "DEFAULT_STRUCTURAL_ID_FIELDS",
     "DaemonConfig",
+    "DeliveryItem",
     "DirectRefRecord",
+    "FieldLineage",
+    "FilterPolicy",
+    "GLOBAL_SCOPELESS_ACTIONS",
     "IDEMPOTENCY_KEY_PATTERN",
     "IDEMPOTENCY_KEY_RE",
     "Identity",
     "JobState",
+    "KernelRecord",
+    "LOCAL_PHASE_BUDGET_NS",
+    "LabeledDelivery",
     "LineageRef",
     "LineageSet",
     "LineagedField",
+    "MirrorCandidate",
     "OBJECT_KIND_PATTERN",
     "OBJECT_KIND_RE",
     "OPAQUE_ID_PATTERN",
@@ -486,14 +399,23 @@ __all__ = [
     "ObjectRef",
     "Principal",
     "ReadAckInput",
+    "RepoFlags",
     "RepoPolicy",
     "ResolvedCredential",
     "ResourceDigest",
     "SHA256_DIGEST_PATTERN",
     "SHA256_DIGEST_RE",
+    "SNAPSHOT_DEGRADED_CODES",
+    "SafePayload",
     "Scope",
+    "SelectorPath",
+    "SelectorReason",
+    "SnapshotDescriptor",
+    "SnapshotObservation",
     "SnapshotStatus",
+    "SourceSnapshot",
     "StoredResult",
+    "TaskBinding",
     "TlsMaterial",
     "ToolCatalog",
     "ToolSpec",
@@ -504,13 +426,20 @@ __all__ = [
     "WorkspaceBinding",
     "WorkspaceRegistration",
     "WorkspaceSelector",
+    "binding_lineage_ref",
+    "field_path_descriptor",
+    "field_path_digest",
+    "is_registrable_alias",
     "is_strict_int",
     "is_trusted_bootstrap_issuer",
     "parse_bearer_token",
+    "require_canonical_timestamp",
     "require_object_kind",
     "require_opaque_id",
     "require_positive_int",
     "require_sha256_digest",
+    "require_uuid",
+    "require_workspace_alias",
     "require_workspace_hint",
     "verify_secret_digest",
 ]
