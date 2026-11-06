@@ -255,6 +255,7 @@ def test_strict_wire_bad_inputs() -> None:
         b'{"n": NaN}',
         b'{"n": Infinity}',
         b'{"n": -Infinity}',
+        b'{"huge_int": ' + (b"9" * 5_000) + b"}",  # > 4300 digits ValueError in Python >= 3.11
     ]
     for raw in raw_bad_cases:
         with pytest.raises(BrainError) as exc_info:
@@ -447,6 +448,54 @@ def test_strict_wire_bad_inputs() -> None:
             },
             ErrorCode.IDENTITY_MISMATCH,
         ),
+        (
+            "get_artifact",
+            {
+                "schema_version": "2.0",
+                "workspace_id": "repo-01",
+                "task_id": "task-01",
+                "artifact_id": "art-01",
+                "revision": 1,
+                "level": ["L1"],
+                "idempotency_key": "idem_unhash_lvl_0001",
+            },
+            ErrorCode.INVALID_INPUT,
+        ),
+        (
+            "get_artifact",
+            {
+                "schema_version": "2.0",
+                "workspace_id": "repo-01",
+                "task_id": "task-01",
+                "artifact_id": "art-01",
+                "revision": 1,
+                "level": {"bad": "L1"},
+                "idempotency_key": "idem_unhash_lvl_0002",
+            },
+            ErrorCode.INVALID_INPUT,
+        ),
+        (
+            "record_outcome",
+            {
+                "schema_version": "2.0",
+                "workspace_id": "repo-01",
+                "delivery_id": "deliv-01",
+                "outcome": ["success"],
+                "idempotency_key": "idem_unhash_out_0001",
+            },
+            ErrorCode.INVALID_INPUT,
+        ),
+        (
+            "record_outcome",
+            {
+                "schema_version": "2.0",
+                "workspace_id": "repo-01",
+                "delivery_id": "deliv-01",
+                "outcome": {"bad": 1},
+                "idempotency_key": "idem_unhash_out_0002",
+            },
+            ErrorCode.INVALID_INPUT,
+        ),
     ]
     for tool, args, expected_code in bad_calls:
         with pytest.raises(BrainError) as exc_info:
@@ -516,9 +565,14 @@ def test_strict_wire_bad_inputs() -> None:
         with pytest.raises(JsonRpcError) as rpc_exc:
             validate_jsonrpc_id(bad_rpc_id)
         assert rpc_exc.value.code == JSONRPC_INVALID_REQUEST
-    with pytest.raises(JsonRpcError) as rpc_parse:
-        parse_jsonrpc_request(b"{not-json")
-    assert rpc_parse.value.code == JSONRPC_PARSE_ERROR
+    for bad_rpc_frame in (
+        b"{not-json",
+        b'{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"n":' + (b"9" * 5_000) + b"}}",
+    ):
+        with pytest.raises(JsonRpcError) as rpc_parse:
+            parse_jsonrpc_request(bad_rpc_frame)
+        assert rpc_parse.value.code == JSONRPC_PARSE_ERROR
+        assert rpc_parse.value.code == -32700
 
     # Core kernel invariants
     with pytest.raises(BrainError):
@@ -548,6 +602,207 @@ def test_strict_wire_bad_inputs() -> None:
         selected_scope=scope,
     )
     assert lf.unknown_source is False and ctx.identity.writer_epoch == 1
+
+
+def test_mcp_tool_result_over_64kib_encodes_in_jsonrpc_and_enforces_1mib_cap() -> None:
+    from superbrain.core.wire import (
+        encode_envelope,
+        encode_jsonrpc_result,
+        load_catalog,
+        make_mcp_tool_result,
+        make_success_envelope,
+    )
+
+    catalog = load_catalog()
+    out_validator = jsonschema.Draft202012Validator(catalog.tools["get_artifact"].output_schema)
+
+    for resource_payloads in (
+        [("single.md", "S" * 65_500)],
+        [("L1.md", "A" * 36_000), ("L2.md", "B" * 36_000)],
+    ):
+        envelope = make_success_envelope(
+            {
+                "artifact_id": "art-large-01",
+                "revision": 1,
+                "level": "L2",
+                "status": "ok",
+                "resources": [
+                    {
+                        "name": name,
+                        "digest": digest_bytes(body.encode("utf-8")),
+                        "encoding": "utf-8",
+                        "content": body,
+                    }
+                    for name, body in resource_payloads
+                ],
+                "served_receipt_id": "rcpt-large-01",
+            }
+        )
+        out_validator.validate(envelope)
+
+        mcp_result = make_mcp_tool_result(envelope)
+        content_items = mcp_result["content"]
+        assert isinstance(content_items, list) and isinstance(content_items[0], dict)
+        text_body = content_items[0]["text"]
+        assert isinstance(text_body, str) and len(text_body.encode("utf-8")) > 65_536
+
+        rpc_bytes = encode_jsonrpc_result("req-over-64k", mcp_result)
+        assert len(rpc_bytes) <= 1_048_576
+        decoded_rpc = json.loads(rpc_bytes.decode("utf-8"))
+        assert decoded_rpc["jsonrpc"] == "2.0"
+        assert decoded_rpc["id"] == "req-over-64k"
+        assert decoded_rpc["result"]["structuredContent"] == envelope
+        assert json.loads(decoded_rpc["result"]["content"][0]["text"]) == envelope
+
+    # JSON safety checks (lone surrogates / NaN) still enforced on outgoing JSON-RPC result
+    for unsafe_result in (
+        {"bad": "\ud800"},
+        {"bad": float("nan")},
+        {"bad": float("inf")},
+    ):
+        with pytest.raises(BrainError) as unsafe_exc:
+            encode_jsonrpc_result("req-unsafe", unsafe_result)
+        assert unsafe_exc.value.code == ErrorCode.INVALID_INPUT
+
+    # Outgoing envelope / JSON-RPC result exceeding 1 MiB body cap is rejected
+    oversize_resources: list[JsonValue] = [
+        {
+            "name": f"part-{idx}.txt",
+            "digest": "sha256:" + ("c" * 64),
+            "encoding": "utf-8",
+            "content": "X" * 60_000,
+        }
+        for idx in range(20)
+    ]
+    oversize_env: dict[str, JsonValue] = {
+        "ok": True,
+        "data": {
+            "artifact_id": "art-oversize",
+            "revision": 1,
+            "level": "L2",
+            "status": "ok",
+            "resources": oversize_resources,
+        },
+    }
+    with pytest.raises(BrainError) as env_exc:
+        encode_envelope(oversize_env)
+    assert env_exc.value.code == ErrorCode.INVALID_INPUT
+
+    # Even if an envelope is ~600 KiB (< 1 MiB), duplicating it in structuredContent + text > 1 MiB fails framing
+    half_mib_resources: list[JsonValue] = [
+        {
+            "name": f"seg-{idx}.txt",
+            "digest": "sha256:" + ("d" * 64),
+            "encoding": "utf-8",
+            "content": "Y" * 60_000,
+        }
+        for idx in range(10)
+    ]
+    half_mib_mcp = make_mcp_tool_result(
+        {
+            "ok": True,
+            "data": {
+                "artifact_id": "art-half-mib",
+                "revision": 1,
+                "level": "L2",
+                "status": "ok",
+                "resources": half_mib_resources,
+            },
+        }
+    )
+    with pytest.raises(BrainError) as rpc_exc:
+        encode_jsonrpc_result("req-over-1m", half_mib_mcp)
+    assert rpc_exc.value.code == ErrorCode.INVALID_INPUT
+
+
+def test_overlong_integer_digits_and_stored_result_decoders_raise_brain_error() -> None:
+    from superbrain.core.kernel import StoredResult
+    from superbrain.core.wire import (
+        JSONRPC_PARSE_ERROR,
+        JsonRpcError,
+        parse_json,
+        parse_jsonrpc_request,
+    )
+
+    huge_digits = "9" * 5_000
+
+    with pytest.raises(BrainError) as pj_exc:
+        parse_json(f'{{"huge": {huge_digits}}}'.encode())
+    assert pj_exc.value.code == ErrorCode.INVALID_INPUT
+
+    with pytest.raises(JsonRpcError) as rpc_exc:
+        parse_jsonrpc_request(
+            f'{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"n":{huge_digits}}}}}'.encode()
+        )
+    assert rpc_exc.value.code == JSONRPC_PARSE_ERROR
+
+    for bad_refs_str in (
+        f"[{huge_digits}]",
+        '[{"kind":"skill","kind":"dup","id":"s-1","revision":1,"digest":"sha256:' + ("0" * 64) + '"}]',
+        "[NaN]",
+        "[" * 40 + "]" * 40,
+        '"\\ud800"',
+    ):
+        with pytest.raises(BrainError) as refs_exc:
+            StoredResult.decode_refs_json(bad_refs_str)
+        assert refs_exc.value.code == ErrorCode.INVALID_INPUT
+
+    for bad_canonical in (
+        f'{{"result_id":"r-1","assignment_id":null,"refs":[{huge_digits}]}}'.encode(),
+        b'{"result_id":"r-1","result_id":"r-2","assignment_id":null,"refs":[]}',
+        b'{"result_id":"r-1","assignment_id":NaN,"refs":[]}',
+        (b"[" * 40) + (b"]" * 40),
+    ):
+        with pytest.raises(BrainError) as canon_exc:
+            StoredResult.from_canonical(bad_canonical)
+        assert canon_exc.value.code == ErrorCode.INVALID_INPUT
+
+
+def test_unhashable_enum_candidates_in_normalize_call_raise_brain_error() -> None:
+    from superbrain.core.kernel import Principal
+    from superbrain.core.wire import normalize_call
+
+    principal = Principal(
+        principal_id="princ-01",
+        owner_id="owner-01",
+        harness_id="codex-desktop",
+        machine_id="mach-01",
+    )
+    bad_levels: tuple[JsonValue, ...] = (["L1"], {"level": "L1"})
+    for bad_level in bad_levels:
+        with pytest.raises(BrainError) as lvl_exc:
+            normalize_call(
+                "get_artifact",
+                {
+                    "schema_version": "2.0",
+                    "workspace_id": "repo-01",
+                    "task_id": "task-01",
+                    "artifact_id": "art-01",
+                    "revision": 1,
+                    "level": bad_level,
+                    "idempotency_key": "idem_bad_lvl_type_01",
+                },
+                principal,
+                selected_scope=None,
+            )
+        assert lvl_exc.value.code == ErrorCode.INVALID_INPUT
+
+    bad_outcomes: tuple[JsonValue, ...] = (["success"], {"outcome": "success"})
+    for bad_outcome in bad_outcomes:
+        with pytest.raises(BrainError) as out_exc:
+            normalize_call(
+                "record_outcome",
+                {
+                    "schema_version": "2.0",
+                    "workspace_id": "repo-01",
+                    "delivery_id": "deliv-01",
+                    "outcome": bad_outcome,
+                    "idempotency_key": "idem_bad_out_type_01",
+                },
+                principal,
+                selected_scope=None,
+            )
+        assert out_exc.value.code == ErrorCode.INVALID_INPUT
 
 
 def test_prepare_response_snapshot_state_oneof() -> None:

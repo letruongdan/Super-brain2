@@ -3,10 +3,17 @@
 from __future__ import annotations
 
 import copy
-import json
-import math
 from collections.abc import Mapping
 
+from superbrain.core._json_parse import (
+    MAX_WIRE_ARRAY_LEN,
+    MAX_WIRE_BODY_BYTES,
+    MAX_WIRE_DEPTH,
+    MAX_WIRE_TEXT_BYTES,
+    _encode_wire_str,
+    _validate_wire_structure,
+    parse_json,
+)
 from superbrain.core._wire_catalog import EXPECTED_TOOL_ORDER, build_catalog
 from superbrain.core._wire_jsonrpc import (
     JSONRPC_INVALID_PARAMS,
@@ -80,11 +87,6 @@ __all__ = [
 MCP_PROTOCOL_VERSION = "2025-06-18"
 SCHEMA_VERSION = "2.0"
 
-MAX_WIRE_BODY_BYTES = 1_048_576
-MAX_WIRE_TEXT_BYTES = 65_536
-MAX_WIRE_ARRAY_LEN = 1_024
-MAX_WIRE_DEPTH = 32
-
 DEFAULT_CONTEXT_BUDGET_TOKENS = 4_000
 MAX_CONTEXT_BUDGET_TOKENS = 4_000
 DEFAULT_SEARCH_LIMIT = 20
@@ -107,16 +109,6 @@ _FORBIDDEN_AUTHORITY_KEYS = frozenset(
 )
 
 
-def _encode_wire_str(value: str, *, max_bytes: int = MAX_WIRE_TEXT_BYTES) -> bytes:
-    try:
-        encoded = value.encode("utf-8", errors="strict")
-    except UnicodeEncodeError as err:
-        raise BrainError(ErrorCode.INVALID_INPUT, "unpaired surrogate") from err
-    if len(encoded) > max_bytes:
-        raise BrainError(ErrorCode.INVALID_INPUT, "string exceeds size limit")
-    return encoded
-
-
 def _require_nonempty_text(value: object, *, max_bytes: int = MAX_WIRE_TEXT_BYTES) -> str:
     if not isinstance(value, str) or not value:
         raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
@@ -136,81 +128,6 @@ def _require_bounded_int(value: object, *, minimum: int, maximum: int) -> int:
     if type(value) is not int or not (minimum <= value <= maximum):
         raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
     return value
-
-
-def _validate_wire_structure(root: object) -> None:
-    """Iteratively verify depth <= 32, array length <= 1024, UTF-8 string caps, and finite numbers."""
-    stack: list[tuple[object, int]] = [(root, 0)]
-    while stack:
-        item, depth = stack.pop()
-        if item is None or isinstance(item, (bool, int)):
-            continue
-        if isinstance(item, float):
-            if not math.isfinite(item):
-                raise BrainError(ErrorCode.INVALID_INPUT, "non-finite number")
-            continue
-        if isinstance(item, str):
-            _encode_wire_str(item)
-            continue
-        if isinstance(item, list):
-            next_depth = depth + 1
-            if next_depth > MAX_WIRE_DEPTH:
-                raise BrainError(ErrorCode.INVALID_INPUT, "nesting depth exceeded")
-            if len(item) > MAX_WIRE_ARRAY_LEN:
-                raise BrainError(ErrorCode.INVALID_INPUT, "array exceeds length limit")
-            for child in item:
-                stack.append((child, next_depth))
-            continue
-        if isinstance(item, dict):
-            next_depth = depth + 1
-            if next_depth > MAX_WIRE_DEPTH:
-                raise BrainError(ErrorCode.INVALID_INPUT, "nesting depth exceeded")
-            for key, child in item.items():
-                if not isinstance(key, str):
-                    raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
-                _encode_wire_str(key)
-                stack.append((child, next_depth))
-            continue
-        raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
-
-
-def parse_json(raw: bytes) -> JsonValue:
-    """Strictly parse UTF-8 JSON bytes enforcing size, duplicate-key, surrogate, and depth caps."""
-    if not isinstance(raw, bytes):
-        raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
-    if len(raw) > MAX_WIRE_BODY_BYTES:
-        raise BrainError(ErrorCode.INVALID_INPUT, "payload exceeds size limit")
-    try:
-        text = raw.decode("utf-8", errors="strict")
-    except UnicodeDecodeError as err:
-        raise BrainError(ErrorCode.INVALID_INPUT, "invalid UTF-8 encoding") from err
-
-    def unique_pairs(pairs: list[tuple[str, JsonValue]]) -> dict[str, JsonValue]:
-        obj: dict[str, JsonValue] = {}
-        for key, val in pairs:
-            if key in obj:
-                raise BrainError(ErrorCode.INVALID_INPUT, "duplicate object key")
-            obj[key] = val
-        return obj
-
-    def reject_nonfinite(_token: str) -> float:
-        raise BrainError(ErrorCode.INVALID_INPUT, "non-finite number")
-
-    try:
-        parsed: JsonValue = json.loads(
-            text,
-            object_pairs_hook=unique_pairs,
-            parse_constant=reject_nonfinite,
-        )
-    except BrainError:
-        raise
-    except RecursionError as err:
-        raise BrainError(ErrorCode.INVALID_INPUT, "nesting depth exceeded") from err
-    except json.JSONDecodeError as err:
-        raise BrainError(ErrorCode.INVALID_INPUT, "malformed JSON") from err
-
-    _validate_wire_structure(parsed)
-    return parsed
 
 
 def load_catalog() -> ToolCatalog:
@@ -417,7 +334,8 @@ def normalize_call(
         require_opaque_id(business["task_id"], label="task_id")
         require_opaque_id(business["artifact_id"], label="artifact_id")
         require_positive_int(business["revision"])
-        if business["level"] not in {"L0", "L1", "L2"}:
+        level = business["level"]
+        if not isinstance(level, str) or level not in {"L0", "L1", "L2"}:
             raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
         _require_idempotency_key(business["idempotency_key"])
     elif tool == "submit_episode":
@@ -431,6 +349,8 @@ def normalize_call(
         require_opaque_id(business["workspace_id"], label="workspace_id")
         require_opaque_id(business["delivery_id"], label="delivery_id")
         outcome = business["outcome"]
+        if not isinstance(outcome, str):
+            raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
         if outcome == "verified":
             raise BrainError(ErrorCode.INVALID_INPUT, "forbidden client-supplied authority field")
         if outcome not in {"success", "failure", "unknown"}:
@@ -530,7 +450,10 @@ def encode_envelope(result: JsonValue | Mapping[str, JsonValue]) -> bytes:
             raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
         if not isinstance(message, str) or not is_safe_wire_message(message):
             raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
-    return canonical_json(result)
+    encoded = canonical_json(result)
+    if len(encoded) > MAX_WIRE_BODY_BYTES:
+        raise BrainError(ErrorCode.INVALID_INPUT, "payload exceeds size limit")
+    return encoded
 
 
 def make_mcp_tool_result(envelope: Mapping[str, JsonValue]) -> dict[str, JsonValue]:
@@ -550,4 +473,4 @@ def parse_jsonrpc_request(raw: bytes) -> tuple[JsonRpcId, str, dict[str, JsonVal
 
 
 def encode_jsonrpc_result(request_id: JsonRpcId, result: Mapping[str, JsonValue]) -> bytes:
-    return build_jsonrpc_result(request_id, result, _validate_wire_structure)
+    return build_jsonrpc_result(request_id, result)

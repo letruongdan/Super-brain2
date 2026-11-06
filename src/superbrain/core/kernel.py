@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import copy
-import json
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TypeAlias
 
+from superbrain.core._json_parse import parse_json
 from superbrain.core.canonical import canonical_json, validate_json
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.jsonvalue import JsonValue
@@ -223,12 +223,18 @@ class StoredResult:
         if not isinstance(raw, str):
             raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
         try:
-            parsed = json.loads(raw)
-        except json.JSONDecodeError as err:
-            raise BrainError(ErrorCode.INVALID_INPUT, "malformed JSON") from err
+            raw_bytes = raw.encode("utf-8", errors="strict")
+        except UnicodeEncodeError as err:
+            raise BrainError(ErrorCode.INVALID_INPUT, "unpaired surrogate") from err
+        parsed = parse_json(raw_bytes)
         if not isinstance(parsed, list):
             raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
-        return tuple(ObjectRef.from_dict(item) for item in parsed)
+        refs: list[ObjectRef] = []
+        for item in parsed:
+            if not isinstance(item, Mapping):
+                raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+            refs.append(ObjectRef.from_dict(item))
+        return tuple(refs)
 
     def encode_canonical(self) -> bytes:
         payload: dict[str, JsonValue] = {
@@ -240,12 +246,7 @@ class StoredResult:
 
     @classmethod
     def from_canonical(cls, raw: bytes) -> StoredResult:
-        if not isinstance(raw, bytes):
-            raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
-        try:
-            parsed = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as err:
-            raise BrainError(ErrorCode.INVALID_INPUT, "malformed JSON") from err
+        parsed = parse_json(raw)
         if not isinstance(parsed, dict) or set(parsed) != {"result_id", "assignment_id", "refs"}:
             raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
         raw_assignment = parsed["assignment_id"]
@@ -254,10 +255,15 @@ class StoredResult:
         raw_refs = parsed["refs"]
         if not isinstance(raw_refs, list):
             raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+        refs: list[ObjectRef] = []
+        for item in raw_refs:
+            if not isinstance(item, Mapping):
+                raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+            refs.append(ObjectRef.from_dict(item))
         return cls(
             result_id=require_opaque_id(parsed["result_id"], label="result_id"),
             assignment_id=raw_assignment,
-            refs=tuple(ObjectRef.from_dict(item) for item in raw_refs),
+            refs=tuple(refs),
         )
 
 

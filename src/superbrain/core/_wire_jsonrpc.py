@@ -5,8 +5,9 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from typing import TypeAlias
 
-from superbrain.core.canonical import canonical_json
-from superbrain.core.errors import BrainError
+from superbrain.core._json_parse import MAX_WIRE_BODY_BYTES
+from superbrain.core.canonical import canonical_json, validate_json
+from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.jsonvalue import JsonValue
 
 JSONRPC_VERSION = "2.0"
@@ -89,23 +90,30 @@ def parse_jsonrpc_frame(
 def build_jsonrpc_result(
     request_id: JsonRpcId,
     result: Mapping[str, JsonValue],
-    validator: Callable[[object], None],
 ) -> bytes:
     checked_id = validate_jsonrpc_id(request_id)
+    if not isinstance(result, Mapping):
+        raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
     res_dict = dict(result)
-    validator(res_dict)
-    return canonical_json({"jsonrpc": JSONRPC_VERSION, "id": checked_id, "result": res_dict})
+    validate_json(res_dict)
+    encoded = canonical_json({"jsonrpc": JSONRPC_VERSION, "id": checked_id, "result": res_dict})
+    if len(encoded) > MAX_WIRE_BODY_BYTES:
+        raise BrainError(ErrorCode.INVALID_INPUT, "payload exceeds size limit")
+    return encoded
 
 
 def encode_jsonrpc_error(request_id: JsonRpcId, code: int, message: str | None = None) -> bytes:
     checked_id = validate_jsonrpc_id(request_id)
     safe_msg = _JSONRPC_ERROR_MESSAGES.get(code, "invalid request")
-    if message is not None and message in _JSONRPC_ERROR_MESSAGES.values():
+    if isinstance(message, str) and message in _JSONRPC_ERROR_MESSAGES.values():
         safe_msg = message
-    return canonical_json(
+    encoded = canonical_json(
         {
             "jsonrpc": JSONRPC_VERSION,
             "id": checked_id,
             "error": {"code": code, "message": safe_msg},
         }
     )
+    if len(encoded) > MAX_WIRE_BODY_BYTES:
+        raise BrainError(ErrorCode.INVALID_INPUT, "payload exceeds size limit")
+    return encoded
