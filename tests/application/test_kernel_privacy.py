@@ -620,7 +620,7 @@ def test_benign_keys_survive_word_boundary_splits(key: str) -> None:
 
 
 def test_long_key_word_split_stays_linear() -> None:
-    for key in ("A" * 60_000, "Ab" * 30_000, "a1" * 30_000, "AAb" * 20_000):
+    for key in ("A" * 60_000, "Ab" * 30_000, "a1" * 30_000, "AAb" * 20_000, "pass_" * 12_000, "abcdefg_" * 7_500):
         start = time.perf_counter()
         _apply({key: 1})
         assert time.perf_counter() - start < 0.1
@@ -638,3 +638,40 @@ def test_direct_manual_projection_applies_segment_rule() -> None:
     assert project_manual_submission({"task_id": secret_id, "status": "ok"}, policy) == {"status": "ok"}
     kept: dict[str, JsonValue] = {"task_id": "task-2026-11-07-0001", "delivery_id": "a" * 30, "status": "ok"}
     assert project_manual_submission(kept, policy) == kept
+
+
+# --- fix round 4: consolidated sensitive-key corpus (every key named in review rounds 1-4) -----------------------
+
+KEY_CORPUS_STRIP: tuple[str, ...] = (
+    # round 1 base vocabulary and variants
+    "password", "PASSWORD", "Passwd", "db_password", "client-secret", "API_KEY", "apiKey", "access_token",
+    "Refresh-Token", "private_key", "Set-Cookie", "cookie", "session_token", "pwd", "token", "auth_token",
+    "X-Auth-Token", "x-api-key", "Passphrase", "github_token", "\uff30\uff21\uff33\uff33\uff37\uff2f\uff32\uff24",
+    "password_hash", "credential", "bearer", "authorization",
+    # round 2 mid-key words
+    "aws_secret_access_key", "awsSecretAccessKey", "db_password_old", "user_password_hash", "my_secret_value",
+    "x_client_secret_v2", "stripe_api_key_live", "github_token_value",
+    # round 3 acronym and digit boundaries
+    "AWSSecretAccessKey", "DBPassword", "SMTPPassword", "JWTSecret", "password2", "db_password1", "secret2",
+    "apiKey2", "OAuthToken", "APIKey", "access_token_count",
+    # round 4 joined single words and containment
+    "accesstoken", "ACCESSTOKEN", "privatekey", "Privatekey", "clientsecret", "refreshtoken", "sessiontoken",
+    "setcookie", "authtoken", "xapikey", "xauthtoken", "mypassword", "passwordhash",
+)  # fmt: skip
+KEY_CORPUS_KEEP: tuple[str, ...] = (
+    "context_budget_tokens", "tokenizer", "token_estimator", "token_budget", "secretary", "description",
+    "XMLHttpRequest", "sha256Digest", "IPv6Address",
+)  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    ("key", "stripped"), [(k, True) for k in KEY_CORPUS_STRIP] + [(k, False) for k in KEY_CORPUS_KEEP]
+)
+def test_sensitive_key_corpus_exact_outcomes(key: str, stripped: bool) -> None:
+    safe = _apply({key: "hunter2", "keep": 1})
+    if stripped:
+        assert safe.value == {"keep": 1}
+        assert safe.stripped_keys_count == 1
+    else:
+        assert safe.value == {key: "hunter2", "keep": 1}
+        assert safe.stripped_keys_count == 0

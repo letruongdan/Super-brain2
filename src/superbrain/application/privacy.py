@@ -78,6 +78,9 @@ _BENIGN_NEXT_WORDS: dict[str, frozenset[str]] = {
     "token": frozenset({"estimator", "estimate", "budget", "count", "counts", "limit", "usage", "total"}),
 }
 """Word n-grams that are measurements, not credentials (``token_estimator``), when followed by these words."""
+_CONTAINMENT_MIN = 6
+"""A single word containing a sensitive name at least this long is sensitive (``mypassword``); ``token`` is not."""
+_BENIGN_CONTAINING_WORDS: frozenset[str] = frozenset({"secretary", "secretaries", "secretariat", "secretarial"})
 
 
 class _Reject(Exception):
@@ -184,7 +187,10 @@ class _Run:
         self._paths = _PathMatcher(policy.blocked_path_patterns)
         self._min_segment = policy.entropy_min_length
         self._max_words = max((len(_key_words(k)) for k in policy.sensitive_keys), default=1)
-        self._first_words = frozenset(words[0] for k in policy.sensitive_keys if (words := _key_words(k)))
+        # Vocabulary = joined forms of every sensitive name (``access_token`` -> ``accesstoken``), so one word equal
+        # to a joined multi-word name matches; ``_prefixes`` only prunes windows that can no longer reach one.
+        self._prefixes = frozenset(name[:i] for name in self._sensitive for i in range(1, len(name) + 1))
+        self._contained = tuple(sorted(name for name in self._sensitive if len(name) >= _CONTAINMENT_MIN))
 
     def tick(self) -> None:
         if self._deadline_ns is not None and self._monotonic_ns() >= self._deadline_ns:
@@ -228,20 +234,33 @@ class _Run:
         raise _Reject
 
     def _sensitive_key(self, key: str) -> bool:
-        """Any contiguous window of normalised words (exact word n-gram) naming a sensitive key.
+        """A key is sensitive when, over its NFKC/casefold words:
 
-        Windows are bounded by the longest sensitive name, so the check stays linear in the key length.
+        * any contiguous window of words, joined, equals a sensitive name (exact word n-gram; a single word equal to
+          a joined multi-word name such as ``accesstoken`` counts), unless a benign follower makes it a measurement
+          (``token_estimator``); or
+        * one word contains a sensitive name of >= 6 chars (``mypassword``), unless that word is benign
+          (``secretary``).
+
+        Windows are bounded by the longest name and pruned by name prefixes, so the check is linear in the key.
         """
         words = _key_words(key)
-        for start in range(len(words)):
-            if words[start] not in self._first_words:
-                continue
+        for start, word in enumerate(words):
+            if (
+                len(word) >= _CONTAINMENT_MIN
+                and word not in _BENIGN_CONTAINING_WORDS
+                and any(name in word for name in self._contained)
+            ):
+                return True
+            joined = ""
             for size in range(1, min(self._max_words, len(words) - start) + 1):
-                if "".join(words[start : start + size]) not in self._sensitive:
+                joined += words[start + size - 1]
+                if joined not in self._prefixes:
+                    break
+                if joined not in self._sensitive:
                     continue
                 following = words[start + size] if start + size < len(words) else None
-                benign = _BENIGN_NEXT_WORDS.get("".join(words[start : start + size]), frozenset())
-                if following is None or following not in benign:
+                if following is None or following not in _BENIGN_NEXT_WORDS.get(joined, frozenset()):
                     return True
         return False
 
