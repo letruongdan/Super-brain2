@@ -1,0 +1,812 @@
+"""Contract tests for canonical MCP tools v2 schema, strict wire codec, and wheel packaging."""
+
+from __future__ import annotations
+
+import copy
+import hashlib
+import ipaddress
+import json
+import os
+import subprocess
+from pathlib import Path
+from typing import Any
+
+import jsonschema
+import pytest
+from cryptography import x509
+from cryptography.hazmat.primitives import serialization
+
+from superbrain.core.canonical import digest_bytes
+from superbrain.core.errors import SAFE_WIRE_MESSAGES, BrainError, ErrorCode
+from superbrain.core.jsonvalue import JsonValue
+from tests.support.inc2_fixture import InstalledEnv, SampleTlsMaterial
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+FIXTURES_DIR = REPO_ROOT / "tests" / "fixtures" / "mcp_v2"
+
+EXPECTED_TOOLS: dict[str, tuple[str, bool, str]] = {
+    "prepare_task": ("mutation", False, "sp4/sp5 (fixture-in-i2)"),
+    "search_knowledge": ("read_only", False, "sp4"),
+    "get_artifact": ("mutation", False, "sp4/sp5 (fixture-in-i2)"),
+    "submit_episode": ("mutation", False, "sp2/sp3"),
+    "record_outcome": ("mutation", False, "sp3/sp6 (fixture-in-i2)"),
+    "request_improvement": ("mutation", True, "sp6"),
+    "get_job": ("read_only", False, "sp1-i2"),
+    "get_health": ("conditional_deep_mutation", False, "sp1-i2 (shallow) / sp1-i4 (deep)"),
+}
+
+
+def _collect_local_refs(node: object) -> set[str]:
+    refs: set[str] = set()
+    if isinstance(node, dict):
+        ref = node.get("$ref")
+        if isinstance(ref, str):
+            assert ref.startswith("#/$defs/"), f"unexpected non-local $ref: {ref}"
+            refs.add(ref.removeprefix("#/$defs/"))
+        for key, value in node.items():
+            if key != "$defs":
+                refs |= _collect_local_refs(value)
+    elif isinstance(node, list):
+        for item in node:
+            refs |= _collect_local_refs(item)
+    return refs
+
+
+def _transitive_closure(root_node: dict[str, Any], defs: dict[str, Any]) -> set[str]:
+    needed: set[str] = set()
+    frontier = list(_collect_local_refs(root_node))
+    while frontier:
+        name = frontier.pop()
+        assert name in defs, f"missing $defs[{name!r}] in closure"
+        if name not in needed:
+            needed.add(name)
+            frontier.extend(_collect_local_refs(defs[name]))
+    return needed
+
+
+def test_exact_eight_tools_and_no_v1_or_approval() -> None:
+    from superbrain.core.kernel import Principal
+    from superbrain.core.wire import load_catalog, normalize_call
+
+    assert ErrorCode.UNAUTHENTICATED.value == "unauthenticated"
+    assert ErrorCode.DAEMON_UNAVAILABLE.value == "daemon_unavailable"
+    assert ErrorCode.POLICY_UNAVAILABLE.value == "policy_unavailable"
+
+    catalog = load_catalog()
+    assert catalog.contract == "mcp-tools-v2"
+    assert catalog.tokenizer == "utf8-byte-v1"
+    assert catalog.resolution == "single-checkout-owner-profile-v1"
+    assert catalog.schema_id == "https://ensemble-agents.local/superbrain/mcp-tools-v2.json"
+    assert set(catalog.tools) == set(EXPECTED_TOOLS)
+    assert len(catalog.tools) == 8
+
+    root_defs = catalog.schema["$defs"]
+    assert isinstance(root_defs, dict)
+    error_code_def = root_defs["ErrorCode"]
+    assert isinstance(error_code_def, dict)
+    code_enum = error_code_def["enum"]
+    assert isinstance(code_enum, list)
+    assert set(code_enum) == {code.value for code in ErrorCode}
+
+    error_detail_def = root_defs["ErrorDetail"]
+    assert isinstance(error_detail_def, dict)
+    detail_props = error_detail_def["properties"]
+    assert isinstance(detail_props, dict)
+    msg_def = detail_props["message"]
+    assert isinstance(msg_def, dict)
+    msg_enum = msg_def["enum"]
+    assert isinstance(msg_enum, list)
+    assert set(msg_enum) == set(SAFE_WIRE_MESSAGES)
+
+    for name, (side_effects, is_async, implemented_in) in EXPECTED_TOOLS.items():
+        spec = catalog.tools[name]
+        assert spec.name == name
+        assert spec.contract == "mcp-tools-v2"
+        assert spec.tokenizer == "utf8-byte-v1"
+        assert spec.side_effects == side_effects
+        assert spec.is_async is is_async
+        assert spec.implemented_in == implemented_in
+
+        mcp_entry = spec.to_mcp_tool()
+        assert mcp_entry["name"] == name
+        assert mcp_entry["x-contract"] == "mcp-tools-v2"
+        assert mcp_entry["x-tokenizer"] == "utf8-byte-v1"
+        assert mcp_entry["x-side-effects"] == side_effects
+        assert mcp_entry["x-async"] is is_async
+        assert mcp_entry["x-implemented-in"] == implemented_in
+
+        for exported_schema in (spec.input_schema, spec.output_schema):
+            jsonschema.Draft202012Validator.check_schema(exported_schema)
+            assert exported_schema.get("type") == "object"
+            defs = exported_schema.get("$defs")
+            assert isinstance(defs, dict)
+            closure = _transitive_closure(exported_schema, defs)
+            assert set(defs) == closure
+
+    principal = Principal(
+        principal_id="princ-01",
+        owner_id="owner-01",
+        harness_id="codex-desktop",
+        machine_id="mach-01",
+    )
+
+    prep_validator = jsonschema.Draft202012Validator(catalog.tools["prepare_task"].input_schema)
+    v1_args: dict[str, Any] = {
+        "schema_version": "1.0",
+        "workspace_hint": "sb2",
+        "description": "legacy v1 request",
+        "idempotency_key": "idem_legacy_v1_0001",
+    }
+    assert not prep_validator.is_valid(v1_args)
+    with pytest.raises(BrainError) as exc_info:
+        normalize_call("prepare_task", v1_args, principal, selected_scope=None)
+    assert exc_info.value.code == ErrorCode.UNSUPPORTED_VERSION
+
+    # Client cannot self-declare authority/provenance fields on prepare_task, submit_episode, or record_outcome
+    for forbidden_field, forbidden_val in (
+        ("source", "native"),
+        ("approval", {"approved": True}),
+        ("native_receipt", "rcpt-native-1"),
+        ("snapshot_status", "available"),
+        ("degraded_codes", []),
+        ("unknown_source", False),
+    ):
+        bad_prep: dict[str, Any] = {
+            "schema_version": "2.0",
+            "workspace_hint": "sb2",
+            "description": "attempt authority injection",
+            "idempotency_key": "idem_forbid_prep_0001",
+            forbidden_field: forbidden_val,
+        }
+        assert not prep_validator.is_valid(bad_prep)
+        with pytest.raises(BrainError) as exc_info:
+            normalize_call("prepare_task", bad_prep, principal, selected_scope=None)
+        assert exc_info.value.code == ErrorCode.INVALID_INPUT
+
+    submit_validator = jsonschema.Draft202012Validator(catalog.tools["submit_episode"].input_schema)
+    for injected_key in ("source", "approval", "native_receipt", "verified", "verification_status"):
+        bad_submit: dict[str, Any] = {
+            "schema_version": "2.0",
+            "task_id": "task-01",
+            "session_id": "sess-01",
+            "evidence": [{"kind": "cmd", "data": {"exit_code": 0, injected_key: "injected"}}],
+            "idempotency_key": "idem_forbid_sub_0001",
+        }
+        assert not submit_validator.is_valid(bad_submit)
+        with pytest.raises(BrainError) as exc_info:
+            normalize_call("submit_episode", bad_submit, principal, selected_scope=None)
+        assert exc_info.value.code == ErrorCode.INVALID_INPUT
+
+    outcome_validator = jsonschema.Draft202012Validator(catalog.tools["record_outcome"].input_schema)
+    for bad_outcome in (
+        {
+            "schema_version": "2.0",
+            "workspace_id": "repo-01",
+            "delivery_id": "deliv-01",
+            "outcome": "verified",
+            "idempotency_key": "idem_forbid_out_0001",
+        },
+        {
+            "schema_version": "2.0",
+            "workspace_id": "repo-01",
+            "delivery_id": "deliv-01",
+            "outcome": "success",
+            "verification_status": "verified",
+            "idempotency_key": "idem_forbid_out_0002",
+        },
+    ):
+        assert not outcome_validator.is_valid(bad_outcome)
+        with pytest.raises(BrainError) as exc_info:
+            normalize_call("record_outcome", bad_outcome, principal, selected_scope=None)
+        assert exc_info.value.code == ErrorCode.INVALID_INPUT
+
+
+def test_strict_wire_bad_inputs() -> None:
+    from superbrain.core.kernel import (
+        CallContext,
+        Identity,
+        LineagedField,
+        LineageRef,
+        ObjectRef,
+        Principal,
+        ReadAckInput,
+        ResourceDigest,
+        Scope,
+        StoredResult,
+    )
+    from superbrain.core.wire import (
+        JSONRPC_INVALID_REQUEST,
+        JSONRPC_PARSE_ERROR,
+        JsonRpcError,
+        canonical_request_payload,
+        encode_envelope,
+        make_error_envelope,
+        make_mcp_tool_result,
+        make_success_envelope,
+        normalize_call,
+        parse_json,
+        parse_jsonrpc_request,
+        validate_jsonrpc_id,
+    )
+
+    canary = "CANARY_SECRET_RAW_9876543210_DO_NOT_LEAK"
+    canary_bytes = canary.encode("utf-8")
+
+    def assert_safe_wire_error(err: BrainError, expected_code: ErrorCode) -> None:
+        assert err.code == expected_code
+        encoded = encode_envelope(make_error_envelope(err))
+        assert canary_bytes not in encoded
+        decoded = parse_json(encoded)
+        assert isinstance(decoded, dict)
+        assert decoded["ok"] is False
+
+    # 1. Strict JSON wire limits in parse_json
+    raw_bad_cases: list[bytes] = [
+        f'{{"a": 1, "a": "{canary}"}}'.encode(),  # duplicate key
+        b'{"pad":"' + (canary_bytes * 40_000) + b'"}',  # > 1 MiB body
+        b'{"big":"' + (b"x" * 65_500) + canary_bytes + b'"}',  # > 64 KiB ASCII string
+        ('{"utf8":"' + ("€" * 21_846) + '"}').encode("utf-8"),  # <= 65536 chars, > 65536 UTF-8 bytes
+        json.dumps(list(range(1025))).encode("utf-8"),  # > 1024 array items
+        (b"[" * 33) + b"1" + (b"]" * 33),  # > 32 list depth
+        (b'{"k":' * 33) + b"1" + (b"}" * 33),  # > 32 dict depth
+        f'{{"s": "\\ud800{canary}"}}'.encode(),  # lone high surrogate
+        f'{{"s": "\\udfff{canary}"}}'.encode(),  # lone low surrogate
+        b'{"bad":"\xff\xfe' + canary_bytes + b'"}',  # invalid UTF-8
+        b'{"n": NaN}',
+        b'{"n": Infinity}',
+        b'{"n": -Infinity}',
+    ]
+    for raw in raw_bad_cases:
+        with pytest.raises(BrainError) as exc_info:
+            parse_json(raw)
+        assert_safe_wire_error(exc_info.value, ErrorCode.INVALID_INPUT)
+
+    # Exactly depth 32 is permitted
+    depth_32 = (b"[" * 32) + b"1" + (b"]" * 32)
+    assert isinstance(parse_json(depth_32), list)
+
+    principal = Principal(
+        principal_id="princ-01",
+        owner_id="owner-01",
+        harness_id="claude-code",
+        machine_id="mach-01",
+    )
+    scope = Scope(repo_id="repo-01", checkout_id="chk-a")
+
+    # 2. Boolean rejected for integer fields, unknown fields, selector & conditional rules
+    bad_calls: list[tuple[str, Any, ErrorCode]] = [
+        (
+            "get_artifact",
+            {
+                "schema_version": "2.0",
+                "workspace_id": "repo-01",
+                "task_id": "task-01",
+                "artifact_id": "art-01",
+                "revision": True,
+                "level": "L0",
+                "idempotency_key": "idem_bool_rev_0001",
+            },
+            ErrorCode.INVALID_INPUT,
+        ),
+        (
+            "search_knowledge",
+            {
+                "schema_version": "2.0",
+                "workspace_id": "repo-01",
+                "query": "test",
+                "limit": False,
+            },
+            ErrorCode.INVALID_INPUT,
+        ),
+        (
+            "prepare_task",
+            {
+                "schema_version": "2.0",
+                "workspace_hint": "sb2",
+                "description": "desc",
+                "context_budget_tokens": True,
+                "idempotency_key": "idem_bool_bud_0001",
+            },
+            ErrorCode.INVALID_INPUT,
+        ),
+        (
+            "search_knowledge",
+            {
+                "schema_version": "2.0",
+                "workspace_id": "repo-01",
+                "query": "test",
+                canary: canary,
+            },
+            ErrorCode.INVALID_INPUT,
+        ),
+        # Mixed selector on prepare_task
+        (
+            "prepare_task",
+            {
+                "schema_version": "2.0",
+                "workspace_hint": "sb2",
+                "workspace_id": "repo-01",
+                "checkout_id": "chk-a",
+                "description": "mixed selector",
+                "idempotency_key": "idem_mix_sel_0001",
+            },
+            ErrorCode.INVALID_INPUT,
+        ),
+        # Partial IDs selector on prepare_task
+        (
+            "prepare_task",
+            {
+                "schema_version": "2.0",
+                "workspace_id": "repo-01",
+                "description": "missing checkout_id",
+                "idempotency_key": "idem_part_sel_0001",
+            },
+            ErrorCode.INVALID_INPUT,
+        ),
+        # Missing selector in normalized daemon prepare_task
+        (
+            "prepare_task",
+            {
+                "schema_version": "2.0",
+                "description": "no selector for daemon",
+                "idempotency_key": "idem_zero_sel_0001",
+            },
+            ErrorCode.INVALID_INPUT,
+        ),
+        # Traversal / raw path in workspace_hint
+        (
+            "prepare_task",
+            {
+                "schema_version": "2.0",
+                "workspace_hint": "../escape",
+                "description": "bad hint",
+                "idempotency_key": "idem_bad_hint_0001",
+            },
+            ErrorCode.INVALID_INPUT,
+        ),
+        (
+            "prepare_task",
+            {
+                "schema_version": "2.0",
+                "workspace_hint": "..",
+                "description": "dotdot hint",
+                "idempotency_key": "idem_bad_hint_0002",
+            },
+            ErrorCode.INVALID_INPUT,
+        ),
+        # Null source_snapshot_id on prepare_task request
+        (
+            "prepare_task",
+            {
+                "schema_version": "2.0",
+                "workspace_hint": "sb2",
+                "source_snapshot_id": None,
+                "description": "null snapshot on input",
+                "idempotency_key": "idem_null_snap_0001",
+            },
+            ErrorCode.INVALID_INPUT,
+        ),
+        # deep=True missing idempotency_key
+        (
+            "get_health",
+            {
+                "schema_version": "2.0",
+                "deep": True,
+            },
+            ErrorCode.INVALID_INPUT,
+        ),
+        # deep=False with idempotency_key
+        (
+            "get_health",
+            {
+                "schema_version": "2.0",
+                "deep": False,
+                "idempotency_key": "idem_shallow_health_01",
+            },
+            ErrorCode.INVALID_INPUT,
+        ),
+        # Duplicate resource_digests names in ReadAckInput
+        (
+            "record_outcome",
+            {
+                "schema_version": "2.0",
+                "workspace_id": "repo-01",
+                "delivery_id": "deliv-01",
+                "outcome": "success",
+                "read_acks": [
+                    {
+                        "served_receipt_id": "rcpt-01",
+                        "task_id": "task-01",
+                        "revision": 1,
+                        "resource_digests": [
+                            {"name": "L1.md", "digest": "sha256:" + ("a" * 64)},
+                            {"name": "L1.md", "digest": "sha256:" + ("b" * 64)},
+                        ],
+                    }
+                ],
+                "idempotency_key": "idem_dup_res_0001",
+            },
+            ErrorCode.INVALID_INPUT,
+        ),
+        # Principal mismatch -> IDENTITY_MISMATCH
+        (
+            "get_job",
+            {
+                "schema_version": "2.0",
+                "job_id": "job-01",
+                "owner_id": f"wrong-{canary}",
+            },
+            ErrorCode.IDENTITY_MISMATCH,
+        ),
+        (
+            "get_job",
+            {
+                "schema_version": "2.0",
+                "job_id": "job-01",
+                "machine_id": "mach-foreign",
+            },
+            ErrorCode.IDENTITY_MISMATCH,
+        ),
+    ]
+    for tool, args, expected_code in bad_calls:
+        with pytest.raises(BrainError) as exc_info:
+            normalize_call(tool, args, principal, selected_scope=scope)
+        assert_safe_wire_error(exc_info.value, expected_code)
+
+    # Even if an internal caller puts raw canary into BrainError.message, wire error strips it
+    raw_err = BrainError(ErrorCode.IO_ERROR, f"sqlite failed on {canary}")
+    assert_safe_wire_error(raw_err, ErrorCode.IO_ERROR)
+    with pytest.raises(BrainError) as exc_info:
+        encode_envelope({"ok": False, "error": {"code": "invalid_input", "message": f"leak {canary}"}})
+    assert exc_info.value.code == ErrorCode.INVALID_INPUT
+
+    # Matching identity fields stripped + defaults filled + framing correlation_id excluded from digest
+    call_with_id = normalize_call(
+        "prepare_task",
+        {
+            "schema_version": "2.0",
+            "workspace_hint": "sb2",
+            "description": "same business call",
+            "idempotency_key": "idem_same_call_0001",
+            "principal_id": "princ-01",
+            "owner_id": "owner-01",
+            "harness_id": "claude-code",
+            "machine_id": "mach-01",
+        },
+        principal,
+        selected_scope=scope,
+        correlation_id="rpc-frame-1",
+    )
+    call_explicit_default = normalize_call(
+        "prepare_task",
+        {
+            "schema_version": "2.0",
+            "workspace_hint": "sb2",
+            "description": "same business call",
+            "context_budget_tokens": 4000,
+            "idempotency_key": "idem_same_call_0001",
+        },
+        principal,
+        selected_scope=scope,
+        correlation_id="rpc-frame-2",
+    )
+    assert "owner_id" not in call_with_id.arguments
+    assert "principal_id" not in call_with_id.arguments
+    assert call_with_id.arguments == call_explicit_default.arguments
+    assert digest_bytes(canonical_request_payload(call_with_id)) == digest_bytes(
+        canonical_request_payload(call_explicit_default)
+    )
+
+    # MCP tool result helper & core types validation
+    ok_env = make_success_envelope({"outcome_id": "out-1", "status": "declared"})
+    mcp_ok = make_mcp_tool_result(ok_env)
+    assert mcp_ok["isError"] is False
+    assert mcp_ok["structuredContent"] == ok_env
+    assert mcp_ok["content"] == [{"type": "text", "text": encode_envelope(ok_env).decode("utf-8")}]
+
+    err_env = make_error_envelope(BrainError(ErrorCode.CAPABILITY_UNAVAILABLE, "not yet built"))
+    mcp_err = make_mcp_tool_result(err_env)
+    assert mcp_err["isError"] is True
+
+    # JSON-RPC ID and framing checks
+    assert validate_jsonrpc_id("req-1") == "req-1"
+    assert validate_jsonrpc_id(42) == 42
+    assert validate_jsonrpc_id(None) is None
+    for bad_rpc_id in (True, 1.5, "x" * 129):
+        with pytest.raises(JsonRpcError) as rpc_exc:
+            validate_jsonrpc_id(bad_rpc_id)
+        assert rpc_exc.value.code == JSONRPC_INVALID_REQUEST
+    with pytest.raises(JsonRpcError) as rpc_parse:
+        parse_jsonrpc_request(b"{not-json")
+    assert rpc_parse.value.code == JSONRPC_PARSE_ERROR
+
+    # Core kernel invariants
+    with pytest.raises(BrainError):
+        ObjectRef(kind="skill", id="s-1", revision=True, digest="sha256:" + ("0" * 64))
+    with pytest.raises(BrainError):
+        ObjectRef(kind="skill", id="s-1", revision=1, digest="sha256:NOTHEX")
+    with pytest.raises(BrainError):
+        ReadAckInput(
+            served_receipt_id="r-1",
+            task_id="t-1",
+            revision=1,
+            resource_digests=(
+                ResourceDigest("L0.md", "sha256:" + ("1" * 64)),
+                ResourceDigest("L0.md", "sha256:" + ("2" * 64)),
+            ),
+        )
+
+    ref = ObjectRef(kind="skill", id="s-1", revision=2, digest="sha256:" + ("a" * 64))
+    stored = StoredResult(result_id="res-1", assignment_id="asgn-1", refs=(ref,))
+    assert StoredResult.from_canonical(stored.encode_canonical()) == stored
+    lineage_ref = LineageRef(owner_id="owner-01", repo_id="repo-01", source=ref)
+    lf = LineagedField(value={"k": "v"}, sources=frozenset({lineage_ref}), unknown_source=False)
+    ctx = CallContext(
+        principal=principal,
+        identity=Identity(store_id="store-1", writer_epoch=1, instance_id="inst-1"),
+        deadline_ns=1_000_000_000,
+        selected_scope=scope,
+    )
+    assert lf.unknown_source is False and ctx.identity.writer_epoch == 1
+
+
+def test_prepare_response_snapshot_state_oneof() -> None:
+    from superbrain.core.wire import load_catalog
+
+    catalog = load_catalog()
+    out_validator = jsonschema.Draft202012Validator(catalog.tools["prepare_task"].output_schema)
+    in_validator = jsonschema.Draft202012Validator(catalog.tools["prepare_task"].input_schema)
+
+    base_data: dict[str, Any] = {
+        "workspace_id": "repo-01",
+        "checkout_id": "chk-a",
+        "source_snapshot_id": "snap-01",
+        "snapshot_status": "available",
+        "degraded_codes": [],
+        "task_id": "task-01",
+        "delivery_id": "deliv-01",
+        "skills": [],
+        "lessons": [],
+        "continuity": [],
+        "context": [],
+        "finishing_gates": [],
+    }
+
+    for valid_patch in (
+        {"snapshot_status": "available", "source_snapshot_id": "snap-01", "degraded_codes": []},
+        {"snapshot_status": "available", "source_snapshot_id": "snap-01", "degraded_codes": ["jev_timeout"]},
+        {
+            "snapshot_status": "unavailable",
+            "source_snapshot_id": None,
+            "degraded_codes": ["snapshot_unavailable"],
+        },
+        {
+            "snapshot_status": "deadline",
+            "source_snapshot_id": None,
+            "degraded_codes": ["snapshot_deadline"],
+        },
+    ):
+        candidate = {"ok": True, "data": {**copy.deepcopy(base_data), **valid_patch}}
+        out_validator.validate(candidate)
+
+    invalid_patches: list[dict[str, JsonValue]] = [
+        {"snapshot_status": "available", "source_snapshot_id": None, "degraded_codes": []},
+        {
+            "snapshot_status": "available",
+            "source_snapshot_id": "snap-01",
+            "degraded_codes": ["snapshot_unavailable"],
+        },
+        {
+            "snapshot_status": "available",
+            "source_snapshot_id": "snap-01",
+            "degraded_codes": ["snapshot_deadline"],
+        },
+        {
+            "snapshot_status": "unavailable",
+            "source_snapshot_id": "snap-01",
+            "degraded_codes": ["snapshot_unavailable"],
+        },
+        {"snapshot_status": "unavailable", "source_snapshot_id": None, "degraded_codes": []},
+        {
+            "snapshot_status": "unavailable",
+            "source_snapshot_id": None,
+            "degraded_codes": ["snapshot_unavailable", "snapshot_deadline"],
+        },
+        {
+            "snapshot_status": "deadline",
+            "source_snapshot_id": "snap-01",
+            "degraded_codes": ["snapshot_deadline"],
+        },
+        {"snapshot_status": "deadline", "source_snapshot_id": None, "degraded_codes": []},
+    ]
+    for invalid_patch in invalid_patches:
+        bad_candidate = {"ok": True, "data": {**copy.deepcopy(base_data), **invalid_patch}}
+        assert not out_validator.is_valid(bad_candidate), f"expected invalid for {invalid_patch}"
+
+    missing_status = copy.deepcopy(base_data)
+    del missing_status["snapshot_status"]
+    assert not out_validator.is_valid({"ok": True, "data": missing_status})
+
+    for bad_client_extra in ({"snapshot_status": "available"}, {"unknown_source": True}):
+        assert not in_validator.is_valid(
+            {
+                "schema_version": "2.0",
+                "workspace_hint": "sb2",
+                "description": "task",
+                "idempotency_key": "idem_bad_status_0001",
+                **bad_client_extra,
+            }
+        )
+
+
+def test_schema_roundtrip_and_packaged_digest(
+    inc2_installed_env: InstalledEnv,
+    inc2_tls_material: SampleTlsMaterial,
+    trusted_tmp: Path,
+) -> None:
+    from superbrain.core.kernel import Principal, Scope
+    from superbrain.core.wire import (
+        canonical_request_payload,
+        encode_envelope,
+        load_catalog,
+        normalize_call,
+        parse_json,
+    )
+
+    catalog = load_catalog()
+    root_validator = jsonschema.Draft202012Validator(catalog.schema)
+    kernel_http_schema = {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/$defs/KernelHttpCall",
+        "$defs": catalog.schema["$defs"],
+    }
+    http_call_validator = jsonschema.Draft202012Validator(kernel_http_schema)
+    root_validator.check_schema(catalog.schema)
+
+    requests_doc = parse_json((FIXTURES_DIR / "requests.json").read_bytes())
+    responses_doc = parse_json((FIXTURES_DIR / "responses.json").read_bytes())
+    errors_doc = parse_json((FIXTURES_DIR / "errors.json").read_bytes())
+    assert isinstance(requests_doc, dict)
+    assert isinstance(responses_doc, dict)
+    assert isinstance(errors_doc, dict)
+
+    p_raw = requests_doc["principal"]
+    assert isinstance(p_raw, dict)
+    principal = Principal(
+        principal_id=str(p_raw["principal_id"]),
+        owner_id=str(p_raw["owner_id"]),
+        harness_id=str(p_raw["harness_id"]),
+        machine_id=str(p_raw["machine_id"]),
+    )
+
+    req_cases = requests_doc["cases"]
+    assert isinstance(req_cases, list)
+    seen_req_tools: set[str] = set()
+    for case in req_cases:
+        assert isinstance(case, dict)
+        tool = str(case["tool"])
+        seen_req_tools.add(tool)
+        spec = catalog.tools[tool]
+        client_validator = jsonschema.Draft202012Validator(spec.input_schema)
+        client_args = case["client_args"]
+        client_validator.validate(client_args)
+
+        if not case["client_only"]:
+            raw_scope = case["selected_scope"]
+            scope = (
+                Scope(
+                    repo_id=str(raw_scope["repo_id"]),
+                    checkout_id=str(raw_scope["checkout_id"]) if raw_scope["checkout_id"] is not None else None,
+                )
+                if isinstance(raw_scope, dict)
+                else None
+            )
+            corr = str(case["correlation_id"]) if isinstance(case["correlation_id"], str) else None
+            call = normalize_call(tool, client_args, principal, selected_scope=scope, correlation_id=corr)
+            assert call.arguments == case["daemon_args"]
+
+            http_payload: dict[str, Any] = {
+                "tool": call.tool,
+                "arguments": call.arguments,
+                "correlation_id": call.correlation_id,
+                "selected_scope": (
+                    {"repo_id": scope.repo_id, "checkout_id": scope.checkout_id} if scope is not None else None
+                ),
+            }
+            http_call_validator.validate(http_payload)
+
+            # Reversed key order & different correlation_id produce identical canonical request digest
+            assert isinstance(client_args, dict)
+            reordered_args = dict(reversed(list(client_args.items())))
+            call_reordered = normalize_call(
+                tool, reordered_args, principal, selected_scope=scope, correlation_id="other-corr-id"
+            )
+            assert canonical_request_payload(call) == canonical_request_payload(call_reordered)
+    assert seen_req_tools == set(EXPECTED_TOOLS)
+
+    resp_cases = responses_doc["cases"]
+    assert isinstance(resp_cases, list)
+    seen_resp_tools: set[str] = set()
+    for case in resp_cases:
+        assert isinstance(case, dict)
+        tool = str(case["tool"])
+        seen_resp_tools.add(tool)
+        envelope = case["envelope"]
+        jsonschema.Draft202012Validator(catalog.tools[tool].output_schema).validate(envelope)
+        encoded = encode_envelope(envelope)
+        assert parse_json(encoded) == envelope
+    assert seen_resp_tools == set(EXPECTED_TOOLS)
+
+    err_cases = errors_doc["cases"]
+    assert isinstance(err_cases, list)
+    seen_err_codes: set[str] = set()
+    for case in err_cases:
+        assert isinstance(case, dict)
+        tool = str(case["tool"])
+        envelope = case["envelope"]
+        assert isinstance(envelope, dict) and isinstance(envelope["error"], dict)
+        seen_err_codes.add(str(envelope["error"]["code"]))
+        jsonschema.Draft202012Validator(catalog.tools[tool].output_schema).validate(envelope)
+        encoded = encode_envelope(envelope)
+        assert parse_json(encoded) == envelope
+    assert {
+        "capability_unavailable",
+        "invalid_input",
+        "identity_mismatch",
+        "unauthenticated",
+        "daemon_unavailable",
+        "policy_unavailable",
+        "commit_outcome_unknown",
+    } <= seen_err_codes
+
+    # Verify session TLS material fixture
+    leaf_cert = x509.load_pem_x509_certificate(inc2_tls_material.leaf_cert_path.read_bytes())
+    san = leaf_cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+    assert ipaddress.IPv4Address("127.0.0.1") in san.get_values_for_type(x509.IPAddress)
+    assert (
+        hashlib.sha256(leaf_cert.public_bytes(serialization.Encoding.DER)).hexdigest()
+        == inc2_tls_material.leaf_cert_sha256
+    )
+
+    # Verify installed wheel in isolated -I subprocess outside repo root (immune to CWD/env poison)
+    isolated_cwd = trusted_tmp / "outside-cwd"
+    isolated_cwd.mkdir()
+    poison_dir = isolated_cwd / "schemas"
+    poison_dir.mkdir()
+    (poison_dir / "mcp-tools-v2.json").write_text('{"poison": true}', encoding="utf-8")
+
+    probe_code = (
+        "import importlib.resources, json, pathlib, superbrain; "
+        "from superbrain.core.wire import load_catalog; "
+        "res = importlib.resources.files('superbrain.core').joinpath('data/mcp-tools-v2.json'); "
+        "cat = load_catalog(); "
+        "print(json.dumps({"
+        "'origin': str(pathlib.Path(superbrain.__file__).resolve()), "
+        "'packaged_exists': res.is_file(), "
+        "'schema_sha256': cat.schema_sha256, "
+        "'tool_count': len(cat.tools)"
+        "}))"
+    )
+    env = dict(os.environ)
+    for var in ("PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV", "UV_PROJECT_ENVIRONMENT", "SUPERBRAIN_SCHEMA"):
+        env.pop(var, None)
+    env["SUPERBRAIN_HOME"] = str(isolated_cwd)
+
+    completed = subprocess.run(
+        [str(inc2_installed_env.venv_python), "-I", "-c", probe_code],
+        cwd=isolated_cwd,
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=True,
+        timeout=60.0,
+    )
+    payload = json.loads(completed.stdout.strip())
+    origin_path = Path(payload["origin"]).resolve()
+    assert origin_path.is_relative_to(inc2_installed_env.venv_dir.resolve())
+    assert not origin_path.is_relative_to((REPO_ROOT / "src").resolve())
+    assert payload["packaged_exists"] is True
+    assert payload["tool_count"] == 8
+    assert payload["schema_sha256"] == inc2_installed_env.source_schema_sha256
+    assert catalog.schema_sha256 == inc2_installed_env.source_schema_sha256

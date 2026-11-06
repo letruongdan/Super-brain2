@@ -1,0 +1,1228 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ensemble-agents.local/superbrain/mcp-tools-v2.json",
+  "title": "Super-brain2 Canonical MCP Tools v2 Contract",
+  "type": "object",
+  "x-contract": "mcp-tools-v2",
+  "x-tokenizer": "utf8-byte-v1",
+  "x-resolution": "single-checkout-owner-profile-v1",
+  "x-tools": {
+    "prepare_task": {
+      "description": "Prepare a workspace-bound task delivery with bounded snapshot observation and holdout assignment.",
+      "client_input_ref": "#/$defs/PrepareTaskClientArgs",
+      "daemon_input_ref": "#/$defs/PrepareTaskDaemonArgs",
+      "result_ref": "#/$defs/PrepareTaskResult",
+      "x-contract": "mcp-tools-v2",
+      "x-tokenizer": "utf8-byte-v1",
+      "x-side-effects": "mutation",
+      "x-async": false,
+      "x-implemented-in": "sp4/sp5 (fixture-in-i2)"
+    },
+    "search_knowledge": {
+      "description": "Search workspace-eligible knowledge artifacts without invoking external providers.",
+      "client_input_ref": "#/$defs/SearchKnowledgeClientArgs",
+      "daemon_input_ref": "#/$defs/SearchKnowledgeDaemonArgs",
+      "result_ref": "#/$defs/SearchKnowledgeResult",
+      "x-contract": "mcp-tools-v2",
+      "x-tokenizer": "utf8-byte-v1",
+      "x-side-effects": "read_only",
+      "x-async": false,
+      "x-implemented-in": "sp4"
+    },
+    "get_artifact": {
+      "description": "Read an artifact at level L0/L1/L2 and record a server-side send attempt.",
+      "client_input_ref": "#/$defs/GetArtifactClientArgs",
+      "daemon_input_ref": "#/$defs/GetArtifactDaemonArgs",
+      "result_ref": "#/$defs/GetArtifactResult",
+      "x-contract": "mcp-tools-v2",
+      "x-tokenizer": "utf8-byte-v1",
+      "x-side-effects": "mutation",
+      "x-async": false,
+      "x-implemented-in": "sp4/sp5 (fixture-in-i2)"
+    },
+    "submit_episode": {
+      "description": "Record agent-reported task evidence, optional candidate lesson, and declared read acknowledgments.",
+      "client_input_ref": "#/$defs/SubmitEpisodeClientArgs",
+      "daemon_input_ref": "#/$defs/SubmitEpisodeDaemonArgs",
+      "result_ref": "#/$defs/SubmitEpisodeResult",
+      "x-contract": "mcp-tools-v2",
+      "x-tokenizer": "utf8-byte-v1",
+      "x-side-effects": "mutation",
+      "x-async": false,
+      "x-implemented-in": "sp2/sp3"
+    },
+    "record_outcome": {
+      "description": "Record a declared task delivery outcome together with applied refs and declared read acknowledgments.",
+      "client_input_ref": "#/$defs/RecordOutcomeClientArgs",
+      "daemon_input_ref": "#/$defs/RecordOutcomeDaemonArgs",
+      "result_ref": "#/$defs/RecordOutcomeResult",
+      "x-contract": "mcp-tools-v2",
+      "x-tokenizer": "utf8-byte-v1",
+      "x-side-effects": "mutation",
+      "x-async": false,
+      "x-implemented-in": "sp3/sp6 (fixture-in-i2)"
+    },
+    "request_improvement": {
+      "description": "Enqueue an asynchronous reflection/improvement job for a workspace task.",
+      "client_input_ref": "#/$defs/RequestImprovementClientArgs",
+      "daemon_input_ref": "#/$defs/RequestImprovementDaemonArgs",
+      "result_ref": "#/$defs/RequestImprovementResult",
+      "x-contract": "mcp-tools-v2",
+      "x-tokenizer": "utf8-byte-v1",
+      "x-side-effects": "mutation",
+      "x-async": true,
+      "x-implemented-in": "sp6"
+    },
+    "get_job": {
+      "description": "Read the current state, attempt count, typed result refs, and accounting status of an authorized job.",
+      "client_input_ref": "#/$defs/GetJobClientArgs",
+      "daemon_input_ref": "#/$defs/GetJobDaemonArgs",
+      "result_ref": "#/$defs/GetJobResult",
+      "x-contract": "mcp-tools-v2",
+      "x-tokenizer": "utf8-byte-v1",
+      "x-side-effects": "read_only",
+      "x-async": false,
+      "x-implemented-in": "sp1-i2"
+    },
+    "get_health": {
+      "description": "Read fast shallow daemon health or trigger/inspect deep doctor status.",
+      "client_input_ref": "#/$defs/GetHealthClientArgs",
+      "daemon_input_ref": "#/$defs/GetHealthDaemonArgs",
+      "result_ref": "#/$defs/GetHealthResult",
+      "x-contract": "mcp-tools-v2",
+      "x-tokenizer": "utf8-byte-v1",
+      "x-side-effects": "conditional_deep_mutation",
+      "x-async": false,
+      "x-implemented-in": "sp1-i2 (shallow) / sp1-i4 (deep)"
+    }
+  },
+  "$defs": {
+    "SchemaVersion": {
+      "type": "string",
+      "const": "2.0"
+    },
+    "OpaqueId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+    },
+    "ObjectKind": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+    },
+    "WorkspaceHint": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9._-]{1,128}$",
+      "not": {
+        "pattern": "(^\\.{1,2}$)|(\\.\\.)"
+      }
+    },
+    "IdempotencyKey": {
+      "type": "string",
+      "minLength": 16,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9_-]{16,128}$"
+    },
+    "Sha256Digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "PositiveInt": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "BoundedText": {
+      "type": "string",
+      "maxLength": 65536
+    },
+    "NonEmptyBoundedText": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 65536
+    },
+    "Scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repo_id", "checkout_id"],
+      "properties": {
+        "repo_id": {"$ref": "#/$defs/OpaqueId"},
+        "checkout_id": {
+          "anyOf": [
+            {"$ref": "#/$defs/OpaqueId"},
+            {"type": "null"}
+          ]
+        }
+      }
+    },
+    "ObjectRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "id", "revision", "digest"],
+      "properties": {
+        "kind": {"$ref": "#/$defs/ObjectKind"},
+        "id": {"$ref": "#/$defs/OpaqueId"},
+        "revision": {"$ref": "#/$defs/PositiveInt"},
+        "digest": {"$ref": "#/$defs/Sha256Digest"}
+      }
+    },
+    "ResourceDigest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "digest"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "digest": {"$ref": "#/$defs/Sha256Digest"}
+      }
+    },
+    "ReadAckInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["served_receipt_id", "task_id", "revision", "resource_digests"],
+      "properties": {
+        "served_receipt_id": {"$ref": "#/$defs/OpaqueId"},
+        "task_id": {"$ref": "#/$defs/OpaqueId"},
+        "revision": {"$ref": "#/$defs/PositiveInt"},
+        "resource_digests": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1024,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/ResourceDigest"}
+        }
+      }
+    },
+    "JobState": {
+      "type": "string",
+      "enum": [
+        "queued",
+        "leased",
+        "running",
+        "succeeded",
+        "failed",
+        "cancelled",
+        "dead_letter"
+      ]
+    },
+    "AccountingStatus": {
+      "type": "string",
+      "enum": [
+        "none",
+        "reserved",
+        "settled",
+        "outcome_unknown"
+      ]
+    },
+    "SnapshotStatus": {
+      "type": "string",
+      "enum": [
+        "available",
+        "unavailable",
+        "deadline"
+      ]
+    },
+    "DeliveredRefItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "id", "revision", "digest"],
+      "properties": {
+        "kind": {"$ref": "#/$defs/ObjectKind"},
+        "id": {"$ref": "#/$defs/OpaqueId"},
+        "revision": {"$ref": "#/$defs/PositiveInt"},
+        "digest": {"$ref": "#/$defs/Sha256Digest"},
+        "summary": {"$ref": "#/$defs/BoundedText"},
+        "status": {
+          "type": "string",
+          "const": "ok"
+        }
+      }
+    },
+    "RedactedItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "status", "reason"],
+      "properties": {
+        "id": {"$ref": "#/$defs/OpaqueId"},
+        "kind": {"$ref": "#/$defs/ObjectKind"},
+        "status": {
+          "type": "string",
+          "const": "redacted"
+        },
+        "reason": {"$ref": "#/$defs/OpaqueId"}
+      }
+    },
+    "DeliveryItem": {
+      "oneOf": [
+        {"$ref": "#/$defs/DeliveredRefItem"},
+        {"$ref": "#/$defs/RedactedItem"}
+      ]
+    },
+    "SafeEvidenceObject": {
+      "type": "object",
+      "propertyNames": {
+        "not": {
+          "enum": [
+            "source",
+            "approval",
+            "approval_receipt",
+            "native_receipt",
+            "snapshot_status",
+            "degraded_codes",
+            "unknown_source",
+            "verified",
+            "verification_status"
+          ]
+        }
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/SafeEvidenceValue"
+      }
+    },
+    "SafeEvidenceValue": {
+      "anyOf": [
+        {"$ref": "#/$defs/BoundedText"},
+        {"type": "number"},
+        {"type": "boolean"},
+        {"type": "null"},
+        {
+          "type": "array",
+          "maxItems": 1024,
+          "items": {"$ref": "#/$defs/SafeEvidenceValue"}
+        },
+        {"$ref": "#/$defs/SafeEvidenceObject"}
+      ]
+    },
+    "EvidenceInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "data"],
+      "properties": {
+        "kind": {"$ref": "#/$defs/ObjectKind"},
+        "data": {"$ref": "#/$defs/SafeEvidenceObject"}
+      }
+    },
+    "CandidateLessonInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["title", "content"],
+      "properties": {
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "content": {"$ref": "#/$defs/NonEmptyBoundedText"},
+        "conditions": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {"$ref": "#/$defs/NonEmptyBoundedText"}
+        }
+      }
+    },
+    "ArtifactResource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "digest", "encoding", "content"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "digest": {"$ref": "#/$defs/Sha256Digest"},
+        "encoding": {
+          "type": "string",
+          "enum": ["utf-8", "base64"]
+        },
+        "content": {"$ref": "#/$defs/BoundedText"}
+      }
+    },
+    "SearchKnowledgeItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact_id", "kind", "revision", "digest", "summary"],
+      "properties": {
+        "artifact_id": {"$ref": "#/$defs/OpaqueId"},
+        "kind": {"$ref": "#/$defs/ObjectKind"},
+        "revision": {"$ref": "#/$defs/PositiveInt"},
+        "digest": {"$ref": "#/$defs/Sha256Digest"},
+        "summary": {"$ref": "#/$defs/BoundedText"}
+      }
+    },
+    "ErrorCode": {
+      "type": "string",
+      "enum": [
+        "invalid_input",
+        "identity_mismatch",
+        "not_found",
+        "quarantined",
+        "revision_conflict",
+        "idempotency_conflict",
+        "in_progress",
+        "commit_outcome_unknown",
+        "store_busy",
+        "deadline_exceeded",
+        "capability_unavailable",
+        "unsupported_version",
+        "migration_required",
+        "writer_held",
+        "unsafe_path",
+        "insecure_permissions",
+        "integrity_failure",
+        "storage_full",
+        "filesystem_busy",
+        "io_error",
+        "unauthenticated",
+        "daemon_unavailable",
+        "policy_unavailable"
+      ]
+    },
+    "ErrorDetail": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "message"],
+      "properties": {
+        "code": {"$ref": "#/$defs/ErrorCode"},
+        "message": {
+          "type": "string",
+          "enum": [
+            "I/O error",
+            "array exceeds length limit",
+            "boolean not allowed for integer",
+            "capability unavailable",
+            "commit outcome unknown",
+            "daemon unavailable",
+            "deadline exceeded",
+            "deep health requires idempotency_key",
+            "duplicate object key",
+            "duplicate resource digest name",
+            "filesystem busy",
+            "forbidden client-supplied authority field",
+            "idempotency conflict",
+            "identity mismatch",
+            "insecure permissions",
+            "integrity failure",
+            "invalid UTF-8 encoding",
+            "invalid input",
+            "malformed JSON",
+            "migration required",
+            "missing required field",
+            "mixed or invalid workspace selector",
+            "nesting depth exceeded",
+            "non-finite number",
+            "not found",
+            "operation in progress",
+            "payload exceeds size limit",
+            "policy unavailable",
+            "principal identity mismatch",
+            "quarantined",
+            "revision conflict",
+            "shallow health forbids idempotency_key",
+            "storage full",
+            "store busy",
+            "string exceeds size limit",
+            "unauthenticated",
+            "unknown field",
+            "unpaired surrogate",
+            "unsafe path",
+            "unsupported schema version",
+            "unsupported version",
+            "writer lock held"
+          ]
+        }
+      }
+    },
+    "ErrorEnvelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ok", "error"],
+      "properties": {
+        "ok": {
+          "type": "boolean",
+          "const": false
+        },
+        "error": {"$ref": "#/$defs/ErrorDetail"}
+      }
+    },
+    "PrepareTaskClientArgs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "description", "idempotency_key"],
+      "properties": {
+        "schema_version": {"$ref": "#/$defs/SchemaVersion"},
+        "workspace_hint": {"$ref": "#/$defs/WorkspaceHint"},
+        "workspace_id": {"$ref": "#/$defs/OpaqueId"},
+        "checkout_id": {"$ref": "#/$defs/OpaqueId"},
+        "source_snapshot_id": {"$ref": "#/$defs/OpaqueId"},
+        "task_id": {"$ref": "#/$defs/OpaqueId"},
+        "description": {"$ref": "#/$defs/NonEmptyBoundedText"},
+        "context_budget_tokens": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4000,
+          "default": 4000
+        },
+        "idempotency_key": {"$ref": "#/$defs/IdempotencyKey"},
+        "principal_id": {"$ref": "#/$defs/OpaqueId"},
+        "owner_id": {"$ref": "#/$defs/OpaqueId"},
+        "harness_id": {"$ref": "#/$defs/OpaqueId"},
+        "machine_id": {"$ref": "#/$defs/OpaqueId"}
+      },
+      "oneOf": [
+        {
+          "not": {
+            "anyOf": [
+              {"required": ["workspace_hint"]},
+              {"required": ["workspace_id"]},
+              {"required": ["checkout_id"]}
+            ]
+          }
+        },
+        {
+          "required": ["workspace_hint"],
+          "not": {
+            "anyOf": [
+              {"required": ["workspace_id"]},
+              {"required": ["checkout_id"]}
+            ]
+          }
+        },
+        {
+          "required": ["workspace_id", "checkout_id"],
+          "not": {
+            "required": ["workspace_hint"]
+          }
+        }
+      ]
+    },
+    "PrepareTaskDaemonArgs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "description",
+        "context_budget_tokens",
+        "idempotency_key"
+      ],
+      "properties": {
+        "schema_version": {"$ref": "#/$defs/SchemaVersion"},
+        "workspace_hint": {"$ref": "#/$defs/WorkspaceHint"},
+        "workspace_id": {"$ref": "#/$defs/OpaqueId"},
+        "checkout_id": {"$ref": "#/$defs/OpaqueId"},
+        "source_snapshot_id": {"$ref": "#/$defs/OpaqueId"},
+        "task_id": {"$ref": "#/$defs/OpaqueId"},
+        "description": {"$ref": "#/$defs/NonEmptyBoundedText"},
+        "context_budget_tokens": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4000
+        },
+        "idempotency_key": {"$ref": "#/$defs/IdempotencyKey"}
+      },
+      "oneOf": [
+        {
+          "required": ["workspace_hint"],
+          "not": {
+            "anyOf": [
+              {"required": ["workspace_id"]},
+              {"required": ["checkout_id"]}
+            ]
+          }
+        },
+        {
+          "required": ["workspace_id", "checkout_id"],
+          "not": {
+            "required": ["workspace_hint"]
+          }
+        }
+      ]
+    },
+    "PrepareTaskResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "workspace_id",
+        "checkout_id",
+        "source_snapshot_id",
+        "snapshot_status",
+        "degraded_codes",
+        "task_id",
+        "delivery_id",
+        "skills",
+        "lessons",
+        "continuity",
+        "context",
+        "finishing_gates"
+      ],
+      "properties": {
+        "workspace_id": {"$ref": "#/$defs/OpaqueId"},
+        "checkout_id": {"$ref": "#/$defs/OpaqueId"},
+        "source_snapshot_id": {
+          "anyOf": [
+            {"$ref": "#/$defs/OpaqueId"},
+            {"type": "null"}
+          ]
+        },
+        "snapshot_status": {"$ref": "#/$defs/SnapshotStatus"},
+        "degraded_codes": {
+          "type": "array",
+          "maxItems": 1024,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/OpaqueId"}
+        },
+        "task_id": {"$ref": "#/$defs/OpaqueId"},
+        "delivery_id": {"$ref": "#/$defs/OpaqueId"},
+        "assignment_id": {
+          "anyOf": [
+            {"$ref": "#/$defs/OpaqueId"},
+            {"type": "null"}
+          ]
+        },
+        "skills": {
+          "type": "array",
+          "maxItems": 1024,
+          "items": {"$ref": "#/$defs/DeliveryItem"}
+        },
+        "lessons": {
+          "type": "array",
+          "maxItems": 1024,
+          "items": {"$ref": "#/$defs/DeliveryItem"}
+        },
+        "continuity": {
+          "type": "array",
+          "maxItems": 1024,
+          "items": {"$ref": "#/$defs/DeliveryItem"}
+        },
+        "context": {
+          "type": "array",
+          "maxItems": 1024,
+          "items": {"$ref": "#/$defs/DeliveryItem"}
+        },
+        "finishing_gates": {
+          "type": "array",
+          "maxItems": 1024,
+          "items": {"$ref": "#/$defs/DeliveryItem"}
+        }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "snapshot_status": {"const": "available"},
+            "source_snapshot_id": {"$ref": "#/$defs/OpaqueId"},
+            "degraded_codes": {
+              "not": {
+                "contains": {
+                  "enum": ["snapshot_unavailable", "snapshot_deadline"]
+                }
+              }
+            }
+          }
+        },
+        {
+          "properties": {
+            "snapshot_status": {"const": "unavailable"},
+            "source_snapshot_id": {"type": "null"},
+            "degraded_codes": {
+              "allOf": [
+                {"contains": {"const": "snapshot_unavailable"}},
+                {"not": {"contains": {"const": "snapshot_deadline"}}}
+              ]
+            }
+          }
+        },
+        {
+          "properties": {
+            "snapshot_status": {"const": "deadline"},
+            "source_snapshot_id": {"type": "null"},
+            "degraded_codes": {
+              "allOf": [
+                {"contains": {"const": "snapshot_deadline"}},
+                {"not": {"contains": {"const": "snapshot_unavailable"}}}
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "SearchKnowledgeClientArgs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "workspace_id", "query"],
+      "properties": {
+        "schema_version": {"$ref": "#/$defs/SchemaVersion"},
+        "workspace_id": {"$ref": "#/$defs/OpaqueId"},
+        "query": {"$ref": "#/$defs/NonEmptyBoundedText"},
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100,
+          "default": 20
+        },
+        "principal_id": {"$ref": "#/$defs/OpaqueId"},
+        "owner_id": {"$ref": "#/$defs/OpaqueId"},
+        "harness_id": {"$ref": "#/$defs/OpaqueId"},
+        "machine_id": {"$ref": "#/$defs/OpaqueId"}
+      }
+    },
+    "SearchKnowledgeDaemonArgs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "workspace_id", "query", "limit"],
+      "properties": {
+        "schema_version": {"$ref": "#/$defs/SchemaVersion"},
+        "workspace_id": {"$ref": "#/$defs/OpaqueId"},
+        "query": {"$ref": "#/$defs/NonEmptyBoundedText"},
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100
+        }
+      }
+    },
+    "SearchKnowledgeResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["items"],
+      "properties": {
+        "items": {
+          "type": "array",
+          "maxItems": 100,
+          "items": {"$ref": "#/$defs/SearchKnowledgeItem"}
+        }
+      }
+    },
+    "GetArtifactClientArgs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "workspace_id",
+        "task_id",
+        "artifact_id",
+        "revision",
+        "level",
+        "idempotency_key"
+      ],
+      "properties": {
+        "schema_version": {"$ref": "#/$defs/SchemaVersion"},
+        "workspace_id": {"$ref": "#/$defs/OpaqueId"},
+        "task_id": {"$ref": "#/$defs/OpaqueId"},
+        "artifact_id": {"$ref": "#/$defs/OpaqueId"},
+        "revision": {"$ref": "#/$defs/PositiveInt"},
+        "level": {
+          "type": "string",
+          "enum": ["L0", "L1", "L2"]
+        },
+        "idempotency_key": {"$ref": "#/$defs/IdempotencyKey"},
+        "principal_id": {"$ref": "#/$defs/OpaqueId"},
+        "owner_id": {"$ref": "#/$defs/OpaqueId"},
+        "harness_id": {"$ref": "#/$defs/OpaqueId"},
+        "machine_id": {"$ref": "#/$defs/OpaqueId"}
+      }
+    },
+    "GetArtifactDaemonArgs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "workspace_id",
+        "task_id",
+        "artifact_id",
+        "revision",
+        "level",
+        "idempotency_key"
+      ],
+      "properties": {
+        "schema_version": {"$ref": "#/$defs/SchemaVersion"},
+        "workspace_id": {"$ref": "#/$defs/OpaqueId"},
+        "task_id": {"$ref": "#/$defs/OpaqueId"},
+        "artifact_id": {"$ref": "#/$defs/OpaqueId"},
+        "revision": {"$ref": "#/$defs/PositiveInt"},
+        "level": {
+          "type": "string",
+          "enum": ["L0", "L1", "L2"]
+        },
+        "idempotency_key": {"$ref": "#/$defs/IdempotencyKey"}
+      }
+    },
+    "GetArtifactOkResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact_id", "revision", "level", "status", "resources"],
+      "properties": {
+        "artifact_id": {"$ref": "#/$defs/OpaqueId"},
+        "revision": {"$ref": "#/$defs/PositiveInt"},
+        "level": {
+          "type": "string",
+          "enum": ["L0", "L1", "L2"]
+        },
+        "status": {
+          "type": "string",
+          "const": "ok"
+        },
+        "resources": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1024,
+          "items": {"$ref": "#/$defs/ArtifactResource"}
+        },
+        "served_receipt_id": {"$ref": "#/$defs/OpaqueId"}
+      }
+    },
+    "GetArtifactRedactedResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact_id", "revision", "level", "status", "reason", "resources"],
+      "properties": {
+        "artifact_id": {"$ref": "#/$defs/OpaqueId"},
+        "revision": {"$ref": "#/$defs/PositiveInt"},
+        "level": {
+          "type": "string",
+          "enum": ["L0", "L1", "L2"]
+        },
+        "status": {
+          "type": "string",
+          "const": "redacted"
+        },
+        "reason": {"$ref": "#/$defs/OpaqueId"},
+        "resources": {
+          "type": "array",
+          "maxItems": 0
+        }
+      }
+    },
+    "GetArtifactResult": {
+      "oneOf": [
+        {"$ref": "#/$defs/GetArtifactOkResult"},
+        {"$ref": "#/$defs/GetArtifactRedactedResult"}
+      ]
+    },
+    "SubmitEpisodeClientArgs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "task_id", "session_id", "evidence", "idempotency_key"],
+      "properties": {
+        "schema_version": {"$ref": "#/$defs/SchemaVersion"},
+        "task_id": {"$ref": "#/$defs/OpaqueId"},
+        "session_id": {"$ref": "#/$defs/OpaqueId"},
+        "workspace_id": {"$ref": "#/$defs/OpaqueId"},
+        "checkout_id": {"$ref": "#/$defs/OpaqueId"},
+        "evidence": {
+          "type": "array",
+          "maxItems": 1024,
+          "items": {"$ref": "#/$defs/EvidenceInput"}
+        },
+        "candidate_lesson": {"$ref": "#/$defs/CandidateLessonInput"},
+        "read_acks": {
+          "type": "array",
+          "maxItems": 1024,
+          "items": {"$ref": "#/$defs/ReadAckInput"}
+        },
+        "idempotency_key": {"$ref": "#/$defs/IdempotencyKey"},
+        "principal_id": {"$ref": "#/$defs/OpaqueId"},
+        "owner_id": {"$ref": "#/$defs/OpaqueId"},
+        "harness_id": {"$ref": "#/$defs/OpaqueId"},
+        "machine_id": {"$ref": "#/$defs/OpaqueId"}
+      }
+    },
+    "SubmitEpisodeDaemonArgs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "task_id", "session_id", "evidence", "idempotency_key"],
+      "properties": {
+        "schema_version": {"$ref": "#/$defs/SchemaVersion"},
+        "task_id": {"$ref": "#/$defs/OpaqueId"},
+        "session_id": {"$ref": "#/$defs/OpaqueId"},
+        "workspace_id": {"$ref": "#/$defs/OpaqueId"},
+        "checkout_id": {"$ref": "#/$defs/OpaqueId"},
+        "evidence": {
+          "type": "array",
+          "maxItems": 1024,
+          "items": {"$ref": "#/$defs/EvidenceInput"}
+        },
+        "candidate_lesson": {"$ref": "#/$defs/CandidateLessonInput"},
+        "read_acks": {
+          "type": "array",
+          "maxItems": 1024,
+          "items": {"$ref": "#/$defs/ReadAckInput"}
+        },
+        "idempotency_key": {"$ref": "#/$defs/IdempotencyKey"}
+      }
+    },
+    "SubmitEpisodeResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["episode_id", "evidence_ids"],
+      "properties": {
+        "episode_id": {"$ref": "#/$defs/OpaqueId"},
+        "evidence_ids": {
+          "type": "array",
+          "maxItems": 1024,
+          "items": {"$ref": "#/$defs/OpaqueId"}
+        },
+        "candidate_lesson_id": {
+          "anyOf": [
+            {"$ref": "#/$defs/OpaqueId"},
+            {"type": "null"}
+          ]
+        }
+      }
+    },
+    "RecordOutcomeClientArgs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "workspace_id", "delivery_id", "outcome", "idempotency_key"],
+      "properties": {
+        "schema_version": {"$ref": "#/$defs/SchemaVersion"},
+        "workspace_id": {"$ref": "#/$defs/OpaqueId"},
+        "delivery_id": {"$ref": "#/$defs/OpaqueId"},
+        "outcome": {
+          "type": "string",
+          "enum": ["success", "failure", "unknown"]
+        },
+        "applied_refs": {
+          "type": "array",
+          "maxItems": 1024,
+          "items": {"$ref": "#/$defs/ObjectRef"}
+        },
+        "read_acks": {
+          "type": "array",
+          "maxItems": 1024,
+          "items": {"$ref": "#/$defs/ReadAckInput"}
+        },
+        "idempotency_key": {"$ref": "#/$defs/IdempotencyKey"},
+        "principal_id": {"$ref": "#/$defs/OpaqueId"},
+        "owner_id": {"$ref": "#/$defs/OpaqueId"},
+        "harness_id": {"$ref": "#/$defs/OpaqueId"},
+        "machine_id": {"$ref": "#/$defs/OpaqueId"}
+      }
+    },
+    "RecordOutcomeDaemonArgs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "workspace_id", "delivery_id", "outcome", "idempotency_key"],
+      "properties": {
+        "schema_version": {"$ref": "#/$defs/SchemaVersion"},
+        "workspace_id": {"$ref": "#/$defs/OpaqueId"},
+        "delivery_id": {"$ref": "#/$defs/OpaqueId"},
+        "outcome": {
+          "type": "string",
+          "enum": ["success", "failure", "unknown"]
+        },
+        "applied_refs": {
+          "type": "array",
+          "maxItems": 1024,
+          "items": {"$ref": "#/$defs/ObjectRef"}
+        },
+        "read_acks": {
+          "type": "array",
+          "maxItems": 1024,
+          "items": {"$ref": "#/$defs/ReadAckInput"}
+        },
+        "idempotency_key": {"$ref": "#/$defs/IdempotencyKey"}
+      }
+    },
+    "RecordOutcomeResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["outcome_id", "status"],
+      "properties": {
+        "outcome_id": {"$ref": "#/$defs/OpaqueId"},
+        "status": {
+          "type": "string",
+          "const": "declared"
+        }
+      }
+    },
+    "RequestImprovementClientArgs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "workspace_id", "task_id", "idempotency_key"],
+      "properties": {
+        "schema_version": {"$ref": "#/$defs/SchemaVersion"},
+        "workspace_id": {"$ref": "#/$defs/OpaqueId"},
+        "task_id": {"$ref": "#/$defs/OpaqueId"},
+        "idempotency_key": {"$ref": "#/$defs/IdempotencyKey"},
+        "principal_id": {"$ref": "#/$defs/OpaqueId"},
+        "owner_id": {"$ref": "#/$defs/OpaqueId"},
+        "harness_id": {"$ref": "#/$defs/OpaqueId"},
+        "machine_id": {"$ref": "#/$defs/OpaqueId"}
+      }
+    },
+    "RequestImprovementDaemonArgs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "workspace_id", "task_id", "idempotency_key"],
+      "properties": {
+        "schema_version": {"$ref": "#/$defs/SchemaVersion"},
+        "workspace_id": {"$ref": "#/$defs/OpaqueId"},
+        "task_id": {"$ref": "#/$defs/OpaqueId"},
+        "idempotency_key": {"$ref": "#/$defs/IdempotencyKey"}
+      }
+    },
+    "RequestImprovementResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["job_id", "state"],
+      "properties": {
+        "job_id": {"$ref": "#/$defs/OpaqueId"},
+        "state": {"$ref": "#/$defs/JobState"}
+      }
+    },
+    "GetJobClientArgs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "job_id"],
+      "properties": {
+        "schema_version": {"$ref": "#/$defs/SchemaVersion"},
+        "job_id": {"$ref": "#/$defs/OpaqueId"},
+        "principal_id": {"$ref": "#/$defs/OpaqueId"},
+        "owner_id": {"$ref": "#/$defs/OpaqueId"},
+        "harness_id": {"$ref": "#/$defs/OpaqueId"},
+        "machine_id": {"$ref": "#/$defs/OpaqueId"}
+      }
+    },
+    "GetJobDaemonArgs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "job_id"],
+      "properties": {
+        "schema_version": {"$ref": "#/$defs/SchemaVersion"},
+        "job_id": {"$ref": "#/$defs/OpaqueId"}
+      }
+    },
+    "GetJobResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["job_id", "state", "attempt", "result_refs", "accounting_status"],
+      "properties": {
+        "job_id": {"$ref": "#/$defs/OpaqueId"},
+        "state": {"$ref": "#/$defs/JobState"},
+        "attempt": {"$ref": "#/$defs/PositiveInt"},
+        "result_refs": {
+          "type": "array",
+          "maxItems": 1024,
+          "items": {"$ref": "#/$defs/ObjectRef"}
+        },
+        "accounting_status": {"$ref": "#/$defs/AccountingStatus"}
+      }
+    },
+    "GetHealthClientArgs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version"],
+      "properties": {
+        "schema_version": {"$ref": "#/$defs/SchemaVersion"},
+        "deep": {
+          "type": "boolean",
+          "default": false
+        },
+        "idempotency_key": {"$ref": "#/$defs/IdempotencyKey"},
+        "principal_id": {"$ref": "#/$defs/OpaqueId"},
+        "owner_id": {"$ref": "#/$defs/OpaqueId"},
+        "harness_id": {"$ref": "#/$defs/OpaqueId"},
+        "machine_id": {"$ref": "#/$defs/OpaqueId"}
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "deep": {"const": false}
+          },
+          "not": {
+            "required": ["idempotency_key"]
+          }
+        },
+        {
+          "required": ["deep", "idempotency_key"],
+          "properties": {
+            "deep": {"const": true}
+          }
+        }
+      ]
+    },
+    "GetHealthDaemonArgs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "deep"],
+      "properties": {
+        "schema_version": {"$ref": "#/$defs/SchemaVersion"},
+        "deep": {"type": "boolean"},
+        "idempotency_key": {"$ref": "#/$defs/IdempotencyKey"}
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "deep": {"const": false}
+          },
+          "not": {
+            "required": ["idempotency_key"]
+          }
+        },
+        {
+          "required": ["deep", "idempotency_key"],
+          "properties": {
+            "deep": {"const": true}
+          }
+        }
+      ]
+    },
+    "GetHealthResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ready",
+        "store_id",
+        "writer_epoch",
+        "schema_version",
+        "policy_schema_version",
+        "degraded_codes"
+      ],
+      "properties": {
+        "ready": {"type": "boolean"},
+        "store_id": {"$ref": "#/$defs/OpaqueId"},
+        "writer_epoch": {"$ref": "#/$defs/PositiveInt"},
+        "schema_version": {"$ref": "#/$defs/PositiveInt"},
+        "policy_schema_version": {"$ref": "#/$defs/PositiveInt"},
+        "degraded_codes": {
+          "type": "array",
+          "maxItems": 1024,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/OpaqueId"}
+        },
+        "doctor_run_id": {
+          "anyOf": [
+            {"$ref": "#/$defs/OpaqueId"},
+            {"type": "null"}
+          ]
+        },
+        "age_s": {
+          "anyOf": [
+            {"type": "number", "minimum": 0},
+            {"type": "null"}
+          ]
+        },
+        "job_id": {
+          "anyOf": [
+            {"$ref": "#/$defs/OpaqueId"},
+            {"type": "null"}
+          ]
+        }
+      }
+    },
+    "KernelHttpCall": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tool", "arguments", "correlation_id", "selected_scope"],
+      "properties": {
+        "tool": {
+          "type": "string",
+          "enum": [
+            "prepare_task",
+            "search_knowledge",
+            "get_artifact",
+            "submit_episode",
+            "record_outcome",
+            "request_improvement",
+            "get_job",
+            "get_health"
+          ]
+        },
+        "arguments": {"type": "object"},
+        "correlation_id": {
+          "anyOf": [
+            {"type": "string", "minLength": 1, "maxLength": 128},
+            {"type": "null"}
+          ]
+        },
+        "selected_scope": {
+          "anyOf": [
+            {"$ref": "#/$defs/Scope"},
+            {"type": "null"}
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {"tool": {"const": "prepare_task"}},
+            "required": ["tool"]
+          },
+          "then": {
+            "properties": {"arguments": {"$ref": "#/$defs/PrepareTaskDaemonArgs"}}
+          }
+        },
+        {
+          "if": {
+            "properties": {"tool": {"const": "search_knowledge"}},
+            "required": ["tool"]
+          },
+          "then": {
+            "properties": {"arguments": {"$ref": "#/$defs/SearchKnowledgeDaemonArgs"}}
+          }
+        },
+        {
+          "if": {
+            "properties": {"tool": {"const": "get_artifact"}},
+            "required": ["tool"]
+          },
+          "then": {
+            "properties": {"arguments": {"$ref": "#/$defs/GetArtifactDaemonArgs"}}
+          }
+        },
+        {
+          "if": {
+            "properties": {"tool": {"const": "submit_episode"}},
+            "required": ["tool"]
+          },
+          "then": {
+            "properties": {"arguments": {"$ref": "#/$defs/SubmitEpisodeDaemonArgs"}}
+          }
+        },
+        {
+          "if": {
+            "properties": {"tool": {"const": "record_outcome"}},
+            "required": ["tool"]
+          },
+          "then": {
+            "properties": {"arguments": {"$ref": "#/$defs/RecordOutcomeDaemonArgs"}}
+          }
+        },
+        {
+          "if": {
+            "properties": {"tool": {"const": "request_improvement"}},
+            "required": ["tool"]
+          },
+          "then": {
+            "properties": {"arguments": {"$ref": "#/$defs/RequestImprovementDaemonArgs"}}
+          }
+        },
+        {
+          "if": {
+            "properties": {"tool": {"const": "get_job"}},
+            "required": ["tool"]
+          },
+          "then": {
+            "properties": {"arguments": {"$ref": "#/$defs/GetJobDaemonArgs"}}
+          }
+        },
+        {
+          "if": {
+            "properties": {"tool": {"const": "get_health"}},
+            "required": ["tool"]
+          },
+          "then": {
+            "properties": {"arguments": {"$ref": "#/$defs/GetHealthDaemonArgs"}}
+          }
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,377 @@
+{
+  "principal": {
+    "principal_id": "princ-019a5390-0001",
+    "owner_id": "owner-01",
+    "harness_id": "codex-desktop",
+    "machine_id": "mach-win-01"
+  },
+  "cases": [
+    {
+      "name": "prepare_task_client_zero_selector",
+      "tool": "prepare_task",
+      "client_only": true,
+      "client_args": {
+        "schema_version": "2.0",
+        "description": "Implement canonical MCP v2 contract and strict wire validator.",
+        "idempotency_key": "idem_prep_zero_0001"
+      }
+    },
+    {
+      "name": "prepare_task_hint_with_matching_identity",
+      "tool": "prepare_task",
+      "client_only": false,
+      "selected_scope": {
+        "repo_id": "repo-01",
+        "checkout_id": "chk-a"
+      },
+      "correlation_id": "req-prep-01",
+      "client_args": {
+        "schema_version": "2.0",
+        "workspace_hint": "super-brain2.main",
+        "description": "Prepare task with workspace alias and matching principal fields.",
+        "idempotency_key": "idem_prep_hint_0002",
+        "principal_id": "princ-019a5390-0001",
+        "owner_id": "owner-01",
+        "harness_id": "codex-desktop",
+        "machine_id": "mach-win-01"
+      },
+      "daemon_args": {
+        "schema_version": "2.0",
+        "workspace_hint": "super-brain2.main",
+        "description": "Prepare task with workspace alias and matching principal fields.",
+        "context_budget_tokens": 4000,
+        "idempotency_key": "idem_prep_hint_0002"
+      }
+    },
+    {
+      "name": "prepare_task_ids_and_explicit_snapshot",
+      "tool": "prepare_task",
+      "client_only": false,
+      "selected_scope": {
+        "repo_id": "repo-01",
+        "checkout_id": "chk-a"
+      },
+      "correlation_id": "req-prep-02",
+      "client_args": {
+        "schema_version": "2.0",
+        "workspace_id": "repo-01",
+        "checkout_id": "chk-a",
+        "source_snapshot_id": "snap-019a5390-abcd",
+        "task_id": "task-019a5390-0001",
+        "description": "Resume remediation on checkout A with explicit snapshot.",
+        "context_budget_tokens": 2048,
+        "idempotency_key": "idem_prep_pair_0003"
+      },
+      "daemon_args": {
+        "schema_version": "2.0",
+        "workspace_id": "repo-01",
+        "checkout_id": "chk-a",
+        "source_snapshot_id": "snap-019a5390-abcd",
+        "task_id": "task-019a5390-0001",
+        "description": "Resume remediation on checkout A with explicit snapshot.",
+        "context_budget_tokens": 2048,
+        "idempotency_key": "idem_prep_pair_0003"
+      }
+    },
+    {
+      "name": "search_knowledge_default_limit",
+      "tool": "search_knowledge",
+      "client_only": false,
+      "selected_scope": {
+        "repo_id": "repo-01",
+        "checkout_id": "chk-a"
+      },
+      "correlation_id": "req-search-01",
+      "client_args": {
+        "schema_version": "2.0",
+        "workspace_id": "repo-01",
+        "query": "sqlite wal writer lease",
+        "owner_id": "owner-01"
+      },
+      "daemon_args": {
+        "schema_version": "2.0",
+        "workspace_id": "repo-01",
+        "query": "sqlite wal writer lease",
+        "limit": 20
+      }
+    },
+    {
+      "name": "search_knowledge_explicit_limit",
+      "tool": "search_knowledge",
+      "client_only": false,
+      "selected_scope": {
+        "repo_id": "repo-01",
+        "checkout_id": "chk-a"
+      },
+      "correlation_id": null,
+      "client_args": {
+        "schema_version": "2.0",
+        "workspace_id": "repo-01",
+        "query": "idempotency replay",
+        "limit": 50
+      },
+      "daemon_args": {
+        "schema_version": "2.0",
+        "workspace_id": "repo-01",
+        "query": "idempotency replay",
+        "limit": 50
+      }
+    },
+    {
+      "name": "get_artifact_l1",
+      "tool": "get_artifact",
+      "client_only": false,
+      "selected_scope": {
+        "repo_id": "repo-01",
+        "checkout_id": "chk-a"
+      },
+      "correlation_id": "req-art-01",
+      "client_args": {
+        "schema_version": "2.0",
+        "workspace_id": "repo-01",
+        "task_id": "task-019a5390-0001",
+        "artifact_id": "art-skill-tdd",
+        "revision": 3,
+        "level": "L1",
+        "idempotency_key": "idem_art_read_0004"
+      },
+      "daemon_args": {
+        "schema_version": "2.0",
+        "workspace_id": "repo-01",
+        "task_id": "task-019a5390-0001",
+        "artifact_id": "art-skill-tdd",
+        "revision": 3,
+        "level": "L1",
+        "idempotency_key": "idem_art_read_0004"
+      }
+    },
+    {
+      "name": "submit_episode_with_ack_and_candidate",
+      "tool": "submit_episode",
+      "client_only": false,
+      "selected_scope": {
+        "repo_id": "repo-01",
+        "checkout_id": "chk-a"
+      },
+      "correlation_id": "req-ep-01",
+      "client_args": {
+        "schema_version": "2.0",
+        "task_id": "task-019a5390-0001",
+        "session_id": "sess-019a5390-0009",
+        "workspace_id": "repo-01",
+        "checkout_id": "chk-a",
+        "evidence": [
+          {
+            "kind": "command_run",
+            "data": {
+              "command": "pytest -q tests/contract/test_mcp_v2_schema.py",
+              "exit_code": 0,
+              "output_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+            }
+          }
+        ],
+        "candidate_lesson": {
+          "title": "Validate UTF-16 surrogates after JSON decode",
+          "content": "Python json.loads permits lone surrogates in \\uXXXX escapes; encode UTF-8 strictly.",
+          "conditions": [
+            "JSON wire ingress"
+          ]
+        },
+        "read_acks": [
+          {
+            "served_receipt_id": "rcpt-019a5390-0010",
+            "task_id": "task-019a5390-0001",
+            "revision": 3,
+            "resource_digests": [
+              {
+                "name": "L0.md",
+                "digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+              },
+              {
+                "name": "L1.md",
+                "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+              }
+            ]
+          }
+        ],
+        "idempotency_key": "idem_submit_ep_0005"
+      },
+      "daemon_args": {
+        "schema_version": "2.0",
+        "task_id": "task-019a5390-0001",
+        "session_id": "sess-019a5390-0009",
+        "workspace_id": "repo-01",
+        "checkout_id": "chk-a",
+        "evidence": [
+          {
+            "kind": "command_run",
+            "data": {
+              "command": "pytest -q tests/contract/test_mcp_v2_schema.py",
+              "exit_code": 0,
+              "output_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+            }
+          }
+        ],
+        "candidate_lesson": {
+          "title": "Validate UTF-16 surrogates after JSON decode",
+          "content": "Python json.loads permits lone surrogates in \\uXXXX escapes; encode UTF-8 strictly.",
+          "conditions": [
+            "JSON wire ingress"
+          ]
+        },
+        "read_acks": [
+          {
+            "served_receipt_id": "rcpt-019a5390-0010",
+            "task_id": "task-019a5390-0001",
+            "revision": 3,
+            "resource_digests": [
+              {
+                "name": "L0.md",
+                "digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+              },
+              {
+                "name": "L1.md",
+                "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+              }
+            ]
+          }
+        ],
+        "idempotency_key": "idem_submit_ep_0005"
+      }
+    },
+    {
+      "name": "record_outcome_declared_success",
+      "tool": "record_outcome",
+      "client_only": false,
+      "selected_scope": {
+        "repo_id": "repo-01",
+        "checkout_id": "chk-a"
+      },
+      "correlation_id": "req-out-01",
+      "client_args": {
+        "schema_version": "2.0",
+        "workspace_id": "repo-01",
+        "delivery_id": "deliv-019a5390-0020",
+        "outcome": "success",
+        "applied_refs": [
+          {
+            "kind": "skill",
+            "id": "art-skill-tdd",
+            "revision": 3,
+            "digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444"
+          }
+        ],
+        "read_acks": [
+          {
+            "served_receipt_id": "rcpt-019a5390-0010",
+            "task_id": "task-019a5390-0001",
+            "revision": 3,
+            "resource_digests": [
+              {
+                "name": "L1.md",
+                "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+              }
+            ]
+          }
+        ],
+        "idempotency_key": "idem_outcome_0006"
+      },
+      "daemon_args": {
+        "schema_version": "2.0",
+        "workspace_id": "repo-01",
+        "delivery_id": "deliv-019a5390-0020",
+        "outcome": "success",
+        "applied_refs": [
+          {
+            "kind": "skill",
+            "id": "art-skill-tdd",
+            "revision": 3,
+            "digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444"
+          }
+        ],
+        "read_acks": [
+          {
+            "served_receipt_id": "rcpt-019a5390-0010",
+            "task_id": "task-019a5390-0001",
+            "revision": 3,
+            "resource_digests": [
+              {
+                "name": "L1.md",
+                "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+              }
+            ]
+          }
+        ],
+        "idempotency_key": "idem_outcome_0006"
+      }
+    },
+    {
+      "name": "request_improvement",
+      "tool": "request_improvement",
+      "client_only": false,
+      "selected_scope": {
+        "repo_id": "repo-01",
+        "checkout_id": "chk-a"
+      },
+      "correlation_id": "req-imp-01",
+      "client_args": {
+        "schema_version": "2.0",
+        "workspace_id": "repo-01",
+        "task_id": "task-019a5390-0001",
+        "idempotency_key": "idem_improve_0007"
+      },
+      "daemon_args": {
+        "schema_version": "2.0",
+        "workspace_id": "repo-01",
+        "task_id": "task-019a5390-0001",
+        "idempotency_key": "idem_improve_0007"
+      }
+    },
+    {
+      "name": "get_job",
+      "tool": "get_job",
+      "client_only": false,
+      "selected_scope": null,
+      "correlation_id": "req-job-01",
+      "client_args": {
+        "schema_version": "2.0",
+        "job_id": "job-019a5390-0030"
+      },
+      "daemon_args": {
+        "schema_version": "2.0",
+        "job_id": "job-019a5390-0030"
+      }
+    },
+    {
+      "name": "get_health_shallow_default",
+      "tool": "get_health",
+      "client_only": false,
+      "selected_scope": null,
+      "correlation_id": "req-health-01",
+      "client_args": {
+        "schema_version": "2.0"
+      },
+      "daemon_args": {
+        "schema_version": "2.0",
+        "deep": false
+      }
+    },
+    {
+      "name": "get_health_deep_with_key",
+      "tool": "get_health",
+      "client_only": false,
+      "selected_scope": null,
+      "correlation_id": "req-health-02",
+      "client_args": {
+        "schema_version": "2.0",
+        "deep": true,
+        "idempotency_key": "idem_health_deep_0008"
+      },
+      "daemon_args": {
+        "schema_version": "2.0",
+        "deep": true,
+        "idempotency_key": "idem_health_deep_0008"
+      }
+    }
+  ]
+}

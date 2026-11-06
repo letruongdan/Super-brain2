@@ -10,6 +10,8 @@ from pathlib import Path
 
 import pytest
 
+pytest_plugins = ["tests.support.inc2_fixture"]
+
 
 @pytest.fixture
 def trusted_tmp(tmp_path: Path) -> Iterator[Path]:

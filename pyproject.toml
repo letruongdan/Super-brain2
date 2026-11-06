@@ -8,11 +8,15 @@ version = "0.1.0"
 description = "Super-brain2: local-first knowledge store with layered architecture"
 requires-python = ">=3.11"
 dependencies = [
+    "cryptography>=44,<51",
     "pywin32>=311; sys_platform == 'win32'",
 ]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/superbrain"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"schemas/mcp-tools-v2.json" = "superbrain/core/data/mcp-tools-v2.json"
 
 [tool.ruff]
 target-version = "py311"
@@ -24,6 +28,10 @@ select = ["E", "F", "W", "I", "B", "UP", "BLE", "S110", "S112"]
 [tool.mypy]
 strict = true
 files = ["src", "tests", "scripts"]
+
+[[tool.mypy.overrides]]
+module = ["jsonschema", "jsonschema.*"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -60,7 +68,9 @@ forbidden_modules = [
 
 [dependency-groups]
 dev = [
+    "hatchling>=1.26,<2",
     "import-linter>=2.15",
+    "jsonschema>=4.23",
     "mypy>=2.4.1",
     "pytest>=9.2.0",
     "ruff>=0.17.3",

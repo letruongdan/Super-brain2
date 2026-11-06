@@ -1,0 +1,136 @@
+{
+  "cases": [
+    {
+      "name": "capability_unavailable_prepare_task",
+      "tool": "prepare_task",
+      "envelope": {
+        "ok": false,
+        "error": {
+          "code": "capability_unavailable",
+          "message": "capability unavailable"
+        }
+      }
+    },
+    {
+      "name": "invalid_input_search",
+      "tool": "search_knowledge",
+      "envelope": {
+        "ok": false,
+        "error": {
+          "code": "invalid_input",
+          "message": "invalid input"
+        }
+      }
+    },
+    {
+      "name": "identity_mismatch_prepare",
+      "tool": "prepare_task",
+      "envelope": {
+        "ok": false,
+        "error": {
+          "code": "identity_mismatch",
+          "message": "principal identity mismatch"
+        }
+      }
+    },
+    {
+      "name": "unauthenticated_call",
+      "tool": "get_job",
+      "envelope": {
+        "ok": false,
+        "error": {
+          "code": "unauthenticated",
+          "message": "unauthenticated"
+        }
+      }
+    },
+    {
+      "name": "daemon_unavailable_shim",
+      "tool": "get_health",
+      "envelope": {
+        "ok": false,
+        "error": {
+          "code": "daemon_unavailable",
+          "message": "daemon unavailable"
+        }
+      }
+    },
+    {
+      "name": "policy_unavailable_health",
+      "tool": "get_health",
+      "envelope": {
+        "ok": false,
+        "error": {
+          "code": "policy_unavailable",
+          "message": "policy unavailable"
+        }
+      }
+    },
+    {
+      "name": "commit_outcome_unknown_prepare",
+      "tool": "prepare_task",
+      "envelope": {
+        "ok": false,
+        "error": {
+          "code": "commit_outcome_unknown",
+          "message": "commit outcome unknown"
+        }
+      }
+    },
+    {
+      "name": "idempotency_conflict_outcome",
+      "tool": "record_outcome",
+      "envelope": {
+        "ok": false,
+        "error": {
+          "code": "idempotency_conflict",
+          "message": "idempotency conflict"
+        }
+      }
+    },
+    {
+      "name": "in_progress_artifact",
+      "tool": "get_artifact",
+      "envelope": {
+        "ok": false,
+        "error": {
+          "code": "in_progress",
+          "message": "operation in progress"
+        }
+      }
+    },
+    {
+      "name": "deadline_exceeded_prepare",
+      "tool": "prepare_task",
+      "envelope": {
+        "ok": false,
+        "error": {
+          "code": "deadline_exceeded",
+          "message": "deadline exceeded"
+        }
+      }
+    },
+    {
+      "name": "store_busy_submit",
+      "tool": "submit_episode",
+      "envelope": {
+        "ok": false,
+        "error": {
+          "code": "store_busy",
+          "message": "store busy"
+        }
+      }
+    },
+    {
+      "name": "unsupported_version_v1",
+      "tool": "request_improvement",
+      "envelope": {
+        "ok": false,
+        "error": {
+          "code": "unsupported_version",
+          "message": "unsupported schema version"
+        }
+      }
+    }
+  ]
+}

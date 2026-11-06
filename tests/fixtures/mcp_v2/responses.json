@@ -1,0 +1,272 @@
+{
+  "cases": [
+    {
+      "name": "prepare_task_snapshot_available",
+      "tool": "prepare_task",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "workspace_id": "repo-01",
+          "checkout_id": "chk-a",
+          "source_snapshot_id": "snap-019a5390-abcd",
+          "snapshot_status": "available",
+          "degraded_codes": [],
+          "task_id": "task-019a5390-0001",
+          "delivery_id": "deliv-019a5390-0020",
+          "assignment_id": "assign-019a5390-0001",
+          "skills": [
+            {
+              "kind": "skill",
+              "id": "art-skill-tdd",
+              "revision": 3,
+              "digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+              "summary": "Strict red-green-refactor cycle."
+            }
+          ],
+          "lessons": [
+            {
+              "id": "les-quarantined-01",
+              "status": "redacted",
+              "reason": "quarantined"
+            }
+          ],
+          "continuity": [
+            {
+              "kind": "continuity",
+              "id": "cont-019a5390-0001",
+              "revision": 1,
+              "digest": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+              "summary": "Checkout A T0 gate closed."
+            }
+          ],
+          "context": [
+            {
+              "kind": "context",
+              "id": "ctx-wire-spec",
+              "revision": 1,
+              "digest": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
+              "summary": "Snapshot-bound context excerpt."
+            }
+          ],
+          "finishing_gates": [
+            {
+              "kind": "gate",
+              "id": "gate-pytest-full",
+              "revision": 1,
+              "digest": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+              "summary": "Run full locked pytest suite."
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "prepare_task_snapshot_unavailable",
+      "tool": "prepare_task",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "workspace_id": "repo-01",
+          "checkout_id": "chk-a",
+          "source_snapshot_id": null,
+          "snapshot_status": "unavailable",
+          "degraded_codes": [
+            "snapshot_unavailable"
+          ],
+          "task_id": "task-019a5390-0002",
+          "delivery_id": "deliv-019a5390-0021",
+          "assignment_id": null,
+          "skills": [
+            {
+              "kind": "skill",
+              "id": "art-skill-tdd",
+              "revision": 3,
+              "digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+              "summary": "Strict red-green-refactor cycle."
+            }
+          ],
+          "lessons": [],
+          "continuity": [],
+          "context": [],
+          "finishing_gates": []
+        }
+      }
+    },
+    {
+      "name": "prepare_task_snapshot_deadline",
+      "tool": "prepare_task",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "workspace_id": "repo-01",
+          "checkout_id": "chk-a",
+          "source_snapshot_id": null,
+          "snapshot_status": "deadline",
+          "degraded_codes": [
+            "snapshot_deadline"
+          ],
+          "task_id": "task-019a5390-0003",
+          "delivery_id": "deliv-019a5390-0022",
+          "skills": [],
+          "lessons": [],
+          "continuity": [],
+          "context": [],
+          "finishing_gates": []
+        }
+      }
+    },
+    {
+      "name": "search_knowledge_ok",
+      "tool": "search_knowledge",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "items": [
+            {
+              "artifact_id": "art-skill-tdd",
+              "kind": "skill",
+              "revision": 3,
+              "digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+              "summary": "Write failing tests first and verify pristine green output."
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "get_artifact_ok",
+      "tool": "get_artifact",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "artifact_id": "art-skill-tdd",
+          "revision": 3,
+          "level": "L1",
+          "status": "ok",
+          "resources": [
+            {
+              "name": "L0.md",
+              "digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+              "encoding": "utf-8",
+              "content": "# TDD Summary\nWrite failing test first."
+            },
+            {
+              "name": "L1.md",
+              "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+              "encoding": "utf-8",
+              "content": "# TDD Full Guide\nObserve RED before writing production code."
+            }
+          ],
+          "served_receipt_id": "rcpt-019a5390-0010"
+        }
+      }
+    },
+    {
+      "name": "get_artifact_redacted",
+      "tool": "get_artifact",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "artifact_id": "art-skill-tdd",
+          "revision": 3,
+          "level": "L1",
+          "status": "redacted",
+          "reason": "quarantined",
+          "resources": []
+        }
+      }
+    },
+    {
+      "name": "submit_episode_ok",
+      "tool": "submit_episode",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "episode_id": "ep-019a5390-0040",
+          "evidence_ids": [
+            "ev-019a5390-0041"
+          ],
+          "candidate_lesson_id": "cand-019a5390-0042"
+        }
+      }
+    },
+    {
+      "name": "record_outcome_ok",
+      "tool": "record_outcome",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "outcome_id": "out-019a5390-0050",
+          "status": "declared"
+        }
+      }
+    },
+    {
+      "name": "request_improvement_ok",
+      "tool": "request_improvement",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "job_id": "job-019a5390-0030",
+          "state": "queued"
+        }
+      }
+    },
+    {
+      "name": "get_job_ok",
+      "tool": "get_job",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "job_id": "job-019a5390-0030",
+          "state": "running",
+          "attempt": 1,
+          "result_refs": [
+            {
+              "kind": "lesson",
+              "id": "les-019a5390-0099",
+              "revision": 1,
+              "digest": "sha256:8888888888888888888888888888888888888888888888888888888888888888"
+            }
+          ],
+          "accounting_status": "reserved"
+        }
+      }
+    },
+    {
+      "name": "get_health_shallow_ok",
+      "tool": "get_health",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "ready": true,
+          "store_id": "store-019a5390-0001",
+          "writer_epoch": 1,
+          "schema_version": 3,
+          "policy_schema_version": 2,
+          "degraded_codes": []
+        }
+      }
+    },
+    {
+      "name": "get_health_deep_ok",
+      "tool": "get_health",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "ready": true,
+          "store_id": "store-019a5390-0001",
+          "writer_epoch": 2,
+          "schema_version": 3,
+          "policy_schema_version": 2,
+          "degraded_codes": [
+            "tls_expiring"
+          ],
+          "doctor_run_id": "doc-019a5390-0070",
+          "age_s": 120.5,
+          "job_id": null
+        }
+      }
+    }
+  ]
+}
