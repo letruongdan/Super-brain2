@@ -38,7 +38,7 @@ from superbrain.storage.sqlite import db_files
 from superbrain.storage.swap import stage_and_swap
 from superbrain.storage.writer import WriterLease
 
-__all__ = ["MigrationReport", "migrate_database"]
+__all__ = ["MigrationReport", "migrate_database", "migrate_staged_file"]
 
 
 @dataclass(frozen=True)
@@ -90,9 +90,16 @@ def _integrity_report(db: sqlite3.Connection) -> str:
     return "\n".join(str(row[0]) for row in db.execute("PRAGMA integrity_check"))
 
 
-def _migrate_file(path: Path, pending: Sequence[Migration], os_: OsAdapters, platform: str = sys.platform) -> None:
+def migrate_staged_file(
+    path: Path,
+    pending: Sequence[Migration],
+    os_: OsAdapters,
+    platform: str = sys.platform,
+    *,
+    flush: bool = True,
+) -> None:
     """Recover the WAL of the staged copy ``path``, apply ``pending`` and leave one self-contained file, made durable
-    with ``os_.publisher.flush_file``."""
+    with ``os_.publisher.flush_file`` when ``flush`` is true."""
     db = sqlite3.connect(path, isolation_level=None)
     try:
         _configure(db, platform)
@@ -110,7 +117,8 @@ def _migrate_file(path: Path, pending: Sequence[Migration], os_: OsAdapters, pla
     leftovers = [p.name for p in (*db_files(path)[1:], path.with_name(path.name + "-journal")) if p.exists()]
     if leftovers:
         raise BrainError(ErrorCode.IO_ERROR, f"the migrated {path.name} kept companions {leftovers}")
-    os_.publisher.flush_file(path)
+    if flush:
+        os_.publisher.flush_file(path)
 
 
 def migrate_database(
@@ -164,7 +172,7 @@ def migrate_database(
     def build(stage: Path) -> None:
         copy_database(source, stage / name, "into the migration stage")
         try:
-            _migrate_file(stage / name, pending, os_)
+            migrate_staged_file(stage / name, pending, os_)
         except sqlite3.Error as exc:
             raise sqlite_error(f"cannot migrate the {target} database", exc) from exc
         if target == "store":

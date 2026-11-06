@@ -926,7 +926,7 @@ def test_overlong_and_unsupported_policy_version_metadata_fails_closed_without_w
 
     from superbrain.ports.policy import IntentKind
     from superbrain.storage.runtime import admit_existing_pair
-    from superbrain.storage.schema import Migration, read_schema_info
+    from superbrain.storage.schema import Migration, code_version, read_schema_info
 
     authority_tables: tuple[str, ...] = (
         "intents",
@@ -1050,8 +1050,11 @@ def test_overlong_and_unsupported_policy_version_metadata_fails_closed_without_w
         ("future-schema-and-reader", {"schema_version": "99", "min_reader_version": "99"}),
         ("future-schema-compat-reader", {"schema_version": "99", "min_reader_version": "2"}),
         ("reader-exceeds-schema", {"schema_version": "2", "min_reader_version": "99"}),
+        ("reader-exceeds-v3-schema", {"schema_version": "3", "min_reader_version": "99"}),
+        ("downgraded-v2-meta", {"schema_version": "2", "min_reader_version": "2"}),
         ("downgraded-v1-meta", {"schema_version": "1", "min_reader_version": "1"}),
         ("zero-reader-meta", {"schema_version": "2", "min_reader_version": "0"}),
+        ("zero-reader-v3-meta", {"schema_version": "3", "min_reader_version": "0"}),
         ("zero-schema-meta", {"schema_version": "0", "min_reader_version": "0"}),
         ("non-digit-schema", {"schema_version": "v2"}),
     ):
@@ -1087,73 +1090,81 @@ def test_overlong_and_unsupported_policy_version_metadata_fails_closed_without_w
             admit_existing_pair(closed_root, closed_store_id, os_, purpose="migrate")
         assert exc_admit_mig.value.code is ErrorCode.INTEGRITY_FAILURE
 
-    # Non-hardcoded future policy tuple compatibility: injected v3 policy migration allows all 6
-    # KernelPolicyPort methods to succeed at schema_version == 3, while still rejecting out-of-band version drift.
-    v3_policy_migrations = (
+    # Non-hardcoded future policy tuple compatibility: injected next-version policy migration allows all 6
+    # KernelPolicyPort methods to succeed at schema_version == next_ver, while still rejecting out-of-band drift.
+    base_ver = code_version(KERNEL_POLICY_MIGRATIONS)
+    assert base_ver == 3
+    next_ver = base_ver + 1
+    v_next_policy_migrations = (
         *KERNEL_POLICY_MIGRATIONS,
-        Migration(to_version=3, min_reader_version=2, apply=lambda db: None),
+        Migration(to_version=next_ver, min_reader_version=base_ver, apply=lambda db: None),
     )
-    rt_v3 = open_runtime(
-        trusted_tmp / "policy-v3-compat",
+    rt_v_next = open_runtime(
+        trusted_tmp / "policy-v-next-compat",
         os_,
         store_migrations=KERNEL_STORE_MIGRATIONS,
-        policy_migrations=v3_policy_migrations,
+        policy_migrations=v_next_policy_migrations,
     )
     try:
-        v3_info = read_schema_info(rt_v3.root.policy_db)
-        assert v3_info is not None and v3_info.schema_version == 3 and v3_info.min_reader_version == 2
+        v_next_info = read_schema_info(rt_v_next.root.policy_db)
+        assert (
+            v_next_info is not None
+            and v_next_info.schema_version == 4
+            and v_next_info.schema_version == next_ver
+            and v_next_info.min_reader_version == base_ver
+        )
 
-        v3_store_id = rt_v3.policy.store_id
-        v3_gen = rt_v3.policy.trust_generation()
-        v3_exp = clock.now() + dt.timedelta(hours=1)
-        seeded_v3 = seed_principal_and_credential(
-            rt_v3.policy, owner_id="alice", harness_id="claude-code", machine_id="box-1"
+        v_next_store_id = rt_v_next.policy.store_id
+        v_next_gen = rt_v_next.policy.trust_generation()
+        v_next_exp = clock.now() + dt.timedelta(hours=1)
+        seeded_v_next = seed_principal_and_credential(
+            rt_v_next.policy, owner_id="alice", harness_id="claude-code", machine_id="box-1"
         )
-        reg_v3 = WorkspaceRegistration(
+        reg_v_next = WorkspaceRegistration(
             owner_id="alice",
-            principal_id=seeded_v3.principal.principal_id,
+            principal_id=seeded_v_next.principal.principal_id,
             machine_id="box-1",
-            alias="repo-v3",
-            checkout_path=str(trusted_tmp / "v3-chk"),
-            path_identity="alice:box-1:v3:chk",
+            alias="repo-v-next",
+            checkout_path=str(trusted_tmp / "v-next-chk"),
+            path_identity="alice:box-1:v-next:chk",
         )
-        bind_v3 = rt_v3.policy.register_authorized_workspace(
-            reg_v3,
+        bind_v_next = rt_v_next.policy.register_authorized_workspace(
+            reg_v_next,
             make_bootstrap_auth(
-                store_id=v3_store_id,
+                store_id=v_next_store_id,
                 owner_id="alice",
                 action="workspace_register",
-                subject_id=reg_v3.subject_id,
-                trust_generation=v3_gen,
-                expires_at=v3_exp,
+                subject_id=reg_v_next.subject_id,
+                trust_generation=v_next_gen,
+                expires_at=v_next_exp,
             ),
         )
-        scope_v3 = Scope(repo_id=bind_v3.repo_id, checkout_id=bind_v3.checkout_id)
-        assert rt_v3.policy.resolve_credential(seeded_v3.token) == seeded_v3.principal
-        assert rt_v3.policy.allows(seeded_v3.principal, None, action="get_health") is True
-        assert rt_v3.policy.allows(seeded_v3.principal, scope_v3, action="get_artifact") is True
-        v3_key_id, v3_key_bytes = rt_v3.policy.request_digest_key()
-        assert v3_key_id and len(v3_key_bytes) == 32
-        assert bind_v3.checkout_id in rt_v3.policy.snapshot().checkouts
+        scope_v_next = Scope(repo_id=bind_v_next.repo_id, checkout_id=bind_v_next.checkout_id)
+        assert rt_v_next.policy.resolve_credential(seeded_v_next.token) == seeded_v_next.principal
+        assert rt_v_next.policy.allows(seeded_v_next.principal, None, action="get_health") is True
+        assert rt_v_next.policy.allows(seeded_v_next.principal, scope_v_next, action="get_artifact") is True
+        v_next_key_id, v_next_key_bytes = rt_v_next.policy.request_digest_key()
+        assert v_next_key_id and len(v_next_key_bytes) == 32
+        assert bind_v_next.checkout_id in rt_v_next.policy.snapshot().checkouts
 
-        rev_v3 = rt_v3.policy.record_authorized_revocation(
-            seeded_v3.credential_id,
+        rev_v_next = rt_v_next.policy.record_authorized_revocation(
+            seeded_v_next.credential_id,
             make_bootstrap_auth(
-                store_id=v3_store_id,
+                store_id=v_next_store_id,
                 owner_id="alice",
                 action="credential_revoke",
-                subject_id=seeded_v3.credential_id,
-                trust_generation=v3_gen,
-                expires_at=v3_exp,
+                subject_id=seeded_v_next.credential_id,
+                trust_generation=v_next_gen,
+                expires_at=v_next_exp,
             ),
         )
-        assert rev_v3.kind is IntentKind.CREDENTIAL_REVOKE
+        assert rev_v_next.kind is IntentKind.CREDENTIAL_REVOKE
 
-        # Drift above v3 on the open v3 handle still fails closed with POLICY_UNAVAILABLE.
-        with rt_v3.policy._immediate() as db_v3:
-            db_v3.execute("UPDATE meta SET value = '4' WHERE key = 'schema_version'")
-        with pytest.raises(BrainError) as exc_v3_drift:
-            rt_v3.policy.snapshot()
-        assert exc_v3_drift.value.code is ErrorCode.POLICY_UNAVAILABLE
+        # Drift above next_ver on the open handle still fails closed with POLICY_UNAVAILABLE.
+        with rt_v_next.policy._immediate() as db_v_next:
+            db_v_next.execute("UPDATE meta SET value = ? WHERE key = 'schema_version'", (str(next_ver + 1),))
+        with pytest.raises(BrainError) as exc_v_next_drift:
+            rt_v_next.policy.snapshot()
+        assert exc_v_next_drift.value.code is ErrorCode.POLICY_UNAVAILABLE
     finally:
-        rt_v3.close()
+        rt_v_next.close()
