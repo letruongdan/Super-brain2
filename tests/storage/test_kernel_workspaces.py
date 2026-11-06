@@ -1334,6 +1334,9 @@ def test_handoff_lineage_from_stored_t1_is_inherited_by_t2(
     )
     stored = kstore.transact(lambda tx: tx.read_field_lineage("T2"))[field_path_digest(("derived",))]
     assert src_a in stored.sources
-    assert {ref.repo_id for ref in stored.sources} == {repo_a.repo_id, repo_b.repo_id}
+    # I2-T3-R02 (spec 14.2: content created in a task inherits the task's current lineage, not only its repo): the
+    # field derived inside T2 (bound to C) carries A+B from the T1 handoff plus C. The earlier {A, B} oracle locked
+    # the defect the Task 3 review reproduced; corrected by the independent test author.
+    assert {ref.repo_id for ref in stored.sources} == {repo_a.repo_id, repo_b.repo_id, repo_c.repo_id}
     t2_lineage, _ = kstore.transact(lambda tx: tx.read_task_lineage("T2"))
     assert {ref.repo_id for ref in t2_lineage} == {repo_a.repo_id, repo_b.repo_id, repo_c.repo_id}
