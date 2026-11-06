@@ -1064,7 +1064,7 @@ def test_cross_revision_v1_workspace_register_root_reopens_reconciles_and_blocks
     from superbrain.ports.policy import PolicyView
     from superbrain.storage.kernel_schema import KERNEL_POLICY_KINDS
     from superbrain.storage.ledger import LedgerEntry
-    from superbrain.storage.schema import code_version, read_schema_info
+    from superbrain.storage.schema import SchemaInfo, code_version, read_schema_info
 
     v2_policy_migrations = KERNEL_POLICY_MIGRATIONS[:2]
     v2_store_migrations = KERNEL_STORE_MIGRATIONS[:2]
@@ -1201,7 +1201,7 @@ def test_cross_revision_v1_workspace_register_root_reopens_reconciles_and_blocks
     assert digest_tree(root_a / "policy") == snap_pol_pre_a
     assert digest_tree(root_a / "store") == snap_str_pre_a
 
-    # Offline migrate upgrades policy 2 -> 3 and skips store at 2.
+    # Offline migrate upgrades policy 2 -> 3 and store 2 -> 3.
     clock.advance(dt.timedelta(seconds=5))
     mig_a = migrate_offline(
         DaemonConfig(1, root_a, store_id_a, trusted_tmp / "c.pem", trusted_tmp / "c.key"),
@@ -1212,9 +1212,13 @@ def test_cross_revision_v1_workspace_register_root_reopens_reconciles_and_blocks
     assert mig_a.policy_report.status == "migrated"
     assert mig_a.policy_report.from_version == 2
     assert mig_a.policy_report.to_version == 3
-    assert mig_a.store_report.status == "skipped"
+    assert mig_a.store_report.status == "migrated"
     assert mig_a.store_report.from_version == 2
-    assert mig_a.store_report.to_version == 2
+    assert mig_a.store_report.to_version == 3
+    assert code_version(KERNEL_POLICY_MIGRATIONS) == 3
+    assert code_version(KERNEL_STORE_MIGRATIONS) == 3
+    assert read_schema_info(root_a / "policy" / "policy.db") == SchemaInfo(3, 3, store_id_a)
+    assert read_schema_info(root_a / "store" / "brain.db") == SchemaInfo(3, 3, store_id_a)
 
     # Post-migration serve admission + open_runtime_under_lease preserves retained 6-key intent and handler_version=1.
     clock.advance(dt.timedelta(seconds=5))
@@ -1432,9 +1436,11 @@ def test_cross_revision_v1_workspace_register_root_reopens_reconciles_and_blocks
     assert mig_b.policy_report.status == "migrated"
     assert mig_b.policy_report.from_version == 2
     assert mig_b.policy_report.to_version == 3
-    assert mig_b.store_report.status == "skipped"
+    assert mig_b.store_report.status == "migrated"
     assert mig_b.store_report.from_version == 2
-    assert mig_b.store_report.to_version == 2
+    assert mig_b.store_report.to_version == 3
+    assert read_schema_info(root_b / "policy" / "policy.db") == SchemaInfo(3, 3, store_id_b)
+    assert read_schema_info(root_b / "store" / "brain.db") == SchemaInfo(3, 3, store_id_b)
 
     clock.advance(dt.timedelta(seconds=5))
     admitted_b = admit_existing_pair(root_b, store_id_b, os_, purpose="serve")
@@ -1481,6 +1487,7 @@ def test_cross_revision_v1_workspace_register_root_reopens_reconciles_and_blocks
             )
         finally:
             pol_b.close()
+    assert read_schema_info(root_b / "store" / "brain.db") == SchemaInfo(3, 3, store_id_b)
 
     clock.advance(dt.timedelta(seconds=5))
     admitted_b2 = admit_existing_pair(root_b, store_id_b, os_, purpose="serve")
@@ -1526,7 +1533,13 @@ def test_historical_v2_writer_is_fenced_before_policy_mutation_across_migrate_an
     from superbrain.core.kernel import DaemonConfig
     from superbrain.storage.backup import create_policy_backup
     from superbrain.storage.restore import restore_policy
-    from superbrain.storage.schema import POLICY_MIGRATIONS, STORE_MIGRATIONS, code_version, read_schema_info
+    from superbrain.storage.schema import (
+        POLICY_MIGRATIONS,
+        STORE_MIGRATIONS,
+        SchemaInfo,
+        code_version,
+        read_schema_info,
+    )
     from superbrain.storage.sqlite import open_readonly
     from superbrain.storage.swap import READY
 
@@ -2015,9 +2028,12 @@ def test_historical_v2_writer_is_fenced_before_policy_mutation_across_migrate_an
         assert mig_hist.policy_report.to_version == 3
         assert mig_hist.policy_report.backup is not None
         maint_v2_policy_backup = mig_hist.policy_report.backup
-        assert mig_hist.store_report.status == "skipped"
+        assert mig_hist.store_report.status == "migrated"
         assert mig_hist.store_report.from_version == 2
-        assert mig_hist.store_report.to_version == 2
+        assert mig_hist.store_report.to_version == 3
+        assert mig_hist.store_report.backup is not None
+        assert read_schema_info(root_hist / "policy" / "policy.db") == SchemaInfo(3, 3, hist_store_id)
+        assert read_schema_info(root_hist / "store" / "brain.db") == SchemaInfo(3, 3, hist_store_id)
 
         clock.advance(dt.timedelta(seconds=5))
         adm_cur = admit_existing_pair(root_hist, hist_store_id, os_, purpose="serve")
@@ -2073,6 +2089,7 @@ def test_historical_v2_writer_is_fenced_before_policy_mutation_across_migrate_an
                 )
             finally:
                 pol_h.close()
+        assert read_schema_info(root_hist / "store" / "brain.db") == SchemaInfo(3, 3, hist_store_id)
 
         _assert_root_hist_fenced("step4-after-restore-store")
 
@@ -2150,9 +2167,11 @@ def test_historical_v2_writer_is_fenced_before_policy_mutation_across_migrate_an
     v2_store = KERNEL_STORE_MIGRATIONS[:2]
     assert code_version(v2_policy) == 2
     assert code_version(v2_store) == 2
+    assert code_version(KERNEL_POLICY_MIGRATIONS) == 3
+    assert code_version(KERNEL_STORE_MIGRATIONS) == 3
 
     # B1 & B2: Create a root at v1, take v1 policy backup, upgrade to (store=2, policy=2), take v2 policy backup,
-    # then upgrade via migrate_offline to (store=2, policy=3).
+    # then upgrade via migrate_offline to (store=3, policy=3).
     b1_root = trusted_tmp / "part-b-upgraded-root"
     rt_b1_v1 = open_runtime(
         b1_root,
@@ -2194,7 +2213,9 @@ def test_historical_v2_writer_is_fenced_before_policy_mutation_across_migrate_an
     )
     assert not mig_b1_to_v3.noop
     assert mig_b1_to_v3.policy_report.from_version == 2 and mig_b1_to_v3.policy_report.to_version == 3
-    assert mig_b1_to_v3.store_report.status == "skipped" and mig_b1_to_v3.store_report.to_version == 2
+    assert mig_b1_to_v3.store_report.status == "migrated"
+    assert mig_b1_to_v3.store_report.from_version == 2 and mig_b1_to_v3.store_report.to_version == 3
+    assert read_schema_info(b1_root / "store" / "brain.db") == SchemaInfo(3, 3, b1_store_id)
 
     # Clean up prior policy.replaced-* / store.replaced-* from setup so stage-creation checks start clean.
     for leftover in list(b1_root.iterdir()):
@@ -2453,3 +2474,1270 @@ def test_historical_v2_writer_is_fenced_before_policy_mutation_across_migrate_an
     assert promoted_info is not None and promoted_info.schema_version == 3 and promoted_info.min_reader_version == 3
     assert digest_tree(b4b_root / "policy") == b4b_stage_hashes
     assert digest_tree(b4b_root / "store") == b4b_store_hashes
+
+
+def test_historical_restore_policy_cannot_strip_main_store_fence_before_authority_mutation(
+    trusted_tmp: Path, os_: OsAdapters, clock: FakeClock
+) -> None:
+    import json
+    import os
+    import shutil
+    import sqlite3
+    import subprocess
+    import sys
+    import zipfile
+    from typing import Literal
+
+    from superbrain.composition.migrate_entry import migrate_offline
+    from superbrain.core.kernel import DaemonConfig
+    from superbrain.storage.backup import create_policy_backup, create_store_backup
+    from superbrain.storage.cas import RetentionClass
+    from superbrain.storage.restore import restore_policy
+    from superbrain.storage.schema import (
+        POLICY_MIGRATIONS,
+        STORE_MIGRATIONS,
+        SchemaInfo,
+        code_version,
+        ensure_readable,
+        read_schema_info,
+    )
+    from superbrain.storage.sqlite import open_readonly
+
+    def _norm_blob(val: object) -> bytes:
+        if isinstance(val, (bytes, bytearray, memoryview)):
+            return bytes(val)
+        return str(val).encode("utf-8")
+
+    def _norm_row(row: tuple[object, ...]) -> tuple[object, ...]:
+        return tuple(bytes(v) if isinstance(v, (bytes, bytearray, memoryview)) else v for v in row)
+
+    def _read_full_policy_state(policy_db: Path) -> dict[str, object]:
+        db = open_readonly(policy_db)
+        try:
+            trust_rows = db.execute("SELECT id, generation FROM trust ORDER BY id").fetchall()
+            assert len(trust_rows) == 1 and trust_rows[0][0] == 1 and type(trust_rows[0][1]) is int
+            meta_rows = dict(db.execute("SELECT key, value FROM meta").fetchall())
+            intents_rows = [
+                (r[0], r[1], _norm_blob(r[2]), r[3])
+                for r in db.execute(
+                    "SELECT intent_id, kind, payload, created_at FROM intents ORDER BY rowid"
+                ).fetchall()
+            ]
+            checkouts_rows = db.execute(
+                "SELECT checkout_id, repo_id, checkout_path, alias FROM workspace_checkout ORDER BY checkout_id"
+            ).fetchall()
+            checkouts_all = [_norm_row(r) for r in db.execute("SELECT * FROM workspace_checkout ORDER BY rowid")]
+            locators_all = [_norm_row(r) for r in db.execute("SELECT * FROM workspace_repo_locator ORDER BY rowid")]
+            repo_policies_all = [_norm_row(r) for r in db.execute("SELECT * FROM repo_policy ORDER BY rowid")]
+            grants_rows = db.execute(
+                "SELECT principal_id, repo_id, granted_intent_id FROM repo_grant ORDER BY principal_id, repo_id"
+            ).fetchall()
+            creds_rows = [
+                (r[0], r[1], _norm_blob(r[2]), r[3])
+                for r in db.execute(
+                    "SELECT id, principal_id, secret_digest, revoked_intent_id FROM credential ORDER BY id"
+                ).fetchall()
+            ]
+            principals_rows = db.execute(
+                "SELECT id, owner_id, harness_id, machine_id FROM principal ORDER BY id"
+            ).fetchall()
+            digest_key_rows = [
+                (r[0], _norm_blob(r[1]))
+                for r in db.execute("SELECT id, key_bytes FROM request_digest_key ORDER BY id").fetchall()
+            ]
+            tombstones_all = [_norm_row(r) for r in db.execute("SELECT * FROM tombstones ORDER BY rowid")]
+            quarantine_all = [_norm_row(r) for r in db.execute("SELECT * FROM quarantine ORDER BY rowid")]
+            return {
+                "trust_generation": trust_rows[0][1],
+                "meta": meta_rows,
+                "intents": intents_rows,
+                "checkouts": checkouts_rows,
+                "checkouts_all": checkouts_all,
+                "locators_all": locators_all,
+                "repo_policies_all": repo_policies_all,
+                "grants": grants_rows,
+                "credentials": creds_rows,
+                "principals": principals_rows,
+                "request_digest_key": digest_key_rows,
+                "tombstones": tombstones_all,
+                "quarantine": quarantine_all,
+            }
+        finally:
+            db.close()
+
+    def _read_store_ws_ledger_versions(store_db: Path) -> list[int]:
+        db = open_readonly(store_db)
+        try:
+            rows = db.execute(
+                "SELECT handler_version FROM ledger WHERE kind = 'policy.workspace_register' ORDER BY sequence"
+            ).fetchall()
+            return [int(r[0]) for r in rows]
+        finally:
+            db.close()
+
+    repo_root = Path(__file__).resolve().parents[2]
+    hist_commit = "6a67b384c16c5a405f2a26b3ecb4b67e4ab26652"
+    shallow_proc = subprocess.run(
+        ["git", "rev-parse", "--is-shallow-repository"],
+        cwd=repo_root,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    has_hist_commit = (
+        subprocess.run(
+            ["git", "cat-file", "-e", f"{hist_commit}^{{commit}}"],
+            cwd=repo_root,
+            capture_output=True,
+            check=False,
+        ).returncode
+        == 0
+    )
+    if shallow_proc.returncode == 0 and shallow_proc.stdout.strip() == "false":
+        assert has_hist_commit, f"non-shallow repository must contain historical commit {hist_commit}"
+
+    part_a_ran = False
+    if has_hist_commit:
+        part_a_ran = True
+        hist_zip = trusted_tmp / "hist-r4-6a67b38.zip"
+        arch_proc = subprocess.run(
+            ["git", "archive", "--format=zip", f"--output={hist_zip}", hist_commit, "src"],
+            cwd=repo_root,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert arch_proc.returncode == 0, arch_proc.stderr
+        hist_dir = trusted_tmp / "hist-r4-6a67b38"
+        hist_dir.mkdir()
+        os_.permissions.secure_directory(hist_dir)
+        with zipfile.ZipFile(hist_zip) as zf:
+            for member in zf.infolist():
+                member_path = Path(member.filename)
+                member_parts = member_path.parts
+                assert (
+                    bool(member_parts)
+                    and member_parts[0] == "src"
+                    and ".." not in member_parts
+                    and not member_path.is_absolute()
+                    and not member_path.drive
+                ), f"unsafe zip entry: {member.filename}"
+            zf.extractall(hist_dir)
+        hist_src = hist_dir / "src"
+        assert (hist_src / "superbrain" / "__init__.py").is_file()
+
+        driver_path = trusted_tmp / "hist_r4_6a67b38_driver.py"
+        driver_code = (
+            "import datetime as dt\n"
+            "import json\n"
+            "import sys\n"
+            "from pathlib import Path\n"
+            "\n"
+            "req = json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))\n"
+            "hist_src = Path(req['hist_src']).resolve()\n"
+            "repo_root = Path(req['repo_root']).resolve()\n"
+            "repo_src = (repo_root / 'src').resolve()\n"
+            "sys.path[:] = [p for p in sys.path if Path(p or '.').resolve() != repo_src]\n"
+            "sys.path[:0] = [str(hist_src), str(repo_root)]\n"
+            "\n"
+            "import superbrain\n"
+            "from superbrain.adapters.os import os_adapters\n"
+            "from superbrain.composition.migrate_entry import migrate_offline\n"
+            "from superbrain.core.errors import BrainError\n"
+            "from superbrain.core.kernel import DaemonConfig, WorkspaceRegistration\n"
+            "from superbrain.storage.backup import create_policy_backup, create_store_backup\n"
+            "from superbrain.storage.kernel_schema import KERNEL_POLICY_MIGRATIONS, KERNEL_STORE_MIGRATIONS\n"
+            "from superbrain.storage.layout import prepare_data_root\n"
+            "from superbrain.storage.restore import restore_policy\n"
+            "from superbrain.storage.runtime import admit_existing_pair, open_runtime\n"
+            "from superbrain.storage.schema import code_version\n"
+            "from superbrain.storage.writer import acquire_writer\n"
+            "from tests.support.clock import FakeClock\n"
+            "from tests.support.fs import digest_tree\n"
+            "from tests.support.kernel_auth import make_bootstrap_auth, seed_principal_and_credential\n"
+            "\n"
+            "assert Path(superbrain.__file__).resolve().is_relative_to(hist_src)\n"
+            "assert Path(restore_policy.__code__.co_filename).resolve().is_relative_to(hist_src)\n"
+            "assert Path(open_runtime.__code__.co_filename).resolve().is_relative_to(hist_src)\n"
+            "assert code_version(KERNEL_STORE_MIGRATIONS) == 2\n"
+            "assert code_version(KERNEL_POLICY_MIGRATIONS) == 2\n"
+            "\n"
+            "mode = req['mode']\n"
+            "root = Path(req['root'])\n"
+            "base = Path(req['base'])\n"
+            "if mode == 'create_pending':\n"
+            "    clock = FakeClock(dt.datetime(2026, 11, 6, 8, 0, tzinfo=dt.UTC))\n"
+            "    adapters = os_adapters(clock)\n"
+            "    rt = open_runtime(\n"
+            "        root,\n"
+            "        adapters,\n"
+            "        store_migrations=KERNEL_STORE_MIGRATIONS,\n"
+            "        policy_migrations=KERNEL_POLICY_MIGRATIONS,\n"
+            "    )\n"
+            "    try:\n"
+            "        cred = seed_principal_and_credential(\n"
+            "            rt.policy, owner_id='dan', harness_id='claude-code', machine_id='dev-hist-r4'\n"
+            "        )\n"
+            "        clock.advance(dt.timedelta(seconds=5))\n"
+            "        s_bak = create_store_backup(rt.store, adapters, clock.now())\n"
+            "        clock.advance(dt.timedelta(seconds=5))\n"
+            "        reg = WorkspaceRegistration(\n"
+            "            owner_id='dan',\n"
+            "            principal_id=cred.principal.principal_id,\n"
+            "            machine_id=cred.principal.machine_id,\n"
+            "            alias='checkout',\n"
+            "            checkout_path=str(base / 'old'),\n"
+            "            path_identity='same-physical-checkout',\n"
+            "        )\n"
+            "        auth = make_bootstrap_auth(\n"
+            "            store_id=rt.policy.store_id,\n"
+            "            owner_id='dan',\n"
+            "            action='workspace_register',\n"
+            "            subject_id=reg.subject_id,\n"
+            "            trust_generation=rt.policy.trust_generation(),\n"
+            "            expires_at=clock.now() + dt.timedelta(minutes=5),\n"
+            "        )\n"
+            "        binding = rt.policy.register_authorized_workspace(reg, auth)\n"
+            "        clock.advance(dt.timedelta(seconds=5))\n"
+            "        p_bak = create_policy_backup(rt.policy, adapters, clock.now())\n"
+            "        intents = rt.policy.intents()\n"
+            "        ws_entries = [e for e in rt.store.entries() if e.kind == 'policy.workspace_register']\n"
+            "        print(\n"
+            "            json.dumps(\n"
+            "                {\n"
+            "                    'store_id': rt.policy.store_id,\n"
+            "                    'principal_id': cred.principal.principal_id,\n"
+            "                    'machine_id': cred.principal.machine_id,\n"
+            "                    'credential_id': cred.credential_id,\n"
+            "                    'token': cred.token,\n"
+            "                    'repo_id': binding.repo_id,\n"
+            "                    'checkout_id': binding.checkout_id,\n"
+            "                    'intent_id': auth.intent_id,\n"
+            "                    'store_backup': str(s_bak),\n"
+            "                    'policy_backup': str(p_bak),\n"
+            "                    'intents_count': len(intents),\n"
+            "                    'intent_has_subject': 'subject_id' in intents[0].payload,\n"
+            "                    'ledger_workspace_entries': len(ws_entries),\n"
+            "                }\n"
+            "            )\n"
+            "        )\n"
+            "    finally:\n"
+            "        rt.close()\n"
+            "elif mode == 'hist_restore_policy':\n"
+            "    clock = FakeClock(dt.datetime(2026, 11, 6, 9, 0, tzinfo=dt.UTC))\n"
+            "    adapters = os_adapters(clock)\n"
+            "    droot = prepare_data_root(root, adapters)\n"
+            "    lease = acquire_writer(droot, adapters)\n"
+            "    try:\n"
+            "        rep = restore_policy(\n"
+            "            droot,\n"
+            "            lease,\n"
+            "            adapters,\n"
+            "            Path(str(req['backup'])),\n"
+            "            store_id=str(req['store_id']),\n"
+            "            now=clock.now(),\n"
+            "            migrations=KERNEL_POLICY_MIGRATIONS,\n"
+            "        )\n"
+            "    finally:\n"
+            "        lease.release()\n"
+            "    print(json.dumps({'status': 'accepted', 'trust_generation': rep.trust_generation}))\n"
+            "elif mode == 'probe_preadmission':\n"
+            "    clock = FakeClock(dt.datetime(2026, 11, 6, 9, 15, tzinfo=dt.UTC))\n"
+            "    adapters = os_adapters(clock)\n"
+            "    sid = str(req['store_id'])\n"
+            "    out: dict[str, object] = {}\n"
+            "    for p_label, p_val in (('admit_serve', 'serve'), ('admit_migrate', 'migrate')):\n"
+            "        snap_before = digest_tree(root)\n"
+            "        try:\n"
+            "            adm = admit_existing_pair(root, sid, adapters, purpose=p_val)\n"
+            "            adm.release()\n"
+            "            out[p_label] = 'accepted'\n"
+            "        except BrainError as err:\n"
+            "            out[p_label] = err.code.value\n"
+            "        out[f'{p_label}_unchanged'] = digest_tree(root) == snap_before\n"
+            "    snap_before_mig = digest_tree(root)\n"
+            "    try:\n"
+            "        migrate_offline(DaemonConfig(1, root, sid, base / 'c.pem', base / 'c.key'), adapters)\n"
+            "        out['migrate_offline'] = 'accepted'\n"
+            "    except BrainError as err:\n"
+            "        out['migrate_offline'] = err.code.value\n"
+            "    out['migrate_offline_unchanged'] = digest_tree(root) == snap_before_mig\n"
+            "    print(json.dumps(out))\n"
+            "elif mode == 'probe_open_and_register_ws':\n"
+            "    clock = FakeClock(dt.datetime(2026, 11, 6, 9, 30, tzinfo=dt.UTC))\n"
+            "    adapters = os_adapters(clock)\n"
+            "    stage_reached = 'open_runtime'\n"
+            "    error_code: str | None = None\n"
+            "    before_intents: int | None = None\n"
+            "    after_intents: int | None = None\n"
+            "    live_path_changed = False\n"
+            "    try:\n"
+            "        rt = open_runtime(\n"
+            "            root,\n"
+            "            adapters,\n"
+            "            store_migrations=KERNEL_STORE_MIGRATIONS,\n"
+            "            policy_migrations=KERNEL_POLICY_MIGRATIONS,\n"
+            "        )\n"
+            "        try:\n"
+            "            before_intents = len(rt.policy.intents())\n"
+            "            stage_reached = 'register_authorized_workspace'\n"
+            "            reg = WorkspaceRegistration(\n"
+            "                owner_id='dan',\n"
+            "                principal_id=str(req['principal_id']),\n"
+            "                machine_id=str(req['machine_id']),\n"
+            "                alias='checkout',\n"
+            "                checkout_path=str(base / 'new'),\n"
+            "                path_identity='same-physical-checkout',\n"
+            "            )\n"
+            "            rt.policy.register_authorized_workspace(\n"
+            "                reg,\n"
+            "                make_bootstrap_auth(\n"
+            "                    store_id=rt.policy.store_id,\n"
+            "                    owner_id='dan',\n"
+            "                    action='workspace_register',\n"
+            "                    subject_id=reg.subject_id,\n"
+            "                    trust_generation=rt.policy.trust_generation(),\n"
+            "                    expires_at=clock.now() + dt.timedelta(minutes=5),\n"
+            "                ),\n"
+            "            )\n"
+            "            after_intents = len(rt.policy.intents())\n"
+            "            live_path_changed = (\n"
+            "                next(iter(rt.policy.snapshot().checkouts.values())).checkout_path == reg.checkout_path\n"
+            "            )\n"
+            "            stage_reached = 'reconcile_policy'\n"
+            "            rt.store.reconcile_policy()\n"
+            "            stage_reached = 'completed'\n"
+            "        finally:\n"
+            "            rt.close()\n"
+            "    except BrainError as err:\n"
+            "        error_code = err.code.value\n"
+            "    print(\n"
+            "        json.dumps(\n"
+            "            {\n"
+            "                'stage_reached': stage_reached,\n"
+            "                'error_code': error_code,\n"
+            "                'before_intents': before_intents,\n"
+            "                'after_intents': after_intents,\n"
+            "                'live_path_changed': live_path_changed,\n"
+            "            }\n"
+            "        )\n"
+            "    )\n"
+            "elif mode == 'probe_open_and_revoke':\n"
+            "    clock = FakeClock(dt.datetime(2026, 11, 6, 9, 45, tzinfo=dt.UTC))\n"
+            "    adapters = os_adapters(clock)\n"
+            "    stage_reached = 'open_runtime'\n"
+            "    error_code_rev: str | None = None\n"
+            "    before_intents_rev: int | None = None\n"
+            "    after_intents_rev: int | None = None\n"
+            "    credential_revoked = False\n"
+            "    try:\n"
+            "        rt = open_runtime(\n"
+            "            root,\n"
+            "            adapters,\n"
+            "            store_migrations=KERNEL_STORE_MIGRATIONS,\n"
+            "            policy_migrations=KERNEL_POLICY_MIGRATIONS,\n"
+            "        )\n"
+            "        try:\n"
+            "            before_intents_rev = len(rt.policy.intents())\n"
+            "            stage_reached = 'record_authorized_revocation'\n"
+            "            rt.policy.record_authorized_revocation(\n"
+            "                str(req['credential_id']),\n"
+            "                make_bootstrap_auth(\n"
+            "                    store_id=rt.policy.store_id,\n"
+            "                    owner_id='dan',\n"
+            "                    action='credential_revoke',\n"
+            "                    subject_id=str(req['credential_id']),\n"
+            "                    trust_generation=rt.policy.trust_generation(),\n"
+            "                    expires_at=clock.now() + dt.timedelta(minutes=5),\n"
+            "                ),\n"
+            "            )\n"
+            "            after_intents_rev = len(rt.policy.intents())\n"
+            "            credential_revoked = True\n"
+            "            stage_reached = 'reconcile_policy'\n"
+            "            rt.store.reconcile_policy()\n"
+            "            stage_reached = 'completed'\n"
+            "        finally:\n"
+            "            rt.close()\n"
+            "    except BrainError as err:\n"
+            "        error_code_rev = err.code.value\n"
+            "    print(\n"
+            "        json.dumps(\n"
+            "            {\n"
+            "                'stage_reached': stage_reached,\n"
+            "                'error_code': error_code_rev,\n"
+            "                'before_intents': before_intents_rev,\n"
+            "                'after_intents': after_intents_rev,\n"
+            "                'credential_revoked': credential_revoked,\n"
+            "            }\n"
+            "        )\n"
+            "    )\n"
+            "else:\n"
+            "    raise AssertionError(f'unknown mode: {mode}')\n"
+        )
+        driver_path.write_text(driver_code, encoding="utf-8")
+        os_.permissions.secure_file(driver_path)
+
+        req_counter = 0
+
+        def _run_r4_child(payload: dict[str, object]) -> dict[str, object]:
+            nonlocal req_counter
+            req_counter += 1
+            req_file = trusted_tmp / f"hist-r4-req-{req_counter}.json"
+            full_payload = {
+                "hist_src": str(hist_src),
+                "repo_root": str(repo_root),
+                **payload,
+            }
+            req_file.write_text(json.dumps(full_payload), encoding="utf-8")
+            os_.permissions.secure_file(req_file)
+            proc = subprocess.run(
+                [sys.executable, str(driver_path), str(req_file)],
+                cwd=repo_root,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            assert proc.returncode == 0, (
+                f"historical r4 child failed ({payload['mode']}):\n{proc.stdout}\n{proc.stderr}"
+            )
+            parsed = json.loads(proc.stdout)
+            assert isinstance(parsed, dict)
+            return parsed
+
+        part_a_base = trusted_tmp / "part-a-r4-6a67b38"
+        part_a_base.mkdir()
+        os_.permissions.secure_directory(part_a_base)
+        root_hist = part_a_base / "store"
+
+        # (a) 6a67b38 child creates (store=2, policy=2) root, commits pending 6-key workspace_register (intents == 1,
+        # checkout_path == old), takes valid v2 policy & store backups, and closes before Store.reconcile_policy().
+        created = _run_r4_child(
+            {
+                "mode": "create_pending",
+                "root": str(root_hist),
+                "base": str(part_a_base),
+            }
+        )
+        assert created["intents_count"] == 1
+        assert created["intent_has_subject"] is False
+        assert created["ledger_workspace_entries"] == 0
+        hist_store_id = str(created["store_id"])
+        hist_principal_id = str(created["principal_id"])
+        hist_machine_id = str(created["machine_id"])
+        hist_credential_id = str(created["credential_id"])
+        hist_token = str(created["token"])
+        hist_repo_id = str(created["repo_id"])
+        hist_checkout_id = str(created["checkout_id"])
+        hist_intent_id = str(created["intent_id"])
+        hist_store_backup = Path(str(created["store_backup"]))
+        hist_policy_backup = Path(str(created["policy_backup"]))
+        assert read_schema_info(root_hist / "policy" / "policy.db") == SchemaInfo(2, 2, hist_store_id)
+        assert read_schema_info(root_hist / "store" / "brain.db") == SchemaInfo(2, 2, hist_store_id)
+
+        # (b) Current Code refuses admit_existing_pair("serve") and open_runtime on (2, 2) with MIGRATION_REQUIRED
+        # and zero mutations, runs migrate_offline upgrading BOTH policy (2 -> 3) and store (2 -> 3), opens runtime
+        # under lease, and reconciles handler_version == 2 (subject_id is None).
+        snap_pre_mig = digest_tree(root_hist)
+        with pytest.raises(BrainError) as exc_pre_admit:
+            bad_adm = admit_existing_pair(root_hist, hist_store_id, os_, purpose="serve")
+            bad_adm.release()
+        assert exc_pre_admit.value.code is ErrorCode.MIGRATION_REQUIRED
+        assert digest_tree(root_hist) == snap_pre_mig
+
+        snap_pol_pre = digest_tree(root_hist / "policy")
+        snap_str_pre = digest_tree(root_hist / "store")
+        with pytest.raises(BrainError) as exc_pre_open:
+            bad_rt = open_runtime(
+                root_hist,
+                os_,
+                store_migrations=KERNEL_STORE_MIGRATIONS,
+                policy_migrations=KERNEL_POLICY_MIGRATIONS,
+            )
+            bad_rt.close()
+        assert exc_pre_open.value.code is ErrorCode.MIGRATION_REQUIRED
+        assert digest_tree(root_hist / "policy") == snap_pol_pre
+        assert digest_tree(root_hist / "store") == snap_str_pre
+
+        clock.advance(dt.timedelta(minutes=1))
+        mig_initial = migrate_offline(
+            DaemonConfig(1, root_hist, hist_store_id, part_a_base / "server.pem", part_a_base / "server.key"),
+            os_,
+        )
+        assert not mig_initial.noop
+        assert mig_initial.policy_report.status == "migrated"
+        assert mig_initial.policy_report.from_version == 2 and mig_initial.policy_report.to_version == 3
+        assert mig_initial.policy_report.backup is not None
+        maint_v2_policy_backup = mig_initial.policy_report.backup
+        assert read_schema_info(root_hist / "policy" / "policy.db") == SchemaInfo(3, 3, hist_store_id)
+
+        clock.advance(dt.timedelta(seconds=5))
+        adm_reconcile = admit_existing_pair(root_hist, hist_store_id, os_, purpose="serve")
+        rt_reconcile = open_runtime_under_lease(adm_reconcile)
+        try:
+            ws_reconciled = [e for e in rt_reconcile.store.entries() if e.kind == "policy.workspace_register"]
+            assert len(ws_reconciled) == 1
+            assert ws_reconciled[0].handler_version == 2
+            assert ws_reconciled[0].meta["intent_id"] == hist_intent_id
+            assert ws_reconciled[0].meta["subject_id"] is None
+            assert rt_reconcile.policy.snapshot().checkouts[hist_checkout_id].checkout_path == str(part_a_base / "old")
+            assert rt_reconcile.policy.resolve_credential(hist_token).principal_id == hist_principal_id
+        finally:
+            rt_reconcile.close()
+
+        # (c) Before historical restore_policy, 6a67b38 open_runtime fails at open_runtime with UNSUPPORTED_VERSION.
+        pol_before_c = digest_tree(root_hist / "policy")
+        str_before_c = digest_tree(root_hist / "store")
+        state_before_c = _read_full_policy_state(root_hist / "policy" / "policy.db")
+        res_before_restore = _run_r4_child(
+            {
+                "mode": "probe_open_and_register_ws",
+                "root": str(root_hist),
+                "base": str(part_a_base),
+                "principal_id": hist_principal_id,
+                "machine_id": hist_machine_id,
+            }
+        )
+        assert res_before_restore == {
+            "stage_reached": "open_runtime",
+            "error_code": ErrorCode.UNSUPPORTED_VERSION.value,
+            "before_intents": None,
+            "after_intents": None,
+            "live_path_changed": False,
+        }
+        assert digest_tree(root_hist / "policy") == pol_before_c
+        assert digest_tree(root_hist / "store") == str_before_c
+        assert _read_full_policy_state(root_hist / "policy" / "policy.db") == state_before_c
+
+        def _assert_hist_preadmission_fenced(label: str) -> None:
+            root_snap_pre = digest_tree(root_hist)
+            preadm = _run_r4_child(
+                {
+                    "mode": "probe_preadmission",
+                    "root": str(root_hist),
+                    "base": str(part_a_base),
+                    "store_id": hist_store_id,
+                }
+            )
+            assert preadm == {
+                "admit_serve": ErrorCode.UNSUPPORTED_VERSION.value,
+                "admit_serve_unchanged": True,
+                "admit_migrate": ErrorCode.UNSUPPORTED_VERSION.value,
+                "admit_migrate_unchanged": True,
+                "migrate_offline": ErrorCode.UNSUPPORTED_VERSION.value,
+                "migrate_offline_unchanged": True,
+            }, f"{label}: unexpected pre-admission result {preadm}"
+            assert digest_tree(root_hist) == root_snap_pre, f"{label}: root bytes mutated during pre-admission refusal"
+
+        def _assert_hist_open_mutations_fenced(
+            label: str,
+            expected_ledger_versions: list[int],
+        ) -> None:
+            store_snap = digest_tree(root_hist / "store")
+            pol_state_expected = _read_full_policy_state(root_hist / "policy" / "policy.db")
+            intents_list = pol_state_expected["intents"]
+            assert isinstance(intents_list, list) and len(intents_list) == 1
+            assert intents_list[0][0] == hist_intent_id
+            assert pol_state_expected["checkouts"] == [
+                (hist_checkout_id, hist_repo_id, str(part_a_base / "old"), "checkout")
+            ]
+            creds_list = pol_state_expected["credentials"]
+            assert isinstance(creds_list, list) and len(creds_list) == 1
+            assert creds_list[0][0] == hist_credential_id and creds_list[0][3] is None
+            assert pol_state_expected["principals"] == [
+                (hist_principal_id, "dan", "claude-code", hist_machine_id)
+            ]
+            grants_list = pol_state_expected["grants"]
+            assert isinstance(grants_list, list) and len(grants_list) == 1
+            dk_list = pol_state_expected["request_digest_key"]
+            assert isinstance(dk_list, list) and len(dk_list) == 1 and len(dk_list[0][1]) == 32
+
+            ws_res = _run_r4_child(
+                {
+                    "mode": "probe_open_and_register_ws",
+                    "root": str(root_hist),
+                    "base": str(part_a_base),
+                    "principal_id": hist_principal_id,
+                    "machine_id": hist_machine_id,
+                }
+            )
+            assert ws_res == {
+                "stage_reached": "open_runtime",
+                "error_code": ErrorCode.UNSUPPORTED_VERSION.value,
+                "before_intents": None,
+                "after_intents": None,
+                "live_path_changed": False,
+            }, f"{label}: historical 6a67b38 restore_policy stripped fence and mutated policy: {ws_res}"
+            assert digest_tree(root_hist / "store") == store_snap, f"{label}: store/ bytes changed on ws open_runtime"
+            assert _read_store_ws_ledger_versions(root_hist / "store" / "brain.db") == expected_ledger_versions
+            assert _read_full_policy_state(root_hist / "policy" / "policy.db") == pol_state_expected
+
+            rev_res = _run_r4_child(
+                {
+                    "mode": "probe_open_and_revoke",
+                    "root": str(root_hist),
+                    "base": str(part_a_base),
+                    "credential_id": hist_credential_id,
+                }
+            )
+            assert rev_res == {
+                "stage_reached": "open_runtime",
+                "error_code": ErrorCode.UNSUPPORTED_VERSION.value,
+                "before_intents": None,
+                "after_intents": None,
+                "credential_revoked": False,
+            }, f"{label}: historical 6a67b38 restore_policy allowed revocation mutation: {rev_res}"
+            assert digest_tree(root_hist / "store") == store_snap, f"{label}: store/ bytes changed on rev open_runtime"
+            assert _read_store_ws_ledger_versions(root_hist / "store" / "brain.db") == expected_ledger_versions
+            assert _read_full_policy_state(root_hist / "policy" / "policy.db") == pol_state_expected
+
+        # (d), (e), (f) Execute 6a67b38's own restore_policy for BOTH 6a67b38's v2 policy backup AND migrate_offline's
+        # v2 maintenance policy backup, verify 6a67b38 runtime & admission are fenced at (policy=2, store=3) before any
+        # authority mutation, and verify Current Code recovers (policy=2, store=3) -> (policy=3, store=3) cleanly.
+        for pass_idx, (bak_label, v2_pol_bak) in enumerate(
+            (
+                ("hist-6a67b38-v2-policy-backup", hist_policy_backup),
+                ("migrate-maint-v2-policy-backup", maint_v2_policy_backup),
+            )
+        ):
+            hist_restore_res = _run_r4_child(
+                {
+                    "mode": "hist_restore_policy",
+                    "root": str(root_hist),
+                    "base": str(part_a_base),
+                    "backup": str(v2_pol_bak),
+                    "store_id": hist_store_id,
+                }
+            )
+            assert hist_restore_res["status"] == "accepted"
+            assert read_schema_info(root_hist / "policy" / "policy.db") == SchemaInfo(2, 2, hist_store_id)
+
+            if pass_idx == 0:
+                # Pass 0 reproduces probe_historical_restore.py directly first, then verifies pre-admission & store v3.
+                _assert_hist_open_mutations_fenced(f"step-e-{bak_label}", expected_ledger_versions=[2])
+                assert mig_initial.store_report.status == "migrated"
+                assert mig_initial.store_report.from_version == 2 and mig_initial.store_report.to_version == 3
+                assert mig_initial.store_report.backup is not None
+                assert read_schema_info(root_hist / "store" / "brain.db") == SchemaInfo(3, 3, hist_store_id)
+                _assert_hist_preadmission_fenced(f"step-e-{bak_label}-preadm")
+            else:
+                # Pass 1 runs pre-admission checks first (on fresh DELETE-mode restored policy.db) then open_runtime.
+                assert read_schema_info(root_hist / "store" / "brain.db") == SchemaInfo(3, 3, hist_store_id)
+                _assert_hist_preadmission_fenced(f"step-e-{bak_label}-preadm")
+                _assert_hist_open_mutations_fenced(f"step-e-{bak_label}", expected_ledger_versions=[2])
+
+            # (f) Current Code refuses (policy=2, store=3) before migration with MIGRATION_REQUIRED & zero mutations,
+            # then upgrades (policy=2, store=3) -> (policy=3, store=3) via migrate_offline.
+            snap_mixed_root = digest_tree(root_hist)
+            with pytest.raises(BrainError) as exc_cur_admit:
+                bad_cur_adm = admit_existing_pair(root_hist, hist_store_id, os_, purpose="serve")
+                bad_cur_adm.release()
+            assert exc_cur_admit.value.code is ErrorCode.MIGRATION_REQUIRED
+            assert digest_tree(root_hist) == snap_mixed_root
+
+            snap_mixed_pol = digest_tree(root_hist / "policy")
+            snap_mixed_str = digest_tree(root_hist / "store")
+            with pytest.raises(BrainError) as exc_cur_open:
+                bad_cur_rt = open_runtime(
+                    root_hist,
+                    os_,
+                    store_migrations=KERNEL_STORE_MIGRATIONS,
+                    policy_migrations=KERNEL_POLICY_MIGRATIONS,
+                )
+                bad_cur_rt.close()
+            assert exc_cur_open.value.code is ErrorCode.MIGRATION_REQUIRED
+            assert digest_tree(root_hist / "policy") == snap_mixed_pol
+            assert digest_tree(root_hist / "store") == snap_mixed_str
+
+            clock.advance(dt.timedelta(minutes=1))
+            mig_recover = migrate_offline(
+                DaemonConfig(1, root_hist, hist_store_id, part_a_base / "server.pem", part_a_base / "server.key"),
+                os_,
+            )
+            assert not mig_recover.noop
+            assert mig_recover.policy_report.status == "migrated"
+            assert mig_recover.policy_report.from_version == 2 and mig_recover.policy_report.to_version == 3
+            assert mig_recover.store_report.status == "skipped"
+            assert mig_recover.store_report.from_version == 3 and mig_recover.store_report.to_version == 3
+            assert read_schema_info(root_hist / "policy" / "policy.db") == SchemaInfo(3, 3, hist_store_id)
+            assert read_schema_info(root_hist / "store" / "brain.db") == SchemaInfo(3, 3, hist_store_id)
+
+            clock.advance(dt.timedelta(seconds=5))
+            adm_recovered = admit_existing_pair(root_hist, hist_store_id, os_, purpose="serve")
+            rt_recovered = open_runtime_under_lease(adm_recovered)
+            try:
+                assert rt_recovered.policy.store_id == hist_store_id
+                assert rt_recovered.store.store_id == hist_store_id
+                assert rt_recovered.policy.resolve_credential(hist_token).principal_id == hist_principal_id
+                snap_rec = rt_recovered.policy.snapshot()
+                assert snap_rec.checkouts[hist_checkout_id].repo_id == hist_repo_id
+                assert snap_rec.checkouts[hist_checkout_id].checkout_path == str(part_a_base / "old")
+                assert (hist_principal_id, hist_repo_id) in snap_rec.grants
+                assert rt_recovered.store.reconcile_policy() == 0
+                ws_rec_entries = [e for e in rt_recovered.store.entries() if e.kind == "policy.workspace_register"]
+                assert [e.handler_version for e in ws_rec_entries] == [2]
+
+                # Unproven replay of retained 6-key intent_id refuses with REVISION_CONFLICT and zero mutations.
+                pol_state_pre_replay = _read_full_policy_state(root_hist / "policy" / "policy.db")
+                reg_replay_6key = WorkspaceRegistration(
+                    owner_id="dan",
+                    principal_id=hist_principal_id,
+                    machine_id=hist_machine_id,
+                    alias="checkout",
+                    checkout_path=str(part_a_base / "old"),
+                    path_identity="same-physical-checkout",
+                )
+                with pytest.raises(BrainError) as exc_unproven:
+                    rt_recovered.policy.register_authorized_workspace(
+                        reg_replay_6key,
+                        make_bootstrap_auth(
+                            intent_id=hist_intent_id,
+                            store_id=hist_store_id,
+                            owner_id="dan",
+                            action="workspace_register",
+                            subject_id=reg_replay_6key.subject_id,
+                            trust_generation=rt_recovered.policy.trust_generation(),
+                            expires_at=clock.now() + dt.timedelta(hours=1),
+                        ),
+                    )
+                assert exc_unproven.value.code is ErrorCode.REVISION_CONFLICT
+                assert _read_full_policy_state(root_hist / "policy" / "policy.db") == pol_state_pre_replay
+
+                if pass_idx == 1:
+                    # Fresh 7-key v2 workspace_register succeeds, preserving repo_id & checkout_id and appending v2 row.
+                    reg_fresh_v2 = WorkspaceRegistration(
+                        owner_id="dan",
+                        principal_id=hist_principal_id,
+                        machine_id=hist_machine_id,
+                        alias="checkout",
+                        checkout_path=str(part_a_base / "recovered-new"),
+                        path_identity="same-physical-checkout",
+                    )
+                    fresh_intent_id = new_id()
+                    bind_fresh = rt_recovered.policy.register_authorized_workspace(
+                        reg_fresh_v2,
+                        make_bootstrap_auth(
+                            intent_id=fresh_intent_id,
+                            store_id=hist_store_id,
+                            owner_id="dan",
+                            action="workspace_register",
+                            subject_id=reg_fresh_v2.subject_id,
+                            trust_generation=rt_recovered.policy.trust_generation(),
+                            expires_at=clock.now() + dt.timedelta(hours=1),
+                        ),
+                    )
+                    assert bind_fresh.repo_id == hist_repo_id
+                    assert bind_fresh.checkout_id == hist_checkout_id
+                    assert rt_recovered.store.reconcile_policy() == 1
+                    ws_after_fresh = [e for e in rt_recovered.store.entries() if e.kind == "policy.workspace_register"]
+                    assert [e.handler_version for e in ws_after_fresh] == [2, 2]
+                    assert ws_after_fresh[1].meta["intent_id"] == fresh_intent_id
+                    assert ws_after_fresh[1].meta["subject_id"] == reg_fresh_v2.subject_id
+            finally:
+                rt_recovered.close()
+
+        # (g) Current Code restore_store of older v2 store backup (and v2 store_full maintenance backup) upgrades
+        # staged brain.db to (3, 3), so even if 6a67b38 subsequently executes 6a67b38's restore_policy (v2 backup),
+        # 6a67b38 admit_existing_pair, migrate_offline, and open_runtime STILL fail with UNSUPPORTED_VERSION before
+        # any authority mutation!
+        assert mig_initial.store_report.backup is not None
+        maint_v2_store_full_backup = mig_initial.store_report.backup
+        for s_bak_label, s_bak_path in (
+            ("hist-6a67b38-v2-store-backup", hist_store_backup),
+            ("migrate-maint-v2-store-full-backup", maint_v2_store_full_backup),
+        ):
+            clock.advance(dt.timedelta(minutes=1))
+            with maintenance_lease(root_hist, os_) as (mroot_g, mlease_g):
+                pol_g = PolicyStore.open(mroot_g, mlease_g, os_, migrations=KERNEL_POLICY_MIGRATIONS)
+                try:
+                    restore_store(
+                        mroot_g,
+                        mlease_g,
+                        os_,
+                        s_bak_path,
+                        pol_g,
+                        clock.now(),
+                        migrations=KERNEL_STORE_MIGRATIONS,
+                    )
+                finally:
+                    pol_g.close()
+            assert read_schema_info(root_hist / "store" / "brain.db") == SchemaInfo(3, 3, hist_store_id)
+
+            hist_restore_after_s = _run_r4_child(
+                {
+                    "mode": "hist_restore_policy",
+                    "root": str(root_hist),
+                    "base": str(part_a_base),
+                    "backup": str(hist_policy_backup),
+                    "store_id": hist_store_id,
+                }
+            )
+            assert hist_restore_after_s["status"] == "accepted"
+            assert read_schema_info(root_hist / "policy" / "policy.db") == SchemaInfo(2, 2, hist_store_id)
+            assert read_schema_info(root_hist / "store" / "brain.db") == SchemaInfo(3, 3, hist_store_id)
+
+            _assert_hist_preadmission_fenced(f"step-g-{s_bak_label}-preadm")
+            _assert_hist_open_mutations_fenced(f"step-g-{s_bak_label}", expected_ledger_versions=[])
+
+            clock.advance(dt.timedelta(minutes=1))
+            mig_g_rec = migrate_offline(
+                DaemonConfig(1, root_hist, hist_store_id, part_a_base / "server.pem", part_a_base / "server.key"),
+                os_,
+            )
+            assert mig_g_rec.policy_report.status == "migrated" and mig_g_rec.policy_report.to_version == 3
+            assert mig_g_rec.store_report.status == "skipped" and mig_g_rec.store_report.to_version == 3
+            adm_g = admit_existing_pair(root_hist, hist_store_id, os_, purpose="serve")
+            rt_g = open_runtime_under_lease(adm_g)
+            try:
+                assert [e.handler_version for e in rt_g.store.entries() if e.kind == "policy.workspace_register"] == [2]
+            finally:
+                rt_g.close()
+
+    if shallow_proc.returncode == 0 and shallow_proc.stdout.strip() == "false":
+        assert part_a_ran is True
+
+    # --- Part B: Unconditional Shallow-Clone-Safe In-Process Checks ---
+    v2_policy = KERNEL_POLICY_MIGRATIONS[:2]
+    v2_store = KERNEL_STORE_MIGRATIONS[:2]
+    assert code_version(v2_policy) == 2
+    assert code_version(v2_store) == 2
+    assert code_version(KERNEL_POLICY_MIGRATIONS) == 3
+    assert code_version(KERNEL_STORE_MIGRATIONS) == 3
+
+    # B1. Build (store=3, policy=3) root from v1 -> v2 -> v3 with v1/v2/v3 backups and handler_version=2 history.
+    pb_root = trusted_tmp / "part-b-r4-root"
+    rt_pb_v1 = open_runtime(pb_root, os_, store_migrations=STORE_MIGRATIONS, policy_migrations=POLICY_MIGRATIONS)
+    try:
+        pb_store_id = rt_pb_v1.policy.store_id
+        pb_blob_digest = rt_pb_v1.store.store_content(
+            b"pb-v1-blob", "evidence", new_id(), RetentionClass.DURABLE, None
+        )
+        clock.advance(dt.timedelta(seconds=5))
+        pb_v1_store_backup = create_store_backup(rt_pb_v1.store, os_, clock.now())
+        clock.advance(dt.timedelta(seconds=5))
+        pb_v1_pol_backup = create_policy_backup(rt_pb_v1.policy, os_, clock.now())
+    finally:
+        rt_pb_v1.close()
+
+    clock.advance(dt.timedelta(seconds=5))
+    mig_pb_v2 = migrate_offline(
+        DaemonConfig(1, pb_root, pb_store_id, trusted_tmp / "pb.pem", trusted_tmp / "pb.key"),
+        os_,
+        policy_migrations=v2_policy,
+        store_migrations=v2_store,
+    )
+    assert mig_pb_v2.store_report.backup is not None
+    pb_v1_store_full_backup = mig_pb_v2.store_report.backup
+
+    rt_pb_v2 = open_runtime(pb_root, os_, store_migrations=v2_store, policy_migrations=v2_policy)
+    try:
+        pb_cred = seed_principal_and_credential(
+            rt_pb_v2.policy, owner_id="dan", harness_id="claude-code", machine_id="dev-pb"
+        )
+        clock.advance(dt.timedelta(seconds=5))
+        pb_v2_store_backup = create_store_backup(rt_pb_v2.store, os_, clock.now())
+        clock.advance(dt.timedelta(seconds=5))
+        pb_v2_pol_backup = create_policy_backup(rt_pb_v2.policy, os_, clock.now())
+    finally:
+        rt_pb_v2.close()
+
+    clock.advance(dt.timedelta(seconds=5))
+    mig_pb_v3 = migrate_offline(
+        DaemonConfig(1, pb_root, pb_store_id, trusted_tmp / "pb.pem", trusted_tmp / "pb.key"),
+        os_,
+    )
+    assert mig_pb_v3.policy_report.to_version == 3 and mig_pb_v3.store_report.to_version == 3
+    assert mig_pb_v3.store_report.backup is not None
+    pb_v2_store_full_backup = mig_pb_v3.store_report.backup
+
+    adm_pb = admit_existing_pair(pb_root, pb_store_id, os_, purpose="serve")
+    rt_pb_v3 = open_runtime_under_lease(adm_pb)
+    try:
+        pb_reg = WorkspaceRegistration(
+            owner_id="dan",
+            principal_id=pb_cred.principal.principal_id,
+            machine_id="dev-pb",
+            alias="pb-ws",
+            checkout_path=str(trusted_tmp / "pb-ws"),
+            path_identity="dan:dev-pb:ws",
+        )
+        rt_pb_v3.policy.register_authorized_workspace(
+            pb_reg,
+            make_bootstrap_auth(
+                store_id=pb_store_id,
+                owner_id="dan",
+                action="workspace_register",
+                subject_id=pb_reg.subject_id,
+                trust_generation=rt_pb_v3.policy.trust_generation(),
+                expires_at=clock.now() + dt.timedelta(minutes=30),
+            ),
+        )
+        assert rt_pb_v3.store.reconcile_policy() == 1
+        clock.advance(dt.timedelta(seconds=5))
+        pb_v3_store_backup = create_store_backup(rt_pb_v3.store, os_, clock.now())
+    finally:
+        rt_pb_v3.close()
+
+    for leftover in list(pb_root.iterdir()):
+        if leftover.name.startswith(("policy.replaced-", "store.replaced-")):
+            shutil.rmtree(leftover)
+
+    # Verify restore_policy with v2_policy or POLICY_MIGRATIONS fails with UNSUPPORTED_VERSION on (store=3, policy=3).
+    pb_pol_snap = digest_tree(pb_root / "policy")
+    pb_str_snap = digest_tree(pb_root / "store")
+    for bad_pol_bak, bad_pol_migs in ((pb_v2_pol_backup, v2_policy), (pb_v1_pol_backup, POLICY_MIGRATIONS)):
+        clock.advance(dt.timedelta(seconds=5))
+        with maintenance_lease(pb_root, os_) as (mroot_pb, mlease_pb):
+            with pytest.raises(BrainError) as exc_pb_rpol:
+                restore_policy(
+                    mroot_pb,
+                    mlease_pb,
+                    os_,
+                    bad_pol_bak,
+                    store_id=pb_store_id,
+                    now=clock.now(),
+                    migrations=bad_pol_migs,
+                )
+            assert exc_pb_rpol.value.code is ErrorCode.UNSUPPORTED_VERSION
+        assert digest_tree(pb_root / "policy") == pb_pol_snap
+        assert digest_tree(pb_root / "store") == pb_str_snap
+        assert not any(name.startswith("policy.") for name in os.listdir(pb_root))
+
+    # B2. Verify restore_store with older migrations (v2_store / STORE_MIGRATIONS) fails with UNSUPPORTED_VERSION
+    # before staging when open policy is v3 OR live store.db is v3 OR live store.db has handler_version >= 2.
+    with maintenance_lease(pb_root, os_) as (mroot_pb_s, mlease_pb_s):
+        pol_pb_v3 = PolicyStore.open(mroot_pb_s, mlease_pb_s, os_, migrations=KERNEL_POLICY_MIGRATIONS)
+        try:
+            for bad_s_bak, bad_s_migs in ((pb_v2_store_backup, v2_store), (pb_v1_store_backup, STORE_MIGRATIONS)):
+                clock.advance(dt.timedelta(seconds=5))
+                with pytest.raises(BrainError) as exc_pb_rstore:
+                    restore_store(
+                        mroot_pb_s,
+                        mlease_pb_s,
+                        os_,
+                        bad_s_bak,
+                        pol_pb_v3,
+                        clock.now(),
+                        migrations=bad_s_migs,
+                    )
+                assert exc_pb_rstore.value.code is ErrorCode.UNSUPPORTED_VERSION
+                assert digest_tree(pb_root / "store") == pb_str_snap
+                assert not any(name.startswith("store.") for name in os.listdir(pb_root))
+        finally:
+            pol_pb_v3.close()
+
+    # Case B2b: open policy is v3 while live store.db is v2 -> restore_store(..., migrations=v2_store) refuses.
+    p3s2_root = trusted_tmp / "part-b-p3-s2"
+    rt_p3s2_seed = open_runtime(p3s2_root, os_, store_migrations=v2_store, policy_migrations=v2_policy)
+    try:
+        p3s2_sid = rt_p3s2_seed.policy.store_id
+        clock.advance(dt.timedelta(seconds=5))
+        p3s2_v2_sbak = create_store_backup(rt_p3s2_seed.store, os_, clock.now())
+    finally:
+        rt_p3s2_seed.close()
+    clock.advance(dt.timedelta(seconds=5))
+    migrate_offline(
+        DaemonConfig(1, p3s2_root, p3s2_sid, trusted_tmp / "p3s2.pem", trusted_tmp / "p3s2.key"),
+        os_,
+        policy_migrations=KERNEL_POLICY_MIGRATIONS,
+        store_migrations=v2_store,
+    )
+    for leftover in list(p3s2_root.iterdir()):
+        if leftover.name.startswith(("policy.replaced-", "store.replaced-")):
+            shutil.rmtree(leftover)
+    p3s2_store_snap = digest_tree(p3s2_root / "store")
+    with maintenance_lease(p3s2_root, os_) as (mr_p3s2, ml_p3s2):
+        pol_p3s2 = PolicyStore.open(mr_p3s2, ml_p3s2, os_, migrations=KERNEL_POLICY_MIGRATIONS)
+        try:
+            with pytest.raises(BrainError) as exc_p3s2:
+                restore_store(
+                    mr_p3s2,
+                    ml_p3s2,
+                    os_,
+                    p3s2_v2_sbak,
+                    pol_p3s2,
+                    clock.now(),
+                    migrations=v2_store,
+                )
+            assert exc_p3s2.value.code is ErrorCode.UNSUPPORTED_VERSION
+            assert digest_tree(p3s2_root / "store") == p3s2_store_snap
+            assert not any(name.startswith("store.") for name in os.listdir(p3s2_root))
+        finally:
+            pol_p3s2.close()
+
+    # Case B2c: open policy is v2 while live store.db has (2, 2) meta + handler_version=2 ledger row -> refuses.
+    hv2_root = trusted_tmp / "part-b-hv2-only"
+    rt_hv2_seed = open_runtime(hv2_root, os_, store_migrations=v2_store, policy_migrations=v2_policy)
+    try:
+        hv2_sid = rt_hv2_seed.policy.store_id
+        clock.advance(dt.timedelta(seconds=5))
+        hv2_v2_sbak = create_store_backup(rt_hv2_seed.store, os_, clock.now())
+    finally:
+        rt_hv2_seed.close()
+    saved_hv2_pol_v2 = (hv2_root / "policy" / "policy.db").read_bytes()
+    clock.advance(dt.timedelta(seconds=5))
+    migrate_offline(DaemonConfig(1, hv2_root, hv2_sid, trusted_tmp / "hv2.pem", trusted_tmp / "hv2.key"), os_)
+    adm_hv2 = admit_existing_pair(hv2_root, hv2_sid, os_, purpose="serve")
+    rt_hv2 = open_runtime_under_lease(adm_hv2)
+    try:
+        hv2_cred = seed_principal_and_credential(
+            rt_hv2.policy, owner_id="dan", harness_id="claude-code", machine_id="dev-hv2"
+        )
+        hv2_reg = WorkspaceRegistration(
+            owner_id="dan",
+            principal_id=hv2_cred.principal.principal_id,
+            machine_id="dev-hv2",
+            alias="hv2-ws",
+            checkout_path=str(trusted_tmp / "hv2-ws"),
+            path_identity="dan:dev-hv2:ws",
+        )
+        rt_hv2.policy.register_authorized_workspace(
+            hv2_reg,
+            make_bootstrap_auth(
+                store_id=hv2_sid,
+                owner_id="dan",
+                action="workspace_register",
+                subject_id=hv2_reg.subject_id,
+                trust_generation=rt_hv2.policy.trust_generation(),
+                expires_at=clock.now() + dt.timedelta(minutes=30),
+            ),
+        )
+        assert rt_hv2.store.reconcile_policy() == 1
+    finally:
+        rt_hv2.close()
+    for leftover in list(hv2_root.iterdir()):
+        if leftover.name.startswith(("policy.replaced-", "store.replaced-")):
+            shutil.rmtree(leftover)
+    for companion in ("policy.db-wal", "policy.db-shm"):
+        (hv2_root / "policy" / companion).unlink(missing_ok=True)
+    (hv2_root / "policy" / "policy.db").write_bytes(saved_hv2_pol_v2)
+    os_.permissions.secure_file(hv2_root / "policy" / "policy.db")
+    hv2_conn = sqlite3.connect(hv2_root / "store" / "brain.db")
+    try:
+        hv2_conn.execute("PRAGMA journal_mode=DELETE")
+        hv2_conn.execute("UPDATE meta SET value = '2' WHERE key IN ('schema_version', 'min_reader_version')")
+        hv2_conn.commit()
+    finally:
+        hv2_conn.close()
+    os_.permissions.secure_file(hv2_root / "store" / "brain.db")
+    hv2_store_snap = digest_tree(hv2_root / "store")
+    with maintenance_lease(hv2_root, os_) as (mr_hv2, ml_hv2):
+        pol_hv2 = PolicyStore.open(mr_hv2, ml_hv2, os_, migrations=v2_policy)
+        try:
+            with pytest.raises(BrainError) as exc_hv2:
+                restore_store(
+                    mr_hv2,
+                    ml_hv2,
+                    os_,
+                    hv2_v2_sbak,
+                    pol_hv2,
+                    clock.now(),
+                    migrations=v2_store,
+                )
+            assert exc_hv2.value.code is ErrorCode.UNSUPPORTED_VERSION
+            assert digest_tree(hv2_root / "store") == hv2_store_snap
+            assert not any(name.startswith("store.") for name in os.listdir(hv2_root))
+        finally:
+            pol_hv2.close()
+
+    # B3. Verify restore_store under KERNEL_STORE_MIGRATIONS upgrades v1/v2 (store & store_full) backups to (3, 3)
+    # and keeps exact snapshot bytes when manifest.schema_version == code_version(KERNEL_STORE_MIGRATIONS) (v3).
+    for up_bak in (pb_v2_store_backup, pb_v2_store_full_backup, pb_v1_store_full_backup, pb_v1_store_backup):
+        clock.advance(dt.timedelta(seconds=5))
+        with maintenance_lease(pb_root, os_) as (mr_up, ml_up):
+            pol_up = PolicyStore.open(mr_up, ml_up, os_, migrations=KERNEL_POLICY_MIGRATIONS)
+            try:
+                restore_store(
+                    mr_up,
+                    ml_up,
+                    os_,
+                    up_bak,
+                    pol_up,
+                    clock.now(),
+                    migrations=KERNEL_STORE_MIGRATIONS,
+                )
+            finally:
+                pol_up.close()
+        assert read_schema_info(pb_root / "store" / "brain.db") == SchemaInfo(3, 3, pb_store_id)
+
+    adm_pb_after_v1 = admit_existing_pair(pb_root, pb_store_id, os_, purpose="serve")
+    rt_pb_after_v1 = open_runtime_under_lease(adm_pb_after_v1)
+    try:
+        assert rt_pb_after_v1.store.cas.read(pb_blob_digest) == b"pb-v1-blob"
+        assert [e.handler_version for e in rt_pb_after_v1.store.entries() if e.kind == "policy.workspace_register"] == [
+            2
+        ]
+    finally:
+        rt_pb_after_v1.close()
+
+    clock.advance(dt.timedelta(seconds=5))
+    with maintenance_lease(pb_root, os_) as (mr_v3, ml_v3):
+        pol_v3_exact = PolicyStore.open(mr_v3, ml_v3, os_, migrations=KERNEL_POLICY_MIGRATIONS)
+        try:
+            restore_store(
+                mr_v3,
+                ml_v3,
+                os_,
+                pb_v3_store_backup,
+                pol_v3_exact,
+                clock.now(),
+                migrations=KERNEL_STORE_MIGRATIONS,
+            )
+        finally:
+            pol_v3_exact.close()
+    assert (pb_root / "store" / "brain.db").read_bytes() == (pb_v3_store_backup / "brain.db").read_bytes()
+
+    # B4. Simulate a (policy=2, store=3) pair (migrating only store 2 -> 3 while leaving policy at 2):
+    # verify v2 tuples fail restore_store, ensure_readable, admit_existing_pair("serve"|"migrate"), migrate_offline,
+    # and open_runtime with UNSUPPORTED_VERSION before returning Runtime (zero policy logical mutations), while
+    # Current Code migrate_offline upgrades (policy=2, store=3) -> (policy=3, store=3) cleanly!
+    sim_root = trusted_tmp / "part-b-sim-p2-s3"
+    rt_sim_v2 = open_runtime(sim_root, os_, store_migrations=v2_store, policy_migrations=v2_policy)
+    try:
+        sim_sid = rt_sim_v2.policy.store_id
+        sim_cred = seed_principal_and_credential(
+            rt_sim_v2.policy, owner_id="dan", harness_id="claude-code", machine_id="dev-sim"
+        )
+        clock.advance(dt.timedelta(seconds=5))
+        sim_v2_sbak = create_store_backup(rt_sim_v2.store, os_, clock.now())
+        clock.advance(dt.timedelta(seconds=5))
+        sim_reg = WorkspaceRegistration(
+            owner_id="dan",
+            principal_id=sim_cred.principal.principal_id,
+            machine_id="dev-sim",
+            alias="sim-ws",
+            checkout_path=str(trusted_tmp / "sim-old"),
+            path_identity="dan:dev-sim:ws",
+        )
+        sim_bind = rt_sim_v2.policy.register_authorized_workspace(
+            sim_reg,
+            make_bootstrap_auth(
+                store_id=sim_sid,
+                owner_id="dan",
+                action="workspace_register",
+                subject_id=sim_reg.subject_id,
+                trust_generation=rt_sim_v2.policy.trust_generation(),
+                expires_at=clock.now() + dt.timedelta(minutes=30),
+            ),
+        )
+    finally:
+        rt_sim_v2.close()
+
+    clock.advance(dt.timedelta(seconds=5))
+    mig_sim_store_only = migrate_offline(
+        DaemonConfig(1, sim_root, sim_sid, trusted_tmp / "sim.pem", trusted_tmp / "sim.key"),
+        os_,
+        policy_migrations=v2_policy,
+        store_migrations=KERNEL_STORE_MIGRATIONS,
+    )
+    assert mig_sim_store_only.policy_report.status == "skipped" and mig_sim_store_only.policy_report.to_version == 2
+    assert mig_sim_store_only.store_report.status == "migrated" and mig_sim_store_only.store_report.to_version == 3
+    for leftover in list(sim_root.iterdir()):
+        if leftover.name.startswith(("policy.replaced-", "store.replaced-")):
+            shutil.rmtree(leftover)
+
+    sim_pol_info = read_schema_info(sim_root / "policy" / "policy.db")
+    sim_str_info = read_schema_info(sim_root / "store" / "brain.db")
+    assert sim_pol_info == SchemaInfo(2, 2, sim_sid)
+    assert sim_str_info == SchemaInfo(3, 3, sim_sid)
+
+    with pytest.raises(BrainError) as exc_sim_read:
+        ensure_readable(sim_str_info, v2_store)
+    assert exc_sim_read.value.code is ErrorCode.UNSUPPORTED_VERSION
+
+    # Even with open v2 PolicyStore, restore_store with migrations=v2_store refuses against live v3 store.db!
+    sim_store_snap_0 = digest_tree(sim_root / "store")
+    with maintenance_lease(sim_root, os_) as (mr_sim, ml_sim):
+        pol_sim_v2 = PolicyStore.open(mr_sim, ml_sim, os_, migrations=v2_policy)
+        try:
+            with pytest.raises(BrainError) as exc_sim_rstore:
+                restore_store(
+                    mr_sim,
+                    ml_sim,
+                    os_,
+                    sim_v2_sbak,
+                    pol_sim_v2,
+                    clock.now(),
+                    migrations=v2_store,
+                )
+            assert exc_sim_rstore.value.code is ErrorCode.UNSUPPORTED_VERSION
+            assert digest_tree(sim_root / "store") == sim_store_snap_0
+            assert not any(name.startswith("store.") for name in os.listdir(sim_root))
+        finally:
+            pol_sim_v2.close()
+
+    sim_root_snap = digest_tree(sim_root)
+    sim_purposes: tuple[Literal["serve", "migrate"], ...] = ("serve", "migrate")
+    for sim_purpose in sim_purposes:
+        with pytest.raises(BrainError) as exc_sim_adm:
+            bad_sim_adm = admit_existing_pair(
+                sim_root,
+                sim_sid,
+                os_,
+                purpose=sim_purpose,
+                store_migrations=v2_store,
+                policy_migrations=v2_policy,
+            )
+            bad_sim_adm.release()
+        assert exc_sim_adm.value.code is ErrorCode.UNSUPPORTED_VERSION
+        assert digest_tree(sim_root) == sim_root_snap
+
+    with pytest.raises(BrainError) as exc_sim_mig:
+        migrate_offline(
+            DaemonConfig(1, sim_root, sim_sid, trusted_tmp / "sim.pem", trusted_tmp / "sim.key"),
+            os_,
+            policy_migrations=v2_policy,
+            store_migrations=v2_store,
+        )
+    assert exc_sim_mig.value.code is ErrorCode.UNSUPPORTED_VERSION
+    assert digest_tree(sim_root) == sim_root_snap
+
+    sim_store_snap = digest_tree(sim_root / "store")
+    sim_pol_state_before = _read_full_policy_state(sim_root / "policy" / "policy.db")
+    with pytest.raises(BrainError) as exc_sim_open:
+        bad_sim_rt = open_runtime(sim_root, os_, store_migrations=v2_store, policy_migrations=v2_policy)
+        bad_sim_rt.close()
+    assert exc_sim_open.value.code is ErrorCode.UNSUPPORTED_VERSION
+    assert digest_tree(sim_root / "store") == sim_store_snap
+    assert _read_full_policy_state(sim_root / "policy" / "policy.db") == sim_pol_state_before
+
+    # Current Code refuses mixed (policy=2, store=3) before migrate, then upgrades cleanly to (3, 3).
+    sim_mixed_snap = digest_tree(sim_root)
+    with pytest.raises(BrainError) as exc_sim_cur_adm:
+        bad_sim_cur = admit_existing_pair(sim_root, sim_sid, os_, purpose="serve")
+        bad_sim_cur.release()
+    assert exc_sim_cur_adm.value.code is ErrorCode.MIGRATION_REQUIRED
+    assert digest_tree(sim_root) == sim_mixed_snap
+
+    sim_mixed_pol = digest_tree(sim_root / "policy")
+    sim_mixed_str = digest_tree(sim_root / "store")
+    with pytest.raises(BrainError) as exc_sim_cur_open:
+        bad_sim_cur_rt = open_runtime(
+            sim_root,
+            os_,
+            store_migrations=KERNEL_STORE_MIGRATIONS,
+            policy_migrations=KERNEL_POLICY_MIGRATIONS,
+        )
+        bad_sim_cur_rt.close()
+    assert exc_sim_cur_open.value.code is ErrorCode.MIGRATION_REQUIRED
+    assert digest_tree(sim_root / "policy") == sim_mixed_pol
+    assert digest_tree(sim_root / "store") == sim_mixed_str
+
+    clock.advance(dt.timedelta(seconds=5))
+    mig_sim_up = migrate_offline(
+        DaemonConfig(1, sim_root, sim_sid, trusted_tmp / "sim.pem", trusted_tmp / "sim.key"),
+        os_,
+    )
+    assert not mig_sim_up.noop
+    assert mig_sim_up.policy_report.status == "migrated"
+    assert mig_sim_up.policy_report.from_version == 2 and mig_sim_up.policy_report.to_version == 3
+    assert mig_sim_up.store_report.status == "skipped"
+    assert mig_sim_up.store_report.from_version == 3 and mig_sim_up.store_report.to_version == 3
+
+    adm_sim_ok = admit_existing_pair(sim_root, sim_sid, os_, purpose="serve")
+    rt_sim_ok = open_runtime_under_lease(adm_sim_ok)
+    try:
+        assert rt_sim_ok.policy.resolve_credential(sim_cred.token).principal_id == sim_cred.principal.principal_id
+        assert rt_sim_ok.policy.snapshot().checkouts[sim_bind.checkout_id].repo_id == sim_bind.repo_id
+        assert [e.handler_version for e in rt_sim_ok.store.entries() if e.kind == "policy.workspace_register"] == [2]
+    finally:
+        rt_sim_ok.close()

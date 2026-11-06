@@ -141,13 +141,25 @@ def _policy_v3(db: sqlite3.Connection) -> None:
     _ = db
 
 
+def _store_v3(db: sqlite3.Connection) -> None:
+    """Main store v3 capability fence (``schema_version=3, min_reader_version=3``) outside ``policy/`` for the
+    coupled v2 ``policy.workspace_register`` subject-authority history contract.
+    """
+    _ = db
+
+
 POLICY_V2_MIGRATION = Migration(to_version=2, min_reader_version=2, apply=_policy_v2)
 POLICY_V3_MIGRATION = Migration(to_version=3, min_reader_version=3, apply=_policy_v3)
 STORE_V2_MIGRATION = Migration(to_version=2, min_reader_version=2, apply=_store_v2)
+STORE_V3_MIGRATION = Migration(to_version=3, min_reader_version=3, apply=_store_v3)
 
 KERNEL_POLICY_MIGRATIONS: tuple[Migration, ...] = (
     *POLICY_MIGRATIONS,
     POLICY_V2_MIGRATION,
     POLICY_V3_MIGRATION,
 )
-KERNEL_STORE_MIGRATIONS: tuple[Migration, ...] = (*STORE_MIGRATIONS, STORE_V2_MIGRATION)
+KERNEL_STORE_MIGRATIONS: tuple[Migration, ...] = (
+    *STORE_MIGRATIONS,
+    STORE_V2_MIGRATION,
+    STORE_V3_MIGRATION,
+)

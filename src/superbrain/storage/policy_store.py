@@ -279,6 +279,12 @@ class PolicyStore:
         self._check()
         return self._store_id
 
+    @property
+    def schema_version(self) -> int:
+        """The admitted schema version of this open policy store."""
+        self._check()
+        return self._schema_version
+
     def is_quarantined(self, digest: str) -> bool:
         self._check()
         return self._exists("SELECT 1 FROM quarantine WHERE digest = ?", (digest,))
