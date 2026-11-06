@@ -16,7 +16,7 @@ import subprocess
 import sys
 import uuid
 import warnings
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -80,11 +80,19 @@ def _clean_subprocess_env() -> dict[str, str]:
     return env
 
 
-def _run_checked(cmd: list[str], *, cwd: Path) -> str:
+def _run_checked(
+    cmd: list[str],
+    *,
+    cwd: Path,
+    extra_env: Mapping[str, str] | None = None,
+) -> str:
+    env = _clean_subprocess_env()
+    if extra_env is not None:
+        env.update(extra_env)
     completed = subprocess.run(
         cmd,
         cwd=cwd,
-        env=_clean_subprocess_env(),
+        env=env,
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -111,7 +119,6 @@ def inc2_installed_env(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Ins
         dist_dir = scratch / "dist"
         dist_dir.mkdir()
         venv_dir = scratch / "venv"
-        reqs_file = scratch / "runtime-requirements.txt"
 
         _run_checked(
             [
@@ -134,35 +141,38 @@ def inc2_installed_env(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Ins
         wheel_path = wheels[0]
 
         _run_checked(
-            ["uv", "venv", "--no-project", "--offline", "--python", sys.executable, str(venv_dir)],
-            cwd=scratch,
+            [
+                "uv",
+                "sync",
+                "--project",
+                str(REPO_ROOT),
+                "--locked",
+                "--offline",
+                "--no-dev",
+                "--no-install-project",
+                "--link-mode=copy",
+                "--python",
+                sys.executable,
+            ],
+            cwd=REPO_ROOT,
+            extra_env={"UV_PROJECT_ENVIRONMENT": str(venv_dir)},
         )
         venv_python = (
             venv_dir / "Scripts" / "python.exe" if sys.platform == "win32" else venv_dir / "bin" / "python"
         )
 
-        exported = _run_checked(
+        _run_checked(
             [
                 "uv",
-                "export",
-                "--project",
-                str(REPO_ROOT),
-                "--frozen",
+                "pip",
+                "install",
                 "--offline",
-                "--no-dev",
-                "--no-emit-project",
-                "--no-hashes",
+                "--no-deps",
+                "--link-mode=copy",
+                "--python",
+                str(venv_python),
+                str(wheel_path),
             ],
-            cwd=REPO_ROOT,
-        )
-        reqs_file.write_text(exported, encoding="utf-8")
-
-        _run_checked(
-            ["uv", "pip", "install", "--offline", "--python", str(venv_python), "-r", str(reqs_file)],
-            cwd=scratch,
-        )
-        _run_checked(
-            ["uv", "pip", "install", "--offline", "--no-deps", "--python", str(venv_python), str(wheel_path)],
             cwd=scratch,
         )
 

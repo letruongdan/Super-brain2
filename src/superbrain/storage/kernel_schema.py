@@ -41,6 +41,7 @@ KERNEL_POLICY_KINDS: tuple[EntryKind, ...] = (
         1,
         {
             "intent_id": FieldType.UUID,
+            "subject_id": FieldType.DIGEST,
             "repo_id": FieldType.OPAQUE_ID,
             "checkout_id": FieldType.OPAQUE_ID,
             "principal_id": FieldType.OPAQUE_ID,

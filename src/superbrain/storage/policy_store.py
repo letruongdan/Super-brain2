@@ -343,20 +343,26 @@ class PolicyStore:
 
     def trust_generation(self) -> int:
         self._check()
-        rows = self._query("SELECT generation FROM trust WHERE id = 1", ())
-        if len(rows) != 1 or type(rows[0][0]) is not int or rows[0][0] < 1:
+        rows = self._query("SELECT id, generation FROM trust", ())
+        if (
+            len(rows) != 1
+            or type(rows[0][0]) is not int
+            or rows[0][0] != 1
+            or type(rows[0][1]) is not int
+            or rows[0][1] < 1
+        ):
             raise BrainError(ErrorCode.INTEGRITY_FAILURE, "the policy store has no valid trust generation")
-        return rows[0][0]
+        return rows[0][1]
 
     # --- KernelPolicyPort --------------------------------------------------------------------------------------
 
     def resolve_credential(self, token: str) -> Principal:
         self._check_kernel_available()
-        return resolve_policy_credential(self._db, token)
+        return resolve_policy_credential(self._db, token, expected_store_id=self._store_id)
 
     def allows(self, principal: Principal, scope: Scope | None, *, action: str) -> bool:
         self._check_kernel_available()
-        return policy_allows(self._db, principal, scope, action=action)
+        return policy_allows(self._db, principal, scope, action=action, expected_store_id=self._store_id)
 
     def snapshot(self) -> AuthSnapshot:
         self._check_kernel_available()
@@ -395,7 +401,7 @@ class PolicyStore:
 
     def request_digest_key(self) -> tuple[str, bytes]:
         self._check_kernel_available()
-        return read_policy_request_digest_key(self._db)
+        return read_policy_request_digest_key(self._db, expected_store_id=self._store_id)
 
     # --- internals ---------------------------------------------------------------------------------------------
 

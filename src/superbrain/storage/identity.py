@@ -29,6 +29,7 @@ _INTENT_PAYLOAD_FIELDS: dict[IntentKind, tuple[str, ...]] = {
     IntentKind.QUARANTINE: ("digest",),
     IntentKind.CREDENTIAL_REVOKE: ("principal_id", "credential_id", "owner_id"),
     IntentKind.WORKSPACE_REGISTER: (
+        "subject_id",
         "repo_id",
         "checkout_id",
         "principal_id",

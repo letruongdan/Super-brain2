@@ -24,7 +24,9 @@ from superbrain.ports.policy import Intent, IntentKind
 from superbrain.storage._policy_authority import (
     ensure_v2_tables,
     require_stored_bool_int,
+    require_stored_digest,
     require_stored_opaque_id,
+    require_stored_optional_uuid,
     require_stored_str,
     require_stored_uuid,
 )
@@ -110,6 +112,49 @@ def _verify_locator_row(
     return loc_repo
 
 
+def _verify_replayed_workspace_state(
+    db: sqlite3.Connection,
+    *,
+    registration: WorkspaceRegistration,
+    repo_id: str,
+    chk_id: str,
+) -> None:
+    p_row = db.execute(
+        "SELECT owner_id, machine_id FROM principal WHERE id = ?",
+        (registration.principal_id,),
+    ).fetchone()
+    if (
+        p_row is None
+        or require_stored_opaque_id(p_row[0]) != registration.owner_id
+        or require_stored_opaque_id(p_row[1]) != registration.machine_id
+    ):
+        raise BrainError(ErrorCode.POLICY_UNAVAILABLE, "policy unavailable")
+
+    repo_row = db.execute(
+        "SELECT owner_id, provider_egress_enabled FROM repo_policy WHERE repo_id = ?",
+        (repo_id,),
+    ).fetchone()
+    if repo_row is None or require_stored_opaque_id(repo_row[0]) != registration.owner_id:
+        raise BrainError(ErrorCode.POLICY_UNAVAILABLE, "policy unavailable")
+    require_stored_bool_int(repo_row[1])
+
+    chk_row = db.execute(
+        "SELECT owner_id, repo_id, machine_id, alias, checkout_path, path_identity "
+        "FROM workspace_checkout WHERE checkout_id = ?",
+        (chk_id,),
+    ).fetchone()
+    if (
+        chk_row is None
+        or require_stored_opaque_id(chk_row[0]) != registration.owner_id
+        or require_stored_opaque_id(chk_row[1]) != repo_id
+        or require_stored_opaque_id(chk_row[2]) != registration.machine_id
+    ):
+        raise BrainError(ErrorCode.POLICY_UNAVAILABLE, "policy unavailable")
+    require_stored_str(chk_row[3])
+    require_stored_str(chk_row[4])
+    require_stored_str(chk_row[5])
+
+
 def record_policy_authorized_revocation(
     db: sqlite3.Connection,
     immediate: Callable[[], AbstractContextManager[sqlite3.Connection]],
@@ -121,7 +166,7 @@ def record_policy_authorized_revocation(
     trust_generation: int,
     now: datetime,
 ) -> Intent:
-    ensure_v2_tables(db)
+    ensure_v2_tables(db, expected_store_id=store_id)
     if not is_uuid(credential_id):
         raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
     _check_ingress_auth(
@@ -138,6 +183,31 @@ def record_policy_authorized_revocation(
             "SELECT intent_id, kind, payload, created_at FROM intents WHERE intent_id = ?",
             (authorization.intent_id,),
         ).fetchone()
+        if existing_intent_row is not None:
+            existing_intent = decode_intent(tuple(existing_intent_row))
+            if existing_intent.kind is not IntentKind.CREDENTIAL_REVOKE:
+                raise BrainError(ErrorCode.REVISION_CONFLICT, "revision conflict")
+            stored_cred_id = require_stored_uuid(existing_intent.payload["credential_id"])
+            stored_principal_id = require_stored_opaque_id(existing_intent.payload["principal_id"])
+            stored_owner_id = require_stored_opaque_id(existing_intent.payload["owner_id"])
+            if stored_cred_id != credential_id:
+                raise BrainError(ErrorCode.REVISION_CONFLICT, "revision conflict")
+            cred_row = db.execute(
+                "SELECT c.principal_id, p.owner_id, c.revoked_intent_id FROM credential AS c "
+                "LEFT JOIN principal AS p ON p.id = c.principal_id WHERE c.id = ?",
+                (credential_id,),
+            ).fetchone()
+            if (
+                cred_row is None
+                or cred_row[1] is None
+                or require_stored_opaque_id(cred_row[0]) != stored_principal_id
+                or require_stored_opaque_id(cred_row[1]) != stored_owner_id
+                or require_stored_optional_uuid(cred_row[2]) is None
+            ):
+                raise BrainError(ErrorCode.POLICY_UNAVAILABLE, "policy unavailable")
+            if authorization.owner_id != stored_owner_id:
+                raise BrainError(ErrorCode.IDENTITY_MISMATCH, "identity mismatch")
+            return existing_intent
 
         cred_row = db.execute(
             "SELECT c.principal_id, p.owner_id FROM credential AS c "
@@ -145,13 +215,10 @@ def record_policy_authorized_revocation(
             (credential_id,),
         ).fetchone()
         if cred_row is None:
-            if existing_intent_row is not None:
-                decode_intent(tuple(existing_intent_row))
-                raise BrainError(ErrorCode.REVISION_CONFLICT, "revision conflict")
             raise BrainError(ErrorCode.NOT_FOUND, "not found")
         if cred_row[1] is None:
             raise BrainError(ErrorCode.POLICY_UNAVAILABLE, "policy unavailable")
-        principal_id = require_stored_uuid(cred_row[0])
+        principal_id = require_stored_opaque_id(cred_row[0])
         cred_owner_id = require_stored_opaque_id(cred_row[1])
         if authorization.owner_id != cred_owner_id:
             raise BrainError(ErrorCode.IDENTITY_MISMATCH, "identity mismatch")
@@ -164,12 +231,6 @@ def record_policy_authorized_revocation(
         checked = validate_policy_intent_payload(
             IntentKind.CREDENTIAL_REVOKE, expected_payload, authorization.intent_id
         )
-
-        if existing_intent_row is not None:
-            existing_intent = decode_intent(tuple(existing_intent_row))
-            if existing_intent.kind is IntentKind.CREDENTIAL_REVOKE and dict(existing_intent.payload) == checked:
-                return existing_intent
-            raise BrainError(ErrorCode.REVISION_CONFLICT, "revision conflict")
 
         created_at = utc_timestamp(now)
         intent = Intent(
@@ -202,7 +263,7 @@ def register_policy_authorized_workspace(
     trust_generation: int,
     now: datetime,
 ) -> WorkspaceBinding:
-    ensure_v2_tables(db)
+    ensure_v2_tables(db, expected_store_id=store_id)
     if not isinstance(registration, WorkspaceRegistration):
         raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
     if isinstance(authorization, BootstrapAuthorization) and authorization.owner_id != registration.owner_id:
@@ -220,6 +281,46 @@ def register_policy_authorized_workspace(
     loc_digest = loc.locator_digest if loc is not None else None
 
     with _map_db_failure():
+        existing_intent_row = db.execute(
+            "SELECT intent_id, kind, payload, created_at FROM intents WHERE intent_id = ?",
+            (authorization.intent_id,),
+        ).fetchone()
+        if existing_intent_row is not None:
+            existing_intent = decode_intent(tuple(existing_intent_row))
+            if existing_intent.kind is not IntentKind.WORKSPACE_REGISTER:
+                raise BrainError(ErrorCode.REVISION_CONFLICT, "revision conflict")
+            stored_subject_id = require_stored_digest(existing_intent.payload["subject_id"])
+            chk_id = require_stored_opaque_id(existing_intent.payload["checkout_id"])
+            repo_id = require_stored_opaque_id(existing_intent.payload["repo_id"])
+            stored_principal_id = require_stored_opaque_id(existing_intent.payload["principal_id"])
+            stored_machine_id = require_stored_opaque_id(existing_intent.payload["machine_id"])
+            stored_alias = require_stored_opaque_id(existing_intent.payload["alias"])
+            raw_loc = existing_intent.payload["locator_digest"]
+            stored_loc_digest = require_stored_digest(raw_loc) if raw_loc is not None else None
+            if (
+                stored_subject_id != registration.subject_id
+                or stored_principal_id != registration.principal_id
+                or stored_machine_id != registration.machine_id
+                or stored_alias != registration.alias
+                or stored_loc_digest != loc_digest
+            ):
+                raise BrainError(ErrorCode.REVISION_CONFLICT, "revision conflict")
+            _verify_replayed_workspace_state(
+                db,
+                registration=registration,
+                repo_id=repo_id,
+                chk_id=chk_id,
+            )
+            return WorkspaceBinding(
+                owner_id=registration.owner_id,
+                repo_id=repo_id,
+                checkout_id=chk_id,
+                machine_id=registration.machine_id,
+                alias=registration.alias,
+                checkout_path=registration.checkout_path,
+                locator_digest=loc_digest,
+            )
+
         p_row = db.execute(
             "SELECT owner_id, machine_id FROM principal WHERE id = ?",
             (registration.principal_id,),
@@ -230,63 +331,6 @@ def register_policy_authorized_workspace(
         stored_p_machine = require_stored_opaque_id(p_row[1])
         if stored_p_owner != registration.owner_id or stored_p_machine != registration.machine_id:
             raise BrainError(ErrorCode.IDENTITY_MISMATCH, "identity mismatch")
-
-        existing_intent_row = db.execute(
-            "SELECT intent_id, kind, payload, created_at FROM intents WHERE intent_id = ?",
-            (authorization.intent_id,),
-        ).fetchone()
-        if existing_intent_row is not None:
-            existing_intent = decode_intent(tuple(existing_intent_row))
-            if existing_intent.kind is not IntentKind.WORKSPACE_REGISTER:
-                raise BrainError(ErrorCode.REVISION_CONFLICT, "revision conflict")
-            chk_id = require_stored_opaque_id(existing_intent.payload["checkout_id"])
-            repo_id = require_stored_opaque_id(existing_intent.payload["repo_id"])
-            chk_row = db.execute(
-                "SELECT owner_id, repo_id, machine_id, alias, checkout_path, path_identity "
-                "FROM workspace_checkout WHERE checkout_id = ?",
-                (chk_id,),
-            ).fetchone()
-            if (
-                chk_row is None
-                or require_stored_opaque_id(chk_row[0]) != registration.owner_id
-                or require_stored_opaque_id(chk_row[1]) != repo_id
-                or require_stored_opaque_id(chk_row[2]) != registration.machine_id
-                or require_stored_str(chk_row[3]) != registration.alias
-                or require_stored_str(chk_row[4]) != registration.checkout_path
-                or require_stored_str(chk_row[5]) != registration.path_identity
-                or require_stored_str(existing_intent.payload["principal_id"]) != registration.principal_id
-                or existing_intent.payload["locator_digest"] != loc_digest
-            ):
-                raise BrainError(ErrorCode.REVISION_CONFLICT, "revision conflict")
-            _verify_existing_repo_policy(
-                db,
-                repo_id=repo_id,
-                expected_owner_id=registration.owner_id,
-                expected_egress=registration.provider_egress_enabled,
-            )
-            if loc is not None:
-                loc_row = db.execute(
-                    "SELECT owner_id, repo_id, scheme, canonical_locator "
-                    "FROM workspace_repo_locator WHERE locator_digest = ?",
-                    (loc.locator_digest,),
-                ).fetchone()
-                if loc_row is None:
-                    raise BrainError(ErrorCode.REVISION_CONFLICT, "revision conflict")
-                _verify_locator_row(
-                    loc_row,
-                    expected_owner_id=registration.owner_id,
-                    expected_repo_id=repo_id,
-                    loc=loc,
-                )
-            return WorkspaceBinding(
-                owner_id=registration.owner_id,
-                repo_id=repo_id,
-                checkout_id=chk_id,
-                machine_id=registration.machine_id,
-                alias=registration.alias,
-                checkout_path=registration.checkout_path,
-                locator_digest=loc_digest,
-            )
 
         created_at = utc_timestamp(now)
         with immediate() as txn_db:
@@ -427,6 +471,7 @@ def register_policy_authorized_workspace(
                 (registration.principal_id, repo_id, authorization.intent_id, created_at),
             )
             payload: dict[str, JsonValue] = {
+                "subject_id": registration.subject_id,
                 "repo_id": repo_id,
                 "checkout_id": checkout_id,
                 "principal_id": registration.principal_id,

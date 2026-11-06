@@ -1065,3 +1065,71 @@ def test_schema_roundtrip_and_packaged_digest(
     assert payload["tool_count"] == 8
     assert payload["schema_sha256"] == inc2_installed_env.source_schema_sha256
     assert catalog.schema_sha256 == inc2_installed_env.source_schema_sha256
+
+
+def test_installed_wheel_env_excludes_dev_dependencies_and_editable_pth(
+    inc2_installed_env: InstalledEnv,
+) -> None:
+    probe_code = (
+        "import cryptography, importlib.util, json, pathlib, superbrain, sysconfig; "
+        "purelib = pathlib.Path(sysconfig.get_path('purelib')).resolve(); "
+        "platlib = pathlib.Path(sysconfig.get_path('platlib')).resolve(); "
+        "roots = sorted({purelib, platlib}, key=str); "
+        "pths = {p.name: p.read_text(encoding='utf-8', errors='replace') "
+        "for r in roots if r.is_dir() for p in sorted(r.glob('*.pth'))}; "
+        "dev_specs = {name: (importlib.util.find_spec(name) is not None) "
+        "for name in ('pytest', 'mypy', 'ruff', 'jsonschema')}; "
+        "print(json.dumps({"
+        "'purelib': str(purelib), "
+        "'platlib': str(platlib), "
+        "'superbrain_origin': str(pathlib.Path(superbrain.__file__).resolve()), "
+        "'cryptography_origin': str(pathlib.Path(cryptography.__file__).resolve()), "
+        "'dev_specs': dev_specs, "
+        "'pths': pths"
+        "}))"
+    )
+    env = dict(os.environ)
+    for var in ("PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV", "UV_PROJECT_ENVIRONMENT", "SUPERBRAIN_SCHEMA"):
+        env.pop(var, None)
+
+    completed = subprocess.run(
+        [str(inc2_installed_env.venv_python), "-I", "-c", probe_code],
+        cwd=inc2_installed_env.venv_dir,
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=True,
+        timeout=60.0,
+    )
+    payload = json.loads(completed.stdout.strip())
+    venv_resolved = inc2_installed_env.venv_dir.resolve()
+    repo_resolved = REPO_ROOT.resolve()
+    purelib = Path(payload["purelib"]).resolve()
+    platlib = Path(payload["platlib"]).resolve()
+    sb_origin = Path(payload["superbrain_origin"]).resolve()
+    crypto_origin = Path(payload["cryptography_origin"]).resolve()
+
+    assert purelib.is_relative_to(venv_resolved)
+    assert platlib.is_relative_to(venv_resolved)
+    assert "site-packages" in purelib.parts or "site-packages" in platlib.parts
+    assert sb_origin.is_relative_to(purelib) or sb_origin.is_relative_to(platlib)
+    assert not sb_origin.is_relative_to(repo_resolved)
+    assert crypto_origin.is_relative_to(purelib) or crypto_origin.is_relative_to(platlib)
+    assert payload["dev_specs"] == {
+        "pytest": False,
+        "mypy": False,
+        "ruff": False,
+        "jsonschema": False,
+    }
+
+    pths = payload["pths"]
+    assert isinstance(pths, dict)
+    forbidden_markers = {
+        os.path.normcase(str(repo_resolved)),
+        os.path.normcase(repo_resolved.as_posix()),
+    }
+    for pth_name, pth_body in pths.items():
+        norm_body = os.path.normcase(str(pth_body))
+        for marker in forbidden_markers:
+            assert marker not in norm_body, f".pth file {pth_name!r} references REPO_ROOT: {pth_body!r}"

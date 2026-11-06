@@ -738,3 +738,181 @@ def test_corrupt_policy_db_raises_policy_unavailable_across_kernel_port(
             assert exc_sql.value.code is ErrorCode.POLICY_UNAVAILABLE
     finally:
         rt.close()
+
+
+def test_missing_or_corrupt_trust_authority_fails_closed_across_all_kernel_policy_methods(
+    trusted_tmp: Path, os_: OsAdapters, clock: FakeClock
+) -> None:
+    from collections.abc import Callable
+
+    def verify_corrupt_case(case_name: str, sql_stmt: str) -> None:
+        rt = open_runtime(
+            trusted_tmp / f"trust-authority-{case_name}",
+            os_,
+            store_migrations=KERNEL_STORE_MIGRATIONS,
+            policy_migrations=KERNEL_POLICY_MIGRATIONS,
+        )
+        try:
+            store_id = rt.policy.store_id
+            gen = rt.policy.trust_generation()
+            expiry = clock.now() + dt.timedelta(hours=1)
+            seeded = seed_principal_and_credential(
+                rt.policy, owner_id="alice", harness_id="claude-code", machine_id="box-1"
+            )
+            reg_initial = WorkspaceRegistration(
+                owner_id="alice",
+                principal_id=seeded.principal.principal_id,
+                machine_id="box-1",
+                alias="repo-healthy",
+                checkout_path=str(trusted_tmp / f"{case_name}-chk1"),
+                path_identity=f"alice:box-1:{case_name}:chk1",
+                locator=TrustedLocator(
+                    scheme="https",
+                    canonical_locator=f"https://example.invalid/alice/{case_name}.git",
+                    locator_digest=digest_bytes(f"https://example.invalid/alice/{case_name}.git".encode()),
+                ),
+            )
+            binding = rt.policy.register_authorized_workspace(
+                reg_initial,
+                make_bootstrap_auth(
+                    store_id=store_id,
+                    owner_id="alice",
+                    action="workspace_register",
+                    subject_id=reg_initial.subject_id,
+                    trust_generation=gen,
+                    expires_at=expiry,
+                ),
+            )
+            ws_scope = Scope(repo_id=binding.repo_id, checkout_id=binding.checkout_id)
+
+            # Baseline pre-corruption checks: all read methods + snapshot succeed.
+            assert rt.policy.resolve_credential(seeded.token) == seeded.principal
+            assert rt.policy.allows(seeded.principal, None, action="get_health") is True
+            assert rt.policy.allows(seeded.principal, ws_scope, action="get_artifact") is True
+            key_id, key_bytes = rt.policy.request_digest_key()
+            assert key_id and len(key_bytes) == 32
+            assert rt.policy.snapshot().trust_generation == gen
+
+            # Corrupt authority state in policy.db.
+            rt.policy._db.execute("PRAGMA ignore_check_constraints = ON")
+            try:
+                with rt.policy._immediate() as db:
+                    db.execute(sql_stmt)
+            finally:
+                rt.policy._db.execute("PRAGMA ignore_check_constraints = OFF")
+
+            reg_after = WorkspaceRegistration(
+                owner_id="alice",
+                principal_id=seeded.principal.principal_id,
+                machine_id="box-1",
+                alias="repo-after-corrupt",
+                checkout_path=str(trusted_tmp / f"{case_name}-chk2"),
+                path_identity=f"alice:box-1:{case_name}:chk2",
+            )
+            port_calls: tuple[tuple[str, Callable[[], object]], ...] = (
+                ("resolve_credential", lambda: rt.policy.resolve_credential(seeded.token)),
+                ("allows_global", lambda: rt.policy.allows(seeded.principal, None, action="get_health")),
+                ("allows_scoped", lambda: rt.policy.allows(seeded.principal, ws_scope, action="get_artifact")),
+                ("request_digest_key", rt.policy.request_digest_key),
+                ("snapshot", rt.policy.snapshot),
+                (
+                    "record_authorized_revocation",
+                    lambda: rt.policy.record_authorized_revocation(
+                        seeded.credential_id,
+                        make_bootstrap_auth(
+                            store_id=store_id,
+                            owner_id="alice",
+                            action="credential_revoke",
+                            subject_id=seeded.credential_id,
+                            trust_generation=gen,
+                            expires_at=expiry,
+                        ),
+                    ),
+                ),
+                (
+                    "register_authorized_workspace",
+                    lambda: rt.policy.register_authorized_workspace(
+                        reg_after,
+                        make_bootstrap_auth(
+                            store_id=store_id,
+                            owner_id="alice",
+                            action="workspace_register",
+                            subject_id=reg_after.subject_id,
+                            trust_generation=gen,
+                            expires_at=expiry,
+                        ),
+                    ),
+                ),
+            )
+            for method_label, fn in port_calls:
+                with pytest.raises(BrainError, match=".") as exc_info:
+                    fn()
+                assert exc_info.value.code is ErrorCode.POLICY_UNAVAILABLE, (
+                    f"{case_name}: expected POLICY_UNAVAILABLE from {method_label}, got {exc_info.value.code}"
+                )
+        finally:
+            rt.close()
+
+    def verify_first_read_after_trust_loss(first_read_name: str) -> None:
+        rt_first = open_runtime(
+            trusted_tmp / f"trust-first-read-{first_read_name}",
+            os_,
+            store_migrations=KERNEL_STORE_MIGRATIONS,
+            policy_migrations=KERNEL_POLICY_MIGRATIONS,
+        )
+        try:
+            f_store_id = rt_first.policy.store_id
+            f_gen = rt_first.policy.trust_generation()
+            f_exp = clock.now() + dt.timedelta(hours=1)
+            f_seeded = seed_principal_and_credential(
+                rt_first.policy, owner_id="alice", harness_id="claude-code", machine_id="box-1"
+            )
+            f_reg = WorkspaceRegistration(
+                owner_id="alice",
+                principal_id=f_seeded.principal.principal_id,
+                machine_id="box-1",
+                alias="repo-first",
+                checkout_path=str(trusted_tmp / f"first-{first_read_name}-chk"),
+                path_identity=f"alice:box-1:first:{first_read_name}",
+            )
+            f_bind = rt_first.policy.register_authorized_workspace(
+                f_reg,
+                make_bootstrap_auth(
+                    store_id=f_store_id,
+                    owner_id="alice",
+                    action="workspace_register",
+                    subject_id=f_reg.subject_id,
+                    trust_generation=f_gen,
+                    expires_at=f_exp,
+                ),
+            )
+            f_scope = Scope(repo_id=f_bind.repo_id, checkout_id=f_bind.checkout_id)
+
+            with rt_first.policy._immediate() as db:
+                db.execute("DELETE FROM trust")
+
+            first_calls: dict[str, Callable[[], object]] = {
+                "resolve_credential": lambda: rt_first.policy.resolve_credential(f_seeded.token),
+                "allows_global": lambda: rt_first.policy.allows(f_seeded.principal, None, action="get_health"),
+                "allows_scoped": lambda: rt_first.policy.allows(f_seeded.principal, f_scope, action="get_artifact"),
+                "request_digest_key": rt_first.policy.request_digest_key,
+            }
+            with pytest.raises(BrainError) as exc_first:
+                first_calls[first_read_name]()
+            assert exc_first.value.code is ErrorCode.POLICY_UNAVAILABLE
+        finally:
+            rt_first.close()
+
+    for case_name, sql_stmt in (
+        ("missing-trust-row", "DELETE FROM trust"),
+        ("zero-trust-generation", "UPDATE trust SET generation = 0 WHERE id = 1"),
+        ("non-int-trust-generation", "UPDATE trust SET generation = 'corrupt' WHERE id = 1"),
+        ("dropped-trust-table", "DROP TABLE trust"),
+        ("dropped-intents-table", "DROP TABLE intents"),
+    ):
+        verify_corrupt_case(case_name, sql_stmt)
+
+    # Also verify each read-side method fails closed as the very first call after DELETE FROM trust
+    # (preventing any cross-method error latch from masking a missing per-method authority check).
+    for first_read_name in ("resolve_credential", "allows_global", "allows_scoped", "request_digest_key"):
+        verify_first_read_after_trust_loss(first_read_name)

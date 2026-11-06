@@ -24,18 +24,53 @@ from superbrain.storage.kernel_schema import POLICY_V2_TABLES
 from superbrain.storage.kinds import is_uuid
 
 _GLOBAL_SCOPELESS_ACTIONS: frozenset[str] = frozenset({"get_health", "get_job", "global_read"})
+_POLICY_V1_TABLES: frozenset[str] = frozenset({"meta", "intents", "tombstones", "quarantine", "trust"})
+_REQUIRED_POLICY_TABLES: frozenset[str] = _POLICY_V1_TABLES | POLICY_V2_TABLES
 
 
-def ensure_v2_tables(db: sqlite3.Connection) -> None:
+def ensure_v2_tables(db: sqlite3.Connection, *, expected_store_id: str | None = None) -> None:
     try:
         tables = {
             row[0]
             for row in db.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
             if isinstance(row[0], str)
         }
+        if not _REQUIRED_POLICY_TABLES <= tables:
+            raise BrainError(ErrorCode.POLICY_UNAVAILABLE, "policy unavailable")
+
+        raw_meta = db.execute("SELECT key, value FROM meta").fetchall()
+        if any(not isinstance(r[0], str) or not isinstance(r[1], str) for r in raw_meta):
+            raise BrainError(ErrorCode.POLICY_UNAVAILABLE, "policy unavailable")
+        meta_rows = {str(r[0]): str(r[1]) for r in raw_meta}
+        raw_sv = meta_rows.get("schema_version")
+        raw_mrv = meta_rows.get("min_reader_version")
+        raw_sid = meta_rows.get("store_id")
+        if (
+            raw_sv is None
+            or not (raw_sv.isascii() and raw_sv.isdigit())
+            or raw_mrv is None
+            or not (raw_mrv.isascii() and raw_mrv.isdigit())
+            or raw_sid is None
+            or not raw_sid
+        ):
+            raise BrainError(ErrorCode.POLICY_UNAVAILABLE, "policy unavailable")
+        sv = int(raw_sv)
+        mrv = int(raw_mrv)
+        if sv < 2 or mrv < 1 or mrv > sv:
+            raise BrainError(ErrorCode.POLICY_UNAVAILABLE, "policy unavailable")
+        if expected_store_id is not None and raw_sid != expected_store_id:
+            raise BrainError(ErrorCode.POLICY_UNAVAILABLE, "policy unavailable")
+
+        trust_rows = db.execute("SELECT id, generation FROM trust").fetchall()
     except sqlite3.Error as exc:
         raise BrainError(ErrorCode.POLICY_UNAVAILABLE, "policy unavailable") from exc
-    if not POLICY_V2_TABLES <= tables:
+    if (
+        len(trust_rows) != 1
+        or type(trust_rows[0][0]) is not int
+        or trust_rows[0][0] != 1
+        or type(trust_rows[0][1]) is not int
+        or trust_rows[0][1] < 1
+    ):
         raise BrainError(ErrorCode.POLICY_UNAVAILABLE, "policy unavailable")
 
 
@@ -88,8 +123,10 @@ def decode_stored_principal(
         raise BrainError(ErrorCode.POLICY_UNAVAILABLE, "policy unavailable") from err
 
 
-def resolve_policy_credential(db: sqlite3.Connection, token: str) -> Principal:
-    ensure_v2_tables(db)
+def resolve_policy_credential(
+    db: sqlite3.Connection, token: str, *, expected_store_id: str | None = None
+) -> Principal:
+    ensure_v2_tables(db, expected_store_id=expected_store_id)
     cred_id, candidate_digest = parse_bearer_token(token)
     try:
         row = db.execute(
@@ -117,9 +154,14 @@ def resolve_policy_credential(db: sqlite3.Connection, token: str) -> Principal:
 
 
 def policy_allows(
-    db: sqlite3.Connection, principal: Principal, scope: Scope | None, *, action: str
+    db: sqlite3.Connection,
+    principal: Principal,
+    scope: Scope | None,
+    *,
+    action: str,
+    expected_store_id: str | None = None,
 ) -> bool:
-    ensure_v2_tables(db)
+    ensure_v2_tables(db, expected_store_id=expected_store_id)
     if (
         not isinstance(principal, Principal)
         or (scope is not None and not isinstance(scope, Scope))
@@ -206,7 +248,7 @@ def policy_allows(
 def build_policy_snapshot(
     db: sqlite3.Connection, *, store_id: str, trust_generation: int
 ) -> AuthSnapshot:
-    ensure_v2_tables(db)
+    ensure_v2_tables(db, expected_store_id=store_id)
     try:
         principals: dict[str, Principal] = {}
         for pid, owner_id, harness_id, machine_id in db.execute(
@@ -220,7 +262,7 @@ def build_policy_snapshot(
             "SELECT id, principal_id, secret_digest, revoked_intent_id FROM credential ORDER BY id"
         ).fetchall():
             cred_id = require_stored_uuid(cid)
-            principal_id = require_stored_str(pid)
+            principal_id = require_stored_opaque_id(pid)
             principal_obj = principals.get(principal_id)
             if principal_obj is None:
                 raise BrainError(ErrorCode.POLICY_UNAVAILABLE, "policy unavailable")
@@ -246,8 +288,8 @@ def build_policy_snapshot(
         for pid, rid, granted_intent_id in db.execute(
             "SELECT principal_id, repo_id, granted_intent_id FROM repo_grant"
         ).fetchall():
-            g_pid = require_stored_str(pid)
-            g_rid = require_stored_str(rid)
+            g_pid = require_stored_opaque_id(pid)
+            g_rid = require_stored_opaque_id(rid)
             require_stored_uuid(granted_intent_id)
             if g_pid not in principals or g_rid not in repo_policies:
                 raise BrainError(ErrorCode.POLICY_UNAVAILABLE, "policy unavailable")
@@ -302,8 +344,10 @@ def build_policy_snapshot(
         raise BrainError(ErrorCode.POLICY_UNAVAILABLE, "policy unavailable") from exc
 
 
-def read_policy_request_digest_key(db: sqlite3.Connection) -> tuple[str, bytes]:
-    ensure_v2_tables(db)
+def read_policy_request_digest_key(
+    db: sqlite3.Connection, *, expected_store_id: str | None = None
+) -> tuple[str, bytes]:
+    ensure_v2_tables(db, expected_store_id=expected_store_id)
     try:
         rows = db.execute(
             "SELECT id, key_bytes FROM request_digest_key WHERE active = 1 ORDER BY rowid DESC"
