@@ -52,6 +52,7 @@ _FIXED_TOKENS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\bsk-[A-Za-z0-9_-]{16,}"),
     re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
     re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}"),
+    re.compile(r"\bAIza[0-9A-Za-z_-]{35}"),
     re.compile(r"\beyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}"),
 )
 _AUTHORITY = re.compile(r"[^/?#\s]*")
@@ -67,7 +68,10 @@ _PATH_SPLIT = re.compile(r"[\\/]+")
 _PATH_LEAD = "`*([{<\"'"
 _PATH_TRAIL = "`*)]}>\"'.,:;!?"
 _ENTROPY_EDGE = "\"'()[]{}<>,;.!?:`*"
-_CAMEL = re.compile(r"([a-z0-9])([A-Z])")
+# Zero-width word boundaries (O(1) per position, so linear on any key): camelCase, acronym->Camel, letter<->digit.
+_WORD_BOUNDARY = re.compile(
+    r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])|(?<=[A-Za-z])(?=[0-9])|(?<=[0-9])(?=[A-Za-z])"
+)
 _KEY_WORD_SPLIT = re.compile(r"[^0-9a-z]+")
 _ID_SEGMENTS = re.compile(r"[._-]")
 _BENIGN_NEXT_WORDS: dict[str, frozenset[str]] = {
@@ -85,9 +89,9 @@ class _Deadline(Exception):
 
 
 def _key_words(key: str) -> list[str]:
-    """NFKC + casefold words of a key, split at separators and camelCase boundaries."""
+    """NFKC + casefold words of a key, split at separators, camelCase, acronym->Camel and letter<->digit."""
     normalized = unicodedata.normalize("NFKC", key)
-    return [word for word in _KEY_WORD_SPLIT.split(_CAMEL.sub(r"\1 \2", normalized).casefold()) if word]
+    return [word for word in _KEY_WORD_SPLIT.split(_WORD_BOUNDARY.sub(" ", normalized).casefold()) if word]
 
 
 def _joined_key(key: str) -> str:
@@ -180,6 +184,7 @@ class _Run:
         self._paths = _PathMatcher(policy.blocked_path_patterns)
         self._min_segment = policy.entropy_min_length
         self._max_words = max((len(_key_words(k)) for k in policy.sensitive_keys), default=1)
+        self._first_words = frozenset(words[0] for k in policy.sensitive_keys if (words := _key_words(k)))
 
     def tick(self) -> None:
         if self._deadline_ns is not None and self._monotonic_ns() >= self._deadline_ns:
@@ -229,6 +234,8 @@ class _Run:
         """
         words = _key_words(key)
         for start in range(len(words)):
+            if words[start] not in self._first_words:
+                continue
             for size in range(1, min(self._max_words, len(words) - start) + 1):
                 if "".join(words[start : start + size]) not in self._sensitive:
                     continue
@@ -445,6 +452,16 @@ class _Run:
         return self._entropy(text) if entropy else text
 
 
+def _low_entropy_opaque_id(key: str, item: object, policy: FilterPolicy) -> bool:
+    """An ``OpaqueId`` in an ID field whose long segments are low-entropy (same segment rule as the filter)."""
+    if _structural_kind(key) != "id" or not isinstance(item, str) or not OPAQUE_ID_RE.fullmatch(item):
+        return False
+    return all(
+        len(segment) < policy.entropy_min_length or _shannon_bits(segment) < policy.entropy_min_bits
+        for segment in _ID_SEGMENTS.split(item)
+    )
+
+
 def project_manual_submission(value: JsonValue, policy: FilterPolicy) -> JsonValue:
     """Spec 14.2 ``manual_submission=false``: keep only structural IDs and status metadata of an object.
 
@@ -459,9 +476,7 @@ def project_manual_submission(value: JsonValue, policy: FilterPolicy) -> JsonVal
     kept: dict[str, JsonValue] = {}
     for key, item in value.items():
         if key in policy.structural_id_fields:
-            if _exempt_structural(key, item, policy.entropy_min_length) or (
-                _structural_kind(key) == "id" and isinstance(item, str) and OPAQUE_ID_RE.fullmatch(item)
-            ):
+            if _exempt_structural(key, item, policy.entropy_min_length) or _low_entropy_opaque_id(key, item, policy):
                 kept[key] = item
         elif key in STATUS_FIELDS and isinstance(item, str) and _STATUS_VALUE_RE.fullmatch(item):
             kept[key] = item

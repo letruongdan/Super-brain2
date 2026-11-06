@@ -584,3 +584,57 @@ def test_skipped_sensitive_subtrees_still_count_toward_input_cap(key: str) -> No
     with pytest.raises(BrainError) as exc:
         _apply(payload)
     assert exc.value.code is ErrorCode.INVALID_INPUT
+
+
+# --- fix round 3 ----------------------------------------------------------------------------------------------------
+
+GOOGLE_KEY = "AIza" + "SyA1b2C3d4-E5f6G7h8I9-j0K1l2M3n4O5p"  # 35 chars after AIza, short segments
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "AWSSecretAccessKey",
+        "DBPassword",
+        "SMTPPassword",
+        "JWTSecret",
+        "password2",
+        "db_password1",
+        "secret2",
+        "apiKey2",
+        "OAuthToken",
+        "APIKey",
+        "access_token_count",
+    ],
+)
+def test_acronym_and_digit_word_boundaries_split_sensitive_keys(key: str) -> None:
+    safe = _apply({key: "hunter2", "keep": 1})
+    assert safe.value == {"keep": 1}
+
+
+@pytest.mark.parametrize(
+    "key", ["token_budget", "token_estimator", "tokenizer", "context_budget_tokens", "secretary", "description"]
+)
+def test_benign_keys_survive_word_boundary_splits(key: str) -> None:
+    assert _apply({key: "visible"}).value == {key: "visible"}
+
+
+def test_long_key_word_split_stays_linear() -> None:
+    for key in ("A" * 60_000, "Ab" * 30_000, "a1" * 30_000, "AAb" * 20_000):
+        start = time.perf_counter()
+        _apply({key: 1})
+        assert time.perf_counter() - start < 0.1
+
+
+def test_google_api_key_fixed_pattern_applies_in_prose_and_id_fields() -> None:
+    assert len(GOOGLE_KEY) == 39
+    safe = _apply({"t": f"key {GOOGLE_KEY} used", "id": GOOGLE_KEY, "task_id": GOOGLE_KEY})
+    assert safe.value == {"t": f"key {REDACTED} used", "id": REDACTED, "task_id": REDACTED}
+
+
+def test_direct_manual_projection_applies_segment_rule() -> None:
+    policy = FilterPolicy(manual_submission=False)
+    secret_id = "task-wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY"
+    assert project_manual_submission({"task_id": secret_id, "status": "ok"}, policy) == {"status": "ok"}
+    kept: dict[str, JsonValue] = {"task_id": "task-2026-11-07-0001", "delivery_id": "a" * 30, "status": "ok"}
+    assert project_manual_submission(kept, policy) == kept
