@@ -1,0 +1,107 @@
+{
+  "schema": "sp1-i2-t0-closure-and-d2-freeze-v1",
+  "source": "ask_question tool responses in Antigravity conversation (capture_method: manual)",
+  "conversation_id": "02c79a65-8291-42ab-9e7e-96d270340269",
+  "occurred_at": "2026-11-06T07:06:17+07:00",
+  "recorded_at_utc": "2026-11-06T00:06:45Z",
+  "baseline_source_commit": "77f2a12c99798c81032c5e99b2e99f9371eed8a9",
+  "prior_docs_commit": "f6e71ae40e58a3c24e53dbbec8e07f852e6f9a3b",
+  "approved_pins": {
+    "spec_rev4_path": "docs/superpowers/specs/2026-10-30-super-brain2-system-design.md",
+    "spec_rev4_git_blob": "88f450e2fa72146c42804dceb1864735fafd9a85",
+    "decisions_path": "docs/superpowers/specs/2026-11-04-sp1-increment2-kernel-decisions.md",
+    "decisions_sha256": "bb9072099f36e9142cfd1b5f72687556e8af4919769d276b4fc8d35a2ab50596",
+    "plan_path": "docs/superpowers/plans/2026-11-04-sp1-increment2-daemon-mcp-kernel.md",
+    "plan_sha256": "5fcacd1395dc99c68068446bf59f3ebb3eee328aba92a68c84854ca28bb1ef14",
+    "initial_owner_release_approval_path": "docs/reviews/2026-11-05-sp1-increment2-owner-release-approval.json",
+    "initial_owner_release_approval_sha256": "8fe99023a5ef0af73e00e23d5a5f0ea6b7849b5222ee699b9ee21baae148a281"
+  },
+  "t0_evidence_pins": {
+    "transport_run_manifest_relpath": ".superpowers/sdd/2026-11-04-sp1-increment2-daemon-mcp-kernel/spike-native/transport-run-manifest.json",
+    "transport_run_manifest_sha256": "ce7045fc17f361c2146bea4eac6ab25386e02cedde0bd5694554e0923bdd4594",
+    "transport_script_sha256": "0b93257e4a617bb9f1d8bc3ddbf5cd8d55520ce2943eaaf7ba0348be962f9232",
+    "transport_receipts": {
+      "win32-py311": "bb9e0934db28c07c0d3e3fb1b90979c972e057dde01504430b73d490dc8815a4",
+      "win32-py314": "c77787448581c9db10ea5570f648813eaf718b5a22d7192fcc105e2efe2515ad",
+      "linux-py311": "99357e502e07800c8813e3bdc46fe39bc8e88b6c0dc01ddd8fad2deba15c289f",
+      "linux-py314": "0edb0b374c2134bf846d44f29d9f23b7b9c715aac1343c95b814fee53cfce2ea"
+    },
+    "t0r1": {
+      "native_session_sha256": "ebdad8002fdf1049373baf578cbe504200166862598de16e109683a555a2e729",
+      "native_events_sha256": "34f162b75463e46e60cce30d75921c008683bd7fb851e7060e910c9c2396866e",
+      "closure_sha256": "3cb457f07d28a983840ebd6e56a711767bab7b7c47e1fee894e9abd44ba51677"
+    },
+    "t0r2": {
+      "native_session_sha256": "9381f790d35ca5fb28e0371676cd5d928e9f5f73711e595ac10c27d243edd882",
+      "native_events_sha256": "3b5f604a35fa4bfcbff7f4e4fa9418242a5271158340a78a1670dafdfbe4cf2f",
+      "gui_observer_join_sha256": "bca8005a643dd383a1d24f44bc1e5dc6a552d6a19f0e6207e809ded88db645fc"
+    },
+    "t0r3": {
+      "native_session_sha256": "2df0367657fb730c835addce15ad4915ffb33288f65e7b48762e33e36b62856d",
+      "native_events_sha256": "98b5224b7befa41168133a677c3f1cf54ce7766a5d3e6f42a2354eb1b145fa72",
+      "claude_runner_receipt_sha256": "507be444c8b772cc8cb1c9097942e0a5b8ed0a2c640bb548148cada3bcf00052"
+    }
+  },
+  "frozen_gate_decisions": {
+    "t0_gate_closed": true,
+    "d2_transport_frozen": true,
+    "d2_transport_profile": "loopback HTTPS 127.0.0.1:<ephemeral_port> + runtime cryptography>=44,<51 per-store CA/leaf cert pin + 2-request socket state machine (GET /v2/identity -> POST /v2/tools/call)",
+    "d3_x_resolution_frozen": true,
+    "x_resolution": "single-checkout-owner-profile-v1",
+    "canonical_schema_id": "https://ensemble-agents.local/superbrain/mcp-tools-v2.json",
+    "selected_deployment_hosts_for_i2": [
+      {
+        "host": "Codex desktop app",
+        "version": "OpenAI.Codex 26.1029.7803.0 MSIX (ChatGPT.exe) + codex.exe 0.166.0-alpha.6",
+        "t0_status": "passed"
+      },
+      {
+        "host": "Claude Code",
+        "version": "2.1.317 (Claude Code)",
+        "t0_status": "passed"
+      }
+    ],
+    "excluded_or_unselected_hosts": [
+      {
+        "host": "Antigravity Desktop",
+        "version": "Antigravity.exe 1.23.2 + agy 1.5.1",
+        "t0_status": "failed_r1_unsupported_in_i2",
+        "note": "Empirically failed R1 in t0r2 due to shared language_server.exe reusing checkout-A shim across checkouts/windows; deferred to future increment/SP7 per Owner Ruling at 2026-11-05T19:05:18+07:00."
+      },
+      {
+        "host": "OpenCode",
+        "version": "2.2.0",
+        "t0_status": "not_run"
+      },
+      {
+        "host": "Cursor",
+        "version": null,
+        "t0_status": "not_run"
+      }
+    ]
+  },
+  "owner_decision_records": [
+    {
+      "occurred_at": "2026-11-05T17:16:35+07:00",
+      "decision_id": "t0-remediation-schedule",
+      "question_1": "Với T0-02 (thao tác chuyển workspace A → B → C và mở đồng thời 2 cửa sổ A + B trên Antigravity desktop và Codex desktop app), bạn muốn chạy phiên t0r2 theo cách nào?",
+      "answer_1": "(Recommended) Khởi chạy listener t0r2 + mở các phiên desktop GUI cô lập (isolated --user-data-dir & CODEX_HOME tạm, không chạm ~/.codex/config.toml hay ~/.gemini) để thao tác đổi workspace A → B → C và 2 cửa sổ A + B trên Antigravity.exe và Codex/ChatGPT.exe",
+      "question_2": "Với T0-01 (Claude Code đang chạm weekly limit tới 03:00 sáng Asia/Ho_Chi_Minh), bạn chọn phương án nào?",
+      "answer_2": "Giữ nguyên tập 3 host: chạy xong Antigravity + Codex desktop trong t0r2 bây giờ, lưu checkpoint và chờ sau 03:00 sáng khi Claude Code reset quota rồi chạy nốt Claude Code trước khi mở Task 1"
+    },
+    {
+      "occurred_at": "2026-11-05T19:05:18+07:00",
+      "decision_id": "r1-antigravity-desktop-ruling-and-t0r2-cleanup",
+      "question_1": "Theo cổng R1 (Plan dòng 47 & D3 dòng 35), bạn chọn phương án nào cho Antigravity Desktop trước khi sang bước kế tiếp?",
+      "answer_1": "(Recommended) Giữ nguyên thiết kế D3 single-checkout-owner-profile-v1; ghi nhận Antigravity Desktop fail R1 (không hỗ trợ ở Đợt 2, chuyển sang đợt sau) và chốt tập host Đợt 2 là Codex desktop app + Claude Code",
+      "question_2": "Về việc kết thúc phiên chạy t0r2 và dọn dẹp thư mục tạm ngay bây giờ, bạn chọn cách nào?",
+      "answer_2": "(Recommended) Tôi đã đóng các cửa sổ test A/B/C; hãy tắt listener t0r2, xóa thư mục tạm t0r2 và giữ nguyên không chạm vào ~/.codex/config.toml"
+    },
+    {
+      "occurred_at": "2026-11-06T07:06:17+07:00",
+      "decision_id": "t0-gate-closure-and-d2-x-resolution-freeze",
+      "question": "Phiên t0r3 trên Claude Code (2.1.317) đã PASSED 100% (6 phiên exit 0, 7 lệnh mcp_tool_call thật qua A → B → C, 2 phiên song song A + B, phiên đa lượt đọc sang B vẫn giữ nguyên shim_pid=10864 & selected_scope=repo-1/chk-a; đã tắt listener và xóa sạch thư mục tạm t0r3). Mọi host mục tiêu Đợt 2 (Codex desktop app + Claude Code) và 4/4 ô transport đều đã PASSED. Bạn xác nhận đóng cổng T0, đóng băng D2 + x-resolution và mở Task 1 → 9 chứ?",
+      "answer": "(Recommended) Đóng cổng T0, đóng băng D2 (loopback HTTPS 127.0.0.1 + cryptography CA/leaf pin + 2-request socket) & x-resolution=\"single-checkout-owner-profile-v1\" cho tập host Đợt 2 (Codex desktop app + Claude Code), lưu biên bản chốt vào docs/reviews/ và triển khai liên tục từ Task 1 → 9"
+    }
+  ]
+}
