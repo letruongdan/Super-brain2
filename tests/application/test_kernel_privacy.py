@@ -396,7 +396,19 @@ ADVERSARIAL: tuple[str, ...] = (
 )
 
 
-@pytest.mark.parametrize("text", ADVERSARIAL, ids=[f"adv{i}" for i in range(len(ADVERSARIAL))])
+USERINFO_ADVERSARIAL: tuple[str, ...] = (
+    "https://u:" + "a://" * 14_990,
+    "x://u:" + "p/" * 29_000 + "@h",
+    "a://b:" * 10_000,
+    "u:p@" * 15_000,
+)
+
+
+@pytest.mark.parametrize(
+    "text",
+    ADVERSARIAL + USERINFO_ADVERSARIAL,
+    ids=[f"adv{i}" for i in range(len(ADVERSARIAL) + len(USERINFO_ADVERSARIAL))],
+)
 def test_adversarial_inputs_stay_within_local_budget(text: str) -> None:
     flt = PrivacyFilter()
     best = float("inf")
@@ -493,6 +505,82 @@ def test_non_sensitive_keys_are_kept() -> None:
 def test_input_size_cap_applies_before_redaction_shrinks_it() -> None:
     chunk = "<private>" + "b" * 59_000 + "</private>"
     payload: JsonValue = {"chunks": [chunk for _ in range(20)]}  # ~1.2 MB in, ~0.3 KB out
+    with pytest.raises(BrainError) as exc:
+        _apply(payload)
+    assert exc.value.code is ErrorCode.INVALID_INPUT
+
+
+# --- fix round 2 ----------------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "aws_secret_access_key",
+        "awsSecretAccessKey",
+        "db_password_old",
+        "user_password_hash",
+        "my_secret_value",
+        "x_client_secret_v2",
+        "stripe_api_key_live",
+        "github_token_value",
+    ],
+)
+def test_sensitive_word_anywhere_in_key_drops_subtree(key: str) -> None:
+    safe = _apply({key: "hunter2", "keep": 1})
+    assert safe.value == {"keep": 1}
+    assert safe.stripped_keys_count == 1
+
+
+@pytest.mark.parametrize("key", ["context_budget_tokens", "tokenizer", "token_estimator", "description"])
+def test_benign_token_like_keys_stay(key: str) -> None:
+    assert _apply({key: "visible"}).value == {key: "visible"}
+
+
+def test_structural_exemption_is_narrowed_by_field_type() -> None:
+    session_token = "Zq8Lm2Xv9Tn4Wp7Ks1Jd6Hf3Rb5Yc0"  # real-looking session secret, entropy > 4
+    aws_like = "wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY"
+    task_id = "task-2026-11-07-Zx9Qw3Er7Ty1"
+    payload: JsonValue = {
+        "session_id": session_token,
+        "id": aws_like,
+        "task_id": task_id,
+        "delivery_id": UUID_ID,
+        "digest": aws_like,
+    }
+    safe = _apply(payload)
+    assert safe.value == {
+        "session_id": REDACTED,
+        "id": REDACTED,
+        "task_id": task_id,
+        "delivery_id": UUID_ID,
+        "digest": REDACTED,
+    }
+    projected = project_manual_submission(
+        {"task_id": task_id, "digest": "not-a-digest", "revision": 0, "session_id": "s-1", "status": "ok"},
+        FilterPolicy(manual_submission=False),
+    )
+    assert projected == {"task_id": task_id, "status": "ok"}
+    assert project_manual_submission({"revision": 3, "digest": SHA_ID}, FilterPolicy(manual_submission=False)) == {
+        "revision": 3,
+        "digest": SHA_ID,
+    }
+
+
+@pytest.mark.parametrize(
+    "url",
+    [f"https://user:pa/ss{CANARY}@host/x", f"https://u:p?w{CANARY}@h", f"https://u:p#w{CANARY}@h"],
+)
+def test_credential_userinfo_redacted_through_last_at_even_with_delimiters(url: str) -> None:
+    safe = _apply({"u": f"clone {url} now"})
+    _assert_no_canary(safe.value)
+    assert isinstance(safe.value, dict)
+    assert str(safe.value["u"]).startswith(f"clone https://{REDACTED}@")
+
+
+@pytest.mark.parametrize("key", ["password", "token ghp_aaaaaaaaaaaaaaaaaaaaaaaa"])
+def test_skipped_sensitive_subtrees_still_count_toward_input_cap(key: str) -> None:
+    payload: JsonValue = {key: ["c" * 60_000 for _ in range(40)]}
     with pytest.raises(BrainError) as exc:
         _apply(payload)
     assert exc.value.code is ErrorCode.INVALID_INPUT

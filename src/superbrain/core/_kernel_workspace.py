@@ -85,6 +85,7 @@ DEFAULT_BLOCKED_PATH_PATTERNS: tuple[str, ...] = (
     "*.p12",
     "*.pfx",
 )
+# ``session_id`` is deliberately absent: session tokens are classic secrets (fix round 2 ruling).
 DEFAULT_STRUCTURAL_ID_FIELDS: frozenset[str] = frozenset(
     {
         "id",
@@ -93,7 +94,6 @@ DEFAULT_STRUCTURAL_ID_FIELDS: frozenset[str] = frozenset(
         "assignment_id",
         "outcome_id",
         "episode_id",
-        "session_id",
         "workspace_id",
         "checkout_id",
         "source_snapshot_id",

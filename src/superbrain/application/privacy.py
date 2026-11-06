@@ -55,6 +55,8 @@ _FIXED_TOKENS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\beyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}"),
 )
 _AUTHORITY = re.compile(r"[^/?#\s]*")
+_SEGMENT = re.compile(r"\S*")
+_CREDENTIAL_USER = re.compile(r"[^\s:/@?#]{1,256}:")
 _KEY_VALUE_SECRET = re.compile(
     r"(?i)\b(password|passwd|pwd|passphrase|secret|api[_-]?key|access[_-]?token|refresh[_-]?token"
     r"|client[_-]?secret|auth[_-]?token|private[_-]?key)([ \t]{0,16}[=:][ \t]{0,16})"
@@ -67,6 +69,11 @@ _PATH_TRAIL = "`*)]}>\"'.,:;!?"
 _ENTROPY_EDGE = "\"'()[]{}<>,;.!?:`*"
 _CAMEL = re.compile(r"([a-z0-9])([A-Z])")
 _KEY_WORD_SPLIT = re.compile(r"[^0-9a-z]+")
+_ID_SEGMENTS = re.compile(r"[._-]")
+_BENIGN_NEXT_WORDS: dict[str, frozenset[str]] = {
+    "token": frozenset({"estimator", "estimate", "budget", "count", "counts", "limit", "usage", "total"}),
+}
+"""Word n-grams that are measurements, not credentials (``token_estimator``), when followed by these words."""
 
 
 class _Reject(Exception):
@@ -91,6 +98,36 @@ def _shannon_bits(text: str) -> float:
     counts = Counter(text)
     total = len(text)
     return -sum((n / total) * math.log2(n / total) for n in counts.values())
+
+
+def _structural_kind(key: str) -> str:
+    """Field type of a structural field (mcp-tools-v2 catalog): ``digest``, ``revision`` or an ID field."""
+    if key == "digest" or key.endswith("_digest"):
+        return "digest"
+    if key == "revision":
+        return "revision"
+    return "id"
+
+
+def _exempt_structural(key: str, value: object, min_segment: int) -> bool:
+    """Whether ``value`` is a valid typed structural value for field ``key`` (never free text).
+
+    ``digest``: only ``sha256:<64 lower hex>``. ``revision``: only a positive int. ID fields: a canonical UUID, or a
+    catalog ``OpaqueId`` whose ``.``/``_``/``-`` separated segments are all shorter than the entropy candidate length
+    (a separator-free credential-shaped run is never an ID).
+    """
+    kind = _structural_kind(key)
+    if kind == "revision":
+        return type(value) is int and value >= 1
+    if not isinstance(value, str):
+        return False
+    if kind == "digest":
+        return SHA256_DIGEST_RE.fullmatch(value) is not None
+    if _UUID_RE.fullmatch(value):
+        return True
+    return OPAQUE_ID_RE.fullmatch(value) is not None and all(
+        len(segment) < min_segment for segment in _ID_SEGMENTS.split(value)
+    )
 
 
 def _is_structural_id(value: str) -> bool:
@@ -141,6 +178,8 @@ class _Run:
         self._deadline_ns = deadline_ns
         self._sensitive = frozenset(_joined_key(k) for k in policy.sensitive_keys) - {""}
         self._paths = _PathMatcher(policy.blocked_path_patterns)
+        self._min_segment = policy.entropy_min_length
+        self._max_words = max((len(_key_words(k)) for k in policy.sensitive_keys), default=1)
 
     def tick(self) -> None:
         if self._deadline_ns is not None and self._monotonic_ns() >= self._deadline_ns:
@@ -170,10 +209,11 @@ class _Run:
         if type(item) is str:
             self._check_text(item)
             structural = key is not None and key in self.policy.structural_id_fields
-            if structural and _is_structural_id(item):
+            if structural and _is_structural_id(item) and _exempt_structural(str(key), item, self._min_segment):
                 return item
-            # Opaque IDs in structural fields are exempt from the entropy rule only, never from fixed patterns.
-            return self.redact(item, entropy=not (structural and OPAQUE_ID_RE.fullmatch(item)))
+            exempt = structural and _exempt_structural(str(key), item, self._min_segment)
+            # A typed structural ID is exempt from the entropy rule only, never from the fixed patterns.
+            return self.redact(item, entropy=not exempt)
         if type(item) is list:
             if len(item) > MAX_ARRAY_ITEMS:
                 raise _Reject
@@ -183,10 +223,19 @@ class _Run:
         raise _Reject
 
     def _sensitive_key(self, key: str) -> bool:
+        """Any contiguous window of normalised words (exact word n-gram) naming a sensitive key.
+
+        Windows are bounded by the longest sensitive name, so the check stays linear in the key length.
+        """
         words = _key_words(key)
-        for size in range(1, len(words) + 1):
-            if "".join(words[:size]) in self._sensitive or "".join(words[-size:]) in self._sensitive:
-                return True
+        for start in range(len(words)):
+            for size in range(1, min(self._max_words, len(words) - start) + 1):
+                if "".join(words[start : start + size]) not in self._sensitive:
+                    continue
+                following = words[start + size] if start + size < len(words) else None
+                benign = _BENIGN_NEXT_WORDS.get("".join(words[start : start + size]), frozenset())
+                if following is None or following not in benign:
+                    return True
         return False
 
     def _object(self, item: dict[object, object], depth: int) -> JsonValue:
@@ -199,15 +248,41 @@ class _Run:
             self._check_text(raw_key)
             if self._sensitive_key(raw_key):
                 self.stripped += 1
+                self._measure(child, depth + 1)
                 continue
             before = self.redacted
             if self.redact(raw_key) != raw_key:
                 # A key that itself embeds a secret, private block or blocked path drops its whole subtree.
                 self.redacted = before
                 self.stripped += 1
+                self._measure(child, depth + 1)
                 continue
             out[raw_key] = self.value(child, depth + 1, key=raw_key)
         return out
+
+    def _measure(self, item: object, depth: int) -> None:
+        """Count a dropped subtree toward the input cap and bounds without redacting it (it is never kept)."""
+        self.tick()
+        if depth > MAX_DEPTH:
+            raise _Reject
+        self._count(0)
+        if type(item) is str:
+            self._check_text(item)
+        elif type(item) is list:
+            if len(item) > MAX_ARRAY_ITEMS:
+                raise _Reject
+            for child in item:
+                self._measure(child, depth + 1)
+        elif type(item) is dict:
+            if len(item) > MAX_OBJECT_KEYS:
+                raise _Reject
+            for key, child in item.items():
+                if type(key) is not str:
+                    raise _Reject
+                self._check_text(key)
+                self._measure(child, depth + 1)
+        elif not (item is None or type(item) in (bool, int, float)):
+            raise _Reject
 
     def _check_text(self, text: str) -> None:
         size = len(text.encode("utf-8"))
@@ -284,21 +359,34 @@ class _Run:
         return "".join(out)
 
     def _userinfo(self, text: str) -> str:
-        """``scheme://user:pass@host`` -> ``scheme://[redacted]@host``, up to the last ``@`` of the authority."""
+        """``scheme://user:pass@host`` -> ``scheme://[redacted]@host``.
+
+        Privacy-first: a credential-like ``user:`` right after ``://`` is redacted through the last ``@`` before the
+        next whitespace, even when ``/ ? #`` appear inside it. Otherwise userinfo is redacted up to the last ``@`` of
+        the authority. Linear: each whitespace-delimited segment's end and last ``@`` are computed once.
+        """
         out: list[str] = []
         cursor = 0
+        seg_end = seg_last_at = -1
         index = text.find("://")
         while index != -1:
             start = index + 3
-            authority = _AUTHORITY.match(text, start)
-            stop = authority.end() if authority is not None else start
-            at = text.rfind("@", start, stop)
+            if start > seg_end:
+                segment = _SEGMENT.match(text, start)
+                seg_end = segment.end() if segment is not None else start
+                seg_last_at = text.rfind("@", start, seg_end)
+            if seg_last_at > start and _CREDENTIAL_USER.match(text, start, seg_end):
+                at = seg_last_at
+            else:
+                authority = _AUTHORITY.match(text, start)
+                stop = authority.end() if authority is not None else start
+                at = text.rfind("@", start, stop)
             if at > start:
                 out.append(text[cursor:start])
                 out.append(REDACTED)
                 self.redacted += 1
                 cursor = at
-            index = text.find("://", max(stop, start))
+            index = text.find("://", max(at, start))
         out.append(text[cursor:])
         return "".join(out)
 
@@ -371,11 +459,9 @@ def project_manual_submission(value: JsonValue, policy: FilterPolicy) -> JsonVal
     kept: dict[str, JsonValue] = {}
     for key, item in value.items():
         if key in policy.structural_id_fields:
-            if (isinstance(item, str) and OPAQUE_ID_RE.fullmatch(item)) or (
-                isinstance(item, str) and SHA256_DIGEST_RE.fullmatch(item)
+            if _exempt_structural(key, item, policy.entropy_min_length) or (
+                _structural_kind(key) == "id" and isinstance(item, str) and OPAQUE_ID_RE.fullmatch(item)
             ):
-                kept[key] = item
-            elif type(item) is int and item >= 0:
                 kept[key] = item
         elif key in STATUS_FIELDS and isinstance(item, str) and _STATUS_VALUE_RE.fullmatch(item):
             kept[key] = item
