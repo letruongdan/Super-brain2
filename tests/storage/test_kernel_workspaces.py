@@ -6,6 +6,7 @@ import ast
 import builtins
 import datetime as dt
 import os
+import shutil
 import socket
 import sqlite3
 import subprocess
@@ -17,7 +18,6 @@ from pathlib import Path
 import pytest
 
 from superbrain.adapters.os.workspaces import (
-    DirectorySnapshotObserver,
     build_registration,
     canonical_remote_locator,
     physical_checkout,
@@ -57,6 +57,7 @@ from superbrain.core.kernel import (
 from superbrain.ports.os import OsAdapters
 from superbrain.ports.policy import IntentKind
 from superbrain.storage.backup import create_policy_backup, create_store_backup
+from superbrain.storage.cas import blob_path
 from superbrain.storage.kernel_schema import (
     KERNEL_POLICY_KINDS,
     KERNEL_POLICY_MIGRATIONS,
@@ -78,6 +79,7 @@ from superbrain.storage.workspaces import (
 )
 from tests.storage.conftest import maintenance_lease
 from tests.support.clock import FakeClock
+from tests.support.inc2_observer import DirectorySnapshotObserver
 from tests.support.kernel_auth import SeededCredential, make_bootstrap_auth, seed_principal_and_credential
 
 MS = 1_000_000
@@ -317,11 +319,56 @@ def test_remote_ambiguity_fails_with_revision_conflict(
 def test_no_remote_move_creates_distinct_checkout_and_no_link(
     kernel: Runtime, dan: SeededCredential, clock: FakeClock, trusted_tmp: Path
 ) -> None:
-    old = _register(kernel, clock, dan, alias="m1", checkout=trusted_tmp / "place-1" / "proj", remote=None)
-    moved = _register(kernel, clock, dan, alias="m2", checkout=trusted_tmp / "place-2" / "proj", remote=None)
+    place_1 = trusted_tmp / "place-1" / "proj"
+    old = _register(kernel, clock, dan, alias="m1", checkout=place_1, remote=None)
+    (trusted_tmp / "place-2").mkdir()
+    place_2 = trusted_tmp / "place-2" / "proj"
+    os.rename(place_1, place_2)  # the same directory (same file ID) now lives elsewhere
+    moved = _register(kernel, clock, dan, alias="m2", checkout=place_2, remote=None)
     assert old.repo_id != moved.repo_id
     assert old.checkout_id != moved.checkout_id
-    assert resolve_binding(dan.principal, WorkspaceSelector(workspace_hint="m1"), kernel.policy) == old
+    assert moved.checkout_path == os.path.realpath(place_2)
+    still_old = resolve_binding(dan.principal, WorkspaceSelector(workspace_hint="m1"), kernel.policy)
+    assert still_old == old  # the old alias does not silently follow the moved directory
+    assert still_old.checkout_path != moved.checkout_path
+
+
+def test_reused_file_id_never_carries_checkout_identity(
+    kernel: Runtime, dan: SeededCredential, clock: FakeClock, trusted_tmp: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_stat = os.stat
+
+    def same_file_id(path: str | os.PathLike[str], *, follow_symlinks: bool = True) -> os.stat_result:
+        r = real_stat(path, follow_symlinks=follow_symlinks)
+        return os.stat_result(
+            (
+                r.st_mode,
+                4242,
+                77,
+                r.st_nlink,
+                r.st_uid,
+                r.st_gid,
+                r.st_size,
+                int(r.st_atime),
+                int(r.st_mtime),
+                int(r.st_ctime),
+            )
+        )
+
+    first_dir = trusted_tmp / "gone" / "proj"
+    first_dir.mkdir(parents=True)
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "stat", same_file_id)
+        first = _register(kernel, clock, dan, alias="i1", checkout=first_dir, remote=None)
+    shutil.rmtree(first_dir.parent)
+    reused_dir = trusted_tmp / "fresh" / "proj"
+    reused_dir.mkdir(parents=True)
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "stat", same_file_id)  # the file system handed the old file ID to a new directory
+        reused = _register(kernel, clock, dan, alias="i2", checkout=reused_dir, remote=None)
+        assert physical_checkout(str(reused_dir)).path_identity != physical_checkout(str(trusted_tmp)).path_identity
+    assert (reused.repo_id, reused.checkout_id) != (first.repo_id, first.checkout_id)
+    assert resolve_binding(dan.principal, WorkspaceSelector(workspace_hint="i1"), kernel.policy) == first
 
 
 @pytest.mark.parametrize(
@@ -336,13 +383,15 @@ def test_no_remote_move_creates_distinct_checkout_and_no_link(
         ("file:///srv/git/repo.git", "file:///srv/git/repo"),
         ("/srv/git/repo.git", "file:///srv/git/repo"),
         ("C:\\git\\repo.git", "file:///C:/git/repo"),
+        ("https://h.example/o/Repo.GIT", "https://h.example/o/Repo"),
     ],
 )
 def test_canonical_locator_strips_userinfo_query_and_fragment(
     raw: str, canonical: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _no_fs_net_exec(monkeypatch)
-    loc = canonical_remote_locator(raw)
+    with monkeypatch.context() as guard:
+        _no_fs_net_exec(guard)
+        loc = canonical_remote_locator(raw)
     assert loc.canonical_locator == canonical
     assert loc.locator_digest == digest_bytes(canonical.encode("utf-8"))
     assert "@" not in loc.canonical_locator and "?" not in loc.canonical_locator and "#" not in loc.canonical_locator
@@ -369,8 +418,8 @@ def test_canonical_locator_strips_userinfo_query_and_fragment(
     ],
 )
 def test_canonical_locator_rejects_unsupported_shapes_without_echo(raw: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    _no_fs_net_exec(monkeypatch)
-    with pytest.raises(BrainError) as exc:
+    with monkeypatch.context() as guard, pytest.raises(BrainError) as exc:
+        _no_fs_net_exec(guard)
         canonical_remote_locator(raw)
     assert exc.value.code is ErrorCode.INVALID_INPUT
     if raw:
@@ -651,8 +700,9 @@ def test_missing_or_slow_observer_produces_labeled_delivery_with_known_lineage(
     assert bound.meta["selector_reason"] == "provider_unavailable"
     known_field = LineagedField(value=None, sources=known.sources, unknown_source=known.unknown_source)
     mystery_field = LineagedField(value=None, sources=mystery.sources, unknown_source=True)
-    assert evaluate_egress_eligibility(known_field, kernel.policy) is True
-    assert evaluate_egress_eligibility(mystery_field, kernel.policy) is False
+    restrictions = StoreSourceRestrictions(kernel.store, kernel.policy, resolvers={"artifact": source_a.__eq__})
+    assert evaluate_egress_eligibility(known_field, kernel.policy, restrictions=restrictions) is True
+    assert evaluate_egress_eligibility(mystery_field, kernel.policy, restrictions=restrictions) is False
 
 
 def test_unknown_snapshot_replay_does_not_upgrade_after_observer_recovers(
@@ -873,10 +923,11 @@ def test_lineage_unknown_survives_quarantine_and_rebuild(
     lineage, task_unknown = kstore.transact(lambda tx: tx.read_task_lineage("q-1"))
     assert task_unknown is True and src in lineage
     assert kstore.transact(lambda tx: tx.read_source_snapshot(snapshot_id)) == snap
-    restrictions = StoreSourceRestrictions(kernel.store, kernel.policy)
+    restrictions = StoreSourceRestrictions(kernel.store, kernel.policy, resolvers={"artifact": src.__eq__})
     known_field = LineagedField(value=None, sources=known.sources)
     assert evaluate_egress_eligibility(known_field, kernel.policy, restrictions=restrictions) is False
-    assert evaluate_egress_eligibility(LineagedField(None, unknown.sources, True), kernel.policy) is False
+    unknown_field = LineagedField(None, unknown.sources, True)
+    assert evaluate_egress_eligibility(unknown_field, kernel.policy, restrictions=restrictions) is False
 
 
 def test_restore_store_older_than_registration_keeps_ids_and_grants(
@@ -1132,3 +1183,157 @@ def test_snapshot_cache_does_not_trust_mtime_size(trusted_tmp: Path, monkeypatch
     assert first.descriptor.descriptor_digest != second.descriptor.descriptor_digest
     expired = observer.observe(binding, 0)
     assert expired.status is SnapshotStatus.DEADLINE and expired.descriptor is None
+
+
+# --- fix round 1 ------------------------------------------------------------------------------------------------
+
+
+def _snapshot_ref(binding: WorkspaceBinding, snapshot_id: str, descriptor_digest: str) -> LineageRef:
+    return LineageRef(
+        owner_id=binding.owner_id,
+        repo_id=binding.repo_id,
+        source=ObjectRef(kind="source_snapshot", id=snapshot_id, revision=1, digest=descriptor_digest),
+    )
+
+
+def test_source_restrictions_cover_any_unresolvable_source(
+    kernel: Runtime, dan: SeededCredential, clock: FakeClock, trusted_tmp: Path
+) -> None:
+    binding = _register(kernel, clock, dan, alias="rs", checkout=trusted_tmp / "rs", egress=True)
+    src = _source(binding, "art-r")
+    delivery = _prepare(
+        kernel,
+        dan.principal,
+        WorkspaceSelector(workspace_hint="rs"),
+        task_id="rs-1",
+        mono=Mono(),
+        observer=FakeObserver(_desc()),
+        served=(src,),
+    )
+    snapshot_id = delivery.binding.source_snapshot_id
+    assert snapshot_id is not None
+    kstore = KernelWorkspaceStore(kernel.store, kernel.policy)
+    lineage, _unknown = kstore.transact(lambda tx: tx.read_task_lineage("rs-1"))
+    binding_ref = next(ref for ref in lineage if ref.source.kind == "workspace_binding")
+    snap = _desc().descriptor_digest
+    snap_ref = _snapshot_ref(binding, snapshot_id, snap)
+    plain = StoreSourceRestrictions(kernel.store, kernel.policy)
+    assert plain.is_restricted(binding_ref) is False
+    assert plain.is_restricted(snap_ref) is False
+    assert plain.is_restricted(src) is True  # no resolver for the kind: unresolvable, so restricted
+    forged_binding = LineageRef(
+        binding.owner_id, binding.repo_id, ObjectRef("workspace_binding", "chk-forged", 1, binding_ref.source.digest)
+    )
+    tampered_binding = LineageRef(
+        binding.owner_id, binding.repo_id, ObjectRef("workspace_binding", binding.checkout_id, 1, "sha256:" + "f" * 64)
+    )
+    for ref in (
+        forged_binding,
+        tampered_binding,
+        _snapshot_ref(binding, new_id(), snap),
+        _snapshot_ref(binding, snapshot_id, "sha256:" + "e" * 64),
+        LineageRef("dan", binding.repo_id, ObjectRef("lesson", "les-1", 1, digest_bytes(b"x"))),
+    ):
+        assert plain.is_restricted(ref) is True, ref
+    resolving = StoreSourceRestrictions(kernel.store, kernel.policy, resolvers={"artifact": src.__eq__})
+    assert resolving.is_restricted(src) is False
+    assert resolving.is_restricted(_source(binding, "art-other")) is True
+    blob_path(kernel.root.cas_dir, snap).unlink()
+    assert plain.is_restricted(snap_ref) is True  # descriptor blob missing
+    kernel.policy.record_intent(IntentKind.QUARANTINE, {"digest": src.source.digest})
+    kernel.store.reconcile_policy()
+    assert resolving.is_restricted(src) is True
+
+
+def test_explicit_tombstoned_or_blobless_snapshot_is_refused(
+    kernel: Runtime, dan: SeededCredential, clock: FakeClock, trusted_tmp: Path
+) -> None:
+    binding = _register(kernel, clock, dan, alias="ex", checkout=trusted_tmp / "ex")
+    kstore = KernelWorkspaceStore(kernel.store, kernel.policy)
+    tombstoned = kstore.transact(lambda tx: register_snapshot(tx, binding, _desc(TREE_1)))
+    blobless = kstore.transact(lambda tx: register_snapshot(tx, binding, _desc(TREE_2)))
+    kernel.policy.record_intent(IntentKind.TOMBSTONE, {"holder_kind": "event", "holder_id": tombstoned})
+    kernel.store.reconcile_policy()
+    blob_path(kernel.root.cas_dir, _desc(TREE_2).descriptor_digest).unlink()
+    observer = FakeObserver(_desc())
+    for task_id, snapshot_id in (("ex-t", tombstoned), ("ex-b", blobless)):
+        with pytest.raises(BrainError) as exc:
+            _prepare(
+                kernel,
+                dan.principal,
+                WorkspaceSelector(workspace_hint="ex", source_snapshot_id=snapshot_id),
+                task_id=task_id,
+                mono=Mono(),
+                observer=observer,
+            )
+        assert exc.value.code is ErrorCode.NOT_FOUND, task_id
+    assert observer.calls == []
+    assert _entries(kernel, "lineage.task_bound") == []
+
+
+def test_snapshot_dedupe_never_reuses_a_restricted_snapshot(
+    kernel: Runtime, dan: SeededCredential, clock: FakeClock, trusted_tmp: Path
+) -> None:
+    binding = _register(kernel, clock, dan, alias="dd", checkout=trusted_tmp / "dd")
+    sel = WorkspaceSelector(workspace_hint="dd")
+    digest = _desc().descriptor_digest
+    first = _prepare(kernel, dan.principal, sel, task_id="dd-1", mono=Mono(), observer=FakeObserver(_desc()))
+    s1 = first.binding.source_snapshot_id
+    assert s1 is not None
+    kernel.policy.record_intent(IntentKind.TOMBSTONE, {"holder_kind": "event", "holder_id": s1})
+    kernel.store.reconcile_policy()
+    second = _prepare(kernel, dan.principal, sel, task_id="dd-2", mono=Mono(), observer=FakeObserver(_desc()))
+    s2 = second.binding.source_snapshot_id
+    assert second.binding.snapshot_status is SnapshotStatus.AVAILABLE and s2 not in (None, s1)
+    blob_path(kernel.root.cas_dir, digest).unlink()
+    third = _prepare(kernel, dan.principal, sel, task_id="dd-3", mono=Mono(), observer=FakeObserver(_desc()))
+    assert third.binding.snapshot_status is SnapshotStatus.AVAILABLE
+    assert third.binding.source_snapshot_id not in (None, s1, s2)
+    assert kernel.store.cas.blob_intact(digest)
+    kernel.policy.record_intent(IntentKind.QUARANTINE, {"digest": digest})
+    kernel.store.reconcile_policy()
+    fourth = _prepare(kernel, dan.principal, sel, task_id="dd-4", mono=Mono(), observer=FakeObserver(_desc()))
+    assert fourth.binding.snapshot_status is SnapshotStatus.UNAVAILABLE
+    assert fourth.binding.source_snapshot_id is None
+    kstore = KernelWorkspaceStore(kernel.store, kernel.policy)
+    with pytest.raises(BrainError) as exc:
+        kstore.transact(lambda tx: register_snapshot(tx, binding, _desc()))
+    assert exc.value.code is ErrorCode.QUARANTINED
+
+
+def test_handoff_lineage_from_stored_t1_is_inherited_by_t2(
+    kernel: Runtime, dan: SeededCredential, clock: FakeClock, trusted_tmp: Path
+) -> None:
+    repo_a = _register(kernel, clock, dan, alias="ha", checkout=trusted_tmp / "ha", remote="https://h.example/o/a.git")
+    repo_b = _register(kernel, clock, dan, alias="hb", checkout=trusted_tmp / "hb", remote="https://h.example/o/b.git")
+    repo_c = _register(kernel, clock, dan, alias="hc", checkout=trusted_tmp / "hc", remote="https://h.example/o/c.git")
+    src_a = _source(repo_a, "art-a")
+    _prepare(
+        kernel,
+        dan.principal,
+        WorkspaceSelector(workspace_hint="hb"),
+        task_id="T1",
+        mono=Mono(),
+        observer=None,
+        items=(DeliveryItem(("handoff",), frozenset({src_a})),),
+        served=(src_a,),
+    )
+    kstore = KernelWorkspaceStore(kernel.store, kernel.policy)
+    kernel.store.rebuild_projections()  # T2 must see what the ledger/projection holds, not T1's in-memory result
+    t1 = resolve_task_binding(kstore, kernel.policy, dan.principal, "T1")
+    assert t1.repo_id == repo_b.repo_id
+    t1_lineage, t1_unknown = kstore.transact(lambda tx: tx.read_task_lineage("T1"))
+    _prepare(
+        kernel,
+        dan.principal,
+        WorkspaceSelector(workspace_hint="hc"),
+        task_id="T2",
+        mono=Mono(),
+        observer=None,
+        items=(DeliveryItem(("derived",), t1_lineage, unknown_source=t1_unknown),),
+    )
+    stored = kstore.transact(lambda tx: tx.read_field_lineage("T2"))[field_path_digest(("derived",))]
+    assert src_a in stored.sources
+    assert {ref.repo_id for ref in stored.sources} == {repo_a.repo_id, repo_b.repo_id}
+    t2_lineage, _ = kstore.transact(lambda tx: tx.read_task_lineage("T2"))
+    assert {ref.repo_id for ref in t2_lineage} == {repo_a.repo_id, repo_b.repo_id, repo_c.repo_id}

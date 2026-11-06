@@ -2,8 +2,15 @@
 
 The filter walks object keys and values and lists, drops sensitive-key subtrees and keys that themselves carry
 secrets, redacts ``<private>`` blocks, fixed secret shapes, URL userinfo, ``key=value`` secrets, blocked paths and
-high-entropy ASCII tokens to ``[redacted]``, and refuses the whole payload on anything ambiguous (malformed private
+high-entropy ASCII runs to ``[redacted]``, and refuses the whole payload on anything ambiguous (malformed private
 markers, bounds, non-JSON values). Errors carry only a static allowlisted reason: never input text or ``str(exc)``.
+
+Every scan is linear in the input (literal anchors, bounded quantifiers or hand-written scanners, never nested
+unbounded quantifiers), and the shared local deadline is checked between scans inside each string.
+
+Known limitation (outside D6): sensitive key names are matched after NFKC + casefold normalisation, so
+compatibility forms (fullwidth letters, ligatures) are caught, but cross-script confusables (a Cyrillic ``а`` in
+``pаssword``) are not; their values still pass through every value-level rule.
 """
 
 from __future__ import annotations
@@ -13,6 +20,7 @@ import fnmatch
 import math
 import re
 import time
+import unicodedata
 from collections import Counter
 from collections.abc import Callable
 
@@ -28,19 +36,16 @@ MAX_TEXT_BYTES = 64 * 1024
 MAX_ARRAY_ITEMS = 1024
 MAX_OBJECT_KEYS = 1024
 MAX_TOTAL_BYTES = 1024 * 1024
+_NODE_OVERHEAD = 2
 _MAX_INT = 2**63
 STATUS_FIELDS: frozenset[str] = frozenset({"schema_version", "status", "outcome", "state"})
 
 _UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
-_STRUCTURAL_SPAN_RE = re.compile(
-    r"(?<![A-Za-z0-9])(?:sha256:[0-9a-f]{64}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?![A-Za-z0-9])"
-)
 _STATUS_VALUE_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
-_PRIVATE_STRICT = re.compile(r"<\s*(/?)\s*private\s*>", re.IGNORECASE)
-_PRIVATE_LOOSE = re.compile(r"<\s*/?\s*private", re.IGNORECASE)
-_PEM = re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|\Z)", re.DOTALL)
-_AUTH_HEADER = re.compile(r"(?i)\b(authorization|proxy-authorization)(\s*[:=]\s*)[^\r\n,;]+")
-_AUTH_SCHEME = re.compile(r"(?i)\b(bearer|basic|token)\s+([A-Za-z0-9._~+/=-]{8,})")
+_PEM_BEGIN = re.compile(r"-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY-----")
+_PEM_END = re.compile(r"-----END [A-Z0-9 ]{0,40}PRIVATE KEY-----")
+_AUTH_HEADER = re.compile(r"(?i)\b(authorization|proxy-authorization)([ \t]{0,16}[:=][ \t]{0,16})[^\r\n,;]+")
+_AUTH_SCHEME = re.compile(r"(?i)\b(bearer|basic|token)[ \t]{1,16}([A-Za-z0-9._~+/=-]{8,})")
 _FIXED_TOKENS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"),
     re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{16,}"),
@@ -49,13 +54,19 @@ _FIXED_TOKENS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}"),
     re.compile(r"\beyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}"),
 )
-_URL_USERINFO = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)([^\s/@?#\[\]]+)@")
+_AUTHORITY = re.compile(r"[^/?#\s]*")
 _KEY_VALUE_SECRET = re.compile(
-    r"(?i)\b(password|passwd|pwd|secret|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret"
-    r"|auth[_-]?token|private[_-]?key)(\s*[=:]\s*)(\"[^\"]*\"|'[^']*'|[^\s;,&]+)"
+    r"(?i)\b(password|passwd|pwd|passphrase|secret|api[_-]?key|access[_-]?token|refresh[_-]?token"
+    r"|client[_-]?secret|auth[_-]?token|private[_-]?key)([ \t]{0,16}[=:][ \t]{0,16})"
+    r"(\"[^\"\r\n]{0,512}\"|'[^'\r\n]{0,512}'|[^\s;,&]+)"
 )
 _PATH_TOKEN = re.compile(r"[^\s\"'<>|()\[\]{},;]+")
 _PATH_SPLIT = re.compile(r"[\\/]+")
+_PATH_LEAD = "`*([{<\"'"
+_PATH_TRAIL = "`*)]}>\"'.,:;!?"
+_ENTROPY_EDGE = "\"'()[]{}<>,;.!?:`*"
+_CAMEL = re.compile(r"([a-z0-9])([A-Z])")
+_KEY_WORD_SPLIT = re.compile(r"[^0-9a-z]+")
 
 
 class _Reject(Exception):
@@ -66,8 +77,14 @@ class _Deadline(Exception):
     """Internal deadline signal; deliberately carries no text."""
 
 
-def _normalize_key(key: str) -> str:
-    return re.sub(r"[^a-z0-9]", "", key.lower())
+def _key_words(key: str) -> list[str]:
+    """NFKC + casefold words of a key, split at separators and camelCase boundaries."""
+    normalized = unicodedata.normalize("NFKC", key)
+    return [word for word in _KEY_WORD_SPLIT.split(_CAMEL.sub(r"\1 \2", normalized).casefold()) if word]
+
+
+def _joined_key(key: str) -> str:
+    return "".join(_key_words(key))
 
 
 def _shannon_bits(text: str) -> float:
@@ -86,29 +103,30 @@ def _tokenish(token: str) -> bool:
 
 
 class _PathMatcher:
+    """Component-boundary matcher for blocked path patterns (``name``, ``dir/`` and ``a/b`` chains)."""
+
     def __init__(self, patterns: tuple[str, ...]) -> None:
-        self._dirs: list[str] = []
-        self._chains: list[list[str]] = []
-        self._names: list[str] = []
+        self._dirs: set[str] = set()
+        self._chains: list[list[re.Pattern[str]]] = []
+        names: list[str] = []
         for pattern in patterns:
             lowered = pattern.lower()
             if lowered.endswith("/"):
-                self._dirs.append(lowered.rstrip("/"))
+                self._dirs.add(lowered.rstrip("/"))
             elif "/" in lowered:
-                self._chains.append([part for part in lowered.split("/") if part])
+                self._chains.append([re.compile(fnmatch.translate(part)) for part in lowered.split("/") if part])
             else:
-                self._names.append(lowered)
+                names.append(fnmatch.translate(lowered))
+        self._names = re.compile("|".join(f"(?:{n})" for n in names)) if names else None
 
     def blocked(self, token: str) -> bool:
-        parts = [p.lower() for p in _PATH_SPLIT.split(token) if p]
+        parts = [p.lower() for p in _PATH_SPLIT.split(token) if p and p != "."]
         for index, part in enumerate(parts):
-            if part in self._dirs or any(fnmatch.fnmatchcase(part, name) for name in self._names):
+            if part in self._dirs or (self._names is not None and self._names.fullmatch(part)):
                 return True
             for chain in self._chains:
                 window = parts[index : index + len(chain)]
-                if len(window) != len(chain):
-                    continue
-                if all(fnmatch.fnmatchcase(p, c) for p, c in zip(window, chain, strict=True)):
+                if len(window) == len(chain) and all(rx.fullmatch(p) for rx, p in zip(chain, window, strict=True)):
                     return True
         return False
 
@@ -118,19 +136,27 @@ class _Run:
         self.policy = policy
         self.redacted = 0
         self.stripped = 0
+        self._input_bytes = 0
         self._monotonic_ns = monotonic_ns
         self._deadline_ns = deadline_ns
-        self._sensitive = tuple(sorted({_normalize_key(k) for k in policy.sensitive_keys} - {""}))
+        self._sensitive = frozenset(_joined_key(k) for k in policy.sensitive_keys) - {""}
         self._paths = _PathMatcher(policy.blocked_path_patterns)
 
     def tick(self) -> None:
         if self._deadline_ns is not None and self._monotonic_ns() >= self._deadline_ns:
             raise _Deadline
 
+    def _count(self, size: int) -> None:
+        """Input size cap: refuse before any redaction can shrink an oversized payload."""
+        self._input_bytes += size + _NODE_OVERHEAD
+        if self._input_bytes > MAX_TOTAL_BYTES:
+            raise _Reject
+
     def value(self, item: object, depth: int, key: str | None = None) -> JsonValue:
         self.tick()
         if depth > MAX_DEPTH:
             raise _Reject
+        self._count(0)
         if item is None or type(item) is bool:
             return item
         if type(item) is int:
@@ -143,9 +169,11 @@ class _Run:
             return item
         if type(item) is str:
             self._check_text(item)
-            if key is not None and key in self.policy.structural_id_fields and _is_structural_id(item):
+            structural = key is not None and key in self.policy.structural_id_fields
+            if structural and _is_structural_id(item):
                 return item
-            return self.redact(item)
+            # Opaque IDs in structural fields are exempt from the entropy rule only, never from fixed patterns.
+            return self.redact(item, entropy=not (structural and OPAQUE_ID_RE.fullmatch(item)))
         if type(item) is list:
             if len(item) > MAX_ARRAY_ITEMS:
                 raise _Reject
@@ -153,6 +181,13 @@ class _Run:
         if type(item) is dict:
             return self._object(item, depth)
         raise _Reject
+
+    def _sensitive_key(self, key: str) -> bool:
+        words = _key_words(key)
+        for size in range(1, len(words) + 1):
+            if "".join(words[:size]) in self._sensitive or "".join(words[-size:]) in self._sensitive:
+                return True
+        return False
 
     def _object(self, item: dict[object, object], depth: int) -> JsonValue:
         if len(item) > MAX_OBJECT_KEYS:
@@ -162,8 +197,7 @@ class _Run:
             if type(raw_key) is not str:
                 raise _Reject
             self._check_text(raw_key)
-            normalized = _normalize_key(raw_key)
-            if any(name in normalized for name in self._sensitive):
+            if self._sensitive_key(raw_key):
                 self.stripped += 1
                 continue
             before = self.redacted
@@ -175,10 +209,11 @@ class _Run:
             out[raw_key] = self.value(child, depth + 1, key=raw_key)
         return out
 
-    @staticmethod
-    def _check_text(text: str) -> None:
-        if len(text.encode("utf-8")) > MAX_TEXT_BYTES:
+    def _check_text(self, text: str) -> None:
+        size = len(text.encode("utf-8"))
+        if size > MAX_TEXT_BYTES:
             raise _Reject
+        self._count(size)
 
     def _sub(self, pattern: re.Pattern[str], repl: str | Callable[[re.Match[str]], str], text: str) -> str:
         new, count = pattern.subn(repl, text)
@@ -186,26 +221,84 @@ class _Run:
         return new
 
     def _private(self, text: str) -> str:
-        strict = list(_PRIVATE_STRICT.finditer(text))
-        if len(_PRIVATE_LOOSE.findall(text)) != len(strict):
-            raise _Reject
+        """``<private>…</private>`` -> ``[redacted]``; any malformed, orphan or nested marker refuses.
+
+        A marker is ``<`` [ws] [``/``] [ws] ``private`` [ws] ``>`` (case-insensitive). Each ``private`` occurrence
+        is inspected once, looking back over the whitespace run before it and forward over the one after it.
+        """
+        low = text.lower()
+        if len(low) != len(text):  # a few characters lowercase to two; keep offsets aligned with ``text``
+            low = "".join(ch.lower() if len(ch.lower()) == 1 else ch for ch in text)
+        markers: list[tuple[int, int, bool]] = []
+        index = low.find("private")
+        while index != -1:
+            j = index - 1
+            while j >= 0 and low[j].isspace():
+                j -= 1
+            closing = j >= 0 and low[j] == "/"
+            if closing:
+                j -= 1
+                while j >= 0 and low[j].isspace():
+                    j -= 1
+            if j >= 0 and low[j] == "<":
+                k = index + 7
+                while k < len(low) and low[k].isspace():
+                    k += 1
+                if k >= len(low) or low[k] != ">":
+                    raise _Reject
+                markers.append((j, k + 1, closing))
+            index = low.find("private", index + 7)
         out: list[str] = []
         cursor, open_at = 0, -1
-        for match in strict:
-            closing = match.group(1) == "/"
+        for start, end, closing in markers:
             if not closing:
                 if open_at >= 0:
                     raise _Reject
-                out.append(text[cursor : match.start()])
-                open_at = match.start()
+                out.append(text[cursor:start])
+                open_at = start
             else:
                 if open_at < 0:
                     raise _Reject
                 out.append(REDACTED)
                 self.redacted += 1
-                cursor, open_at = match.end(), -1
+                cursor, open_at = end, -1
         if open_at >= 0:
             raise _Reject
+        out.append(text[cursor:])
+        return "".join(out)
+
+    def _pem(self, text: str) -> str:
+        out: list[str] = []
+        cursor = 0
+        begin = _PEM_BEGIN.search(text)
+        while begin is not None:
+            out.append(text[cursor : begin.start()])
+            out.append(REDACTED)
+            self.redacted += 1
+            end = _PEM_END.search(text, begin.end())
+            if end is None:  # unterminated key: redact to the end of the string
+                return "".join(out)
+            cursor = end.end()
+            begin = _PEM_BEGIN.search(text, cursor)
+        out.append(text[cursor:])
+        return "".join(out)
+
+    def _userinfo(self, text: str) -> str:
+        """``scheme://user:pass@host`` -> ``scheme://[redacted]@host``, up to the last ``@`` of the authority."""
+        out: list[str] = []
+        cursor = 0
+        index = text.find("://")
+        while index != -1:
+            start = index + 3
+            authority = _AUTHORITY.match(text, start)
+            stop = authority.end() if authority is not None else start
+            at = text.rfind("@", start, stop)
+            if at > start:
+                out.append(text[cursor:start])
+                out.append(REDACTED)
+                self.redacted += 1
+                cursor = at
+            index = text.find("://", max(stop, start))
         out.append(text[cursor:])
         return "".join(out)
 
@@ -217,38 +310,51 @@ class _Run:
 
     def _blocked_path(self, match: re.Match[str]) -> str:
         token = match.group(0)
-        if not self._paths.blocked(token):
+        core = token.lstrip(_PATH_LEAD)
+        lead = len(token) - len(core)
+        core = core.rstrip(_PATH_TRAIL)
+        if not core or not self._paths.blocked(core):
             return token
         self.redacted += 1
-        return REDACTED
+        return token[:lead] + REDACTED + token[lead + len(core) :]
 
     def _entropy(self, text: str) -> str:
-        masked = _STRUCTURAL_SPAN_RE.sub(lambda m: " " * len(m.group(0)), text)
+        """D6: a maximal run of >= N printable non-whitespace ASCII chars with Shannon >= bits is redacted.
+
+        Exempt: a run that is (inside surrounding punctuation) a canonical UUID or ``sha256:<64 hex>``. The
+        ``[redacted]`` sentinel is a run boundary, never part of a candidate.
+        """
         min_len = self.policy.entropy_min_length
-        candidate = re.compile(rf"[A-Za-z0-9+=_~-]{{{min_len},}}")
+        candidate = re.compile(rf"[\x21-\x7e]{{{min_len},}}")
+        masked = text.replace(REDACTED, " " * len(REDACTED))
         spans = []
         for match in candidate.finditer(masked):
             token = match.group(0)
-            has_digit = any(ch.isdigit() for ch in token)
-            has_alpha = any(ch.isalpha() for ch in token)
-            if has_digit and has_alpha and _shannon_bits(token) >= self.policy.entropy_min_bits:
+            if _is_structural_id(token.strip(_ENTROPY_EDGE)):
+                continue
+            if _shannon_bits(token) >= self.policy.entropy_min_bits:
                 spans.append(match.span())
         for start, end in reversed(spans):
             text = text[:start] + REDACTED + text[end:]
         self.redacted += len(spans)
         return text
 
-    def redact(self, text: str) -> str:
+    def redact(self, text: str, *, entropy: bool = True) -> str:
         text = self._private(text)
-        text = self._sub(_PEM, REDACTED, text)
+        self.tick()
+        text = self._pem(text)
         text = self._sub(_AUTH_HEADER, rf"\1\2{REDACTED}", text)
+        self.tick()
         text = _AUTH_SCHEME.sub(self._auth_scheme, text)
         for pattern in _FIXED_TOKENS:
             text = self._sub(pattern, REDACTED, text)
-        text = self._sub(_URL_USERINFO, rf"\1{REDACTED}@", text)
+            self.tick()
+        text = self._userinfo(text)
         text = self._sub(_KEY_VALUE_SECRET, rf"\1\2{REDACTED}", text)
+        self.tick()
         text = _PATH_TOKEN.sub(self._blocked_path, text)
-        return self._entropy(text)
+        self.tick()
+        return self._entropy(text) if entropy else text
 
 
 def project_manual_submission(value: JsonValue, policy: FilterPolicy) -> JsonValue:

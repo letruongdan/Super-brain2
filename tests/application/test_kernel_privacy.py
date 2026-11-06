@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import time
 import traceback
 from collections.abc import Iterator
 
 import pytest
 
 from superbrain.application.privacy import PrivacyFilter, filter_policy_for, project_manual_submission
+from superbrain.core._json_parse import parse_json
 from superbrain.core.canonical import canonical_json
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.jsonvalue import JsonValue
@@ -86,6 +88,15 @@ def test_nested_secrets_in_keys_values_and_lists_are_removed() -> None:
         "Set-Cookie",
         "cookie",
         "session_token",
+        "pwd",
+        "token",
+        "auth_token",
+        "X-Auth-Token",
+        "x-api-key",
+        "Passphrase",
+        "github_token",
+        "ＰＡＳＳＷＯＲＤ",  # fullwidth PASSWORD (NFKC)
+        "password_hash",
         "credential",
         "bearer",
         "authorization",
@@ -356,8 +367,132 @@ def test_safe_payload_is_canonical_bounded_and_canary_free() -> None:
     _assert_no_canary(safe.value)
     for text in _walk_strings(safe.value):
         assert CANARY not in text
-    assert canonical_json(safe.value) == canonical_json(safe.value)
+    assert parse_json(canonical_json(safe.value)) == safe.value
     with pytest.raises(BrainError):
         SafePayload(value=float("nan"), redacted_count=0, stripped_keys_count=0)
     with pytest.raises(BrainError):
         SafePayload(value="x", redacted_count=-1, stripped_keys_count=0)
+
+
+# --- fix round 1 ----------------------------------------------------------------------------------------------------
+
+ADVERSARIAL: tuple[str, ...] = (
+    "a." * 30_000,
+    "a://" * 15_000,
+    "https://" + "a@" * 29_000,
+    "x@" * 30_000,
+    "sk-" * 20_000,
+    "<" + " " * 60_000 + "x",
+    "< " * 30_000,
+    "</" * 30_000,
+    "private " * 7_000,
+    'password="' * 6_000,
+    "Bearer " * 9_000,
+    "eyJa." * 12_000,
+    "-----BEGIN " * 5_000,
+    "/." * 30_000,
+    "a" * 60_000,
+    "q8Zr2Lm9" * 7_500,
+)
+
+
+@pytest.mark.parametrize("text", ADVERSARIAL, ids=[f"adv{i}" for i in range(len(ADVERSARIAL))])
+def test_adversarial_inputs_stay_within_local_budget(text: str) -> None:
+    flt = PrivacyFilter()
+    best = float("inf")
+    for _ in range(3):
+        start = time.perf_counter()
+        try:
+            flt.apply({"t": text}, FilterPolicy())
+        except BrainError as err:
+            assert err.code is ErrorCode.INVALID_INPUT
+        best = min(best, time.perf_counter() - start)
+        if best < 0.05:
+            break
+    assert best < 0.1, f"{best:.3f}s"
+
+
+def test_tiny_deadline_raises_promptly_inside_long_strings() -> None:
+    payloads: tuple[JsonValue, ...] = (
+        {"t": "a." * 30_000},
+        {"t": "https://" + "a@" * 29_000},
+        [text[:60_000] for text in ADVERSARIAL],
+    )
+    for payload in payloads:
+        start = time.perf_counter()
+        with pytest.raises(BrainError) as exc:
+            PrivacyFilter().apply(payload, FilterPolicy(), deadline_ns=time.monotonic_ns() + 1_000_000)
+        assert exc.value.code is ErrorCode.DEADLINE_EXCEEDED
+        assert time.perf_counter() - start < 0.05
+        _assert_safe_error(exc.value)
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",  # AWS-style secret key with '/'
+        "qWeRtYuIoPaSdFgHjKlZxCvBnMmNbVcXzLkJhGfD",  # 40 random letters, no digit
+        "Zx9.Qw3.Er7.Ty1.Ui5.Op2.As8.Df4",  # dotted alnum
+        "https://github.com/anthropics/claude-code",  # D6 accepts redacting long high-entropy runs
+    ],
+)
+def test_d6_entropy_rule_covers_any_printable_run(token: str) -> None:
+    safe = _apply({"t": f"value {token} end"})
+    assert safe.value == {"t": f"value {REDACTED} end"}
+
+
+def test_opaque_structural_id_survives_filter_and_manual_projection() -> None:
+    opaque = "outcome-2026-11-06-Zx9Qw3Er7Ty1"  # >=24 chars, entropy >= 4.0, valid opaque ID
+    payload: JsonValue = {"outcome_id": opaque, "status": "declared", "body": "dropped"}
+    safe = _apply(payload, FilterPolicy(manual_submission=False))
+    assert safe.value == {"outcome_id": opaque, "status": "declared"}
+    assert project_manual_submission(payload, FilterPolicy(manual_submission=False)) == safe.value
+    assert _apply({"note": opaque}).value == {"note": REDACTED}  # outside a structural field it is free text
+
+
+def test_userinfo_is_redacted_up_to_the_last_at_before_host() -> None:
+    safe = _apply({"u": f"https://user:p@ss{CANARY}@host.invalid/x"})
+    assert safe.value == {"u": f"https://{REDACTED}@host.invalid/x"}
+
+
+@pytest.mark.parametrize(
+    ("text", "core"),
+    [
+        ("see `.env` here", ".env"),
+        ("see `server.pem` here", "server.pem"),
+        ("copy id_rsa. then", "id_rsa"),
+        ("open ~/.ssh. then", ".ssh"),
+        ("use prod.pem: now", "prod.pem"),
+        ("**/home/u/.npmrc**", ".npmrc"),
+    ],
+)
+def test_blocked_paths_in_markdown_and_punctuation_are_redacted(text: str, core: str) -> None:
+    safe = _apply({"t": text})
+    assert isinstance(safe.value, dict)
+    out = str(safe.value["t"])
+    assert core not in out and REDACTED in out
+
+
+def test_keys_embedding_userinfo_entropy_or_blocked_path_drop_subtree() -> None:
+    payload: JsonValue = {
+        f"https://u:{CANARY}@h.invalid/x": {"v": 1},
+        HIGH_ENTROPY: {"v": 2},
+        "/home/u/.ssh/id_rsa": {"v": 3},
+        "plain": 4,
+    }
+    safe = _apply(payload)
+    assert safe.value == {"plain": 4}
+    assert safe.stripped_keys_count == 3
+
+
+def test_non_sensitive_keys_are_kept() -> None:
+    payload: JsonValue = {"context_budget_tokens": 4000, "tokenizer": "utf8-byte-v1", "description": "x"}
+    assert _apply(payload).value == payload
+
+
+def test_input_size_cap_applies_before_redaction_shrinks_it() -> None:
+    chunk = "<private>" + "b" * 59_000 + "</private>"
+    payload: JsonValue = {"chunks": [chunk for _ in range(20)]}  # ~1.2 MB in, ~0.3 KB out
+    with pytest.raises(BrainError) as exc:
+        _apply(payload)
+    assert exc.value.code is ErrorCode.INVALID_INPUT

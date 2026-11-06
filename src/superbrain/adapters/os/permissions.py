@@ -89,6 +89,13 @@ if sys.platform != "win32":
                     found.append(PermissionProblem(ancestor, reason))
             return found
 
+    def owned_by_current_user(path: Path) -> bool:
+        """Whether ``path`` (links followed) is owned by the current user."""
+        try:
+            return os.stat(path).st_uid == os.geteuid()
+        except OSError as err:
+            raise _inspect_error(path, err) from err
+
 
 if sys.platform == "win32":
     import ntsecuritycon
@@ -117,6 +124,13 @@ if sys.platform == "win32":
         sd = _security_descriptor(path, win32security.OWNER_SECURITY_INFORMATION)
         return str(win32security.ConvertSidToStringSid(sd.GetSecurityDescriptorOwner()))
 
+
+    def owned_by_current_user(path: Path) -> bool:
+        """Whether ``path`` is owned by the current user's SID."""
+        try:
+            return _owner_sid(path) == _current_user_sid()
+        except FileNotFoundError as err:
+            raise _inspect_error(path, err) from err
 
     def _allowed_aces(path: Path) -> list[tuple[int, int, str]] | None:
         """(ace flags, access mask, sid) of every access-allowed ACE, or ``None`` for a NULL DACL."""

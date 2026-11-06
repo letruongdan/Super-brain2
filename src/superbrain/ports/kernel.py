@@ -90,7 +90,13 @@ class KernelTx(Protocol):
         """True iff policy tombstoned the business holder ``holder_id`` (a snapshot, say)."""
         ...
 
-    def find_source_snapshot(self, checkout_id: str, descriptor_digest: str) -> SourceSnapshot | None: ...
+    def blob_present(self, digest: str) -> bool:
+        """True iff the blob ``digest`` exists in CAS and hashes to its digest."""
+        ...
+
+    def find_source_snapshots(self, checkout_id: str, descriptor_digest: str) -> tuple[SourceSnapshot, ...]:
+        """Every recorded snapshot of ``checkout_id`` with this content, oldest first."""
+        ...
 
     def read_source_snapshot(self, snapshot_id: str) -> SourceSnapshot | None: ...
 
@@ -121,5 +127,5 @@ class WorkspaceMirrorReadPort(Protocol):
 
 class SourceRestrictionPort(Protocol):
     def is_restricted(self, ref: LineageRef) -> bool:
-        """True iff the source of ``ref`` is quarantined, tombstoned or no longer resolvable."""
+        """True iff the source of ``ref`` is quarantined, tombstoned, missing or cannot be resolved (any kind)."""
         ...

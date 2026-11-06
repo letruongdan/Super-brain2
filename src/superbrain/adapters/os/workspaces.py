@@ -1,36 +1,26 @@
-"""Workspace identity adapters: canonical remote locators, physical checkout identity and a bounded directory
-snapshot observer (Task 3, D3).
+"""Workspace identity adapters: canonical remote locators and physical checkout identity (Task 3, D3).
 
 Pure string canonicalization for locators: nothing here fetches a URL, runs ``git`` or any project program, hook or
-config. Physical identity comes from the file system (``realpath`` + ``stat`` device/file index), never from a
-lowercased spelling. Error messages are static and never echo the caller's input.
+config. Checkout identity is the canonical physical path in the file system's own case (``realpath``), keyed with the
+machine by the policy registry; the file ID (device + index) only confirms that the caller's spelling and the
+resolved path name the same directory, and never carries identity across a move or a reused index. Error messages are
+static and never echo the caller's input. The real snapshot observer is gated to SP2/SP5 and is not shipped here.
 """
 
 from __future__ import annotations
 
-import hashlib
 import os
 import re
 import stat
 import sys
-import time
-from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC
 from pathlib import Path, PureWindowsPath
 from urllib.parse import urlsplit
 
-from superbrain.core.canonical import canonical_json, digest_bytes
+from superbrain.adapters.os.permissions import owned_by_current_user
+from superbrain.core.canonical import digest_bytes
 from superbrain.core.errors import BrainError, ErrorCode
-from superbrain.core.kernel import (
-    SnapshotDescriptor,
-    SnapshotObservation,
-    SnapshotStatus,
-    TrustedLocator,
-    WorkspaceBinding,
-    WorkspaceRegistration,
-)
-from superbrain.ports.clock import Clock
+from superbrain.core.kernel import TrustedLocator, WorkspaceRegistration
 
 _MAX_LOCATOR = 2048
 _FORBIDDEN_IN_PATH = re.compile(r"[\x00-\x20\x7f%\"'<>`|^{}]")
@@ -40,7 +30,6 @@ _SEGMENT_RE = re.compile(r"[A-Za-z0-9._~+-]{1,255}")
 _SCP_RE = re.compile(r"(?:[A-Za-z0-9._-]{1,64}@)?([A-Za-z0-9.-]{2,253}):(?!//)(.+)")
 _WIN_DRIVE_RE = re.compile(r"([A-Za-z]):[\\/](.*)")
 _DEFAULT_PORTS = {"https": 443, "ssh": 22}
-_CHUNK = 1 << 20
 
 
 def _invalid() -> BrainError:
@@ -54,7 +43,7 @@ def _segments(path: str, *, allow_empty: bool = False) -> list[str]:
     for part in parts:
         if part in {".", ".."} or _SEGMENT_RE.fullmatch(part) is None:
             raise _invalid()
-    if parts and parts[-1].endswith(".git") and len(parts[-1]) > 4:
+    if parts and parts[-1].lower().endswith(".git") and len(parts[-1]) > 4:
         parts[-1] = parts[-1][:-4]
     return parts
 
@@ -131,7 +120,7 @@ class PhysicalCheckout:
     checkout_path: str
     """The resolved real path, in the file system's own case."""
     path_identity: str
-    """``fsid:<device>:<file index>`` of the directory: equal for every spelling or link that reaches it."""
+    """``path:<canonical physical path>``: equal for every spelling or link that reaches the same location."""
 
 
 def _reject_unsafe_spelling(raw: str) -> None:
@@ -150,16 +139,6 @@ def _is_absolute(raw: str) -> bool:
     return raw.startswith("/")
 
 
-def _check_owner(path: str, st: os.stat_result) -> None:
-    if sys.platform == "win32":
-        from superbrain.adapters.os import permissions
-
-        if permissions._owner_sid(Path(path)) != permissions._current_user_sid():
-            raise BrainError(ErrorCode.INSECURE_PERMISSIONS, "insecure permissions")
-    elif st.st_uid != os.geteuid():
-        raise BrainError(ErrorCode.INSECURE_PERMISSIONS, "insecure permissions")
-
-
 def physical_checkout(raw_path: object) -> PhysicalCheckout:
     """Resolve an owner-supplied checkout path to its physical identity (links/junctions followed by the OS).
 
@@ -172,20 +151,25 @@ def physical_checkout(raw_path: object) -> PhysicalCheckout:
     if not _is_absolute(raw_path):
         raise _invalid()
     resolved: str | None = None
+    same_directory = False
+    is_directory = False
     try:
         resolved = os.path.realpath(raw_path, strict=True)
-        st = os.stat(resolved)
+        resolved_stat = os.stat(resolved)
+        same_directory = os.path.samestat(os.stat(raw_path), resolved_stat)  # confirmation only, never identity
+        is_directory = stat.S_ISDIR(resolved_stat.st_mode)
     except (OSError, ValueError):
         resolved = None
     if resolved is None:
         raise BrainError(ErrorCode.NOT_FOUND, "not found")
     _reject_unsafe_spelling(resolved)
-    if not stat.S_ISDIR(st.st_mode):
+    if not is_directory:
         raise _invalid()
-    if not st.st_ino:
+    if not same_directory:
         raise BrainError(ErrorCode.UNSAFE_PATH, "unsafe path")
-    _check_owner(resolved, st)
-    return PhysicalCheckout(checkout_path=resolved, path_identity=f"fsid:{st.st_dev:x}:{st.st_ino:x}")
+    if not owned_by_current_user(Path(resolved)):
+        raise BrainError(ErrorCode.INSECURE_PERMISSIONS, "insecure permissions")
+    return PhysicalCheckout(checkout_path=resolved, path_identity=f"path:{resolved}")
 
 
 def build_registration(
@@ -210,107 +194,3 @@ def build_registration(
         locator=canonical_remote_locator(raw_remote) if raw_remote is not None else None,
         provider_egress_enabled=provider_egress_enabled,
     )
-
-
-class _Budget(Exception):
-    pass
-
-
-class _Limit(Exception):
-    pass
-
-
-class DirectorySnapshotObserver:
-    """Bounded content snapshot of an approved checkout directory (fixture-grade, not activated in production).
-
-    Every regular file is hashed from its bytes on every observation: size and mtime are never trusted as proof of
-    unchanged content. Links are recorded by name and never followed; ``.git`` is skipped; nothing is executed.
-    """
-
-    def __init__(
-        self,
-        *,
-        clock: Clock,
-        monotonic_ns: Callable[[], int] = time.monotonic_ns,
-        max_files: int = 20_000,
-        max_bytes: int = 256 * 1024 * 1024,
-    ) -> None:
-        self._clock = clock
-        self._monotonic_ns = monotonic_ns
-        self._max_files = max_files
-        self._max_bytes = max_bytes
-
-    def observe(self, binding: WorkspaceBinding, deadline_ns: int) -> SnapshotObservation:
-        if self._monotonic_ns() >= deadline_ns:
-            return SnapshotObservation(SnapshotStatus.DEADLINE, None)
-        status: SnapshotStatus | None = None
-        records: list[list[str]] = []
-        try:
-            physical = physical_checkout(binding.checkout_path)
-            if physical.checkout_path != binding.checkout_path:
-                status = SnapshotStatus.UNAVAILABLE
-            else:
-                self._walk(physical.checkout_path, deadline_ns, records)
-        except _Budget:
-            status = SnapshotStatus.DEADLINE
-        except (_Limit, OSError, BrainError):
-            status = SnapshotStatus.UNAVAILABLE
-        if status is not None:
-            return SnapshotObservation(status, None)
-        if self._monotonic_ns() > deadline_ns:
-            return SnapshotObservation(SnapshotStatus.DEADLINE, None)
-        observed_at = self._clock.now().astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-        descriptor = SnapshotDescriptor(
-            kind="directory",
-            tree_or_head_digest=digest_bytes(canonical_json(sorted(records))),
-            dirty=False,
-            dirty_digest=None,
-            observed_at=observed_at,
-        )
-        return SnapshotObservation(SnapshotStatus.AVAILABLE, descriptor)
-
-    def _walk(self, root: str, deadline_ns: int, records: list[list[str]]) -> None:
-        files = total = 0
-        pending: list[tuple[str, str]] = [(root, "")]
-        while pending:
-            directory, rel = pending.pop()
-            with os.scandir(directory) as entries:
-                listing = sorted(entries, key=lambda e: e.name)
-            for entry in listing:
-                self._tick(deadline_ns)
-                name = f"{rel}/{entry.name}" if rel else entry.name
-                info = entry.stat(follow_symlinks=False)
-                if entry.is_symlink() or getattr(info, "st_file_attributes", 0) & 0x400:
-                    records.append(["link", name, ""])
-                elif stat.S_ISDIR(info.st_mode):
-                    if entry.name != ".git":
-                        pending.append((entry.path, name))
-                elif stat.S_ISREG(info.st_mode):
-                    files += 1
-                    if files > self._max_files:
-                        raise _Limit
-                    digest, size = self._hash(entry.path, deadline_ns)
-                    total += size
-                    if total > self._max_bytes:
-                        raise _Limit
-                    records.append(["file", name, digest])
-
-    def _tick(self, deadline_ns: int) -> None:
-        if self._monotonic_ns() >= deadline_ns:
-            raise _Budget
-
-    def _hash(self, path: str, deadline_ns: int) -> tuple[str, int]:
-        hasher = hashlib.sha256()
-        size = 0
-        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
-        fd = os.open(path, flags)
-        try:
-            while chunk := os.read(fd, _CHUNK):
-                self._tick(deadline_ns)
-                hasher.update(chunk)
-                size += len(chunk)
-                if size > self._max_bytes:
-                    raise _Limit
-        finally:
-            os.close(fd)
-        return "sha256:" + hasher.hexdigest(), size

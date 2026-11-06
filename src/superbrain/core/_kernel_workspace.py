@@ -55,6 +55,16 @@ DEFAULT_SENSITIVE_KEYS: frozenset[str] = frozenset(
         "cookie",
         "set-cookie",
         "session_token",
+        "pwd",
+        "token",
+        "auth_token",
+        "x-auth-token",
+        "x-api-key",
+        "passphrase",
+        "passwords",
+        "secrets",
+        "credentials",
+        "cookies",
     }
 )
 DEFAULT_BLOCKED_PATH_PATTERNS: tuple[str, ...] = (
@@ -455,15 +465,20 @@ class MirrorCandidate:
             raise _invalid()
 
 
+def binding_identity_digest(owner_id: str, repo_id: str, checkout_id: str) -> str:
+    """Digest naming a verified ``(owner, repo, checkout)`` binding: the ``workspace_binding`` lineage source."""
+    identity: dict[str, JsonValue] = {
+        "owner_id": require_opaque_id(owner_id),
+        "repo_id": require_opaque_id(repo_id),
+        "checkout_id": require_opaque_id(checkout_id),
+    }
+    return digest_bytes(canonical_json(identity))
+
+
 def binding_lineage_ref(binding: WorkspaceBinding) -> LineageRef:
     """The lineage ref of a verified workspace binding: every task lineage starts from its repo."""
     if not isinstance(binding, WorkspaceBinding):
         raise _invalid()
-    identity: dict[str, JsonValue] = {
-        "owner_id": binding.owner_id,
-        "repo_id": binding.repo_id,
-        "checkout_id": binding.checkout_id,
-    }
     return LineageRef(
         owner_id=binding.owner_id,
         repo_id=binding.repo_id,
@@ -471,6 +486,6 @@ def binding_lineage_ref(binding: WorkspaceBinding) -> LineageRef:
             kind="workspace_binding",
             id=binding.checkout_id,
             revision=1,
-            digest=digest_bytes(canonical_json(identity)),
+            digest=binding_identity_digest(binding.owner_id, binding.repo_id, binding.checkout_id),
         ),
     )

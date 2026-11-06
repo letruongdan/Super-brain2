@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Callable, Mapping
 
 import pytest
@@ -98,6 +99,9 @@ class _Restrictions:
         return ref in self.restricted
 
 
+NONE_RESTRICTED = _Restrictions(set())
+
+
 def test_union_lineage_is_monotonic_and_deduplicated() -> None:
     current = frozenset({A1})
     grown = union_lineage(current, [A2, A1, B1])
@@ -157,34 +161,49 @@ def test_quarantined_content_redacts_value_but_keeps_lineage_restriction() -> No
     assert redacted.value == {"status": "redacted"}
     assert redacted.sources == field.sources
     policy = _Policy({"repo-a": True, "repo-b": True})
-    assert evaluate_egress_eligibility(field, policy) is True
-    assert evaluate_egress_eligibility(redacted, policy, restrictions=_Restrictions({A1})) is False
+    assert evaluate_egress_eligibility(field, policy, restrictions=NONE_RESTRICTED) is True
+    quarantined_a = _Restrictions({A1})
+    assert evaluate_egress_eligibility(field, policy, restrictions=quarantined_a) is False
+    assert evaluate_egress_eligibility(redacted, policy, restrictions=quarantined_a) is False
 
 
-@pytest.mark.parametrize("status", [SnapshotStatus.UNAVAILABLE, SnapshotStatus.DEADLINE])
-def test_s1a_snapshot_status_alone_does_not_block_egress(status: SnapshotStatus) -> None:
-    observation = SnapshotObservation(status=status, descriptor=None)
-    assert observation.descriptor is None
+def test_restrictions_port_is_required_without_default() -> None:
+    params = inspect.signature(evaluate_egress_eligibility).parameters
+    assert params["restrictions"].default is inspect.Parameter.empty
+    assert params["restrictions"].kind is inspect.Parameter.KEYWORD_ONLY
+    with pytest.raises(TypeError):
+        evaluate_egress_eligibility(lineage_field("x", frozenset({A1})), _Policy({"repo-a": True}))  # type: ignore[call-arg]
+    with pytest.raises(BrainError):
+        evaluate_egress_eligibility(
+            lineage_field("x", frozenset({A1})),
+            _Policy({"repo-a": True}),
+            restrictions=None,  # type: ignore[arg-type]
+        )
+
+
+def test_s1a_snapshot_status_alone_does_not_block_egress() -> None:
+    assert not any("snapshot" in name for name in inspect.signature(evaluate_egress_eligibility).parameters)
     binding_ref = _ref("dan", "repo-a", "workspace_binding", "chk-a")
     task_lineage = union_lineage(frozenset({binding_ref}), [A2])
     known_field = lineage_field("known item", task_lineage)
     policy = _Policy({"repo-a": True})
-    assert evaluate_egress_eligibility(known_field, policy) is True
-    assert evaluate_egress_eligibility(task_lineage, policy) is True
+    assert evaluate_egress_eligibility(known_field, policy, restrictions=NONE_RESTRICTED) is True
+    assert evaluate_egress_eligibility(task_lineage, policy, restrictions=NONE_RESTRICTED) is True
     # Only the genuinely unknown item is blocked, never the known ones beside it.
     unknown_item = lineage_field("unproven item", task_lineage, unknown_source=True)
-    assert evaluate_egress_eligibility(unknown_item, policy) is False
-    assert evaluate_egress_eligibility(known_field, policy) is True
+    assert evaluate_egress_eligibility(unknown_item, policy, restrictions=NONE_RESTRICTED) is False
+    assert evaluate_egress_eligibility(known_field, policy, restrictions=NONE_RESTRICTED) is True
 
 
 def test_egress_denied_for_unknown_disabled_missing_or_foreign_sources() -> None:
     policy = _Policy({"repo-a": True, "repo-b": False})
-    assert evaluate_egress_eligibility(lineage_field("x", frozenset({A1})), policy) is True
-    assert evaluate_egress_eligibility(lineage_field("x", frozenset({A1, B1})), policy) is False
-    assert evaluate_egress_eligibility(lineage_field("x", frozenset({A1, C1})), policy) is False
-    assert evaluate_egress_eligibility(lineage_field("x", frozenset()), policy) is False
+    ok = NONE_RESTRICTED
+    assert evaluate_egress_eligibility(lineage_field("x", frozenset({A1})), policy, restrictions=ok) is True
+    assert evaluate_egress_eligibility(lineage_field("x", frozenset({A1, B1})), policy, restrictions=ok) is False
+    assert evaluate_egress_eligibility(lineage_field("x", frozenset({A1, C1})), policy, restrictions=ok) is False
+    assert evaluate_egress_eligibility(lineage_field("x", frozenset()), policy, restrictions=ok) is False
     foreign = _ref("eve", "repo-a", "artifact", "art-1")
-    assert evaluate_egress_eligibility(lineage_field("x", frozenset({foreign})), policy) is False
+    assert evaluate_egress_eligibility(lineage_field("x", frozenset({foreign})), policy, restrictions=ok) is False
     assert evaluate_egress_eligibility(frozenset({A1}), policy, restrictions=_Restrictions({A1})) is False
 
 

@@ -28,6 +28,7 @@ from superbrain.core.kernel import (
     SnapshotStatus,
     SourceSnapshot,
     TaskBinding,
+    binding_identity_digest,
 )
 from superbrain.ports.kernel import KernelTx
 from superbrain.ports.policy import PolicyView
@@ -306,10 +307,12 @@ def _decoded(build: Callable[[], _T]) -> _T:
 
 def _lineage_ref(row: Sequence[object]) -> LineageRef:
     owner, repo, kind, ident, revision, digest = row
+    if type(revision) is not int:
+        raise ValueError("source_revision")
     return LineageRef(
         owner_id=str(owner),
         repo_id=str(repo),
-        source=ObjectRef(kind=str(kind), id=str(ident), revision=revision, digest=str(digest)),  # type: ignore[arg-type]
+        source=ObjectRef(kind=str(kind), id=str(ident), revision=revision, digest=str(digest)),
     )
 
 
@@ -376,19 +379,22 @@ class StoreKernelTx:
     def holder_tombstoned(self, holder_id: str) -> bool:
         return is_uuid(holder_id) and self._policy.is_tombstoned(_HOLDER_KIND, holder_id)
 
+    def blob_present(self, digest: str) -> bool:
+        return self._cas.blob_intact(digest)
+
     def _query(self, sql: str, params: tuple[object, ...]) -> list[tuple[object, ...]]:
         try:
             return self._txn.db.execute(sql, params).fetchall()
         except sqlite3.Error as exc:
             raise sqlite_error("cannot read the workspace projections", exc) from exc
 
-    def find_source_snapshot(self, checkout_id: str, descriptor_digest: str) -> SourceSnapshot | None:
+    def find_source_snapshots(self, checkout_id: str, descriptor_digest: str) -> tuple[SourceSnapshot, ...]:
         rows = self._query(
             f"SELECT {_SNAPSHOT_COLUMNS} FROM {SNAPSHOTS_TABLE} WHERE checkout_id = ? AND descriptor_digest = ?"
-            " ORDER BY sequence LIMIT 1",
+            " ORDER BY sequence",
             (checkout_id, descriptor_digest),
         )
-        return _decoded(lambda: _snapshot(rows[0])) if rows else None
+        return tuple(_decoded(partial(_snapshot, row)) for row in rows)
 
     def read_source_snapshot(self, snapshot_id: str) -> SourceSnapshot | None:
         rows = self._query(f"SELECT {_SNAPSHOT_COLUMNS} FROM {SNAPSHOTS_TABLE} WHERE snapshot_id = ?", (snapshot_id,))
@@ -489,13 +495,25 @@ class StoreWorkspaceMirror:
         return tuple(_decoded(partial(_mirror_candidate, row)) for row in rows)
 
 
-class StoreSourceRestrictions:
-    """``SourceRestrictionPort``: a source is restricted when policy quarantines its digest or tombstones it, or
-    when a referenced snapshot is unknown to the ledger or its descriptor is quarantined."""
+SourceResolver = Callable[[LineageRef], bool]
+"""Domain resolver for one source kind: True iff the exact ``(owner, repo, kind, id, revision, digest)`` exists."""
 
-    def __init__(self, store: Store, policy: PolicyView) -> None:
+
+class StoreSourceRestrictions:
+    """``SourceRestrictionPort``: fail closed. A source is restricted unless it resolves exactly and is readable.
+
+    Policy quarantine of its digest or a tombstone of its holder restricts any kind. ``source_snapshot`` and
+    ``workspace_binding`` resolve against the ledger projections (snapshot row plus present, unquarantined
+    descriptor blob; committed task binding with the exact binding digest). Every other kind needs a domain resolver
+    passed in ``resolvers``; a kind without one is unresolvable and therefore restricted.
+    """
+
+    def __init__(
+        self, store: Store, policy: PolicyView, *, resolvers: Mapping[str, SourceResolver] | None = None
+    ) -> None:
         self._store = store
         self._policy = policy
+        self._resolvers = dict(resolvers or {})
 
     def is_restricted(self, ref: LineageRef) -> bool:
         if not isinstance(ref, LineageRef):
@@ -503,12 +521,43 @@ class StoreSourceRestrictions:
         source = ref.source
         if self._policy.is_quarantined(source.digest):
             return True
-        if is_uuid(source.id) and self._policy.is_tombstoned(_HOLDER_KIND, source.id):
+        if is_uuid(source.id) and (
+            self._policy.is_tombstoned(_HOLDER_KIND, source.id) or self._policy.is_tombstoned(source.kind, source.id)
+        ):
             return True
-        if source.kind != "source_snapshot":
+        if source.kind == "source_snapshot":
+            return not self._snapshot_resolves(ref)
+        if source.kind == "workspace_binding":
+            return not self._binding_resolves(ref)
+        resolver = self._resolvers.get(source.kind)
+        return resolver is None or resolver(ref) is not True
+
+    def _snapshot_resolves(self, ref: LineageRef) -> bool:
+        with _reading(self._store) as db:
+            row = db.execute(
+                f"SELECT owner_id, repo_id, descriptor_digest FROM {SNAPSHOTS_TABLE} WHERE snapshot_id = ?",
+                (ref.source.id,),
+            ).fetchone()
+        if row is None or (str(row[0]), str(row[1]), str(row[2])) != (ref.owner_id, ref.repo_id, ref.source.digest):
+            return False
+        return (
+            ref.source.revision == 1
+            and not self._policy.is_quarantined(ref.source.digest)
+            and (self._store.cas.blob_intact(ref.source.digest))
+        )
+
+    def _binding_resolves(self, ref: LineageRef) -> bool:
+        if ref.source.revision != 1:
+            return False
+        try:
+            expected = binding_identity_digest(ref.owner_id, ref.repo_id, ref.source.id)
+        except BrainError:
+            return False
+        if expected != ref.source.digest:
             return False
         with _reading(self._store) as db:
             row = db.execute(
-                f"SELECT descriptor_digest FROM {SNAPSHOTS_TABLE} WHERE snapshot_id = ?", (source.id,)
+                f"SELECT 1 FROM {TASK_BINDINGS_TABLE} WHERE owner_id = ? AND repo_id = ? AND checkout_id = ? LIMIT 1",
+                (ref.owner_id, ref.repo_id, ref.source.id),
             ).fetchone()
-        return row is None or self._policy.is_quarantined(str(row[0]))
+        return row is not None

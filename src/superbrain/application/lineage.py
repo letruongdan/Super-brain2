@@ -76,10 +76,12 @@ def _deadline() -> BrainError:
 
 
 def _lineage_items(values: Iterable[object]) -> list[LineageRef]:
-    items = list(values)
-    if not all(isinstance(ref, LineageRef) for ref in items):
-        raise _invalid()
-    return items  # type: ignore[return-value]
+    items: list[LineageRef] = []
+    for ref in values:
+        if not isinstance(ref, LineageRef):
+            raise _invalid()
+        items.append(ref)
+    return items
 
 
 def union_lineage(current: LineageSet, served: Iterable[LineageRef]) -> LineageSet:
@@ -125,14 +127,16 @@ def evaluate_egress_eligibility(
     subject: LineagedField | FieldLineage | LineageSet,
     policy: KernelPolicyPort,
     *,
-    restrictions: SourceRestrictionPort | None = None,
+    restrictions: SourceRestrictionPort,
 ) -> bool:
     """Provider egress eligibility from the current policy of every lineage source (spec 9/14.2).
 
     Denied when the source is unknown or unproven (no sources), or any source's repo is missing, owned by someone
-    else, has ``provider_egress`` disabled, or is restricted (quarantined/tombstoned/unresolvable). Snapshot status
-    is deliberately not an input (S1=A).
+    else, has ``provider_egress`` disabled, or is restricted (quarantined/tombstoned/missing/unresolvable).
+    ``restrictions`` is required: there is no fail-open default. Snapshot status is not an input (S1=A).
     """
+    if restrictions is None or not callable(getattr(restrictions, "is_restricted", None)):
+        raise _invalid()
     if isinstance(subject, (LineagedField, FieldLineage)):
         sources, unknown = subject.sources, subject.unknown_source
     elif isinstance(subject, frozenset):
@@ -146,7 +150,7 @@ def evaluate_egress_eligibility(
         repo = snapshot.repo_policies.get(ref.repo_id)
         if repo is None or repo.owner_id != ref.owner_id or not RepoFlags.from_repo_policy(repo).provider_egress:
             return False
-        if restrictions is not None and restrictions.is_restricted(ref):
+        if restrictions.is_restricted(ref):
             return False
     return True
 
@@ -239,14 +243,17 @@ def resolve_task_binding(
 def register_snapshot(tx: KernelTx, binding: WorkspaceBinding, descriptor: SnapshotDescriptor) -> str:
     """Record ``descriptor`` for ``binding`` (descriptor blob held in the same transaction); its snapshot ID.
 
-    The same content for the same checkout returns the existing snapshot ID; any content change (a different dirty
-    digest included) yields a new one.
+    The same content for the same checkout returns an existing snapshot ID only while that snapshot is still
+    readable (not tombstoned, descriptor not quarantined, blob present); otherwise a new snapshot is recorded. Any
+    content change (a different dirty digest included) yields a new one. A quarantined descriptor is refused.
     """
     if not isinstance(binding, WorkspaceBinding) or not isinstance(descriptor, SnapshotDescriptor):
         raise _invalid()
-    existing = tx.find_source_snapshot(binding.checkout_id, descriptor.descriptor_digest)
-    if existing is not None:
-        return existing.snapshot_id
+    if tx.blob_restricted(descriptor.descriptor_digest):
+        raise BrainError(ErrorCode.QUARANTINED, "quarantined")
+    for existing in tx.find_source_snapshots(binding.checkout_id, descriptor.descriptor_digest):
+        if existing.owner_id == binding.owner_id and _snapshot_readable(tx, existing):
+            return existing.snapshot_id
     snapshot_id = new_id()
     digest = tx.hold_blob(descriptor.content_bytes(), holder_id=snapshot_id)
     if digest != descriptor.descriptor_digest:
@@ -270,8 +277,19 @@ def register_snapshot(tx: KernelTx, binding: WorkspaceBinding, descriptor: Snaps
     return snapshot_id
 
 
+def _snapshot_readable(tx: KernelTx, snapshot: SourceSnapshot) -> bool:
+    return (
+        not tx.holder_tombstoned(snapshot.snapshot_id)
+        and not tx.blob_restricted(snapshot.descriptor_digest)
+        and tx.blob_present(snapshot.descriptor_digest)
+    )
+
+
 def admit_source_snapshot(tx: KernelTx, binding: WorkspaceBinding, snapshot_id: str) -> SourceSnapshot:
-    """An explicit snapshot must belong to ``binding``'s checkout and be readable: never a silent fallback."""
+    """An explicit snapshot must belong to ``binding``'s checkout and be readable: never a silent fallback.
+
+    Unknown, foreign, tombstoned or blob-missing -> ``NOT_FOUND``; quarantined descriptor -> ``QUARANTINED``.
+    """
     snapshot = tx.read_source_snapshot(snapshot_id)
     if (
         snapshot is None
@@ -283,6 +301,8 @@ def admit_source_snapshot(tx: KernelTx, binding: WorkspaceBinding, snapshot_id: 
         raise _not_found()
     if tx.blob_restricted(snapshot.descriptor_digest):
         raise BrainError(ErrorCode.QUARANTINED, "quarantined")
+    if not tx.blob_present(snapshot.descriptor_digest):
+        raise _not_found()
     return snapshot
 
 
