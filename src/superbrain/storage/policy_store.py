@@ -38,9 +38,11 @@ from superbrain.storage._policy_authority import (
     build_policy_snapshot,
     policy_allows,
     read_policy_request_digest_key,
+    resolve_policy_credential,
+)
+from superbrain.storage._policy_mutations import (
     record_policy_authorized_revocation,
     register_policy_authorized_workspace,
-    resolve_policy_credential,
 )
 from superbrain.storage.errors import sqlite_error
 from superbrain.storage.identity import validate_policy_intent_payload
@@ -358,10 +360,7 @@ class PolicyStore:
 
     def snapshot(self) -> AuthSnapshot:
         self._check_kernel_available()
-        try:
-            gen = self.trust_generation()
-        except BrainError as exc:
-            raise BrainError(ErrorCode.POLICY_UNAVAILABLE, "policy unavailable") from exc
+        gen = self._kernel_trust_generation()
         return build_policy_snapshot(self._db, store_id=self._store_id, trust_generation=gen)
 
     def record_authorized_revocation(
@@ -375,7 +374,7 @@ class PolicyStore:
             credential_id=credential_id,
             authorization=authorization,
             store_id=self._store_id,
-            trust_generation=self.trust_generation(),
+            trust_generation=self._kernel_trust_generation(),
             now=self._os.clock.now(),
         )
 
@@ -390,7 +389,7 @@ class PolicyStore:
             registration=registration,
             authorization=authorization,
             store_id=self._store_id,
-            trust_generation=self.trust_generation(),
+            trust_generation=self._kernel_trust_generation(),
             now=self._os.clock.now(),
         )
 
@@ -399,6 +398,12 @@ class PolicyStore:
         return read_policy_request_digest_key(self._db)
 
     # --- internals ---------------------------------------------------------------------------------------------
+
+    def _kernel_trust_generation(self) -> int:
+        try:
+            return self.trust_generation()
+        except BrainError as exc:
+            raise BrainError(ErrorCode.POLICY_UNAVAILABLE, "policy unavailable") from exc
 
     def _check_kernel_available(self) -> None:
         if threading.get_ident() != self._owner:

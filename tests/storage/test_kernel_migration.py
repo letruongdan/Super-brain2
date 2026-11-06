@@ -548,3 +548,90 @@ def test_read_daemon_config_valid_and_refusals(
         with pytest.raises(BrainError) as exc_bad:
             read_daemon_config(bad_file, os_)
         assert exc_bad.value.code in expected_codes
+
+
+def test_preadmission_scratch_resists_squatted_tmp_and_rejects_symlink_scratch_base(
+    trusted_tmp: Path, os_: OsAdapters, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import tempfile as tempfile_mod
+
+    # Build a v2 root with uncheckpointed WAL frames and no -shm so pre-admission scratch MUST run.
+    wal_root = trusted_tmp / "wal-scratch-test"
+    store_id = _make_v2_root(wal_root, os_)
+    store_db = wal_root / "store" / "brain.db"
+    wal_file = wal_root / "store" / "brain.db-wal"
+    shm_file = wal_root / "store" / "brain.db-shm"
+    conn = sqlite3.connect(store_db, isolation_level=None)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA wal_autocheckpoint=0")
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('noop_probe', '1')")
+        conn.execute("COMMIT")
+        raw_main = store_db.read_bytes()
+        raw_wal = wal_file.read_bytes()
+    finally:
+        conn.close()
+    store_db.write_bytes(raw_main)
+    wal_file.write_bytes(raw_wal)
+    if shm_file.exists():
+        shm_file.unlink()
+    os_.permissions.secure_file(store_db)
+    os_.permissions.secure_file(wal_file)
+    assert wal_file.stat().st_size > 32
+
+    # 1. Default scratch_base=None ephemeral temp path resists pre-existing squatted/loose fixed names in temp dir.
+    fake_tmp = trusted_tmp / "shared-tmp"
+    fake_tmp.mkdir()
+    os_.permissions.secure_directory(fake_tmp)
+    squatted_names = ["superbrain-scratch"]
+    if hasattr(os, "geteuid"):
+        squatted_names.append(f"superbrain-scratch-{os.geteuid()}")
+    for name in squatted_names:
+        squatted = fake_tmp / name
+        squatted.mkdir()
+        _loosen_file(squatted)
+
+    with monkeypatch.context() as mp:
+        mp.delenv("LOCALAPPDATA", raising=False)
+        mp.setattr(tempfile_mod, "gettempdir", lambda: str(fake_tmp))
+        admitted = admit_existing_pair(wal_root, store_id, os_, purpose="serve", scratch_base=None)
+        admitted.release()
+
+    # Re-write uncheckpointed WAL without -shm for the next scratch_base checks.
+    store_db.write_bytes(raw_main)
+    wal_file.write_bytes(raw_wal)
+    if shm_file.exists():
+        shm_file.unlink()
+    os_.permissions.secure_file(store_db)
+    os_.permissions.secure_file(wal_file)
+
+    # 2. Explicit scratch_base that is a symlink/reparse point is rejected with UNSAFE_PATH, leavingwal_root untouched.
+    linked_scratch = trusted_tmp / "linked-scratch"
+    linked_scratch.mkdir()
+    os_.permissions.secure_directory(linked_scratch)
+    snap_before_link = digest_tree(wal_root)
+    with monkeypatch.context() as mp:
+        fake_link(mp, linked_scratch)
+        with pytest.raises(BrainError) as exc_link:
+            admit_existing_pair(wal_root, store_id, os_, purpose="serve", scratch_base=linked_scratch)
+        assert exc_link.value.code is ErrorCode.UNSAFE_PATH
+    assert digest_tree(wal_root) == snap_before_link
+
+    # 3. Race during creation of a missing scratch_base (no exist_ok=True): if another actor plants an insecure
+    # directory right before mkdir runs, mkdir must NOT swallow FileExistsError + re-secure it; must refuse!
+    raced_scratch = trusted_tmp / "raced-scratch"
+    real_mkdir = Path.mkdir
+
+    def racing_mkdir(self: Path, mode: int = 0o777, parents: bool = False, exist_ok: bool = False) -> None:
+        if self == raced_scratch and not raced_scratch.exists():
+            real_mkdir(raced_scratch, mode=0o700, parents=False, exist_ok=False)
+            _loosen_file(raced_scratch)
+        real_mkdir(self, mode=mode, parents=parents, exist_ok=exist_ok)
+
+    with monkeypatch.context() as mp:
+        mp.setattr(Path, "mkdir", racing_mkdir)
+        with pytest.raises(BrainError) as exc_race:
+            admit_existing_pair(wal_root, store_id, os_, purpose="serve", scratch_base=raced_scratch)
+        assert exc_race.value.code is ErrorCode.INSECURE_PERMISSIONS
+    assert digest_tree(wal_root) == snap_before_link

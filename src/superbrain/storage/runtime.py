@@ -271,16 +271,7 @@ def _effective_target_db(root: DataRoot, target: Target, os_: OsAdapters) -> tup
     return _check_db_companions(effective_dir, effective_dir / db_name, os_), extra_ready_stage_db
 
 
-@contextlib.contextmanager
-def _preadmission_scratch(root: Path, os_: OsAdapters, scratch_base: Path | None) -> Iterator[Path]:
-    if scratch_base is not None:
-        base = Path(os.path.abspath(scratch_base))
-    elif sys.platform == "win32":
-        local_app = os.environ.get("LOCALAPPDATA")
-        base = (Path(local_app) if local_app else Path(tempfile.gettempdir())) / "superbrain-scratch"
-    else:
-        base = Path(tempfile.gettempdir()) / f"superbrain-scratch-{os.geteuid()}"
-
+def _ensure_scratch_base(base: Path, root: Path, os_: OsAdapters) -> None:
     os_.paths.reject_unsafe_path(str(base))
     if base == root or root in base.parents or base in root.parents:
         raise BrainError(ErrorCode.UNSAFE_PATH, "pre-admission scratch directory must be outside data_root")
@@ -288,26 +279,91 @@ def _preadmission_scratch(root: Path, os_: OsAdapters, scratch_base: Path | None
     anc = os_.permissions.check_ancestors(base)
     if anc:
         raise BrainError(ErrorCode.INSECURE_PERMISSIONS, f"scratch ancestor is not trusted: {anc[0].path}")
-    if not os.path.lexists(base):
-        try:
-            base.mkdir(parents=True, mode=0o700, exist_ok=True)
-        except OSError as exc:
-            raise os_error(f"cannot create scratch base {base}", exc) from exc
-        os_.permissions.secure_directory(base)
-    else:
-        if not base.is_dir():
-            raise BrainError(ErrorCode.INVALID_INPUT, f"scratch base {base} is not a directory")
-        probs = os_.permissions.object_problems(base)
-        if probs:
-            raise BrainError(ErrorCode.INSECURE_PERMISSIONS, f"scratch base {base} is not owner-only")
 
+    missing: list[Path] = []
+    for candidate in (base, *base.parents):
+        if os.path.lexists(candidate):
+            break
+        missing.append(candidate)
+    else:
+        raise BrainError(ErrorCode.IO_ERROR, f"no existing directory ancestor is available for {base}")
+
+    for directory in reversed(missing):
+        try:
+            directory.mkdir(mode=0o700)
+        except FileExistsError:
+            os_.paths.reject_links(directory)
+            if not directory.is_dir():
+                raise BrainError(ErrorCode.INVALID_INPUT, f"scratch base {directory} is not a directory") from None
+            if os_.permissions.object_problems(directory):
+                raise BrainError(
+                    ErrorCode.INSECURE_PERMISSIONS, f"scratch base {directory} is not owner-only"
+                ) from None
+        except OSError as exc:
+            raise os_error(f"cannot create scratch base {directory}", exc) from exc
+        else:
+            os_.paths.reject_links(directory)
+            os_.permissions.secure_directory(directory)
+
+    os_.paths.reject_links(base)
+    anc = os_.permissions.check_ancestors(base)
+    if anc:
+        raise BrainError(ErrorCode.INSECURE_PERMISSIONS, f"scratch ancestor is not trusted: {anc[0].path}")
+    if not base.is_dir():
+        raise BrainError(ErrorCode.INVALID_INPUT, f"scratch base {base} is not a directory")
+    if os_.permissions.object_problems(base):
+        raise BrainError(ErrorCode.INSECURE_PERMISSIONS, f"scratch base {base} is not owner-only")
+
+
+@contextlib.contextmanager
+def _preadmission_scratch(root: Path, os_: OsAdapters, scratch_base: Path | None) -> Iterator[Path]:
+    if scratch_base is not None:
+        base: Path | None = Path(os.path.abspath(scratch_base))
+    elif sys.platform == "win32" and os.environ.get("LOCALAPPDATA"):
+        base = Path(os.path.abspath(os.environ["LOCALAPPDATA"])) / "superbrain-scratch"
+    else:
+        base = None
+
+    if base is None:
+        raw_tmp = Path(tempfile.gettempdir())
+        tmp_dir = raw_tmp.resolve() if sys.platform == "darwin" else Path(os.path.abspath(raw_tmp))
+        os_.paths.reject_unsafe_path(str(tmp_dir))
+        if tmp_dir == root or root in tmp_dir.parents:
+            raise BrainError(ErrorCode.UNSAFE_PATH, "pre-admission scratch directory must be outside data_root")
+        os_.paths.reject_links(tmp_dir)
+        try:
+            work = Path(os.path.abspath(tempfile.mkdtemp(prefix="superbrain-admit-", dir=str(tmp_dir))))
+        except OSError as exc:
+            raise os_error(f"cannot create scratch directory in {tmp_dir}", exc) from exc
+        try:
+            if work == root or root in work.parents or work in root.parents:
+                raise BrainError(ErrorCode.UNSAFE_PATH, "pre-admission scratch directory must be outside data_root")
+            os_.paths.reject_links(work)
+            anc = os_.permissions.check_ancestors(work)
+            if anc:
+                raise BrainError(ErrorCode.INSECURE_PERMISSIONS, f"scratch ancestor is not trusted: {anc[0].path}")
+            if not work.is_dir():
+                raise BrainError(ErrorCode.INVALID_INPUT, f"scratch directory {work} is not a directory")
+            os_.permissions.secure_directory(work)
+            if os_.permissions.object_problems(work):
+                raise BrainError(ErrorCode.INSECURE_PERMISSIONS, f"scratch directory {work} is not owner-only")
+            yield work
+        finally:
+            with contextlib.suppress(OSError):
+                shutil.rmtree(work)
+        return
+
+    _ensure_scratch_base(base, root, os_)
     work = base / f"admit-{new_id()}"
     try:
         work.mkdir(mode=0o700)
     except OSError as exc:
         raise os_error(f"cannot create scratch directory {work}", exc) from exc
     try:
+        os_.paths.reject_links(work)
         os_.permissions.secure_directory(work)
+        if os_.permissions.object_problems(work):
+            raise BrainError(ErrorCode.INSECURE_PERMISSIONS, f"scratch directory {work} is not owner-only")
         yield work
     finally:
         with contextlib.suppress(OSError):

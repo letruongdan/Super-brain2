@@ -392,3 +392,161 @@ def test_authorized_intents_validation_idempotency_conflict_and_retained_replay(
         assert rev_entries[0].meta["credential_id"] == cred_a.credential_id
     finally:
         rt.close()
+
+
+def test_workspace_register_enforces_egress_and_locator_consistency(
+    trusted_tmp: Path, os_: OsAdapters, clock: FakeClock
+) -> None:
+    rt = open_runtime(
+        trusted_tmp / "ws-consistency",
+        os_,
+        store_migrations=KERNEL_STORE_MIGRATIONS,
+        policy_migrations=KERNEL_POLICY_MIGRATIONS,
+    )
+    try:
+        store_id = rt.policy.store_id
+        gen = rt.policy.trust_generation()
+        valid_exp = clock.now() + dt.timedelta(minutes=30)
+        cred = seed_principal_and_credential(rt.policy, owner_id="dan", harness_id="claude-code", machine_id="m1")
+
+        loc_https = TrustedLocator(
+            scheme="https",
+            canonical_locator="https://example.invalid/dan/repo-one.git",
+            locator_digest=digest_bytes(b"https://example.invalid/dan/repo-one.git"),
+        )
+        reg_base = WorkspaceRegistration(
+            owner_id="dan",
+            principal_id=cred.principal.principal_id,
+            machine_id="m1",
+            alias="wt-one",
+            checkout_path=str(trusted_tmp / "wt-one"),
+            path_identity="dan:m1:wt-one",
+            locator=loc_https,
+            provider_egress_enabled=False,
+        )
+        intent_1 = new_id()
+        bind_1 = rt.policy.register_authorized_workspace(
+            reg_base,
+            make_bootstrap_auth(
+                intent_id=intent_1,
+                store_id=store_id,
+                owner_id="dan",
+                action="workspace_register",
+                subject_id=reg_base.subject_id,
+                trust_generation=gen,
+                expires_at=valid_exp,
+            ),
+        )
+        assert rt.policy.snapshot().repo_policies[bind_1.repo_id].provider_egress_enabled is False
+
+        # 1. Reusing intent_1 with modified provider_egress_enabled raises REVISION_CONFLICT.
+        reg_egress_flip = WorkspaceRegistration(
+            owner_id="dan",
+            principal_id=cred.principal.principal_id,
+            machine_id="m1",
+            alias="wt-one",
+            checkout_path=str(trusted_tmp / "wt-one"),
+            path_identity="dan:m1:wt-one",
+            locator=loc_https,
+            provider_egress_enabled=True,
+        )
+        with pytest.raises(BrainError) as exc_reuse_egress:
+            rt.policy.register_authorized_workspace(
+                reg_egress_flip,
+                make_bootstrap_auth(
+                    intent_id=intent_1,
+                    store_id=store_id,
+                    owner_id="dan",
+                    action="workspace_register",
+                    subject_id=reg_egress_flip.subject_id,
+                    trust_generation=gen,
+                    expires_at=valid_exp,
+                ),
+            )
+        assert exc_reuse_egress.value.code is ErrorCode.REVISION_CONFLICT
+
+        # 2. Reusing intent_1 with same locator_digest but modified scheme/canonical_locator raises REVISION_CONFLICT.
+        for bad_loc in (
+            TrustedLocator(
+                scheme="ssh",
+                canonical_locator=loc_https.canonical_locator,
+                locator_digest=loc_https.locator_digest,
+            ),
+            TrustedLocator(
+                scheme="https",
+                canonical_locator="https://example.invalid/dan/spoofed.git",
+                locator_digest=loc_https.locator_digest,
+            ),
+        ):
+            reg_loc_spoof = WorkspaceRegistration(
+                owner_id="dan",
+                principal_id=cred.principal.principal_id,
+                machine_id="m1",
+                alias="wt-one",
+                checkout_path=str(trusted_tmp / "wt-one"),
+                path_identity="dan:m1:wt-one",
+                locator=bad_loc,
+                provider_egress_enabled=False,
+            )
+            with pytest.raises(BrainError) as exc_reuse_loc:
+                rt.policy.register_authorized_workspace(
+                    reg_loc_spoof,
+                    make_bootstrap_auth(
+                        intent_id=intent_1,
+                        store_id=store_id,
+                        owner_id="dan",
+                        action="workspace_register",
+                        subject_id=reg_loc_spoof.subject_id,
+                        trust_generation=gen,
+                        expires_at=valid_exp,
+                    ),
+                )
+            assert exc_reuse_loc.value.code is ErrorCode.REVISION_CONFLICT
+
+        # 3. Registering a second checkout on an existing locator_digest with mismatched scheme/canonical_locator
+        # or conflicting provider_egress_enabled raises REVISION_CONFLICT and preserves repo_policy!
+        for bad_reg in (
+            WorkspaceRegistration(
+                owner_id="dan",
+                principal_id=cred.principal.principal_id,
+                machine_id="m1",
+                alias="wt-two",
+                checkout_path=str(trusted_tmp / "wt-two"),
+                path_identity="dan:m1:wt-two",
+                locator=TrustedLocator(
+                    scheme="ssh",
+                    canonical_locator="ssh://example.invalid/dan/repo-one.git",
+                    locator_digest=loc_https.locator_digest,
+                ),
+                provider_egress_enabled=False,
+            ),
+            WorkspaceRegistration(
+                owner_id="dan",
+                principal_id=cred.principal.principal_id,
+                machine_id="m1",
+                alias="wt-two",
+                checkout_path=str(trusted_tmp / "wt-two"),
+                path_identity="dan:m1:wt-two",
+                locator=loc_https,
+                provider_egress_enabled=True,
+            ),
+            # Re-registering existing path_identity with new intent_id but conflicting provider_egress_enabled:
+            reg_egress_flip,
+        ):
+            with pytest.raises(BrainError) as exc_conflict:
+                rt.policy.register_authorized_workspace(
+                    bad_reg,
+                    make_bootstrap_auth(
+                        store_id=store_id,
+                        owner_id="dan",
+                        action="workspace_register",
+                        subject_id=bad_reg.subject_id,
+                        trust_generation=gen,
+                        expires_at=valid_exp,
+                    ),
+                )
+            assert exc_conflict.value.code is ErrorCode.REVISION_CONFLICT
+
+        assert rt.policy.snapshot().repo_policies[bind_1.repo_id].provider_egress_enabled is False
+    finally:
+        rt.close()

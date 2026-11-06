@@ -566,3 +566,175 @@ def test_unauthorized_or_existing_key_is_not_overwritten(
     assert mat.key_path.read_bytes() == original_key
     assert mat.ca_key_path.read_bytes() == original_ca_key
     assert mat.cert_path.read_bytes() == original_cert
+
+
+def test_corrupt_policy_db_raises_policy_unavailable_across_kernel_port(
+    trusted_tmp: Path, os_: OsAdapters, clock: FakeClock
+) -> None:
+    rt = open_runtime(
+        trusted_tmp / "corrupt-policy",
+        os_,
+        store_migrations=KERNEL_STORE_MIGRATIONS,
+        policy_migrations=KERNEL_POLICY_MIGRATIONS,
+    )
+    try:
+        store_id = rt.policy.store_id
+        gen = rt.policy.trust_generation()
+        expiry = clock.now() + dt.timedelta(hours=1)
+        seeded = seed_principal_and_credential(
+            rt.policy, owner_id="alice", harness_id="claude-code", machine_id="box-1"
+        )
+
+        # 1. Corrupt credential.secret_digest (non-ASCII, non-sha256 format, non-text) -> POLICY_UNAVAILABLE
+        # across resolve_credential, allows, and snapshot (never UnicodeEncodeError or UNAUTHENTICATED).
+        for bad_digest in ("sha256:\U0001f4a5corrupt", "not-a-sha256-digest", 12345):
+            with rt.policy._immediate() as db:
+                db.execute(
+                    "UPDATE credential SET secret_digest = ? WHERE id = ?",
+                    (bad_digest, seeded.credential_id),
+                )
+            for call in (
+                lambda: rt.policy.resolve_credential(seeded.token),
+                lambda: rt.policy.allows(seeded.principal, None, action="get_health"),
+                rt.policy.snapshot,
+            ):
+                with pytest.raises(BrainError) as exc_digest:
+                    call()
+                assert exc_digest.value.code is ErrorCode.POLICY_UNAVAILABLE
+
+        # Restore valid secret_digest, then corrupt principal.owner_id -> POLICY_UNAVAILABLE (never INVALID_INPUT).
+        with rt.policy._immediate() as db:
+            db.execute(
+                "UPDATE credential SET secret_digest = ? WHERE id = ?",
+                (seeded.secret_digest, seeded.credential_id),
+            )
+            db.execute(
+                "UPDATE principal SET owner_id = ? WHERE id = ?",
+                ("bad owner with spaces", seeded.principal.principal_id),
+            )
+        for call in (
+            lambda: rt.policy.resolve_credential(seeded.token),
+            rt.policy.snapshot,
+        ):
+            with pytest.raises(BrainError) as exc_principal:
+                call()
+            assert exc_principal.value.code is ErrorCode.POLICY_UNAVAILABLE
+
+        # Restore principal.owner_id, then corrupt stored intents row for an incoming intent_id -> POLICY_UNAVAILABLE
+        # on record_authorized_revocation and register_authorized_workspace (never INTEGRITY_FAILURE).
+        bad_intent_id = new_id()
+        with rt.policy._immediate() as db:
+            db.execute(
+                "UPDATE principal SET owner_id = ? WHERE id = ?",
+                ("alice", seeded.principal.principal_id),
+            )
+            db.execute(
+                "INSERT INTO intents (intent_id, kind, payload, created_at) VALUES (?, ?, ?, ?)",
+                (bad_intent_id, "credential_revoke", b"{corrupt-json", "2026-11-05T00:00:00Z"),
+            )
+        reg = WorkspaceRegistration(
+            owner_id="alice",
+            principal_id=seeded.principal.principal_id,
+            machine_id="box-1",
+            alias="repo-corrupt",
+            checkout_path=str(trusted_tmp / "repo-corrupt"),
+            path_identity="alice:box-1:corrupt",
+        )
+        with pytest.raises(BrainError) as exc_corrupt_rev:
+            rt.policy.record_authorized_revocation(
+                seeded.credential_id,
+                make_bootstrap_auth(
+                    intent_id=bad_intent_id,
+                    store_id=store_id,
+                    owner_id="alice",
+                    action="credential_revoke",
+                    subject_id=seeded.credential_id,
+                    trust_generation=gen,
+                    expires_at=expiry,
+                ),
+            )
+        assert exc_corrupt_rev.value.code is ErrorCode.POLICY_UNAVAILABLE
+
+        with pytest.raises(BrainError) as exc_corrupt_ws:
+            rt.policy.register_authorized_workspace(
+                reg,
+                make_bootstrap_auth(
+                    intent_id=bad_intent_id,
+                    store_id=store_id,
+                    owner_id="alice",
+                    action="workspace_register",
+                    subject_id=reg.subject_id,
+                    trust_generation=gen,
+                    expires_at=expiry,
+                ),
+            )
+        assert exc_corrupt_ws.value.code is ErrorCode.POLICY_UNAVAILABLE
+
+        # 2. Missing/corrupt trust row -> POLICY_UNAVAILABLE on snapshot, revocation, and workspace registration.
+        with rt.policy._immediate() as db:
+            db.execute("DELETE FROM intents WHERE intent_id = ?", (bad_intent_id,))
+            db.execute("DELETE FROM trust")
+        for mut_call in (
+            rt.policy.snapshot,
+            lambda: rt.policy.record_authorized_revocation(
+                seeded.credential_id,
+                make_bootstrap_auth(
+                    store_id=store_id,
+                    owner_id="alice",
+                    action="credential_revoke",
+                    subject_id=seeded.credential_id,
+                    trust_generation=gen,
+                    expires_at=expiry,
+                ),
+            ),
+            lambda: rt.policy.register_authorized_workspace(
+                reg,
+                make_bootstrap_auth(
+                    store_id=store_id,
+                    owner_id="alice",
+                    action="workspace_register",
+                    subject_id=reg.subject_id,
+                    trust_generation=gen,
+                    expires_at=expiry,
+                ),
+            ),
+        ):
+            with pytest.raises(BrainError) as exc_trust:
+                mut_call()
+            assert exc_trust.value.code is ErrorCode.POLICY_UNAVAILABLE
+
+        # 3. SQLite error during pre-transaction reads (e.g. dropped intents table while v2 tables remain) ->
+        # POLICY_UNAVAILABLE rather than raw sqlite3.OperationalError!
+        with rt.policy._immediate() as db:
+            db.execute("INSERT INTO trust (id, generation) VALUES (1, ?)", (gen,))
+            db.execute("DROP TABLE intents")
+        for mut_call in (
+            rt.policy.snapshot,
+            lambda: rt.policy.record_authorized_revocation(
+                seeded.credential_id,
+                make_bootstrap_auth(
+                    store_id=store_id,
+                    owner_id="alice",
+                    action="credential_revoke",
+                    subject_id=seeded.credential_id,
+                    trust_generation=gen,
+                    expires_at=expiry,
+                ),
+            ),
+            lambda: rt.policy.register_authorized_workspace(
+                reg,
+                make_bootstrap_auth(
+                    store_id=store_id,
+                    owner_id="alice",
+                    action="workspace_register",
+                    subject_id=reg.subject_id,
+                    trust_generation=gen,
+                    expires_at=expiry,
+                ),
+            ),
+        ):
+            with pytest.raises(BrainError) as exc_sql:
+                mut_call()
+            assert exc_sql.value.code is ErrorCode.POLICY_UNAVAILABLE
+    finally:
+        rt.close()
