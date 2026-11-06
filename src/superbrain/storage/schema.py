@@ -85,10 +85,22 @@ def code_version(migrations: Sequence[Migration]) -> int:
     return migrations[-1].to_version
 
 
+_MAX_VERSION_DIGITS = 18
+
+
 def _version(path: Path, name: str, value: object) -> int:
-    if not isinstance(value, str) or not (value.isascii() and value.isdigit()):
+    if (
+        not isinstance(value, str)
+        or not (1 <= len(value) <= _MAX_VERSION_DIGITS)
+        or not (value.isascii() and value.isdigit())
+    ):
         raise BrainError(ErrorCode.INTEGRITY_FAILURE, f"{path}: meta {name} is not a plain decimal integer")
-    return int(value)
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise BrainError(
+            ErrorCode.INTEGRITY_FAILURE, f"{path}: meta {name} is not a plain decimal integer"
+        ) from exc
 
 
 def _meta(db: sqlite3.Connection, path: Path) -> SchemaInfo:
@@ -106,7 +118,7 @@ def _meta(db: sqlite3.Connection, path: Path) -> SchemaInfo:
         raise BrainError(ErrorCode.INTEGRITY_FAILURE, f"{path}: meta store_id is not text")
     schema_version = _version(path, "schema_version", rows["schema_version"])
     min_reader = _version(path, "min_reader_version", rows["min_reader_version"])
-    if schema_version < 1 or min_reader > schema_version:
+    if schema_version < 1 or min_reader < 1 or min_reader > schema_version:
         raise BrainError(ErrorCode.INTEGRITY_FAILURE, f"{path}: meta versions are inconsistent")
     return SchemaInfo(schema_version, min_reader, store_id)
 

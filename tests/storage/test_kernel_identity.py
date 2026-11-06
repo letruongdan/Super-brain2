@@ -916,3 +916,244 @@ def test_missing_or_corrupt_trust_authority_fails_closed_across_all_kernel_polic
     # (preventing any cross-method error latch from masking a missing per-method authority check).
     for first_read_name in ("resolve_credential", "allows_global", "allows_scoped", "request_digest_key"):
         verify_first_read_after_trust_loss(first_read_name)
+
+
+def test_overlong_and_unsupported_policy_version_metadata_fails_closed_without_writes(
+    trusted_tmp: Path, os_: OsAdapters, clock: FakeClock
+) -> None:
+    import sqlite3
+    from collections.abc import Callable, Mapping
+
+    from superbrain.ports.policy import IntentKind
+    from superbrain.storage.runtime import admit_existing_pair
+    from superbrain.storage.schema import Migration, read_schema_info
+
+    authority_tables: tuple[str, ...] = (
+        "intents",
+        "credential",
+        "repo_policy",
+        "repo_grant",
+        "workspace_repo_locator",
+        "workspace_checkout",
+    )
+
+    def _snapshot_authority_rows(db: sqlite3.Connection) -> dict[str, list[tuple[object, ...]]]:
+        return {table: db.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall() for table in authority_tables}
+
+    def verify_live_meta_case(case_name: str, meta_updates: Mapping[str, str]) -> None:
+        rt = open_runtime(
+            trusted_tmp / f"policy-meta-{case_name}",
+            os_,
+            store_migrations=KERNEL_STORE_MIGRATIONS,
+            policy_migrations=KERNEL_POLICY_MIGRATIONS,
+        )
+        try:
+            store_id = rt.policy.store_id
+            gen = rt.policy.trust_generation()
+            expiry = clock.now() + dt.timedelta(hours=1)
+            seeded = seed_principal_and_credential(
+                rt.policy, owner_id="alice", harness_id="claude-code", machine_id="box-1"
+            )
+            reg_init = WorkspaceRegistration(
+                owner_id="alice",
+                principal_id=seeded.principal.principal_id,
+                machine_id="box-1",
+                alias="repo-init",
+                checkout_path=str(trusted_tmp / f"{case_name}-chk-init"),
+                path_identity=f"alice:box-1:{case_name}:init",
+                locator=TrustedLocator(
+                    scheme="https",
+                    canonical_locator=f"https://example.invalid/alice/{case_name}.git",
+                    locator_digest=digest_bytes(f"https://example.invalid/alice/{case_name}.git".encode()),
+                ),
+            )
+            i_init = new_id()
+            auth_init = make_bootstrap_auth(
+                intent_id=i_init,
+                store_id=store_id,
+                owner_id="alice",
+                action="workspace_register",
+                subject_id=reg_init.subject_id,
+                trust_generation=gen,
+                expires_at=expiry,
+            )
+            binding = rt.policy.register_authorized_workspace(reg_init, auth_init)
+            ws_scope = Scope(repo_id=binding.repo_id, checkout_id=binding.checkout_id)
+
+            with rt.policy._immediate() as db:
+                for m_key, m_val in meta_updates.items():
+                    db.execute("UPDATE meta SET value = ? WHERE key = ?", (m_val, m_key))
+
+            rows_before = _snapshot_authority_rows(rt.policy._db)
+
+            reg_fresh = WorkspaceRegistration(
+                owner_id="alice",
+                principal_id=seeded.principal.principal_id,
+                machine_id="box-1",
+                alias="repo-fresh",
+                checkout_path=str(trusted_tmp / f"{case_name}-chk-fresh"),
+                path_identity=f"alice:box-1:{case_name}:fresh",
+            )
+            port_calls: tuple[tuple[str, Callable[[], object]], ...] = (
+                ("resolve_credential", lambda: rt.policy.resolve_credential(seeded.token)),
+                ("allows_global", lambda: rt.policy.allows(seeded.principal, None, action="get_health")),
+                ("allows_scoped", lambda: rt.policy.allows(seeded.principal, ws_scope, action="get_artifact")),
+                ("request_digest_key", rt.policy.request_digest_key),
+                ("snapshot", rt.policy.snapshot),
+                (
+                    "register_authorized_workspace_fresh",
+                    lambda: rt.policy.register_authorized_workspace(
+                        reg_fresh,
+                        make_bootstrap_auth(
+                            store_id=store_id,
+                            owner_id="alice",
+                            action="workspace_register",
+                            subject_id=reg_fresh.subject_id,
+                            trust_generation=gen,
+                            expires_at=expiry,
+                        ),
+                    ),
+                ),
+                (
+                    "register_authorized_workspace_replay",
+                    lambda: rt.policy.register_authorized_workspace(reg_init, auth_init),
+                ),
+                (
+                    "record_authorized_revocation",
+                    lambda: rt.policy.record_authorized_revocation(
+                        seeded.credential_id,
+                        make_bootstrap_auth(
+                            store_id=store_id,
+                            owner_id="alice",
+                            action="credential_revoke",
+                            subject_id=seeded.credential_id,
+                            trust_generation=gen,
+                            expires_at=expiry,
+                        ),
+                    ),
+                ),
+            )
+            for method_label, fn in port_calls:
+                with pytest.raises(BrainError, match=".") as exc_info:
+                    fn()
+                assert exc_info.value.code is ErrorCode.POLICY_UNAVAILABLE, (
+                    f"{case_name}: expected POLICY_UNAVAILABLE from {method_label}, got {exc_info.value.code}"
+                )
+
+            assert _snapshot_authority_rows(rt.policy._db) == rows_before
+        finally:
+            rt.close()
+
+    for live_case_name, live_meta in (
+        ("overlong-schema", {"schema_version": "9" * 5000}),
+        ("overlong-reader", {"min_reader_version": "9" * 5000}),
+        ("future-schema-and-reader", {"schema_version": "99", "min_reader_version": "99"}),
+        ("future-schema-compat-reader", {"schema_version": "99", "min_reader_version": "2"}),
+        ("reader-exceeds-schema", {"schema_version": "2", "min_reader_version": "99"}),
+        ("downgraded-v1-meta", {"schema_version": "1", "min_reader_version": "1"}),
+        ("zero-reader-meta", {"schema_version": "2", "min_reader_version": "0"}),
+        ("zero-schema-meta", {"schema_version": "0", "min_reader_version": "0"}),
+        ("non-digit-schema", {"schema_version": "v2"}),
+    ):
+        verify_live_meta_case(live_case_name, live_meta)
+
+    # Closed DB pre-admission / read_schema_info with overlong decimal metadata raises INTEGRITY_FAILURE
+    # (never raw ValueError).
+    for meta_key in ("schema_version", "min_reader_version"):
+        closed_root = trusted_tmp / f"closed-overlong-{meta_key}"
+        rt_closed = open_runtime(
+            closed_root,
+            os_,
+            store_migrations=KERNEL_STORE_MIGRATIONS,
+            policy_migrations=KERNEL_POLICY_MIGRATIONS,
+        )
+        try:
+            closed_store_id = rt_closed.policy.store_id
+            policy_db_path = rt_closed.root.policy_db
+            with rt_closed.policy._immediate() as db_closed:
+                db_closed.execute("UPDATE meta SET value = ? WHERE key = ?", ("9" * 5000, meta_key))
+        finally:
+            rt_closed.close()
+
+        with pytest.raises(BrainError) as exc_rsi:
+            read_schema_info(policy_db_path)
+        assert exc_rsi.value.code is ErrorCode.INTEGRITY_FAILURE
+
+        with pytest.raises(BrainError) as exc_admit_serve:
+            admit_existing_pair(closed_root, closed_store_id, os_, purpose="serve")
+        assert exc_admit_serve.value.code is ErrorCode.INTEGRITY_FAILURE
+
+        with pytest.raises(BrainError) as exc_admit_mig:
+            admit_existing_pair(closed_root, closed_store_id, os_, purpose="migrate")
+        assert exc_admit_mig.value.code is ErrorCode.INTEGRITY_FAILURE
+
+    # Non-hardcoded future policy tuple compatibility: injected v3 policy migration allows all 6
+    # KernelPolicyPort methods to succeed at schema_version == 3, while still rejecting out-of-band version drift.
+    v3_policy_migrations = (
+        *KERNEL_POLICY_MIGRATIONS,
+        Migration(to_version=3, min_reader_version=2, apply=lambda db: None),
+    )
+    rt_v3 = open_runtime(
+        trusted_tmp / "policy-v3-compat",
+        os_,
+        store_migrations=KERNEL_STORE_MIGRATIONS,
+        policy_migrations=v3_policy_migrations,
+    )
+    try:
+        v3_info = read_schema_info(rt_v3.root.policy_db)
+        assert v3_info is not None and v3_info.schema_version == 3 and v3_info.min_reader_version == 2
+
+        v3_store_id = rt_v3.policy.store_id
+        v3_gen = rt_v3.policy.trust_generation()
+        v3_exp = clock.now() + dt.timedelta(hours=1)
+        seeded_v3 = seed_principal_and_credential(
+            rt_v3.policy, owner_id="alice", harness_id="claude-code", machine_id="box-1"
+        )
+        reg_v3 = WorkspaceRegistration(
+            owner_id="alice",
+            principal_id=seeded_v3.principal.principal_id,
+            machine_id="box-1",
+            alias="repo-v3",
+            checkout_path=str(trusted_tmp / "v3-chk"),
+            path_identity="alice:box-1:v3:chk",
+        )
+        bind_v3 = rt_v3.policy.register_authorized_workspace(
+            reg_v3,
+            make_bootstrap_auth(
+                store_id=v3_store_id,
+                owner_id="alice",
+                action="workspace_register",
+                subject_id=reg_v3.subject_id,
+                trust_generation=v3_gen,
+                expires_at=v3_exp,
+            ),
+        )
+        scope_v3 = Scope(repo_id=bind_v3.repo_id, checkout_id=bind_v3.checkout_id)
+        assert rt_v3.policy.resolve_credential(seeded_v3.token) == seeded_v3.principal
+        assert rt_v3.policy.allows(seeded_v3.principal, None, action="get_health") is True
+        assert rt_v3.policy.allows(seeded_v3.principal, scope_v3, action="get_artifact") is True
+        v3_key_id, v3_key_bytes = rt_v3.policy.request_digest_key()
+        assert v3_key_id and len(v3_key_bytes) == 32
+        assert bind_v3.checkout_id in rt_v3.policy.snapshot().checkouts
+
+        rev_v3 = rt_v3.policy.record_authorized_revocation(
+            seeded_v3.credential_id,
+            make_bootstrap_auth(
+                store_id=v3_store_id,
+                owner_id="alice",
+                action="credential_revoke",
+                subject_id=seeded_v3.credential_id,
+                trust_generation=v3_gen,
+                expires_at=v3_exp,
+            ),
+        )
+        assert rev_v3.kind is IntentKind.CREDENTIAL_REVOKE
+
+        # Drift above v3 on the open v3 handle still fails closed with POLICY_UNAVAILABLE.
+        with rt_v3.policy._immediate() as db_v3:
+            db_v3.execute("UPDATE meta SET value = '4' WHERE key = 'schema_version'")
+        with pytest.raises(BrainError) as exc_v3_drift:
+            rt_v3.policy.snapshot()
+        assert exc_v3_drift.value.code is ErrorCode.POLICY_UNAVAILABLE
+    finally:
+        rt_v3.close()

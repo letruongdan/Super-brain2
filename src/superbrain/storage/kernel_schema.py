@@ -38,7 +38,7 @@ KERNEL_POLICY_KINDS: tuple[EntryKind, ...] = (
     ),
     EntryKind(
         "policy.workspace_register",
-        1,
+        2,
         {
             "intent_id": FieldType.UUID,
             "subject_id": FieldType.DIGEST,
@@ -50,7 +50,7 @@ KERNEL_POLICY_KINDS: tuple[EntryKind, ...] = (
             "locator_digest": FieldType.DIGEST,
         },
         {},
-        nullable=frozenset({"locator_digest"}),
+        nullable=frozenset({"locator_digest", "subject_id"}),
         reserved=True,
     ),
 )

@@ -36,6 +36,7 @@ from superbrain.ports.policy import Intent, IntentKind
 from superbrain.storage import backup
 from superbrain.storage._policy_authority import (
     build_policy_snapshot,
+    ensure_v2_tables,
     policy_allows,
     read_policy_request_digest_key,
     resolve_policy_credential,
@@ -106,7 +107,9 @@ def _decode_intent(row: Sequence[object]) -> Intent:
             raise BrainError(ErrorCode.INVALID_INPUT, "a column has the wrong type")
         decoded = json.loads(payload)
         intent_kind = IntentKind(str(kind))
-        checked = validate_policy_intent_payload(intent_kind, decoded, intent_id)
+        checked = validate_policy_intent_payload(
+            intent_kind, decoded, intent_id, allow_legacy_v1=True
+        )
     except (BrainError, ValueError) as exc:  # JSONDecodeError and UnicodeDecodeError are ValueErrors
         raise BrainError(ErrorCode.INTEGRITY_FAILURE, f"policy intent {intent_id!r} is malformed: {exc}") from exc
     return Intent(intent_id=intent_id, kind=intent_kind, payload=checked, created_at=created_at)
@@ -116,7 +119,14 @@ class PolicyStore:
     """Implements ``PolicySource``. Obtain it with ``create`` or ``open``; ``close`` it when done."""
 
     def __init__(
-        self, *, root: DataRoot, lease: WriterLease, os_: OsAdapters, db: sqlite3.Connection, store_id: str
+        self,
+        *,
+        root: DataRoot,
+        lease: WriterLease,
+        os_: OsAdapters,
+        db: sqlite3.Connection,
+        store_id: str,
+        schema_version: int = 1,
     ) -> None:
         self._owner = threading.get_ident()
         self._root = root
@@ -124,6 +134,7 @@ class PolicyStore:
         self._os = os_
         self._db = db
         self._store_id = store_id
+        self._schema_version = schema_version
         self._closed = False
 
     # --- lifecycle ---------------------------------------------------------------------------------------------
@@ -210,7 +221,14 @@ class PolicyStore:
         db = connect(path)
         try:
             readmit_writable(db, path, info, migrations)
-            policy = cls(root=root, lease=lease, os_=os_, db=db, store_id=info.store_id)
+            policy = cls(
+                root=root,
+                lease=lease,
+                os_=os_,
+                db=db,
+                store_id=info.store_id,
+                schema_version=info.schema_version,
+            )
             for file in db_files(path):
                 if file.exists():
                     os_.permissions.secure_file(file)
@@ -358,21 +376,48 @@ class PolicyStore:
 
     def resolve_credential(self, token: str) -> Principal:
         self._check_kernel_available()
-        return resolve_policy_credential(self._db, token, expected_store_id=self._store_id)
+        return resolve_policy_credential(
+            self._db,
+            token,
+            expected_store_id=self._store_id,
+            expected_schema_version=self._schema_version,
+        )
 
     def allows(self, principal: Principal, scope: Scope | None, *, action: str) -> bool:
         self._check_kernel_available()
-        return policy_allows(self._db, principal, scope, action=action, expected_store_id=self._store_id)
+        return policy_allows(
+            self._db,
+            principal,
+            scope,
+            action=action,
+            expected_store_id=self._store_id,
+            expected_schema_version=self._schema_version,
+        )
 
     def snapshot(self) -> AuthSnapshot:
         self._check_kernel_available()
+        ensure_v2_tables(
+            self._db,
+            expected_store_id=self._store_id,
+            expected_schema_version=self._schema_version,
+        )
         gen = self._kernel_trust_generation()
-        return build_policy_snapshot(self._db, store_id=self._store_id, trust_generation=gen)
+        return build_policy_snapshot(
+            self._db,
+            store_id=self._store_id,
+            trust_generation=gen,
+            expected_schema_version=self._schema_version,
+        )
 
     def record_authorized_revocation(
         self, credential_id: str, authorization: BootstrapAuthorization
     ) -> Intent:
         self._check_kernel_available()
+        ensure_v2_tables(
+            self._db,
+            expected_store_id=self._store_id,
+            expected_schema_version=self._schema_version,
+        )
         return record_policy_authorized_revocation(
             self._db,
             self._immediate,
@@ -382,12 +427,18 @@ class PolicyStore:
             store_id=self._store_id,
             trust_generation=self._kernel_trust_generation(),
             now=self._os.clock.now(),
+            expected_schema_version=self._schema_version,
         )
 
     def register_authorized_workspace(
         self, registration: WorkspaceRegistration, authorization: BootstrapAuthorization
     ) -> WorkspaceBinding:
         self._check_kernel_available()
+        ensure_v2_tables(
+            self._db,
+            expected_store_id=self._store_id,
+            expected_schema_version=self._schema_version,
+        )
         return register_policy_authorized_workspace(
             self._db,
             self._immediate,
@@ -397,11 +448,16 @@ class PolicyStore:
             store_id=self._store_id,
             trust_generation=self._kernel_trust_generation(),
             now=self._os.clock.now(),
+            expected_schema_version=self._schema_version,
         )
 
     def request_digest_key(self) -> tuple[str, bytes]:
         self._check_kernel_available()
-        return read_policy_request_digest_key(self._db, expected_store_id=self._store_id)
+        return read_policy_request_digest_key(
+            self._db,
+            expected_store_id=self._store_id,
+            expected_schema_version=self._schema_version,
+        )
 
     # --- internals ---------------------------------------------------------------------------------------------
 

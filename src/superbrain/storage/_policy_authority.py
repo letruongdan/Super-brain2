@@ -20,15 +20,42 @@ from superbrain.core.kernel import (
 )
 from superbrain.ports.policy import IntentKind
 from superbrain.storage.identity import validate_policy_intent_payload
-from superbrain.storage.kernel_schema import POLICY_V2_TABLES
+from superbrain.storage.kernel_schema import KERNEL_POLICY_MIGRATIONS, POLICY_V2_TABLES
 from superbrain.storage.kinds import is_uuid
+from superbrain.storage.schema import code_version
 
 _GLOBAL_SCOPELESS_ACTIONS: frozenset[str] = frozenset({"get_health", "get_job", "global_read"})
 _POLICY_V1_TABLES: frozenset[str] = frozenset({"meta", "intents", "tombstones", "quarantine", "trust"})
 _REQUIRED_POLICY_TABLES: frozenset[str] = _POLICY_V1_TABLES | POLICY_V2_TABLES
+_MAX_VERSION_DIGITS = 18
 
 
-def ensure_v2_tables(db: sqlite3.Connection, *, expected_store_id: str | None = None) -> None:
+def _parse_policy_version(raw: str | None) -> int:
+    if (
+        raw is None
+        or not (1 <= len(raw) <= _MAX_VERSION_DIGITS)
+        or not (raw.isascii() and raw.isdigit())
+    ):
+        raise BrainError(ErrorCode.POLICY_UNAVAILABLE, "policy unavailable")
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise BrainError(ErrorCode.POLICY_UNAVAILABLE, "policy unavailable") from exc
+
+
+def ensure_v2_tables(
+    db: sqlite3.Connection,
+    *,
+    expected_store_id: str | None = None,
+    expected_schema_version: int | None = None,
+) -> None:
+    target_sv = (
+        code_version(KERNEL_POLICY_MIGRATIONS)
+        if expected_schema_version is None
+        else expected_schema_version
+    )
+    if type(target_sv) is not int or target_sv < 2:
+        raise BrainError(ErrorCode.POLICY_UNAVAILABLE, "policy unavailable")
     try:
         tables = {
             row[0]
@@ -42,21 +69,10 @@ def ensure_v2_tables(db: sqlite3.Connection, *, expected_store_id: str | None = 
         if any(not isinstance(r[0], str) or not isinstance(r[1], str) for r in raw_meta):
             raise BrainError(ErrorCode.POLICY_UNAVAILABLE, "policy unavailable")
         meta_rows = {str(r[0]): str(r[1]) for r in raw_meta}
-        raw_sv = meta_rows.get("schema_version")
-        raw_mrv = meta_rows.get("min_reader_version")
+        sv = _parse_policy_version(meta_rows.get("schema_version"))
+        mrv = _parse_policy_version(meta_rows.get("min_reader_version"))
         raw_sid = meta_rows.get("store_id")
-        if (
-            raw_sv is None
-            or not (raw_sv.isascii() and raw_sv.isdigit())
-            or raw_mrv is None
-            or not (raw_mrv.isascii() and raw_mrv.isdigit())
-            or raw_sid is None
-            or not raw_sid
-        ):
-            raise BrainError(ErrorCode.POLICY_UNAVAILABLE, "policy unavailable")
-        sv = int(raw_sv)
-        mrv = int(raw_mrv)
-        if sv < 2 or mrv < 1 or mrv > sv:
+        if sv != target_sv or mrv < 1 or mrv > sv or raw_sid is None or not raw_sid:
             raise BrainError(ErrorCode.POLICY_UNAVAILABLE, "policy unavailable")
         if expected_store_id is not None and raw_sid != expected_store_id:
             raise BrainError(ErrorCode.POLICY_UNAVAILABLE, "policy unavailable")
@@ -124,9 +140,17 @@ def decode_stored_principal(
 
 
 def resolve_policy_credential(
-    db: sqlite3.Connection, token: str, *, expected_store_id: str | None = None
+    db: sqlite3.Connection,
+    token: str,
+    *,
+    expected_store_id: str | None = None,
+    expected_schema_version: int | None = None,
 ) -> Principal:
-    ensure_v2_tables(db, expected_store_id=expected_store_id)
+    ensure_v2_tables(
+        db,
+        expected_store_id=expected_store_id,
+        expected_schema_version=expected_schema_version,
+    )
     cred_id, candidate_digest = parse_bearer_token(token)
     try:
         row = db.execute(
@@ -160,8 +184,13 @@ def policy_allows(
     *,
     action: str,
     expected_store_id: str | None = None,
+    expected_schema_version: int | None = None,
 ) -> bool:
-    ensure_v2_tables(db, expected_store_id=expected_store_id)
+    ensure_v2_tables(
+        db,
+        expected_store_id=expected_store_id,
+        expected_schema_version=expected_schema_version,
+    )
     if (
         not isinstance(principal, Principal)
         or (scope is not None and not isinstance(scope, Scope))
@@ -246,9 +275,17 @@ def policy_allows(
 
 
 def build_policy_snapshot(
-    db: sqlite3.Connection, *, store_id: str, trust_generation: int
+    db: sqlite3.Connection,
+    *,
+    store_id: str,
+    trust_generation: int,
+    expected_schema_version: int | None = None,
 ) -> AuthSnapshot:
-    ensure_v2_tables(db, expected_store_id=store_id)
+    ensure_v2_tables(
+        db,
+        expected_store_id=store_id,
+        expected_schema_version=expected_schema_version,
+    )
     try:
         principals: dict[str, Principal] = {}
         for pid, owner_id, harness_id, machine_id in db.execute(
@@ -304,7 +341,10 @@ def build_policy_snapshot(
             if not isinstance(raw_payload, bytes):
                 raise BrainError(ErrorCode.POLICY_UNAVAILABLE, "policy unavailable")
             checked = validate_policy_intent_payload(
-                IntentKind.WORKSPACE_REGISTER, json.loads(raw_payload), iid
+                IntentKind.WORKSPACE_REGISTER,
+                json.loads(raw_payload),
+                iid,
+                allow_legacy_v1=True,
             )
             loc = checked.get("locator_digest")
             intent_locators[iid] = loc if isinstance(loc, str) else None
@@ -345,9 +385,16 @@ def build_policy_snapshot(
 
 
 def read_policy_request_digest_key(
-    db: sqlite3.Connection, *, expected_store_id: str | None = None
+    db: sqlite3.Connection,
+    *,
+    expected_store_id: str | None = None,
+    expected_schema_version: int | None = None,
 ) -> tuple[str, bytes]:
-    ensure_v2_tables(db, expected_store_id=expected_store_id)
+    ensure_v2_tables(
+        db,
+        expected_store_id=expected_store_id,
+        expected_schema_version=expected_schema_version,
+    )
     try:
         rows = db.execute(
             "SELECT id, key_bytes FROM request_digest_key WHERE active = 1 ORDER BY rowid DESC"

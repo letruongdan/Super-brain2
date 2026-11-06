@@ -115,26 +115,28 @@ def _verify_locator_row(
 def _verify_replayed_workspace_state(
     db: sqlite3.Connection,
     *,
-    registration: WorkspaceRegistration,
+    principal_id: str,
+    machine_id: str,
     repo_id: str,
     chk_id: str,
+    expected_owner_id: str | None = None,
 ) -> None:
     p_row = db.execute(
         "SELECT owner_id, machine_id FROM principal WHERE id = ?",
-        (registration.principal_id,),
+        (principal_id,),
     ).fetchone()
-    if (
-        p_row is None
-        or require_stored_opaque_id(p_row[0]) != registration.owner_id
-        or require_stored_opaque_id(p_row[1]) != registration.machine_id
-    ):
+    if p_row is None:
+        raise BrainError(ErrorCode.POLICY_UNAVAILABLE, "policy unavailable")
+    p_owner = require_stored_opaque_id(p_row[0])
+    p_machine = require_stored_opaque_id(p_row[1])
+    if p_machine != machine_id or (expected_owner_id is not None and p_owner != expected_owner_id):
         raise BrainError(ErrorCode.POLICY_UNAVAILABLE, "policy unavailable")
 
     repo_row = db.execute(
         "SELECT owner_id, provider_egress_enabled FROM repo_policy WHERE repo_id = ?",
         (repo_id,),
     ).fetchone()
-    if repo_row is None or require_stored_opaque_id(repo_row[0]) != registration.owner_id:
+    if repo_row is None or require_stored_opaque_id(repo_row[0]) != p_owner:
         raise BrainError(ErrorCode.POLICY_UNAVAILABLE, "policy unavailable")
     require_stored_bool_int(repo_row[1])
 
@@ -145,9 +147,9 @@ def _verify_replayed_workspace_state(
     ).fetchone()
     if (
         chk_row is None
-        or require_stored_opaque_id(chk_row[0]) != registration.owner_id
+        or require_stored_opaque_id(chk_row[0]) != p_owner
         or require_stored_opaque_id(chk_row[1]) != repo_id
-        or require_stored_opaque_id(chk_row[2]) != registration.machine_id
+        or require_stored_opaque_id(chk_row[2]) != machine_id
     ):
         raise BrainError(ErrorCode.POLICY_UNAVAILABLE, "policy unavailable")
     require_stored_str(chk_row[3])
@@ -165,8 +167,13 @@ def record_policy_authorized_revocation(
     store_id: str,
     trust_generation: int,
     now: datetime,
+    expected_schema_version: int | None = None,
 ) -> Intent:
-    ensure_v2_tables(db, expected_store_id=store_id)
+    ensure_v2_tables(
+        db,
+        expected_store_id=store_id,
+        expected_schema_version=expected_schema_version,
+    )
     if not is_uuid(credential_id):
         raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
     _check_ingress_auth(
@@ -262,8 +269,13 @@ def register_policy_authorized_workspace(
     store_id: str,
     trust_generation: int,
     now: datetime,
+    expected_schema_version: int | None = None,
 ) -> WorkspaceBinding:
-    ensure_v2_tables(db, expected_store_id=store_id)
+    ensure_v2_tables(
+        db,
+        expected_store_id=store_id,
+        expected_schema_version=expected_schema_version,
+    )
     if not isinstance(registration, WorkspaceRegistration):
         raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
     if isinstance(authorization, BootstrapAuthorization) and authorization.owner_id != registration.owner_id:
@@ -289,7 +301,6 @@ def register_policy_authorized_workspace(
             existing_intent = decode_intent(tuple(existing_intent_row))
             if existing_intent.kind is not IntentKind.WORKSPACE_REGISTER:
                 raise BrainError(ErrorCode.REVISION_CONFLICT, "revision conflict")
-            stored_subject_id = require_stored_digest(existing_intent.payload["subject_id"])
             chk_id = require_stored_opaque_id(existing_intent.payload["checkout_id"])
             repo_id = require_stored_opaque_id(existing_intent.payload["repo_id"])
             stored_principal_id = require_stored_opaque_id(existing_intent.payload["principal_id"])
@@ -297,6 +308,16 @@ def register_policy_authorized_workspace(
             stored_alias = require_stored_opaque_id(existing_intent.payload["alias"])
             raw_loc = existing_intent.payload["locator_digest"]
             stored_loc_digest = require_stored_digest(raw_loc) if raw_loc is not None else None
+            if "subject_id" not in existing_intent.payload:
+                _verify_replayed_workspace_state(
+                    db,
+                    principal_id=stored_principal_id,
+                    machine_id=stored_machine_id,
+                    repo_id=repo_id,
+                    chk_id=chk_id,
+                )
+                raise BrainError(ErrorCode.REVISION_CONFLICT, "revision conflict")
+            stored_subject_id = require_stored_digest(existing_intent.payload["subject_id"])
             if (
                 stored_subject_id != registration.subject_id
                 or stored_principal_id != registration.principal_id
@@ -307,9 +328,11 @@ def register_policy_authorized_workspace(
                 raise BrainError(ErrorCode.REVISION_CONFLICT, "revision conflict")
             _verify_replayed_workspace_state(
                 db,
-                registration=registration,
+                principal_id=registration.principal_id,
+                machine_id=registration.machine_id,
                 repo_id=repo_id,
                 chk_id=chk_id,
+                expected_owner_id=registration.owner_id,
             )
             return WorkspaceBinding(
                 owner_id=registration.owner_id,

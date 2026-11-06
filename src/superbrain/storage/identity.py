@@ -24,19 +24,29 @@ from superbrain.storage.kinds import CORE_KINDS, KindRegistry
 
 _CALLER_IDENTITY_FIELDS: tuple[str, ...] = ("owner_id", "principal_id", "harness_id", "machine_id")
 
+_WORKSPACE_REGISTER_V2_FIELDS: tuple[str, ...] = (
+    "subject_id",
+    "repo_id",
+    "checkout_id",
+    "principal_id",
+    "machine_id",
+    "alias",
+    "locator_digest",
+)
+_WORKSPACE_REGISTER_LEGACY_V1_FIELDS: tuple[str, ...] = (
+    "repo_id",
+    "checkout_id",
+    "principal_id",
+    "machine_id",
+    "alias",
+    "locator_digest",
+)
+
 _INTENT_PAYLOAD_FIELDS: dict[IntentKind, tuple[str, ...]] = {
     IntentKind.TOMBSTONE: ("holder_kind", "holder_id"),
     IntentKind.QUARANTINE: ("digest",),
     IntentKind.CREDENTIAL_REVOKE: ("principal_id", "credential_id", "owner_id"),
-    IntentKind.WORKSPACE_REGISTER: (
-        "subject_id",
-        "repo_id",
-        "checkout_id",
-        "principal_id",
-        "machine_id",
-        "alias",
-        "locator_digest",
-    ),
+    IntentKind.WORKSPACE_REGISTER: _WORKSPACE_REGISTER_V2_FIELDS,
 }
 
 _INTENT_EFFECT_KIND: dict[IntentKind, str] = {
@@ -49,12 +59,44 @@ _INTENT_EFFECT_KIND: dict[IntentKind, str] = {
 _POLICY_EFFECT_REGISTRY = KindRegistry((*CORE_KINDS, *KERNEL_POLICY_KINDS))
 
 
-def validate_policy_intent_payload(kind: object, payload: object, intent_id: str) -> dict[str, JsonValue]:
+def validate_policy_intent_payload(
+    kind: object,
+    payload: object,
+    intent_id: str,
+    *,
+    allow_legacy_v1: bool = False,
+) -> dict[str, JsonValue]:
     """Validate ``payload`` for ``kind`` against its reserved ``policy.*`` ledger schema."""
     if not isinstance(kind, IntentKind) or kind not in _INTENT_PAYLOAD_FIELDS:
         raise BrainError(ErrorCode.INVALID_INPUT, f"{kind!r} is not an IntentKind")
     if not isinstance(payload, Mapping):
         raise BrainError(ErrorCode.INVALID_INPUT, f"a {kind} payload must be an object")
+    if kind is IntentKind.WORKSPACE_REGISTER:
+        payload_keys = set(payload)
+        if payload_keys == set(_WORKSPACE_REGISTER_V2_FIELDS):
+            if payload["subject_id"] is None:
+                raise BrainError(
+                    ErrorCode.INVALID_INPUT,
+                    "policy.workspace_register: field 'subject_id' is not a valid digest",
+                )
+            checked_v2: dict[str, JsonValue] = {
+                name: payload[name] for name in _WORKSPACE_REGISTER_V2_FIELDS
+            }
+            _POLICY_EFFECT_REGISTRY.validate(_INTENT_EFFECT_KIND[kind], {**checked_v2, "intent_id": intent_id})
+            return checked_v2
+        if allow_legacy_v1 and payload_keys == set(_WORKSPACE_REGISTER_LEGACY_V1_FIELDS):
+            checked_6: dict[str, JsonValue] = {
+                name: payload[name] for name in _WORKSPACE_REGISTER_LEGACY_V1_FIELDS
+            }
+            _POLICY_EFFECT_REGISTRY.validate(
+                _INTENT_EFFECT_KIND[kind],
+                {**checked_6, "subject_id": None, "intent_id": intent_id},
+            )
+            return checked_6
+        raise BrainError(
+            ErrorCode.INVALID_INPUT,
+            f"a {kind} payload takes exactly {list(_WORKSPACE_REGISTER_V2_FIELDS)}",
+        )
     fields = _INTENT_PAYLOAD_FIELDS[kind]
     if set(payload) != set(fields):
         raise BrainError(ErrorCode.INVALID_INPUT, f"a {kind} payload takes exactly {list(fields)}")
@@ -74,11 +116,20 @@ def classify_reconcile_intent(
     if type(intent.kind) is not IntentKind or intent.kind not in _INTENT_EFFECT_KIND:
         raise BrainError(ErrorCode.INTEGRITY_FAILURE, f"unknown policy intent kind {intent.kind!r}")
     try:
-        checked = validate_policy_intent_payload(intent.kind, intent.payload, intent.intent_id)
+        checked = validate_policy_intent_payload(
+            intent.kind, intent.payload, intent.intent_id, allow_legacy_v1=True
+        )
     except BrainError as exc:
         raise BrainError(
             ErrorCode.INTEGRITY_FAILURE, f"policy intent {intent.intent_id!r} has invalid payload: {exc}"
         ) from exc
+    if intent.kind is IntentKind.WORKSPACE_REGISTER:
+        ws_meta: dict[str, JsonValue] = {
+            **checked,
+            "subject_id": checked.get("subject_id"),
+            "intent_id": intent.intent_id,
+        }
+        return ("policy.workspace_register", ws_meta, None)
     meta: dict[str, JsonValue] = {**checked, "intent_id": intent.intent_id}
     if intent.kind is IntentKind.TOMBSTONE:
         return ("policy.tombstone", meta, (str(meta["holder_kind"]), str(meta["holder_id"])))
@@ -86,8 +137,6 @@ def classify_reconcile_intent(
         return ("policy.quarantine", meta, None)
     if intent.kind is IntentKind.CREDENTIAL_REVOKE:
         return ("policy.credential_revoke", meta, None)
-    if intent.kind is IntentKind.WORKSPACE_REGISTER:
-        return ("policy.workspace_register", meta, None)
     raise BrainError(ErrorCode.INTEGRITY_FAILURE, f"unhandled policy intent kind {intent.kind!r}")
 
 
