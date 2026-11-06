@@ -23,10 +23,27 @@ from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.faults import crashpoint
 from superbrain.core.ids import new_id
 from superbrain.core.jsonvalue import JsonValue
+from superbrain.core.kernel import (
+    AuthSnapshot,
+    BootstrapAuthorization,
+    Principal,
+    Scope,
+    WorkspaceBinding,
+    WorkspaceRegistration,
+)
 from superbrain.ports.os import OsAdapters
 from superbrain.ports.policy import Intent, IntentKind
 from superbrain.storage import backup
+from superbrain.storage._policy_authority import (
+    build_policy_snapshot,
+    policy_allows,
+    read_policy_request_digest_key,
+    record_policy_authorized_revocation,
+    register_policy_authorized_workspace,
+    resolve_policy_credential,
+)
 from superbrain.storage.errors import sqlite_error
+from superbrain.storage.identity import validate_policy_intent_payload
 from superbrain.storage.kinds import CORE_KINDS, KindRegistry
 from superbrain.storage.layout import DataRoot
 from superbrain.storage.ledger import utc_timestamp
@@ -65,10 +82,11 @@ def _validated_payload(kind: object, payload: object, intent_id: str) -> dict[st
     """The payload of an intent of ``kind``, checked against its effect's ledger schema; else ``INVALID_INPUT``.
 
     TOMBSTONE takes exactly ``holder_kind`` (a ``cas.hold`` holder kind) and ``holder_id`` (a UUID); QUARANTINE
-    takes exactly ``digest``. Nothing else is accepted: the effect entries carry no free text.
+    takes exactly ``digest``. Authorized kernel intents (``CREDENTIAL_REVOKE``, ``WORKSPACE_REGISTER``) cannot be
+    submitted through generic ``record_intent``.
     """
-    if not isinstance(kind, IntentKind):
-        raise BrainError(ErrorCode.INVALID_INPUT, f"{kind!r} is not an IntentKind")
+    if not isinstance(kind, IntentKind) or kind not in _PAYLOAD_FIELDS:
+        raise BrainError(ErrorCode.INVALID_INPUT, f"{kind!r} is not an allowed generic IntentKind")
     if not isinstance(payload, Mapping):
         raise BrainError(ErrorCode.INVALID_INPUT, f"a {kind} payload must be an object")
     fields = _PAYLOAD_FIELDS[kind]
@@ -86,7 +104,7 @@ def _decode_intent(row: Sequence[object]) -> Intent:
             raise BrainError(ErrorCode.INVALID_INPUT, "a column has the wrong type")
         decoded = json.loads(payload)
         intent_kind = IntentKind(str(kind))
-        checked = _validated_payload(intent_kind, decoded, intent_id)
+        checked = validate_policy_intent_payload(intent_kind, decoded, intent_id)
     except (BrainError, ValueError) as exc:  # JSONDecodeError and UnicodeDecodeError are ValueErrors
         raise BrainError(ErrorCode.INTEGRITY_FAILURE, f"policy intent {intent_id!r} is malformed: {exc}") from exc
     return Intent(intent_id=intent_id, kind=intent_kind, payload=checked, created_at=created_at)
@@ -328,7 +346,65 @@ class PolicyStore:
             raise BrainError(ErrorCode.INTEGRITY_FAILURE, "the policy store has no valid trust generation")
         return rows[0][0]
 
+    # --- KernelPolicyPort --------------------------------------------------------------------------------------
+
+    def resolve_credential(self, token: str) -> Principal:
+        self._check_kernel_available()
+        return resolve_policy_credential(self._db, token)
+
+    def allows(self, principal: Principal, scope: Scope | None, *, action: str) -> bool:
+        self._check_kernel_available()
+        return policy_allows(self._db, principal, scope, action=action)
+
+    def snapshot(self) -> AuthSnapshot:
+        self._check_kernel_available()
+        try:
+            gen = self.trust_generation()
+        except BrainError as exc:
+            raise BrainError(ErrorCode.POLICY_UNAVAILABLE, "policy unavailable") from exc
+        return build_policy_snapshot(self._db, store_id=self._store_id, trust_generation=gen)
+
+    def record_authorized_revocation(
+        self, credential_id: str, authorization: BootstrapAuthorization
+    ) -> Intent:
+        self._check_kernel_available()
+        return record_policy_authorized_revocation(
+            self._db,
+            self._immediate,
+            _decode_intent,
+            credential_id=credential_id,
+            authorization=authorization,
+            store_id=self._store_id,
+            trust_generation=self.trust_generation(),
+            now=self._os.clock.now(),
+        )
+
+    def register_authorized_workspace(
+        self, registration: WorkspaceRegistration, authorization: BootstrapAuthorization
+    ) -> WorkspaceBinding:
+        self._check_kernel_available()
+        return register_policy_authorized_workspace(
+            self._db,
+            self._immediate,
+            _decode_intent,
+            registration=registration,
+            authorization=authorization,
+            store_id=self._store_id,
+            trust_generation=self.trust_generation(),
+            now=self._os.clock.now(),
+        )
+
+    def request_digest_key(self) -> tuple[str, bytes]:
+        self._check_kernel_available()
+        return read_policy_request_digest_key(self._db)
+
     # --- internals ---------------------------------------------------------------------------------------------
+
+    def _check_kernel_available(self) -> None:
+        if threading.get_ident() != self._owner:
+            raise AssertionError("policy store used off its owner thread")
+        if self._closed or not self._lease.held:
+            raise BrainError(ErrorCode.POLICY_UNAVAILABLE, "policy unavailable")
 
     def _check(self) -> None:
         if self._closed:

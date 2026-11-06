@@ -201,6 +201,31 @@ def prepare_data_root(root: Path, os_: OsAdapters) -> DataRoot:
     return DataRoot.at(root)
 
 
+def verify_existing_data_root(root: Path, os_: OsAdapters) -> DataRoot:
+    """Check an already-initialized ``root`` and ``writer.lock`` without creating or modifying any file or directory."""
+    os_.paths.reject_unsafe_path(str(root))
+    if not root.is_absolute():
+        raise BrainError(ErrorCode.UNSAFE_PATH, f"data root {root} must be an absolute path")
+    root = Path(os.path.abspath(root))
+    _reject_links(root, os_)
+    ancestor_problems = os_.permissions.check_ancestors(root)
+    if ancestor_problems:
+        raise _insecure(ancestor_problems, "an ancestor of the data root is not trusted")
+    if not os.path.lexists(root):
+        raise BrainError(ErrorCode.NOT_FOUND, f"data root {root} does not exist")
+    if not root.is_dir():
+        raise BrainError(ErrorCode.INVALID_INPUT, f"data root {root} is not a directory")
+    _require_owner_only(root, os_)
+    lock = root / LOCK_NAME
+    if not os.path.lexists(lock):
+        raise BrainError(ErrorCode.NOT_FOUND, f"writer lock {lock} does not exist")
+    if not lock.is_file():
+        raise BrainError(ErrorCode.INVALID_INPUT, f"writer lock {lock} is not a regular file")
+    for entry in _existing_reserved_entries(root):
+        _require_owner_only(entry, os_)
+    return DataRoot.at(root)
+
+
 def secure_subdirectories(root: DataRoot, lease: "WriterLease", os_: OsAdapters) -> None:
     """Under the writer lease: re-check links and existing subdirectories, then create and secure missing ones."""
     if not lease.held or lease.root != root:

@@ -14,6 +14,8 @@ from superbrain.core.jsonvalue import JsonValue
 class IntentKind(StrEnum):
     TOMBSTONE = "tombstone"
     QUARANTINE = "quarantine"
+    CREDENTIAL_REVOKE = "credential_revoke"
+    WORKSPACE_REGISTER = "workspace_register"
 
 
 @dataclass(frozen=True)

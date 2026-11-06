@@ -15,9 +15,8 @@ from superbrain.core.canonical import digest_bytes
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.faults import crashpoint
 from superbrain.core.ids import new_id
-from superbrain.core.jsonvalue import JsonValue
 from superbrain.ports.os import OsAdapters
-from superbrain.ports.policy import IntentKind, PolicySource, PolicyView
+from superbrain.ports.policy import PolicySource, PolicyView
 from superbrain.storage import backup
 from superbrain.storage.cas import (
     ContentStore,
@@ -27,6 +26,8 @@ from superbrain.storage.cas import (
 )
 from superbrain.storage.errors import sqlite_error
 from superbrain.storage.handlers import check_handlers, check_history, with_defaults
+from superbrain.storage.identity import classify_reconcile_intent
+from superbrain.storage.kernel_schema import KERNEL_POLICY_KINDS
 from superbrain.storage.kinds import KindRegistry
 from superbrain.storage.layout import DataRoot
 from superbrain.storage.ledger import (
@@ -43,6 +44,7 @@ from superbrain.storage.ledger import (
 from superbrain.storage.schema import (
     STORE_MIGRATIONS,
     Migration,
+    code_version,
     ensure_writable,
     initialize,
     read_schema_info,
@@ -214,7 +216,8 @@ class Store:
         ``HolderProjection`` and ``CORE_KINDS`` are always registered, in addition to ``handlers`` and ``kinds``.
         """
         _check_lease(root, lease)
-        handlers, kinds = with_defaults(handlers, kinds)
+        extra = KERNEL_POLICY_KINDS if code_version(migrations) >= 2 else ()
+        handlers, kinds = with_defaults(handlers, kinds, extra_kinds=extra)
         check_handlers(handlers, kinds)
         path = root.store_db
         if any(os.path.lexists(p) for p in db_files(path)):
@@ -256,7 +259,8 @@ class Store:
         unfinished ``put``s are removed. Both end with ``reconcile_policy``, so every pending intent is applied.
         """
         _check_lease(root, lease)
-        handlers, kinds = with_defaults(handlers, kinds)
+        extra = KERNEL_POLICY_KINDS if code_version(migrations) >= 2 else ()
+        handlers, kinds = with_defaults(handlers, kinds, extra_kinds=extra)
         check_handlers(handlers, kinds)
         lease.register_handle(_HANDLE)
         try:
@@ -488,14 +492,12 @@ class Store:
             with self.transaction() as txn:
                 if not txn.mark_intent_applied(intent.intent_id):
                     continue
-                meta: dict[str, JsonValue] = {**intent.payload, "intent_id": intent.intent_id}
-                if intent.kind is IntentKind.TOMBSTONE:
-                    txn._append_reserved("policy.tombstone", actor=_POLICY_ACTOR, owner_id=None, meta=meta)
-                    holder_kind, holder_id = str(meta["holder_kind"]), str(meta["holder_id"])  # validated above
+                effect_kind, meta, tombstone_holder = classify_reconcile_intent(intent)
+                txn._append_reserved(effect_kind, actor=_POLICY_ACTOR, owner_id=None, meta=meta)
+                if tombstone_holder is not None:
+                    holder_kind, holder_id = tombstone_holder
                     for digest in held_digests(txn.db, holder_kind, holder_id):
                         txn.release(digest, holder_kind, holder_id, reason="tombstoned")
-                else:
-                    txn._append_reserved("policy.quarantine", actor=_POLICY_ACTOR, owner_id=None, meta=meta)
             applied += 1
             crashpoint("intents.after_store_apply")
         return applied

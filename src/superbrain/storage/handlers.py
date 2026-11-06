@@ -11,27 +11,30 @@ from collections.abc import Sequence
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.storage.cas import HolderProjection
 from superbrain.storage.errors import sqlite_error
-from superbrain.storage.kinds import CORE_KINDS, KindRegistry
+from superbrain.storage.kinds import CORE_KINDS, EntryKind, KindRegistry
 from superbrain.storage.ledger import ProjectionHandler
 
 _HANDLER_NAME = re.compile(r"[a-z][a-z0-9_]{0,31}")
 
 
 def with_defaults(
-    handlers: Sequence[ProjectionHandler], kinds: KindRegistry
+    handlers: Sequence[ProjectionHandler],
+    kinds: KindRegistry,
+    *,
+    extra_kinds: Sequence[EntryKind] = (),
 ) -> tuple[tuple[ProjectionHandler, ...], KindRegistry]:
-    """``handlers`` plus ``HolderProjection`` and ``kinds`` plus ``CORE_KINDS``, each added only if absent.
+    """``handlers`` plus ``HolderProjection`` and ``kinds`` plus ``CORE_KINDS`` (and ``extra_kinds``), added if absent.
 
-    A caller kind named like a core kind must be that core kind; a caller handler named ``cas_holders`` that is no
-    ``HolderProjection`` is left in place, so the duplicate-name check refuses it.
+    A caller kind named like a core or built-in kind must equal that kind; a caller handler named ``cas_holders`` that
+    is no ``HolderProjection`` is left in place, so the duplicate-name check refuses it.
     """
-    extra_kinds = []
-    for core in CORE_KINDS:
-        if core.kind not in kinds.kinds():
-            extra_kinds.append(core)
-        elif kinds.get(core.kind) != core:
-            raise BrainError(ErrorCode.INVALID_INPUT, f"core entry kind {core.kind!r} cannot be redefined")
-    merged_kinds = KindRegistry([*(kinds.get(name) for name in sorted(kinds.kinds())), *extra_kinds])
+    added_kinds = []
+    for builtin in (*CORE_KINDS, *extra_kinds):
+        if builtin.kind not in kinds.kinds():
+            added_kinds.append(builtin)
+        elif kinds.get(builtin.kind) != builtin:
+            raise BrainError(ErrorCode.INVALID_INPUT, f"core entry kind {builtin.kind!r} cannot be redefined")
+    merged_kinds = KindRegistry([*(kinds.get(name) for name in sorted(kinds.kinds())), *added_kinds])
     if any(isinstance(handler, HolderProjection) for handler in handlers):
         return tuple(handlers), merged_kinds
     return (HolderProjection(), *handlers), merged_kinds

@@ -111,17 +111,17 @@ def _meta(db: sqlite3.Connection, path: Path) -> SchemaInfo:
     return SchemaInfo(schema_version, min_reader, store_id)
 
 
-def read_schema_info(path: Path) -> SchemaInfo | None:
+def read_schema_info(path: Path, *, scratch_dir: Path | None = None) -> SchemaInfo | None:
     """The committed ``meta`` of the database at ``path``; ``None`` if the file does not exist.
 
     Reads through ``open_readonly``, so committed WAL frames count even without a ``-shm``, and the database files
-    are never modified.
+    are never modified. When ``scratch_dir`` is supplied, WAL recovery happens in ``scratch_dir`` outside the data root.
     """
     if not path.exists():
         return None
     db: sqlite3.Connection | None = None
     try:
-        db = open_readonly(path)
+        db = open_readonly(path, scratch_dir=scratch_dir)
         return _meta(db, path)
     except BrainError:
         raise

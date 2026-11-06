@@ -71,15 +71,16 @@ def _wal_size(wal: Path) -> int:
         raise os_error(f"cannot inspect {wal.name}", exc) from exc
 
 
-def _recovered_copy(path: Path) -> sqlite3.Connection:
+def _recovered_copy(path: Path, *, scratch_dir: Path | None = None) -> sqlite3.Connection:
     """An in-memory copy of what SQLite itself recovers from ``path`` plus its ``-wal`` (no ``-shm``).
 
-    Both files are copied into a new private directory next to ``path`` (it inherits the owner-only access of the
-    database's own directory), the copy is opened writable so SQLite recovers the WAL into it, then it is backed up
-    into a ``:memory:`` connection and the directory is removed. ``path`` and its ``-wal`` are only read. SQLite
-    decides which WAL frames are committed: a WAL with no valid header or checksum adds nothing.
+    Both files are copied into a new private directory next to ``path`` (or inside ``scratch_dir`` when supplied so
+    ``path.parent`` stays untouched), the copy is opened writable so SQLite recovers the WAL into it, then it is
+    backed up into a ``:memory:`` connection and the directory is removed. ``path`` and its ``-wal`` are only read.
+    SQLite decides which WAL frames are committed: a WAL with no valid header or checksum adds nothing.
     """
-    work = path.with_name(f"{path.name}{READING}{new_id()}")
+    parent = scratch_dir if scratch_dir is not None else path.parent
+    work = parent / f"{path.name}{READING}{new_id()}"
     try:
         work.mkdir(mode=0o700)
     except OSError as exc:
@@ -115,11 +116,13 @@ def _recovered_copy(path: Path) -> sqlite3.Connection:
     return memory
 
 
-def open_readonly(path: Path) -> sqlite3.Connection:
+def open_readonly(path: Path, *, scratch_dir: Path | None = None) -> sqlite3.Connection:
     """A read-only view of the committed state of the closed (or leased) database ``path``.
 
-    Even ``mode=ro`` creates ``-wal``/``-shm`` when they are missing (observed on Windows), which would change a
-    database we promised only to look at. So:
+    Even ``mode=ro`` creates ``-wal``/``-shm`` when they are missing (observed on Windows), and updates reader marks
+    in an existing ``-shm``. When ``scratch_dir`` is provided (for pre-admission under a held writer lease with no
+    live writer), any ``-wal`` holding frames is recovered in ``scratch_dir`` outside the data root so ``path``,
+    ``-wal`` and ``-shm`` remain byte-for-byte untouched; otherwise:
 
     * ``-wal`` and ``-shm`` both exist (a live writer, or one that died before checkpointing): ``mode=ro``, which
       sees the committed WAL frames and never checkpoints or deletes the WAL.
@@ -137,6 +140,10 @@ def open_readonly(path: Path) -> sqlite3.Connection:
     """
     uri = path.absolute().as_uri()
     _, wal, shm = db_files(path)
+    if scratch_dir is not None:
+        if _wal_size(wal) > WAL_HEADER_SIZE:
+            return _recovered_copy(path, scratch_dir=scratch_dir)
+        return sqlite3.connect(f"{uri}?immutable=1", uri=True, isolation_level=None)
     if os.path.exists(wal) and os.path.exists(shm):
         return sqlite3.connect(f"{uri}?mode=ro", uri=True, isolation_level=None)
     if _wal_size(wal) > WAL_HEADER_SIZE:

@@ -174,3 +174,14 @@ def acquire_writer(root: DataRoot, os_: OsAdapters) -> WriterLease:
         handle.release()
         raise
     return lease
+
+
+def acquire_writer_unbumped(root: DataRoot, os_: OsAdapters) -> WriterLease:
+    """Take the writer lock on an existing ``writer.lock`` without writing or bumping ``writer_epoch``."""
+    handle = os_.locks.acquire(root.lock_path)
+    try:
+        current, target = _read_slots(handle.read_payload())
+        return WriterLease(root, handle, current, target)
+    except BaseException:
+        handle.release()
+        raise

@@ -19,6 +19,7 @@ from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.jsonvalue import JsonValue
 
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+_OPAQUE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _ACTOR = re.compile(r"(user|system|principal):[a-z0-9][a-z0-9._:-]{0,63}")
 _OWNER_ID = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 _KIND_NAME = re.compile(r"[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+")
@@ -42,6 +43,7 @@ class FieldType(StrEnum):
     TIMESTAMP = "timestamp"
     BOOL = "bool"
     ENUM = "enum"
+    OPAQUE_ID = "opaque_id"
 
 
 def _invalid(message: str) -> BrainError:
@@ -112,6 +114,8 @@ def _matches(ftype: FieldType, value: object, allowed: frozenset[str]) -> bool:
         return type(value) is bool
     if ftype is FieldType.ENUM:
         return type(value) is str and value in allowed
+    if ftype is FieldType.OPAQUE_ID:
+        return type(value) is str and _OPAQUE_ID.fullmatch(value) is not None
     raise AssertionError(f"unhandled field type {ftype!r}")
 
 
