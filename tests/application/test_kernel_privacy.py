@@ -424,19 +424,79 @@ def test_adversarial_inputs_stay_within_local_budget(text: str) -> None:
     assert best < 0.1, f"{best:.3f}s"
 
 
-def test_tiny_deadline_raises_promptly_inside_long_strings() -> None:
-    payloads: tuple[JsonValue, ...] = (
-        {"t": "a." * 30_000},
-        {"t": "https://" + "a@" * 29_000},
-        [text[:60_000] for text in ADVERSARIAL],
-    )
-    for payload in payloads:
+class _StepClock:
+    """Injected monotonic clock: deterministic, advances ``step_ns`` on every read (no wall-clock race)."""
+
+    def __init__(self, start: int = 10**12, step_ns: int = 0) -> None:
+        self.now = start
+        self.step_ns = step_ns
+        self.reads = 0
+
+    def __call__(self) -> int:
+        self.reads += 1
+        value = self.now
+        self.now += self.step_ns
+        return value
+
+
+TINY_DEADLINE_PAYLOADS: tuple[JsonValue, ...] = (
+    {"t": "a." * 30_000},
+    {"t": "https://" + "a@" * 29_000},
+    [text[:60_000] for text in ADVERSARIAL],
+    {"t": "short"},
+)
+
+
+@pytest.mark.parametrize("payload", TINY_DEADLINE_PAYLOADS, ids=["dots", "userinfo", "corpus", "short"])
+def test_tiny_deadline_raises_promptly_inside_long_strings(payload: JsonValue) -> None:
+    clock = _StepClock(step_ns=250_000)  # every deadline read moves time by 0.25 ms
+    with pytest.raises(BrainError) as exc:
+        PrivacyFilter(monotonic_ns=clock).apply(payload, FilterPolicy(), deadline_ns=clock.now + 1_000_000)
+    assert exc.value.code is ErrorCode.DEADLINE_EXCEEDED
+    assert clock.reads <= 5  # the budget is noticed within a handful of checks, not after the whole string
+    _assert_safe_error(exc.value)
+
+
+def test_expired_deadline_real_clock_coarse_bound() -> None:
+    for payload in TINY_DEADLINE_PAYLOADS:
         start = time.perf_counter()
         with pytest.raises(BrainError) as exc:
-            PrivacyFilter().apply(payload, FilterPolicy(), deadline_ns=time.monotonic_ns() + 1_000_000)
+            PrivacyFilter().apply(payload, FilterPolicy(), deadline_ns=time.monotonic_ns())
         assert exc.value.code is ErrorCode.DEADLINE_EXCEEDED
         assert time.perf_counter() - start < 0.05
-        _assert_safe_error(exc.value)
+
+
+@pytest.mark.parametrize("phase", ["entropy", "projection"])
+def test_deadline_expiring_in_the_last_phase_never_returns_a_payload(
+    phase: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import superbrain.application.privacy as privacy_mod
+
+    clock = _StepClock()
+    deadline = clock.now + 1_000_000
+    if phase == "entropy":
+        original_entropy = privacy_mod._Run._entropy
+
+        def slow_entropy(self: object, text: str) -> str:
+            result = original_entropy(self, text)  # type: ignore[arg-type]
+            clock.now = deadline  # the last redaction phase used up the budget
+            return result
+
+        monkeypatch.setattr(privacy_mod._Run, "_entropy", slow_entropy)
+    else:
+        original_project = privacy_mod.project_manual_submission
+
+        def slow_project(value: JsonValue, policy: FilterPolicy) -> JsonValue:
+            result = original_project(value, policy)
+            clock.now = deadline  # time ran out after the traversal, right before return
+            return result
+
+        monkeypatch.setattr(privacy_mod, "project_manual_submission", slow_project)
+    with pytest.raises(BrainError) as exc:
+        # A bare string: no key is redacted after the value, so nothing else would notice the late expiry.
+        PrivacyFilter(monotonic_ns=clock).apply("plain text", FilterPolicy(), deadline_ns=deadline)
+    assert exc.value.code is ErrorCode.DEADLINE_EXCEEDED
+    _assert_safe_error(exc.value)
 
 
 @pytest.mark.parametrize(

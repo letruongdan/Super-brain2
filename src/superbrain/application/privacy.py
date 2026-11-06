@@ -468,7 +468,10 @@ class _Run:
         self.tick()
         text = _PATH_TOKEN.sub(self._blocked_path, text)
         self.tick()
-        return self._entropy(text) if entropy else text
+        if entropy:
+            text = self._entropy(text)
+        self.tick()  # after the last phase too: a late expiry is never hidden by returning
+        return text
 
 
 def _low_entropy_opaque_id(key: str, item: object, policy: FilterPolicy) -> bool:
@@ -510,7 +513,12 @@ def filter_policy_for(flags: RepoFlags, base: FilterPolicy | None = None) -> Fil
 
 
 class PrivacyFilter:
-    """Stateless filter; ``monotonic_ns`` is injectable so the shared local budget can be tested exactly."""
+    """Stateless filter; ``monotonic_ns`` is injectable so the shared local budget can be tested exactly.
+
+    Deadline semantics are fail-closed: the deadline is checked per node, after every redaction phase and immediately
+    before returning. The default clock is ``time.monotonic_ns``, whose resolution is platform-dependent (about
+    15.6 ms on Windows with CPython 3.11, sub-microsecond on 3.13+); a deadline is "expired" when that clock says so.
+    """
 
     def __init__(self, monotonic_ns: Callable[[], int] = time.monotonic_ns) -> None:
         self._monotonic_ns = monotonic_ns
@@ -532,6 +540,7 @@ class PrivacyFilter:
             cleaned = project_manual_submission(run.value(value, 1), policy)
             if len(canonical_json(cleaned)) > MAX_TOTAL_BYTES:
                 outcome = ErrorCode.INVALID_INPUT
+            run.tick()  # fail closed: no SafePayload is returned once now >= deadline_ns
         except _Deadline:
             outcome = ErrorCode.DEADLINE_EXCEEDED
         except (_Reject, UnicodeError, ValueError, TypeError, RecursionError, OverflowError):
