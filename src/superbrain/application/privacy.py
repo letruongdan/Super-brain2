@@ -57,7 +57,7 @@ _FIXED_TOKENS: tuple[re.Pattern[str], ...] = (
 )
 _AUTHORITY = re.compile(r"[^/?#\s]*")
 _SEGMENT = re.compile(r"\S*")
-_CREDENTIAL_USER = re.compile(r"[^\s:/@?#]{1,256}:")
+_CREDENTIAL_USER = re.compile(r"[^\s:/@?#]+:")
 _KEY_VALUE_SECRET = re.compile(
     r"(?i)\b(password|passwd|pwd|passphrase|secret|api[_-]?key|access[_-]?token|refresh[_-]?token"
     r"|client[_-]?secret|auth[_-]?token|private[_-]?key)([ \t]{0,16}[=:][ \t]{0,16})"
@@ -417,7 +417,9 @@ class _Run:
         return "".join(out)
 
     def _auth_scheme(self, match: re.Match[str]) -> str:
-        if not _tokenish(match.group(2)):
+        # Once ``Bearer``/``Basic`` is recognised its credential is a secret whatever its charset (I2-T3-R05); only
+        # the plain word ``token`` keeps the prose heuristic ("the token validation step").
+        if match.group(1).lower() == "token" and not _tokenish(match.group(2)):
             return match.group(0)
         self.redacted += 1
         return f"{match.group(1)} {REDACTED}"
