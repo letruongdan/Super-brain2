@@ -7,7 +7,6 @@ a ``WriterLease`` is held.
 """
 
 import os
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -173,7 +172,7 @@ def prepare_data_root(root: Path, os_: OsAdapters) -> DataRoot:
     if lock_existed:
         _require_owner_only(lock, os_)
 
-    if sys.platform != "win32":
+    if os_.traits.restrict_umask:
         os.umask(0o077)
     missing: list[Path] = []
     for candidate in (root, *root.parents):

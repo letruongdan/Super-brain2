@@ -10,7 +10,6 @@ import contextlib
 import os
 import shutil
 import sqlite3
-import sys
 import tempfile
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
@@ -317,16 +316,22 @@ def _ensure_scratch_base(base: Path, root: Path, os_: OsAdapters) -> None:
 
 @contextlib.contextmanager
 def _preadmission_scratch(root: Path, os_: OsAdapters, scratch_base: Path | None) -> Iterator[Path]:
+    default_base = os_.traits.resolved_default_scratch_base() if scratch_base is None else None
     if scratch_base is not None:
+        os_.paths.reject_unsafe_path(str(scratch_base))
         base: Path | None = Path(os.path.abspath(scratch_base))
-    elif sys.platform == "win32" and os.environ.get("LOCALAPPDATA"):
-        base = Path(os.path.abspath(os.environ["LOCALAPPDATA"])) / "superbrain-scratch"
+    elif default_base is not None:
+        os_.paths.reject_unsafe_path(str(default_base))
+        base = Path(os.path.abspath(default_base))
     else:
         base = None
 
     if base is None:
-        raw_tmp = Path(tempfile.gettempdir())
-        tmp_dir = raw_tmp.resolve() if sys.platform == "darwin" else Path(os.path.abspath(raw_tmp))
+        raw_tmp = os_.traits.resolved_temp_dir()
+        if raw_tmp is None:
+            raise BrainError(ErrorCode.INVALID_INPUT, "no pre-admission scratch temp_dir is configured")
+        os_.paths.reject_unsafe_path(str(raw_tmp))
+        tmp_dir = raw_tmp.resolve() if os_.traits.resolve_temp_links else Path(os.path.abspath(raw_tmp))
         os_.paths.reject_unsafe_path(str(tmp_dir))
         if tmp_dir == root or root in tmp_dir.parents:
             raise BrainError(ErrorCode.UNSAFE_PATH, "pre-admission scratch directory must be outside data_root")

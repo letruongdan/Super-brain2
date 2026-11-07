@@ -5,11 +5,11 @@ import os
 import shutil
 import sqlite3
 import stat
-import sys
 from pathlib import Path
 
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.ids import new_id
+from superbrain.ports.os import PlatformTraits
 from superbrain.storage.errors import os_error, sqlite_error
 
 _BUSY_TIMEOUT_MS = 5000
@@ -157,11 +157,37 @@ def open_immutable(path: Path) -> sqlite3.Connection:
     return sqlite3.connect(f"{path.absolute().as_uri()}?immutable=1", uri=True, isolation_level=None)
 
 
-def connect(path: Path, *, readonly: bool = False, platform: str = sys.platform) -> sqlite3.Connection:
+def apply_durability_pragmas(
+    db: sqlite3.Connection,
+    traits: PlatformTraits | None = None,
+    *,
+    platform: str | None = None,
+    foreign_keys: bool = True,
+) -> None:
+    """Apply the package's SQLite durability pragmas to ``db``."""
+    if traits is not None and platform is not None:
+        raise ValueError("pass either traits or platform, not both")
+    full_fsync = traits.sqlite_full_fsync if traits is not None else platform == "darwin"
+    db.execute("PRAGMA synchronous=FULL")
+    if foreign_keys:
+        db.execute("PRAGMA foreign_keys=ON")
+    db.execute("PRAGMA secure_delete=ON")
+    if full_fsync:
+        db.execute("PRAGMA fullfsync=ON")
+        db.execute("PRAGMA checkpoint_fullfsync=ON")
+
+
+def connect(
+    path: Path,
+    *,
+    readonly: bool = False,
+    traits: PlatformTraits | None = None,
+    platform: str | None = None,
+) -> sqlite3.Connection:
     """Open ``path`` with the store's durability pragmas.
 
     ``readonly`` opens ``file:<path>?mode=ro`` and leaves ``journal_mode`` untouched (changing it needs a write).
-    ``platform`` selects the macOS ``fullfsync`` pragmas; it is a parameter so tests can exercise it anywhere.
+    ``traits`` (or ``platform`` for direct schema tests) selects the macOS ``fullfsync`` pragmas.
     Every ``sqlite3.Error`` is mapped by ``sqlite_error``; the connection is closed on failure.
     """
     try:
@@ -177,14 +203,9 @@ def connect(path: Path, *, readonly: bool = False, platform: str = sys.platform)
             mode = db.execute("PRAGMA journal_mode=WAL").fetchone()[0]
             if str(mode).lower() != "wal":
                 raise BrainError(ErrorCode.IO_ERROR, f"{path}: journal_mode is {mode!r}, WAL did not take effect")
-        db.execute("PRAGMA synchronous=FULL")
+        apply_durability_pragmas(db, traits, platform=platform, foreign_keys=True)
         if not readonly and db.execute("PRAGMA synchronous").fetchone()[0] != 2:
             raise BrainError(ErrorCode.IO_ERROR, f"{path}: synchronous=FULL did not take effect")
-        db.execute("PRAGMA foreign_keys=ON")
-        db.execute("PRAGMA secure_delete=ON")
-        if platform == "darwin":
-            db.execute("PRAGMA fullfsync=ON")
-            db.execute("PRAGMA checkpoint_fullfsync=ON")
     except BrainError:
         db.close()
         raise

@@ -1,6 +1,6 @@
 """OS-facing ports."""
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -113,9 +113,33 @@ class LockFactory(Protocol):
 
 
 @dataclass(frozen=True)
+class PlatformTraits:
+    sqlite_full_fsync: bool
+    restrict_umask: bool
+    default_scratch_base: Path | Callable[[], Path | None] | None = None
+    resolve_temp_links: bool = False
+    temp_dir: Path | Callable[[], Path] | None = None
+
+    def resolved_default_scratch_base(self) -> Path | None:
+        """Evaluate ``default_scratch_base`` when callable, or return it directly."""
+        value = self.default_scratch_base
+        if value is None or isinstance(value, Path):
+            return value
+        return value()
+
+    def resolved_temp_dir(self) -> Path | None:
+        """Evaluate ``temp_dir`` when callable, or return it directly."""
+        value = self.temp_dir
+        if value is None or isinstance(value, Path):
+            return value
+        return value()
+
+
+@dataclass(frozen=True)
 class OsAdapters:
     paths: PathSafety
     permissions: PermissionGuard
     publisher: DurablePublisher
     locks: LockFactory
     clock: Clock
+    traits: PlatformTraits

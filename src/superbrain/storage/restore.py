@@ -15,7 +15,6 @@ policy store is ahead of the mark, which is why its own generation is part of th
 
 import os
 import sqlite3
-import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -31,7 +30,7 @@ from superbrain.storage.layout import DataRoot
 from superbrain.storage.migrate import migrate_staged_file
 from superbrain.storage.policy_store import STORE_PUBLISHED, PolicyStore
 from superbrain.storage.schema import POLICY_MIGRATIONS, STORE_MIGRATIONS, Migration, SchemaInfo, _meta, code_version
-from superbrain.storage.sqlite import db_files, open_immutable, open_readonly
+from superbrain.storage.sqlite import apply_durability_pragmas, db_files, open_immutable, open_readonly
 from superbrain.storage.swap import stage_and_swap
 from superbrain.storage.writer import WriterLease
 
@@ -211,9 +210,7 @@ def _write_generation(path: Path, generation: int, os_: OsAdapters, *, published
         raise sqlite_error("cannot open the staged policy store", exc) from exc
     try:
         try:
-            db.execute("PRAGMA synchronous=FULL")
-            if sys.platform == "darwin":
-                db.execute("PRAGMA fullfsync=ON")
+            apply_durability_pragmas(db, os_.traits, foreign_keys=False)
             rows = db.execute("UPDATE trust SET generation = ? WHERE id = 1", (generation,)).rowcount
             if published:
                 db.execute(

@@ -166,7 +166,7 @@ class PolicyStore:
         try:
             remove_unfinished_creates(path)
             staging = path.with_name(f"{path.name}{CREATING}{new_id()}")
-            db = connect(staging)
+            db = connect(staging, traits=os_.traits)
             try:
                 initialize(db, migrations, store_id=store_id)
                 hwm = lease.state().trust_generation_hwm
@@ -218,7 +218,7 @@ class PolicyStore:
         if info is None:
             raise BrainError(ErrorCode.NOT_FOUND, f"no policy store at {path}")
         ensure_writable(info, migrations)
-        db = connect(path)
+        db = connect(path, traits=os_.traits)
         try:
             readmit_writable(db, path, info, migrations)
             policy = cls(

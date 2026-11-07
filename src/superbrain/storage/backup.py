@@ -23,7 +23,6 @@ import re
 import shutil
 import sqlite3
 import stat
-import sys
 from collections.abc import Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -44,7 +43,7 @@ from superbrain.storage.layout import DataRoot
 from superbrain.storage.ledger import utc_timestamp
 from superbrain.storage.prune import MANIFEST_NAME, backup_dir_name, prune_backups
 from superbrain.storage.schema import Migration, SchemaInfo, ensure_readable, read_schema_info
-from superbrain.storage.sqlite import db_files, open_immutable
+from superbrain.storage.sqlite import apply_durability_pragmas, db_files, open_immutable
 from superbrain.storage.writer import WriterLease
 
 if TYPE_CHECKING:
@@ -133,9 +132,7 @@ def _snapshot_db(source: sqlite3.Connection, dest: Path, os_: OsAdapters) -> Non
         raise sqlite_error(f"cannot create the snapshot {dest}", exc) from exc
     try:
         try:
-            target.execute("PRAGMA synchronous=FULL")
-            if sys.platform == "darwin":
-                target.execute("PRAGMA fullfsync=ON")
+            apply_durability_pragmas(target, os_.traits, foreign_keys=False)
             source.backup(target)
             mode = target.execute("PRAGMA journal_mode=DELETE").fetchone()[0]
         except sqlite3.Error as exc:

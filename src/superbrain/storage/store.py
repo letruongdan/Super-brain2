@@ -226,7 +226,7 @@ class Store:
         try:
             remove_unfinished_creates(path)
             staging = path.with_name(f"{path.name}{CREATING}{new_id()}")
-            db = connect(staging)
+            db = connect(staging, traits=os_.traits)
             try:
                 initialize(db, migrations, store_id=policy.store_id)
                 _create_live_tables(db, handlers)
@@ -288,7 +288,7 @@ class Store:
         ensure_writable(info, migrations)
         if info.store_id != policy.store_id:
             raise BrainError(ErrorCode.INTEGRITY_FAILURE, "the store belongs to a different policy store")
-        db = connect(path)
+        db = connect(path, traits=os_.traits)
         try:
             readmit_writable(db, path, info, migrations)
             store = cls(

@@ -7,7 +7,6 @@ and swaps it in with ``stage_and_swap``. A failure before the swap leaves the or
 """
 
 import sqlite3
-import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -15,7 +14,7 @@ from pathlib import Path
 from typing import Literal
 
 from superbrain.core.errors import BrainError, ErrorCode
-from superbrain.ports.os import OsAdapters
+from superbrain.ports.os import OsAdapters, PlatformTraits
 from superbrain.storage.backup import (
     BackupKind,
     copy_blobs,
@@ -34,7 +33,7 @@ from superbrain.storage.schema import (
     code_version,
     read_schema_info,
 )
-from superbrain.storage.sqlite import db_files
+from superbrain.storage.sqlite import apply_durability_pragmas, db_files
 from superbrain.storage.swap import stage_and_swap
 from superbrain.storage.writer import WriterLease
 
@@ -76,14 +75,12 @@ def _apply(db: sqlite3.Connection, pending: Sequence[Migration]) -> None:
             raise
 
 
-def _configure(db: sqlite3.Connection, platform: str) -> None:
+def _configure(db: sqlite3.Connection, traits_or_platform: PlatformTraits | str) -> None:
     """The durability settings every database connection of this package uses (see ``sqlite.connect``)."""
-    db.execute("PRAGMA synchronous=FULL")
-    db.execute("PRAGMA foreign_keys=ON")
-    db.execute("PRAGMA secure_delete=ON")
-    if platform == "darwin":
-        db.execute("PRAGMA fullfsync=ON")
-        db.execute("PRAGMA checkpoint_fullfsync=ON")
+    if isinstance(traits_or_platform, str):
+        apply_durability_pragmas(db, platform=traits_or_platform, foreign_keys=True)
+    else:
+        apply_durability_pragmas(db, traits_or_platform, foreign_keys=True)
 
 
 def _integrity_report(db: sqlite3.Connection) -> str:
@@ -94,7 +91,7 @@ def migrate_staged_file(
     path: Path,
     pending: Sequence[Migration],
     os_: OsAdapters,
-    platform: str = sys.platform,
+    platform: str | None = None,
     *,
     flush: bool = True,
 ) -> None:
@@ -102,7 +99,7 @@ def migrate_staged_file(
     with ``os_.publisher.flush_file`` when ``flush`` is true."""
     db = sqlite3.connect(path, isolation_level=None)
     try:
-        _configure(db, platform)
+        _configure(db, platform if platform is not None else os_.traits)
         mode = db.execute("PRAGMA journal_mode=DELETE").fetchone()[0]
         if str(mode).lower() != "delete":
             raise BrainError(ErrorCode.IO_ERROR, f"{path.name}: journal_mode is {mode!r}, DELETE did not take effect")
