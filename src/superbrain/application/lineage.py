@@ -13,7 +13,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import Callable, Iterable, Sequence
 
-from superbrain.application.privacy import PrivacyFilter
+from superbrain.application.privacy import PrivacyFilter, admissible_field_path
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.ids import new_id
 from superbrain.core.jsonvalue import JsonValue
@@ -331,14 +331,27 @@ def record_task_lineage(tx: KernelTx, task_id: str, sources: LineageSet, *, unkn
 
 
 def record_field_lineage(
-    tx: KernelTx, task_id: str, path: Sequence[str | int], sources: LineageSet, *, unknown: bool
+    tx: KernelTx,
+    task_id: str,
+    path: Sequence[str | int],
+    sources: LineageSet,
+    *,
+    unknown: bool,
+    filter_policy: FilterPolicy | None = None,
 ) -> FieldLineage:
-    """Record a field's sources (and sticky unknown marker) keyed by its path digest; the path stays in CAS."""
-    digest = field_path_digest(path)
+    """Record a field's sources (and sticky unknown marker) keyed by its path digest; the path stays in CAS.
+
+    A path naming a key the privacy filter would strip is refused before any CAS publish or ledger write
+    (``INVALID_INPUT``): field-path descriptors never carry filtered secrets (I2-T3-R01).
+    """
+    checked_path = tuple(path)
+    digest = field_path_digest(checked_path)
+    if not admissible_field_path(checked_path, filter_policy if filter_policy is not None else FilterPolicy()):
+        raise BrainError(ErrorCode.INVALID_INPUT, "privacy filter rejected payload")
     current = tx.read_field_lineage(task_id).get(digest)
     if current is None:
         holder = str(uuid.uuid5(_FIELD_HOLDER_NAMESPACE, f"{task_id}\0{digest}"))
-        tx.hold_blob(field_path_descriptor(path), holder_id=holder)
+        tx.hold_blob(field_path_descriptor(checked_path), holder_id=holder)
     known = current.sources if current is not None else frozenset()
     for ref in sorted(frozenset(_lineage_items(sources)) - known, key=repr):
         tx.append_record(
@@ -482,7 +495,17 @@ def prepare_labeled_delivery(
         elif observation is not None:
             status = observation.status
         return _commit_delivery(
-            tx, binding, task_id, checked_items, served, snapshot_id, status, safe, selector_path, selector_reason
+            tx,
+            binding,
+            task_id,
+            checked_items,
+            served,
+            snapshot_id,
+            status,
+            safe,
+            selector_path,
+            selector_reason,
+            filter_policy,
         )
 
     return store.transact(commit)
@@ -499,10 +522,14 @@ def _commit_delivery(
     safe: SafePayload,
     selector_path: SelectorPath,
     selector_reason: SelectorReason,
+    filter_policy: FilterPolicy,
 ) -> LabeledDelivery:
     has_snapshot = status is SnapshotStatus.AVAILABLE
     kept = tuple(item for item in items if has_snapshot or not item.snapshot_dependent)
-    omitted = tuple(field_path_digest(item.path) for item in items if item not in kept)
+    # I2-T3-R01: field identities come only from paths the filter keeps; an item whose path names a stripped key keeps
+    # its lineage restriction on the task but is never given a persisted field-path descriptor or digest.
+    persistable = {item: admissible_field_path(item.path, filter_policy) for item in items}
+    omitted = tuple(field_path_digest(item.path) for item in items if item not in kept and persistable[item])
     task_lineage = union_lineage(
         frozenset({binding_lineage_ref(binding)}), [*served, *(ref for item in kept for ref in item.sources)]
     )
@@ -537,9 +564,19 @@ def _commit_delivery(
         )
     )
     record_task_lineage(tx, task_id, task_lineage, unknown=any(unknown_flags))
+    # I2-T3-R02 (spec 14.2): content created inside a task carries the task's current lineage (binding, served and
+    # item sources) united with the item's own sources; unknown follows the item's own derivation.
     recorded = tuple(
-        record_field_lineage(tx, task_id, item.path, item.sources, unknown=flag)
+        record_field_lineage(
+            tx,
+            task_id,
+            item.path,
+            union_lineage(task_lineage, item.sources),
+            unknown=flag,
+            filter_policy=filter_policy,
+        )
         for item, flag in zip(kept, unknown_flags, strict=True)
+        if persistable[item]
     )
     return LabeledDelivery(
         binding=task,

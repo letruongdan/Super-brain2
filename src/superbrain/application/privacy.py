@@ -514,6 +514,26 @@ def filter_policy_for(flags: RepoFlags, base: FilterPolicy | None = None) -> Fil
     return dataclasses.replace(base if base is not None else FilterPolicy(), manual_submission=flags.manual_submission)
 
 
+def admissible_field_path(path: tuple[str | int, ...], policy: FilterPolicy) -> bool:
+    """Whether a structural field path may be persisted (CAS descriptor, ledger digest) under ``policy``.
+
+    Every string segment must survive the filter exactly as an object key would: not a sensitive key and unchanged by
+    every redaction rule. A path naming a key the filter strips is never persisted (I2-T3-R01).
+    """
+    if not isinstance(policy, FilterPolicy) or not isinstance(path, tuple):
+        raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+    run = _Run(policy, time.monotonic_ns, None)
+    admissible = True
+    try:
+        for segment in path:
+            if isinstance(segment, str) and (run._sensitive_key(segment) or run.redact(segment) != segment):
+                admissible = False
+                break
+    except (_Reject, UnicodeError, ValueError, TypeError, RecursionError):
+        admissible = False
+    return admissible
+
+
 class PrivacyFilter:
     """Stateless filter; ``monotonic_ns`` is injectable so the shared local budget can be tested exactly.
 
