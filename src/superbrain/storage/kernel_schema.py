@@ -218,10 +218,52 @@ def _store_v3(db: sqlite3.Connection) -> None:
     _ = db
 
 
+def _store_v4(db: sqlite3.Connection) -> None:
+    """Main store v4 operational tables (``schema_version=4, min_reader_version=4``) for Task 4 idempotency,
+    artifact send attempts, and artifact read acknowledgments (C1, C4, C5).
+    """
+    db.execute(
+        "CREATE TABLE idempotency ("
+        "principal_id TEXT NOT NULL, "
+        "tool TEXT NOT NULL, "
+        "key_hash TEXT NOT NULL, "
+        "request_digest_key_id TEXT NOT NULL, "
+        "request_digest TEXT NOT NULL, "
+        "result_id TEXT NOT NULL, "
+        "assignment_id TEXT, "
+        "refs_json TEXT NOT NULL, "
+        "committed_at TEXT NOT NULL, "
+        "PRIMARY KEY (principal_id, tool, key_hash))"
+    )
+    db.execute("CREATE INDEX idx_idempotency_committed_at ON idempotency (committed_at, principal_id, tool, key_hash)")
+    db.execute(
+        "CREATE TABLE artifact_send_attempt ("
+        "id TEXT PRIMARY KEY, "
+        "logical_result_id TEXT NOT NULL, "
+        "principal_id TEXT NOT NULL, "
+        "task_id TEXT NOT NULL, "
+        "artifact_id TEXT NOT NULL, "
+        "revision INTEGER NOT NULL CHECK (revision >= 1), "
+        "digests_json TEXT NOT NULL, "
+        "state TEXT NOT NULL CHECK (state IN ('pending', 'unknown', 'served_only')))"
+    )
+    db.execute("CREATE INDEX idx_artifact_send_attempt_state ON artifact_send_attempt (state)")
+    db.execute(
+        "CREATE TABLE artifact_read_ack ("
+        "id TEXT PRIMARY KEY, "
+        "served_receipt_id TEXT NOT NULL UNIQUE, "
+        "principal_id TEXT NOT NULL, "
+        "task_id TEXT NOT NULL, "
+        "revision INTEGER NOT NULL CHECK (revision >= 1), "
+        "digests_json TEXT NOT NULL)"
+    )
+
+
 POLICY_V2_MIGRATION = Migration(to_version=2, min_reader_version=2, apply=_policy_v2)
 POLICY_V3_MIGRATION = Migration(to_version=3, min_reader_version=3, apply=_policy_v3)
 STORE_V2_MIGRATION = Migration(to_version=2, min_reader_version=2, apply=_store_v2)
 STORE_V3_MIGRATION = Migration(to_version=3, min_reader_version=3, apply=_store_v3)
+STORE_V4_MIGRATION = Migration(to_version=4, min_reader_version=4, apply=_store_v4)
 
 KERNEL_POLICY_MIGRATIONS: tuple[Migration, ...] = (
     *POLICY_MIGRATIONS,
@@ -232,4 +274,5 @@ KERNEL_STORE_MIGRATIONS: tuple[Migration, ...] = (
     *STORE_MIGRATIONS,
     STORE_V2_MIGRATION,
     STORE_V3_MIGRATION,
+    STORE_V4_MIGRATION,
 )

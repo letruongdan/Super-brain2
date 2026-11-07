@@ -7,21 +7,26 @@ the mirror port, so a stale or forged mirror row can neither grant access nor mi
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
+from datetime import datetime
 from typing import Protocol, TypeVar
 
 from superbrain.core.kernel import (
     AuthSnapshot,
     BootstrapAuthorization,
     FieldLineage,
+    IdempotencyRow,
     KernelRecord,
     LineageRef,
     LineageSet,
     MirrorCandidate,
     Principal,
+    RequestAuthView,
     Scope,
     SnapshotObservation,
     SourceSnapshot,
+    StagedBlob,
+    StoredResult,
     TaskBinding,
     WorkspaceBinding,
     WorkspaceRegistration,
@@ -46,9 +51,7 @@ class KernelPolicyPort(Protocol):
         """Return an immutable point-in-time snapshot of principals, credentials, grants, and checkouts."""
         ...
 
-    def record_authorized_revocation(
-        self, credential_id: str, authorization: BootstrapAuthorization
-    ) -> Intent:
+    def record_authorized_revocation(self, credential_id: str, authorization: BootstrapAuthorization) -> Intent:
         """Commit an authorized ``credential_revoke`` intent and mark ``credential_id`` revoked."""
         ...
 
@@ -60,6 +63,10 @@ class KernelPolicyPort(Protocol):
 
     def request_digest_key(self) -> tuple[str, bytes]:
         """Return the active ``(key_id, key_bytes)`` 32-byte per-store HMAC secret."""
+        ...
+
+    def request_digest_key_by_id(self, key_id: str) -> bytes | None:
+        """Return the 32-byte HMAC secret for ``key_id`` (active or retained), or ``None`` if absent."""
         ...
 
 
@@ -114,10 +121,73 @@ class KernelTx(Protocol):
         """Field lineage of ``task_id`` keyed by ``field_path_digest``."""
         ...
 
+    def read_idempotency(self, principal_id: str, tool: str, key_hash: str) -> IdempotencyRow | None:
+        """Read the operational idempotency row for ``(principal_id, tool, key_hash)``, if present."""
+        ...
+
+    def save_idempotency(self, row: IdempotencyRow) -> None:
+        """Persist or atomically replace the operational idempotency row inside the write transaction."""
+        ...
+
 
 class KernelStorePort(Protocol):
     def transact(self, operation: Callable[[KernelTx], _T]) -> _T:
         """Run ``operation`` inside one ``Store.transaction()``: all of it commits or none of it does."""
+        ...
+
+
+class KernelBlobStagePort(Protocol):
+    """Owner-thread CAS pre-staging port outside SQLite business transactions (C2)."""
+
+    def stage_blob(self, data: bytes) -> StagedBlob:
+        """Durably stage safe ``data`` into CAS outside any SQLite transaction and return its ``StagedBlob``."""
+        ...
+
+
+class RequestAuthStatePort(Protocol):
+    """Read-only port over the owner-published RAM ``RequestAuthView`` (C3)."""
+
+    def current(self) -> RequestAuthView | None:
+        """Return the currently published ``RequestAuthView`` for this root, or ``None`` if unavailable."""
+        ...
+
+
+class KernelIdempotencyPort(Protocol):
+    """Owner-thread operational idempotency and C4 wall-clock high-water mark port over ``store4``."""
+
+    def clock_untrusted(self) -> bool:
+        """True iff C4 detected wall-clock regression or missing/corrupt watermark state."""
+        ...
+
+    def lookup_for_owner(self, *, principal_id: str, tool: str, key_hash: str, now: datetime) -> IdempotencyRow | None:
+        """Validate C4 wall clock at ``now`` and read ``(principal_id, tool, key_hash)``."""
+        ...
+
+    def record_replay(self, *, row: IdempotencyRow, now: datetime) -> None:
+        """Advance the durable C4 operational watermark on replay without altering ``row.committed_at``."""
+        ...
+
+    def commit_prepared_effect(
+        self,
+        *,
+        staged_blobs: Sequence[StagedBlob],
+        principal_id: str,
+        tool: str,
+        key_hash: str,
+        active_key_id: str,
+        request_digest: str,
+        now: datetime,
+        verify_raced_row: Callable[[IdempotencyRow], None],
+        apply: Callable[[KernelTx], StoredResult],
+    ) -> tuple[StoredResult, bool]:
+        """Atomically execute ``apply(strict_tx)``, persist the idempotency row, and advance the C4 watermark.
+
+        Returns ``(stored_result, was_live_replay)``.
+        """
+        ...
+
+    def prune_expired(self, now: datetime, limit: int = 100) -> int:
+        """Validate C4 clock + retained keys and delete at most ``limit`` (`1..100`) expired idempotency rows."""
         ...
 
 

@@ -97,6 +97,9 @@ class _Policy:
     def request_digest_key(self) -> tuple[str, bytes]:
         raise AssertionError("eligibility never reads request keys")
 
+    def request_digest_key_by_id(self, key_id: str) -> bytes:
+        raise AssertionError("eligibility never reads request keys")
+
 
 class _Restrictions:
     def __init__(self, restricted: set[LineageRef]) -> None:

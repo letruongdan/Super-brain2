@@ -14,11 +14,9 @@ import uuid
 from collections.abc import Callable, Iterable, Sequence
 
 from superbrain.application._lineage_delivery import (
-    aggregate_delivery_fields,
     append_field_lineage_by_digest,
-    append_task_bound,
+    commit_delivery_atomic,
     load_delivery,
-    partition_delivery_fields,
     replay_for,
     source_meta,
 )
@@ -51,7 +49,6 @@ from superbrain.core.kernel import (
     TaskBinding,
     WorkspaceBinding,
     WorkspaceSelector,
-    binding_lineage_ref,
     field_path_descriptor,
     field_path_digest,
     is_registrable_alias,
@@ -472,6 +469,57 @@ def prepare_labeled_delivery(
     return store.transact(commit)
 
 
+def commit_new_labeled_delivery(
+    tx: KernelTx,
+    *,
+    binding: WorkspaceBinding,
+    task_id: str,
+    items: Sequence[DeliveryItem] = (),
+    served_sources: Iterable[LineageRef] = (),
+    snapshot_id: str | None,
+    status: SnapshotStatus,
+    safe: SafePayload,
+    selector_path: SelectorPath = SelectorPath.RULES,
+    selector_reason: SelectorReason = SelectorReason.PROVIDER_UNAVAILABLE,
+    filter_policy: FilterPolicy,
+) -> LabeledDelivery:
+    """Factor Task 3's atomic delivery commit without its ``load_delivery(task_id)`` shortcut (C1)."""
+    require_opaque_id(task_id)
+    if (
+        not isinstance(binding, WorkspaceBinding)
+        or not isinstance(status, SnapshotStatus)
+        or not isinstance(safe, SafePayload)
+        or not isinstance(selector_path, SelectorPath)
+        or not isinstance(selector_reason, SelectorReason)
+        or not isinstance(filter_policy, FilterPolicy)
+    ):
+        raise _invalid()
+    checked_items = tuple(items)
+    if not all(isinstance(item, DeliveryItem) for item in checked_items):
+        raise _invalid()
+    served = tuple(_lineage_items(served_sources))
+    existing = tx.read_task_binding(task_id)
+    if existing is not None and (
+        existing.owner_id,
+        existing.repo_id,
+        existing.checkout_id,
+    ) != (binding.owner_id, binding.repo_id, binding.checkout_id):
+        raise _not_found()
+    return _commit_delivery(
+        tx,
+        binding,
+        task_id,
+        checked_items,
+        served,
+        snapshot_id,
+        status,
+        safe,
+        selector_path,
+        selector_reason,
+        filter_policy,
+    )
+
+
 def _commit_delivery(
     tx: KernelTx,
     binding: WorkspaceBinding,
@@ -485,69 +533,21 @@ def _commit_delivery(
     selector_reason: SelectorReason,
     filter_policy: FilterPolicy,
 ) -> LabeledDelivery:
-    prior_lineage, prior_unknown = tx.read_task_lineage(task_id)
-    prior_fields = tx.read_field_lineage(task_id)
-    fields = aggregate_delivery_fields(items, filter_policy)
-    kept_fields, omitted_fields = partition_delivery_fields(fields, status, prior_digests=prior_fields.keys())
-    base_task_lineage = union_lineage(
-        prior_lineage,
-        [
-            binding_lineage_ref(binding),
-            *served,
-            *(ref for pf in prior_fields.values() for ref in pf.sources),
-            *(ref for field in kept_fields for ref in field.sources),
-        ],
-    )
-    base_task_unknown = (
-        prior_unknown
-        or any(pf.unknown_source or not pf.sources for pf in prior_fields.values())
-        or any(field.unknown for field in kept_fields)
-    )
-    task = append_task_bound(tx, binding, task_id, snapshot_id, status, selector_path, selector_reason)
-    record_task_lineage(tx, task_id, base_task_lineage, unknown=base_task_unknown)
-    # I2-T3-R01 & R02 (spec 14.2): non-admissible paths contribute restrictions to task lineage without persisting a
-    # CAS descriptor or field row; every delivered field carries current task lineage without blanket sibling unknown.
-    for field in kept_fields:
-        if field.persistable:
-            record_field_lineage(
-                tx,
-                task_id,
-                field.path,
-                union_lineage(base_task_lineage, field.sources),
-                unknown=field.unknown,
-                filter_policy=filter_policy,
-            )
-    if prior_fields:
-        kept_by_digest = {field.digest: field for field in kept_fields}
-        current_fields = tx.read_field_lineage(task_id)
-        for digest in sorted(prior_fields):
-            pf = prior_fields[digest]
-            matched = kept_by_digest.get(digest)
-            target_sources = (
-                union_lineage(base_task_lineage, pf.sources)
-                if matched is None
-                else union_lineage(base_task_lineage, union_lineage(pf.sources, matched.sources))
-            )
-            target_unknown = pf.unknown_source or not pf.sources or (matched is not None and matched.unknown)
-            append_field_lineage_by_digest(
-                tx,
-                task_id,
-                digest,
-                current_fields.get(digest, pf),
-                target_sources,
-                unknown=target_unknown,
-            )
-    committed_lineage, committed_unknown = tx.read_task_lineage(task_id)
-    committed_fields = tx.read_field_lineage(task_id)
-    omitted = tuple(
-        sorted(field.digest for field in omitted_fields if field.persistable and field.digest not in committed_fields)
-    )
-    return LabeledDelivery(
-        binding=task,
-        task_lineage=committed_lineage,
-        task_unknown=committed_unknown,
-        items=tuple(committed_fields[digest] for digest in sorted(committed_fields)),
-        omitted_items=omitted,
-        safe_payload=safe,
-        replayed=False,
+    return commit_delivery_atomic(
+        tx,
+        binding,
+        task_id,
+        items,
+        served,
+        snapshot_id,
+        status,
+        safe,
+        selector_path,
+        selector_reason,
+        filter_policy,
+        union_fn=union_lineage,
+        record_task_fn=lambda t, tid, src, unk: record_task_lineage(t, tid, src, unknown=unk),
+        record_field_fn=lambda t, tid, pth, src, unk, fp: record_field_lineage(
+            t, tid, pth, src, unknown=unk, filter_policy=fp
+        ),
     )

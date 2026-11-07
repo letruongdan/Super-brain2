@@ -39,6 +39,7 @@ from superbrain.storage._policy_authority import (
     ensure_v2_tables,
     policy_allows,
     read_policy_request_digest_key,
+    read_policy_request_digest_key_by_id,
     resolve_policy_credential,
 )
 from superbrain.storage._policy_mutations import (
@@ -107,9 +108,7 @@ def _decode_intent(row: Sequence[object]) -> Intent:
             raise BrainError(ErrorCode.INVALID_INPUT, "a column has the wrong type")
         decoded = json.loads(payload)
         intent_kind = IntentKind(str(kind))
-        checked = validate_policy_intent_payload(
-            intent_kind, decoded, intent_id, allow_legacy_v1=True
-        )
+        checked = validate_policy_intent_payload(intent_kind, decoded, intent_id, allow_legacy_v1=True)
     except (BrainError, ValueError) as exc:  # JSONDecodeError and UnicodeDecodeError are ValueErrors
         raise BrainError(ErrorCode.INTEGRITY_FAILURE, f"policy intent {intent_id!r} is malformed: {exc}") from exc
     return Intent(intent_id=intent_id, kind=intent_kind, payload=checked, created_at=created_at)
@@ -415,9 +414,7 @@ class PolicyStore:
             expected_schema_version=self._schema_version,
         )
 
-    def record_authorized_revocation(
-        self, credential_id: str, authorization: BootstrapAuthorization
-    ) -> Intent:
+    def record_authorized_revocation(self, credential_id: str, authorization: BootstrapAuthorization) -> Intent:
         self._check_kernel_available()
         ensure_v2_tables(
             self._db,
@@ -461,6 +458,15 @@ class PolicyStore:
         self._check_kernel_available()
         return read_policy_request_digest_key(
             self._db,
+            expected_store_id=self._store_id,
+            expected_schema_version=self._schema_version,
+        )
+
+    def request_digest_key_by_id(self, key_id: str) -> bytes | None:
+        self._check_kernel_available()
+        return read_policy_request_digest_key_by_id(
+            self._db,
+            key_id,
             expected_store_id=self._store_id,
             expected_schema_version=self._schema_version,
         )

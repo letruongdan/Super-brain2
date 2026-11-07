@@ -350,6 +350,16 @@ class Store:
         return self._store_id
 
     @property
+    def schema_version(self) -> int:
+        self._check()
+        return self._schema_version
+
+    @property
+    def in_transaction(self) -> bool:
+        self._check()
+        return self._txn_active or self._db.in_transaction
+
+    @property
     def root(self) -> DataRoot:
         self._check()
         return self._root

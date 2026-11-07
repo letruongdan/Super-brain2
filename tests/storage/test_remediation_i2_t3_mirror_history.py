@@ -32,8 +32,9 @@ from typing import Any
 from superbrain.adapters.os import os_adapters
 from superbrain.application.lineage import resolve_binding
 from superbrain.composition.kernel_projections import kernel_store_extensions
-from superbrain.core.errors import BrainError
-from superbrain.core.kernel import Principal, WorkspaceSelector
+from superbrain.composition.migrate_entry import migrate_offline
+from superbrain.core.errors import BrainError, ErrorCode
+from superbrain.core.kernel import DaemonConfig, Principal, WorkspaceSelector
 from superbrain.ports.os import OsAdapters
 from superbrain.storage.ledger import LedgerEntry
 from superbrain.storage.runtime import admit_existing_pair, open_runtime_under_lease
@@ -269,6 +270,20 @@ def test_exact_007_v1_register_entry_with_subject_opens_with_current_mirror(trus
     principal = Principal(*(str(v) for v in written["principal"]))
     clock = FakeClock(dt.datetime(2026, 11, 6, 10, 0, tzinfo=dt.UTC))
     adapters = os_adapters(clock=clock)
+
+    # Current kernel targets (store=4, policy=3): serve refuses (3, 3) until migrate_offline upgrades store 3 -> 4.
+    try:
+        unexpected_admit = admit_existing_pair(root, store_id, adapters, purpose="serve")
+        unexpected_admit.release()
+        raise AssertionError("expected MIGRATION_REQUIRED before store 3 -> 4 offline migration")
+    except BrainError as pre_mig_err:
+        assert pre_mig_err.code is ErrorCode.MIGRATION_REQUIRED
+
+    mig_cur = migrate_offline(DaemonConfig(1, root, store_id, base / "unused.pem", base / "unused.key"), adapters)
+    assert mig_cur.policy_report.status == "skipped" and mig_cur.policy_report.to_version == 3
+    assert mig_cur.store_report.status == "migrated"
+    assert mig_cur.store_report.from_version == 3 and mig_cur.store_report.to_version == 4
+
     for attempt in ("first open", "reopen after rebuild"):
         handlers, kinds = kernel_store_extensions()
         try:

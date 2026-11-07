@@ -19,12 +19,36 @@ import warnings
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+
+if TYPE_CHECKING:
+    from tests.support.inc2_kernel_domain import (
+        FIXTURE_DOMAIN_KINDS as FIXTURE_DOMAIN_KINDS,
+    )
+    from tests.support.inc2_kernel_domain import (
+        FixtureDeliveryRefSpec as FixtureDeliveryRefSpec,
+    )
+    from tests.support.inc2_kernel_domain import (
+        FixtureDomainProjection as FixtureDomainProjection,
+    )
+    from tests.support.inc2_kernel_domain import (
+        FixtureKernelDomain as FixtureKernelDomain,
+    )
+    from tests.support.inc2_kernel_domain import (
+        FixtureResourceSpec as FixtureResourceSpec,
+    )
+    from tests.support.inc2_kernel_domain import (
+        fixture_store_extensions as fixture_store_extensions,
+    )
+    from tests.support.inc2_kernel_domain import (
+        validate_response_envelope as validate_response_envelope,
+    )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SOURCE_SCHEMA_PATH = REPO_ROOT / "schemas" / "mcp-tools-v2.json"
@@ -157,9 +181,7 @@ def inc2_installed_env(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Ins
             cwd=REPO_ROOT,
             extra_env={"UV_PROJECT_ENVIRONMENT": str(venv_dir)},
         )
-        venv_python = (
-            venv_dir / "Scripts" / "python.exe" if sys.platform == "win32" else venv_dir / "bin" / "python"
-        )
+        venv_python = venv_dir / "Scripts" / "python.exe" if sys.platform == "win32" else venv_dir / "bin" / "python"
 
         _run_checked(
             [
@@ -295,3 +317,24 @@ def inc2_tls_material(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Samp
         )
     finally:
         _cleanup_dir(directory)
+
+
+_KERNEL_DOMAIN_EXPORTS = frozenset(
+    {
+        "FIXTURE_DOMAIN_KINDS",
+        "FixtureDeliveryRefSpec",
+        "FixtureDomainProjection",
+        "FixtureKernelDomain",
+        "FixtureResourceSpec",
+        "fixture_store_extensions",
+        "validate_response_envelope",
+    }
+)
+
+
+def __getattr__(name: str) -> object:
+    if name in _KERNEL_DOMAIN_EXPORTS:
+        from tests.support import inc2_kernel_domain
+
+        return getattr(inc2_kernel_domain, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

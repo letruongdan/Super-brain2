@@ -18,6 +18,7 @@ from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.jsonvalue import JsonValue
 from superbrain.core.kernel import (
     FieldLineage,
+    IdempotencyRow,
     KernelRecord,
     LineageRef,
     LineageSet,
@@ -32,6 +33,7 @@ from superbrain.core.kernel import (
 )
 from superbrain.ports.kernel import KernelTx
 from superbrain.ports.policy import PolicyView
+from superbrain.storage._idempotency_sql import read_idempotency_row, write_idempotency_row
 from superbrain.storage.cas import ContentStore, held_digests
 from superbrain.storage.errors import sqlite_error
 from superbrain.storage.kernel_schema import KERNEL_WORKSPACE_KINDS
@@ -451,6 +453,12 @@ class StoreKernelTx:
             sources = frozenset(grouped.get(digest, set()))
             result[digest] = _decoded(partial(FieldLineage, digest, sources, digest in unknown))
         return result
+
+    def read_idempotency(self, principal_id: str, tool: str, key_hash: str) -> IdempotencyRow | None:
+        return read_idempotency_row(self._txn.db, principal_id, tool, key_hash)
+
+    def save_idempotency(self, row: IdempotencyRow) -> None:
+        write_idempotency_row(self._txn.db, row)
 
 
 class KernelWorkspaceStore:

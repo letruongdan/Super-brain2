@@ -17,6 +17,7 @@ from superbrain.core.kernel import (
     Scope,
     WorkspaceBinding,
     parse_bearer_token,
+    require_opaque_id,
     verify_secret_digest,
 )
 from superbrain.ports.policy import IntentKind
@@ -31,11 +32,7 @@ _MAX_VERSION_DIGITS = 18
 
 
 def _parse_policy_version(raw: str | None) -> int:
-    if (
-        raw is None
-        or not (1 <= len(raw) <= _MAX_VERSION_DIGITS)
-        or not (raw.isascii() and raw.isdigit())
-    ):
+    if raw is None or not (1 <= len(raw) <= _MAX_VERSION_DIGITS) or not (raw.isascii() and raw.isdigit()):
         raise BrainError(ErrorCode.POLICY_UNAVAILABLE, "policy unavailable")
     try:
         return int(raw)
@@ -49,11 +46,7 @@ def ensure_v2_tables(
     expected_store_id: str | None = None,
     expected_schema_version: int | None = None,
 ) -> None:
-    target_sv = (
-        code_version(KERNEL_POLICY_MIGRATIONS)
-        if expected_schema_version is None
-        else expected_schema_version
-    )
+    target_sv = code_version(KERNEL_POLICY_MIGRATIONS) if expected_schema_version is None else expected_schema_version
     if type(target_sv) is not int or target_sv < 2:
         raise BrainError(ErrorCode.POLICY_UNAVAILABLE, "policy unavailable")
     try:
@@ -408,3 +401,36 @@ def read_policy_request_digest_key(
     if not isinstance(key_bytes, bytes) or len(key_bytes) != 32:
         raise BrainError(ErrorCode.POLICY_UNAVAILABLE, "policy unavailable")
     return checked_id, key_bytes
+
+
+def read_policy_request_digest_key_by_id(
+    db: sqlite3.Connection,
+    key_id: str,
+    *,
+    expected_store_id: str | None = None,
+    expected_schema_version: int | None = None,
+) -> bytes | None:
+    require_opaque_id(key_id, label="key_id")
+    ensure_v2_tables(
+        db,
+        expected_store_id=expected_store_id,
+        expected_schema_version=expected_schema_version,
+    )
+    try:
+        row = db.execute(
+            "SELECT id, key_bytes, active FROM request_digest_key WHERE id = ?",
+            (key_id,),
+        ).fetchone()
+    except sqlite3.Error as exc:
+        raise BrainError(ErrorCode.POLICY_UNAVAILABLE, "policy unavailable") from exc
+    if row is None:
+        return None
+    stored_id, key_bytes, active = row
+    checked_id = require_stored_opaque_id(stored_id)
+    if checked_id != key_id:
+        raise BrainError(ErrorCode.POLICY_UNAVAILABLE, "policy unavailable")
+    if type(active) is not int or active not in (0, 1):
+        raise BrainError(ErrorCode.POLICY_UNAVAILABLE, "policy unavailable")
+    if type(key_bytes) is not bytes or len(key_bytes) != 32:
+        raise BrainError(ErrorCode.POLICY_UNAVAILABLE, "policy unavailable")
+    return key_bytes
