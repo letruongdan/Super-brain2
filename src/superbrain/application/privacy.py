@@ -57,7 +57,10 @@ _FIXED_TOKENS: tuple[re.Pattern[str], ...] = (
 )
 _AUTHORITY = re.compile(r"[^/?#\s]*")
 _SEGMENT = re.compile(r"\S*")
-_CREDENTIAL_USER = re.compile(r"[^\s:/@?#]+:")
+# Credential-like userinfo prefix ``user:`` right after ``scheme://``: the username may be empty and may contain
+# a raw ``@`` (I2-T3-R06); it stops at whitespace, ``:``, ``/``, ``?`` or ``#``. Runs after successive ``://``
+# are disjoint (each ``://`` holds a ``:`` and a ``/``), so matching stays linear.
+_CREDENTIAL_USER = re.compile(r"[^\s:/?#]*:")
 _KEY_VALUE_SECRET = re.compile(
     r"(?i)\b(password|passwd|pwd|passphrase|secret|api[_-]?key|access[_-]?token|refresh[_-]?token"
     r"|client[_-]?secret|auth[_-]?token|private[_-]?key)([ \t]{0,16}[=:][ \t]{0,16})"
