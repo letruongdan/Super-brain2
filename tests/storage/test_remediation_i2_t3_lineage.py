@@ -484,3 +484,46 @@ def test_direct_record_field_lineage_refuses_filter_stripped_path_before_any_wri
     finally:
         rt.close()
     assert _files_containing(root, CANARY_1.encode("utf-8")) == []  # CAS blobs, DB/WAL, projections
+
+
+def _rehold_under_other_digest(kernel: Runtime, binding: WorkspaceBinding, *, other_holder: bool) -> tuple[str, str]:
+    """Register a snapshot, release its exact hold, then hold the SAME snapshot ID under a DIFFERENT digest.
+
+    I2-T3-R04 invariant: only the exact current hold ``(event, snapshot_id, descriptor_digest)`` proves a snapshot
+    readable. A hold of that snapshot ID on another blob is not that hold.
+    """
+    kstore = KernelWorkspaceStore(kernel.store, kernel.policy)
+    digest = _desc(TREE_1).descriptor_digest
+    sid = kstore.transact(lambda tx: register_snapshot(tx, binding, _desc(TREE_1)))
+    wrong = kernel.store.cas.put(b"unrelated blob held under the snapshot id")
+    assert wrong != digest
+    with kernel.store.transaction() as txn:
+        txn.release(digest, "event", sid, "superseded")
+        txn.hold(wrong, "event", sid, RetentionClass.DURABLE, None)
+        if other_holder:
+            txn.hold(digest, "event", new_id(), RetentionClass.DURABLE, None)
+    assert ("event", sid) not in _holder_ids(kernel, digest)
+    assert ("event", sid) in _holder_ids(kernel, wrong)
+    assert kernel.store.cas.blob_intact(digest)
+    return sid, digest
+
+
+@pytest.mark.parametrize("other_holder", [False, True], ids=["wrong-digest-only", "wrong-digest-plus-other-holder"])
+def test_hold_of_the_snapshot_id_on_another_digest_is_not_the_exact_hold(
+    kernel: Runtime, dan: SeededCredential, clock: FakeClock, trusted_tmp: Path, other_holder: bool
+) -> None:
+    binding = _register(
+        kernel, clock, dan, alias="xd", checkout=trusted_tmp / "xd", remote="https://s.example/o/x.git", egress=True
+    )
+    sid, digest = _rehold_under_other_digest(kernel, binding, other_holder=other_holder)
+    kstore = KernelWorkspaceStore(kernel.store, kernel.policy)
+    for label in ("live", "after rebuild"):
+        with pytest.raises(BrainError) as exc:
+            kstore.transact(lambda tx: admit_source_snapshot(tx, binding, sid))
+        assert exc.value.code is ErrorCode.NOT_FOUND, label
+        restrictions = StoreSourceRestrictions(kernel.store, kernel.policy)
+        assert restrictions.is_restricted(_snapshot_ref(binding, sid, digest)) is True, label
+        fresh = kstore.transact(lambda tx: register_snapshot(tx, binding, _desc(TREE_1)))
+        assert fresh != sid, label
+        assert ("event", fresh) in _holder_ids(kernel, digest), label
+        kernel.store.rebuild_projections()

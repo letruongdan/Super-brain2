@@ -98,3 +98,50 @@ def test_very_long_username_is_refused_or_redacted_in_linear_time(user_len: int)
             break
     assert rendered is None or URL_CANARY not in rendered, rendered[:200] if rendered else rendered
     assert best < 0.1, f"{best:.3f}s"
+
+
+# --- I2-T3-R06 (reopened by the independent review): empty and raw-@ usernames ------------------------------------
+# Same ledger invariant: after ``scheme://`` a credential-like ``user:password`` segment never survives, through the
+# last ``@`` before whitespace, including ``/ ? #``. The 0-length username and a username that itself contains ``@``
+# are boundary forms of that same segment, not new requirements.
+
+
+# Low-entropy fillers (``aa@aa.aa``) keep the entropy layer from masking the rule under test.
+
+
+@pytest.mark.parametrize("tail", ["aa@aa.aa", "aa@aa.aa/repo"], ids=["host", "host-path"])
+@pytest.mark.parametrize("delimiter", ["/", "?", "#", ""], ids=["slash", "query", "fragment", "none"])
+@pytest.mark.parametrize(
+    "prefix",
+    ["https://:", "https://aa@aa.aa:", "https://dan@aa.aa:"],
+    ids=["empty-user", "raw-at-user", "raw-at-email-user"],
+)
+def test_empty_or_raw_at_username_credential_like_url_never_keeps_the_password(
+    prefix: str, delimiter: str, tail: str
+) -> None:
+    url = f"{prefix}{URL_CANARY}{delimiter}{tail}"
+    rendered = _filtered_text({"description": f"clone {url} now"})
+    assert rendered is None or URL_CANARY not in rendered, rendered
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "https://:" + URL_CANARY + "/" + "a" * 60_000 + "@aa.aa",
+        "https://" + "a@" * 20_000 + "aa.aa:" + URL_CANARY + "/aa@aa.aa",
+        "https://" + "a@" * 20_000 + ":" + URL_CANARY + "?aa@aa.aa",
+        "https://" + "a" * 30_000 + "@aa.aa:" + URL_CANARY + "#aa@aa.aa",
+    ],
+    ids=["empty-user-long-password", "many-raw-at-user", "many-raw-at-empty-host", "long-user-raw-at"],
+)
+def test_empty_or_raw_at_username_forms_stay_linear_and_never_keep_the_password(text: str) -> None:
+    best = float("inf")
+    rendered: str | None = None
+    for _ in range(3):
+        start = time.perf_counter()
+        rendered = _filtered_text({"description": text})
+        best = min(best, time.perf_counter() - start)
+        if best < 0.05:
+            break
+    assert rendered is None or URL_CANARY not in rendered, rendered[:200] if rendered else rendered
+    assert best < 0.1, f"{best:.3f}s"
