@@ -13,6 +13,13 @@ from __future__ import annotations
 import uuid
 from collections.abc import Callable, Iterable, Sequence
 
+from superbrain.application._lineage_delivery import (
+    aggregate_delivery_fields,
+    append_task_bound,
+    load_delivery,
+    partition_delivery_fields,
+    replay_for,
+)
 from superbrain.application.privacy import PrivacyFilter, admissible_field_path
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.ids import new_id
@@ -407,28 +414,6 @@ def observe_within_budget(
     return observation
 
 
-def _load_delivery(tx: KernelTx, task_id: str) -> LabeledDelivery | None:
-    bound = tx.read_task_binding(task_id)
-    if bound is None:
-        return None
-    lineage, unknown = tx.read_task_lineage(task_id)
-    fields = tx.read_field_lineage(task_id)
-    return LabeledDelivery(
-        binding=bound,
-        task_lineage=lineage,
-        task_unknown=unknown,
-        items=tuple(fields[digest] for digest in sorted(fields)),
-        replayed=True,
-    )
-
-
-def _replay_for(replay: LabeledDelivery, binding: WorkspaceBinding) -> LabeledDelivery:
-    bound = replay.binding
-    if (bound.owner_id, bound.repo_id, bound.checkout_id) != (binding.owner_id, binding.repo_id, binding.checkout_id):
-        raise _not_found()
-    return replay
-
-
 def prepare_labeled_delivery(
     *,
     store: KernelStorePort,
@@ -465,9 +450,9 @@ def prepare_labeled_delivery(
         raise _deadline()
     local_deadline = local_deadline_ns(local_phase_start_ns, total_deadline_ns)
     binding = resolve_binding(principal, selector, policy, selected_scope=selected_scope)
-    replay = store.transact(lambda tx: _load_delivery(tx, task_id))
+    replay = store.transact(lambda tx: load_delivery(tx, task_id))
     if replay is not None:
-        return _replay_for(replay, binding)
+        return replay_for(replay, binding)
     safe = PrivacyFilter(monotonic_ns).apply(payload, filter_policy, deadline_ns=local_deadline)
     explicit = selector.source_snapshot_id
     observation: SnapshotObservation | None = None
@@ -479,9 +464,9 @@ def prepare_labeled_delivery(
         raise _deadline()
 
     def commit(tx: KernelTx) -> LabeledDelivery:
-        raced = _load_delivery(tx, task_id)
+        raced = load_delivery(tx, task_id)
         if raced is not None:
-            return _replay_for(raced, binding)
+            return replay_for(raced, binding)
         snapshot_id: str | None = None
         status = SnapshotStatus.UNAVAILABLE
         if explicit is not None:
@@ -524,65 +509,38 @@ def _commit_delivery(
     selector_reason: SelectorReason,
     filter_policy: FilterPolicy,
 ) -> LabeledDelivery:
-    has_snapshot = status is SnapshotStatus.AVAILABLE
-    kept = tuple(item for item in items if has_snapshot or not item.snapshot_dependent)
-    # I2-T3-R01: field identities come only from paths the filter keeps; an item whose path names a stripped key keeps
-    # its lineage restriction on the task but is never given a persisted field-path descriptor or digest.
-    persistable = {item: admissible_field_path(item.path, filter_policy) for item in items}
-    omitted = tuple(field_path_digest(item.path) for item in items if item not in kept and persistable[item])
-    task_lineage = union_lineage(
-        frozenset({binding_lineage_ref(binding)}), [*served, *(ref for item in kept for ref in item.sources)]
+    fields = aggregate_delivery_fields(items, filter_policy)
+    kept_fields, omitted_fields = partition_delivery_fields(fields, status)
+    prior_lineage, prior_unknown = tx.read_task_lineage(task_id)
+    base_task_lineage = union_lineage(
+        prior_lineage,
+        [binding_lineage_ref(binding), *served, *(ref for field in kept_fields for ref in field.sources)],
     )
-    unknown_flags = [item.unknown_source or not item.sources for item in kept]
-    task = TaskBinding(
-        task_id=task_id,
-        owner_id=binding.owner_id,
-        repo_id=binding.repo_id,
-        checkout_id=binding.checkout_id,
-        delivery_id=new_id(),
-        assignment_id=new_id(),
-        source_snapshot_id=snapshot_id,
-        snapshot_status=status,
-        selector_path=selector_path,
-        selector_reason=selector_reason,
-    )
-    tx.append_record(
-        KernelRecord(
-            "lineage.task_bound",
-            {
-                "task_id": task.task_id,
-                "owner_id": task.owner_id,
-                "repo_id": task.repo_id,
-                "checkout_id": task.checkout_id,
-                "delivery_id": task.delivery_id,
-                "assignment_id": task.assignment_id,
-                "source_snapshot_id": task.source_snapshot_id,
-                "snapshot_status": task.snapshot_status.value,
-                "selector_path": task.selector_path.value,
-                "selector_reason": task.selector_reason.value,
-            },
-        )
-    )
-    record_task_lineage(tx, task_id, task_lineage, unknown=any(unknown_flags))
-    # I2-T3-R02 (spec 14.2): content created inside a task carries the task's current lineage (binding, served and
-    # item sources) united with the item's own sources; unknown follows the item's own derivation.
-    recorded = tuple(
-        record_field_lineage(
-            tx,
-            task_id,
-            item.path,
-            union_lineage(task_lineage, item.sources),
-            unknown=flag,
-            filter_policy=filter_policy,
-        )
-        for item, flag in zip(kept, unknown_flags, strict=True)
-        if persistable[item]
+    base_task_unknown = prior_unknown or any(field.unknown for field in kept_fields)
+    task = append_task_bound(tx, binding, task_id, snapshot_id, status, selector_path, selector_reason)
+    record_task_lineage(tx, task_id, base_task_lineage, unknown=base_task_unknown)
+    # I2-T3-R01 & R02 (spec 14.2): non-admissible paths contribute restrictions to task lineage without persisting a
+    # CAS descriptor or field row; kept admissible fields inherit current task lineage united with their own sources.
+    for field in kept_fields:
+        if field.persistable:
+            record_field_lineage(
+                tx,
+                task_id,
+                field.path,
+                union_lineage(base_task_lineage, field.sources),
+                unknown=field.unknown,
+                filter_policy=filter_policy,
+            )
+    committed_lineage, committed_unknown = tx.read_task_lineage(task_id)
+    committed_fields = tx.read_field_lineage(task_id)
+    omitted = tuple(
+        sorted(field.digest for field in omitted_fields if field.persistable and field.digest not in committed_fields)
     )
     return LabeledDelivery(
         binding=task,
-        task_lineage=task_lineage,
-        task_unknown=any(unknown_flags),
-        items=recorded,
+        task_lineage=committed_lineage,
+        task_unknown=committed_unknown,
+        items=tuple(committed_fields[digest] for digest in sorted(committed_fields)),
         omitted_items=omitted,
         safe_payload=safe,
         replayed=False,

@@ -439,6 +439,14 @@ class LabeledDelivery:
             raise _invalid()
         for digest in self.omitted_items:
             require_sha256_digest(digest)
+        item_digests = {i.field_path_digest for i in self.items}
+        omitted_digests = set(self.omitted_items)
+        if (
+            len(item_digests) != len(self.items)
+            or len(omitted_digests) != len(self.omitted_items)
+            or not item_digests.isdisjoint(omitted_digests)
+        ):
+            raise _invalid()
         if self.safe_payload is not None and not isinstance(self.safe_payload, SafePayload):
             raise _invalid()
 
