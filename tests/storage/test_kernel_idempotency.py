@@ -816,8 +816,9 @@ def test_replay_rechecks_revocation_quarantine_scope(trusted_tmp: Path, os_: OsA
             "resources": [],
         }
 
-        # Quarantining the recorded snapshot descriptor after commit degrades snapshot_status to unavailable
-        # (source_snapshot_id=None, degraded_codes=["snapshot_unavailable"]) and omits snapshot_dependent content!
+        # Quarantining the recorded snapshot descriptor after commit preserves the StoredResult's historical
+        # snapshot provenance (C1:67) while omitting snapshot_dependent content under current policy (C1:56)!
+        assert initial["source_snapshot_id"] is not None
         rt.policy.record_intent(IntentKind.QUARANTINE, {"digest": _desc(TREE_A).descriptor_digest})
         snap_quar_replayed = _expect_ok(
             "prepare_task",
@@ -826,10 +827,25 @@ def test_replay_rechecks_revocation_quarantine_scope(trusted_tmp: Path, os_: OsA
             ),
         )
         assert snap_quar_replayed["delivery_id"] == initial["delivery_id"]
-        assert snap_quar_replayed["source_snapshot_id"] is None
-        assert snap_quar_replayed["snapshot_status"] == "unavailable"
-        assert snap_quar_replayed["degraded_codes"] == ["snapshot_unavailable"]
+        assert snap_quar_replayed["assignment_id"] == initial["assignment_id"]
+        assert snap_quar_replayed["source_snapshot_id"] == initial["source_snapshot_id"]
+        assert snap_quar_replayed["snapshot_status"] == "available"
+        assert snap_quar_replayed["degraded_codes"] == []
         assert snap_quar_replayed["finishing_gates"] == []
+        assert snap_quar_replayed["skills"] == replayed["skills"]
+
+        rendered_snap_quar = bridge.render_current(stored, cred_a2.principal, selected_scope=scope_alpha)
+        assert isinstance(rendered_snap_quar, dict)
+        for field_name in (
+            "delivery_id",
+            "assignment_id",
+            "source_snapshot_id",
+            "snapshot_status",
+            "degraded_codes",
+            "finishing_gates",
+            "skills",
+        ):
+            assert rendered_snap_quar[field_name] == snap_quar_replayed[field_name]
     finally:
         rt.close()
 
