@@ -70,9 +70,11 @@ from superbrain.ports.clock import Clock
 from superbrain.ports.kernel import KernelBlobStagePort, KernelPolicyPort, KernelTx, SnapshotObserver
 from superbrain.ports.policy import PolicyView
 from superbrain.storage.identity import authorize_direct_ref
-from superbrain.storage.kinds import EntryKind, FieldType, KindRegistry
+from superbrain.storage.kernel_schema import KERNEL_WORKSPACE_KINDS
+from superbrain.storage.kinds import CORE_KINDS, EntryKind, FieldType, KindRegistry
 from superbrain.storage.ledger import LedgerEntry, ProjectionHandler
 from superbrain.storage.store import Store
+from superbrain.storage.workspaces import StoreKernelTx
 
 _SLOTS = frozenset({"skills", "lessons", "continuity", "context", "finishing_gates"})
 _LEVELS = frozenset({"L0", "L1", "L2"})
@@ -119,6 +121,7 @@ FIXTURE_DOMAIN_KINDS: tuple[EntryKind, ...] = (
             "slot": FieldType.ENUM,
             "position": FieldType.INT,
             "omitted": FieldType.BOOL,
+            "snapshot_dependent": FieldType.BOOL,
             "ref_kind": FieldType.OPAQUE_ID,
             "ref_id": FieldType.OPAQUE_ID,
             "ref_revision": FieldType.INT,
@@ -278,6 +281,7 @@ class FixtureDomainProjection:
             "slot TEXT NOT NULL, "
             "position INTEGER NOT NULL, "
             "omitted INTEGER NOT NULL, "
+            "snapshot_dependent INTEGER NOT NULL, "
             "ref_kind TEXT NOT NULL, "
             "ref_id TEXT NOT NULL, "
             "ref_revision INTEGER NOT NULL, "
@@ -372,12 +376,13 @@ class FixtureDomainProjection:
             )
         elif entry.kind == "fixture.delivery_result_item":
             db.execute(
-                f"INSERT INTO {prefix}delivery_items VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                f"INSERT INTO {prefix}delivery_items VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     m["result_id"],
                     m["slot"],
                     m["position"],
                     1 if m["omitted"] else 0,
+                    1 if m["snapshot_dependent"] else 0,
                     m["ref_kind"],
                     m["ref_id"],
                     m["ref_revision"],
@@ -464,14 +469,9 @@ class FixtureDomainProjection:
 
 def fixture_store_extensions() -> tuple[tuple[ProjectionHandler, ...], KindRegistry]:
     """Return ``(handlers, kinds)`` combining production kernel workspace extensions with the test fixture domain."""
-    ws_handlers, ws_kinds = kernel_store_extensions()
-    all_kinds = KindRegistry([*(ws_kinds.get(name) for name in _kind_names(ws_kinds)), *FIXTURE_DOMAIN_KINDS])
+    ws_handlers, _ = kernel_store_extensions()
+    all_kinds = KindRegistry([*CORE_KINDS, *KERNEL_WORKSPACE_KINDS, *FIXTURE_DOMAIN_KINDS])
     return ((*ws_handlers, FixtureDomainProjection()), all_kinds)
-
-
-def _kind_names(registry: KindRegistry) -> tuple[str, ...]:
-    internal = getattr(registry, "_kinds", {})
-    return tuple(sorted(internal))
 
 
 def validate_response_envelope(tool: str, envelope: Mapping[str, JsonValue]) -> dict[str, JsonValue]:
@@ -740,10 +740,14 @@ class FixtureKernelDomain(KernelToolDomain):
             elif observation is not None:
                 status = observation.status
 
+            persisted_paths = {fe.path for fe in agg_fields if fe.persistable}
             served_refs = tuple(
                 LineageRef(owner_id=spec.owner_id, repo_id=spec.repo_id, source=spec.ref)
-                for spec, _, _, _ in spec_paths
-                if spec.repo_id is not None and not spec.unknown_source
+                for spec, path, _, _ in spec_paths
+                if path in persisted_paths
+                and (status is SnapshotStatus.AVAILABLE or not spec.snapshot_dependent)
+                and spec.repo_id is not None
+                and not spec.unknown_source
             )
             labeled = commit_new_labeled_delivery(
                 tx,
@@ -776,6 +780,7 @@ class FixtureKernelDomain(KernelToolDomain):
                 entry_dict: dict[str, JsonValue] = {
                     "slot": spec.slot,
                     "position": pos,
+                    "snapshot_dependent": spec.snapshot_dependent,
                     "ref": spec.ref.to_dict(),
                     "owner_id": spec.owner_id,
                     "repo_id": spec.repo_id,
@@ -794,6 +799,7 @@ class FixtureKernelDomain(KernelToolDomain):
                             "slot": spec.slot,
                             "position": pos,
                             "omitted": is_omitted,
+                            "snapshot_dependent": spec.snapshot_dependent,
                             "ref_kind": spec.ref.kind,
                             "ref_id": spec.ref.id,
                             "ref_revision": spec.ref.revision,
@@ -1058,6 +1064,8 @@ class FixtureKernelDomain(KernelToolDomain):
         *,
         selected_scope: Scope | None,
     ) -> dict[str, JsonValue]:
+        pview = self._policy_view()
+        snap_readable = False
         with self.store.transaction() as read_txn:
             d_row = read_txn.db.execute(
                 "SELECT result_id, task_id, owner_id, repo_id, checkout_id, delivery_id, assignment_id, "
@@ -1067,7 +1075,7 @@ class FixtureKernelDomain(KernelToolDomain):
             ).fetchone()
             item_rows = (
                 read_txn.db.execute(
-                    "SELECT slot, position, omitted, ref_kind, ref_id, ref_revision, ref_digest, "
+                    "SELECT slot, position, omitted, snapshot_dependent, ref_kind, ref_id, ref_revision, ref_digest, "
                     "owner_id, repo_id, checkout_id FROM p_fixture_domain_delivery_items "
                     "WHERE result_id = ? ORDER BY slot, position",
                     (str(d_row[0]),),
@@ -1075,6 +1083,19 @@ class FixtureKernelDomain(KernelToolDomain):
                 if d_row is not None
                 else []
             )
+            if d_row is not None and d_row[7] is not None:
+                ktx = StoreKernelTx(read_txn, self.store.cas, pview)
+                snap = ktx.read_source_snapshot(str(d_row[7]))
+                snap_readable = (
+                    snap is not None
+                    and snap.owner_id == str(d_row[2])
+                    and snap.repo_id == str(d_row[3])
+                    and snap.checkout_id == str(d_row[4])
+                    and ktx.snapshot_held(snap.snapshot_id, snap.descriptor_digest)
+                    and not ktx.holder_tombstoned(snap.snapshot_id)
+                    and not ktx.blob_restricted(snap.descriptor_digest)
+                    and ktx.blob_present(snap.descriptor_digest)
+                )
         if d_row is None or primary.revision != 1:
             raise BrainError(ErrorCode.NOT_FOUND, "not found")
         (
@@ -1096,10 +1117,11 @@ class FixtureKernelDomain(KernelToolDomain):
 
         selected_entries: list[dict[str, JsonValue]] = []
         omitted_entries: list[dict[str, JsonValue]] = []
-        for s_slot, s_pos, s_omit, r_kind, r_id, r_rev, r_dig, r_owner, r_repo, r_chk in item_rows:
+        for s_slot, s_pos, s_omit, s_snap_dep, r_kind, r_id, r_rev, r_dig, r_owner, r_repo, r_chk in item_rows:
             entry_obj: dict[str, JsonValue] = {
                 "slot": str(s_slot),
                 "position": int(s_pos),
+                "snapshot_dependent": int(s_snap_dep) == 1,
                 "ref": {
                     "kind": str(r_kind),
                     "id": str(r_id),
@@ -1135,16 +1157,20 @@ class FixtureKernelDomain(KernelToolDomain):
         if expected_digest != str(stored_digest) or expected_digest != primary.digest:
             raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
 
-        # Authorize caller identity against policy; checkouts/grants/quarantine determine item redaction & access.
-        caller_active = self.policy.allows(principal, None, action="get_health")
-        if not caller_active or str(owner_id) != principal.owner_id:
+        # Authorize recorded Delivery subject against live principal, workspace grant, machine & selected_scope (C1/D3).
+        req_scope = Scope(str(repo_id), str(checkout_id))
+        if (
+            str(owner_id) != principal.owner_id
+            or (selected_scope is not None and selected_scope != req_scope)
+            or not self.policy.allows(principal, req_scope, action="prepare_task")
+        ):
             raise BrainError(ErrorCode.NOT_FOUND, "not found")
         auth_snap = self.policy.snapshot()
-        chk_binding = auth_snap.checkouts.get(str(checkout_id))
-        if chk_binding is None or chk_binding.machine_id != principal.machine_id:
-            raise BrainError(ErrorCode.NOT_FOUND, "not found")
 
-        effective_scope = selected_scope if selected_scope is not None else Scope(str(repo_id), str(checkout_id))
+        snapshot_degraded = snapshot_id is not None and not snap_readable
+        rendered_snapshot_id: str | None = None if (snapshot_id is None or snapshot_degraded) else str(snapshot_id)
+        status_enum = SnapshotStatus.UNAVAILABLE if snapshot_degraded else SnapshotStatus(str(snap_status))
+
         slots: dict[str, list[JsonValue]] = {
             "skills": [],
             "lessons": [],
@@ -1152,13 +1178,14 @@ class FixtureKernelDomain(KernelToolDomain):
             "context": [],
             "finishing_gates": [],
         }
-        pview = self._policy_view()
-        for s_slot, _s_pos, s_omit, r_kind, r_id, r_rev, r_dig, r_owner, r_repo, r_chk in item_rows:
+        for s_slot, _s_pos, s_omit, s_snap_dep, r_kind, r_id, r_rev, r_dig, r_owner, r_repo, r_chk in item_rows:
             if int(s_omit) == 1:
+                continue
+            if int(s_snap_dep) == 1 and rendered_snapshot_id is None:
                 continue
             redacted = self._item_is_redacted(
                 principal=principal,
-                effective_scope=effective_scope,
+                effective_scope=req_scope,
                 auth_snap=auth_snap,
                 pview=pview,
                 ref_kind=str(r_kind),
@@ -1187,13 +1214,12 @@ class FixtureKernelDomain(KernelToolDomain):
                     }
                 )
 
-        status_enum = SnapshotStatus(str(snap_status))
         degraded_code = SNAPSHOT_DEGRADED_CODES.get(status_enum)
         degraded_codes: list[JsonValue] = [degraded_code] if degraded_code is not None else []
         return {
             "workspace_id": str(repo_id),
             "checkout_id": str(checkout_id),
-            "source_snapshot_id": None if snapshot_id is None else str(snapshot_id),
+            "source_snapshot_id": rendered_snapshot_id,
             "snapshot_status": status_enum.value,
             "degraded_codes": degraded_codes,
             "task_id": str(task_id),
@@ -1255,7 +1281,13 @@ class FixtureKernelDomain(KernelToolDomain):
         )
         if expected_rec_digest != str(stored_rec_digest) or expected_rec_digest != primary.digest:
             raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
-        if not self.policy.allows(principal, None, action="get_health") or str(owner_id) != principal.owner_id:
+        req_scope = Scope(str(repo_id), str(checkout_id))
+        if (
+            str(owner_id) != principal.owner_id
+            or selected_scope is None
+            or selected_scope != req_scope
+            or not self.policy.allows(principal, req_scope, action="get_artifact")
+        ):
             raise BrainError(ErrorCode.NOT_FOUND, "not found")
 
         auth_snap = self.policy.snapshot()
@@ -1270,14 +1302,11 @@ class FixtureKernelDomain(KernelToolDomain):
                 "resources": [],
             }
         a_kind, a_owner, a_repo, a_chk, holder_id = a_row
-        eff_scope = selected_scope
-        scope_mismatch = eff_scope is None or eff_scope != Scope(str(repo_id), str(checkout_id))
         redacted = (
-            scope_mismatch
-            or pview.is_tombstoned("event", str(holder_id))
+            pview.is_tombstoned("event", str(holder_id))
             or self._item_is_redacted(
                 principal=principal,
-                effective_scope=eff_scope if eff_scope is not None else Scope(str(repo_id), str(checkout_id)),
+                effective_scope=req_scope,
                 auth_snap=auth_snap,
                 pview=pview,
                 ref_kind=str(a_kind),

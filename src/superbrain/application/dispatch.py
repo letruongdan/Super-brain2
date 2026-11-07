@@ -38,6 +38,16 @@ from superbrain.ports.kernel import (
     KernelTx,
 )
 
+_STORED_KIND_ACTIONS: dict[str, str] = {
+    "delivery_result": "prepare_task",
+    "artifact_result": "get_artifact",
+    "outcome_result": "record_outcome",
+}
+
+
+def _scope_action_for_stored(result: StoredResult) -> str:
+    return _STORED_KIND_ACTIONS.get(result.refs[0].kind, "prepare_task") if result.refs else "prepare_task"
+
 
 @dataclass(frozen=True)
 class PreparedEffect:
@@ -114,12 +124,22 @@ class KernelDispatcher:
             raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
         if not self._policy.allows(principal, None, action="get_health"):
             raise BrainError(ErrorCode.NOT_FOUND, "not found")
-        if selected_scope is not None and not self._policy.allows(principal, selected_scope, action="get_artifact"):
+        if selected_scope is not None and not self._policy.allows(
+            principal, selected_scope, action=_scope_action_for_stored(result)
+        ):
             raise BrainError(ErrorCode.NOT_FOUND, "not found")
         if self._domain is None:
             raise BrainError(ErrorCode.CAPABILITY_UNAVAILABLE, "capability unavailable")
         rendered = self._domain.render_stored(result, principal, selected_scope=selected_scope)
         make_success_envelope(rendered)
+        return rendered
+
+    def _render_dict(
+        self, result: StoredResult, principal: Principal, *, selected_scope: Scope | None
+    ) -> dict[str, JsonValue]:
+        rendered = self.render_current(result, principal, selected_scope=selected_scope)
+        if not isinstance(rendered, dict):
+            raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
         return rendered
 
     def _verify_owner_auth_and_scope(self, call: Call, ctx: CallContext, auth: PrivateRequestAuth) -> Principal:
@@ -194,9 +214,7 @@ class KernelDispatcher:
                 assignment_id=existing.assignment_id,
                 refs=existing.refs,
             )
-            rendered_replay = self._domain.render_stored(
-                replay_result, live_principal, selected_scope=call.selected_scope
-            )
+            rendered_replay = self._render_dict(replay_result, live_principal, selected_scope=call.selected_scope)
             self._idempotency.record_replay(row=existing, now=now)
             return rendered_replay
 
@@ -227,7 +245,7 @@ class KernelDispatcher:
             except Exception as exc:  # noqa: BLE001 — lost completion callback after durable commit (4a line 160)
                 raise BrainError(ErrorCode.COMMIT_OUTCOME_UNKNOWN, "commit outcome unknown") from exc
 
-        return self._domain.render_stored(stored, live_principal, selected_scope=call.selected_scope)
+        return self._render_dict(stored, live_principal, selected_scope=call.selected_scope)
 
     def _check_raced_row(self, row: IdempotencyRow, call: Call, *, now: datetime) -> None:
         self._verify_retained_row(row, call, now=now)

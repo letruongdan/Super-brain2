@@ -133,12 +133,13 @@ def validate_c4_clock(
             "SELECT value FROM meta WHERE key = ?",
             (IDEMPOTENCY_CLOCK_HWM_META_KEY,),
         ).fetchone()
-        agg_row = db.execute("SELECT COUNT(*), MIN(committed_at), MAX(committed_at) FROM idempotency").fetchone()
+        count_row = db.execute("SELECT COUNT(*) FROM idempotency").fetchone()
+        comm_rows = db.execute("SELECT DISTINCT committed_at FROM idempotency").fetchall()
     except sqlite3.Error as exc:
         raise sqlite_error("cannot validate idempotency clock watermark", exc) from exc
 
-    assert agg_row is not None
-    row_count = int(agg_row[0]) if type(agg_row[0]) is int else -1
+    assert count_row is not None
+    row_count = int(count_row[0]) if type(count_row[0]) is int else -1
     if row_count < 0:
         raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
 
@@ -157,16 +158,14 @@ def validate_c4_clock(
     elif row_count > 0:
         raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
 
-    if row_count > 0:
-        min_comm, max_comm = agg_row[1], agg_row[2]
-        if not isinstance(min_comm, str) or not isinstance(max_comm, str):
+    for (raw_comm,) in comm_rows:
+        if not isinstance(raw_comm, str):
             raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
         try:
-            _ = parse_canonical_utc(min_comm)
-            max_comm_utc = parse_canonical_utc(max_comm)
+            comm_utc = parse_canonical_utc(raw_comm)
         except BrainError as err:
             raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure") from err
-        if now_utc < max_comm_utc:
+        if now_utc < comm_utc:
             raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
 
     if epoch_hwm_utc is not None and now_utc < epoch_hwm_utc:

@@ -24,10 +24,8 @@ from superbrain.ports.policy import PolicyView
 from superbrain.storage._idempotency_sql import (
     advance_c4_hwm,
     delete_idempotency_rows,
-    read_idempotency_row,
     select_expired_rows,
     validate_c4_clock,
-    write_idempotency_row,
 )
 from superbrain.storage.cas import ContentStore
 from superbrain.storage.kinds import RetentionClass, is_uuid
@@ -129,7 +127,8 @@ class KernelIdempotencyStore(KernelIdempotencyPort):
     def lookup_for_owner(self, *, principal_id: str, tool: str, key_hash: str, now: datetime) -> IdempotencyRow | None:
         with self._store.transaction() as txn:
             self._validate_clock(txn.db, now)
-            return read_idempotency_row(txn.db, principal_id, tool, key_hash)
+            ktx = StoreKernelTx(txn, self._store.cas, self._policy_view)
+            return ktx.read_idempotency(principal_id, tool, key_hash)
 
     def record_replay(self, *, row: IdempotencyRow, now: datetime) -> None:
         _ = row
@@ -152,7 +151,14 @@ class KernelIdempotencyStore(KernelIdempotencyPort):
     ) -> tuple[StoredResult, bool]:
         with self._store.transaction() as txn:
             now_utc, now_str, durable_hwm = self._validate_clock(txn.db, now)
-            existing = read_idempotency_row(txn.db, principal_id, tool, key_hash)
+            strict_tx = StrictKernelTx(
+                txn,
+                self._store.cas,
+                self._policy_view,
+                store_id=self._store.store_id,
+                staged_blobs=staged_blobs,
+            )
+            existing = strict_tx.read_idempotency(principal_id, tool, key_hash)
             if existing is not None:
                 verify_raced_row(existing)
                 if now_utc < existing.committed_at_utc() + IDEMPOTENCY_TTL:
@@ -166,13 +172,6 @@ class KernelIdempotencyStore(KernelIdempotencyPort):
                         True,
                     )
 
-            strict_tx = StrictKernelTx(
-                txn,
-                self._store.cas,
-                self._policy_view,
-                store_id=self._store.store_id,
-                staged_blobs=staged_blobs,
-            )
             stored = apply(strict_tx)
             if not isinstance(stored, StoredResult):
                 raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
@@ -187,7 +186,7 @@ class KernelIdempotencyStore(KernelIdempotencyPort):
                 refs=stored.refs,
                 committed_at=now_str,
             )
-            write_idempotency_row(txn.db, new_row)
+            strict_tx.save_idempotency(new_row)
             advance_c4_hwm(txn.db, now_str, current_hwm=durable_hwm)
         return stored, False
 

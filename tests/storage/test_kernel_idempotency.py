@@ -29,6 +29,7 @@ from superbrain.core.kernel import (
     AccountingStatus,
     CallContext,
     DaemonConfig,
+    IdempotencyRow,
     Identity,
     JobState,
     ObjectRef,
@@ -65,6 +66,7 @@ from superbrain.storage.restore import restore_policy, restore_store
 from superbrain.storage.runtime import Runtime, admit_existing_pair, open_runtime, open_runtime_under_lease
 from superbrain.storage.schema import SchemaInfo, code_version, read_schema_info
 from superbrain.storage.store import Store
+from superbrain.storage.workspaces import StoreKernelTx
 from tests.storage.conftest import maintenance_lease
 from tests.support.clock import FakeClock
 from tests.support.inc2_fixture import (
@@ -79,6 +81,7 @@ from tests.support.kernel_auth import SeededCredential, make_bootstrap_auth, see
 MS = 1_000_000
 REMOTE_A = "https://github.example/dan/repo-alpha.git"
 REMOTE_B = "https://github.example/dan/repo-beta.git"
+REMOTE_C = "https://github.example/dan/repo-gamma.git"
 TREE_A = "sha256:" + "a" * 64
 TREE_B = "sha256:" + "b" * 64
 TREE_C = "sha256:" + "c" * 64
@@ -566,6 +569,7 @@ def test_replay_rechecks_revocation_quarantine_scope(trusted_tmp: Path, os_: OsA
         skill_quar_ref = ObjectRef(kind="skill", id="skill-quar", revision=1, digest=digest_bytes(b"skill-quar"))
         lesson_beta_ref = ObjectRef(kind="lesson", id="lesson-beta", revision=2, digest=digest_bytes(b"lesson-beta"))
         ctx_other_chk_ref = ObjectRef(kind="context", id="ctx-chk2", revision=1, digest=digest_bytes(b"ctx-chk2"))
+        gate_snap_dep_ref = ObjectRef(kind="gate", id="gate-snap", revision=1, digest=digest_bytes(b"gate-snap"))
 
         def plan(binding: WorkspaceBinding, _task_id: str) -> Sequence[FixtureDeliveryRefSpec]:
             return (
@@ -597,6 +601,14 @@ def test_replay_rechecks_revocation_quarantine_scope(trusted_tmp: Path, os_: OsA
                     repo_id=ws_alpha.repo_id,
                     checkout_id=ws_alpha_2.checkout_id,
                 ),
+                FixtureDeliveryRefSpec(
+                    slot="finishing_gates",
+                    ref=gate_snap_dep_ref,
+                    owner_id=binding.owner_id,
+                    repo_id=ws_alpha.repo_id,
+                    checkout_id=ws_alpha.checkout_id,
+                    snapshot_dependent=True,
+                ),
             )
 
         scope_alpha = Scope(ws_alpha.repo_id, ws_alpha.checkout_id)
@@ -617,6 +629,18 @@ def test_replay_rechecks_revocation_quarantine_scope(trusted_tmp: Path, os_: OsA
         )
         _ = art_ref
 
+        render_current_calls = 0
+        orig_render_current = bridge._dispatcher.render_current
+
+        def spy_render_current(
+            result: StoredResult, principal: Principal, *, selected_scope: Scope | None
+        ) -> JsonValue:
+            nonlocal render_current_calls
+            render_current_calls += 1
+            return orig_render_current(result, principal, selected_scope=selected_scope)
+
+        bridge._dispatcher.render_current = spy_render_current  # type: ignore[method-assign]
+
         prep_call = normalize_call(
             "prepare_task",
             {
@@ -635,6 +659,7 @@ def test_replay_rechecks_revocation_quarantine_scope(trusted_tmp: Path, os_: OsA
                 prep_call, _ctx_for(rt, cred_a1.principal, mono, selected_scope=scope_alpha), auth=_auth_for(cred_a1)
             ),
         )
+        assert render_current_calls == 1
         # Initially: skill-keep & skill-quar & lesson-beta are ok; ctx-chk2 is already out of scope for chk-alpha!
         assert initial["skills"] == [
             {"kind": "skill", "id": "skill-keep", "revision": 1, "digest": skill_ok_ref.digest, "status": "ok"},
@@ -718,12 +743,14 @@ def test_replay_rechecks_revocation_quarantine_scope(trusted_tmp: Path, os_: OsA
             )
 
         # Replay via active cred_a2: same delivery_id & assignment_id, while quarantined & grant-lost refs redact!
+        rc_before_replay = render_current_calls
         replayed = _expect_ok(
             "prepare_task",
             bridge.dispatch(
                 prep_call, _ctx_for(rt, cred_a2.principal, mono, selected_scope=scope_alpha), auth=_auth_for(cred_a2)
             ),
         )
+        assert render_current_calls == rc_before_replay + 1
         assert replayed["delivery_id"] == initial["delivery_id"]
         assert replayed["assignment_id"] == initial["assignment_id"]
         assert replayed["skills"] == [
@@ -732,29 +759,46 @@ def test_replay_rechecks_revocation_quarantine_scope(trusted_tmp: Path, os_: OsA
         ]
         assert replayed["lessons"] == [{"id": "lesson-beta", "status": "redacted", "reason": "access_restricted"}]
         assert replayed["context"] == [{"id": "ctx-chk2", "status": "redacted", "reason": "access_restricted"}]
+        assert replayed["finishing_gates"] == [
+            {"kind": "gate", "id": "gate-snap", "revision": 1, "digest": gate_snap_dep_ref.digest, "status": "ok"}
+        ]
 
-        # Direct render_current with another selected_scope also redacts skill-keep as out of scope!
+        # Direct render_current on authorized scope_alpha returns the redacted items; cross-checkout selected_scope
+        # on chk-alpha's recorded Delivery or Artifact receipt MUST refuse with NOT_FOUND per D3!
         with rt.store.transaction() as stxn:
             row = stxn.db.execute(
                 "SELECT result_id, assignment_id, refs_json FROM idempotency WHERE principal_id = ? AND tool = ?",
                 (cred_a2.principal.principal_id, "prepare_task"),
             ).fetchone()
-        assert row is not None
+            art_row = stxn.db.execute(
+                "SELECT result_id, assignment_id, refs_json FROM idempotency WHERE principal_id = ? AND tool = ?",
+                (cred_a2.principal.principal_id, "get_artifact"),
+            ).fetchone()
+        assert row is not None and art_row is not None
         stored = StoredResult(
             result_id=str(row[0]),
             assignment_id=None if row[1] is None else str(row[1]),
             refs=StoredResult.decode_refs_json(str(row[2])),
         )
-        rendered_other_scope = bridge.render_current(
-            stored,
-            cred_a2.principal,
-            selected_scope=Scope(ws_alpha.repo_id, ws_alpha_2.checkout_id),
+        art_stored = StoredResult(
+            result_id=str(art_row[0]),
+            assignment_id=None if art_row[1] is None else str(art_row[1]),
+            refs=StoredResult.decode_refs_json(str(art_row[2])),
         )
-        assert isinstance(rendered_other_scope, dict)
-        assert rendered_other_scope["skills"] == [
-            {"id": "skill-keep", "status": "redacted", "reason": "access_restricted"},
-            {"id": "skill-quar", "status": "redacted", "reason": "access_restricted"},
-        ]
+        rendered_same_scope = bridge.render_current(stored, cred_a2.principal, selected_scope=scope_alpha)
+        assert isinstance(rendered_same_scope, dict)
+        assert rendered_same_scope["skills"] == replayed["skills"]
+        assert rendered_same_scope["lessons"] == replayed["lessons"]
+        assert rendered_same_scope["context"] == replayed["context"]
+
+        other_chk_scope = Scope(ws_alpha.repo_id, ws_alpha_2.checkout_id)
+        with pytest.raises(BrainError) as other_deliv_exc:
+            bridge.render_current(stored, cred_a2.principal, selected_scope=other_chk_scope)
+        assert other_deliv_exc.value.code is ErrorCode.NOT_FOUND
+
+        with pytest.raises(BrainError) as other_art_exc:
+            bridge.render_current(art_stored, cred_a2.principal, selected_scope=other_chk_scope)
+        assert other_art_exc.value.code is ErrorCode.NOT_FOUND
 
         # Replaying get_artifact after blob quarantine preserves result identity & returns schema-valid redacted result.
         art_replayed = _expect_ok(
@@ -771,6 +815,21 @@ def test_replay_rechecks_revocation_quarantine_scope(trusted_tmp: Path, os_: OsA
             "reason": "access_restricted",
             "resources": [],
         }
+
+        # Quarantining the recorded snapshot descriptor after commit degrades snapshot_status to unavailable
+        # (source_snapshot_id=None, degraded_codes=["snapshot_unavailable"]) and omits snapshot_dependent content!
+        rt.policy.record_intent(IntentKind.QUARANTINE, {"digest": _desc(TREE_A).descriptor_digest})
+        snap_quar_replayed = _expect_ok(
+            "prepare_task",
+            bridge.dispatch(
+                prep_call, _ctx_for(rt, cred_a2.principal, mono, selected_scope=scope_alpha), auth=_auth_for(cred_a2)
+            ),
+        )
+        assert snap_quar_replayed["delivery_id"] == initial["delivery_id"]
+        assert snap_quar_replayed["source_snapshot_id"] is None
+        assert snap_quar_replayed["snapshot_status"] == "unavailable"
+        assert snap_quar_replayed["degraded_codes"] == ["snapshot_unavailable"]
+        assert snap_quar_replayed["finishing_gates"] == []
     finally:
         rt.close()
 
@@ -954,6 +1013,150 @@ def test_expiry_is_30_days_from_original_commit(trusted_tmp: Path) -> None:
         assert _count_rows(rt.store, "p_cas_holders_") == holders_before
         assert _count_rows(rt.store, "artifact_send_attempt") == 1
         assert _count_rows(rt.store, "artifact_read_ack") == 1
+
+        # Concurrent reuse hitting commit_prepared_effect's raced-live-row branch
+        # (same-HMAC replay & changed-HMAC conflict):
+        race_completions: list[str] = []
+        obs.descriptor = _desc(TREE_A)
+        race_bridge, race_domain = _make_bridge(
+            rt,
+            clock,
+            mono,
+            observer=obs,
+            on_commit_completed=lambda sr: race_completions.append(sr.result_id),
+        )
+        # Seed initial row at 2027-01-01T00:00:00Z, then advance 30 days to 2027-01-31T00:00:00Z so it is expired.
+        clock.set(dt.datetime(2027, 1, 1, 0, 0, 0, 0, tzinfo=dt.UTC))
+        call_race_seed = normalize_call(
+            "prepare_task",
+            {
+                "schema_version": "2.0",
+                "workspace_hint": "ws-exp",
+                "description": "seed before concurrent reuse",
+                "idempotency_key": "idem_ttl_race_reuse_01",
+            },
+            seeded.principal,
+            selected_scope=scope,
+        )
+        _expect_ok(
+            "prepare_task",
+            race_bridge.dispatch(
+                call_race_seed, _ctx_for(rt, seeded.principal, mono, selected_scope=scope), auth=_auth_for(seeded)
+            ),
+        )
+        assert race_domain.apply_calls == 1
+        assert len(race_completions) == 1
+
+        # Case 1 (same-HMAC raced reuse at 2027-01-31T00:00:00Z): both callers pass lookup_for_owner seeing the expired
+        # row; winner commits replacement right before loser enters commit_prepared_effect -> loser replays winner's row
+        # (was_raced_replay=True) with ZERO extra apply_calls and ZERO extra on_commit_completed callbacks!
+        clock.set(dt.datetime(2027, 1, 31, 0, 0, 0, 0, tzinfo=dt.UTC))
+        obs.descriptor = _desc(TREE_B)
+        call_race_same = normalize_call(
+            "prepare_task",
+            {
+                "schema_version": "2.0",
+                "workspace_hint": "ws-exp",
+                "description": "winner replacement payload v1",
+                "idempotency_key": "idem_ttl_race_reuse_01",
+            },
+            seeded.principal,
+            selected_scope=scope,
+        )
+        orig_commit_fn = race_bridge._dispatcher._idempotency.commit_prepared_effect
+        winner_same_result: dict[str, JsonValue] | None = None
+        inject_same_once = True
+
+        def raced_same_commit(**kwargs: object) -> tuple[StoredResult, bool]:
+            nonlocal inject_same_once, winner_same_result
+            if inject_same_once:
+                inject_same_once = False
+                winner_same_result = _expect_ok(
+                    "prepare_task",
+                    race_bridge.dispatch(
+                        call_race_same,
+                        _ctx_for(rt, seeded.principal, mono, selected_scope=scope),
+                        auth=_auth_for(seeded),
+                    ),
+                )
+            return orig_commit_fn(**kwargs)  # type: ignore[arg-type]
+
+        race_bridge._dispatcher._idempotency.commit_prepared_effect = raced_same_commit  # type: ignore[method-assign]
+        try:
+            loser_same_result = _expect_ok(
+                "prepare_task",
+                race_bridge.dispatch(
+                    call_race_same, _ctx_for(rt, seeded.principal, mono, selected_scope=scope), auth=_auth_for(seeded)
+                ),
+            )
+        finally:
+            race_bridge._dispatcher._idempotency.commit_prepared_effect = orig_commit_fn  # type: ignore[method-assign]
+
+        assert winner_same_result is not None
+        assert loser_same_result == winner_same_result
+        assert race_domain.apply_calls == 2  # 1 seed + 1 winner (loser did NOT run apply!)
+        assert len(race_completions) == 2  # loser hit was_raced_replay=True -> no duplicate completion signal!
+
+        # Case 2 (changed-HMAC raced reuse after another 30d at 2027-03-02T00:00:00Z): winner commits replacement first,
+        # loser enters commit_prepared_effect with different normalized arguments -> IDEMPOTENCY_CONFLICT & zero writes!
+        clock.set(dt.datetime(2027, 3, 2, 0, 0, 0, 0, tzinfo=dt.UTC))
+        obs.descriptor = _desc(TREE_C)
+        call_race_winner_2 = normalize_call(
+            "prepare_task",
+            {
+                "schema_version": "2.0",
+                "workspace_hint": "ws-exp",
+                "description": "winner replacement payload v2",
+                "idempotency_key": "idem_ttl_race_reuse_01",
+            },
+            seeded.principal,
+            selected_scope=scope,
+        )
+        call_race_loser_conflict = normalize_call(
+            "prepare_task",
+            {
+                "schema_version": "2.0",
+                "workspace_hint": "ws-exp",
+                "description": "conflicting loser payload v2",
+                "idempotency_key": "idem_ttl_race_reuse_01",
+            },
+            seeded.principal,
+            selected_scope=scope,
+        )
+        winner_2_result: dict[str, JsonValue] | None = None
+        inject_conflict_once = True
+
+        def raced_conflict_commit(**kwargs: object) -> tuple[StoredResult, bool]:
+            nonlocal inject_conflict_once, winner_2_result
+            if inject_conflict_once:
+                inject_conflict_once = False
+                winner_2_result = _expect_ok(
+                    "prepare_task",
+                    race_bridge.dispatch(
+                        call_race_winner_2,
+                        _ctx_for(rt, seeded.principal, mono, selected_scope=scope),
+                        auth=_auth_for(seeded),
+                    ),
+                )
+            return orig_commit_fn(**kwargs)  # type: ignore[arg-type]
+
+        race_bridge._dispatcher._idempotency.commit_prepared_effect = raced_conflict_commit  # type: ignore[method-assign]
+        try:
+            _expect_err(
+                "prepare_task",
+                race_bridge.dispatch(
+                    call_race_loser_conflict,
+                    _ctx_for(rt, seeded.principal, mono, selected_scope=scope),
+                    auth=_auth_for(seeded),
+                ),
+                ErrorCode.IDEMPOTENCY_CONFLICT,
+            )
+        finally:
+            race_bridge._dispatcher._idempotency.commit_prepared_effect = orig_commit_fn  # type: ignore[method-assign]
+
+        assert winner_2_result is not None
+        assert race_domain.apply_calls == 3  # only winner_2 ran apply; conflicting loser wrote nothing!
+        assert len(race_completions) == 3
     finally:
         rt.close()
 
@@ -966,8 +1169,8 @@ def test_retry_after_tree_changes_keeps_original_snapshot(trusted_tmp: Path, os_
     rt = _open_fixture_runtime(trusted_tmp / "root", os_)
     try:
         seeded = seed_principal_and_credential(rt.policy)
-        ws_1 = _register_ws(rt, clock, seeded, alias="ws-hint", checkout_dir=trusted_tmp / "chk-1")
-        ws_2 = _register_ws(rt, clock, seeded, alias="ws-other-2", checkout_dir=trusted_tmp / "chk-2")
+        ws_1 = _register_ws(rt, clock, seeded, alias="ws-hint", checkout_dir=trusted_tmp / "chk-1", remote=REMOTE_A)
+        ws_2 = _register_ws(rt, clock, seeded, alias="ws-other-2", checkout_dir=trusted_tmp / "chk-2", remote=REMOTE_B)
         obs = FakeObserver(descriptor=_desc(TREE_A))
         bridge, domain = _make_bridge(rt, clock, mono, observer=obs)
 
@@ -1004,6 +1207,19 @@ def test_retry_after_tree_changes_keeps_original_snapshot(trusted_tmp: Path, os_
         assert len(obs.calls) == 1
         assert domain.prepare_calls == 1
         assert domain.apply_calls == 1
+
+        # Revoking repo_grant on recorded ws_1.repo_id (even while "ws-hint" points to still-granted ws_2!)
+        # MUST fail closed with NOT_FOUND on selected_scope=None replay — never returning ungranted ws_1's Delivery!
+        with rt.policy._immediate() as pdb:
+            pdb.execute(
+                "DELETE FROM repo_grant WHERE principal_id = ? AND repo_id = ?",
+                (seeded.principal.principal_id, ws_1.repo_id),
+            )
+        _expect_err(
+            "prepare_task",
+            bridge.dispatch(call, _ctx_for(rt, seeded.principal, mono, selected_scope=None), auth=_auth_for(seeded)),
+            ErrorCode.NOT_FOUND,
+        )
     finally:
         rt.close()
 
@@ -1374,11 +1590,13 @@ def test_existing_task_with_new_key_or_expired_key_creates_new_logical_delivery(
         seeded = seed_principal_and_credential(rt.policy)
         ws_a = _register_ws(rt, clock, seeded, alias="ws-a", checkout_dir=trusted_tmp / "chk-a", remote=REMOTE_A)
         ws_b = _register_ws(rt, clock, seeded, alias="ws-b", checkout_dir=trusted_tmp / "chk-b", remote=REMOTE_B)
+        ws_c = _register_ws(rt, clock, seeded, alias="ws-c", checkout_dir=trusted_tmp / "chk-c", remote=REMOTE_C)
         scope_a = Scope(ws_a.repo_id, ws_a.checkout_id)
         scope_b = Scope(ws_b.repo_id, ws_b.checkout_id)
 
         ref_1 = ObjectRef(kind="lesson", id="les-1", revision=1, digest=digest_bytes(b"les-1"))
         ref_snap_dep = ObjectRef(kind="context", id="ctx-snap", revision=1, digest=digest_bytes(b"ctx-snap"))
+        ref_gate_c = ObjectRef(kind="gate", id="gate-c-snap", revision=1, digest=digest_bytes(b"gate-c-snap"))
         ref_2 = ObjectRef(kind="skill", id="sk-2", revision=1, digest=digest_bytes(b"sk-2"))
 
         current_specs: list[FixtureDeliveryRefSpec] = [
@@ -1471,6 +1689,14 @@ def test_existing_task_with_new_key_or_expired_key_creates_new_logical_delivery(
                 checkout_id=ws_a.checkout_id,
                 snapshot_dependent=True,
             ),
+            FixtureDeliveryRefSpec(
+                slot="finishing_gates",
+                ref=ref_gate_c,
+                owner_id="dan",
+                repo_id=ws_c.repo_id,
+                checkout_id=None,
+                snapshot_dependent=True,
+            ),
         ]
         call_k2 = normalize_call(
             "prepare_task",
@@ -1498,6 +1724,18 @@ def test_existing_task_with_new_key_or_expired_key_creates_new_logical_delivery(
         assert d2["snapshot_status"] == "unavailable"
         assert d2["source_snapshot_id"] is None
         assert d2["context"] == []
+        assert d2["finishing_gates"] == []
+
+        # Omitted snapshot_dependent cross-repo source (ws_c) MUST NOT pollute p_task_lineage_sources on unavailable d2!
+        with rt.store.transaction() as stxn:
+            d2_task_repos = {
+                str(r[0])
+                for r in stxn.db.execute(
+                    "SELECT repo_id FROM p_task_lineage_sources WHERE task_id = 'task-shared-01'"
+                ).fetchall()
+            }
+        assert ws_b.repo_id in d2_task_repos
+        assert ws_c.repo_id not in d2_task_repos
 
         # Replaying k1 STILL returns d1's AVAILABLE snapshot & delivery_id (never task's latest unavailable status!).
         d1_replay = _expect_ok(
@@ -1532,8 +1770,15 @@ def test_existing_task_with_new_key_or_expired_key_creates_new_logical_delivery(
                 "SELECT 1 FROM p_field_lineage_unknown WHERE task_id = 'task-shared-01' AND field_path_digest = ?",
                 (lessons_digest,),
             ).fetchone()
+            d3_task_repos = {
+                str(r[0])
+                for r in stxn.db.execute(
+                    "SELECT repo_id FROM p_task_lineage_sources WHERE task_id = 'task-shared-01'"
+                ).fetchall()
+            }
         assert unk_row is not None
         assert f_unk_row is not None
+        assert ws_c.repo_id in d3_task_repos
 
         rt.store.rebuild_projections()
         d2_after_rebuild = _expect_ok(
@@ -1713,6 +1958,100 @@ def test_cas_is_staged_before_transaction_and_only_declared_blobs_can_be_held(
             )
             strict_tx.hold_blob(missing_bytes, holder_id=new_id())
         assert miss_exc.value.code is ErrorCode.INTEGRITY_FAILURE
+
+        # Stage failure / cancellation on 2nd blob BEFORE SQLite transaction opens (C2, task-4-brief.md:85, 188):
+        # leaves zero new idempotency rows, zero new holds, zero new ledger/projection rows, and only safe unheld
+        # orphan bytes in CAS; clean retry executes the full transaction and holds the blobs!
+        domain.before_apply_hook = None
+        new_obs_desc = _desc(TREE_C)
+        obs_stage_fail = FakeObserver(descriptor=new_obs_desc)
+        stage_fail_plan = lambda binding, _tid: (  # noqa: E731
+            FixtureDeliveryRefSpec(
+                slot="lessons",
+                ref=kept_ref,
+                owner_id=binding.owner_id,
+                repo_id=binding.repo_id,
+                checkout_id=binding.checkout_id,
+                custom_field_path=("lessons", "safe_stage_orphan_check"),
+            ),
+        )
+        bridge_sf, domain_sf = _make_bridge(
+            rt, clock, mono, observer=obs_stage_fail, delivery_plan=stage_fail_plan
+        )
+        idem_before_sf = _count_rows(rt.store, "idempotency")
+        holds_before_sf = _count_rows(rt.store, "p_cas_holders_")
+        ledger_before_sf = _count_rows(rt.store, "ledger")
+        deliv_before_sf = _count_rows(rt.store, "p_fixture_domain_deliveries")
+
+        stage_calls = 0
+
+        def fail_on_second_stage(data: bytes) -> str:
+            nonlocal stage_calls
+            assert not rt.store._db.in_transaction
+            stage_calls += 1
+            if stage_calls == 2:
+                raise BrainError(ErrorCode.DEADLINE_EXCEEDED, "deadline exceeded")
+            return orig_put(data)
+
+        rt.store.cas.put = fail_on_second_stage  # type: ignore[method-assign]
+        call_sf = normalize_call(
+            "prepare_task",
+            {
+                "schema_version": "2.0",
+                "workspace_hint": "ws-c2",
+                "description": "stage cancel after first safe blob",
+                "idempotency_key": "idem_c2_stage_fail_03",
+            },
+            seeded.principal,
+            selected_scope=scope,
+        )
+        _expect_err(
+            "prepare_task",
+            bridge_sf.dispatch(
+                call_sf, _ctx_for(rt, seeded.principal, mono, selected_scope=scope), auth=_auth_for(seeded)
+            ),
+            ErrorCode.DEADLINE_EXCEEDED,
+        )
+        assert stage_calls == 2
+        assert domain_sf.apply_calls == 0
+        assert _count_rows(rt.store, "idempotency") == idem_before_sf
+        assert _count_rows(rt.store, "p_cas_holders_") == holds_before_sf
+        assert _count_rows(rt.store, "ledger") == ledger_before_sf
+        assert _count_rows(rt.store, "p_fixture_domain_deliveries") == deliv_before_sf
+        assert new_obs_desc.descriptor_digest in rt.store.cas.orphans()
+
+        # Restore CAS publisher and retry with the exact same key -> full transaction runs and holds the blobs!
+        rt.store.cas.put = orig_put  # type: ignore[method-assign]
+        sf_ok = _expect_ok(
+            "prepare_task",
+            bridge_sf.dispatch(
+                call_sf, _ctx_for(rt, seeded.principal, mono, selected_scope=scope), auth=_auth_for(seeded)
+            ),
+        )
+        assert sf_ok["snapshot_status"] == "available"
+        assert domain_sf.apply_calls == 1
+        assert _count_rows(rt.store, "idempotency") == idem_before_sf + 1
+        assert new_obs_desc.descriptor_digest not in rt.store.cas.orphans()
+
+        # Direct StoreKernelTx.read_idempotency / save_idempotency delegation check.
+        direct_kh = compute_idempotency_key_hash(seeded.principal.principal_id, "prepare_task", "idem_direct_ktx_0001")
+        active_kid, active_kbytes = rt.policy.request_digest_key()
+        direct_row = IdempotencyRow(
+            principal_id=seeded.principal.principal_id,
+            tool="prepare_task",
+            key_hash=direct_kh,
+            request_digest_key_id=active_kid,
+            request_digest=compute_request_hmac(active_kbytes, call_sf),
+            result_id="direct-res-1",
+            assignment_id=None,
+            refs=(kept_ref,),
+            committed_at=utc_timestamp(clock.now()),
+        )
+        with rt.store.transaction() as stxn:
+            base_ktx = StoreKernelTx(stxn, rt.store.cas, rt.policy)
+            assert base_ktx.read_idempotency(seeded.principal.principal_id, "prepare_task", direct_kh) is None
+            base_ktx.save_idempotency(direct_row)
+            assert base_ktx.read_idempotency(seeded.principal.principal_id, "prepare_task", direct_kh) == direct_row
     finally:
         rt.close()
 
@@ -1830,6 +2169,99 @@ def test_clock_regression_refuses_handling_and_pruning_without_writes(trusted_tm
         )
         assert recovered == orig
         assert bridge2.clock_untrusted() is False
+
+        # Advance HWM past 30 days (to 2026-12-10T00:00:00Z) via a second key while call_1 (Nov 1) stays retained;
+        # then regress clock to 2026-12-05T00:00:00Z (< HWM Dec 10, while >= Dec 1 30d expiry cutoff for call_1):
+        # reusing expired call_1 MUST still be refused with INTEGRITY_FAILURE and zero writes (row NOT replaced!).
+        clock.set(dt.datetime(2026, 12, 10, 0, 0, 0, 0, tzinfo=dt.UTC))
+        call_hwm_dec10 = normalize_call(
+            "prepare_task",
+            {
+                "schema_version": "2.0",
+                "workspace_hint": "ws-c4",
+                "description": "advance hwm to Dec 10",
+                "idempotency_key": "idem_c4_clock_dec10_03",
+            },
+            seeded.principal,
+            selected_scope=scope,
+        )
+        _expect_ok(
+            "prepare_task",
+            bridge2.dispatch(
+                call_hwm_dec10, _ctx_for(rt2, seeded.principal, mono, selected_scope=scope), auth=_auth_for(seeded)
+            ),
+        )
+        assert domain2.apply_calls == 1
+
+        clock.set(dt.datetime(2026, 12, 5, 0, 0, 0, 0, tzinfo=dt.UTC))
+        call_1_replacement = normalize_call(
+            "prepare_task",
+            {
+                "schema_version": "2.0",
+                "workspace_hint": "ws-c4",
+                "description": "attempt expired replacement while regressed below Dec 10 HWM",
+                "idempotency_key": "idem_c4_clock_0001",
+            },
+            seeded.principal,
+            selected_scope=scope,
+        )
+        _expect_err(
+            "prepare_task",
+            bridge2.dispatch(
+                call_1_replacement, _ctx_for(rt2, seeded.principal, mono, selected_scope=scope), auth=_auth_for(seeded)
+            ),
+            ErrorCode.INTEGRITY_FAILURE,
+        )
+        assert bridge2.clock_untrusted() is True
+        assert domain2.apply_calls == 1
+        with rt2.store.transaction() as stxn:
+            call_1_comm = stxn.db.execute(
+                "SELECT committed_at FROM idempotency WHERE key_hash = ?",
+                (compute_idempotency_key_hash(seeded.principal.principal_id, "prepare_task", "idem_c4_clock_0001"),),
+            ).fetchone()
+        assert call_1_comm == ("2026-11-01T00:00:00.000000Z",)
+
+        # Catch clock back up to 2026-12-15T00:00:00Z, then corrupt a mid-range row's committed_at so it sorts
+        # lexicographically between MIN ("2026-11-01...") and MAX ("2026-12-10..."): validate_c4_clock catches it!
+        clock.set(dt.datetime(2026, 12, 15, 0, 0, 0, 0, tzinfo=dt.UTC))
+        call_mid = normalize_call(
+            "prepare_task",
+            {
+                "schema_version": "2.0",
+                "workspace_hint": "ws-c4",
+                "description": "seed third row for mid-range corruption check",
+                "idempotency_key": "idem_c4_clock_mid_0004",
+            },
+            seeded.principal,
+            selected_scope=scope,
+        )
+        _expect_ok(
+            "prepare_task",
+            bridge2.dispatch(
+                call_mid, _ctx_for(rt2, seeded.principal, mono, selected_scope=scope), auth=_auth_for(seeded)
+            ),
+        )
+        assert bridge2.clock_untrusted() is False
+        mid_kh = compute_idempotency_key_hash(seeded.principal.principal_id, "prepare_task", "idem_c4_clock_dec10_03")
+        with rt2.store.transaction() as stxn:
+            stxn.db.execute(
+                "UPDATE idempotency SET committed_at = '2026-11-15T99:99:99.000000Z' WHERE key_hash = ?",
+                (mid_kh,),
+            )
+        _expect_err(
+            "prepare_task",
+            bridge2.dispatch(
+                call_mid, _ctx_for(rt2, seeded.principal, mono, selected_scope=scope), auth=_auth_for(seeded)
+            ),
+            ErrorCode.INTEGRITY_FAILURE,
+        )
+        assert bridge2.clock_untrusted() is True
+        # Restore valid timestamp before testing missing-watermark refusal.
+        with rt2.store.transaction() as stxn:
+            stxn.db.execute(
+                "UPDATE idempotency SET committed_at = '2026-12-10T00:00:00.000000Z' WHERE key_hash = ?",
+                (mid_kh,),
+            )
 
         # Missing watermark while retained idempotency rows exist -> INTEGRITY_FAILURE + clock_untrusted!
         with rt2.store.transaction() as stxn:
