@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import datetime as dt
 from collections.abc import Iterator, Mapping
+from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 
@@ -36,6 +37,7 @@ from superbrain.application.lineage import (
     evaluate_egress_eligibility,
     prepare_labeled_delivery,
     record_field_lineage,
+    record_task_lineage,
     register_snapshot,
 )
 from superbrain.composition.kernel_projections import kernel_store_extensions
@@ -48,6 +50,7 @@ from superbrain.core.kernel import (
     FieldLineage,
     FilterPolicy,
     LabeledDelivery,
+    LineagedField,
     LineageRef,
     LineageSet,
     ObjectRef,
@@ -61,7 +64,7 @@ from superbrain.core.kernel import (
     binding_lineage_ref,
     field_path_digest,
 )
-from superbrain.ports.kernel import KernelTx
+from superbrain.ports.kernel import KernelTx, SourceRestrictionPort
 from superbrain.ports.os import OsAdapters
 from superbrain.storage.kernel_schema import KERNEL_POLICY_MIGRATIONS, KERNEL_STORE_MIGRATIONS
 from superbrain.storage.kinds import RetentionClass
@@ -527,3 +530,450 @@ def test_hold_of_the_snapshot_id_on_another_digest_is_not_the_exact_hold(
         assert fresh != sid, label
         assert ("event", fresh) in _holder_ids(kernel, digest), label
         kernel.store.rebuild_projections()
+
+
+# --- I2-T3-R02 reopened (7278dc8): duplicate field paths and initial == committed == replay == rebuilt ------------
+
+
+@dataclass(frozen=True)
+class _DeliveryBoundaryView:
+    items: tuple[FieldLineage, ...]
+    task_lineage: LineageSet
+    task_unknown: bool
+    field_eligibility: tuple[tuple[str, bool], ...]
+    task_eligible: bool
+
+
+def _delivery_view(
+    delivery: LabeledDelivery, rt: Runtime, restrictions: SourceRestrictionPort
+) -> _DeliveryBoundaryView:
+    return _DeliveryBoundaryView(
+        items=delivery.items,
+        task_lineage=delivery.task_lineage,
+        task_unknown=delivery.task_unknown,
+        field_eligibility=tuple(
+            (f.field_path_digest, evaluate_egress_eligibility(f, rt.policy, restrictions=restrictions))
+            for f in delivery.items
+        ),
+        task_eligible=evaluate_egress_eligibility(
+            LineagedField(value=None, sources=delivery.task_lineage, unknown_source=delivery.task_unknown),
+            rt.policy,
+            restrictions=restrictions,
+        ),
+    )
+
+
+def _projected_view(
+    kstore: KernelWorkspaceStore, rt: Runtime, task_id: str, restrictions: SourceRestrictionPort
+) -> _DeliveryBoundaryView:
+    fields = kstore.transact(partial(_read_field_lineage, task_id))
+    task_lineage, task_unknown = kstore.transact(partial(_read_task_lineage, task_id))
+    items = tuple(fields[d] for d in sorted(fields))
+    return _DeliveryBoundaryView(
+        items=items,
+        task_lineage=task_lineage,
+        task_unknown=task_unknown,
+        field_eligibility=tuple(
+            (f.field_path_digest, evaluate_egress_eligibility(f, rt.policy, restrictions=restrictions))
+            for f in items
+        ),
+        task_eligible=evaluate_egress_eligibility(
+            LineagedField(value=None, sources=task_lineage, unknown_source=task_unknown),
+            rt.policy,
+            restrictions=restrictions,
+        ),
+    )
+
+
+def _assert_structural_uniqueness(delivery: LabeledDelivery) -> None:
+    digests = [f.field_path_digest for f in delivery.items]
+    assert len(digests) == len(set(digests)), digests
+    assert len(delivery.omitted_items) == len(set(delivery.omitted_items)), delivery.omitted_items
+    assert set(digests).isdisjoint(delivery.omitted_items), (digests, delivery.omitted_items)
+
+
+def _prepare_and_check_boundaries(
+    rt: Runtime,
+    principal: Principal,
+    alias: str,
+    task_id: str,
+    *,
+    items: tuple[DeliveryItem, ...],
+    restrictions: SourceRestrictionPort,
+    observer: _Observer | None = None,
+    served: tuple[LineageRef, ...] = (),
+) -> tuple[LabeledDelivery, _DeliveryBoundaryView]:
+    kstore = KernelWorkspaceStore(rt.store, rt.policy)
+    initial = _prepare(rt, principal, alias, task_id, items=items, served=served, observer=observer)
+    assert initial.replayed is False
+    initial_view = _delivery_view(initial, rt, restrictions)
+    committed_view = _projected_view(kstore, rt, task_id, restrictions)
+    replay = _prepare(rt, principal, alias, task_id, items=items, served=served, observer=observer)
+    assert replay.replayed is True
+    replay_view = _delivery_view(replay, rt, restrictions)
+    rt.store.rebuild_projections()
+    rebuilt_view = _projected_view(kstore, rt, task_id, restrictions)
+    rebuilt_replay = _prepare(rt, principal, alias, task_id, items=items, served=served, observer=observer)
+    assert rebuilt_replay.replayed is True
+    rebuilt_replay_view = _delivery_view(rebuilt_replay, rt, restrictions)
+
+    assert initial_view == committed_view
+    assert replay_view == committed_view
+    assert rebuilt_view == committed_view
+    assert rebuilt_replay_view == committed_view
+    for candidate in (initial, replay, rebuilt_replay):
+        _assert_structural_uniqueness(candidate)
+    return initial, initial_view
+
+
+@pytest.mark.parametrize("path", [("same",), ("nested", 0, "same")], ids=["top-level", "nested"])
+def test_duplicate_field_path_unknown_source_aggregates_monotonically_in_both_orders(
+    kernel: Runtime, dan: SeededCredential, clock: FakeClock, trusted_tmp: Path, path: tuple[str | int, ...]
+) -> None:
+    repo = _register(
+        kernel,
+        clock,
+        dan,
+        alias="dupu",
+        checkout=trusted_tmp / "dupu",
+        remote="https://h.example/o/du.git",
+        egress=True,
+    )
+    src_a = _artifact(repo, "art-known-a")
+    src_b = _artifact(repo, "art-known-b")
+    restrictions = StoreSourceRestrictions(
+        kernel.store, kernel.policy, resolvers={"artifact": {src_a, src_b}.__contains__}
+    )
+    known_item = DeliveryItem(path, frozenset({src_a}), unknown_source=False)
+    unknown_item = DeliveryItem(path, frozenset({src_b}), unknown_source=True)
+    target_digest = field_path_digest(path)
+
+    init_ft, view_ft = _prepare_and_check_boundaries(
+        kernel, dan.principal, "dupu", "dup-unk-ft", items=(known_item, unknown_item), restrictions=restrictions
+    )
+    init_tf, view_tf = _prepare_and_check_boundaries(
+        kernel, dan.principal, "dupu", "dup-unk-tf", items=(unknown_item, known_item), restrictions=restrictions
+    )
+    assert len(init_ft.items) == 1 and len(init_tf.items) == 1
+    assert view_ft == view_tf
+    (field,) = view_ft.items
+    assert field.field_path_digest == target_digest
+    assert {binding_lineage_ref(repo), src_a, src_b} <= field.sources
+    assert field.unknown_source is True
+    assert view_ft.task_unknown is True
+    assert view_ft.field_eligibility == ((target_digest, False),)
+    assert view_ft.task_eligible is False
+
+
+def test_duplicate_field_path_empty_unproven_sources_marks_unknown_in_both_orders(
+    kernel: Runtime, dan: SeededCredential, clock: FakeClock, trusted_tmp: Path
+) -> None:
+    repo = _register(
+        kernel,
+        clock,
+        dan,
+        alias="dupe",
+        checkout=trusted_tmp / "dupe",
+        remote="https://h.example/o/de.git",
+        egress=True,
+    )
+    src_allow = _artifact(repo, "art-allow")
+    restrictions = StoreSourceRestrictions(kernel.store, kernel.policy, resolvers={"artifact": src_allow.__eq__})
+    path = ("unproven_dup",)
+    target_digest = field_path_digest(path)
+    empty_item = DeliveryItem(path, frozenset(), unknown_source=False)
+    known_item = DeliveryItem(path, frozenset({src_allow}), unknown_source=False)
+
+    init_ek, view_ek = _prepare_and_check_boundaries(
+        kernel, dan.principal, "dupe", "dup-emp-ek", items=(empty_item, known_item), restrictions=restrictions
+    )
+    init_ke, view_ke = _prepare_and_check_boundaries(
+        kernel, dan.principal, "dupe", "dup-emp-ke", items=(known_item, empty_item), restrictions=restrictions
+    )
+    assert len(init_ek.items) == 1 and len(init_ke.items) == 1
+    assert view_ek == view_ke
+    (field,) = view_ek.items
+    assert field.field_path_digest == target_digest
+    assert {binding_lineage_ref(repo), src_allow} <= field.sources
+    assert field.unknown_source is True
+    assert view_ek.task_unknown is True
+    assert view_ek.field_eligibility == ((target_digest, False),)
+    assert view_ek.task_eligible is False
+
+
+def test_duplicate_field_path_merges_multi_repo_provenance_and_denies_disabled_egress(
+    kernel: Runtime, dan: SeededCredential, clock: FakeClock, trusted_tmp: Path
+) -> None:
+    repo_task = _register(
+        kernel,
+        clock,
+        dan,
+        alias="dupt",
+        checkout=trusted_tmp / "dupt",
+        remote="https://h.example/o/dt.git",
+        egress=True,
+    )
+    repo_allow = _register(
+        kernel,
+        clock,
+        dan,
+        alias="dupa",
+        checkout=trusted_tmp / "dupa",
+        remote="https://h.example/o/da.git",
+        egress=True,
+    )
+    repo_deny = _register(
+        kernel,
+        clock,
+        dan,
+        alias="dupd",
+        checkout=trusted_tmp / "dupd",
+        remote="https://h.example/o/dd.git",
+        egress=False,
+    )
+    src_allow = _artifact(repo_allow, "art-allow")
+    src_deny = _artifact(repo_deny, "art-deny")
+    restrictions = StoreSourceRestrictions(
+        kernel.store, kernel.policy, resolvers={"artifact": {src_allow, src_deny}.__contains__}
+    )
+    assert restrictions.is_restricted(src_allow) is False
+    assert restrictions.is_restricted(src_deny) is False
+
+    _ctrl_init, ctrl_view = _prepare_and_check_boundaries(
+        kernel,
+        dan.principal,
+        "dupt",
+        "dup-repo-ctrl",
+        items=(DeliveryItem(("control_ok",), frozenset({src_allow}), unknown_source=False),),
+        restrictions=restrictions,
+    )
+    assert ctrl_view.field_eligibility == ((field_path_digest(("control_ok",)), True),)
+    assert ctrl_view.task_eligible is True
+
+    path = ("multi_repo",)
+    target_digest = field_path_digest(path)
+    allow_item = DeliveryItem(path, frozenset({src_allow}), unknown_source=False)
+    deny_item = DeliveryItem(path, frozenset({src_deny}), unknown_source=False)
+
+    init_ad, view_ad = _prepare_and_check_boundaries(
+        kernel, dan.principal, "dupt", "dup-repo-ad", items=(allow_item, deny_item), restrictions=restrictions
+    )
+    init_da, view_da = _prepare_and_check_boundaries(
+        kernel, dan.principal, "dupt", "dup-repo-da", items=(deny_item, allow_item), restrictions=restrictions
+    )
+    assert len(init_ad.items) == 1 and len(init_da.items) == 1
+    assert view_ad == view_da
+    (field,) = view_ad.items
+    expected_sources = frozenset({binding_lineage_ref(repo_task), src_allow, src_deny})
+    assert field.sources == expected_sources
+    assert view_ad.task_lineage == expected_sources
+    assert field.unknown_source is False
+    assert view_ad.task_unknown is False
+    assert view_ad.field_eligibility == ((target_digest, False),)
+    assert view_ad.task_eligible is False
+
+
+def test_duplicate_snapshot_dependent_path_omits_once_and_preserves_s1a_sibling(
+    kernel: Runtime, dan: SeededCredential, clock: FakeClock, trusted_tmp: Path
+) -> None:
+    repo = _register(
+        kernel,
+        clock,
+        dan,
+        alias="snapa",
+        checkout=trusted_tmp / "snapa",
+        remote="https://h.example/o/sa.git",
+        egress=True,
+    )
+    src_1 = _artifact(repo, "art-s1")
+    src_2 = _artifact(repo, "art-s2")
+    restrictions = StoreSourceRestrictions(
+        kernel.store, kernel.policy, resolvers={"artifact": {src_1, src_2}.__contains__}
+    )
+    snap_digest = field_path_digest(("snap_only",))
+    kept_digest = field_path_digest(("kept_known",))
+    items = (
+        DeliveryItem(("snap_only",), frozenset({src_1}), unknown_source=False, snapshot_dependent=True),
+        DeliveryItem(("kept_known",), frozenset({src_1}), unknown_source=False, snapshot_dependent=False),
+        DeliveryItem(("snap_only",), frozenset({src_2}), unknown_source=False, snapshot_dependent=True),
+    )
+
+    initial, view = _prepare_and_check_boundaries(
+        kernel, dan.principal, "snapa", "dup-snap-only", items=items, restrictions=restrictions, observer=None
+    )
+    assert initial.binding.snapshot_status is SnapshotStatus.UNAVAILABLE
+    assert initial.omitted_items == (snap_digest,)
+    assert [f.field_path_digest for f in view.items] == [kept_digest]
+    (kept_field,) = view.items
+    assert kept_field.unknown_source is False
+    assert view.task_unknown is False
+    assert view.field_eligibility == ((kept_digest, True),)
+    assert view.task_eligible is True
+
+
+@pytest.mark.parametrize("restriction_kind", ["unknown-source", "disabled-egress-repo"])
+def test_mixed_snapshot_dependent_duplicate_path_omits_unit_when_unavailable_and_aggregates_when_available(
+    kernel: Runtime,
+    dan: SeededCredential,
+    clock: FakeClock,
+    trusted_tmp: Path,
+    restriction_kind: str,
+) -> None:
+    repo_allow = _register(
+        kernel,
+        clock,
+        dan,
+        alias="snapm",
+        checkout=trusted_tmp / "snapm",
+        remote="https://h.example/o/sm.git",
+        egress=True,
+    )
+    repo_deny = _register(
+        kernel,
+        clock,
+        dan,
+        alias="snapd",
+        checkout=trusted_tmp / "snapd",
+        remote="https://h.example/o/sd.git",
+        egress=False,
+    )
+    src_allow = _artifact(repo_allow, "art-allow")
+    src_deny = _artifact(repo_deny, "art-deny")
+    restrictions = StoreSourceRestrictions(
+        kernel.store, kernel.policy, resolvers={"artifact": {src_allow, src_deny}.__contains__}
+    )
+    mixed_digest = field_path_digest(("mixed_snap",))
+    base_item = DeliveryItem(("mixed_snap",), frozenset({src_allow}), unknown_source=False, snapshot_dependent=False)
+    if restriction_kind == "unknown-source":
+        snap_item = DeliveryItem(("mixed_snap",), frozenset({src_allow}), unknown_source=True, snapshot_dependent=True)
+    else:
+        snap_item = DeliveryItem(("mixed_snap",), frozenset({src_deny}), unknown_source=False, snapshot_dependent=True)
+
+    unavail_1, uview_1 = _prepare_and_check_boundaries(
+        kernel,
+        dan.principal,
+        "snapm",
+        f"mixed-unavail-1-{restriction_kind}",
+        items=(base_item, snap_item),
+        restrictions=restrictions,
+        observer=None,
+    )
+    unavail_2, uview_2 = _prepare_and_check_boundaries(
+        kernel,
+        dan.principal,
+        "snapm",
+        f"mixed-unavail-2-{restriction_kind}",
+        items=(snap_item, base_item),
+        restrictions=restrictions,
+        observer=None,
+    )
+    assert unavail_1.omitted_items == (mixed_digest,)
+    assert unavail_2.omitted_items == (mixed_digest,)
+    assert uview_1.items == () and uview_2.items == ()
+    assert uview_1 == uview_2
+
+    obs = _Observer(_desc(TREE_1))
+    avail_1, aview_1 = _prepare_and_check_boundaries(
+        kernel,
+        dan.principal,
+        "snapm",
+        f"mixed-avail-1-{restriction_kind}",
+        items=(base_item, snap_item),
+        restrictions=restrictions,
+        observer=obs,
+    )
+    avail_2, aview_2 = _prepare_and_check_boundaries(
+        kernel,
+        dan.principal,
+        "snapm",
+        f"mixed-avail-2-{restriction_kind}",
+        items=(snap_item, base_item),
+        restrictions=restrictions,
+        observer=obs,
+    )
+    assert avail_1.omitted_items == () and avail_2.omitted_items == ()
+    assert len(avail_1.items) == 1 and len(avail_2.items) == 1
+    assert aview_1 == aview_2
+    (field,) = aview_1.items
+    assert field.field_path_digest == mixed_digest
+    assert src_allow in field.sources
+    if restriction_kind == "unknown-source":
+        assert field.unknown_source is True
+        assert aview_1.task_unknown is True
+    else:
+        assert src_deny in field.sources
+        assert field.unknown_source is False
+        assert aview_1.task_unknown is False
+    assert aview_1.field_eligibility == ((mixed_digest, False),)
+    assert aview_1.task_eligible is False
+
+
+@pytest.mark.parametrize("pre_state", ["pre-task-deny-source", "pre-task-unknown", "pre-field-lineage"])
+def test_preexisting_task_or_field_lineage_is_reflected_in_initial_labeled_delivery(
+    kernel: Runtime, dan: SeededCredential, clock: FakeClock, trusted_tmp: Path, pre_state: str
+) -> None:
+    repo_allow = _register(
+        kernel,
+        clock,
+        dan,
+        alias="prea",
+        checkout=trusted_tmp / "prea",
+        remote="https://h.example/o/pa.git",
+        egress=True,
+    )
+    repo_deny = _register(
+        kernel,
+        clock,
+        dan,
+        alias="pred",
+        checkout=trusted_tmp / "pred",
+        remote="https://h.example/o/pd.git",
+        egress=False,
+    )
+    src_allow = _artifact(repo_allow, "art-pre-allow")
+    src_deny = _artifact(repo_deny, "art-pre-deny")
+    restrictions = StoreSourceRestrictions(
+        kernel.store, kernel.policy, resolvers={"artifact": {src_allow, src_deny}.__contains__}
+    )
+    kstore = KernelWorkspaceStore(kernel.store, kernel.policy)
+    task_id = f"pre-task-{pre_state}"
+    derived_digest = field_path_digest(("derived",))
+    prior_digest = field_path_digest(("prior",))
+
+    if pre_state == "pre-task-deny-source":
+        kstore.transact(lambda tx: record_task_lineage(tx, task_id, frozenset({src_deny}), unknown=False))
+    elif pre_state == "pre-task-unknown":
+        kstore.transact(lambda tx: record_task_lineage(tx, task_id, frozenset({src_allow}), unknown=True))
+    else:
+        assert pre_state == "pre-field-lineage"
+
+        def _seed_fields(tx: KernelTx) -> None:
+            record_field_lineage(tx, task_id, ("prior",), frozenset({src_deny}), unknown=False)
+            record_field_lineage(tx, task_id, ("derived",), frozenset({src_deny}), unknown=True)
+
+        kstore.transact(_seed_fields)
+
+    initial, view = _prepare_and_check_boundaries(
+        kernel,
+        dan.principal,
+        "prea",
+        task_id,
+        items=(DeliveryItem(("derived",), frozenset({src_allow}), unknown_source=False),),
+        restrictions=restrictions,
+    )
+    by_digest = {f.field_path_digest: f for f in initial.items}
+    assert derived_digest in by_digest
+    if pre_state == "pre-task-deny-source":
+        assert src_deny in view.task_lineage
+        assert src_deny in by_digest[derived_digest].sources
+        assert view.field_eligibility == ((derived_digest, False),)
+        assert view.task_eligible is False
+    elif pre_state == "pre-task-unknown":
+        assert view.task_unknown is True
+        assert view.task_eligible is False
+    else:
+        assert set(by_digest) == {prior_digest, derived_digest}
+        assert src_deny in by_digest[prior_digest].sources
+        assert {binding_lineage_ref(repo_allow), src_allow, src_deny} <= by_digest[derived_digest].sources
+        assert by_digest[derived_digest].unknown_source is True
+        assert dict(view.field_eligibility) == {prior_digest: False, derived_digest: False}

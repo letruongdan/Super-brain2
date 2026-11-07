@@ -17,22 +17,29 @@ from superbrain.application.lineage import (
 )
 from superbrain.core.canonical import digest_bytes
 from superbrain.core.errors import BrainError, ErrorCode
+from superbrain.core.ids import new_id
 from superbrain.core.kernel import (
     COMMIT_RESERVE_NS,
     LOCAL_PHASE_BUDGET_NS,
     AuthSnapshot,
     BootstrapAuthorization,
+    FieldLineage,
+    LabeledDelivery,
     LineagedField,
     LineageRef,
     ObjectRef,
     Principal,
     RepoPolicy,
     Scope,
+    SelectorPath,
+    SelectorReason,
     SnapshotDescriptor,
     SnapshotObservation,
     SnapshotStatus,
+    TaskBinding,
     WorkspaceBinding,
     WorkspaceRegistration,
+    field_path_digest,
 )
 from superbrain.ports.policy import Intent
 
@@ -249,3 +256,59 @@ def test_snapshot_observation_available_iff_descriptor() -> None:
     ):
         with pytest.raises(BrainError):
             SnapshotObservation(status, descriptor)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["duplicate-items", "duplicate-omitted", "item-and-omitted-overlap"],
+)
+def test_labeled_delivery_requires_unique_and_disjoint_field_digests(case: str) -> None:
+    binding = TaskBinding(
+        task_id="task-ld-1",
+        owner_id="dan",
+        repo_id="repo-a",
+        checkout_id="chk-a",
+        delivery_id=new_id(),
+        assignment_id=None,
+        source_snapshot_id=None,
+        snapshot_status=SnapshotStatus.UNAVAILABLE,
+        selector_path=SelectorPath.RULES,
+        selector_reason=SelectorReason.PROVIDER_UNAVAILABLE,
+    )
+    d_a = field_path_digest(("a",))
+    d_b = field_path_digest(("b",))
+    d_c = field_path_digest(("c",))
+    d_d = field_path_digest(("d",))
+    valid = LabeledDelivery(
+        binding=binding,
+        task_lineage=frozenset({A1}),
+        task_unknown=False,
+        items=(FieldLineage(d_a, frozenset({A1})), FieldLineage(d_b, frozenset({A1, A2}))),
+        omitted_items=(d_c, d_d),
+    )
+    assert [f.field_path_digest for f in valid.items] == [d_a, d_b]
+    assert valid.omitted_items == (d_c, d_d)
+
+    if case == "duplicate-items":
+        items: tuple[FieldLineage, ...] = (
+            FieldLineage(d_a, frozenset({A1}), unknown_source=False),
+            FieldLineage(d_a, frozenset({A1}), unknown_source=True),
+        )
+        omitted: tuple[str, ...] = (d_c,)
+    elif case == "duplicate-omitted":
+        items = (FieldLineage(d_a, frozenset({A1})),)
+        omitted = (d_c, d_c)
+    else:
+        assert case == "item-and-omitted-overlap"
+        items = (FieldLineage(d_a, frozenset({A1})),)
+        omitted = (d_c, d_a)
+
+    with pytest.raises(BrainError) as exc:
+        LabeledDelivery(
+            binding=binding,
+            task_lineage=frozenset({A1}),
+            task_unknown=True,
+            items=items,
+            omitted_items=omitted,
+        )
+    assert exc.value.code is ErrorCode.INVALID_INPUT
