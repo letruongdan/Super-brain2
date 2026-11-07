@@ -177,7 +177,7 @@ class KernelIdempotencyPort(Protocol):
         active_key_id: str,
         request_digest: str,
         now: datetime,
-        verify_raced_row: Callable[[IdempotencyRow], None],
+        verify_raced_row: Callable[[IdempotencyRow], bool],
         apply: Callable[[KernelTx], StoredResult],
     ) -> tuple[StoredResult, bool]:
         """Atomically execute ``apply(strict_tx)``, persist the idempotency row, and advance the C4 watermark.

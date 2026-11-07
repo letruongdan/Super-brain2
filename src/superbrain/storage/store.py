@@ -332,6 +332,17 @@ class Store:
     def closed(self) -> bool:
         return self._closed
 
+    @property
+    def lease(self) -> WriterLease:
+        return self._lease
+
+    @property
+    def owner_thread_id(self) -> int:
+        return self._owner
+
+    def has_policy_source(self, policy: object) -> bool:
+        return self._policy is policy
+
     def close(self) -> None:
         self._check()
         if self._txn_active:

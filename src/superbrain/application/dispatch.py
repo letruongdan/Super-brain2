@@ -247,8 +247,8 @@ class KernelDispatcher:
 
         return self._render_dict(stored, live_principal, selected_scope=call.selected_scope)
 
-    def _check_raced_row(self, row: IdempotencyRow, call: Call, *, now: datetime) -> None:
-        self._verify_retained_row(row, call, now=now)
+    def _check_raced_row(self, row: IdempotencyRow, call: Call, *, now: datetime) -> bool:
+        return self._verify_retained_row(row, call, now=now)
 
 
 def dispatch(

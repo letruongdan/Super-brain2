@@ -69,10 +69,12 @@ from superbrain.core.wire import encode_envelope, load_catalog
 from superbrain.ports.clock import Clock
 from superbrain.ports.kernel import KernelBlobStagePort, KernelPolicyPort, KernelTx, SnapshotObserver
 from superbrain.ports.policy import PolicyView
+from superbrain.storage._pair_admission import verify_admitted_store_pair, verify_live_store_handle
 from superbrain.storage.identity import authorize_direct_ref
 from superbrain.storage.kernel_schema import KERNEL_WORKSPACE_KINDS
 from superbrain.storage.kinds import CORE_KINDS, EntryKind, FieldType, KindRegistry
 from superbrain.storage.ledger import LedgerEntry, ProjectionHandler
+from superbrain.storage.policy_store import PolicyStore
 from superbrain.storage.store import Store
 from superbrain.storage.workspaces import StoreKernelTx
 
@@ -499,6 +501,15 @@ class FixtureKernelDomain(KernelToolDomain):
     prepare_calls: int = 0
     apply_calls: int = 0
 
+    def __post_init__(self) -> None:
+        self._check_live()
+
+    def _check_live(self) -> None:
+        if isinstance(self.policy, PolicyStore):
+            verify_admitted_store_pair(self.store, self.policy)
+        else:
+            verify_live_store_handle(self.store)
+
     def supports_tool(self, tool: str, *, deep: bool = False) -> bool:
         if tool == "get_health":
             return not deep
@@ -622,6 +633,7 @@ class FixtureKernelDomain(KernelToolDomain):
 
     def prepare_mutation(self, call: Call, ctx: CallContext, *, now: datetime) -> PreparedEffect:
         _ = now
+        self._check_live()
         self.prepare_calls += 1
         if call.tool == "prepare_task":
             return self._prepare_task_effect(call, ctx)
@@ -1007,6 +1019,7 @@ class FixtureKernelDomain(KernelToolDomain):
         return PreparedEffect(blobs=(), apply=apply)
 
     def execute_readonly(self, call: Call, ctx: CallContext) -> dict[str, JsonValue]:
+        self._check_live()
         if call.tool != "get_job":
             raise BrainError(ErrorCode.CAPABILITY_UNAVAILABLE, "capability unavailable")
         job_id = str(call.arguments["job_id"])
@@ -1045,6 +1058,7 @@ class FixtureKernelDomain(KernelToolDomain):
         *,
         selected_scope: Scope | None,
     ) -> dict[str, JsonValue]:
+        self._check_live()
         if not result.refs:
             raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
         primary = result.refs[0]
@@ -1093,7 +1107,9 @@ class FixtureKernelDomain(KernelToolDomain):
                     and snap.checkout_id == str(d_row[4])
                     and ktx.snapshot_held(snap.snapshot_id, snap.descriptor_digest)
                     and not ktx.holder_tombstoned(snap.snapshot_id)
+                    and not pview.is_tombstoned("event", snap.snapshot_id)
                     and not ktx.blob_restricted(snap.descriptor_digest)
+                    and not pview.is_quarantined(snap.descriptor_digest)
                     and ktx.blob_present(snap.descriptor_digest)
                 )
         if d_row is None or primary.revision != 1:
@@ -1167,9 +1183,10 @@ class FixtureKernelDomain(KernelToolDomain):
             raise BrainError(ErrorCode.NOT_FOUND, "not found")
         auth_snap = self.policy.snapshot()
 
-        snapshot_degraded = snapshot_id is not None and not snap_readable
-        rendered_snapshot_id: str | None = None if (snapshot_id is None or snapshot_degraded) else str(snapshot_id)
-        status_enum = SnapshotStatus.UNAVAILABLE if snapshot_degraded else SnapshotStatus(str(snap_status))
+        rendered_snapshot_id: str | None = None if snapshot_id is None else str(snapshot_id)
+        status_enum = SnapshotStatus(str(snap_status))
+        if (status_enum is SnapshotStatus.AVAILABLE) != (rendered_snapshot_id is not None):
+            raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
 
         slots: dict[str, list[JsonValue]] = {
             "skills": [],
@@ -1181,7 +1198,7 @@ class FixtureKernelDomain(KernelToolDomain):
         for s_slot, _s_pos, s_omit, s_snap_dep, r_kind, r_id, r_rev, r_dig, r_owner, r_repo, r_chk in item_rows:
             if int(s_omit) == 1:
                 continue
-            if int(s_snap_dep) == 1 and rendered_snapshot_id is None:
+            if int(s_snap_dep) == 1 and (rendered_snapshot_id is None or not snap_readable):
                 continue
             redacted = self._item_is_redacted(
                 principal=principal,
