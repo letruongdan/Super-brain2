@@ -9,6 +9,7 @@ from collections.abc import Callable, Mapping
 from superbrain.application._prequeue import (
     AtomicRequestAuthState,
     admit_prequeue_request,
+    authorize_call_against_snapshot,
     begin_local_phase,
     reconstruct_queued_call,
 )
@@ -16,6 +17,7 @@ from superbrain.application._reservation import (
     Reservation,
     ReservationTable,
     enter_commit,
+    invoke_response_callback,
     make_checked_error,
     reserve,
 )
@@ -51,6 +53,7 @@ __all__ = [
     "ReservationTable",
     "SubmittedKernelRequest",
     "admit_prequeue_request",
+    "authorize_call_against_snapshot",
     "begin_local_phase",
     "compute_canonical_payload_hmac",
     "enter_commit",
@@ -155,6 +158,8 @@ class KernelDeadlineCoordinator:
                 expected_principal=expected_principal,
                 correlation_id=correlation_id,
             )
+            if receive_ns is not None and self._monotonic_clock.monotonic_ns() >= deadlines.handler_deadline_ns:
+                raise BrainError(ErrorCode.DEADLINE_EXCEEDED, "deadline exceeded")
             if queued.scope_key is not None:
                 assert queued.request_digest is not None
                 reservation = self._reservations.reserve(
@@ -181,8 +186,7 @@ class KernelDeadlineCoordinator:
             if reservation is not None:
                 self._reservations.rollback_unstarted(reservation)
             err_env = make_checked_error(err.code, err.message)
-            if on_response is not None:
-                on_response(err_env)
+            invoke_response_callback(on_response, err_env)
             return SubmittedKernelRequest(immediate_response=err_env)
 
     def call_tool(
@@ -242,6 +246,8 @@ class KernelDeadlineCoordinator:
             response = self._owner_runner(call, ctx, queued.auth, reservation)
         except BrainError as err:
             response = make_checked_error(err.code, err.message)
+        except Exception:  # noqa: BLE001 — guarantee finish_owner_execution settles static error on unexpected bug
+            response = make_checked_error(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
         finally:
             self._reservations.finish_owner_execution(reservation, response)
         return True

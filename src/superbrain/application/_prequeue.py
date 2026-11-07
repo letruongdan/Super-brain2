@@ -16,6 +16,7 @@ from superbrain.core.jsonvalue import JsonValue
 from superbrain.core.kernel import (
     HANDLER_RESERVE_NS,
     LOCAL_PHASE_BUDGET_NS,
+    AuthSnapshot,
     Call,
     Principal,
     PrivateRequestAuth,
@@ -24,6 +25,7 @@ from superbrain.core.kernel import (
     RequestDeadlines,
     ReservationScopeKey,
     Scope,
+    is_registrable_alias,
     is_strict_int,
     parse_bearer_token,
     require_opaque_id,
@@ -41,7 +43,8 @@ class AtomicRequestAuthState(RequestAuthStatePort):
         self._expected_store_id = expected_store_id
         self._lock = threading.Lock()
         self._view: RequestAuthView | None = None
-        self._version = 0
+        self._installed_version = 0
+        self._issued_version = 0
 
     @property
     def store_id(self) -> str:
@@ -62,15 +65,18 @@ class AtomicRequestAuthState(RequestAuthStatePort):
                 self._view = None
             raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
         with self._lock:
+            if view.version <= self._installed_version:
+                raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
             self._view = view
-            if view.version > self._version:
-                self._version = view.version
+            self._installed_version = view.version
+            if view.version > self._issued_version:
+                self._issued_version = view.version
             return view
 
     def next_version(self) -> int:
         with self._lock:
-            self._version += 1
-            return self._version
+            self._issued_version = max(self._issued_version, self._installed_version) + 1
+            return self._issued_version
 
     def clear(self) -> None:
         with self._lock:
@@ -127,6 +133,89 @@ def reconstruct_queued_call(queued: QueuedKernelRequest) -> Call:
     return call
 
 
+def authorize_call_against_snapshot(snap: AuthSnapshot, principal: Principal, call: Call) -> None:
+    """Enforce principal, ``selected_scope``, and tool selector/scope rules symmetrically against ``snap``."""
+    if not isinstance(snap, AuthSnapshot) or not isinstance(principal, Principal) or not isinstance(call, Call):
+        raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+    if not snap.allows(principal, None, action="get_health"):
+        raise BrainError(ErrorCode.NOT_FOUND, "not found")
+    if call.selected_scope is not None and not snap.allows(principal, call.selected_scope, action=call.tool):
+        raise BrainError(ErrorCode.NOT_FOUND, "not found")
+
+    if call.tool == "prepare_task":
+        if "workspace_hint" in call.arguments:
+            hint = str(call.arguments["workspace_hint"])
+            if not is_registrable_alias(hint):
+                raise BrainError(ErrorCode.NOT_FOUND, "not found")
+            matches = [
+                binding
+                for binding in snap.checkouts.values()
+                if binding.owner_id == principal.owner_id
+                and binding.machine_id == principal.machine_id
+                and binding.alias == hint
+            ]
+            if not matches:
+                raise BrainError(ErrorCode.NOT_FOUND, "not found")
+            if len(matches) > 1:
+                raise BrainError(ErrorCode.REVISION_CONFLICT, "revision conflict")
+            binding = matches[0]
+            if call.selected_scope is not None and (
+                call.selected_scope.repo_id != binding.repo_id
+                or (
+                    call.selected_scope.checkout_id is not None
+                    and call.selected_scope.checkout_id != binding.checkout_id
+                )
+            ):
+                raise BrainError(ErrorCode.NOT_FOUND, "not found")
+            if not snap.allows(principal, Scope(binding.repo_id, binding.checkout_id), action="prepare_task"):
+                raise BrainError(ErrorCode.NOT_FOUND, "not found")
+        elif "workspace_id" in call.arguments and "checkout_id" in call.arguments:
+            arg_ws = str(call.arguments["workspace_id"])
+            arg_chk = str(call.arguments["checkout_id"])
+            found = snap.checkouts.get(arg_chk)
+            if found is None or found.owner_id != principal.owner_id or found.repo_id != arg_ws:
+                raise BrainError(ErrorCode.NOT_FOUND, "not found")
+            if found.machine_id != principal.machine_id:
+                raise BrainError(ErrorCode.IDENTITY_MISMATCH, "identity mismatch")
+            if call.selected_scope is not None and (
+                call.selected_scope.repo_id != found.repo_id
+                or (
+                    call.selected_scope.checkout_id is not None and call.selected_scope.checkout_id != found.checkout_id
+                )
+            ):
+                raise BrainError(ErrorCode.NOT_FOUND, "not found")
+            if not snap.allows(principal, Scope(found.repo_id, found.checkout_id), action="prepare_task"):
+                raise BrainError(ErrorCode.NOT_FOUND, "not found")
+        else:
+            raise BrainError(ErrorCode.INVALID_INPUT, "mixed or invalid workspace selector")
+    elif "workspace_id" in call.arguments:
+        arg_ws = str(call.arguments["workspace_id"])
+        arg_chk_opt = str(call.arguments["checkout_id"]) if "checkout_id" in call.arguments else None
+        if call.selected_scope is not None and (
+            call.selected_scope.repo_id != arg_ws
+            or (
+                arg_chk_opt is not None
+                and call.selected_scope.checkout_id is not None
+                and call.selected_scope.checkout_id != arg_chk_opt
+            )
+        ):
+            raise BrainError(ErrorCode.NOT_FOUND, "not found")
+        if not snap.allows(principal, Scope(arg_ws, arg_chk_opt), action=call.tool):
+            raise BrainError(ErrorCode.NOT_FOUND, "not found")
+    elif "checkout_id" in call.arguments:
+        arg_chk = str(call.arguments["checkout_id"])
+        chk_b = snap.checkouts.get(arg_chk)
+        if chk_b is None:
+            raise BrainError(ErrorCode.NOT_FOUND, "not found")
+        if call.selected_scope is not None and (
+            call.selected_scope.repo_id != chk_b.repo_id
+            or (call.selected_scope.checkout_id is not None and call.selected_scope.checkout_id != arg_chk)
+        ):
+            raise BrainError(ErrorCode.NOT_FOUND, "not found")
+        if not snap.allows(principal, Scope(chk_b.repo_id, arg_chk), action=call.tool):
+            raise BrainError(ErrorCode.NOT_FOUND, "not found")
+
+
 def admit_prequeue_request(
     *,
     expected_store_id: str,
@@ -167,16 +256,7 @@ def admit_prequeue_request(
         correlation_id=correlation_id,
     )
 
-    if not view.auth.allows(principal, None, action="get_health"):
-        raise BrainError(ErrorCode.NOT_FOUND, "not found")
-    if call.selected_scope is not None:
-        if not view.auth.allows(principal, call.selected_scope, action=call.tool):
-            raise BrainError(ErrorCode.NOT_FOUND, "not found")
-    elif "workspace_id" in call.arguments:
-        arg_ws = str(call.arguments["workspace_id"])
-        arg_chk = str(call.arguments["checkout_id"]) if "checkout_id" in call.arguments else None
-        if not view.auth.allows(principal, Scope(arg_ws, arg_chk), action=call.tool):
-            raise BrainError(ErrorCode.NOT_FOUND, "not found")
+    authorize_call_against_snapshot(view.auth, principal, call)
 
     canonical_bytes = canonical_request_payload(call)
     scope_key: ReservationScopeKey | None = None

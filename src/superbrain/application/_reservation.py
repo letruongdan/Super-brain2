@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import hmac
 import threading
 from collections.abc import Callable
@@ -33,6 +34,23 @@ def make_checked_error(code: ErrorCode, message: str) -> CallResult:
     envelope = make_error_envelope(BrainError(code, message))
     encode_envelope(envelope)
     return envelope
+
+
+def invoke_response_callback(cb: Callable[[CallResult], None] | None, response: CallResult) -> None:
+    """Invoke transport response callback outside the state lock, isolating socket/client errors."""
+    if cb is None:
+        return
+    with contextlib.suppress(Exception):
+        cb(response)
+
+
+def _deliver_settled(
+    reservation: Reservation,
+    response: CallResult,
+    cb: Callable[[CallResult], None] | None,
+) -> None:
+    reservation._response_event.set()
+    invoke_response_callback(cb, response)
 
 
 class Reservation:
@@ -245,9 +263,7 @@ class ReservationTable:
                 claimed = True
 
         if settled_here:
-            reservation._response_event.set()
-            if deliver_cb is not None:
-                deliver_cb(expired_env)
+            _deliver_settled(reservation, expired_env, deliver_cb)
         return claimed
 
     def enter_commit(self, reservation: Reservation, now_ns: int) -> bool:
@@ -289,9 +305,7 @@ class ReservationTable:
                 deliver_cb = reservation._on_response
 
         if settled_here:
-            reservation._response_event.set()
-            if deliver_cb is not None:
-                deliver_cb(expired_env)
+            _deliver_settled(reservation, expired_env, deliver_cb)
         return True
 
     def arbitrate_at(self, now_ns: int) -> tuple[tuple[Reservation, CallResult], ...]:
@@ -328,10 +342,10 @@ class ReservationTable:
                         res._response = unknown_env
                         to_deliver.append((res, unknown_env, res._on_response))
 
-        for res, env, cb in to_deliver:
+        for res, _env, _cb in to_deliver:
             res._response_event.set()
-            if cb is not None:
-                cb(env)
+        for _res, env, cb in to_deliver:
+            invoke_response_callback(cb, env)
         return tuple((res, env) for res, env, _ in to_deliver)
 
     def finish_owner_execution(self, reservation: Reservation, response: CallResult) -> bool:
@@ -357,9 +371,7 @@ class ReservationTable:
                 deliver_cb = reservation._on_response
 
         if won:
-            reservation._response_event.set()
-            if deliver_cb is not None:
-                deliver_cb(response)
+            _deliver_settled(reservation, response, deliver_cb)
         return won
 
 

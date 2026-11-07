@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol
 
-from superbrain.application.deadlines import Reservation, enter_commit
+from superbrain.application.deadlines import Reservation, authorize_call_against_snapshot, enter_commit
 from superbrain.application.idempotency import (
     compute_idempotency_key_hash,
     compute_request_hmac,
@@ -172,10 +172,7 @@ class KernelDispatcher:
         live_principal = self._policy.resolve_credential(auth.token)
         if live_principal != auth.principal or live_principal != ctx.principal:
             raise BrainError(ErrorCode.IDENTITY_MISMATCH, "principal identity mismatch")
-        if call.selected_scope is not None and not self._policy.allows(
-            live_principal, call.selected_scope, action=call.tool
-        ):
-            raise BrainError(ErrorCode.NOT_FOUND, "not found")
+        authorize_call_against_snapshot(self._policy.snapshot(), live_principal, call)
         return live_principal
 
     def _check_handler_budget(self, ctx: CallContext, reservation: Reservation | None) -> None:

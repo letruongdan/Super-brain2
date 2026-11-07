@@ -31,7 +31,11 @@ from superbrain.core.kernel import (
     LOCAL_PHASE_BUDGET_NS,
     RESPONSE_RESERVE_NS,
     TOTAL_REQUEST_BUDGET_NS,
+    AuthSnapshot,
+    CallContext,
     CallResult,
+    Identity,
+    PrivateRequestAuth,
     RequestAuthView,
     RequestDeadlines,
     ReservationPhase,
@@ -43,6 +47,7 @@ from superbrain.core.kernel import (
     StoredResult,
     WorkspaceBinding,
 )
+from superbrain.core.wire import normalize_call
 from superbrain.ports.clock import MonotonicClock
 from superbrain.ports.kernel import KernelTx
 from superbrain.ports.os import OsAdapters
@@ -1448,3 +1453,470 @@ def test_i2_t4a_n01_strict_store_infers_policy_store_and_rejects_split_authority
     finally:
         rt_b.close()
         rt_a.close()
+
+
+# --- 11. SDD R1 Finding #1: Fault-isolated on_response callbacks across arbiter, owner, and submit -------------------
+
+
+def test_r1_response_callback_exceptions_isolated_across_arbiter_owner_and_submit(
+    trusted_tmp: Path, os_: OsAdapters, clock: FakeClock
+) -> None:
+    mono = FakeMonotonicClock(start_ns=1_000 * MS)
+    rt = _open_fixture_runtime(trusted_tmp / "root", os_)
+    try:
+        seeded = seed_principal_and_credential(rt.policy)
+        binding = _register_ws(rt, clock, seeded, alias="ws-main", checkout_dir=trusted_tmp / "chk")
+        scope = Scope(binding.repo_id, binding.checkout_id)
+        domain = FixtureKernelDomain(
+            store=rt.store,
+            policy=rt.policy,
+            clock=clock,
+            observer=RecordingObserver(descriptor=_desc()),
+            monotonic_ns=mono.monotonic_ns,
+        )
+        bridge = KernelBridge(
+            store=rt.store,
+            policy=rt.policy,
+            clock=clock,
+            monotonic_clock=mono,
+            writer_epoch=rt.lease.epoch,
+            domain=domain,
+            max_queue_size=4,
+        )
+        bridge.publish_auth_view()
+
+        def _broken_pipe(_env: CallResult) -> None:
+            raise BrokenPipeError("simulated disconnected client socket")
+
+        sibling_callbacks: list[CallResult] = []
+
+        # 1) Arbiter sweep: item 0's callback raises BrokenPipeError; item 1 MUST still wake & receive its callback!
+        sub_0 = bridge.submit_request(
+            "prepare_task",
+            {
+                "schema_version": "2.0",
+                "workspace_hint": "ws-main",
+                "description": "item 0 broken pipe on arbitrate",
+                "idempotency_key": "idem_r1_cb_arb_000001",
+            },
+            token=seeded.token,
+            selected_scope=scope,
+            on_response=_broken_pipe,
+        )
+        sub_1 = bridge.submit_request(
+            "prepare_task",
+            {
+                "schema_version": "2.0",
+                "workspace_hint": "ws-main",
+                "description": "item 1 sibling must not be stranded",
+                "idempotency_key": "idem_r1_cb_arb_000002",
+            },
+            token=seeded.token,
+            selected_scope=scope,
+            on_response=sibling_callbacks.append,
+        )
+
+        mono.advance(1_300 * MS)
+        settled = bridge.arbitrate_deadlines()
+        assert len(settled) == 2
+        _expect_err("prepare_task", sub_0.wait(timeout=1.0), ErrorCode.DEADLINE_EXCEEDED)
+        _expect_err("prepare_task", sub_1.wait(timeout=1.0), ErrorCode.DEADLINE_EXCEEDED)
+        assert len(sibling_callbacks) == 1
+        _expect_err("prepare_task", sibling_callbacks[0], ErrorCode.DEADLINE_EXCEEDED)
+        assert bridge.process_next_queued(block=False) is True
+        assert bridge.process_next_queued(block=False) is True
+
+        # 2) Pre-queue error callback raising BrokenPipeError inside submit() MUST NOT escape submit()!
+        prequeue_err_sub = bridge.submit_request(
+            "prepare_task",
+            {
+                "schema_version": "2.0",
+                "workspace_hint": "ws-main",
+                "description": "bad token with broken pipe callback",
+                "idempotency_key": "idem_r1_cb_pre_000003",
+            },
+            token=f"{new_id()}.{'A' * 43}",
+            selected_scope=scope,
+            on_response=_broken_pipe,
+        )
+        assert prequeue_err_sub.done()
+        _expect_err("prepare_task", prequeue_err_sub.wait(timeout=1.0), ErrorCode.UNAUTHENTICATED)
+
+        # 3) try_claim_for_owner expired callback raising BrokenPipeError MUST NOT crash process_next_queued()!
+        sub_claim_exp = bridge.submit_request(
+            "prepare_task",
+            {
+                "schema_version": "2.0",
+                "workspace_hint": "ws-main",
+                "description": "expired at owner claim with broken pipe callback",
+                "idempotency_key": "idem_r1_cb_clm_000004",
+            },
+            token=seeded.token,
+            selected_scope=scope,
+            on_response=_broken_pipe,
+        )
+        mono.advance(1_300 * MS)
+        assert bridge.process_next_queued(block=False) is True
+        _expect_err("prepare_task", sub_claim_exp.wait(timeout=1.0), ErrorCode.DEADLINE_EXCEEDED)
+
+        # 4) finish_owner_execution callback raising BrokenPipeError MUST NOT crash process_next_queued()!
+        sub_finish = bridge.submit_request(
+            "prepare_task",
+            {
+                "schema_version": "2.0",
+                "workspace_hint": "ws-main",
+                "description": "normal commit finish with broken pipe callback",
+                "idempotency_key": "idem_r1_cb_fin_000005",
+            },
+            token=seeded.token,
+            selected_scope=scope,
+            on_response=_broken_pipe,
+        )
+        assert bridge.process_next_queued(block=False) is True
+        _expect_ok("prepare_task", sub_finish.wait(timeout=1.0))
+        assert bridge.reservations.active_count() == 0
+
+        # 5) cancel_before_commit callback raising BrokenPipeError MUST NOT escape cancel_before_commit()!
+        table = ReservationTable()
+        dl = RequestDeadlines.from_receive_ns(mono.monotonic_ns())
+        res_cancel = reserve(
+            ReservationScopeKey(seeded.principal.principal_id, "prepare_task", "sha256:" + "9" * 64),
+            "sha256:" + "8" * 64,
+            table=table,
+            deadlines=dl,
+            request_digest_key_id="k1",
+            on_response=_broken_pipe,
+        )
+        assert table.cancel_before_commit(res_cancel, dl.handler_deadline_ns) is True
+        settled_cancel = res_cancel.wait_response(timeout=1.0)
+        assert settled_cancel is not None
+        _expect_err("prepare_task", settled_cancel, ErrorCode.DEADLINE_EXCEEDED)
+    finally:
+        rt.close()
+
+
+# --- 12. SDD R1 Finding #2: Pre-queue & owner scope/selector authorization symmetry (IDENTITY_MISMATCH / grant) ------
+
+
+def test_r1_prequeue_and_owner_scope_selector_authorization_symmetry(
+    trusted_tmp: Path, os_: OsAdapters, clock: FakeClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mono = FakeMonotonicClock(start_ns=5_000 * MS)
+    rt = _open_fixture_runtime(trusted_tmp / "root", os_)
+    try:
+        dan_box1 = seed_principal_and_credential(rt.policy, owner_id="dan", harness_id="codex", machine_id="box-1")
+        dan_box2 = seed_principal_and_credential(rt.policy, owner_id="dan", harness_id="codex", machine_id="box-2")
+        ws_box1 = _register_ws(
+            rt, clock, dan_box1, alias="ws-same", checkout_dir=trusted_tmp / "chk-b1", remote=REMOTE_A
+        )
+        _register_ws(rt, clock, dan_box2, alias="ws-box2", checkout_dir=trusted_tmp / "chk-b2", remote=REMOTE_A)
+        ws_beta = _register_ws(
+            rt, clock, dan_box1, alias="ws-beta", checkout_dir=trusted_tmp / "chk-beta", remote=REMOTE_B
+        )
+
+        domain = FixtureKernelDomain(
+            store=rt.store,
+            policy=rt.policy,
+            clock=clock,
+            observer=RecordingObserver(descriptor=_desc()),
+            monotonic_ns=mono.monotonic_ns,
+        )
+        bridge = KernelBridge(
+            store=rt.store,
+            policy=rt.policy,
+            clock=clock,
+            monotonic_clock=mono,
+            writer_epoch=rt.lease.epoch,
+            domain=domain,
+        )
+        bridge.publish_auth_view()
+
+        wrong_machine_args: dict[str, JsonValue] = {
+            "schema_version": "2.0",
+            "workspace_id": ws_box1.repo_id,
+            "checkout_id": ws_box1.checkout_id,
+            "description": "dan_box2 targeting dan_box1 checkout on same repo",
+            "idempotency_key": "idem_r1_wrong_mach_001",
+        }
+
+        # 1) Wrong-machine checkout on same owner + granted repo MUST return IDENTITY_MISMATCH ("identity mismatch")
+        #    BOTH pre-queue (selected_scope=None and Scope(repo_id, None)) AND on direct owner dispatch!
+        for sel_scope in (None, Scope(ws_box1.repo_id, None)):
+            sub_wm = bridge.submit_request(
+                "prepare_task",
+                wrong_machine_args,
+                token=dan_box2.token,
+                selected_scope=sel_scope,
+            )
+            assert sub_wm.done(), "wrong-machine checkout must be rejected pre-queue"
+            wm_err = _expect_err("prepare_task", sub_wm.wait(timeout=1.0), ErrorCode.IDENTITY_MISMATCH)
+            assert wm_err["message"] == "identity mismatch"
+
+            direct_call = normalize_call(
+                "prepare_task",
+                wrong_machine_args,
+                dan_box2.principal,
+                selected_scope=sel_scope,
+            )
+            direct_ctx = CallContext(
+                principal=dan_box2.principal,
+                identity=Identity(store_id=rt.store.store_id, writer_epoch=rt.lease.epoch, instance_id="inst-r1"),
+                deadline_ns=mono.monotonic_ns() + TOTAL_REQUEST_BUDGET_NS,
+                selected_scope=sel_scope,
+            )
+            direct_auth = PrivateRequestAuth(
+                credential_id=dan_box2.credential_id,
+                principal=dan_box2.principal,
+                token=dan_box2.token,
+            )
+            direct_err = _expect_err(
+                "prepare_task",
+                bridge.dispatch(direct_call, direct_ctx, auth=direct_auth),
+                ErrorCode.IDENTITY_MISMATCH,
+            )
+            assert direct_err["message"] == "identity mismatch"
+
+        # 2) Mismatched selected_scope (repo A) + arguments.workspace_id (repo B) rejected pre-queue with NOT_FOUND!
+        sub_mismatch = bridge.submit_request(
+            "prepare_task",
+            {
+                "schema_version": "2.0",
+                "workspace_id": ws_beta.repo_id,
+                "checkout_id": ws_beta.checkout_id,
+                "description": "selected_scope repo_a vs arguments repo_b",
+                "idempotency_key": "idem_r1_scope_mis_0002",
+            },
+            token=dan_box1.token,
+            selected_scope=Scope(ws_box1.repo_id, None),
+        )
+        assert sub_mismatch.done()
+        _expect_err("prepare_task", sub_mismatch.wait(timeout=1.0), ErrorCode.NOT_FOUND)
+        assert bridge.queue_depth() == 0
+
+        # 3) Ambiguous workspace_hint rejected pre-queue AND on owner dispatch with REVISION_CONFLICT!
+        base_snap = rt.policy.snapshot()
+        dup_checkouts = dict(base_snap.checkouts)
+        dup_checkouts["chk-ambig-twin"] = WorkspaceBinding(
+            owner_id=dan_box1.principal.owner_id,
+            repo_id=ws_beta.repo_id,
+            checkout_id="chk-ambig-twin",
+            machine_id=dan_box1.principal.machine_id,
+            alias="ws-same",
+            checkout_path=str(trusted_tmp / "chk-beta"),
+        )
+        ambig_snap = AuthSnapshot(
+            store_id=base_snap.store_id,
+            trust_generation=base_snap.trust_generation,
+            credentials=base_snap.credentials,
+            principals=base_snap.principals,
+            repo_policies=base_snap.repo_policies,
+            grants=base_snap.grants,
+            checkouts=dup_checkouts,
+        )
+        ambig_args: dict[str, JsonValue] = {
+            "schema_version": "2.0",
+            "workspace_hint": "ws-same",
+            "description": "ambiguous workspace_hint across two repos on box-1",
+            "idempotency_key": "idem_r1_ambig_hint_003",
+        }
+        with monkeypatch.context() as mp:
+            mp.setattr(rt.policy, "snapshot", lambda: ambig_snap)
+            bridge.publish_auth_view()
+            sub_ambig = bridge.submit_request(
+                "prepare_task",
+                ambig_args,
+                token=dan_box1.token,
+                selected_scope=None,
+            )
+            assert sub_ambig.done()
+            ambig_err = _expect_err("prepare_task", sub_ambig.wait(timeout=1.0), ErrorCode.REVISION_CONFLICT)
+            assert ambig_err["message"] == "revision conflict"
+            owner_ambig_err = _expect_err(
+                "prepare_task",
+                bridge.dispatch(
+                    normalize_call("prepare_task", ambig_args, dan_box1.principal, selected_scope=None),
+                    CallContext(
+                        principal=dan_box1.principal,
+                        identity=Identity(store_id=rt.store.store_id, writer_epoch=rt.lease.epoch, instance_id="inst"),
+                        deadline_ns=mono.monotonic_ns() + TOTAL_REQUEST_BUDGET_NS,
+                        selected_scope=None,
+                    ),
+                    auth=PrivateRequestAuth(
+                        credential_id=dan_box1.credential_id,
+                        principal=dan_box1.principal,
+                        token=dan_box1.token,
+                    ),
+                ),
+                ErrorCode.REVISION_CONFLICT,
+            )
+            assert owner_ambig_err["message"] == "revision conflict"
+        bridge.publish_auth_view()
+
+        # 4) Owner recheck symmetry when selected_scope=None: enqueue valid request for ws_beta, then revoke
+        #    repo_grant on ws_beta BEFORE owner claims -> owner rejects in _verify_owner_auth_and_scope BEFORE
+        #    lookup_for_owner / prepare_mutation!
+        queued_beta = bridge.submit_request(
+            "prepare_task",
+            {
+                "schema_version": "2.0",
+                "workspace_id": ws_beta.repo_id,
+                "checkout_id": ws_beta.checkout_id,
+                "description": "grant revoked while queued with selected_scope=None",
+                "idempotency_key": "idem_r1_revoke_grant_4",
+            },
+            token=dan_box1.token,
+            selected_scope=None,
+        )
+        assert not queued_beta.done()
+        with rt.policy._immediate() as pdb:
+            pdb.execute(
+                "DELETE FROM repo_grant WHERE principal_id = ? AND repo_id = ?",
+                (dan_box1.principal.principal_id, ws_beta.repo_id),
+            )
+        bridge.publish_auth_view()
+
+        assert bridge.process_next_queued(block=False) is True
+        _expect_err("prepare_task", queued_beta.wait(timeout=1.0), ErrorCode.NOT_FOUND)
+        assert domain.prepare_calls == 0
+        assert domain.apply_calls == 0
+    finally:
+        rt.close()
+
+
+# --- 13. SDD R1 Finding #3: Already-expired receive_ns rejected before reserving scope_key or enqueueing -------------
+
+
+def test_r1_already_expired_receive_ns_rejected_before_reserve_or_queue(
+    trusted_tmp: Path, os_: OsAdapters, clock: FakeClock
+) -> None:
+    mono = FakeMonotonicClock(start_ns=10_000 * MS)
+    rt = _open_fixture_runtime(trusted_tmp / "root", os_)
+    try:
+        seeded = seed_principal_and_credential(rt.policy)
+        binding = _register_ws(rt, clock, seeded, alias="ws-main", checkout_dir=trusted_tmp / "chk")
+        scope = Scope(binding.repo_id, binding.checkout_id)
+        domain = FixtureKernelDomain(
+            store=rt.store,
+            policy=rt.policy,
+            clock=clock,
+            observer=RecordingObserver(descriptor=_desc()),
+            monotonic_ns=mono.monotonic_ns,
+        )
+        bridge = KernelBridge(
+            store=rt.store,
+            policy=rt.policy,
+            clock=clock,
+            monotonic_clock=mono,
+            writer_epoch=rt.lease.epoch,
+            domain=domain,
+            max_queue_size=1,
+        )
+        bridge.publish_auth_view()
+
+        # 1) Non-full queue: already-expired receive_ns settles synchronously as DEADLINE_EXCEEDED without queueing!
+        exp_key = "idem_r1_expired_recv_1"
+        exp_scope_key = ReservationScopeKey(
+            seeded.principal.principal_id,
+            "prepare_task",
+            compute_idempotency_key_hash(seeded.principal.principal_id, "prepare_task", exp_key),
+        )
+        sub_exp = bridge.submit_request(
+            "prepare_task",
+            {
+                "schema_version": "2.0",
+                "workspace_hint": "ws-main",
+                "description": "already expired at submit time",
+                "idempotency_key": exp_key,
+            },
+            token=seeded.token,
+            selected_scope=scope,
+            receive_ns=mono.monotonic_ns() - 1_300 * MS,
+        )
+        assert sub_exp.done()
+        _expect_err("prepare_task", sub_exp.wait(timeout=1.0), ErrorCode.DEADLINE_EXCEEDED)
+        assert bridge.queue_depth() == 0
+        assert not bridge.reservations.has_active(exp_scope_key)
+
+        # Auth error STILL takes precedence over expired receive_ns!
+        sub_bad_auth = bridge.submit_request(
+            "prepare_task",
+            {
+                "schema_version": "2.0",
+                "workspace_hint": "ws-main",
+                "description": "unauthenticated + expired receive_ns",
+                "idempotency_key": "idem_r1_expired_auth_2",
+            },
+            token=f"{new_id()}.{'A' * 43}",
+            selected_scope=scope,
+            receive_ns=mono.monotonic_ns() - 2_000 * MS,
+        )
+        assert sub_bad_auth.done()
+        _expect_err("prepare_task", sub_bad_auth.wait(timeout=1.0), ErrorCode.UNAUTHENTICATED)
+
+        # 2) Full queue (max_queue_size=1): already-expired receive_ns MUST return DEADLINE_EXCEEDED (never STORE_BUSY)!
+        slot_filler = bridge.submit_request(
+            "prepare_task",
+            {
+                "schema_version": "2.0",
+                "workspace_hint": "ws-main",
+                "description": "occupy bounded queue slot",
+                "idempotency_key": "idem_r1_slot_filler_03",
+            },
+            token=seeded.token,
+            selected_scope=scope,
+        )
+        assert not slot_filler.done()
+        assert bridge.queue_depth() == 1
+
+        sub_exp_full = bridge.submit_request(
+            "prepare_task",
+            {
+                "schema_version": "2.0",
+                "workspace_hint": "ws-main",
+                "description": "already expired when queue is full",
+                "idempotency_key": exp_key,
+            },
+            token=seeded.token,
+            selected_scope=scope,
+            receive_ns=mono.monotonic_ns() - 1_300 * MS,
+        )
+        assert sub_exp_full.done()
+        _expect_err("prepare_task", sub_exp_full.wait(timeout=1.0), ErrorCode.DEADLINE_EXCEEDED)
+        assert not bridge.reservations.has_active(exp_scope_key)
+    finally:
+        rt.close()
+
+
+# --- 14. SDD R1 Finding #5: AtomicRequestAuthState.install rejects non-monotonic version -----------------------------
+
+
+def test_r1_atomic_auth_state_rejects_non_monotonic_version(trusted_tmp: Path, os_: OsAdapters) -> None:
+    rt = _open_fixture_runtime(trusted_tmp / "root", os_)
+    try:
+        snap = rt.policy.snapshot()
+        key_id, key_bytes = rt.policy.request_digest_key()
+        state = AtomicRequestAuthState(rt.store.store_id)
+
+        v5 = RequestAuthView(version=5, auth=snap, active_request_key_id=key_id, active_request_key_bytes=key_bytes)
+        assert state.install(v5) is v5
+        assert state.current() is v5
+
+        # Same version (5) and older version (4) MUST fail closed with INTEGRITY_FAILURE without overwriting v5!
+        for stale_ver in (5, 4):
+            stale_view = RequestAuthView(
+                version=stale_ver,
+                auth=snap,
+                active_request_key_id=key_id,
+                active_request_key_bytes=key_bytes,
+            )
+            with pytest.raises(BrainError) as exc_stale:
+                state.install(stale_view)
+            assert exc_stale.value.code is ErrorCode.INTEGRITY_FAILURE
+            assert state.current() is v5
+
+        # Strictly higher version (6) installs cleanly!
+        v6 = RequestAuthView(version=6, auth=snap, active_request_key_id=key_id, active_request_key_bytes=key_bytes)
+        assert state.install(v6) is v6
+        assert state.current() is v6
+    finally:
+        rt.close()
