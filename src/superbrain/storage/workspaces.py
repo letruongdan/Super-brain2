@@ -108,7 +108,9 @@ class WorkspaceRegistryMirrorProjection:
     def apply(self, db: sqlite3.Connection, prefix: str, entry: LedgerEntry, policy: PolicyView) -> None:
         keys = frozenset(entry.meta)
         if entry.handler_version == 1:
-            if keys not in (_REGISTER_V1_KEYS, _REGISTER_V2_KEYS) or entry.meta.get("subject_id") is not None:
+            # Real v1 history has both shapes: no ``subject_id`` (6a67b38) and a ``subject_id`` digest (007b40f).
+            # ``MirrorCandidate`` below type-checks the digest; history is read as written, never rejected or rewritten.
+            if keys not in (_REGISTER_V1_KEYS, _REGISTER_V2_KEYS):
                 raise _corrupt(entry, "malformed legacy workspace_register meta")
         elif entry.handler_version == 2:
             if keys != _REGISTER_V2_KEYS:
