@@ -278,8 +278,11 @@ def register_snapshot(tx: KernelTx, binding: WorkspaceBinding, descriptor: Snaps
 
 
 def _snapshot_readable(tx: KernelTx, snapshot: SourceSnapshot) -> bool:
+    """Readable = the exact hold ``(event, snapshot_id, descriptor_digest)`` still exists (I2-T3-R04), the holder is
+    not tombstoned, the descriptor is not quarantined and its blob is present. Another holder is no proof."""
     return (
-        not tx.holder_tombstoned(snapshot.snapshot_id)
+        tx.snapshot_held(snapshot.snapshot_id, snapshot.descriptor_digest)
+        and not tx.holder_tombstoned(snapshot.snapshot_id)
         and not tx.blob_restricted(snapshot.descriptor_digest)
         and tx.blob_present(snapshot.descriptor_digest)
     )
@@ -297,6 +300,7 @@ def admit_source_snapshot(tx: KernelTx, binding: WorkspaceBinding, snapshot_id: 
         or snapshot.repo_id != binding.repo_id
         or snapshot.checkout_id != binding.checkout_id
         or tx.holder_tombstoned(snapshot.snapshot_id)
+        or not tx.snapshot_held(snapshot.snapshot_id, snapshot.descriptor_digest)
     ):
         raise _not_found()
     if tx.blob_restricted(snapshot.descriptor_digest):

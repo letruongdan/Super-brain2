@@ -32,7 +32,7 @@ from superbrain.core.kernel import (
 )
 from superbrain.ports.kernel import KernelTx
 from superbrain.ports.policy import PolicyView
-from superbrain.storage.cas import ContentStore
+from superbrain.storage.cas import ContentStore, held_digests
 from superbrain.storage.errors import sqlite_error
 from superbrain.storage.kernel_schema import KERNEL_WORKSPACE_KINDS
 from superbrain.storage.kinds import KindRegistry, RetentionClass, is_uuid
@@ -384,6 +384,9 @@ class StoreKernelTx:
     def blob_present(self, digest: str) -> bool:
         return self._cas.blob_intact(digest)
 
+    def snapshot_held(self, snapshot_id: str, descriptor_digest: str) -> bool:
+        return is_uuid(snapshot_id) and descriptor_digest in held_digests(self._txn.db, _HOLDER_KIND, snapshot_id)
+
     def _query(self, sql: str, params: tuple[object, ...]) -> list[tuple[object, ...]]:
         try:
             return self._txn.db.execute(sql, params).fetchall()
@@ -540,7 +543,10 @@ class StoreSourceRestrictions:
                 f"SELECT owner_id, repo_id, descriptor_digest FROM {SNAPSHOTS_TABLE} WHERE snapshot_id = ?",
                 (ref.source.id,),
             ).fetchone()
+            held = row is not None and ref.source.digest in held_digests(db, _HOLDER_KIND, ref.source.id)
         if row is None or (str(row[0]), str(row[1]), str(row[2])) != (ref.owner_id, ref.repo_id, ref.source.digest):
+            return False
+        if not held:  # I2-T3-R04: only the exact current hold (event, snapshot_id, descriptor_digest) proves it
             return False
         return (
             ref.source.revision == 1

@@ -90,6 +90,10 @@ class KernelTx(Protocol):
         """True iff policy tombstoned the business holder ``holder_id`` (a snapshot, say)."""
         ...
 
+    def snapshot_held(self, snapshot_id: str, descriptor_digest: str) -> bool:
+        """True iff the exact hold ``(event, snapshot_id, descriptor_digest)`` currently exists."""
+        ...
+
     def blob_present(self, digest: str) -> bool:
         """True iff the blob ``digest`` exists in CAS and hashes to its digest."""
         ...
