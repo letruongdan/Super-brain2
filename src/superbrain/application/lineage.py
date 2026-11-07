@@ -15,10 +15,12 @@ from collections.abc import Callable, Iterable, Sequence
 
 from superbrain.application._lineage_delivery import (
     aggregate_delivery_fields,
+    append_field_lineage_by_digest,
     append_task_bound,
     load_delivery,
     partition_delivery_fields,
     replay_for,
+    source_meta,
 )
 from superbrain.application.privacy import PrivacyFilter, admissible_field_path
 from superbrain.core.errors import BrainError, ErrorCode
@@ -317,22 +319,11 @@ def admit_source_snapshot(tx: KernelTx, binding: WorkspaceBinding, snapshot_id: 
     return snapshot
 
 
-def _source_meta(ref: LineageRef) -> dict[str, JsonValue]:
-    return {
-        "owner_id": ref.owner_id,
-        "repo_id": ref.repo_id,
-        "source_kind": ref.source.kind,
-        "source_id": ref.source.id,
-        "source_revision": ref.source.revision,
-        "source_digest": ref.source.digest,
-    }
-
-
 def record_task_lineage(tx: KernelTx, task_id: str, sources: LineageSet, *, unknown: bool) -> None:
     """Append only new task sources and a first unknown marker: the recorded lineage can never shrink."""
     existing, existing_unknown = tx.read_task_lineage(task_id)
     for ref in sorted(frozenset(_lineage_items(sources)) - existing, key=repr):
-        tx.append_record(KernelRecord("lineage.task_source_added", {"task_id": task_id, **_source_meta(ref)}))
+        tx.append_record(KernelRecord("lineage.task_source_added", {"task_id": task_id, **source_meta(ref)}))
     if unknown and not existing_unknown:
         tx.append_record(KernelRecord("lineage.task_unknown_marked", {"task_id": task_id}))
 
@@ -355,27 +346,12 @@ def record_field_lineage(
     digest = field_path_digest(checked_path)
     if not admissible_field_path(checked_path, filter_policy if filter_policy is not None else FilterPolicy()):
         raise BrainError(ErrorCode.INVALID_INPUT, "privacy filter rejected payload")
+    checked_sources = union_lineage(frozenset(), sources)
     current = tx.read_field_lineage(task_id).get(digest)
     if current is None:
         holder = str(uuid.uuid5(_FIELD_HOLDER_NAMESPACE, f"{task_id}\0{digest}"))
         tx.hold_blob(field_path_descriptor(checked_path), holder_id=holder)
-    known = current.sources if current is not None else frozenset()
-    for ref in sorted(frozenset(_lineage_items(sources)) - known, key=repr):
-        tx.append_record(
-            KernelRecord(
-                "lineage.field_source_added",
-                {"task_id": task_id, "field_path_digest": digest, **_source_meta(ref)},
-                refs=(digest,),
-            )
-        )
-    already_unknown = current is not None and current.unknown_source
-    if unknown and not already_unknown:
-        tx.append_record(
-            KernelRecord(
-                "lineage.field_unknown_marked", {"task_id": task_id, "field_path_digest": digest}, refs=(digest,)
-            )
-        )
-    return FieldLineage(digest, union_lineage(known, sources), unknown_source=unknown or already_unknown)
+    return append_field_lineage_by_digest(tx, task_id, digest, current, checked_sources, unknown=unknown)
 
 
 # --- S1=A labeled delivery ------------------------------------------------------------------------------------------
@@ -509,18 +485,28 @@ def _commit_delivery(
     selector_reason: SelectorReason,
     filter_policy: FilterPolicy,
 ) -> LabeledDelivery:
-    fields = aggregate_delivery_fields(items, filter_policy)
-    kept_fields, omitted_fields = partition_delivery_fields(fields, status)
     prior_lineage, prior_unknown = tx.read_task_lineage(task_id)
+    prior_fields = tx.read_field_lineage(task_id)
+    fields = aggregate_delivery_fields(items, filter_policy)
+    kept_fields, omitted_fields = partition_delivery_fields(fields, status, prior_digests=prior_fields.keys())
     base_task_lineage = union_lineage(
         prior_lineage,
-        [binding_lineage_ref(binding), *served, *(ref for field in kept_fields for ref in field.sources)],
+        [
+            binding_lineage_ref(binding),
+            *served,
+            *(ref for pf in prior_fields.values() for ref in pf.sources),
+            *(ref for field in kept_fields for ref in field.sources),
+        ],
     )
-    base_task_unknown = prior_unknown or any(field.unknown for field in kept_fields)
+    base_task_unknown = (
+        prior_unknown
+        or any(pf.unknown_source or not pf.sources for pf in prior_fields.values())
+        or any(field.unknown for field in kept_fields)
+    )
     task = append_task_bound(tx, binding, task_id, snapshot_id, status, selector_path, selector_reason)
     record_task_lineage(tx, task_id, base_task_lineage, unknown=base_task_unknown)
     # I2-T3-R01 & R02 (spec 14.2): non-admissible paths contribute restrictions to task lineage without persisting a
-    # CAS descriptor or field row; kept admissible fields inherit current task lineage united with their own sources.
+    # CAS descriptor or field row; every delivered field carries current task lineage without blanket sibling unknown.
     for field in kept_fields:
         if field.persistable:
             record_field_lineage(
@@ -530,6 +516,26 @@ def _commit_delivery(
                 union_lineage(base_task_lineage, field.sources),
                 unknown=field.unknown,
                 filter_policy=filter_policy,
+            )
+    if prior_fields:
+        kept_by_digest = {field.digest: field for field in kept_fields}
+        current_fields = tx.read_field_lineage(task_id)
+        for digest in sorted(prior_fields):
+            pf = prior_fields[digest]
+            matched = kept_by_digest.get(digest)
+            target_sources = (
+                union_lineage(base_task_lineage, pf.sources)
+                if matched is None
+                else union_lineage(base_task_lineage, union_lineage(pf.sources, matched.sources))
+            )
+            target_unknown = pf.unknown_source or not pf.sources or (matched is not None and matched.unknown)
+            append_field_lineage_by_digest(
+                tx,
+                task_id,
+                digest,
+                current_fields.get(digest, pf),
+                target_sources,
+                unknown=target_unknown,
             )
     committed_lineage, committed_unknown = tx.read_task_lineage(task_id)
     committed_fields = tx.read_field_lineage(task_id)

@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence, Set
 from dataclasses import dataclass
 
 from superbrain.application.privacy import admissible_field_path
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.ids import new_id
+from superbrain.core.jsonvalue import JsonValue
 from superbrain.core.kernel import (
     DeliveryItem,
+    FieldLineage,
     FilterPolicy,
     KernelRecord,
     LabeledDelivery,
@@ -23,6 +25,48 @@ from superbrain.core.kernel import (
     field_path_digest,
 )
 from superbrain.ports.kernel import KernelTx
+
+
+def source_meta(ref: LineageRef) -> dict[str, JsonValue]:
+    """Ledger metadata dictionary for one ``LineageRef``."""
+    return {
+        "owner_id": ref.owner_id,
+        "repo_id": ref.repo_id,
+        "source_kind": ref.source.kind,
+        "source_id": ref.source.id,
+        "source_revision": ref.source.revision,
+        "source_digest": ref.source.digest,
+    }
+
+
+def append_field_lineage_by_digest(
+    tx: KernelTx,
+    task_id: str,
+    digest: str,
+    current: FieldLineage | None,
+    sources: Iterable[LineageRef],
+    *,
+    unknown: bool,
+) -> FieldLineage:
+    """Append monotonic field sources and sticky unknown marker for ``digest``."""
+    known = current.sources if current is not None else frozenset()
+    checked_sources = frozenset(sources)
+    for ref in sorted(checked_sources - known, key=repr):
+        tx.append_record(
+            KernelRecord(
+                "lineage.field_source_added",
+                {"task_id": task_id, "field_path_digest": digest, **source_meta(ref)},
+                refs=(digest,),
+            )
+        )
+    already_unknown = current is not None and current.unknown_source
+    if unknown and not already_unknown:
+        tx.append_record(
+            KernelRecord(
+                "lineage.field_unknown_marked", {"task_id": task_id, "field_path_digest": digest}, refs=(digest,)
+            )
+        )
+    return FieldLineage(digest, known | checked_sources, unknown_source=unknown or already_unknown)
 
 
 @dataclass(frozen=True)
@@ -78,15 +122,24 @@ def aggregate_delivery_fields(
 
 
 def partition_delivery_fields(
-    fields: Sequence[AggregatedField], status: SnapshotStatus
+    fields: Sequence[AggregatedField],
+    status: SnapshotStatus,
+    *,
+    prior_digests: Set[str] = frozenset(),
 ) -> tuple[tuple[AggregatedField, ...], tuple[AggregatedField, ...]]:
     """Split aggregated fields into ``(kept_fields, omitted_fields)`` for ``status`` (S1=A).
 
-    Any field with ``snapshot_dependent=True`` is omitted as a unit when ``status`` is not ``AVAILABLE``.
+    Any new field with ``snapshot_dependent=True`` is omitted as a unit when ``status`` is not ``AVAILABLE``.
+    A field whose ``digest`` is already in ``prior_digests`` cannot be omitted from the committed projection, so its
+    monotonic restrictions stay in ``kept_fields`` rather than being dropped.
     """
     has_snapshot = status is SnapshotStatus.AVAILABLE
-    kept = tuple(field for field in fields if has_snapshot or not field.snapshot_dependent)
-    omitted = tuple(field for field in fields if not has_snapshot and field.snapshot_dependent)
+    kept = tuple(
+        field for field in fields if has_snapshot or not field.snapshot_dependent or field.digest in prior_digests
+    )
+    omitted = tuple(
+        field for field in fields if not has_snapshot and field.snapshot_dependent and field.digest not in prior_digests
+    )
     return kept, omitted
 
 
