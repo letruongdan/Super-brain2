@@ -22,11 +22,11 @@ from typing import cast
 import jsonschema
 
 from superbrain.application._lineage_delivery import aggregate_delivery_fields
+from superbrain.application.deadlines import begin_local_phase
 from superbrain.application.dispatch import KernelToolDomain, PreparedEffect
 from superbrain.application.lineage import (
     admit_source_snapshot,
     commit_new_labeled_delivery,
-    local_deadline_ns,
     observe_within_budget,
     register_snapshot,
     resolve_binding,
@@ -38,7 +38,6 @@ from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.ids import new_id
 from superbrain.core.jsonvalue import JsonValue
 from superbrain.core.kernel import (
-    COMMIT_RESERVE_NS,
     REDACTED_REASON_DEFAULT,
     SNAPSHOT_DEGRADED_CODES,
     AccountingStatus,
@@ -494,7 +493,7 @@ class FixtureKernelDomain(KernelToolDomain):
     policy: KernelPolicyPort
     clock: Clock
     observer: SnapshotObserver | None = None
-    monotonic_ns: Callable[[], int] = time.monotonic_ns
+    monotonic_ns: Callable[[], int] = time.perf_counter_ns
     delivery_plan: Callable[[WorkspaceBinding, str], Sequence[FixtureDeliveryRefSpec]] | None = None
     repo_flags_overrides: dict[str, RepoFlags] = field(default_factory=dict)
     before_apply_hook: Callable[[KernelTx], None] | None = None
@@ -644,6 +643,7 @@ class FixtureKernelDomain(KernelToolDomain):
         raise BrainError(ErrorCode.CAPABILITY_UNAVAILABLE, "capability unavailable")
 
     def _prepare_task_effect(self, call: Call, ctx: CallContext) -> PreparedEffect:
+        local_deadline = begin_local_phase(self.monotonic_ns, ctx.deadline_ns)
         args = call.arguments
         selector = WorkspaceSelector(
             workspace_id=cast(str | None, args.get("workspace_id")),
@@ -667,11 +667,6 @@ class FixtureKernelDomain(KernelToolDomain):
         ):
             raise BrainError(ErrorCode.NOT_FOUND, "not found")
 
-        start_ns = self.monotonic_ns()
-        total_deadline = ctx.deadline_ns
-        if start_ns >= total_deadline - COMMIT_RESERVE_NS:
-            raise BrainError(ErrorCode.DEADLINE_EXCEEDED, "deadline exceeded")
-        local_deadline = local_deadline_ns(start_ns, total_deadline)
         fpol = self._filter_policy_for_repo(binding.repo_id)
         safe = PrivacyFilter(self.monotonic_ns).apply(dict(args), fpol, deadline_ns=local_deadline)
 
@@ -875,6 +870,7 @@ class FixtureKernelDomain(KernelToolDomain):
         return PreparedEffect(blobs=tuple(blobs), apply=apply)
 
     def _prepare_get_artifact_effect(self, call: Call, ctx: CallContext) -> PreparedEffect:
+        local_deadline = begin_local_phase(self.monotonic_ns, ctx.deadline_ns)
         scope = call.selected_scope
         if scope is None or scope.checkout_id is None:
             raise BrainError(ErrorCode.NOT_FOUND, "not found")
@@ -921,7 +917,7 @@ class FixtureKernelDomain(KernelToolDomain):
                 raise BrainError(ErrorCode.NOT_FOUND, "not found")
 
         fpol = self._filter_policy_for_repo(scope.repo_id)
-        PrivacyFilter(self.monotonic_ns).apply(dict(call.arguments), fpol)
+        PrivacyFilter(self.monotonic_ns).apply(dict(call.arguments), fpol, deadline_ns=local_deadline)
 
         result_id = new_id()
         art_ref = ObjectRef(kind=str(a_kind), id=artifact_id, revision=revision, digest=str(a_digest))
@@ -957,6 +953,7 @@ class FixtureKernelDomain(KernelToolDomain):
         return PreparedEffect(blobs=(), apply=apply)
 
     def _prepare_record_outcome_effect(self, call: Call, ctx: CallContext) -> PreparedEffect:
+        local_deadline = begin_local_phase(self.monotonic_ns, ctx.deadline_ns)
         scope = call.selected_scope
         if scope is None or scope.checkout_id is None:
             raise BrainError(ErrorCode.NOT_FOUND, "not found")
@@ -980,7 +977,7 @@ class FixtureKernelDomain(KernelToolDomain):
         task_id = str(d_row[0])
 
         fpol = self._filter_policy_for_repo(scope.repo_id)
-        safe = PrivacyFilter(self.monotonic_ns).apply(dict(call.arguments), fpol)
+        safe = PrivacyFilter(self.monotonic_ns).apply(dict(call.arguments), fpol, deadline_ns=local_deadline)
         safe_dict = safe.value if isinstance(safe.value, dict) else {}
         kept_applied = safe_dict.get("applied_refs")
         applied_count = len(kept_applied) if isinstance(kept_applied, list) else 0

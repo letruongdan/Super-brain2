@@ -1,4 +1,4 @@
-"""Task 4a owner dispatch, live credential/scope recheck, C1/C2/C4 orchestration, and current-policy rendering."""
+"""Task 4a/4b owner dispatch, live credential/scope recheck, C1/C2/C3/C4 orchestration, and commit gating."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol
 
+from superbrain.application.deadlines import Reservation, enter_commit
 from superbrain.application.idempotency import (
     compute_idempotency_key_hash,
     compute_request_hmac,
@@ -17,6 +18,7 @@ from superbrain.application.idempotency import (
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.jsonvalue import JsonValue
 from superbrain.core.kernel import (
+    HANDLER_RESERVE_NS,
     IDEMPOTENCY_CLOCK_UNTRUSTED_CODE,
     Call,
     CallContext,
@@ -30,7 +32,7 @@ from superbrain.core.kernel import (
     require_opaque_id,
 )
 from superbrain.core.wire import encode_envelope, make_error_envelope, make_success_envelope
-from superbrain.ports.clock import Clock
+from superbrain.ports.clock import Clock, MonotonicClock
 from superbrain.ports.kernel import (
     KernelBlobStagePort,
     KernelIdempotencyPort,
@@ -90,7 +92,10 @@ class KernelDispatcher:
         clock: Clock,
         store_schema_version: Callable[[], int],
         policy_schema_version: Callable[[], int],
+        monotonic_clock: MonotonicClock | None = None,
+        enforce_unreserved_deadline: bool = True,
         domain: KernelToolDomain | None = None,
+        before_enter_commit: Callable[[Reservation | None], None] | None = None,
         on_commit_completed: Callable[[StoredResult], None] | None = None,
     ) -> None:
         require_opaque_id(store_id, label="store_id")
@@ -99,15 +104,29 @@ class KernelDispatcher:
         self._idempotency = idempotency
         self._blob_stager = blob_stager
         self._clock = clock
+        self._monotonic_clock = monotonic_clock
+        self._enforce_unreserved_deadline = enforce_unreserved_deadline
         self._store_schema_version = store_schema_version
         self._policy_schema_version = policy_schema_version
         self._domain = domain
+        self._before_enter_commit = before_enter_commit
         self._on_commit_completed = on_commit_completed
 
     def dispatch(self, call: Call, ctx: CallContext, *, auth: PrivateRequestAuth) -> CallResult:
         """Execute ``call`` on the owner thread and return a validated v2 ``CallResult`` envelope."""
+        return self.dispatch_reserved(call, ctx, auth=auth, reservation=None)
+
+    def dispatch_reserved(
+        self,
+        call: Call,
+        ctx: CallContext,
+        *,
+        auth: PrivateRequestAuth,
+        reservation: Reservation | None = None,
+    ) -> CallResult:
+        """Execute ``call`` on the owner thread gated by ``reservation`` and ``enter_commit`` (Task 4b)."""
         try:
-            data = self._dispatch_data(call, ctx, auth=auth)
+            data = self._dispatch_data(call, ctx, auth=auth, reservation=reservation)
             envelope = make_success_envelope(data)
             encode_envelope(envelope)
             return envelope
@@ -159,6 +178,34 @@ class KernelDispatcher:
             raise BrainError(ErrorCode.NOT_FOUND, "not found")
         return live_principal
 
+    def _check_handler_budget(self, ctx: CallContext, reservation: Reservation | None) -> None:
+        if reservation is not None and reservation.cancelled:
+            raise BrainError(ErrorCode.DEADLINE_EXCEEDED, "deadline exceeded")
+        if reservation is not None:
+            if self._monotonic_clock is None:
+                raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
+            now_ns = self._monotonic_clock.monotonic_ns()
+            if now_ns >= ctx.deadline_ns - HANDLER_RESERVE_NS:
+                raise BrainError(ErrorCode.DEADLINE_EXCEEDED, "deadline exceeded")
+        elif self._monotonic_clock is not None and self._enforce_unreserved_deadline:
+            now_ns = self._monotonic_clock.monotonic_ns()
+            if now_ns >= ctx.deadline_ns - HANDLER_RESERVE_NS:
+                raise BrainError(ErrorCode.DEADLINE_EXCEEDED, "deadline exceeded")
+
+    def _gate_enter_commit(self, ctx: CallContext, reservation: Reservation | None) -> None:
+        if self._before_enter_commit is not None:
+            self._before_enter_commit(reservation)
+        if reservation is not None:
+            if self._monotonic_clock is None:
+                raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
+            now_ns = self._monotonic_clock.monotonic_ns()
+            if not enter_commit(reservation, now_ns):
+                raise BrainError(ErrorCode.DEADLINE_EXCEEDED, "deadline exceeded")
+        elif self._monotonic_clock is not None and self._enforce_unreserved_deadline:
+            now_ns = self._monotonic_clock.monotonic_ns()
+            if now_ns >= ctx.deadline_ns - HANDLER_RESERVE_NS:
+                raise BrainError(ErrorCode.DEADLINE_EXCEEDED, "deadline exceeded")
+
     def _verify_retained_row(self, row: IdempotencyRow, call: Call, *, now: datetime) -> bool:
         """Validate ``row.request_digest_key_id`` (even when expired); return True iff ``row`` is live and matches."""
         stored_key = self._policy.request_digest_key_by_id(row.request_digest_key_id)
@@ -170,8 +217,17 @@ class KernelDispatcher:
             return True
         return False
 
-    def _dispatch_data(self, call: Call, ctx: CallContext, *, auth: PrivateRequestAuth) -> dict[str, JsonValue]:
+    def _dispatch_data(
+        self,
+        call: Call,
+        ctx: CallContext,
+        *,
+        auth: PrivateRequestAuth,
+        reservation: Reservation | None = None,
+    ) -> dict[str, JsonValue]:
         live_principal = self._verify_owner_auth_and_scope(call, ctx, auth)
+        self._check_handler_budget(ctx, reservation)
+
         uses_idem = tool_uses_idempotency(call)
         is_shallow_health = call.tool == "get_health" and not uses_idem
 
@@ -215,14 +271,19 @@ class KernelDispatcher:
                 refs=existing.refs,
             )
             rendered_replay = self._render_dict(replay_result, live_principal, selected_scope=call.selected_scope)
+            self._gate_enter_commit(ctx, reservation)
             self._idempotency.record_replay(row=existing, now=now)
             return rendered_replay
 
         active_key_id, active_key_bytes = self._policy.request_digest_key()
         request_digest = compute_request_hmac(active_key_bytes, call)
         prepared = self._domain.prepare_mutation(call, ctx, now=now)
+
+        if reservation is not None and reservation.cancelled:
+            raise BrainError(ErrorCode.DEADLINE_EXCEEDED, "deadline exceeded")
         staged_blobs = tuple(self._blob_stager.stage_blob(blob) for blob in prepared.blobs)
 
+        self._gate_enter_commit(ctx, reservation)
         commit_now = self._clock.now()
         stored, was_raced_replay = self._idempotency.commit_prepared_effect(
             staged_blobs=staged_blobs,

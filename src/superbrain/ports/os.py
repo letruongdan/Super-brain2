@@ -6,7 +6,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Protocol
 
-from superbrain.ports.clock import Clock
+from superbrain.ports.clock import Clock, MonotonicClock
 
 
 class PathSafety(Protocol):
@@ -143,3 +143,4 @@ class OsAdapters:
     locks: LockFactory
     clock: Clock
     traits: PlatformTraits
+    monotonic: MonotonicClock

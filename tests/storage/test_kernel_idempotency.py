@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import os
+import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -92,6 +93,9 @@ class Mono:
         self.now = start
 
     def __call__(self) -> int:
+        return self.now
+
+    def monotonic_ns(self) -> int:
         return self.now
 
     def advance(self, ns: int) -> None:
@@ -361,6 +365,134 @@ def test_concurrent_retry_one_delivery_assignment_and_result(
         assert domain2.prepare_calls == 0
         assert domain2.apply_calls == 0
         assert len(obs2.calls) == 0
+
+        # --- 4b reservation half: pause before commit AND inside commit + lost response -> single committed result ---
+        paused_before_commit = threading.Event()
+        release_before_commit = threading.Event()
+        paused_in_commit = threading.Event()
+        release_in_commit = threading.Event()
+        lose_response_once = True
+
+        def _before_enter_commit(_res: object) -> None:
+            paused_before_commit.set()
+            assert release_before_commit.wait(timeout=10.0)
+
+        def _on_completed(_stored: StoredResult) -> None:
+            nonlocal lose_response_once
+            if lose_response_once:
+                lose_response_once = False
+                raise RuntimeError("simulated lost transport response after durable SQLite commit")
+
+        obs_res = FakeObserver(descriptor=_desc(TREE_C))
+        dom_res = FixtureKernelDomain(
+            store=rt2.store,
+            policy=rt2.policy,
+            clock=clock,
+            observer=obs_res,
+            monotonic_ns=mono,
+        )
+
+        def _pause_in_apply(_tx: object) -> None:
+            paused_in_commit.set()
+            assert release_in_commit.wait(timeout=10.0)
+
+        dom_res.before_apply_hook = _pause_in_apply
+        bridge_res = KernelBridge(
+            store=rt2.store,
+            policy=rt2.policy,
+            clock=clock,
+            monotonic_clock=mono,
+            writer_epoch=rt2.lease.epoch,
+            domain=dom_res,
+            before_enter_commit=_before_enter_commit,
+            on_commit_completed=_on_completed,
+        )
+        bridge_res.publish_auth_view()
+
+        res_args: dict[str, JsonValue] = {
+            "schema_version": "2.0",
+            "workspace_hint": "ws-main",
+            "description": "4b concurrent reservation + lost response check",
+            "idempotency_key": "idem_concurrent_4b_0002",
+        }
+        sub_first = bridge_res.submit_request(
+            "prepare_task",
+            res_args,
+            token=seeded.token,
+            selected_scope=scope,
+        )
+
+        # Spawn concurrent retries from request threads while main (owner) thread executes sub_first across barriers!
+        pre_commit_outcomes: list[tuple[Mapping[str, JsonValue], Mapping[str, JsonValue]]] = []
+        in_commit_outcomes: list[tuple[Mapping[str, JsonValue], Mapping[str, JsonValue]]] = []
+
+        def _concurrent_probes() -> None:
+            assert paused_before_commit.wait(timeout=5.0)
+            dup_pre = bridge_res.call_tool(
+                "prepare_task", dict(res_args), token=seeded.token, selected_scope=scope, timeout=2.0
+            )
+            conf_pre = bridge_res.call_tool(
+                "prepare_task",
+                {**res_args, "description": "changed while paused before enter_commit"},
+                token=seeded.token,
+                selected_scope=scope,
+                timeout=2.0,
+            )
+            pre_commit_outcomes.append((dup_pre, conf_pre))
+            release_before_commit.set()
+
+            assert paused_in_commit.wait(timeout=5.0)
+            dup_mid = bridge_res.call_tool(
+                "prepare_task", dict(res_args), token=seeded.token, selected_scope=scope, timeout=2.0
+            )
+            conf_mid = bridge_res.call_tool(
+                "prepare_task",
+                {**res_args, "description": "changed while paused inside SQLite commit"},
+                token=seeded.token,
+                selected_scope=scope,
+                timeout=2.0,
+            )
+            in_commit_outcomes.append((dup_mid, conf_mid))
+            release_in_commit.set()
+
+        probe_thread = threading.Thread(target=_concurrent_probes, daemon=True)
+        probe_thread.start()
+        assert bridge_res.process_next_queued(block=False) is True
+        probe_thread.join(timeout=10.0)
+        assert not probe_thread.is_alive()
+
+        assert len(pre_commit_outcomes) == 1
+        _expect_err("prepare_task", pre_commit_outcomes[0][0], ErrorCode.IN_PROGRESS)
+        _expect_err("prepare_task", pre_commit_outcomes[0][1], ErrorCode.IDEMPOTENCY_CONFLICT)
+
+        assert len(in_commit_outcomes) == 1
+        _expect_err("prepare_task", in_commit_outcomes[0][0], ErrorCode.IN_PROGRESS)
+        _expect_err("prepare_task", in_commit_outcomes[0][1], ErrorCode.IDEMPOTENCY_CONFLICT)
+
+        # First caller received COMMIT_OUTCOME_UNKNOWN due to lost post-commit completion callback,
+        # yet durable commit succeeded once and reservation cleared!
+        _expect_err("prepare_task", sub_first.wait(timeout=2.0), ErrorCode.COMMIT_OUTCOME_UNKNOWN)
+        assert bridge_res.reservations.active_count() == 0
+        assert dom_res.prepare_calls == 1
+        assert dom_res.apply_calls == 1
+        assert _count_rows(rt2.store, "idempotency") == 2
+        assert _count_rows(rt2.store, "p_fixture_domain_deliveries") == 2
+
+        dom_res.before_apply_hook = None
+        sub_retry = bridge_res.submit_request(
+            "prepare_task",
+            dict(res_args),
+            token=seeded.token,
+            selected_scope=scope,
+        )
+        assert bridge_res.process_next_queued(block=False) is True
+        recovered = _expect_ok("prepare_task", sub_retry.wait(timeout=2.0))
+        assert recovered["delivery_id"] != first["delivery_id"]
+        assert isinstance(recovered["assignment_id"], str)
+        assert dom_res.prepare_calls == 1
+        assert dom_res.apply_calls == 1
+        assert _count_rows(rt2.store, "idempotency") == 2
+        assert _count_rows(rt2.store, "p_fixture_domain_deliveries") == 2
     finally:
         rt2.close()
 
@@ -1991,9 +2123,7 @@ def test_cas_is_staged_before_transaction_and_only_declared_blobs_can_be_held(
                 custom_field_path=("lessons", "safe_stage_orphan_check"),
             ),
         )
-        bridge_sf, domain_sf = _make_bridge(
-            rt, clock, mono, observer=obs_stage_fail, delivery_plan=stage_fail_plan
-        )
+        bridge_sf, domain_sf = _make_bridge(rt, clock, mono, observer=obs_stage_fail, delivery_plan=stage_fail_plan)
         idem_before_sf = _count_rows(rt.store, "idempotency")
         holds_before_sf = _count_rows(rt.store, "p_cas_holders_")
         ledger_before_sf = _count_rows(rt.store, "ledger")

@@ -116,10 +116,14 @@ class StrictKernelStore(KernelStorePort):
         before_body: Callable[[Txn], None] | None = None,
         after_body: Callable[[Txn], None] | None = None,
     ) -> None:
+        if policy_store is not None and isinstance(policy_view, PolicyStore) and policy_view is not policy_store:
+            raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
+        if policy_store is None and isinstance(policy_view, PolicyStore):
+            policy_store = policy_view
         if policy_store is not None:
             verify_admitted_store_pair(store, policy_store, writer_epoch=writer_epoch)
         else:
-            verify_live_store_handle(store)
+            verify_live_store_handle(store, writer_epoch=writer_epoch)
         self._store = store
         self._policy_view = policy_view
         self._staged_blobs = tuple(staged_blobs)
@@ -132,7 +136,7 @@ class StrictKernelStore(KernelStorePort):
         if self._policy_store is not None:
             verify_admitted_store_pair(self._store, self._policy_store, writer_epoch=self._writer_epoch)
         else:
-            verify_live_store_handle(self._store)
+            verify_live_store_handle(self._store, writer_epoch=self._writer_epoch)
         with self._store.transaction() as txn:
             if self._before_body is not None:
                 self._before_body(txn)
@@ -178,15 +182,24 @@ class KernelIdempotencyStore(KernelIdempotencyPort):
         writer_epoch: int | None = None,
         is_expired: Callable[[str | datetime, datetime], bool] | None = None,
     ) -> None:
-        policy_store = policy if isinstance(policy, PolicyStore) else None
+        resolved_view = policy_view if policy_view is not None else cast(PolicyView, policy)
+        if isinstance(policy, PolicyStore) and isinstance(resolved_view, PolicyStore) and resolved_view is not policy:
+            raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
+        policy_store: PolicyStore | None
+        if isinstance(policy, PolicyStore):
+            policy_store = policy
+        elif isinstance(resolved_view, PolicyStore):
+            policy_store = resolved_view
+        else:
+            policy_store = None
         if policy_store is not None:
             verify_admitted_store_pair(store, policy_store, writer_epoch=writer_epoch)
         else:
-            verify_live_store_handle(store)
+            verify_live_store_handle(store, writer_epoch=writer_epoch)
         self._store = store
         self._policy = policy
         self._policy_store = policy_store
-        self._policy_view = policy_view if policy_view is not None else cast(PolicyView, policy)
+        self._policy_view = resolved_view
         self._writer_epoch = writer_epoch
         self._is_expired = is_expired if is_expired is not None else _default_is_expired
         self._epoch_hwm_utc: datetime | None = None
@@ -199,7 +212,7 @@ class KernelIdempotencyStore(KernelIdempotencyPort):
         if self._policy_store is not None:
             verify_admitted_store_pair(self._store, self._policy_store, writer_epoch=self._writer_epoch)
         else:
-            verify_live_store_handle(self._store)
+            verify_live_store_handle(self._store, writer_epoch=self._writer_epoch)
 
     def _validate_clock(self, db: sqlite3.Connection, now: datetime) -> tuple[datetime, str, str | None]:
         try:

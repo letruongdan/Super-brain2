@@ -1,16 +1,27 @@
-"""Composition bridge binding admitted ``Store`` + ``PolicyStore`` to Task 4 typed dispatch & staging ports."""
+"""Composition bridge binding admitted ``Store`` + ``PolicyStore`` to Task 4a/4b dispatch, staging & deadlines."""
 
 from __future__ import annotations
 
-import threading
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
+from typing import TypeVar, cast
 
+from superbrain.adapters.os.clock import SystemMonotonicClock
+from superbrain.application.deadlines import (
+    DEFAULT_MAX_QUEUE_DEPTH,
+    AtomicRequestAuthState,
+    KernelDeadlineCoordinator,
+    Reservation,
+    ReservationTable,
+    SubmittedKernelRequest,
+)
 from superbrain.application.dispatch import KernelDispatcher, KernelToolDomain
 from superbrain.application.idempotency import is_idempotency_expired
 from superbrain.core.errors import BrainError, ErrorCode
+from superbrain.core.ids import new_id
 from superbrain.core.jsonvalue import JsonValue
 from superbrain.core.kernel import (
+    BootstrapAuthorization,
     Call,
     CallContext,
     CallResult,
@@ -20,15 +31,31 @@ from superbrain.core.kernel import (
     Scope,
     StagedBlob,
     StoredResult,
+    WorkspaceBinding,
+    WorkspaceRegistration,
+    require_opaque_id,
     require_positive_int,
 )
 from superbrain.core.wire import encode_envelope, make_error_envelope
-from superbrain.ports.clock import Clock
+from superbrain.ports.clock import Clock, MonotonicClock
 from superbrain.ports.kernel import KernelBlobStagePort, KernelStorePort, RequestAuthStatePort
+from superbrain.ports.policy import Intent, IntentKind
 from superbrain.storage._pair_admission import verify_admitted_store_pair
 from superbrain.storage.idempotency import KernelBlobStager, KernelIdempotencyStore, StrictKernelStore
 from superbrain.storage.policy_store import PolicyStore
 from superbrain.storage.store import Store
+
+_T = TypeVar("_T")
+
+__all__ = ["AtomicRequestAuthState", "KernelBridge"]
+
+
+class _CallableMonotonicClock:
+    def __init__(self, fn: Callable[[], int]) -> None:
+        self._fn = fn
+
+    def monotonic_ns(self) -> int:
+        return self._fn()
 
 
 def _verify_domain_pair(domain: KernelToolDomain | None, *, store: Store, policy: PolicyStore) -> None:
@@ -42,37 +69,8 @@ def _verify_domain_pair(domain: KernelToolDomain | None, *, store: Store, policy
         raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
 
 
-class AtomicRequestAuthState(RequestAuthStatePort):
-    """In-process atomic RAM holder for ``RequestAuthView`` (short pointer swap only, zero I/O under lock)."""
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._view: RequestAuthView | None = None
-        self._version = 0
-
-    def current(self) -> RequestAuthView | None:
-        with self._lock:
-            return self._view
-
-    def install(self, view: RequestAuthView) -> RequestAuthView:
-        with self._lock:
-            self._view = view
-            if view.version > self._version:
-                self._version = view.version
-            return view
-
-    def next_version(self) -> int:
-        with self._lock:
-            self._version += 1
-            return self._version
-
-    def clear(self) -> None:
-        with self._lock:
-            self._view = None
-
-
 class KernelBridge(KernelBlobStagePort):
-    """Composition root wiring an admitted ``(Store, PolicyStore)`` pair to ``KernelDispatcher``."""
+    """Composition root wiring an admitted ``(Store, PolicyStore)`` pair to ``KernelDispatcher`` and ``4b`` arbiter."""
 
     def __init__(
         self,
@@ -80,17 +78,38 @@ class KernelBridge(KernelBlobStagePort):
         store: Store,
         policy: PolicyStore,
         clock: Clock,
+        monotonic_clock: MonotonicClock | None = None,
         writer_epoch: int = 1,
+        instance_id: str | None = None,
+        max_queue_size: int = DEFAULT_MAX_QUEUE_DEPTH,
         domain: KernelToolDomain | None = None,
+        before_enter_commit: Callable[[Reservation | None], None] | None = None,
         on_commit_completed: Callable[[StoredResult], None] | None = None,
     ) -> None:
         require_positive_int(writer_epoch)
+        require_positive_int(max_queue_size)
+        resolved_instance_id = new_id() if instance_id is None else instance_id
+        require_opaque_id(resolved_instance_id, label="instance_id")
         verify_admitted_store_pair(store, policy, writer_epoch=writer_epoch)
         _verify_domain_pair(domain, store=store, policy=policy)
+
+        dom_mono = getattr(domain, "monotonic_ns", None) if domain is not None else None
+        if monotonic_clock is not None:
+            resolved_mono: MonotonicClock = monotonic_clock
+            enforce_unreserved = True
+        elif callable(dom_mono):
+            resolved_mono = _CallableMonotonicClock(cast(Callable[[], int], dom_mono))
+            enforce_unreserved = True
+        else:
+            resolved_mono = SystemMonotonicClock()
+            enforce_unreserved = False
+
         self._store = store
         self._policy = policy
         self._clock = clock
+        self._monotonic_clock = resolved_mono
         self._writer_epoch = writer_epoch
+        self._instance_id = resolved_instance_id
         self._domain = domain
         self._blob_stager = KernelBlobStager(store)
         self._idempotency = KernelIdempotencyStore(
@@ -100,17 +119,29 @@ class KernelBridge(KernelBlobStagePort):
             writer_epoch=writer_epoch,
             is_expired=is_idempotency_expired,
         )
-        self._auth_state = AtomicRequestAuthState()
+        self._auth_state = AtomicRequestAuthState(store.store_id)
         self._dispatcher = KernelDispatcher(
             store_id=store.store_id,
             policy=policy,
             idempotency=self._idempotency,
             blob_stager=self._blob_stager,
             clock=clock,
+            monotonic_clock=resolved_mono,
+            enforce_unreserved_deadline=enforce_unreserved,
             store_schema_version=self._read_store_schema_version,
             policy_schema_version=self._read_policy_schema_version,
             domain=domain,
+            before_enter_commit=before_enter_commit,
             on_commit_completed=on_commit_completed,
+        )
+        self._coordinator = KernelDeadlineCoordinator(
+            store_id=store.store_id,
+            writer_epoch=writer_epoch,
+            instance_id=resolved_instance_id,
+            auth_state=self._auth_state,
+            monotonic_clock=resolved_mono,
+            owner_runner=self._run_reserved_on_owner,
+            max_queue_size=max_queue_size,
         )
 
     def _check_live_pair(self) -> None:
@@ -125,9 +156,31 @@ class KernelBridge(KernelBlobStagePort):
         self._check_live_pair()
         return self._policy.schema_version
 
+    def _run_reserved_on_owner(
+        self,
+        call: Call,
+        ctx: CallContext,
+        auth: PrivateRequestAuth,
+        reservation: Reservation,
+    ) -> CallResult:
+        try:
+            self._check_live_pair()
+        except BrainError as err:
+            err_envelope = make_error_envelope(err)
+            encode_envelope(err_envelope)
+            return err_envelope
+        return self._dispatcher.dispatch_reserved(call, ctx, auth=auth, reservation=reservation)
+
     @property
     def auth_state(self) -> RequestAuthStatePort:
         return self._auth_state
+
+    @property
+    def reservations(self) -> ReservationTable:
+        return self._coordinator.reservations
+
+    def queue_depth(self) -> int:
+        return self._coordinator.queue_depth()
 
     def publish_auth_view(self) -> RequestAuthView:
         """Load snapshot + active request HMAC key on the owner thread and publish atomically into RAM (C3)."""
@@ -142,13 +195,90 @@ class KernelBridge(KernelBlobStagePort):
                 active_request_key_id=key_id,
                 active_request_key_bytes=key_bytes,
             )
+            return self._auth_state.install(view)
         except BrainError:
             self._auth_state.clear()
             raise
-        return self._auth_state.install(view)
 
     def clear_auth_view(self) -> None:
         self._auth_state.clear()
+
+    def apply_policy_mutation(self, mutation: Callable[[PolicyStore], _T]) -> _T:
+        """Run an owner ``PolicyStore`` mutation and install the updated ``RequestAuthView`` before return."""
+        self._check_live_pair()
+        result = mutation(self._policy)
+        self.publish_auth_view()
+        return result
+
+    def revoke_credential(self, credential_id: str, authorization: BootstrapAuthorization) -> Intent:
+        """Revoke ``credential_id`` on the owner thread and publish the updated ``RequestAuthView`` before return."""
+        return self.apply_policy_mutation(lambda pol: pol.record_authorized_revocation(credential_id, authorization))
+
+    def register_workspace(
+        self, registration: WorkspaceRegistration, authorization: BootstrapAuthorization
+    ) -> WorkspaceBinding:
+        """Register ``registration`` on the owner thread, reconcile policy, and publish ``RequestAuthView``."""
+        self._check_live_pair()
+        binding = self._policy.register_authorized_workspace(registration, authorization)
+        self._store.reconcile_policy()
+        self.publish_auth_view()
+        return binding
+
+    def record_policy_intent(self, kind: IntentKind, payload: Mapping[str, JsonValue]) -> Intent:
+        """Record a policy intent on the owner thread and publish ``RequestAuthView`` before return."""
+        return self.apply_policy_mutation(lambda pol: pol.record_intent(kind, payload))
+
+    def submit_request(
+        self,
+        tool: str,
+        arguments: JsonValue | Mapping[str, JsonValue],
+        *,
+        token: str,
+        selected_scope: Scope | None = None,
+        expected_principal: Principal | None = None,
+        correlation_id: str | None = None,
+        receive_ns: int | None = None,
+        on_response: Callable[[CallResult], None] | None = None,
+    ) -> SubmittedKernelRequest:
+        return self._coordinator.submit(
+            tool,
+            arguments,
+            token=token,
+            selected_scope=selected_scope,
+            expected_principal=expected_principal,
+            correlation_id=correlation_id,
+            receive_ns=receive_ns,
+            on_response=on_response,
+        )
+
+    def call_tool(
+        self,
+        tool: str,
+        arguments: JsonValue | Mapping[str, JsonValue],
+        *,
+        token: str,
+        selected_scope: Scope | None = None,
+        expected_principal: Principal | None = None,
+        correlation_id: str | None = None,
+        receive_ns: int | None = None,
+        timeout: float | None = None,
+    ) -> CallResult:
+        return self._coordinator.call_tool(
+            tool,
+            arguments,
+            token=token,
+            selected_scope=selected_scope,
+            expected_principal=expected_principal,
+            correlation_id=correlation_id,
+            receive_ns=receive_ns,
+            timeout=timeout,
+        )
+
+    def arbitrate_deadlines(self, now_ns: int | None = None) -> tuple[tuple[Reservation, CallResult], ...]:
+        return self._coordinator.arbitrate(now_ns)
+
+    def process_next_queued(self, *, block: bool = False, timeout: float | None = None) -> bool:
+        return self._coordinator.process_next(block=block, timeout=timeout)
 
     def strict_store(self, staged_blobs: Sequence[StagedBlob] = ()) -> KernelStorePort:
         """Return an admitted ``KernelStorePort`` bound to pre-staged ``staged_blobs`` (C2:81)."""

@@ -1,0 +1,212 @@
+"""Task 4b pre-queue RAM RequestAuthView admission and immutable canonical Call copy/reconstruction (C3)."""
+
+from __future__ import annotations
+
+import threading
+from collections.abc import Callable, Mapping
+
+from superbrain.application.idempotency import (
+    compute_canonical_payload_hmac,
+    compute_idempotency_key_hash,
+    tool_uses_idempotency,
+)
+from superbrain.core.canonical import canonical_json
+from superbrain.core.errors import BrainError, ErrorCode
+from superbrain.core.jsonvalue import JsonValue
+from superbrain.core.kernel import (
+    HANDLER_RESERVE_NS,
+    LOCAL_PHASE_BUDGET_NS,
+    Call,
+    Principal,
+    PrivateRequestAuth,
+    QueuedKernelRequest,
+    RequestAuthView,
+    RequestDeadlines,
+    ReservationScopeKey,
+    Scope,
+    is_strict_int,
+    parse_bearer_token,
+    require_opaque_id,
+    require_positive_int,
+)
+from superbrain.core.wire import canonical_request_payload, normalize_call, parse_json
+from superbrain.ports.kernel import RequestAuthStatePort
+
+
+class AtomicRequestAuthState(RequestAuthStatePort):
+    """Store-bound atomic RAM holder for ``RequestAuthView`` (short pointer swap only, zero I/O under lock)."""
+
+    def __init__(self, expected_store_id: str) -> None:
+        require_opaque_id(expected_store_id, label="expected_store_id")
+        self._expected_store_id = expected_store_id
+        self._lock = threading.Lock()
+        self._view: RequestAuthView | None = None
+        self._version = 0
+
+    @property
+    def store_id(self) -> str:
+        return self._expected_store_id
+
+    def current(self) -> RequestAuthView | None:
+        with self._lock:
+            view = self._view
+        if view is not None and view.auth.store_id != self._expected_store_id:
+            raise BrainError(ErrorCode.POLICY_UNAVAILABLE, "policy unavailable")
+        return view
+
+    def install(self, view: RequestAuthView) -> RequestAuthView:
+        if not isinstance(view, RequestAuthView):
+            raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+        if view.auth.store_id != self._expected_store_id:
+            with self._lock:
+                self._view = None
+            raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
+        with self._lock:
+            self._view = view
+            if view.version > self._version:
+                self._version = view.version
+            return view
+
+    def next_version(self) -> int:
+        with self._lock:
+            self._version += 1
+            return self._version
+
+    def clear(self) -> None:
+        with self._lock:
+            self._view = None
+
+
+def begin_local_phase(monotonic_ns: Callable[[], int], total_deadline_ns: int) -> int:
+    """Start the shared <=100 ms local admission/filter/observer phase or fail closed with DEADLINE_EXCEEDED."""
+    if not is_strict_int(total_deadline_ns):
+        raise BrainError(ErrorCode.INVALID_INPUT, "boolean not allowed for integer")
+    start_ns = monotonic_ns()
+    if not is_strict_int(start_ns):
+        raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
+    handler_deadline_ns = total_deadline_ns - HANDLER_RESERVE_NS
+    if start_ns >= handler_deadline_ns:
+        raise BrainError(ErrorCode.DEADLINE_EXCEEDED, "deadline exceeded")
+    return min(start_ns + LOCAL_PHASE_BUDGET_NS, handler_deadline_ns)
+
+
+def _decode_scope(raw_scope: JsonValue) -> Scope | None:
+    if raw_scope is None:
+        return None
+    if not isinstance(raw_scope, dict) or set(raw_scope) != {"repo_id", "checkout_id"}:
+        raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
+    repo_id = raw_scope["repo_id"]
+    checkout_id = raw_scope["checkout_id"]
+    if not isinstance(repo_id, str) or (checkout_id is not None and not isinstance(checkout_id, str)):
+        raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
+    return Scope(repo_id=repo_id, checkout_id=checkout_id)
+
+
+def reconstruct_queued_call(queued: QueuedKernelRequest) -> Call:
+    """Reconstruct a fresh private ``Call`` on the owner thread from immutable ``queued.canonical_payload`` (C3:92)."""
+    if not isinstance(queued, QueuedKernelRequest):
+        raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+    parsed = parse_json(queued.canonical_payload)
+    if not isinstance(parsed, dict) or set(parsed) != {"tool", "selected_scope", "arguments"}:
+        raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
+    if canonical_json(parsed) != queued.canonical_payload:
+        raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
+    tool = parsed["tool"]
+    arguments = parsed["arguments"]
+    decoded_scope = _decode_scope(parsed["selected_scope"])
+    if tool != queued.tool or decoded_scope != queued.selected_scope or not isinstance(arguments, dict):
+        raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
+    call = Call(
+        tool=queued.tool,
+        arguments=arguments,
+        correlation_id=queued.correlation_id,
+        selected_scope=queued.selected_scope,
+    )
+    if canonical_request_payload(call) != queued.canonical_payload:
+        raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
+    return call
+
+
+def admit_prequeue_request(
+    *,
+    expected_store_id: str,
+    writer_epoch: int,
+    auth_state: RequestAuthStatePort,
+    tool: str,
+    raw_arguments: JsonValue | Mapping[str, JsonValue],
+    token: str,
+    deadlines: RequestDeadlines,
+    selected_scope: Scope | None = None,
+    expected_principal: Principal | None = None,
+    correlation_id: str | None = None,
+) -> QueuedKernelRequest:
+    """Authenticate, normalize, authorize scope, and freeze canonical bytes using ONLY ``RequestAuthView`` (C3)."""
+    require_opaque_id(expected_store_id, label="expected_store_id")
+    require_positive_int(writer_epoch)
+    if not isinstance(deadlines, RequestDeadlines):
+        raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+
+    view = auth_state.current()
+    if view is None or not isinstance(view, RequestAuthView) or view.auth.store_id != expected_store_id:
+        raise BrainError(ErrorCode.POLICY_UNAVAILABLE, "policy unavailable")
+
+    credential_id, _ = parse_bearer_token(token)
+    principal = view.auth.resolve_credential(token)
+    if expected_principal is not None:
+        if not isinstance(expected_principal, Principal):
+            raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+        if principal != expected_principal:
+            raise BrainError(ErrorCode.IDENTITY_MISMATCH, "principal identity mismatch")
+
+    auth = PrivateRequestAuth(credential_id=credential_id, principal=principal, token=token)
+    call = normalize_call(
+        tool,
+        raw_arguments,
+        principal,
+        selected_scope=selected_scope,
+        correlation_id=correlation_id,
+    )
+
+    if not view.auth.allows(principal, None, action="get_health"):
+        raise BrainError(ErrorCode.NOT_FOUND, "not found")
+    if call.selected_scope is not None:
+        if not view.auth.allows(principal, call.selected_scope, action=call.tool):
+            raise BrainError(ErrorCode.NOT_FOUND, "not found")
+    elif "workspace_id" in call.arguments:
+        arg_ws = str(call.arguments["workspace_id"])
+        arg_chk = str(call.arguments["checkout_id"]) if "checkout_id" in call.arguments else None
+        if not view.auth.allows(principal, Scope(arg_ws, arg_chk), action=call.tool):
+            raise BrainError(ErrorCode.NOT_FOUND, "not found")
+
+    canonical_bytes = canonical_request_payload(call)
+    scope_key: ReservationScopeKey | None = None
+    request_digest_key_id: str | None = None
+    request_digest: str | None = None
+
+    if tool_uses_idempotency(call):
+        idem_key = call.arguments.get("idempotency_key")
+        if not isinstance(idem_key, str):
+            raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+        key_hash = compute_idempotency_key_hash(principal.principal_id, call.tool, idem_key)
+        scope_key = ReservationScopeKey(
+            principal_id=principal.principal_id,
+            tool=call.tool,
+            key_hash=key_hash,
+        )
+        request_digest_key_id = view.active_request_key_id
+        request_digest = compute_canonical_payload_hmac(view.active_request_key_bytes, canonical_bytes)
+
+    return QueuedKernelRequest(
+        store_id=expected_store_id,
+        writer_epoch=writer_epoch,
+        tool=call.tool,
+        correlation_id=call.correlation_id,
+        selected_scope=call.selected_scope,
+        deadlines=deadlines,
+        auth_view_version=view.version,
+        auth=auth,
+        canonical_payload=canonical_bytes,
+        scope_key=scope_key,
+        request_digest_key_id=request_digest_key_id,
+        request_digest=request_digest,
+    )

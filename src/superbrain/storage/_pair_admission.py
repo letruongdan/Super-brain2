@@ -11,14 +11,18 @@ from superbrain.storage.policy_store import PolicyStore
 from superbrain.storage.store import Store
 
 
-def verify_live_store_handle(store: Store) -> None:
+def verify_live_store_handle(store: Store, *, writer_epoch: int | None = None) -> None:
     """Verify ``store`` is open on its owner thread under a held ``WriterLease`` without raising ``AssertionError``."""
+    if writer_epoch is not None:
+        require_positive_int(writer_epoch)
     if not isinstance(store, Store):
         raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
     if store.closed or threading.get_ident() != store.owner_thread_id:
         raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
     lease = store.lease
     if not lease.held or "store" not in lease.open_handles():
+        raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
+    if writer_epoch is not None and lease.epoch != writer_epoch:
         raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
 
 
