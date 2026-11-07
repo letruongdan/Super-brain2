@@ -977,3 +977,338 @@ def test_preexisting_task_or_field_lineage_is_reflected_in_initial_labeled_deliv
         assert {binding_lineage_ref(repo_allow), src_allow, src_deny} <= by_digest[derived_digest].sources
         assert by_digest[derived_digest].unknown_source is True
         assert dict(view.field_eligibility) == {prior_digest: False, derived_digest: False}
+        assert src_deny in view.task_lineage
+        assert view.task_unknown is True
+        assert view.task_eligible is False
+
+
+# --- I2-T3-R02 reopened round 2 (8277603): pre-existing field lineage constraints ----------------------------------
+
+
+def _seed_prior_field(
+    task_id: str, path: tuple[str | int, ...], sources: LineageSet, unknown: bool, tx: KernelTx
+) -> FieldLineage:
+    return record_field_lineage(tx, task_id, path, sources, unknown=unknown)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "prior-known-denied-distinct",
+        "prior-known-denied-same",
+        "prior-unknown-distinct-preserves-s1a-sibling",
+        "prior-unknown-same",
+        "codex-root-repro-denied-and-unknown-distinct",
+        "prior-empty-items",
+    ],
+)
+def test_preexisting_field_constraints_flow_to_task_and_distinct_or_same_path_fields(
+    kernel: Runtime, dan: SeededCredential, clock: FakeClock, trusted_tmp: Path, case: str
+) -> None:
+    repo_allow = _register(
+        kernel,
+        clock,
+        dan,
+        alias="r5a",
+        checkout=trusted_tmp / "r5a",
+        remote="https://h.example/o/r5a.git",
+        egress=True,
+    )
+    src_allow = _artifact(repo_allow, "art-r5-allow")
+    repo_deny: WorkspaceBinding | None = None
+    src_deny: LineageRef | None = None
+    if case not in ("prior-unknown-distinct-preserves-s1a-sibling", "prior-unknown-same"):
+        repo_deny = _register(
+            kernel,
+            clock,
+            dan,
+            alias="r5d",
+            checkout=trusted_tmp / "r5d",
+            remote="https://h.example/o/r5d.git",
+            egress=False,
+        )
+        src_deny = _artifact(repo_deny, "art-r5-deny")
+
+    if case == "codex-root-repro-denied-and-unknown-distinct":
+        assert repo_deny is not None
+        _prepare(kernel, dan.principal, "r5d", "r5-seed-deny-binding")
+        _prepare(kernel, dan.principal, "r5a", "r5-seed-allow-binding")
+        restrictions = StoreSourceRestrictions(kernel.store, kernel.policy)
+        assert restrictions.is_restricted(binding_lineage_ref(repo_deny)) is False
+        assert restrictions.is_restricted(binding_lineage_ref(repo_allow)) is False
+    elif src_deny is not None:
+        restrictions = StoreSourceRestrictions(
+            kernel.store, kernel.policy, resolvers={"artifact": {src_allow, src_deny}.__contains__}
+        )
+        assert restrictions.is_restricted(src_allow) is False
+        assert restrictions.is_restricted(src_deny) is False
+    else:
+        restrictions = StoreSourceRestrictions(kernel.store, kernel.policy, resolvers={"artifact": src_allow.__eq__})
+        assert restrictions.is_restricted(src_allow) is False
+
+    kstore = KernelWorkspaceStore(kernel.store, kernel.policy)
+    prior_digest = field_path_digest(("prior",))
+    new_digest = field_path_digest(("new",))
+    same_digest = field_path_digest(("same",))
+    allow_binding_ref = binding_lineage_ref(repo_allow)
+
+    for obs_label, observer in (("unavailable", None), ("available", _Observer(_desc(TREE_1)))):
+        task_id = f"r5-{case}-{obs_label}"
+        if case == "prior-known-denied-distinct":
+            assert src_deny is not None
+            kstore.transact(partial(_seed_prior_field, task_id, ("prior",), frozenset({src_deny}), False))
+            items: tuple[DeliveryItem, ...] = (DeliveryItem(("new",), frozenset({src_allow}), unknown_source=False),)
+        elif case == "prior-known-denied-same":
+            assert src_deny is not None
+            kstore.transact(partial(_seed_prior_field, task_id, ("same",), frozenset({src_deny}), False))
+            items = (DeliveryItem(("same",), frozenset({src_allow}), unknown_source=False),)
+        elif case == "prior-unknown-distinct-preserves-s1a-sibling":
+            kstore.transact(partial(_seed_prior_field, task_id, ("prior",), frozenset({src_allow}), True))
+            items = (DeliveryItem(("new",), frozenset({src_allow}), unknown_source=False),)
+        elif case == "prior-unknown-same":
+            kstore.transact(partial(_seed_prior_field, task_id, ("same",), frozenset({src_allow}), True))
+            items = (DeliveryItem(("same",), frozenset({src_allow}), unknown_source=False),)
+        elif case == "codex-root-repro-denied-and-unknown-distinct":
+            assert repo_deny is not None
+            deny_binding_ref = binding_lineage_ref(repo_deny)
+            kstore.transact(partial(_seed_prior_field, task_id, ("prior",), frozenset({deny_binding_ref}), True))
+            items = (DeliveryItem(("new",), frozenset({allow_binding_ref}), unknown_source=False),)
+        else:
+            assert case == "prior-empty-items"
+            assert src_deny is not None
+            kstore.transact(partial(_seed_prior_field, task_id, ("prior",), frozenset({src_deny}), True))
+            items = ()
+
+        initial, view = _prepare_and_check_boundaries(
+            kernel,
+            dan.principal,
+            "r5a",
+            task_id,
+            items=items,
+            restrictions=restrictions,
+            observer=observer,
+        )
+        if observer is None:
+            assert initial.binding.snapshot_status is SnapshotStatus.UNAVAILABLE
+            assert initial.binding.source_snapshot_id is None
+        else:
+            assert initial.binding.snapshot_status is SnapshotStatus.AVAILABLE
+            assert initial.binding.source_snapshot_id is not None
+        assert initial.omitted_items == ()
+        by_digest = {f.field_path_digest: f for f in view.items}
+
+        if case == "prior-known-denied-distinct":
+            assert src_deny is not None
+            assert len(view.items) == 2
+            assert set(by_digest) == {prior_digest, new_digest}
+            assert {allow_binding_ref, src_allow, src_deny} <= view.task_lineage
+            assert view.task_unknown is False
+            assert view.task_eligible is False
+            assert view.task_lineage <= by_digest[prior_digest].sources
+            assert by_digest[prior_digest].unknown_source is False
+            assert src_deny in by_digest[new_digest].sources
+            assert view.task_lineage <= by_digest[new_digest].sources
+            assert by_digest[new_digest].unknown_source is False
+            assert dict(view.field_eligibility) == {prior_digest: False, new_digest: False}
+        elif case == "prior-known-denied-same":
+            assert src_deny is not None
+            assert len(view.items) == 1
+            assert set(by_digest) == {same_digest}
+            assert {allow_binding_ref, src_allow, src_deny} <= view.task_lineage
+            assert view.task_unknown is False
+            assert view.task_eligible is False
+            assert src_deny in by_digest[same_digest].sources
+            assert view.task_lineage <= by_digest[same_digest].sources
+            assert by_digest[same_digest].unknown_source is False
+            assert view.field_eligibility == ((same_digest, False),)
+        elif case == "prior-unknown-distinct-preserves-s1a-sibling":
+            assert len(view.items) == 2
+            assert set(by_digest) == {prior_digest, new_digest}
+            assert {allow_binding_ref, src_allow} <= view.task_lineage
+            assert view.task_unknown is True
+            assert view.task_eligible is False
+            assert view.task_lineage <= by_digest[prior_digest].sources
+            assert by_digest[prior_digest].unknown_source is True
+            assert view.task_lineage <= by_digest[new_digest].sources
+            assert by_digest[new_digest].unknown_source is False
+            assert dict(view.field_eligibility) == {prior_digest: False, new_digest: True}
+        elif case == "prior-unknown-same":
+            assert len(view.items) == 1
+            assert set(by_digest) == {same_digest}
+            assert {allow_binding_ref, src_allow} <= view.task_lineage
+            assert view.task_unknown is True
+            assert view.task_eligible is False
+            assert view.task_lineage <= by_digest[same_digest].sources
+            assert by_digest[same_digest].unknown_source is True
+            assert view.field_eligibility == ((same_digest, False),)
+        elif case == "codex-root-repro-denied-and-unknown-distinct":
+            assert repo_deny is not None
+            deny_binding_ref = binding_lineage_ref(repo_deny)
+            assert len(view.items) == 2
+            assert set(by_digest) == {prior_digest, new_digest}
+            assert deny_binding_ref in view.task_lineage
+            assert allow_binding_ref in view.task_lineage
+            assert view.task_unknown is True
+            assert view.task_eligible is False
+            assert view.task_lineage <= by_digest[prior_digest].sources
+            assert by_digest[prior_digest].unknown_source is True
+            assert deny_binding_ref in by_digest[new_digest].sources
+            assert view.task_lineage <= by_digest[new_digest].sources
+            assert by_digest[new_digest].unknown_source is False
+            assert dict(view.field_eligibility) == {prior_digest: False, new_digest: False}
+        else:
+            assert case == "prior-empty-items"
+            assert src_deny is not None
+            assert len(view.items) == 1
+            assert set(by_digest) == {prior_digest}
+            assert {allow_binding_ref, src_deny} <= view.task_lineage
+            assert view.task_unknown is True
+            assert view.task_eligible is False
+            assert view.task_lineage <= by_digest[prior_digest].sources
+            assert by_digest[prior_digest].unknown_source is True
+            assert view.field_eligibility == ((prior_digest, False),)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "prior-clean-in-disabled-workspace",
+        "prior-clean-with-denied-served-source",
+        "prior-field-with-snapshot-dependent-restriction-on-same-path",
+    ],
+)
+def test_preexisting_clean_field_inherits_disabled_workspace_or_served_lineage_and_same_path_snapshot_restriction(
+    kernel: Runtime, dan: SeededCredential, clock: FakeClock, trusted_tmp: Path, case: str
+) -> None:
+    repo_allow = _register(
+        kernel,
+        clock,
+        dan,
+        alias="r5ba",
+        checkout=trusted_tmp / "r5ba",
+        remote="https://h.example/o/r5ba.git",
+        egress=True,
+    )
+    repo_deny = _register(
+        kernel,
+        clock,
+        dan,
+        alias="r5bd",
+        checkout=trusted_tmp / "r5bd",
+        remote="https://h.example/o/r5bd.git",
+        egress=False,
+    )
+    src_allow = _artifact(repo_allow, "art-r5b-allow")
+    src_deny = _artifact(repo_deny, "art-r5b-deny")
+    restrictions = StoreSourceRestrictions(
+        kernel.store, kernel.policy, resolvers={"artifact": {src_allow, src_deny}.__contains__}
+    )
+    assert restrictions.is_restricted(src_allow) is False
+    assert restrictions.is_restricted(src_deny) is False
+    kstore = KernelWorkspaceStore(kernel.store, kernel.policy)
+    prior_digest = field_path_digest(("prior",))
+    snap_digest = field_path_digest(("snap_same",))
+    snap_new_digest = field_path_digest(("snap_new",))
+
+    if case in ("prior-clean-in-disabled-workspace", "prior-clean-with-denied-served-source"):
+        for obs_label, observer in (("unavailable", None), ("available", _Observer(_desc(TREE_1)))):
+            task_id = f"r5b-{case}-{obs_label}"
+            kstore.transact(partial(_seed_prior_field, task_id, ("prior",), frozenset({src_allow}), False))
+            alias = "r5bd" if case == "prior-clean-in-disabled-workspace" else "r5ba"
+            served = () if case == "prior-clean-in-disabled-workspace" else (src_deny,)
+            initial, view = _prepare_and_check_boundaries(
+                kernel,
+                dan.principal,
+                alias,
+                task_id,
+                items=(),
+                served=served,
+                restrictions=restrictions,
+                observer=observer,
+            )
+            assert initial.omitted_items == ()
+            assert len(view.items) == 1
+            by_digest = {f.field_path_digest: f for f in view.items}
+            assert set(by_digest) == {prior_digest}
+            if case == "prior-clean-in-disabled-workspace":
+                assert binding_lineage_ref(repo_deny) in by_digest[prior_digest].sources
+                assert {binding_lineage_ref(repo_deny), src_allow} <= view.task_lineage
+            else:
+                assert src_deny in by_digest[prior_digest].sources
+                assert binding_lineage_ref(repo_allow) in by_digest[prior_digest].sources
+                assert {binding_lineage_ref(repo_allow), src_allow, src_deny} <= view.task_lineage
+            assert src_allow in by_digest[prior_digest].sources
+            assert view.task_lineage <= by_digest[prior_digest].sources
+            assert by_digest[prior_digest].unknown_source is False
+            assert view.task_unknown is False
+            assert view.field_eligibility == ((prior_digest, False),)
+            assert view.task_eligible is False
+    else:
+        assert case == "prior-field-with-snapshot-dependent-restriction-on-same-path"
+        for unk_label, item_unknown in (("denied-and-unknown", True), ("denied-known-only", False)):
+            task_id = f"r5b-snap-same-{unk_label}"
+            kstore.transact(partial(_seed_prior_field, task_id, ("snap_same",), frozenset({src_allow}), False))
+            initial, view = _prepare_and_check_boundaries(
+                kernel,
+                dan.principal,
+                "r5ba",
+                task_id,
+                items=(
+                    DeliveryItem(
+                        ("snap_same",),
+                        frozenset({src_deny}),
+                        unknown_source=item_unknown,
+                        snapshot_dependent=True,
+                    ),
+                ),
+                restrictions=restrictions,
+                observer=None,
+            )
+            assert initial.binding.snapshot_status is SnapshotStatus.UNAVAILABLE
+            assert initial.omitted_items == ()
+            assert len(view.items) == 1
+            by_digest = {f.field_path_digest: f for f in view.items}
+            assert set(by_digest) == {snap_digest}
+            assert src_deny in by_digest[snap_digest].sources
+            assert src_deny in view.task_lineage
+            assert {binding_lineage_ref(repo_allow), src_allow, src_deny} <= view.task_lineage
+            assert view.task_unknown is item_unknown
+            assert view.task_eligible is False
+            assert view.task_lineage <= by_digest[snap_digest].sources
+            assert by_digest[snap_digest].unknown_source is item_unknown
+            assert view.field_eligibility == ((snap_digest, False),)
+
+        # A distinct new snapshot_dependent path is still omitted while the already-persisted path stays in items.
+        sibling_task = "r5b-snap-same-plus-omitted-new"
+        kstore.transact(partial(_seed_prior_field, sibling_task, ("snap_same",), frozenset({src_allow}), False))
+        sib_init, sib_view = _prepare_and_check_boundaries(
+            kernel,
+            dan.principal,
+            "r5ba",
+            sibling_task,
+            items=(
+                DeliveryItem(
+                    ("snap_same",),
+                    frozenset({src_deny}),
+                    unknown_source=True,
+                    snapshot_dependent=True,
+                ),
+                DeliveryItem(
+                    ("snap_new",),
+                    frozenset({src_allow}),
+                    unknown_source=False,
+                    snapshot_dependent=True,
+                ),
+            ),
+            restrictions=restrictions,
+            observer=None,
+        )
+        assert sib_init.omitted_items == (snap_new_digest,)
+        sib_by_digest = {f.field_path_digest: f for f in sib_view.items}
+        assert set(sib_by_digest) == {snap_digest}
+        assert src_deny in sib_view.task_lineage
+        assert sib_view.task_unknown is True
+        assert sib_view.task_eligible is False
+        assert src_deny in sib_by_digest[snap_digest].sources
+        assert sib_by_digest[snap_digest].unknown_source is True
+        assert sib_view.field_eligibility == ((snap_digest, False),)
