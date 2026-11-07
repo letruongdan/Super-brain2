@@ -35,6 +35,7 @@ from superbrain.application.lineage import (
     admit_source_snapshot,
     evaluate_egress_eligibility,
     prepare_labeled_delivery,
+    record_field_lineage,
     register_snapshot,
 )
 from superbrain.composition.kernel_projections import kernel_store_extensions
@@ -443,3 +444,43 @@ def test_release_of_one_descriptor_leaves_other_snapshots_admissible(
         txn.release(_desc(TREE_1).descriptor_digest, "event", released, "superseded")
     assert kstore.transact(lambda tx: admit_source_snapshot(tx, binding, kept)).snapshot_id == kept
     assert kstore.transact(lambda tx: register_snapshot(tx, binding, _desc(TREE_3))) == kept
+
+
+def _record_field(path: tuple[str | int, ...], sources: LineageSet, tx: KernelTx) -> FieldLineage:
+    return record_field_lineage(tx, "r01d-task", path, sources, unknown=False)
+
+
+def test_direct_record_field_lineage_refuses_filter_stripped_path_before_any_write(
+    trusted_tmp: Path, os_: OsAdapters, clock: FakeClock
+) -> None:
+    """I2-T3-R01 at the shared boundary: ``record_field_lineage`` itself, not only ``prepare_labeled_delivery``.
+
+    Same requirement as the R01 regression above (Task 3 plan: safe field-path descriptor in CAS; D6 privacy before
+    the first durable write): a path naming a key the privacy filter strips is refused (``INVALID_INPUT``) and leaves
+    nothing in CAS, the ledger or projections; a clean path still records.
+    """
+    root = trusted_tmp / "r01direct"
+    rt = _open(root, os_)
+    try:
+        dan = seed_principal_and_credential(rt.policy, owner_id="dan", harness_id="claude-code", machine_id="box-1")
+        binding = _register(
+            rt, clock, dan, alias="r01d", checkout=trusted_tmp / "r01d", remote="https://r.example/o/d.git", egress=True
+        )
+        sources = frozenset({binding_lineage_ref(binding)})
+        kstore = KernelWorkspaceStore(rt.store, rt.policy)
+        before = len(list(rt.store.entries()))
+        secret_paths: tuple[tuple[str | int, ...], ...] = ((CANARY_1,), ("outer", CANARY_1), ("items", 0, CANARY_1))
+        for path in secret_paths:
+            with pytest.raises(BrainError) as exc:
+                kstore.transact(partial(_record_field, path, sources))
+            assert exc.value.code is ErrorCode.INVALID_INPUT, path
+        assert len(list(rt.store.entries())) == before
+        assert kstore.transact(partial(_read_field_lineage, "r01d-task")) == {}
+        recorded = kstore.transact(partial(_record_field, ("description",), sources))
+        assert recorded.field_path_digest == field_path_digest(("description",))
+        assert kstore.transact(partial(_read_field_lineage, "r01d-task"))[recorded.field_path_digest].sources == sources
+        ledger_text = "\n".join(repr((e.kind, dict(e.meta), tuple(e.refs))) for e in rt.store.entries())
+        assert CANARY_1 not in ledger_text
+    finally:
+        rt.close()
+    assert _files_containing(root, CANARY_1.encode("utf-8")) == []  # CAS blobs, DB/WAL, projections
