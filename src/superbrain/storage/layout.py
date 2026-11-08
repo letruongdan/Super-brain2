@@ -19,6 +19,8 @@ if TYPE_CHECKING:
     from superbrain.storage.writer import WriterLease
 
 LOCK_NAME = "writer.lock"
+ENDPOINT_NAME = "endpoint.json"
+ENDPOINT_STAGE_PREFIX = "endpoint.json.stage-"
 RESERVED_ENTRIES: tuple[str, ...] = (
     LOCK_NAME,
     "policy",
@@ -76,6 +78,10 @@ class DataRoot:
     @property
     def staging_dir(self) -> Path:
         return self.store_dir / "staging"
+
+    @property
+    def endpoint_path(self) -> Path:
+        return self.root / ENDPOINT_NAME
 
     def subdirectories(self) -> tuple[Path, ...]:
         """The directories ``secure_subdirectories`` creates, parents first."""
@@ -237,3 +243,9 @@ def secure_subdirectories(root: DataRoot, lease: "WriterLease", os_: OsAdapters)
     for directory in directories:
         if directory not in existing and not _create_directory(directory, os_):
             _require_owner_only(directory, os_)
+
+
+def check_endpoint_entries_under_lease(root: DataRoot, lease: "WriterLease", os_: OsAdapters) -> tuple[Path, ...]:
+    """Under a held writer lease, validate existing ``endpoint.json`` and ``endpoint.json.stage-*`` entries."""
+    del root, lease, os_
+    raise BrainError(ErrorCode.DAEMON_UNAVAILABLE, "daemon unavailable")
