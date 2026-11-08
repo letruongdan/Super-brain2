@@ -330,7 +330,11 @@ class JobKernelTxReads:
             self._txn.release(digest, _HOLDER_KIND, holder_id, reason)
 
     def read_held_blob(self, digest: str, *, holder_id: str) -> bytes | None:
-        if not is_uuid(holder_id) or digest not in held_digests(self._txn.db, _HOLDER_KIND, holder_id):
+        if not is_uuid(holder_id):
+            return None
+        if self._policy.is_tombstoned(_HOLDER_KIND, holder_id):
+            return None
+        if digest not in held_digests(self._txn.db, _HOLDER_KIND, holder_id):
             return None
         if self._policy.is_quarantined(digest) or not self._cas.blob_intact(digest):
             return None

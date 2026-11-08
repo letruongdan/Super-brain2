@@ -153,7 +153,7 @@ class KernelTx(Protocol):
         ...
 
     def read_held_blob(self, digest: str, *, holder_id: str) -> bytes | None:
-        """Bytes of ``digest`` iff ``(event, holder_id)`` holds it and policy does not quarantine it, else ``None``."""
+        """Bytes of ``digest`` iff ``(event, holder_id)`` holds it and policy neither tombstones nor quarantines it."""
         ...
 
     def read_job(self, job_id: str) -> JobRecord | None:
