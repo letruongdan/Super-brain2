@@ -11,21 +11,25 @@ Requirement-derived oracles:
 
 from __future__ import annotations
 
+import datetime as dt
 from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import ParamSpec
+from typing import ParamSpec, TypeVar
 
 import pytest
 
 import superbrain.application._prequeue as prequeue
+import superbrain.application.deadlines as deadlines_mod
 from superbrain.composition.kernel_bridge import KernelBridge
 from superbrain.core.canonical import digest_bytes
 from superbrain.core.errors import ErrorCode
 from superbrain.core.ids import new_id
 from superbrain.core.jsonvalue import JsonValue
 from superbrain.core.kernel import (
+    IDEMPOTENCY_CLOCK_HWM_META_KEY,
     Call,
     CallResult,
+    IdempotencyRow,
     ReadAckInput,
     RepoFlags,
     ResourceDigest,
@@ -33,6 +37,8 @@ from superbrain.core.kernel import (
 )
 from superbrain.core.wire import normalize_call
 from superbrain.ports.os import OsAdapters
+from superbrain.storage.idempotency import KernelIdempotencyStore
+from superbrain.storage.ledger import utc_timestamp
 from superbrain.storage.store import Store
 from superbrain.storage.workspaces import SNAPSHOTS_TABLE
 from tests.application.test_kernel_deadlines import (
@@ -50,9 +56,10 @@ from tests.application.test_kernel_deadlines import (
 )
 from tests.support.clock import FakeClock
 from tests.support.inc2_fixture import FixtureKernelDomain, FixtureResourceSpec
-from tests.support.kernel_auth import seed_principal_and_credential, seed_repo_grant
+from tests.support.kernel_auth import make_bootstrap_auth, seed_principal_and_credential, seed_repo_grant
 
 _P = ParamSpec("_P")
+_R = TypeVar("_R")
 
 
 @pytest.fixture
@@ -67,19 +74,46 @@ def os_(clock: FakeClock) -> OsAdapters:
     return os_adapters(clock)
 
 
+def _wrap_timed(
+    orig: Callable[_P, _R],
+    mono: FakeMonotonicClock,
+    delay_ns_fn: Callable[[], int],
+) -> Callable[_P, _R]:
+    def _measured(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+        out = orig(*args, **kwargs)
+        delay_ns = delay_ns_fn()
+        if delay_ns:
+            mono.advance(delay_ns)
+        return out
+
+    return _measured
+
+
 def _wrap_normalize(
     orig: Callable[_P, Call],
     mono: FakeMonotonicClock,
     delay_ns_fn: Callable[[], int],
 ) -> Callable[_P, Call]:
-    def _measured_normalize(*args: _P.args, **kwargs: _P.kwargs) -> Call:
-        normalized = orig(*args, **kwargs)
-        delay_ns = delay_ns_fn()
-        if delay_ns:
-            mono.advance(delay_ns)
-        return normalized
+    return _wrap_timed(orig, mono, delay_ns_fn)
 
-    return _measured_normalize
+
+def _read_all_idempotency_rows(store: Store) -> list[tuple[object, ...]]:
+    with store.transaction() as txn:
+        rows = txn.db.execute(
+            "SELECT principal_id, tool, key_hash, request_digest_key_id, request_digest, "
+            "result_id, assignment_id, refs_json, committed_at "
+            "FROM idempotency ORDER BY principal_id, tool, key_hash"
+        ).fetchall()
+    return [tuple(r) for r in rows]
+
+
+def _read_c4_hwm(store: Store) -> str | None:
+    with store.transaction() as txn:
+        row = txn.db.execute(
+            "SELECT value FROM meta WHERE key = ?",
+            (IDEMPOTENCY_CLOCK_HWM_META_KEY,),
+        ).fetchone()
+    return None if row is None else str(row[0])
 
 
 def _count_ledger_kind(store: Store, kind: str) -> int:
@@ -977,5 +1011,387 @@ def test_t4c_r01_manual_submission_false_discards_read_acks_across_served_pendin
         )
         assert foreign_pend2_err["message"] == "not found"
         assert _count_rows(rt.store, "artifact_read_ack") == 1
+    finally:
+        rt.close()
+
+
+# --- I2-T4B-R01 (R2): Cached replay & read-only owner admission share the <= 100 ms local budget ---------------------
+
+
+def test_t4b_r01_cached_replay_and_readonly_enforce_shared_local_budget_on_owner_admission(
+    trusted_tmp: Path,
+    os_: OsAdapters,
+    clock: FakeClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mono = FakeMonotonicClock(start_ns=100_000 * MS)
+    rt = _open_fixture_runtime(trusted_tmp / "root", os_)
+    try:
+        token_a = seed_principal_and_credential(rt.policy, owner_id="dan", harness_id="claude-code", machine_id="box-1")
+        token_b = seed_principal_and_credential(
+            rt.policy,
+            principal_id=token_a.principal.principal_id,
+            owner_id=token_a.principal.owner_id,
+            harness_id=token_a.principal.harness_id,
+            machine_id=token_a.principal.machine_id,
+        )
+        binding = _register_ws(rt, clock, token_a, alias="ws-main", checkout_dir=trusted_tmp / "chk")
+        scope = Scope(binding.repo_id, binding.checkout_id)
+        obs = RecordingObserver(descriptor=_desc(TREE_A), mono=mono)
+        domain = FixtureKernelDomain(
+            store=rt.store,
+            policy=rt.policy,
+            clock=clock,
+            observer=obs,
+            monotonic_ns=mono.monotonic_ns,
+        )
+        bridge = KernelBridge(
+            store=rt.store,
+            policy=rt.policy,
+            clock=clock,
+            monotonic_clock=mono,
+            writer_epoch=rt.lease.epoch,
+            domain=domain,
+        )
+        bridge.publish_auth_view()
+
+        replay_record_calls = 0
+        orig_record_replay = KernelIdempotencyStore.record_replay
+
+        def _counting_record_replay(
+            self_store: KernelIdempotencyStore,
+            *,
+            row: IdempotencyRow,
+            now: dt.datetime,
+        ) -> None:
+            nonlocal replay_record_calls
+            replay_record_calls += 1
+            orig_record_replay(self_store, row=row, now=now)
+
+        monkeypatch.setattr(KernelIdempotencyStore, "record_replay", _counting_record_replay)
+
+        domain.seed_artifact(
+            bridge,
+            artifact_id="art-t4b-r2-1",
+            revision=1,
+            kind="skill",
+            owner_id=token_a.principal.owner_id,
+            repo_id=binding.repo_id,
+            checkout_id=binding.checkout_id,
+            resources=(FixtureResourceSpec(name="L1.md", content=b"r2 replay local budget", level="L1"),),
+        )
+
+        # Seed committed initial results at 0 ms delay across prepare_task, get_artifact, record_outcome,
+        # and request_improvement (for get_job), plus verify baseline read-only get_health and get_job.
+        prep_args: dict[str, JsonValue] = {
+            "schema_version": "2.0",
+            "workspace_hint": "ws-main",
+            "description": "seed committed prepare_task for r2 replay budget check",
+            "idempotency_key": "idem_t4b_r2_prep_seed_01",
+        }
+        prep_first = _expect_ok(
+            "prepare_task",
+            _run_tool(bridge, "prepare_task", prep_args, token=token_a.token, selected_scope=scope),
+        )
+        assert prep_first["snapshot_status"] == "available"
+        assert isinstance(prep_first["source_snapshot_id"], str)
+        task_id = str(prep_first["task_id"])
+        delivery_id = str(prep_first["delivery_id"])
+
+        gart_args: dict[str, JsonValue] = {
+            "schema_version": "2.0",
+            "workspace_id": binding.repo_id,
+            "task_id": task_id,
+            "artifact_id": "art-t4b-r2-1",
+            "revision": 1,
+            "level": "L1",
+            "idempotency_key": "idem_t4b_r2_gart_seed_01",
+        }
+        gart_first = _expect_ok(
+            "get_artifact",
+            _run_tool(bridge, "get_artifact", gart_args, token=token_a.token, selected_scope=scope),
+        )
+        receipt_1 = str(gart_first["served_receipt_id"])
+        bridge.finalize_send_attempt(bridge.build_send_completion(receipt_1))
+
+        rout_args: dict[str, JsonValue] = {
+            "schema_version": "2.0",
+            "workspace_id": binding.repo_id,
+            "delivery_id": delivery_id,
+            "outcome": "success",
+            "idempotency_key": "idem_t4b_r2_rout_seed_01",
+        }
+        rout_first = _expect_ok(
+            "record_outcome",
+            _run_tool(bridge, "record_outcome", rout_args, token=token_a.token, selected_scope=scope),
+        )
+        assert rout_first["status"] == "declared"
+
+        health_args: dict[str, JsonValue] = {"schema_version": "2.0", "deep": False}
+        job_args: dict[str, JsonValue] = {"schema_version": "2.0", "job_id": "job-missing-r2-0001"}
+        _expect_ok("get_health", _run_tool(bridge, "get_health", health_args, token=token_a.token, selected_scope=None))
+        _expect_err(
+            "get_job",
+            _run_tool(bridge, "get_job", job_args, token=token_a.token, selected_scope=None),
+            ErrorCode.NOT_FOUND,
+        )
+
+        # Advance wall clock so any unintended record_replay would visibly advance meta[idempotency_clock_hwm_utc].
+        base_obs_calls = len(obs.calls)
+        base_deliveries = _count_rows(rt.store, "p_fixture_domain_deliveries")
+        base_art_results = _count_rows(rt.store, "p_fixture_domain_artifact_results")
+        base_outcomes = _count_rows(rt.store, "p_fixture_domain_outcomes")
+        base_idem_count = _count_rows(rt.store, "idempotency")
+        base_send_attempts = _count_rows(rt.store, "artifact_send_attempt")
+        base_idem_rows = _read_all_idempotency_rows(rt.store)
+        base_hwm = _read_c4_hwm(rt.store)
+        assert base_hwm is not None
+        assert replay_record_calls == 0
+
+        clock.advance(dt.timedelta(seconds=10))
+        replayed_wall_str = utc_timestamp(clock.now())
+        assert replayed_wall_str > base_hwm
+
+        normalize_delay_ns = 0
+        reconstruct_delay_ns = 0
+        resolve_delay_ns = 0
+        snapshot_delay_ns = 0
+
+        real_reconstruct = deadlines_mod.reconstruct_queued_call
+        monkeypatch.setattr(
+            prequeue,
+            "normalize_call",
+            _wrap_normalize(normalize_call, mono, lambda: normalize_delay_ns),
+        )
+        monkeypatch.setattr(
+            deadlines_mod,
+            "reconstruct_queued_call",
+            _wrap_timed(real_reconstruct, mono, lambda: reconstruct_delay_ns),
+        )
+        monkeypatch.setattr(
+            rt.policy,
+            "resolve_credential",
+            _wrap_timed(rt.policy.resolve_credential, mono, lambda: resolve_delay_ns),
+        )
+        monkeypatch.setattr(
+            rt.policy,
+            "snapshot",
+            _wrap_timed(rt.policy.snapshot, mono, lambda: snapshot_delay_ns),
+        )
+
+        step_idx = 0
+
+        def _submit_and_run_owner(
+            tool: str,
+            args: Mapping[str, JsonValue],
+            *,
+            token: str = token_a.token,
+            sel_scope: Scope | None = scope,
+            pre_ms: int = 60,
+            queue_ms: int = 0,
+            reconstruct_ms: int = 0,
+            auth_ms: int = 0,
+            snap_ms: int = 0,
+        ) -> CallResult:
+            nonlocal step_idx, normalize_delay_ns, reconstruct_delay_ns, resolve_delay_ns, snapshot_delay_ns
+            step_idx += 1
+            t_start = (200_000 + step_idx * 10_000) * MS
+            mono.set_ns(t_start)
+            normalize_delay_ns = pre_ms * MS
+            reconstruct_delay_ns = reconstruct_ms * MS
+            resolve_delay_ns = auth_ms * MS
+            snapshot_delay_ns = snap_ms * MS
+            try:
+                sub = bridge.submit_request(tool, dict(args), token=token, selected_scope=sel_scope)
+                assert not sub.done()
+                assert mono.monotonic_ns() == t_start + pre_ms * MS
+                if sub.queued is not None:
+                    assert sub.queued.remaining_local_budget_ns == (100 - pre_ms) * MS
+                if queue_ms:
+                    mono.advance(queue_ms * MS)
+                assert bridge.process_next_queued(block=False) is True
+                return sub.wait(timeout=2.0)
+            finally:
+                normalize_delay_ns = 0
+                reconstruct_delay_ns = 0
+                resolve_delay_ns = 0
+                snapshot_delay_ns = 0
+
+        def _assert_no_replay_or_business_side_effects() -> None:
+            assert len(obs.calls) == base_obs_calls
+            assert _count_rows(rt.store, "p_fixture_domain_deliveries") == base_deliveries
+            assert _count_rows(rt.store, "p_fixture_domain_artifact_results") == base_art_results
+            assert _count_rows(rt.store, "p_fixture_domain_outcomes") == base_outcomes
+            assert _count_rows(rt.store, "idempotency") == base_idem_count
+            assert _read_all_idempotency_rows(rt.store) == base_idem_rows
+            assert replay_record_calls == 0
+            assert _read_c4_hwm(rt.store) == base_hwm
+            assert _count_rows(rt.store, "artifact_send_attempt") == base_send_attempts
+            assert bridge.reservations.active_count() == 0
+
+        # --- (a.1) Fresh-key controls (60 ms pre-queue + 50 ms owner admission = 110 ms > 100 ms) ---
+        for ctrl_idx, (rec_ms, auth_ms, snap_ms) in enumerate(((0, 50, 0), (50, 0, 0), (0, 0, 50)), start=1):
+            _expect_err(
+                "prepare_task",
+                _submit_and_run_owner(
+                    "prepare_task",
+                    {
+                        "schema_version": "2.0",
+                        "workspace_hint": "ws-main",
+                        "description": f"fresh control {ctrl_idx}",
+                        "idempotency_key": f"idem_t4b_r2_fresh_ctrl_0{ctrl_idx}",
+                    },
+                    pre_ms=60,
+                    reconstruct_ms=rec_ms,
+                    auth_ms=auth_ms,
+                    snap_ms=snap_ms,
+                ),
+                ErrorCode.DEADLINE_EXCEEDED,
+            )
+            _assert_no_replay_or_business_side_effects()
+
+        # --- (a.2) & (b) Cached replays + read-only tools MUST also fail closed with DEADLINE_EXCEEDED ---
+        replay_and_readonly_targets: tuple[tuple[str, Mapping[str, JsonValue], Scope | None], ...] = (
+            ("prepare_task", prep_args, scope),
+            ("get_artifact", gart_args, scope),
+            ("record_outcome", rout_args, scope),
+            ("get_health", health_args, None),
+            ("get_job", job_args, None),
+        )
+        for rec_ms, auth_ms, snap_ms in ((0, 50, 0), (50, 0, 0), (0, 0, 50)):
+            for tool_name, tool_args, tool_scope in replay_and_readonly_targets:
+                _expect_err(
+                    tool_name,
+                    _submit_and_run_owner(
+                        tool_name,
+                        tool_args,
+                        sel_scope=tool_scope,
+                        pre_ms=60,
+                        reconstruct_ms=rec_ms,
+                        auth_ms=auth_ms,
+                        snap_ms=snap_ms,
+                    ),
+                    ErrorCode.DEADLINE_EXCEEDED,
+                )
+                _assert_no_replay_or_business_side_effects()
+
+        # --- (c) Queue-wait separation (500 ms queue wait) & within-budget replay recovery (85 ms <= 100 ms) ---
+        _expect_err(
+            "prepare_task",
+            _submit_and_run_owner(
+                "prepare_task",
+                prep_args,
+                pre_ms=60,
+                queue_ms=500,
+                auth_ms=50,
+            ),
+            ErrorCode.DEADLINE_EXCEEDED,
+        )
+        _assert_no_replay_or_business_side_effects()
+
+        _expect_err(
+            "get_artifact",
+            _submit_and_run_owner(
+                "get_artifact",
+                gart_args,
+                pre_ms=60,
+                queue_ms=500,
+                reconstruct_ms=50,
+            ),
+            ErrorCode.DEADLINE_EXCEEDED,
+        )
+        _assert_no_replay_or_business_side_effects()
+
+        # Within-budget recovery on the SAME prepare_task key (60 ms pre-queue + 500 ms queue wait + 25 ms auth = 85 ms)
+        prep_recovered = _expect_ok(
+            "prepare_task",
+            _submit_and_run_owner(
+                "prepare_task",
+                prep_args,
+                pre_ms=60,
+                queue_ms=500,
+                auth_ms=25,
+            ),
+        )
+        assert prep_recovered == prep_first
+        assert prep_recovered["delivery_id"] == delivery_id
+        assert prep_recovered["snapshot_status"] == "available"
+        assert prep_recovered["source_snapshot_id"] == prep_first["source_snapshot_id"]
+        assert len(obs.calls) == base_obs_calls
+        assert _count_rows(rt.store, "p_fixture_domain_deliveries") == base_deliveries
+        assert _count_rows(rt.store, "idempotency") == base_idem_count
+        assert _read_all_idempotency_rows(rt.store) == base_idem_rows
+        assert replay_record_calls == 1
+        assert _read_c4_hwm(rt.store) == replayed_wall_str
+
+        # Within-budget recovery on the SAME get_artifact key (60 ms + 500 ms queue wait + 25 ms reconstruct = 85 ms)
+        gart_recovered = _expect_ok(
+            "get_artifact",
+            _submit_and_run_owner(
+                "get_artifact",
+                gart_args,
+                pre_ms=60,
+                queue_ms=500,
+                reconstruct_ms=25,
+            ),
+        )
+        assert gart_recovered["artifact_id"] == gart_first["artifact_id"]
+        assert gart_recovered["revision"] == gart_first["revision"]
+        assert gart_recovered["resources"] == gart_first["resources"]
+        assert gart_recovered["served_receipt_id"] != receipt_1
+        assert _count_rows(rt.store, "p_fixture_domain_artifact_results") == base_art_results
+        assert _count_rows(rt.store, "artifact_send_attempt") == base_send_attempts + 1
+        assert _read_all_idempotency_rows(rt.store) == base_idem_rows
+        assert replay_record_calls == 2
+        assert bridge.reservations.active_count() == 0
+
+        # --- (d) Auth & scope error precedence over local deadline on over-budget cached replay (60 + 50 = 110 ms) ---
+        # d.1) Revoked credential on owner MUST return UNAUTHENTICATED even when reconstruct consumed 50 ms!
+        t_rev = 500_000 * MS
+        mono.set_ns(t_rev)
+        normalize_delay_ns = 60 * MS
+        sub_revoked = bridge.submit_request("prepare_task", dict(prep_args), token=token_a.token, selected_scope=scope)
+        normalize_delay_ns = 0
+        assert not sub_revoked.done()
+
+        revoke_proof = make_bootstrap_auth(
+            store_id=rt.policy.store_id,
+            owner_id=token_a.principal.owner_id,
+            action="credential_revoke",
+            subject_id=token_a.credential_id,
+            trust_generation=rt.policy.trust_generation(),
+            expires_at=clock.now() + dt.timedelta(hours=1),
+        )
+        bridge.revoke_credential(token_a.credential_id, revoke_proof)
+
+        reconstruct_delay_ns = 50 * MS
+        assert bridge.process_next_queued(block=False) is True
+        reconstruct_delay_ns = 0
+        _expect_err("prepare_task", sub_revoked.wait(timeout=2.0), ErrorCode.UNAUTHENTICATED)
+        assert replay_record_calls == 2
+        assert bridge.reservations.active_count() == 0
+
+        # d.2) Revoked repo grant on owner MUST return NOT_FOUND even when reconstruct consumed 50 ms!
+        t_ungrant = 510_000 * MS
+        mono.set_ns(t_ungrant)
+        normalize_delay_ns = 60 * MS
+        sub_ungrant = bridge.submit_request("prepare_task", dict(prep_args), token=token_b.token, selected_scope=scope)
+        normalize_delay_ns = 0
+        assert not sub_ungrant.done()
+
+        with rt.policy._immediate() as pdb:
+            pdb.execute(
+                "DELETE FROM repo_grant WHERE principal_id = ? AND repo_id = ?",
+                (token_b.principal.principal_id, binding.repo_id),
+            )
+        bridge.publish_auth_view()
+
+        reconstruct_delay_ns = 50 * MS
+        assert bridge.process_next_queued(block=False) is True
+        reconstruct_delay_ns = 0
+        _expect_err("prepare_task", sub_ungrant.wait(timeout=2.0), ErrorCode.NOT_FOUND)
+        assert replay_record_calls == 2
+        assert _read_all_idempotency_rows(rt.store) == base_idem_rows
+        assert bridge.reservations.active_count() == 0
     finally:
         rt.close()
