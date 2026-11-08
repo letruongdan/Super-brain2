@@ -154,13 +154,15 @@ class JobExecutor:
     def _run(self) -> None:
         while (item := self._items.get()) is not None:
             with self._lock:
-                cancelled = self._cancel_events.get(item.lease.job_id, threading.Event())
+                registered = self._cancel_events.get(item.lease.job_id)
+                cancelled = registered if registered is not None else threading.Event()
             try:
                 if not cancelled.is_set():
                     self._commands.put(self._execute(item, cancelled))
             finally:
                 with self._lock:
-                    self._cancel_events.pop(item.lease.job_id, None)
+                    if registered is not None and self._cancel_events.get(item.lease.job_id) is registered:
+                        self._cancel_events.pop(item.lease.job_id, None)
 
     def _execute(self, item: WorkItem, cancelled: threading.Event) -> WorkerCommand:
         handler = self._handlers[item.spec.kind]
