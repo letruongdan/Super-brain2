@@ -90,6 +90,7 @@ from superbrain.core.kernel import (
     ResourceDigest,
     Scope,
     SendAttemptState,
+    ShutdownReport,
     ShutdownState,
     StoredResult,
     TlsMaterial,
@@ -107,6 +108,7 @@ from superbrain.storage.kernel_schema import KERNEL_POLICY_MIGRATIONS, KERNEL_ST
 from superbrain.storage.kinds import EntryKind, FieldType, KindRegistry
 from superbrain.storage.layout import (
     ENDPOINT_NAME,
+    ENDPOINT_STAGE_PREFIX,
     DataRoot,
     check_endpoint_entries_under_lease,
     prepare_data_root,
@@ -2922,3 +2924,538 @@ def test_shutdown_close_failure_retains_lease(
             with contextlib.suppress(BrainError):
                 rt_obj.close()
     assert prepare_data_root(r2, adapters) == DataRoot.at(r2)
+
+
+def test_startup_prepublish_tls_naive_clock_and_post_rebuild_verification(
+    trusted_tmp: Path,
+    _daemon_template: _DaemonTemplate,
+) -> None:
+    """Startup rechecks UTC cert expiry before publish, rejects naive clocks, and verifies legacy rebuild completion."""
+    base_now = _daemon_template.base_time + dt.timedelta(minutes=5)
+
+    # Subcase A: Pre-publish UTC validity recheck catches expiry BEFORE staging/publishing endpoint.json.
+    root_a, _, cfg_a = _instantiate_case(trusted_tmp, "b1-prepublish-tls", _daemon_template)
+    clock_a = FakeClock(base_now)
+    real_adapters_a = os_adapters(clock=clock_a)
+    endpoint_pub_ops: list[tuple[str, str]] = []
+
+    def _is_endpoint_target(path: Path) -> bool:
+        norm = os.path.normcase(path.name)
+        return norm == ENDPOINT_NAME or norm.startswith(ENDPOINT_STAGE_PREFIX)
+
+    class _RecordingEndpointPublisher:
+        def flush_file(self, path: Path) -> None:
+            real_adapters_a.publisher.flush_file(path)
+
+        def write_new(self, path: Path, data: bytes) -> None:
+            if _is_endpoint_target(path):
+                endpoint_pub_ops.append(("write_new", path.name))
+            real_adapters_a.publisher.write_new(path, data)
+
+        def publish(self, staging: Path, final: Path) -> None:
+            if _is_endpoint_target(staging) or _is_endpoint_target(final):
+                endpoint_pub_ops.append(("publish", final.name))
+            real_adapters_a.publisher.publish(staging, final)
+
+        def rename_dir(self, src: Path, dst: Path) -> None:
+            real_adapters_a.publisher.rename_dir(src, dst)
+
+        def sync_directory(self, directory: Path) -> None:
+            real_adapters_a.publisher.sync_directory(directory)
+
+        def durability(self, directory: Path, env: Mapping[str, str]) -> DurabilityReport:
+            return real_adapters_a.publisher.durability(directory, env)
+
+    rec_adapters_a = dataclasses.replace(real_adapters_a, publisher=_RecordingEndpointPublisher())
+    bound_a: list[BoundLoopbackListener] = []
+    hook_seen_a: list[Endpoint] = []
+
+    def _expire_before_publish(ep: Endpoint) -> None:
+        hook_seen_a.append(ep)
+        clock_a.set(_daemon_template.tls.not_after)
+
+    loop_a = create_daemon_owner_loop(
+        os_=rec_adapters_a,
+        clock=clock_a,
+        hooks=DaemonTestHooks(before_endpoint_publish=_expire_before_publish),
+        on_listener_bound=bound_a.append,
+    )
+    _expect_brain_error(ErrorCode.INVALID_INPUT, lambda: loop_a.start(cfg_a))
+    assert len(hook_seen_a) == 1
+    assert endpoint_pub_ops == []
+    assert loop_a.ready is None
+    assert not (root_a / ENDPOINT_NAME).exists()
+    assert bound_a and all(b.sock.fileno() == -1 for b in bound_a)
+    with acquire_writer(DataRoot.at(root_a), real_adapters_a):
+        pass
+
+    # Subcase B: Naive clock (tzinfo=None, +10d well inside cert window regardless of host TZ) fails closed.
+    root_b, _, cfg_b = _instantiate_case(trusted_tmp, "b1-naive-clock", _daemon_template)
+    real_adapters_b = os_adapters(clock=FakeClock(base_now))
+    before_bind_hit: list[bool] = []
+
+    class _SwitchableNaiveClock:
+        def __init__(self, initial: dt.datetime) -> None:
+            self._current = initial
+            self._naive = False
+
+        def switch_to_naive(self) -> None:
+            self._naive = True
+
+        def now(self) -> dt.datetime:
+            if self._naive:
+                return (self._current + dt.timedelta(days=10)).replace(tzinfo=None)
+            return self._current
+
+    naive_clock = _SwitchableNaiveClock(base_now)
+
+    def _flip_naive(_rt: Runtime) -> None:
+        before_bind_hit.append(True)
+        naive_clock.switch_to_naive()
+
+    bound_b: list[BoundLoopbackListener] = []
+    loop_b = create_daemon_owner_loop(
+        os_=real_adapters_b,
+        clock=naive_clock,
+        hooks=DaemonTestHooks(before_bind=_flip_naive),
+        on_listener_bound=bound_b.append,
+    )
+    try:
+        _expect_brain_error(ErrorCode.INVALID_INPUT, lambda: loop_b.start(cfg_b))
+        assert before_bind_hit == [True]
+        assert bound_b == []
+        assert loop_b.ready is None
+        assert not (root_b / ENDPOINT_NAME).exists()
+    finally:
+        with contextlib.suppress(BrainError):
+            loop_b.stop()
+    with acquire_writer(DataRoot.at(root_b), real_adapters_b):
+        pass
+
+    # Subcase C: Post-rebuild verification fails closed with INTEGRITY_FAILURE if legacy settled/0 rows remain.
+    root_c, _, cfg_c = _instantiate_case(trusted_tmp, "b1-post-rebuild-legacy", _daemon_template)
+    clock_c = FakeClock(base_now)
+    real_adapters_c = os_adapters(clock=clock_c)
+    rt_seed = reopen_kernel_job_runtime(root_c, _daemon_template.store_id, real_adapters_c)
+    try:
+        svc_seed, st_seed = kernel_job_service(rt_seed, clock_c)
+        enqueue_job(svc_seed, st_seed, owner_id="dan", payload=b"b1-legacy-seed")
+        lease_seed = svc_seed.lease_next(rt_seed.lease.epoch, clock_c.now())
+        assert lease_seed is not None
+        svc_seed.start(lease_seed)
+        inv_seed = svc_seed.reserve_invocation(lease_seed, RESERVE)
+        svc_seed.settle_usage(inv_seed, UsageRecord(None, False))
+        svc_seed.complete(lease_seed, JobOutcome.success())
+    finally:
+        rt_seed.close()
+
+    db_c = root_c / "store" / "brain.db"
+    with contextlib.closing(sqlite3.connect(db_c)) as raw_db, raw_db:
+        raw_db.execute("PRAGMA journal_mode=DELETE")
+        raw_db.execute(
+            "UPDATE p_provider_invocations_state SET state = 'settled', usage_complete = 0 WHERE invocation_id = ?",
+            (inv_seed,),
+        )
+    real_adapters_c.permissions.secure_file(db_c)
+
+    noop_installed: list[bool] = []
+    recover_reached: list[bool] = []
+    bound_c: list[BoundLoopbackListener] = []
+
+    def _noop_rebuild(rt: Runtime) -> None:
+        noop_installed.append(True)
+        rt.store.rebuild_projections = lambda: 0  # type: ignore[method-assign]
+
+    def _on_before_recover(_rt: Runtime) -> None:
+        recover_reached.append(True)
+
+    loop_c = create_daemon_owner_loop(
+        os_=real_adapters_c,
+        clock=clock_c,
+        hooks=DaemonTestHooks(
+            after_open_before_rebuild=_noop_rebuild,
+            before_job_recover=_on_before_recover,
+        ),
+        on_listener_bound=bound_c.append,
+    )
+    try:
+        _expect_brain_error(ErrorCode.INTEGRITY_FAILURE, lambda: loop_c.start(cfg_c))
+        assert noop_installed == [True]
+        assert recover_reached == []
+        assert bound_c == []
+        assert loop_c.ready is None
+        assert not (root_c / ENDPOINT_NAME).exists()
+    finally:
+        with contextlib.suppress(BrainError):
+            loop_c.stop()
+    with acquire_writer(DataRoot.at(root_c), real_adapters_c):
+        pass
+
+
+def test_owner_live_authority_divergence_invalidates_gate_and_withholds_stamp(
+    trusted_tmp: Path,
+    _daemon_template: _DaemonTemplate,
+) -> None:
+    """Owner live-policy divergence from stale RAM ``AuthGate`` withholds ``grant_stamp`` and invalidates gate."""
+    base_now = _daemon_template.base_time + dt.timedelta(minutes=5)
+
+    # Subcase A: Live PolicyStore workspace mutation without AuthGate republish -> grant_stamp=None & gate cleared.
+    root_a, _, cfg_a = _instantiate_case(trusted_tmp, "b2-stale-stamp", _daemon_template)
+    clock_a = FakeClock(base_now)
+    mono_a = _FakeMonotonicClock()
+    adapters_a = os_adapters(clock=clock_a, monotonic=mono_a)
+
+    rt_seed_a = reopen_kernel_job_runtime(root_a, _daemon_template.store_id, adapters_a)
+    try:
+        svc_a, st_a = kernel_job_service(rt_seed_a, clock_a)
+        job_a_id = enqueue_job(svc_a, st_a, owner_id="dan", payload=b"b2-job-a").job_id
+    finally:
+        rt_seed_a.close()
+
+    rt_box_a: list[Runtime] = []
+    loop_a = create_daemon_owner_loop(
+        os_=adapters_a,
+        clock=clock_a,
+        monotonic_clock=mono_a,
+        hooks=DaemonTestHooks(before_bind=rt_box_a.append),
+    )
+    try:
+        loop_a.start(cfg_a)
+        rt_a = rt_box_a[0]
+        initial_view_a = loop_a.auth_gate.current()
+        assert initial_view_a is not None
+        dl_a = mono_a.now + TOTAL_REQUEST_BUDGET_NS
+
+        rep_ok = loop_a.submit_reply(
+            ToolCommand("get_job", {"schema_version": "2.0", "job_id": job_a_id}, token=_daemon_template.cred_a.token),
+            dl_a,
+        ).result(timeout=BOUND_WAIT_S)
+        assert rep_ok.envelope["ok"] is True
+        assert rep_ok.grant_stamp is not None
+
+        div_dir = trusted_tmp / "b2-div-chk"
+        div_dir.mkdir(parents=True, exist_ok=True)
+        if sys.platform != "win32":
+            os.chmod(div_dir, 0o700)
+
+        def _mutate_live_policy_only() -> None:
+            reg = build_registration(
+                owner_id="dan",
+                principal_id=_daemon_template.dan.principal_id,
+                machine_id=_daemon_template.dan.machine_id,
+                alias="ws-divergent",
+                raw_path=str(div_dir),
+                raw_remote=REMOTE_EXTRA,
+                provider_egress_enabled=False,
+            )
+            proof = make_bootstrap_auth(
+                store_id=rt_a.policy.store_id,
+                owner_id="dan",
+                action="workspace_register",
+                subject_id=reg.subject_id,
+                trust_generation=rt_a.policy.trust_generation(),
+                expires_at=clock_a.now() + dt.timedelta(hours=1),
+            )
+            rt_a.policy.register_authorized_workspace(reg, proof)
+            rt_a.store.reconcile_policy()
+
+        loop_a.run_owner_action(_mutate_live_policy_only).result(timeout=BOUND_WAIT_S)
+        assert loop_a.auth_gate.current() == initial_view_a
+
+        rep_div = loop_a.submit_reply(
+            ToolCommand("get_job", {"schema_version": "2.0", "job_id": job_a_id}, token=_daemon_template.cred_a.token),
+            dl_a,
+        ).result(timeout=BOUND_WAIT_S)
+        assert rep_div.envelope["ok"] is True
+        assert rep_div.grant_stamp is None
+        assert loop_a.auth_gate.current() is None
+        assert loop_a.auth_gate.authorize_stamp(rep_ok.grant_stamp) is False
+    finally:
+        with contextlib.suppress(BrainError):
+            loop_a.stop()
+
+    # Subcase B: Direct PolicyStore credential revocation detected on unauthenticated owner call clears stale AuthGate.
+    root_b, _, cfg_b = _instantiate_case(trusted_tmp, "b2-revoked-divergent", _daemon_template)
+    clock_b = FakeClock(base_now)
+    mono_b = _FakeMonotonicClock()
+    adapters_b = os_adapters(clock=clock_b, monotonic=mono_b)
+
+    rt_seed_b = reopen_kernel_job_runtime(root_b, _daemon_template.store_id, adapters_b)
+    try:
+        svc_b, st_b = kernel_job_service(rt_seed_b, clock_b)
+        job_b_id = enqueue_job(svc_b, st_b, owner_id="dan", payload=b"b2-job-b").job_id
+    finally:
+        rt_seed_b.close()
+
+    rt_box_b: list[Runtime] = []
+    loop_b = create_daemon_owner_loop(
+        os_=adapters_b,
+        clock=clock_b,
+        monotonic_clock=mono_b,
+        hooks=DaemonTestHooks(before_bind=rt_box_b.append),
+    )
+    try:
+        loop_b.start(cfg_b)
+        rt_b = rt_box_b[0]
+        initial_view_b = loop_b.auth_gate.current()
+        assert initial_view_b is not None
+        dl_b = mono_b.now + TOTAL_REQUEST_BUDGET_NS
+
+        def _revoke_live_policy_only() -> None:
+            proof = make_bootstrap_auth(
+                store_id=rt_b.policy.store_id,
+                owner_id="dan",
+                action="credential_revoke",
+                subject_id=_daemon_template.cred_a.credential_id,
+                trust_generation=rt_b.policy.trust_generation(),
+                expires_at=clock_b.now() + dt.timedelta(hours=1),
+            )
+            rt_b.policy.record_authorized_revocation(_daemon_template.cred_a.credential_id, proof)
+            rt_b.store.reconcile_policy()
+
+        loop_b.run_owner_action(_revoke_live_policy_only).result(timeout=BOUND_WAIT_S)
+        assert loop_b.auth_gate.current() == initial_view_b
+
+        rep_unauth = loop_b.submit_reply(
+            ToolCommand("get_job", {"schema_version": "2.0", "job_id": job_b_id}, token=_daemon_template.cred_a.token),
+            dl_b,
+        ).result(timeout=BOUND_WAIT_S)
+        assert rep_unauth.envelope == {"ok": False, "error": {"code": "unauthenticated", "message": "unauthenticated"}}
+        assert rep_unauth.grant_stamp is None
+        assert loop_b.auth_gate.current() is None
+
+        health_b = loop_b.submit(
+            ToolCommand("get_health", {"schema_version": "2.0"}, token=_daemon_template.cred_b.token),
+            dl_b,
+        ).result(timeout=1.0)
+        assert health_b["ok"] is False
+        assert cast(dict[str, JsonValue], health_b["error"])["code"] == "policy_unavailable"
+    finally:
+        with contextlib.suppress(BrainError):
+            loop_b.stop()
+
+
+def test_shutdown_report_metrics_and_shared_concurrent_stop_cutoff(
+    trusted_tmp: Path,
+    _daemon_template: _DaemonTemplate,
+) -> None:
+    """``ShutdownReport`` tracks drained/cancelled/worker metrics and concurrent ``stop()`` calls share one cutoff."""
+    base_now = _daemon_template.base_time + dt.timedelta(minutes=5)
+    ws_a = _daemon_template.ws_a
+    scope_a = Scope(ws_a.repo_id, ws_a.checkout_id)
+    tok_a = _daemon_template.cred_a.token
+
+    # Subcase A: Drain count when queued work finishes inside stop() grace window.
+    _, _, cfg_a = _instantiate_case(trusted_tmp, "b3-drain-metrics", _daemon_template)
+    clock_a = FakeClock(base_now)
+    adapters_a = os_adapters(clock=clock_a)
+    first_at_pre_commit = threading.Event()
+    release_pre_commit = threading.Event()
+    pause_once = [True]
+
+    def _pause_first_pre_commit(_res: Reservation | None) -> None:
+        if pause_once:
+            pause_once.pop()
+            first_at_pre_commit.set()
+            assert release_pre_commit.wait(timeout=BOUND_WAIT_S)
+
+    domain_a = _DaemonTestDomain(ws_a=ws_a)
+    loop_a = create_daemon_owner_loop(
+        os_=adapters_a,
+        clock=clock_a,
+        domain=domain_a,
+        hooks=DaemonTestHooks(before_enter_commit=_pause_first_pre_commit),
+    )
+    try:
+        loop_a.start(cfg_a)
+        fut_a1 = loop_a.submit(
+            ToolCommand(
+                "submit_episode",
+                _episode_args(ws_a, "idem-b3-drain-0001"),
+                token=tok_a,
+                selected_scope=scope_a,
+            ),
+            adapters_a.monotonic.monotonic_ns() + TOTAL_REQUEST_BUDGET_NS,
+        )
+        assert first_at_pre_commit.wait(timeout=BOUND_WAIT_S)
+
+        fut_a2 = loop_a.submit(
+            ToolCommand(
+                "submit_episode",
+                _episode_args(ws_a, "idem-b3-drain-0002"),
+                token=tok_a,
+                selected_scope=scope_a,
+            ),
+            adapters_a.monotonic.monotonic_ns() + TOTAL_REQUEST_BUDGET_NS,
+        )
+
+        rep_a_box: list[ShutdownReport] = []
+        t_stop_a = threading.Thread(target=lambda: rep_a_box.append(loop_a.stop(grace_s=2.0)), daemon=True)
+        t_stop_a.start()
+        _wait_until(lambda: loop_a.ready is None, desc="stop_a clears ready")
+        release_pre_commit.set()
+
+        assert fut_a1.result(timeout=BOUND_WAIT_S)["ok"] is True
+        assert fut_a2.result(timeout=BOUND_WAIT_S)["ok"] is True
+        t_stop_a.join(timeout=BOUND_WAIT_S)
+        assert len(rep_a_box) == 1
+        rep_a = rep_a_box[0]
+        assert rep_a.state is ShutdownState.STOPPED
+        assert rep_a.drained_requests >= 1
+        assert rep_a.cancelled_requests == 0
+        assert rep_a.worker_drained is True
+    finally:
+        release_pre_commit.set()
+        with contextlib.suppress(BrainError):
+            loop_a.stop()
+
+    # Subcase B1: Concurrent stop(grace_s=0.0) shares first stopper's 0.40s cutoff instead of imposing 0.0s.
+    _, _, cfg_b1 = _instantiate_case(trusted_tmp, "b3-shared-cutoff", _daemon_template)
+    clock_b1 = FakeClock(base_now)
+    adapters_b1 = os_adapters(clock=clock_b1)
+    domain_b1 = _DaemonTestDomain(ws_a=ws_a, pause_idem_keys={"idem-b3-shared-0001"})
+    domain_b1.allow_apply_finish.clear()
+    loop_b1 = create_daemon_owner_loop(
+        os_=adapters_b1,
+        clock=clock_b1,
+        domain=domain_b1,
+    )
+    try:
+        loop_b1.start(cfg_b1)
+        fut_commit_b1 = loop_b1.submit(
+            ToolCommand(
+                "submit_episode",
+                _episode_args(ws_a, "idem-b3-shared-0001"),
+                token=tok_a,
+                selected_scope=scope_a,
+            ),
+            adapters_b1.monotonic.monotonic_ns() + TOTAL_REQUEST_BUDGET_NS,
+        )
+        assert domain_b1.apply_entered.wait(timeout=BOUND_WAIT_S)
+
+        fut_queued_b1 = loop_b1.submit(
+            ToolCommand(
+                "submit_episode",
+                _episode_args(ws_a, "idem-b3-shared-0002"),
+                token=tok_a,
+                selected_scope=scope_a,
+            ),
+            adapters_b1.monotonic.monotonic_ns() + TOTAL_REQUEST_BUDGET_NS,
+        )
+
+        rep_1_box: list[ShutdownReport] = []
+        rep_2_box: list[ShutdownReport] = []
+        stop_2_done = threading.Event()
+
+        def _run_stopper_1() -> None:
+            rep_1_box.append(loop_b1.stop(grace_s=0.40))
+
+        def _run_stopper_2() -> None:
+            try:
+                rep_2_box.append(loop_b1.stop(grace_s=0.0))
+            finally:
+                stop_2_done.set()
+
+        t_stop_1 = threading.Thread(target=_run_stopper_1, daemon=True)
+        t_stop_1.start()
+        _wait_until(lambda: loop_b1.ready is None, desc="stopper_1 locks stop cutoff")
+
+        t_stop_2 = threading.Thread(target=_run_stopper_2, daemon=True)
+        t_stop_2.start()
+
+        def _stopper_2_entered_stop() -> bool:
+            if stop_2_done.is_set() or not t_stop_2.is_alive():
+                return True
+            ident = t_stop_2.ident
+            if ident is None:
+                return False
+            frame = sys._current_frames().get(ident)
+            while frame is not None:
+                if frame.f_code.co_name == "stop":
+                    return True
+                frame = frame.f_back
+            return False
+
+        _wait_until(_stopper_2_entered_stop, desc="stopper_2 entered stop()")
+        domain_b1.allow_apply_finish.set()
+
+        t_stop_1.join(timeout=BOUND_WAIT_S)
+        t_stop_2.join(timeout=BOUND_WAIT_S)
+        assert fut_commit_b1.result(timeout=BOUND_WAIT_S)["ok"] is True
+        assert fut_queued_b1.result(timeout=BOUND_WAIT_S)["ok"] is True
+        assert len(rep_1_box) == 1 and rep_1_box[0].state is ShutdownState.STOPPED
+        assert len(rep_2_box) == 1 and rep_2_box[0].state is ShutdownState.STOPPED
+    finally:
+        domain_b1.allow_apply_finish.set()
+        with contextlib.suppress(BrainError):
+            loop_b1.stop()
+
+    # Subcase B2: Overrun ShutdownReport accurately reports worker_drained=False and cancelled_requests >= 1.
+    root_b2, _, cfg_b2 = _instantiate_case(trusted_tmp, "b3-overrun-metrics", _daemon_template)
+    clock_b2 = FakeClock(base_now)
+    adapters_b2 = os_adapters(clock=clock_b2)
+    rt_seed_b2 = reopen_kernel_job_runtime(root_b2, _daemon_template.store_id, adapters_b2)
+    try:
+        svc_b2, st_b2 = kernel_job_service(rt_seed_b2, clock_b2)
+        enqueue_job(svc_b2, st_b2, owner_id="dan", kind="slow.work", payload=b"b3-slow")
+    finally:
+        rt_seed_b2.close()
+
+    worker_entered = threading.Event()
+    worker_saw_cancel = threading.Event()
+    release_worker = threading.Event()
+
+    def _slow_job_handler(_spec: JobSpec, ctx: JobContext) -> tuple[ObjectRef, ...]:
+        worker_entered.set()
+        if ctx.wait_cancelled(BOUND_WAIT_S) and ctx.cancelled():
+            worker_saw_cancel.set()
+        release_worker.wait(timeout=BOUND_WAIT_S)
+        return ()
+
+    domain_b2 = _DaemonTestDomain(ws_a=ws_a, pause_idem_keys={"idem-b3-over-0001"})
+    domain_b2.allow_apply_finish.clear()
+    loop_b2 = create_daemon_owner_loop(
+        os_=adapters_b2,
+        clock=clock_b2,
+        domain=domain_b2,
+        job_handlers={"slow.work": _slow_job_handler},
+    )
+    try:
+        loop_b2.start(cfg_b2)
+        assert worker_entered.wait(timeout=BOUND_WAIT_S)
+
+        fut_commit_b2 = loop_b2.submit(
+            ToolCommand(
+                "submit_episode",
+                _episode_args(ws_a, "idem-b3-over-0001"),
+                token=tok_a,
+                selected_scope=scope_a,
+            ),
+            adapters_b2.monotonic.monotonic_ns() + 10 * TOTAL_REQUEST_BUDGET_NS,
+        )
+        assert domain_b2.apply_entered.wait(timeout=BOUND_WAIT_S)
+
+        fut_queued_b2 = loop_b2.submit(
+            ToolCommand(
+                "submit_episode",
+                _episode_args(ws_a, "idem-b3-over-0002"),
+                token=tok_a,
+                selected_scope=scope_a,
+            ),
+            adapters_b2.monotonic.monotonic_ns() + 10 * TOTAL_REQUEST_BUDGET_NS,
+        )
+
+        rep_over = loop_b2.stop(grace_s=0.05)
+        assert worker_saw_cancel.wait(timeout=BOUND_WAIT_S)
+        assert fut_queued_b2.result(timeout=BOUND_WAIT_S)["ok"] is False
+        assert rep_over.state is ShutdownState.OVERRUN
+        assert rep_over.worker_drained is False
+        assert rep_over.cancelled_requests >= 1
+        domain_b2.allow_apply_finish.set()
+        _ = fut_commit_b2.result(timeout=BOUND_WAIT_S)
+    finally:
+        domain_b2.allow_apply_finish.set()
+        release_worker.set()
+        closed_rep = loop_b2.wait_closed(timeout=BOUND_WAIT_S)
+        assert closed_rep is not None and closed_rep.endpoint_removed is True
+
