@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol
@@ -20,6 +20,7 @@ from superbrain.core.jsonvalue import JsonValue
 from superbrain.core.kernel import (
     HANDLER_RESERVE_NS,
     IDEMPOTENCY_CLOCK_UNTRUSTED_CODE,
+    ArtifactSendSpec,
     Call,
     CallContext,
     CallResult,
@@ -37,6 +38,7 @@ from superbrain.ports.kernel import (
     KernelBlobStagePort,
     KernelIdempotencyPort,
     KernelPolicyPort,
+    KernelSendAttemptPort,
     KernelTx,
 )
 
@@ -78,6 +80,16 @@ class KernelToolDomain(Protocol):
         self, result: StoredResult, principal: Principal, *, selected_scope: Scope | None
     ) -> dict[str, JsonValue]: ...
 
+    def describe_artifact_send(
+        self,
+        result: StoredResult,
+        rendered: Mapping[str, JsonValue],
+        principal: Principal,
+        *,
+        selected_scope: Scope | None,
+    ) -> ArtifactSendSpec | None:
+        return None
+
 
 class KernelDispatcher:
     """Pure application owner dispatcher over port interfaces (zero ``storage`` or ``adapters`` imports)."""
@@ -95,6 +107,7 @@ class KernelDispatcher:
         monotonic_clock: MonotonicClock | None = None,
         enforce_unreserved_deadline: bool = True,
         domain: KernelToolDomain | None = None,
+        send_attempts: KernelSendAttemptPort | None = None,
         before_enter_commit: Callable[[Reservation | None], None] | None = None,
         on_commit_completed: Callable[[StoredResult], None] | None = None,
     ) -> None:
@@ -109,6 +122,7 @@ class KernelDispatcher:
         self._store_schema_version = store_schema_version
         self._policy_schema_version = policy_schema_version
         self._domain = domain
+        self._send_attempts = send_attempts
         self._before_enter_commit = before_enter_commit
         self._on_commit_completed = on_commit_completed
 
@@ -160,6 +174,30 @@ class KernelDispatcher:
         if not isinstance(rendered, dict):
             raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
         return rendered
+
+    def _attach_pending_send_attempt(
+        self,
+        result: StoredResult,
+        rendered: dict[str, JsonValue],
+        principal: Principal,
+        *,
+        selected_scope: Scope | None,
+        reservation: Reservation | None,
+    ) -> dict[str, JsonValue]:
+        if self._send_attempts is None or self._domain is None:
+            return rendered
+        if reservation is not None and reservation.response_settled:
+            return rendered
+        spec = self._domain.describe_artifact_send(
+            result,
+            rendered,
+            principal,
+            selected_scope=selected_scope,
+        )
+        if spec is None:
+            return rendered
+        attempt = self._send_attempts.record_pending_attempt(spec)
+        return {**rendered, "served_receipt_id": attempt.served_receipt_id}
 
     def _verify_owner_auth_and_scope(self, call: Call, ctx: CallContext, auth: PrivateRequestAuth) -> Principal:
         if not isinstance(call, Call) or not isinstance(ctx, CallContext) or not isinstance(auth, PrivateRequestAuth):
@@ -270,7 +308,13 @@ class KernelDispatcher:
             rendered_replay = self._render_dict(replay_result, live_principal, selected_scope=call.selected_scope)
             self._gate_enter_commit(ctx, reservation)
             self._idempotency.record_replay(row=existing, now=now)
-            return rendered_replay
+            return self._attach_pending_send_attempt(
+                replay_result,
+                rendered_replay,
+                live_principal,
+                selected_scope=call.selected_scope,
+                reservation=reservation,
+            )
 
         active_key_id, active_key_bytes = self._policy.request_digest_key()
         request_digest = compute_request_hmac(active_key_bytes, call)
@@ -303,7 +347,14 @@ class KernelDispatcher:
             except Exception as exc:  # noqa: BLE001 — lost completion callback after durable commit (4a line 160)
                 raise BrainError(ErrorCode.COMMIT_OUTCOME_UNKNOWN, "commit outcome unknown") from exc
 
-        return self._render_dict(stored, live_principal, selected_scope=call.selected_scope)
+        rendered_fresh = self._render_dict(stored, live_principal, selected_scope=call.selected_scope)
+        return self._attach_pending_send_attempt(
+            stored,
+            rendered_fresh,
+            live_principal,
+            selected_scope=call.selected_scope,
+            reservation=reservation,
+        )
 
     def _check_raced_row(self, row: IdempotencyRow, call: Call, *, now: datetime) -> bool:
         return self._verify_retained_row(row, call, now=now)

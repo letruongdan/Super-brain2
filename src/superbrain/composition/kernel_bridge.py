@@ -21,14 +21,17 @@ from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.ids import new_id
 from superbrain.core.jsonvalue import JsonValue
 from superbrain.core.kernel import (
+    ArtifactSendAttempt,
     BootstrapAuthorization,
     Call,
     CallContext,
     CallResult,
+    Identity,
     Principal,
     PrivateRequestAuth,
     RequestAuthView,
     Scope,
+    SendAttemptCompletion,
     StagedBlob,
     StoredResult,
     WorkspaceBinding,
@@ -43,6 +46,7 @@ from superbrain.ports.policy import Intent, IntentKind
 from superbrain.storage._pair_admission import verify_admitted_store_pair
 from superbrain.storage.idempotency import KernelBlobStager, KernelIdempotencyStore, StrictKernelStore
 from superbrain.storage.policy_store import PolicyStore
+from superbrain.storage.send_attempts import KernelSendAttemptStore
 from superbrain.storage.store import Store
 
 _T = TypeVar("_T")
@@ -85,7 +89,10 @@ class KernelBridge(KernelBlobStagePort):
         domain: KernelToolDomain | None = None,
         before_enter_commit: Callable[[Reservation | None], None] | None = None,
         on_commit_completed: Callable[[StoredResult], None] | None = None,
+        recover_pending_on_init: bool = True,
     ) -> None:
+        if not isinstance(recover_pending_on_init, bool):
+            raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
         require_positive_int(writer_epoch)
         require_positive_int(max_queue_size)
         resolved_instance_id = new_id() if instance_id is None else instance_id
@@ -110,6 +117,11 @@ class KernelBridge(KernelBlobStagePort):
         self._monotonic_clock = resolved_mono
         self._writer_epoch = writer_epoch
         self._instance_id = resolved_instance_id
+        self._owner_identity = Identity(
+            store_id=store.store_id,
+            writer_epoch=writer_epoch,
+            instance_id=resolved_instance_id,
+        )
         self._domain = domain
         self._blob_stager = KernelBlobStager(store)
         self._idempotency = KernelIdempotencyStore(
@@ -119,6 +131,13 @@ class KernelBridge(KernelBlobStagePort):
             writer_epoch=writer_epoch,
             is_expired=is_idempotency_expired,
         )
+        self._send_attempts = KernelSendAttemptStore(
+            store,
+            policy,
+            writer_epoch=writer_epoch,
+        )
+        if recover_pending_on_init:
+            self._send_attempts.recover_pending_attempts()
         self._auth_state = AtomicRequestAuthState(store.store_id)
         self._dispatcher = KernelDispatcher(
             store_id=store.store_id,
@@ -131,6 +150,7 @@ class KernelBridge(KernelBlobStagePort):
             store_schema_version=self._read_store_schema_version,
             policy_schema_version=self._read_policy_schema_version,
             domain=domain,
+            send_attempts=self._send_attempts,
             before_enter_commit=before_enter_commit,
             on_commit_completed=on_commit_completed,
         )
@@ -142,6 +162,7 @@ class KernelBridge(KernelBlobStagePort):
             monotonic_clock=resolved_mono,
             owner_runner=self._run_reserved_on_owner,
             max_queue_size=max_queue_size,
+            on_unsent_owner_response=self._interrupt_unsent_response,
         )
 
     def _check_live_pair(self) -> None:
@@ -314,3 +335,53 @@ class KernelBridge(KernelBlobStagePort):
 
     def clock_untrusted(self) -> bool:
         return self._idempotency.clock_untrusted()
+
+    def _interrupt_unsent_response(self, response: CallResult) -> None:
+        if response.get("ok") is not True:
+            return
+        data = response.get("data")
+        if not isinstance(data, Mapping):
+            return
+        receipt_id = data.get("served_receipt_id")
+        if not isinstance(receipt_id, str):
+            return
+        try:
+            self._send_attempts.interrupt_attempt(receipt_id)
+        except BrainError:
+            return
+
+    @property
+    def owner_identity(self) -> Identity:
+        return self._owner_identity
+
+    def read_send_attempt(self, send_attempt_id: str) -> ArtifactSendAttempt | None:
+        self._check_live_pair()
+        return self._send_attempts.read_attempt(send_attempt_id)
+
+    def build_send_completion(self, send_attempt_id: str) -> SendAttemptCompletion:
+        self._check_live_pair()
+        attempt = self._send_attempts.read_attempt(send_attempt_id)
+        if attempt is None:
+            raise BrainError(ErrorCode.NOT_FOUND, "not found")
+        return SendAttemptCompletion(
+            send_attempt_id=attempt.send_attempt_id,
+            logical_result_id=attempt.logical_result_id,
+            principal_id=attempt.principal_id,
+            task_id=attempt.task_id,
+            artifact_id=attempt.artifact_id,
+            revision=attempt.revision,
+            resource_digests=attempt.resource_digests,
+            identity=self._owner_identity,
+        )
+
+    def finalize_send_attempt(self, completion: SendAttemptCompletion) -> ArtifactSendAttempt:
+        self._check_live_pair()
+        return self._send_attempts.finalize_attempt(completion, expected_identity=self._owner_identity)
+
+    def interrupt_send_attempt(self, send_attempt_id: str) -> ArtifactSendAttempt:
+        self._check_live_pair()
+        return self._send_attempts.interrupt_attempt(send_attempt_id)
+
+    def recover_pending_send_attempts(self) -> int:
+        self._check_live_pair()
+        return self._send_attempts.recover_pending_attempts()

@@ -185,3 +185,42 @@ class LineagedField:
             raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
         if not isinstance(self.unknown_source, bool):
             raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+
+
+@dataclass(frozen=True)
+class Identity:
+    store_id: str
+    writer_epoch: int
+    instance_id: str
+
+    def __post_init__(self) -> None:
+        require_opaque_id(self.store_id, label="store_id")
+        require_positive_int(self.writer_epoch)
+        require_opaque_id(self.instance_id, label="instance_id")
+
+
+@dataclass(frozen=True)
+class ResourceDigest:
+    name: str
+    digest: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str) or not (1 <= len(self.name) <= 256):
+            raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+        try:
+            self.name.encode("utf-8")
+        except UnicodeEncodeError as err:
+            raise BrainError(ErrorCode.INVALID_INPUT, "unpaired surrogate") from err
+        require_sha256_digest(self.digest)
+
+    def to_dict(self) -> dict[str, JsonValue]:
+        return {"name": self.name, "digest": self.digest}
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, JsonValue]) -> ResourceDigest:
+        if not isinstance(raw, Mapping) or set(raw) != {"name", "digest"}:
+            raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+        name, digest = raw["name"], raw["digest"]
+        if not isinstance(name, str) or not isinstance(digest, str):
+            raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+        return cls(name=name, digest=digest)

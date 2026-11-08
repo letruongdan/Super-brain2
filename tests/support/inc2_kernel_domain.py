@@ -32,6 +32,7 @@ from superbrain.application.lineage import (
     resolve_binding,
 )
 from superbrain.application.privacy import PrivacyFilter, filter_policy_for
+from superbrain.application.send_attempts import record_read_acks
 from superbrain.composition.kernel_projections import kernel_store_extensions
 from superbrain.core.canonical import canonical_json, digest_bytes
 from superbrain.core.errors import BrainError, ErrorCode
@@ -41,6 +42,7 @@ from superbrain.core.kernel import (
     REDACTED_REASON_DEFAULT,
     SNAPSHOT_DEGRADED_CODES,
     AccountingStatus,
+    ArtifactSendSpec,
     Call,
     CallContext,
     DeliveryItem,
@@ -51,7 +53,9 @@ from superbrain.core.kernel import (
     LineageRef,
     ObjectRef,
     Principal,
+    ReadAckInput,
     RepoFlags,
+    ResourceDigest,
     Scope,
     SelectorPath,
     SelectorReason,
@@ -976,6 +980,17 @@ class FixtureKernelDomain(KernelToolDomain):
             raise BrainError(ErrorCode.NOT_FOUND, "not found")
         task_id = str(d_row[0])
 
+        raw_read_acks = call.arguments.get("read_acks")
+        parsed_read_acks: list[ReadAckInput] = []
+        if raw_read_acks is not None:
+            if not isinstance(raw_read_acks, list):
+                raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+            for raw_ack in raw_read_acks:
+                if not isinstance(raw_ack, Mapping):
+                    raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+                parsed_read_acks.append(ReadAckInput.from_dict(raw_ack))
+        read_acks_tuple = tuple(parsed_read_acks)
+
         fpol = self._filter_policy_for_repo(scope.repo_id)
         safe = PrivacyFilter(self.monotonic_ns).apply(dict(call.arguments), fpol, deadline_ns=local_deadline)
         safe_dict = safe.value if isinstance(safe.value, dict) else {}
@@ -989,6 +1004,15 @@ class FixtureKernelDomain(KernelToolDomain):
             self.apply_calls += 1
             if self.before_apply_hook is not None:
                 self.before_apply_hook(tx)
+            if read_acks_tuple:
+                record_read_acks(
+                    tx,
+                    policy=self.policy,
+                    principal=ctx.principal,
+                    effective_scope=scope,
+                    expected_task_id=task_id,
+                    acks=read_acks_tuple,
+                )
             rec_payload: dict[str, JsonValue] = {
                 "result_id": result_id,
                 "outcome_id": outcome_id,
@@ -1066,6 +1090,49 @@ class FixtureKernelDomain(KernelToolDomain):
         if primary.kind == "outcome_result":
             return self._render_outcome_result(result, primary, principal, selected_scope=selected_scope)
         raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
+
+    def describe_artifact_send(
+        self,
+        result: StoredResult,
+        rendered: Mapping[str, JsonValue],
+        principal: Principal,
+        *,
+        selected_scope: Scope | None,
+    ) -> ArtifactSendSpec | None:
+        _ = selected_scope
+        self._check_live()
+        if not result.refs or result.refs[0].kind != "artifact_result":
+            return None
+        if rendered.get("status") != "ok":
+            return None
+        raw_resources = rendered.get("resources")
+        if not isinstance(raw_resources, list) or not raw_resources:
+            return None
+        with self.store.transaction() as read_txn:
+            r_row = read_txn.db.execute(
+                "SELECT task_id, artifact_id, revision FROM p_fixture_domain_artifact_results WHERE result_id = ?",
+                (result.result_id,),
+            ).fetchone()
+        if r_row is None:
+            raise BrainError(ErrorCode.NOT_FOUND, "not found")
+        task_id, artifact_id, revision = str(r_row[0]), str(r_row[1]), int(r_row[2])
+        digests: list[ResourceDigest] = []
+        for item in raw_resources:
+            if not isinstance(item, Mapping):
+                raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
+            r_name = item.get("name")
+            r_dig = item.get("digest")
+            if not isinstance(r_name, str) or not isinstance(r_dig, str):
+                raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
+            digests.append(ResourceDigest(name=r_name, digest=r_dig))
+        return ArtifactSendSpec(
+            logical_result_id=result.result_id,
+            principal_id=principal.principal_id,
+            task_id=task_id,
+            artifact_id=artifact_id,
+            revision=revision,
+            resource_digests=tuple(digests),
+        )
 
     def _render_delivery_result(
         self,

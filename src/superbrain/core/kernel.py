@@ -37,11 +37,13 @@ from superbrain.core._kernel_base import (
     SHA256_DIGEST_RE,
     WORKSPACE_HINT_PATTERN,
     WORKSPACE_HINT_RE,
+    Identity,
     LineagedField,
     LineageRef,
     LineageSet,
     ObjectRef,
     Principal,
+    ResourceDigest,
     Scope,
     SnapshotStatus,
     is_registrable_alias,
@@ -74,6 +76,15 @@ from superbrain.core._kernel_dispatch import (
     StagedBlob,
     parse_canonical_utc,
     require_aware_utc,
+)
+from superbrain.core._kernel_send_attempts import (
+    ArtifactReadAck,
+    ArtifactSendAttempt,
+    ArtifactSendSpec,
+    SendAttemptCompletion,
+    SendAttemptState,
+    canonicalize_resource_digests,
+    decode_resource_digests_json,
 )
 from superbrain.core._kernel_workspace import (
     COMMIT_RESERVE_NS,
@@ -123,18 +134,6 @@ class AccountingStatus(StrEnum):
     RESERVED = "reserved"
     SETTLED = "settled"
     OUTCOME_UNKNOWN = "outcome_unknown"
-
-
-@dataclass(frozen=True)
-class Identity:
-    store_id: str
-    writer_epoch: int
-    instance_id: str
-
-    def __post_init__(self) -> None:
-        require_opaque_id(self.store_id, label="store_id")
-        require_positive_int(self.writer_epoch)
-        require_opaque_id(self.instance_id, label="instance_id")
 
 
 @dataclass(frozen=True)
@@ -237,33 +236,6 @@ class StoredResult:
             assignment_id=raw_assignment,
             refs=tuple(refs),
         )
-
-
-@dataclass(frozen=True)
-class ResourceDigest:
-    name: str
-    digest: str
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.name, str) or not (1 <= len(self.name) <= 256):
-            raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
-        try:
-            self.name.encode("utf-8")
-        except UnicodeEncodeError as err:
-            raise BrainError(ErrorCode.INVALID_INPUT, "unpaired surrogate") from err
-        require_sha256_digest(self.digest)
-
-    def to_dict(self) -> dict[str, JsonValue]:
-        return {"name": self.name, "digest": self.digest}
-
-    @classmethod
-    def from_dict(cls, raw: Mapping[str, JsonValue]) -> ResourceDigest:
-        if not isinstance(raw, Mapping) or set(raw) != {"name", "digest"}:
-            raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
-        name, digest = raw["name"], raw["digest"]
-        if not isinstance(name, str) or not isinstance(digest, str):
-            raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
-        return cls(name=name, digest=digest)
 
 
 @dataclass(frozen=True)
@@ -389,6 +361,9 @@ class ToolCatalog:
 
 __all__ = [
     "AccountingStatus",
+    "ArtifactReadAck",
+    "ArtifactSendAttempt",
+    "ArtifactSendSpec",
     "AuthSnapshot",
     "BootstrapAuthorization",
     "COMMIT_RESERVE_NS",
@@ -447,6 +422,8 @@ __all__ = [
     "Scope",
     "SelectorPath",
     "SelectorReason",
+    "SendAttemptCompletion",
+    "SendAttemptState",
     "SnapshotDescriptor",
     "SnapshotObservation",
     "SnapshotStatus",
@@ -467,6 +444,8 @@ __all__ = [
     "WorkspaceSelector",
     "binding_identity_digest",
     "binding_lineage_ref",
+    "canonicalize_resource_digests",
+    "decode_resource_digests_json",
     "field_path_descriptor",
     "field_path_digest",
     "is_registrable_alias",

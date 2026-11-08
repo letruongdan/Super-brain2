@@ -106,6 +106,7 @@ class KernelDeadlineCoordinator:
         owner_runner: OwnerDispatchRunner,
         max_queue_size: int = DEFAULT_MAX_QUEUE_DEPTH,
         reservations: ReservationTable | None = None,
+        on_unsent_owner_response: Callable[[CallResult], None] | None = None,
     ) -> None:
         require_opaque_id(store_id, label="store_id")
         require_positive_int(writer_epoch)
@@ -119,6 +120,7 @@ class KernelDeadlineCoordinator:
         self._owner_runner = owner_runner
         self._max_queue_size = max_queue_size
         self._reservations = reservations if reservations is not None else ReservationTable()
+        self._on_unsent_owner_response = on_unsent_owner_response
         self._queue_cv = threading.Condition()
         self._queue: deque[tuple[QueuedKernelRequest, Reservation]] = deque()
 
@@ -249,5 +251,7 @@ class KernelDeadlineCoordinator:
         except Exception:  # noqa: BLE001 — guarantee finish_owner_execution settles static error on unexpected bug
             response = make_checked_error(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
         finally:
-            self._reservations.finish_owner_execution(reservation, response)
+            won = self._reservations.finish_owner_execution(reservation, response)
+            if not won and self._on_unsent_owner_response is not None:
+                self._on_unsent_owner_response(response)
         return True

@@ -17,6 +17,8 @@ from typing import TypeVar
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.jsonvalue import JsonValue
 from superbrain.core.kernel import (
+    ArtifactReadAck,
+    ArtifactSendAttempt,
     FieldLineage,
     IdempotencyRow,
     KernelRecord,
@@ -39,6 +41,11 @@ from superbrain.storage.errors import sqlite_error
 from superbrain.storage.kernel_schema import KERNEL_WORKSPACE_KINDS
 from superbrain.storage.kinds import KindRegistry, RetentionClass, is_uuid
 from superbrain.storage.ledger import LedgerEntry, ProjectionHandler, Txn
+from superbrain.storage.send_attempts import (
+    insert_read_ack_row,
+    read_read_ack_by_receipt_row,
+    read_send_attempt_row,
+)
 from superbrain.storage.store import Store
 
 _T = TypeVar("_T")
@@ -459,6 +466,15 @@ class StoreKernelTx:
 
     def save_idempotency(self, row: IdempotencyRow) -> None:
         write_idempotency_row(self._txn.db, row)
+
+    def read_send_attempt(self, send_attempt_id: str) -> ArtifactSendAttempt | None:
+        return read_send_attempt_row(self._txn.db, send_attempt_id)
+
+    def read_read_ack_by_receipt(self, served_receipt_id: str) -> ArtifactReadAck | None:
+        return read_read_ack_by_receipt_row(self._txn.db, served_receipt_id)
+
+    def save_read_ack(self, ack: ArtifactReadAck) -> None:
+        insert_read_ack_row(self._txn.db, ack)
 
 
 class KernelWorkspaceStore:

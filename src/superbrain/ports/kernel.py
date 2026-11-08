@@ -12,10 +12,14 @@ from datetime import datetime
 from typing import Protocol, TypeVar
 
 from superbrain.core.kernel import (
+    ArtifactReadAck,
+    ArtifactSendAttempt,
+    ArtifactSendSpec,
     AuthSnapshot,
     BootstrapAuthorization,
     FieldLineage,
     IdempotencyRow,
+    Identity,
     KernelRecord,
     LineageRef,
     LineageSet,
@@ -23,6 +27,7 @@ from superbrain.core.kernel import (
     Principal,
     RequestAuthView,
     Scope,
+    SendAttemptCompletion,
     SnapshotObservation,
     SourceSnapshot,
     StagedBlob,
@@ -129,6 +134,18 @@ class KernelTx(Protocol):
         """Persist or atomically replace the operational idempotency row inside the write transaction."""
         ...
 
+    def read_send_attempt(self, send_attempt_id: str) -> ArtifactSendAttempt | None:
+        """Read the operational ``artifact_send_attempt`` row by primary key ``send_attempt_id``."""
+        ...
+
+    def read_read_ack_by_receipt(self, served_receipt_id: str) -> ArtifactReadAck | None:
+        """Read the operational ``artifact_read_ack`` row by unique ``served_receipt_id``."""
+        ...
+
+    def save_read_ack(self, ack: ArtifactReadAck) -> None:
+        """Insert ``ack`` into ``artifact_read_ack`` inside the caller's ``Store.transaction()``."""
+        ...
+
 
 class KernelStorePort(Protocol):
     def transact(self, operation: Callable[[KernelTx], _T]) -> _T:
@@ -188,6 +205,35 @@ class KernelIdempotencyPort(Protocol):
 
     def prune_expired(self, now: datetime, limit: int = 100) -> int:
         """Validate C4 clock + retained keys and delete at most ``limit`` (`1..100`) expired idempotency rows."""
+        ...
+
+
+class KernelSendAttemptPort(Protocol):
+    """Owner-thread operational send-attempt audit port over ``store4`` ``artifact_send_attempt`` (C5)."""
+
+    def record_pending_attempt(self, spec: ArtifactSendSpec) -> ArtifactSendAttempt:
+        """Persist a fresh ``pending`` ``artifact_send_attempt`` row in its own owner transaction."""
+        ...
+
+    def read_attempt(self, send_attempt_id: str) -> ArtifactSendAttempt | None:
+        """Read ``artifact_send_attempt`` by primary key ``send_attempt_id``."""
+        ...
+
+    def finalize_attempt(
+        self,
+        completion: SendAttemptCompletion,
+        *,
+        expected_identity: Identity,
+    ) -> ArtifactSendAttempt:
+        """Fence ``completion`` against ``expected_identity`` and subject, moving ``pending -> served_only``."""
+        ...
+
+    def interrupt_attempt(self, send_attempt_id: str) -> ArtifactSendAttempt:
+        """Record an interrupted flush as ``pending -> unknown`` (idempotent on ``unknown``)."""
+        ...
+
+    def recover_pending_attempts(self) -> int:
+        """Transition all ``pending`` ``artifact_send_attempt`` rows to ``unknown`` on reopen/recovery."""
         ...
 
 
