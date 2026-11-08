@@ -1350,14 +1350,14 @@ def test_legacy_projection_and_pending_attempt_recovered_before_ready(
     bound_listeners: list[BoundLoopbackListener] = []
     endpoint_path = DataRoot.at(root).endpoint_path
 
-    def _query_inv(rt: Runtime, inv_id: str) -> tuple[str, int]:
+    def _query_inv(rt: Runtime, inv_id: str) -> tuple[str, int | None]:
         with rt.store.transaction() as txn:
             row = txn.db.execute(
                 "SELECT state, usage_complete FROM p_provider_invocations_state WHERE invocation_id = ?",
                 (inv_id,),
             ).fetchone()
         assert row is not None
-        return str(row[0]), int(row[1])
+        return str(row[0]), (None if row[1] is None else int(row[1]))
 
     def _query_job(rt: Runtime, jid: str) -> tuple[str, int]:
         with rt.store.transaction() as txn:
@@ -1377,13 +1377,13 @@ def test_legacy_projection_and_pending_attempt_recovered_before_ready(
         assert bound_listeners == [] and not endpoint_path.exists()
         assert _query_inv(rt, inv_v1_inc) == ("outcome_unknown", 0)
         assert _query_inv(rt, inv_v1_cmp) == ("settled", 1)
-        assert _query_inv(rt, inv_crashed) == ("reserved", 0)
+        assert _query_inv(rt, inv_crashed) == ("reserved", None)
         stage_order.append("before_job_recover")
 
     def _before_bind(rt: Runtime) -> None:
         assert bound_listeners == [] and not endpoint_path.exists()
         assert _query_inv(rt, inv_v1_inc) == ("outcome_unknown", 0)
-        assert _query_inv(rt, inv_crashed) == ("outcome_unknown", 0)
+        assert _query_inv(rt, inv_crashed) == ("outcome_unknown", None)
         assert _query_job(rt, job_retry) == ("queued", 2)
         assert _query_job(rt, job_dead) == ("dead_letter", 3)
         with rt.store.transaction() as txn:
