@@ -393,14 +393,27 @@ def test_running_cancel_is_cooperative_old_callback_conflicts_and_late_usage_set
     usage, done = _command(executor), _command(executor)
     assert observed.is_set(), "the cancel signal never reached the worker"
     assert usage == WorkerUsage(invocation_id, late_usage) and done == WorkerCompleted(lease)
-    service.apply_command(usage)  # late usage after cancel still settles
+    service.apply_command(usage)  # late incomplete usage after cancel stays reconcilable outcome_unknown (S1=A)
     _expect(ErrorCode.REVISION_CONFLICT, lambda: service.apply_command(done))
-    service.apply_command(usage)  # identical retry: no-op
-    _expect(ErrorCode.IDEMPOTENCY_CONFLICT, lambda: service.settle_usage(invocation_id, UsageRecord("3", True)))
+    service.apply_command(usage)  # identical incomplete retry: no-op
     view = service.get_job(job_id, dan, selected_scope=None)
-    assert (view.state, view.result_refs, view.accounting_status) == (JobState.CANCELLED, (), AccountingStatus.SETTLED)
+    assert (view.state, view.result_refs, view.accounting_status) == (
+        JobState.CANCELLED,
+        (),
+        AccountingStatus.OUTCOME_UNKNOWN,
+    )
     settled = [e for e in rt.store.entries() if e.kind == "provider.settled"]
     assert len(settled) == 1 and settled[0].meta["complete"] is False
+    service.settle_usage(invocation_id, UsageRecord("3", True))  # first complete=True usage reconciles once
+    service.settle_usage(invocation_id, UsageRecord("3", True))  # identical final retry: no-op
+    _expect(ErrorCode.IDEMPOTENCY_CONFLICT, lambda: service.settle_usage(invocation_id, UsageRecord("4", True)))
+    _expect(ErrorCode.IDEMPOTENCY_CONFLICT, lambda: service.settle_usage(invocation_id, UsageRecord(None, False)))
+    reconciled = service.get_job(job_id, dan, selected_scope=None)
+    assert (reconciled.state, reconciled.result_refs, reconciled.accounting_status) == (
+        JobState.CANCELLED,
+        (),
+        AccountingStatus.SETTLED,
+    )
 
     queued_id = enqueue_job(service, store, owner_id="dan").job_id
     assert service.cancel(queued_id, dan, selected_scope=None) is JobState.CANCELLED

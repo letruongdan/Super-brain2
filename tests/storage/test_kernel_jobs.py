@@ -143,10 +143,13 @@ def test_job_reducers_and_kinds_are_registered_at_version_one_without_schema_cha
     handlers, kinds = kernel_store_extensions()
     by_name = {handler.name: handler for handler in handlers}
     assert {"jobs", "provider_invocations"} <= set(by_name)
-    assert by_name["jobs"].handler_version == 1 and by_name["provider_invocations"].handler_version == 1
+    assert by_name["jobs"].handler_version == 1 and by_name["provider_invocations"].handler_version == 2
     assert by_name["jobs"].kinds | by_name["provider_invocations"].kinds == JOB_KINDS
-    assert {kind.kind for kind in KERNEL_JOB_KINDS} == JOB_KINDS
-    assert all(kind.handler_version == 1 and not kind.reserved for kind in KERNEL_JOB_KINDS)
+    assert {kind.kind: kind.handler_version for kind in KERNEL_JOB_KINDS} == {
+        **dict.fromkeys(JOB_KINDS, 1),
+        "provider.settled": 2,
+    }
+    assert all(not kind.reserved for kind in KERNEL_JOB_KINDS)
     assert JOB_KINDS <= kinds.kinds()
     assert {"snapshot.observed", "lineage.task_bound"} <= kinds.kinds()  # Task 3 kinds stay registered
     hold = next(kind for kind in CORE_KINDS if kind.kind == "cas.hold")
@@ -660,8 +663,8 @@ def test_projection_rebuild_never_enqueues_invokes_or_creates_records(
         rt.store.rebuild_projections()
     assert (_tables(rt), _ledger_len(rt)) == (before, ledger)
     assert _invocation(store, invocation_id).state is InvocationState.RESERVED
-    [only] = store.transact(lambda tx: tx.read_job_invocations(lease.job_id))
-    assert only.invocation_id == invocation_id
+    only = _invocation(store, invocation_id)
+    assert (only.invocation_id, only.job_id) == (invocation_id, lease.job_id)
 
 
 def test_job_store_entry_points_require_the_admitted_pair_epoch_and_owner_thread(rt: Runtime, clock: FakeClock) -> None:
