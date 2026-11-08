@@ -195,7 +195,7 @@ class JobService:
         self._store.transact(complete)
 
     def apply_command(self, command: WorkerCommand) -> None:
-        """Apply one typed worker command on the owner side (completion, failure or final usage)."""
+        """Apply one typed worker command on the owner side (completion, failure or usage)."""
         if isinstance(command, WorkerCompleted):
             self.complete(command.lease, JobOutcome.success(command.result_refs))
         elif isinstance(command, WorkerFailed):
@@ -226,7 +226,7 @@ class JobService:
         return invocation_id
 
     def settle_usage(self, invocation_id: str, usage: UsageRecord) -> None:
-        """Commit the first final usage of an invocation whatever its job's state; identical retry no-op."""
+        """Record nonfinal unknown usage or commit the first final usage of an invocation; identical retry no-op."""
         descriptor = usage_descriptor(invocation_id, usage)
         usage_digest = digest_bytes(descriptor)
         self._stager.stage_blob(descriptor)
@@ -236,13 +236,22 @@ class JobService:
             if invocation is None:
                 raise _not_found()
             if invocation.state is InvocationState.SETTLED:
-                if invocation.usage_digest == usage_digest:
+                if usage.complete and invocation.usage_digest == usage_digest:
                     return
                 raise BrainError(ErrorCode.IDEMPOTENCY_CONFLICT, "idempotency conflict")
+            if not usage.complete:
+                if invocation.state is InvocationState.OUTCOME_UNKNOWN and invocation.usage_complete is False:
+                    if invocation.usage_digest == usage_digest:
+                        return
+                    raise BrainError(ErrorCode.IDEMPOTENCY_CONFLICT, "idempotency conflict")
+                prior_usage_digest: str | None = None
+            else:
+                prior_usage_digest = invocation.usage_digest
             tx.hold_blob(descriptor, holder_id=invocation_id)
             meta: dict[str, JsonValue] = {
                 "invocation_id": invocation_id,
                 "prior_state": invocation.state.value,
+                "prior_usage_digest": prior_usage_digest,
                 "usage_digest": usage_digest,
                 "complete": usage.complete,
             }

@@ -205,7 +205,7 @@ class UsageReservation:
 
 @dataclass(frozen=True)
 class UsageRecord:
-    """Final usage of one invocation: a decimal string, or ``None`` with ``complete=False`` (unknown, never "0")."""
+    """Reported usage of one invocation: final decimal ``amount`` (``complete=True``), or nonfinal ``(None, False)``."""
 
     amount: str | None
     complete: bool
@@ -347,12 +347,19 @@ class InvocationRecord:
         require_sha256_digest(self.reservation_digest)
         if not isinstance(self.state, InvocationState):
             raise _invalid()
-        settled = self.state is InvocationState.SETTLED
-        if settled != (self.usage_digest is not None) or settled != (self.usage_complete is not None):
-            raise _invalid()
         if self.usage_digest is not None:
             require_sha256_digest(self.usage_digest)
         if self.usage_complete is not None and type(self.usage_complete) is not bool:
+            raise _invalid()
+        if self.state is InvocationState.RESERVED:
+            if self.usage_digest is not None or self.usage_complete is not None:
+                raise _invalid()
+        elif self.state is InvocationState.OUTCOME_UNKNOWN:
+            both_none = self.usage_digest is None and self.usage_complete is None
+            incomplete = self.usage_digest is not None and self.usage_complete is False
+            if not (both_none or incomplete):
+                raise _invalid()
+        elif self.usage_digest is None or self.usage_complete is not True:
             raise _invalid()
 
 
@@ -443,7 +450,7 @@ class WorkerFailed:
 
 @dataclass(frozen=True)
 class WorkerUsage:
-    """Worker command: final usage of an invocation reserved by the owner side before hand-off."""
+    """Worker command: reported usage of an invocation reserved by the owner side before hand-off."""
 
     invocation_id: str
     usage: UsageRecord

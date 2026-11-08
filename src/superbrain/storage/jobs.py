@@ -172,11 +172,53 @@ class JobsProjection:
         _one_row(cursor, entry)
 
 
+_SETTLED_V1_KEYS = frozenset({"invocation_id", "prior_state", "usage_digest", "complete"})
+_SETTLED_V2_KEYS = frozenset({"invocation_id", "prior_state", "prior_usage_digest", "usage_digest", "complete"})
+_SETTLED_PRIOR_STATES = frozenset({"reserved", "outcome_unknown"})
+
+
+def _apply_provider_settled(
+    db: sqlite3.Connection, table: str, entry: LedgerEntry, invocation_id: str, seq: int
+) -> sqlite3.Cursor:
+    complete = _meta(entry, "complete")
+    if type(complete) is not bool:
+        raise _corrupt(entry, "complete is not a boolean")
+    prior_state = _text(entry, "prior_state")
+    if prior_state not in _SETTLED_PRIOR_STATES:
+        raise _corrupt(entry, "invalid prior_state")
+    usage_digest = _text(entry, "usage_digest")
+    next_state = "settled" if complete else "outcome_unknown"
+    next_complete = 1 if complete else 0
+    if entry.handler_version == 1:
+        if set(entry.meta) != _SETTLED_V1_KEYS:
+            raise _corrupt(entry, "unexpected v1 provider.settled fields")
+        return db.execute(
+            f"UPDATE {table} SET state = ?, usage_digest = ?, usage_complete = ?, sequence = ?"
+            " WHERE invocation_id = ? AND state = ? AND (usage_complete IS NULL OR usage_complete = 0)",
+            (next_state, usage_digest, next_complete, seq, invocation_id, prior_state),
+        )
+    if entry.handler_version == 2:
+        if set(entry.meta) != _SETTLED_V2_KEYS:
+            raise _corrupt(entry, "unexpected v2 provider.settled fields")
+        prior_usage = _opt_text(entry, "prior_usage_digest")
+        if prior_state == "reserved" and prior_usage is not None:
+            raise _corrupt(entry, "reserved invocation cannot have prior_usage_digest")
+        if not complete and prior_usage is not None:
+            raise _corrupt(entry, "incomplete usage cannot overwrite prior_usage_digest")
+        prior_complete = None if prior_usage is None else 0
+        return db.execute(
+            f"UPDATE {table} SET state = ?, usage_digest = ?, usage_complete = ?, sequence = ?"
+            " WHERE invocation_id = ? AND state = ? AND usage_digest IS ? AND usage_complete IS ?",
+            (next_state, usage_digest, next_complete, seq, invocation_id, prior_state, prior_usage, prior_complete),
+        )
+    raise _corrupt(entry, f"unsupported provider.settled version {entry.handler_version}")
+
+
 class ProviderInvocationProjection:
     """``p_provider_invocations_*``: accounting state per invocation, independent of the job's state."""
 
     name = "provider_invocations"
-    handler_version = 1
+    handler_version = 2
     kinds = frozenset({"provider.reserved", "provider.settled", "provider.unknown"})
 
     def create_tables(self, db: sqlite3.Connection, prefix: str) -> None:
@@ -213,14 +255,7 @@ class ProviderInvocationProjection:
                 (seq, invocation_id, _int(entry, "writer_epoch"), _int(entry, "recovery_epoch")),
             )
         else:  # provider.settled
-            complete = _meta(entry, "complete")
-            if type(complete) is not bool:
-                raise _corrupt(entry, "complete is not a boolean")
-            cursor = db.execute(
-                f"UPDATE {table} SET state = 'settled', usage_digest = ?, usage_complete = ?, sequence = ?"
-                " WHERE invocation_id = ? AND state = ?",
-                (_text(entry, "usage_digest"), int(complete), seq, invocation_id, _text(entry, "prior_state")),
-            )
+            cursor = _apply_provider_settled(db, table, entry, invocation_id, seq)
         _one_row(cursor, entry)
 
 

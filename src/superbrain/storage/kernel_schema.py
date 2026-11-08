@@ -186,14 +186,16 @@ KERNEL_JOB_KINDS: tuple[EntryKind, ...] = (
     ),
     EntryKind(
         "provider.settled",
-        1,
+        2,
         {
             "invocation_id": FieldType.UUID,
             "prior_state": FieldType.ENUM,
+            "prior_usage_digest": FieldType.DIGEST,
             "usage_digest": FieldType.DIGEST,
             "complete": FieldType.BOOL,
         },
         {"prior_state": frozenset({"reserved", "outcome_unknown"})},
+        nullable=frozenset({"prior_usage_digest"}),
     ),
     EntryKind(
         "provider.unknown",
