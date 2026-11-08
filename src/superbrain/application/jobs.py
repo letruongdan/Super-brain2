@@ -264,7 +264,7 @@ class JobService:
                 if raw is None:
                     raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
                 refs = decode_result_descriptor(row.job_id, raw)
-            accounting = accounting_status_of(inv.state for inv in tx.read_job_invocations(row.job_id))
+            accounting = accounting_status_of(tx.read_job_accounting_states(row.job_id))
             return JobView(row.job_id, row.state, row.attempt, refs, accounting)
 
         return self._store.transact(read)

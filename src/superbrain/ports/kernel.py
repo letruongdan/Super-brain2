@@ -21,6 +21,7 @@ from superbrain.core.kernel import (
     IdempotencyRow,
     Identity,
     InvocationRecord,
+    InvocationState,
     JobRecord,
     KernelRecord,
     LineageRef,
@@ -164,8 +165,8 @@ class KernelTx(Protocol):
         """The ``p_provider_invocations_state`` row of ``invocation_id``, if present."""
         ...
 
-    def read_job_invocations(self, job_id: str) -> tuple[InvocationRecord, ...]:
-        """Every invocation recorded for ``job_id``, oldest first."""
+    def read_job_accounting_states(self, job_id: str) -> frozenset[InvocationState]:
+        """Distinct ``InvocationState`` values recorded for ``job_id`` across every invocation."""
         ...
 
     def due_jobs(self, now: datetime, limit: int) -> tuple[JobRecord, ...]:

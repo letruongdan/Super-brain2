@@ -290,6 +290,20 @@ def _invocation(row: Sequence[object]) -> InvocationRecord:
     )
 
 
+def _accounting_state(row: Sequence[object]) -> InvocationState:
+    raw_state, complete = row
+    if type(raw_state) is not str:
+        raise TypeError("state")
+    state = InvocationState(raw_state)
+    if state is InvocationState.RESERVED and complete is None:
+        return state
+    if state is InvocationState.OUTCOME_UNKNOWN and (complete is None or (type(complete) is int and complete == 0)):
+        return state
+    if state is InvocationState.SETTLED and type(complete) is int and complete == 1:
+        return state
+    raise ValueError("accounting state invariant")
+
+
 def _bounded(limit: int) -> int:
     if not is_strict_int(limit) or not 1 <= limit <= 100:
         raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
@@ -348,8 +362,12 @@ class JobKernelTxReads:
         found = self._invocations("invocation_id = ?", (invocation_id,))
         return found[0] if found else None
 
-    def read_job_invocations(self, job_id: str) -> tuple[InvocationRecord, ...]:
-        return self._invocations("job_id = ? ORDER BY sequence LIMIT 1024", (job_id,))
+    def read_job_accounting_states(self, job_id: str) -> frozenset[InvocationState]:
+        rows = self._rows(
+            f"SELECT DISTINCT state, usage_complete FROM {INVOCATIONS_TABLE} WHERE job_id = ?",
+            (job_id,),
+        )
+        return frozenset(_decoded(partial(_accounting_state, row)) for row in rows)
 
     def due_jobs(self, now: datetime, limit: int) -> tuple[JobRecord, ...]:
         return self._jobs(
