@@ -25,7 +25,6 @@ from superbrain.core.kernel import (
     RequestDeadlines,
     ReservationScopeKey,
     Scope,
-    is_registrable_alias,
     is_strict_int,
     parse_bearer_token,
     require_opaque_id,
@@ -143,33 +142,13 @@ def authorize_call_against_snapshot(snap: AuthSnapshot, principal: Principal, ca
         raise BrainError(ErrorCode.NOT_FOUND, "not found")
 
     if call.tool == "prepare_task":
-        if "workspace_hint" in call.arguments:
-            hint = str(call.arguments["workspace_hint"])
-            if not is_registrable_alias(hint):
-                raise BrainError(ErrorCode.NOT_FOUND, "not found")
-            matches = [
-                binding
-                for binding in snap.checkouts.values()
-                if binding.owner_id == principal.owner_id
-                and binding.machine_id == principal.machine_id
-                and binding.alias == hint
-            ]
-            if not matches:
-                raise BrainError(ErrorCode.NOT_FOUND, "not found")
-            if len(matches) > 1:
-                raise BrainError(ErrorCode.REVISION_CONFLICT, "revision conflict")
-            binding = matches[0]
-            if call.selected_scope is not None and (
-                call.selected_scope.repo_id != binding.repo_id
-                or (
-                    call.selected_scope.checkout_id is not None
-                    and call.selected_scope.checkout_id != binding.checkout_id
-                )
-            ):
-                raise BrainError(ErrorCode.NOT_FOUND, "not found")
-            if not snap.allows(principal, Scope(binding.repo_id, binding.checkout_id), action="prepare_task"):
-                raise BrainError(ErrorCode.NOT_FOUND, "not found")
-        elif "workspace_id" in call.arguments and "checkout_id" in call.arguments:
+        has_hint = "workspace_hint" in call.arguments
+        has_ws = "workspace_id" in call.arguments
+        has_chk = "checkout_id" in call.arguments
+        if has_hint and not has_ws and not has_chk:
+            # Mutable human alias: binding resolution is deferred until owner cache miss (4a:162-164, 170; 4b:202-203).
+            return
+        if not has_hint and has_ws and has_chk:
             arg_ws = str(call.arguments["workspace_id"])
             arg_chk = str(call.arguments["checkout_id"])
             found = snap.checkouts.get(arg_chk)
@@ -186,8 +165,8 @@ def authorize_call_against_snapshot(snap: AuthSnapshot, principal: Principal, ca
                 raise BrainError(ErrorCode.NOT_FOUND, "not found")
             if not snap.allows(principal, Scope(found.repo_id, found.checkout_id), action="prepare_task"):
                 raise BrainError(ErrorCode.NOT_FOUND, "not found")
-        else:
-            raise BrainError(ErrorCode.INVALID_INPUT, "mixed or invalid workspace selector")
+            return
+        raise BrainError(ErrorCode.INVALID_INPUT, "mixed or invalid workspace selector")
     elif "workspace_id" in call.arguments:
         arg_ws = str(call.arguments["workspace_id"])
         arg_chk_opt = str(call.arguments["checkout_id"]) if "checkout_id" in call.arguments else None

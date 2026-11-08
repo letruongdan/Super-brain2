@@ -1693,7 +1693,8 @@ def test_r1_prequeue_and_owner_scope_selector_authorization_symmetry(
         _expect_err("prepare_task", sub_mismatch.wait(timeout=1.0), ErrorCode.NOT_FOUND)
         assert bridge.queue_depth() == 0
 
-        # 3) Ambiguous workspace_hint rejected pre-queue AND on owner dispatch with REVISION_CONFLICT!
+        # 3) Fresh uncached ambiguous workspace_hint is NOT resolved pre-queue: it enqueues cleanly and settles
+        #    REVISION_CONFLICT on owner execution via resolve_binding!
         base_snap = rt.policy.snapshot()
         dup_checkouts = dict(base_snap.checkouts)
         dup_checkouts["chk-ambig-twin"] = WorkspaceBinding(
@@ -1728,33 +1729,16 @@ def test_r1_prequeue_and_owner_scope_selector_authorization_symmetry(
                 token=dan_box1.token,
                 selected_scope=None,
             )
-            assert sub_ambig.done()
+            assert not sub_ambig.done(), "mutable workspace_hint must defer resolution until owner cache miss"
+            assert bridge.process_next_queued(block=False) is True
             ambig_err = _expect_err("prepare_task", sub_ambig.wait(timeout=1.0), ErrorCode.REVISION_CONFLICT)
             assert ambig_err["message"] == "revision conflict"
-            owner_ambig_err = _expect_err(
-                "prepare_task",
-                bridge.dispatch(
-                    normalize_call("prepare_task", ambig_args, dan_box1.principal, selected_scope=None),
-                    CallContext(
-                        principal=dan_box1.principal,
-                        identity=Identity(store_id=rt.store.store_id, writer_epoch=rt.lease.epoch, instance_id="inst"),
-                        deadline_ns=mono.monotonic_ns() + TOTAL_REQUEST_BUDGET_NS,
-                        selected_scope=None,
-                    ),
-                    auth=PrivateRequestAuth(
-                        credential_id=dan_box1.credential_id,
-                        principal=dan_box1.principal,
-                        token=dan_box1.token,
-                    ),
-                ),
-                ErrorCode.REVISION_CONFLICT,
-            )
-            assert owner_ambig_err["message"] == "revision conflict"
         bridge.publish_auth_view()
 
         # 4) Owner recheck symmetry when selected_scope=None: enqueue valid request for ws_beta, then revoke
         #    repo_grant on ws_beta BEFORE owner claims -> owner rejects in _verify_owner_auth_and_scope BEFORE
         #    lookup_for_owner / prepare_mutation!
+        prep_calls_before = domain.prepare_calls
         queued_beta = bridge.submit_request(
             "prepare_task",
             {
@@ -1777,7 +1761,7 @@ def test_r1_prequeue_and_owner_scope_selector_authorization_symmetry(
 
         assert bridge.process_next_queued(block=False) is True
         _expect_err("prepare_task", queued_beta.wait(timeout=1.0), ErrorCode.NOT_FOUND)
-        assert domain.prepare_calls == 0
+        assert domain.prepare_calls == prep_calls_before
         assert domain.apply_calls == 0
     finally:
         rt.close()
@@ -1918,5 +1902,145 @@ def test_r1_atomic_auth_state_rejects_non_monotonic_version(trusted_tmp: Path, o
         v6 = RequestAuthView(version=6, auth=snap, active_request_key_id=key_id, active_request_key_bytes=key_bytes)
         assert state.install(v6) is v6
         assert state.current() is v6
+    finally:
+        rt.close()
+
+
+# --- 15. SDD R2: Mutable workspace_hint deferred to cache miss (preserves replay & IDEMPOTENCY_CONFLICT) -------------
+
+
+def test_r2_workspace_hint_replay_and_conflict_not_short_circuited_prequeue(
+    trusted_tmp: Path, os_: OsAdapters, clock: FakeClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mono = FakeMonotonicClock(start_ns=8_000 * MS)
+    rt = _open_fixture_runtime(trusted_tmp / "root", os_)
+    try:
+        dan_box1 = seed_principal_and_credential(rt.policy, owner_id="dan", harness_id="codex", machine_id="box-1")
+        ws_box1 = _register_ws(
+            rt, clock, dan_box1, alias="ws-same", checkout_dir=trusted_tmp / "chk-b1", remote=REMOTE_A
+        )
+        ws_beta = _register_ws(
+            rt, clock, dan_box1, alias="ws-beta", checkout_dir=trusted_tmp / "chk-beta", remote=REMOTE_B
+        )
+        scope_box1 = Scope(ws_box1.repo_id, ws_box1.checkout_id)
+
+        domain = FixtureKernelDomain(
+            store=rt.store,
+            policy=rt.policy,
+            clock=clock,
+            observer=RecordingObserver(descriptor=_desc()),
+            monotonic_ns=mono.monotonic_ns,
+        )
+        bridge = KernelBridge(
+            store=rt.store,
+            policy=rt.policy,
+            clock=clock,
+            monotonic_clock=mono,
+            writer_epoch=rt.lease.epoch,
+            domain=domain,
+        )
+        bridge.publish_auth_view()
+
+        hint_args: dict[str, JsonValue] = {
+            "schema_version": "2.0",
+            "workspace_hint": "ws-same",
+            "description": "commit delivery under mutable workspace_hint",
+            "idempotency_key": "k_hint_replay_0001",
+        }
+        changed_missing_hint_args: dict[str, JsonValue] = {
+            **hint_args,
+            "workspace_hint": "missing-hint-99",
+        }
+
+        # 1) Enqueue k_hint_replay_0001 -> while active in ReservationTable, retrying the same key with a changed
+        #    nonexistent workspace_hint MUST return IDEMPOTENCY_CONFLICT pre-queue (never NOT_FOUND)!
+        sub_initial = bridge.submit_request(
+            "prepare_task",
+            hint_args,
+            token=dan_box1.token,
+            selected_scope=scope_box1,
+        )
+        assert not sub_initial.done()
+
+        sub_active_conflict = bridge.submit_request(
+            "prepare_task",
+            changed_missing_hint_args,
+            token=dan_box1.token,
+            selected_scope=scope_box1,
+        )
+        assert sub_active_conflict.done()
+        _expect_err("prepare_task", sub_active_conflict.wait(timeout=1.0), ErrorCode.IDEMPOTENCY_CONFLICT)
+
+        # Execute and commit Delivery D1 on ws_box1.
+        assert bridge.process_next_queued(block=False) is True
+        committed_d1 = _expect_ok("prepare_task", sub_initial.wait(timeout=1.0))
+        assert committed_d1["checkout_id"] == ws_box1.checkout_id
+        assert domain.apply_calls == 1
+
+        # 2) Make "ws-same" ambiguous across checkouts in AuthSnapshot while ws_box1 remains registered & granted:
+        #    replaying k_hint_replay_0001 MUST still return ok=True with identical Delivery D1!
+        base_snap = rt.policy.snapshot()
+        dup_checkouts = dict(base_snap.checkouts)
+        dup_checkouts["chk-ambig-twin"] = WorkspaceBinding(
+            owner_id=dan_box1.principal.owner_id,
+            repo_id=ws_beta.repo_id,
+            checkout_id="chk-ambig-twin",
+            machine_id=dan_box1.principal.machine_id,
+            alias="ws-same",
+            checkout_path=str(trusted_tmp / "chk-beta"),
+        )
+        ambig_snap = AuthSnapshot(
+            store_id=base_snap.store_id,
+            trust_generation=base_snap.trust_generation,
+            credentials=base_snap.credentials,
+            principals=base_snap.principals,
+            repo_policies=base_snap.repo_policies,
+            grants=base_snap.grants,
+            checkouts=dup_checkouts,
+        )
+        with monkeypatch.context() as mp:
+            mp.setattr(rt.policy, "snapshot", lambda: ambig_snap)
+            bridge.publish_auth_view()
+            sub_replay_ambig = bridge.submit_request(
+                "prepare_task",
+                hint_args,
+                token=dan_box1.token,
+                selected_scope=scope_box1,
+            )
+            assert not sub_replay_ambig.done()
+            assert bridge.process_next_queued(block=False) is True
+            assert _expect_ok("prepare_task", sub_replay_ambig.wait(timeout=1.0)) == committed_d1
+
+        # 3) Repoint "ws-same" to ws_beta AND rename ws_box1's alias in policy while ws_box1 stays registered & granted:
+        #    replaying k_hint_replay_0001 with selected_scope=scope_box1 STILL replays identical Delivery D1!
+        with rt.policy._immediate() as pdb:
+            pdb.execute(
+                "UPDATE workspace_checkout SET alias = 'ws-renamed' WHERE checkout_id = ?", (ws_box1.checkout_id,)
+            )
+            pdb.execute("UPDATE workspace_checkout SET alias = 'ws-same' WHERE checkout_id = ?", (ws_beta.checkout_id,))
+        bridge.publish_auth_view()
+
+        sub_replay_repointed = bridge.submit_request(
+            "prepare_task",
+            hint_args,
+            token=dan_box1.token,
+            selected_scope=scope_box1,
+        )
+        assert not sub_replay_repointed.done()
+        assert bridge.process_next_queued(block=False) is True
+        assert _expect_ok("prepare_task", sub_replay_repointed.wait(timeout=1.0)) == committed_d1
+        assert domain.apply_calls == 1
+
+        # 4) Retrying committed k_hint_replay_0001 with a changed nonexistent hint ("missing-hint-99") MUST return
+        #    IDEMPOTENCY_CONFLICT (never NOT_FOUND)!
+        sub_committed_conflict = bridge.submit_request(
+            "prepare_task",
+            changed_missing_hint_args,
+            token=dan_box1.token,
+            selected_scope=scope_box1,
+        )
+        assert not sub_committed_conflict.done()
+        assert bridge.process_next_queued(block=False) is True
+        _expect_err("prepare_task", sub_committed_conflict.wait(timeout=1.0), ErrorCode.IDEMPOTENCY_CONFLICT)
     finally:
         rt.close()
