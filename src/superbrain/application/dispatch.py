@@ -219,15 +219,20 @@ class KernelDispatcher:
     def _check_handler_budget(self, ctx: CallContext, reservation: Reservation | None) -> None:
         if reservation is not None and reservation.cancelled:
             raise BrainError(ErrorCode.DEADLINE_EXCEEDED, "deadline exceeded")
+        cutoff_ns = ctx.deadline_ns - HANDLER_RESERVE_NS
+        if ctx.local_deadline_ns is not None:
+            cutoff_ns = min(cutoff_ns, ctx.local_deadline_ns)
         if reservation is not None:
             if self._monotonic_clock is None:
                 raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
             now_ns = self._monotonic_clock.monotonic_ns()
-            if now_ns >= ctx.deadline_ns - HANDLER_RESERVE_NS:
+            if now_ns >= cutoff_ns:
                 raise BrainError(ErrorCode.DEADLINE_EXCEEDED, "deadline exceeded")
-        elif self._monotonic_clock is not None and self._enforce_unreserved_deadline:
+        elif self._monotonic_clock is not None and (
+            self._enforce_unreserved_deadline or ctx.local_deadline_ns is not None
+        ):
             now_ns = self._monotonic_clock.monotonic_ns()
-            if now_ns >= ctx.deadline_ns - HANDLER_RESERVE_NS:
+            if now_ns >= cutoff_ns:
                 raise BrainError(ErrorCode.DEADLINE_EXCEEDED, "deadline exceeded")
 
     def _gate_enter_commit(self, ctx: CallContext, reservation: Reservation | None) -> None:
