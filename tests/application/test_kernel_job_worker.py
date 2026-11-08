@@ -457,7 +457,8 @@ def test_worker_failures_are_typed_codes_without_exception_text_and_deadline_is_
     ):
         enqueue_job(service, store, owner_id="dan", kind=kind, payload=kind.encode())
         lease = _running(service, rt, clock)
-        executor.submit(_item(service, lease))
+        timeout_ns = 2 * 10**9 if kind == "bad" else 10**9
+        executor.submit(_item(service, lease, timeout_ns=timeout_ns))
         expected.append(WorkerFailed(lease, retryable, code))
     commands = [_command(executor) for _ in expected]
     assert commands == expected
