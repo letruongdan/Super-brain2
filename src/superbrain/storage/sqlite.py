@@ -194,7 +194,7 @@ def connect(
         if readonly:
             db = sqlite3.connect(f"{path.absolute().as_uri()}?mode=ro", uri=True, isolation_level=None)
         else:
-            db = sqlite3.connect(path, isolation_level=None)
+            db = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
     except sqlite3.Error as exc:
         raise sqlite_error(f"cannot open database {path}", exc) from exc
     try:

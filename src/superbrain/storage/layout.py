@@ -7,6 +7,7 @@ a ``WriterLease`` is held.
 """
 
 import os
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -247,5 +248,27 @@ def secure_subdirectories(root: DataRoot, lease: "WriterLease", os_: OsAdapters)
 
 def check_endpoint_entries_under_lease(root: DataRoot, lease: "WriterLease", os_: OsAdapters) -> tuple[Path, ...]:
     """Under a held writer lease, validate existing ``endpoint.json`` and ``endpoint.json.stage-*`` entries."""
-    del root, lease, os_
-    raise BrainError(ErrorCode.DAEMON_UNAVAILABLE, "daemon unavailable")
+    if not lease.held or lease.root != root:
+        raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
+    os_.paths.reject_links(root.root)
+    try:
+        names = os.listdir(root.root)
+    except OSError as err:
+        raise os_error(f"cannot list data root {root.root}", err) from err
+    entries = tuple(
+        root.root / name
+        for name in sorted(names)
+        if os.path.normcase(name) == ENDPOINT_NAME or os.path.normcase(name).startswith(ENDPOINT_STAGE_PREFIX)
+    )
+    if not entries:
+        return ()
+    os_.paths.reject_links(root.root, entries=list(entries))
+    for entry in entries:
+        try:
+            st = entry.lstat()
+        except OSError as err:
+            raise os_error(f"cannot stat endpoint entry {entry}", err) from err
+        if not stat.S_ISREG(st.st_mode):
+            raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+        _require_owner_only(entry, os_)
+    return entries

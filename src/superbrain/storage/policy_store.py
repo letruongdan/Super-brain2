@@ -273,6 +273,11 @@ class PolicyStore:
         self._check()
         return self._root
 
+    def adopt_after_owner_exit(self, exited_owner: threading.Thread) -> None:
+        if exited_owner.is_alive() or exited_owner.ident is None or self._owner != exited_owner.ident:
+            raise AssertionError("policy store owner thread has not exited")
+        self._owner = threading.get_ident()
+
     def snapshot_db(self, dest: Path) -> None:
         """Copy the live database, as of now, into the new self-contained file ``dest`` (``backup._snapshot_db``)."""
         self._check()

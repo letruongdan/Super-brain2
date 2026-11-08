@@ -14,7 +14,7 @@ import sqlite3
 from collections.abc import Callable, Sequence
 from datetime import datetime
 from functools import partial
-from typing import TypeVar
+from typing import TYPE_CHECKING, TypeVar
 
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.kernel import (
@@ -31,6 +31,10 @@ from superbrain.storage.errors import sqlite_error
 from superbrain.storage.kernel_schema import KERNEL_JOB_KINDS
 from superbrain.storage.kinds import KindRegistry, is_uuid
 from superbrain.storage.ledger import LedgerEntry, ProjectionHandler, Txn, utc_timestamp
+
+if TYPE_CHECKING:
+    from superbrain.storage.store import Store
+    from superbrain.storage.writer import WriterLease
 
 _T = TypeVar("_T")
 _HOLDER_KIND = "event"
@@ -426,3 +430,17 @@ class JobKernelTxReads:
             "state = 'dead_letter' AND finished_at <= ? ORDER BY finished_at, job_id LIMIT ?",
             (utc_timestamp(cutoff), _bounded(limit)),
         )
+
+
+def has_legacy_incomplete_settled_projections(store: Store, lease: WriterLease) -> bool:
+    """Under ``lease``, return True iff ``p_provider_invocations_state`` has any legacy ``settled/0`` row."""
+    if store.closed or store.in_transaction or not lease.held or lease.root != store.root:
+        raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
+    try:
+        with store.transaction() as txn:
+            row = txn.db.execute(
+                f"SELECT 1 FROM {INVOCATIONS_TABLE} WHERE state = 'settled' AND usage_complete = 0 LIMIT 1"
+            ).fetchone()
+    except sqlite3.Error as err:
+        raise sqlite_error("reading legacy incomplete settled projections", err) from err
+    return row is not None

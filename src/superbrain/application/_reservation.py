@@ -140,10 +140,15 @@ class Reservation:
 class ReservationTable:
     """In-memory reservation registry and single-lock response arbiter (Task 4b)."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, on_change: Callable[[], None] | None = None) -> None:
         self._lock = threading.Lock()
         self._active: dict[ReservationScopeKey, Reservation] = {}
         self._tracked: dict[str, Reservation] = {}
+        self._on_change = on_change
+
+    def has_tracked(self) -> bool:
+        with self._lock:
+            return bool(self._tracked)
 
     def state_lock_locked(self) -> bool:
         """True iff the shared reservation/arbiter state lock is currently held."""
@@ -202,7 +207,10 @@ class ReservationTable:
             )
             self._active[key] = reservation
             self._tracked[reservation.reservation_id] = reservation
-            return reservation
+        if self._on_change is not None:
+            with contextlib.suppress(Exception):
+                self._on_change()
+        return reservation
 
     def create_unscoped_ticket(
         self,
@@ -219,7 +227,10 @@ class ReservationTable:
                 on_response=on_response,
             )
             self._tracked[ticket.reservation_id] = ticket
-            return ticket
+        if self._on_change is not None:
+            with contextlib.suppress(Exception):
+                self._on_change()
+        return ticket
 
     def rollback_unstarted(self, reservation: Reservation) -> None:
         """Roll back an unstarted reservation immediately on ``STORE_BUSY`` queue-full refusal (4b:205)."""
@@ -231,6 +242,64 @@ class ReservationTable:
             self._tracked.pop(reservation.reservation_id, None)
             if reservation._scope_key is not None and self._active.get(reservation._scope_key) is reservation:
                 del self._active[reservation._scope_key]
+
+    def abort_before_enqueue(self, reservation: Reservation, fallback_error: CallResult) -> CallResult:
+        """Cancel an unqueued reservation atomically and return its single settled envelope."""
+        if not isinstance(reservation, Reservation):
+            raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+        if reservation._state_lock is not self._lock:
+            raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
+        encode_envelope(fallback_error)
+        deliver_cb: Callable[[CallResult], None] | None = None
+        settled_here = False
+
+        with self._lock:
+            reservation._cancelled = True
+            reservation._phase = ReservationPhase.CANCELLED
+            self._tracked.pop(reservation.reservation_id, None)
+            if reservation._scope_key is not None and self._active.get(reservation._scope_key) is reservation:
+                del self._active[reservation._scope_key]
+            if not reservation._response_settled:
+                reservation._response_settled = True
+                reservation._response = fallback_error
+                settled_here = True
+                deliver_cb = reservation._on_response
+                result_env = fallback_error
+            else:
+                assert reservation._response is not None
+                result_env = reservation._response
+
+        if settled_here:
+            _deliver_settled(reservation, result_env, deliver_cb)
+        return result_env
+
+    def cancel_all_uncommitted(self, error_envelope: CallResult) -> int:
+        """Cancel every ``QUEUED`` or ``PREPARING`` reservation once; ``COMMITTING`` stays active."""
+        encode_envelope(error_envelope)
+        to_deliver: list[tuple[Reservation, CallResult, Callable[[CallResult], None] | None]] = []
+        cancelled_count = 0
+
+        with self._lock:
+            for res in list(self._tracked.values()):
+                if res._phase in (ReservationPhase.QUEUED, ReservationPhase.PREPARING):
+                    was_queued = res._phase is ReservationPhase.QUEUED
+                    res._cancelled = True
+                    res._phase = ReservationPhase.CANCELLED
+                    cancelled_count += 1
+                    if was_queued:
+                        self._tracked.pop(res.reservation_id, None)
+                        if res._scope_key is not None and self._active.get(res._scope_key) is res:
+                            del self._active[res._scope_key]
+                    if not res._response_settled:
+                        res._response_settled = True
+                        res._response = error_envelope
+                        to_deliver.append((res, error_envelope, res._on_response))
+
+        for res, _env, _cb in to_deliver:
+            res._response_event.set()
+        for _res, env, cb in to_deliver:
+            invoke_response_callback(cb, env)
+        return cancelled_count
 
     def try_claim_for_owner(self, reservation: Reservation, now_ns: int) -> bool:
         """Claim ``reservation`` on the owner thread if still queued and before ``handler_deadline_ns``."""
@@ -348,30 +417,68 @@ class ReservationTable:
             invoke_response_callback(cb, env)
         return tuple((res, env) for res, env, _ in to_deliver)
 
-    def finish_owner_execution(self, reservation: Reservation, response: CallResult) -> bool:
-        """Clear ``reservation`` after definitive owner finish and settle ``response`` iff still unsettled."""
+    def finish_owner_execution(
+        self,
+        reservation: Reservation,
+        response: CallResult,
+        *,
+        now_ns: int | None = None,
+    ) -> bool:
+        """Clear ``reservation`` after definitive owner finish and settle ``response`` iff within budget."""
         if not isinstance(reservation, Reservation):
             raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+        if now_ns is not None and not is_strict_int(now_ns):
+            raise BrainError(ErrorCode.INVALID_INPUT, "boolean not allowed for integer")
         if reservation._state_lock is not self._lock:
             raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
         encode_envelope(response)
         deliver_cb: Callable[[CallResult], None] | None = None
+        deliver_env: CallResult = response
+        settled_here = False
         won = False
 
         with self._lock:
+            prior_phase = reservation._phase
             self._tracked.pop(reservation.reservation_id, None)
             if reservation._scope_key is not None and self._active.get(reservation._scope_key) is reservation:
                 del self._active[reservation._scope_key]
-            if reservation._phase is not ReservationPhase.CANCELLED:
-                reservation._phase = ReservationPhase.COMPLETED
             if not reservation._response_settled:
-                reservation._response_settled = True
-                reservation._response = response
-                won = True
-                deliver_cb = reservation._on_response
+                if (
+                    now_ns is not None
+                    and prior_phase is ReservationPhase.COMMITTING
+                    and now_ns >= reservation._deadlines.commit_waiter_cutoff_ns
+                ):
+                    reservation._phase = ReservationPhase.COMPLETED
+                    deliver_env = make_checked_error(ErrorCode.COMMIT_OUTCOME_UNKNOWN, "commit outcome unknown")
+                    reservation._response_settled = True
+                    reservation._response = deliver_env
+                    settled_here = True
+                    deliver_cb = reservation._on_response
+                elif (
+                    now_ns is not None
+                    and prior_phase in (ReservationPhase.QUEUED, ReservationPhase.PREPARING)
+                    and now_ns >= reservation._deadlines.handler_deadline_ns
+                ):
+                    reservation._cancelled = True
+                    reservation._phase = ReservationPhase.CANCELLED
+                    deliver_env = make_checked_error(ErrorCode.DEADLINE_EXCEEDED, "deadline exceeded")
+                    reservation._response_settled = True
+                    reservation._response = deliver_env
+                    settled_here = True
+                    deliver_cb = reservation._on_response
+                else:
+                    if prior_phase is not ReservationPhase.CANCELLED:
+                        reservation._phase = ReservationPhase.COMPLETED
+                    reservation._response_settled = True
+                    reservation._response = response
+                    settled_here = True
+                    won = True
+                    deliver_cb = reservation._on_response
+            elif prior_phase is not ReservationPhase.CANCELLED:
+                reservation._phase = ReservationPhase.COMPLETED
 
-        if won:
-            _deliver_settled(reservation, response, deliver_cb)
+        if settled_here:
+            _deliver_settled(reservation, deliver_env, deliver_cb)
         return won
 
 

@@ -26,6 +26,7 @@ from superbrain.storage.kernel_schema import KERNEL_POLICY_MIGRATIONS, KERNEL_ST
 from superbrain.storage.kinds import KindRegistry
 from superbrain.storage.layout import (
     DataRoot,
+    check_endpoint_entries_under_lease,
     prepare_data_root,
     secure_subdirectories,
     verify_existing_data_root,
@@ -430,6 +431,7 @@ def admit_existing_pair(
     root = verify_existing_data_root(path, os_)
     lease = acquire_writer_unbumped(root, os_)
     try:
+        check_endpoint_entries_under_lease(root, lease, os_)
         eff_policy_db, extra_policy_stage = _effective_target_db(root, "policy", os_)
         eff_store_db, extra_store_stage = _effective_target_db(root, "store", os_)
         if eff_policy_db is None and eff_store_db is None:

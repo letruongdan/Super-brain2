@@ -110,6 +110,9 @@ class KernelDeadlineCoordinator:
         max_queue_size: int = DEFAULT_MAX_QUEUE_DEPTH,
         reservations: ReservationTable | None = None,
         on_unsent_owner_response: Callable[[CallResult], None] | None = None,
+        after_reserve_before_enqueue: Callable[[Reservation], None] | None = None,
+        on_queue_wake: Callable[[], None] | None = None,
+        on_owner_finished: Callable[[Reservation, bool], None] | None = None,
     ) -> None:
         require_opaque_id(store_id, label="store_id")
         require_positive_int(writer_epoch)
@@ -124,8 +127,12 @@ class KernelDeadlineCoordinator:
         self._max_queue_size = max_queue_size
         self._reservations = reservations if reservations is not None else ReservationTable()
         self._on_unsent_owner_response = on_unsent_owner_response
+        self._after_reserve_before_enqueue = after_reserve_before_enqueue
+        self._on_queue_wake = on_queue_wake
+        self._on_owner_finished = on_owner_finished
         self._queue_cv = threading.Condition()
         self._queue: deque[tuple[QueuedKernelRequest, Reservation]] = deque()
+        self._closed = False
 
     @property
     def reservations(self) -> ReservationTable:
@@ -134,6 +141,22 @@ class KernelDeadlineCoordinator:
     def queue_depth(self) -> int:
         with self._queue_cv:
             return len(self._queue)
+
+    def close_admissions(self) -> None:
+        with self._queue_cv:
+            self._closed = True
+            self._queue_cv.notify_all()
+        if self._on_queue_wake is not None:
+            with suppress(Exception):
+                self._on_queue_wake()
+
+    def cancel_uncommitted_for_shutdown(self) -> int:
+        with self._queue_cv:
+            self._closed = True
+            self._queue.clear()
+            self._queue_cv.notify_all()
+        err_env = make_checked_error(ErrorCode.DAEMON_UNAVAILABLE, "daemon unavailable")
+        return self._reservations.cancel_all_uncommitted(err_env)
 
     def submit(
         self,
@@ -146,9 +169,13 @@ class KernelDeadlineCoordinator:
         correlation_id: str | None = None,
         receive_ns: int | None = None,
         on_response: Callable[[CallResult], None] | None = None,
+        on_reserved: Callable[[Reservation], None] | None = None,
     ) -> SubmittedKernelRequest:
         reservation: Reservation | None = None
         try:
+            with self._queue_cv:
+                if self._closed:
+                    raise BrainError(ErrorCode.DAEMON_UNAVAILABLE, "daemon unavailable")
             adm_start_ns = self._monotonic_clock.monotonic_ns()
             t0_ns = adm_start_ns if receive_ns is None else receive_ns
             deadlines = RequestDeadlines.from_receive_ns(t0_ns)
@@ -185,17 +212,30 @@ class KernelDeadlineCoordinator:
                     on_response=on_response,
                 )
 
+            if on_reserved is not None:
+                on_reserved(reservation)
+            if self._after_reserve_before_enqueue is not None:
+                self._after_reserve_before_enqueue(reservation)
+
             with self._queue_cv:
+                if self._closed:
+                    raise BrainError(ErrorCode.DAEMON_UNAVAILABLE, "daemon unavailable")
+                if reservation.cancelled:
+                    raise BrainError(ErrorCode.DEADLINE_EXCEEDED, "deadline exceeded")
                 if len(self._queue) >= self._max_queue_size:
                     raise BrainError(ErrorCode.STORE_BUSY, "store busy")
                 self._queue.append((queued, reservation))
-                self._queue_cv.notify()
+                self._queue_cv.notify_all()
+            if self._on_queue_wake is not None:
+                with suppress(Exception):
+                    self._on_queue_wake()
 
             return SubmittedKernelRequest(queued=queued, reservation=reservation)
         except BrainError as err:
-            if reservation is not None:
-                self._reservations.rollback_unstarted(reservation)
             err_env = make_checked_error(err.code, err.message)
+            if reservation is not None:
+                settled_env = self._reservations.abort_before_enqueue(reservation, err_env)
+                return SubmittedKernelRequest(immediate_response=settled_env)
             invoke_response_callback(on_response, err_env)
             return SubmittedKernelRequest(immediate_response=err_env)
 
@@ -264,7 +304,14 @@ class KernelDeadlineCoordinator:
         except Exception:  # noqa: BLE001 — guarantee finish_owner_execution settles static error on unexpected bug
             response = make_checked_error(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
         finally:
-            won = self._reservations.finish_owner_execution(reservation, response)
+            won = self._reservations.finish_owner_execution(
+                reservation,
+                response,
+                now_ns=self._monotonic_clock.monotonic_ns(),
+            )
+            if self._on_owner_finished is not None:
+                with suppress(Exception):
+                    self._on_owner_finished(reservation, won)
             if not won and self._on_unsent_owner_response is not None:
                 with suppress(Exception):
                     self._on_unsent_owner_response(response)

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
-from typing import TypeVar, cast
+from typing import Protocol, TypeVar, cast
 
 from superbrain.adapters.os.clock import SystemMonotonicClock
 from superbrain.application.deadlines import (
@@ -22,6 +22,7 @@ from superbrain.core.ids import new_id
 from superbrain.core.jsonvalue import JsonValue
 from superbrain.core.kernel import (
     ArtifactSendAttempt,
+    AuthGrantStamp,
     BootstrapAuthorization,
     Call,
     CallContext,
@@ -62,6 +63,14 @@ class _CallableMonotonicClock:
         return self._fn()
 
 
+class _MutableRequestAuthState(RequestAuthStatePort, Protocol):
+    def install(self, view: RequestAuthView) -> RequestAuthView: ...
+
+    def next_version(self) -> int: ...
+
+    def clear(self) -> None: ...
+
+
 def _verify_domain_pair(domain: KernelToolDomain | None, *, store: Store, policy: PolicyStore) -> None:
     if domain is None:
         return
@@ -90,6 +99,17 @@ class KernelBridge(KernelBlobStagePort):
         before_enter_commit: Callable[[Reservation | None], None] | None = None,
         on_commit_completed: Callable[[StoredResult], None] | None = None,
         recover_pending_on_init: bool = True,
+        auth_state: _MutableRequestAuthState | None = None,
+        before_auth_gate_publish: Callable[[RequestAuthView], None] | None = None,
+        after_reserve_before_enqueue: Callable[[Reservation], None] | None = None,
+        on_reservation_change: Callable[[], None] | None = None,
+        on_queue_wake: Callable[[], None] | None = None,
+        on_owner_reply_ready: Callable[
+            [Reservation, AuthGrantStamp | None, SendAttemptCompletion | None], None
+        ]
+        | None = None,
+        on_owner_finished: Callable[[Reservation, bool], None] | None = None,
+        on_clock_untrusted_changed: Callable[[bool], None] | None = None,
     ) -> None:
         if not isinstance(recover_pending_on_init, bool):
             raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
@@ -138,7 +158,12 @@ class KernelBridge(KernelBlobStagePort):
         )
         if recover_pending_on_init:
             self._send_attempts.recover_pending_attempts()
-        self._auth_state = AtomicRequestAuthState(store.store_id)
+        self._auth_state: _MutableRequestAuthState = (
+            auth_state if auth_state is not None else AtomicRequestAuthState(store.store_id)
+        )
+        self._before_auth_gate_publish = before_auth_gate_publish
+        self._on_owner_reply_ready = on_owner_reply_ready
+        self._on_clock_untrusted_changed = on_clock_untrusted_changed
         self._dispatcher = KernelDispatcher(
             store_id=store.store_id,
             policy=policy,
@@ -154,6 +179,7 @@ class KernelBridge(KernelBlobStagePort):
             before_enter_commit=before_enter_commit,
             on_commit_completed=on_commit_completed,
         )
+        reservations_table = ReservationTable(on_change=on_reservation_change)
         self._coordinator = KernelDeadlineCoordinator(
             store_id=store.store_id,
             writer_epoch=writer_epoch,
@@ -162,7 +188,11 @@ class KernelBridge(KernelBlobStagePort):
             monotonic_clock=resolved_mono,
             owner_runner=self._run_reserved_on_owner,
             max_queue_size=max_queue_size,
+            reservations=reservations_table,
             on_unsent_owner_response=self._interrupt_unsent_response,
+            after_reserve_before_enqueue=after_reserve_before_enqueue,
+            on_queue_wake=on_queue_wake,
+            on_owner_finished=on_owner_finished,
         )
 
     def _check_live_pair(self) -> None:
@@ -187,10 +217,46 @@ class KernelBridge(KernelBlobStagePort):
         try:
             self._check_live_pair()
         except BrainError as err:
+            if err.code in (ErrorCode.IDENTITY_MISMATCH, ErrorCode.POLICY_UNAVAILABLE, ErrorCode.INTEGRITY_FAILURE):
+                self._auth_state.clear()
             err_envelope = make_error_envelope(err)
             encode_envelope(err_envelope)
             return err_envelope
-        return self._dispatcher.dispatch_reserved(call, ctx, auth=auth, reservation=reservation)
+        result = self._dispatcher.dispatch_reserved(call, ctx, auth=auth, reservation=reservation)
+        if self._on_clock_untrusted_changed is not None:
+            self._on_clock_untrusted_changed(self._idempotency.clock_untrusted())
+        if result.get("ok") is False:
+            err_obj = result.get("error")
+            if isinstance(err_obj, Mapping) and err_obj.get("code") in (
+                ErrorCode.IDENTITY_MISMATCH.value,
+                ErrorCode.POLICY_UNAVAILABLE.value,
+            ):
+                self._auth_state.clear()
+            return result
+        if self._on_owner_reply_ready is not None:
+            stamp = self._mint_owner_grant_stamp(auth.credential_id)
+            completion: SendAttemptCompletion | None = None
+            data = result.get("data")
+            if isinstance(data, Mapping):
+                receipt_id = data.get("served_receipt_id")
+                if isinstance(receipt_id, str):
+                    completion = self.build_send_completion(receipt_id)
+            self._on_owner_reply_ready(reservation, stamp, completion)
+        return result
+
+    def _mint_owner_grant_stamp(self, credential_id: str) -> AuthGrantStamp | None:
+        view = self._auth_state.current()
+        if view is None:
+            return None
+        cred = view.auth.credentials.get(credential_id)
+        if cred is None or cred.revoked or view.auth.principals.get(cred.principal.principal_id) != cred.principal:
+            return None
+        return AuthGrantStamp(
+            credential_id=credential_id,
+            generation=view.version,
+            trust_generation=view.auth.trust_generation,
+            identity=self._owner_identity,
+        )
 
     @property
     def auth_state(self) -> RequestAuthStatePort:
@@ -216,6 +282,8 @@ class KernelBridge(KernelBlobStagePort):
                 active_request_key_id=key_id,
                 active_request_key_bytes=key_bytes,
             )
+            if self._before_auth_gate_publish is not None:
+                self._before_auth_gate_publish(view)
             return self._auth_state.install(view)
         except BrainError:
             self._auth_state.clear()
@@ -227,6 +295,7 @@ class KernelBridge(KernelBlobStagePort):
     def apply_policy_mutation(self, mutation: Callable[[PolicyStore], _T]) -> _T:
         """Run an owner ``PolicyStore`` mutation and install the updated ``RequestAuthView`` before return."""
         self._check_live_pair()
+        self._auth_state.clear()
         result = mutation(self._policy)
         self.publish_auth_view()
         return result
@@ -240,6 +309,7 @@ class KernelBridge(KernelBlobStagePort):
     ) -> WorkspaceBinding:
         """Register ``registration`` on the owner thread, reconcile policy, and publish ``RequestAuthView``."""
         self._check_live_pair()
+        self._auth_state.clear()
         binding = self._policy.register_authorized_workspace(registration, authorization)
         self._store.reconcile_policy()
         self.publish_auth_view()
@@ -260,6 +330,7 @@ class KernelBridge(KernelBlobStagePort):
         correlation_id: str | None = None,
         receive_ns: int | None = None,
         on_response: Callable[[CallResult], None] | None = None,
+        on_reserved: Callable[[Reservation], None] | None = None,
     ) -> SubmittedKernelRequest:
         return self._coordinator.submit(
             tool,
@@ -270,6 +341,7 @@ class KernelBridge(KernelBlobStagePort):
             correlation_id=correlation_id,
             receive_ns=receive_ns,
             on_response=on_response,
+            on_reserved=on_reserved,
         )
 
     def call_tool(
@@ -300,6 +372,12 @@ class KernelBridge(KernelBlobStagePort):
 
     def process_next_queued(self, *, block: bool = False, timeout: float | None = None) -> bool:
         return self._coordinator.process_next(block=block, timeout=timeout)
+
+    def close_admissions(self) -> None:
+        self._coordinator.close_admissions()
+
+    def cancel_uncommitted_for_shutdown(self) -> int:
+        return self._coordinator.cancel_uncommitted_for_shutdown()
 
     def strict_store(self, staged_blobs: Sequence[StagedBlob] = ()) -> KernelStorePort:
         """Return an admitted ``KernelStorePort`` bound to pre-staged ``staged_blobs`` (C2:81)."""

@@ -340,6 +340,11 @@ class Store:
     def owner_thread_id(self) -> int:
         return self._owner
 
+    def adopt_after_owner_exit(self, exited_owner: threading.Thread) -> None:
+        if exited_owner.is_alive() or exited_owner.ident is None or self._owner != exited_owner.ident:
+            raise AssertionError("store owner thread has not exited")
+        self._owner = threading.get_ident()
+
     def has_policy_source(self, policy: object) -> bool:
         return self._policy is policy
 
