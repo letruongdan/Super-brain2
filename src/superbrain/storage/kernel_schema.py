@@ -125,6 +125,86 @@ KERNEL_WORKSPACE_KINDS: tuple[EntryKind, ...] = (
 )
 """Task 3 event-sourced business kinds (no DDL): reducers in ``storage.workspaces`` build ``p_*`` tables."""
 
+_TERMINAL_JOB_STATES = frozenset({"succeeded", "failed", "cancelled", "dead_letter"})
+_RETRY_PRIOR_STATES = frozenset({"leased", "running"})
+_TERMINAL_PRIOR_STATES = frozenset({"queued", "leased", "running"})
+_JOB_ERROR_CODES = frozenset(
+    {"handler_failed", "handler_unavailable", "invalid_payload", "deadline_exceeded", "lease_lost"}
+)
+_LEASE_FIELDS: dict[str, FieldType] = {
+    "job_id": FieldType.UUID,
+    "attempt": FieldType.INT,
+    "writer_epoch": FieldType.INT,
+    "lease_id": FieldType.UUID,
+}
+
+KERNEL_JOB_KINDS: tuple[EntryKind, ...] = (
+    EntryKind(
+        "job.queued",
+        1,
+        {
+            "job_id": FieldType.UUID,
+            "owner_id": FieldType.OPAQUE_ID,
+            "repo_id": FieldType.OPAQUE_ID,
+            "checkout_id": FieldType.OPAQUE_ID,
+            "kind": FieldType.OPAQUE_ID,
+            "payload_digest": FieldType.DIGEST,
+            "attempt": FieldType.INT,
+            "retry_at": FieldType.TIMESTAMP,
+        },
+        {},
+        nullable=frozenset({"repo_id", "checkout_id"}),
+    ),
+    EntryKind("job.leased", 1, dict(_LEASE_FIELDS), {}),
+    EntryKind("job.running", 1, dict(_LEASE_FIELDS), {}),
+    EntryKind(
+        "job.retry",
+        1,
+        {**_LEASE_FIELDS, "prior_state": FieldType.ENUM, "retry_at": FieldType.TIMESTAMP, "reason": FieldType.ENUM},
+        {"prior_state": _RETRY_PRIOR_STATES, "reason": _JOB_ERROR_CODES},
+    ),
+    EntryKind(
+        "job.terminal",
+        1,
+        {
+            **_LEASE_FIELDS,
+            "state": FieldType.ENUM,
+            "prior_state": FieldType.ENUM,
+            "reason": FieldType.ENUM,
+            "result_digest": FieldType.DIGEST,
+            "finished_at": FieldType.TIMESTAMP,
+        },
+        {"state": _TERMINAL_JOB_STATES, "prior_state": _TERMINAL_PRIOR_STATES, "reason": _JOB_ERROR_CODES},
+        nullable=frozenset({"writer_epoch", "lease_id", "reason", "result_digest"}),
+    ),
+    EntryKind("job.retention_expired", 1, {"job_id": FieldType.UUID, "expired_at": FieldType.TIMESTAMP}, {}),
+    EntryKind(
+        "provider.reserved",
+        1,
+        {"invocation_id": FieldType.UUID, **_LEASE_FIELDS, "reservation_digest": FieldType.DIGEST},
+        {},
+    ),
+    EntryKind(
+        "provider.settled",
+        1,
+        {
+            "invocation_id": FieldType.UUID,
+            "prior_state": FieldType.ENUM,
+            "usage_digest": FieldType.DIGEST,
+            "complete": FieldType.BOOL,
+        },
+        {"prior_state": frozenset({"reserved", "outcome_unknown"})},
+    ),
+    EntryKind(
+        "provider.unknown",
+        1,
+        {"invocation_id": FieldType.UUID, "writer_epoch": FieldType.INT, "recovery_epoch": FieldType.INT},
+        {},
+    ),
+)
+"""Task 5 Job/ProviderInvocation kinds (no DDL): reducers in ``storage.jobs`` build ``p_jobs_*`` and
+``p_provider_invocations_*``. States, prior states and reasons are enums; decimal quantities live only in CAS."""
+
 
 def _policy_v2(db: sqlite3.Connection) -> None:
     """Policy store v2 DDL: principals, credentials, repo policies/grants, workspace registry, and request HMAC key."""

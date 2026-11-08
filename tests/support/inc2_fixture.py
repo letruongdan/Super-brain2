@@ -16,7 +16,7 @@ import subprocess
 import sys
 import uuid
 import warnings
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -26,6 +26,17 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+
+from superbrain.application.jobs import JobService
+from superbrain.composition.kernel_projections import kernel_store_extensions
+from superbrain.core.canonical import digest_bytes
+from superbrain.core.kernel import JobRef, JobSpec, ObjectRef, UsageRecord
+from superbrain.ports.clock import Clock
+from superbrain.ports.os import OsAdapters
+from superbrain.storage.idempotency import StagedKernelStore
+from superbrain.storage.kernel_schema import KERNEL_POLICY_MIGRATIONS, KERNEL_STORE_MIGRATIONS
+from superbrain.storage.runtime import Runtime, admit_existing_pair, open_runtime, open_runtime_under_lease
+from superbrain.workers.executor import JobContext, JobHandler
 
 if TYPE_CHECKING:
     from tests.support.inc2_kernel_domain import (
@@ -317,6 +328,71 @@ def inc2_tls_material(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Samp
         )
     finally:
         _cleanup_dir(directory)
+
+
+# --- Task 5 fixture job handler and job-runtime helpers (registered only from tests) ---------------------------
+
+FIXTURE_JOB_KIND = "fixture.echo"
+"""Job kind of the test-only fixture handler; the production worker registry never contains it."""
+FIXTURE_USAGE = UsageRecord(amount="0.25", complete=True)
+
+
+def fixture_job_handler(spec: JobSpec, ctx: JobContext) -> tuple[ObjectRef, ...]:
+    """Settle every reserved invocation with ``FIXTURE_USAGE`` and return one safe ref to the payload digest."""
+    for invocation_id in ctx.invocation_ids:
+        ctx.report_usage(invocation_id, FIXTURE_USAGE)
+    return (ObjectRef(kind="fixture_result", id=ctx.lease.job_id, revision=1, digest=digest_bytes(spec.payload)),)
+
+
+def fixture_job_registry() -> Mapping[str, JobHandler]:
+    """The capability registry a test runner injects to execute the fixture job (never production)."""
+    return {FIXTURE_JOB_KIND: fixture_job_handler}
+
+
+def open_kernel_job_runtime(root: Path, os_: OsAdapters) -> Runtime:
+    """A fresh kernel store opened with the composition projections (workspace + Task 5 job reducers)."""
+    handlers, kinds = kernel_store_extensions()
+    return open_runtime(
+        root,
+        os_,
+        handlers=handlers,
+        kinds=kinds,
+        store_migrations=KERNEL_STORE_MIGRATIONS,
+        policy_migrations=KERNEL_POLICY_MIGRATIONS,
+    )
+
+
+def reopen_kernel_job_runtime(root: Path, store_id: str, os_: OsAdapters) -> Runtime:
+    """Reopen an existing kernel store under a new writer lease: a new ``writer_epoch`` (a killed daemon restart)."""
+    handlers, kinds = kernel_store_extensions()
+    return open_runtime_under_lease(
+        admit_existing_pair(root, store_id, os_, purpose="serve"), handlers=handlers, kinds=kinds
+    )
+
+
+def kernel_job_service(
+    rt: Runtime, clock: Clock, *, cancel_signal: Callable[[str], None] | None = None
+) -> tuple[JobService, StagedKernelStore]:
+    """A ``JobService`` over the admitted ``(store, policy)`` pair of ``rt`` at its current writer epoch."""
+    store = StagedKernelStore(rt.store, rt.policy, writer_epoch=rt.lease.epoch)
+    service = JobService(store, store, rt.policy, clock, writer_epoch=rt.lease.epoch, cancel_signal=cancel_signal)
+    return service, store
+
+
+def enqueue_job(
+    service: JobService,
+    store: StagedKernelStore,
+    *,
+    owner_id: str,
+    payload: bytes = b"fixture payload",
+    kind: str = FIXTURE_JOB_KIND,
+    repo_id: str | None = None,
+    checkout_id: str | None = None,
+) -> JobRef:
+    """Stage ``payload`` outside the transaction, then enqueue it in its own caller transaction."""
+    spec = JobSpec(kind=kind, owner_id=owner_id, payload=payload, repo_id=repo_id, checkout_id=checkout_id)
+    store.stage_blob(payload)
+    return store.transact(lambda tx: service.enqueue(tx, spec))
 
 
 _KERNEL_DOMAIN_EXPORTS = frozenset(

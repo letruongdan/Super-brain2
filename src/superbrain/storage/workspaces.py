@@ -38,6 +38,7 @@ from superbrain.ports.policy import PolicyView
 from superbrain.storage._idempotency_sql import read_idempotency_row, write_idempotency_row
 from superbrain.storage.cas import ContentStore, held_digests
 from superbrain.storage.errors import sqlite_error
+from superbrain.storage.jobs import JobKernelTxReads
 from superbrain.storage.kernel_schema import KERNEL_WORKSPACE_KINDS
 from superbrain.storage.kinds import KindRegistry, RetentionClass, is_uuid
 from superbrain.storage.ledger import LedgerEntry, ProjectionHandler, Txn
@@ -363,7 +364,7 @@ def _mirror_candidate(row: Sequence[object]) -> MirrorCandidate:
 _SNAPSHOT_COLUMNS = "snapshot_id, owner_id, repo_id, checkout_id, kind, dirty, descriptor_digest, observed_at"
 
 
-class StoreKernelTx:
+class StoreKernelTx(JobKernelTxReads):
     """``KernelTx`` over one ``Txn``: typed appends, publish-before-hold blobs and projection reads."""
 
     def __init__(self, txn: Txn, cas: ContentStore, policy: PolicyView) -> None:

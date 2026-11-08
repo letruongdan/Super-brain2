@@ -1144,7 +1144,14 @@ def test_mirror_projection_accepts_legacy_v1_and_v2_entries() -> None:
             proj.apply(db, "p_workspace_registry_", entry(9, 2, bad), _NoPolicy())
         assert exc.value.code is ErrorCode.INTEGRITY_FAILURE
     handlers, kinds = kernel_store_extensions()
-    assert {h.name for h in handlers} == {"workspace_registry", "source_snapshots", "task_lineage", "field_lineage"}
+    assert {h.name for h in handlers} == {
+        "workspace_registry",
+        "source_snapshots",
+        "task_lineage",
+        "field_lineage",
+        "jobs",  # Task 5 reducers are registered by the same composition function (task-5-brief, reconciliation)
+        "provider_invocations",
+    }
     assert {k.kind for k in KERNEL_WORKSPACE_KINDS} <= kinds.kinds()
 
 

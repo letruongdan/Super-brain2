@@ -73,7 +73,7 @@ from superbrain.ports.kernel import KernelBlobStagePort, KernelPolicyPort, Kerne
 from superbrain.ports.policy import PolicyView
 from superbrain.storage._pair_admission import verify_admitted_store_pair, verify_live_store_handle
 from superbrain.storage.identity import authorize_direct_ref
-from superbrain.storage.kernel_schema import KERNEL_WORKSPACE_KINDS
+from superbrain.storage.kernel_schema import KERNEL_JOB_KINDS, KERNEL_WORKSPACE_KINDS
 from superbrain.storage.kinds import CORE_KINDS, EntryKind, FieldType, KindRegistry
 from superbrain.storage.ledger import LedgerEntry, ProjectionHandler
 from superbrain.storage.policy_store import PolicyStore
@@ -474,7 +474,7 @@ class FixtureDomainProjection:
 def fixture_store_extensions() -> tuple[tuple[ProjectionHandler, ...], KindRegistry]:
     """Return ``(handlers, kinds)`` combining production kernel workspace extensions with the test fixture domain."""
     ws_handlers, _ = kernel_store_extensions()
-    all_kinds = KindRegistry([*CORE_KINDS, *KERNEL_WORKSPACE_KINDS, *FIXTURE_DOMAIN_KINDS])
+    all_kinds = KindRegistry([*CORE_KINDS, *KERNEL_WORKSPACE_KINDS, *KERNEL_JOB_KINDS, *FIXTURE_DOMAIN_KINDS])
     return ((*ws_handlers, FixtureDomainProjection()), all_kinds)
 
 

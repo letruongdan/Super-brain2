@@ -20,6 +20,8 @@ from superbrain.core.kernel import (
     FieldLineage,
     IdempotencyRow,
     Identity,
+    InvocationRecord,
+    JobRecord,
     KernelRecord,
     LineageRef,
     LineageSet,
@@ -144,6 +146,42 @@ class KernelTx(Protocol):
 
     def save_read_ack(self, ack: ArtifactReadAck) -> None:
         """Insert ``ack`` into ``artifact_read_ack`` inside the caller's ``Store.transaction()``."""
+        ...
+
+    def release_blob(self, digest: str, *, holder_id: str, reason: str) -> None:
+        """Release the ``event`` hold of ``holder_id`` on ``digest`` (reason ``expired`` only); absent hold: no-op."""
+        ...
+
+    def read_held_blob(self, digest: str, *, holder_id: str) -> bytes | None:
+        """Bytes of ``digest`` iff ``(event, holder_id)`` holds it and policy does not quarantine it, else ``None``."""
+        ...
+
+    def read_job(self, job_id: str) -> JobRecord | None:
+        """The ``p_jobs_state`` row of ``job_id``, if present."""
+        ...
+
+    def read_invocation(self, invocation_id: str) -> InvocationRecord | None:
+        """The ``p_provider_invocations_state`` row of ``invocation_id``, if present."""
+        ...
+
+    def read_job_invocations(self, job_id: str) -> tuple[InvocationRecord, ...]:
+        """Every invocation recorded for ``job_id``, oldest first."""
+        ...
+
+    def due_jobs(self, now: datetime, limit: int) -> tuple[JobRecord, ...]:
+        """Up to ``limit`` queued jobs with ``retry_at <= now``, in ``(retry_at, job_id)`` order."""
+        ...
+
+    def stale_jobs(self, epoch: int, limit: int) -> tuple[JobRecord, ...]:
+        """Up to ``limit`` ``leased|running`` jobs whose lease epoch is older than ``epoch``, by ``job_id``."""
+        ...
+
+    def unsettled_invocations(self, epoch: int, limit: int) -> tuple[InvocationRecord, ...]:
+        """Up to ``limit`` ``reserved`` invocations whose epoch is older than ``epoch``, by ``invocation_id``."""
+        ...
+
+    def expired_dead_letters(self, cutoff: datetime, limit: int) -> tuple[JobRecord, ...]:
+        """Up to ``limit`` ``dead_letter`` jobs finished at or before ``cutoff``, by ``(finished_at, job_id)``."""
         ...
 
 

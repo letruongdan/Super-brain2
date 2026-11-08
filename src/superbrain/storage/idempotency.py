@@ -321,3 +321,37 @@ class KernelIdempotencyStore(KernelIdempotencyPort):
             deleted = delete_idempotency_rows(txn.db, keys_to_delete)
             advance_c4_hwm(txn.db, now_str, current_hwm=durable_hwm)
         return deleted
+
+
+class StagedKernelStore(KernelStorePort, KernelBlobStagePort):
+    """``KernelStorePort`` + ``KernelBlobStagePort`` over one admitted pair: bytes staged here before ``transact``
+    (outside any SQLite transaction, C2) are exactly the bytes its ``StrictKernelTx`` may hold.
+
+    Every entry point re-verifies the admitted ``(store, policy)`` pair and writer epoch (I2-T4A-N01). The staged set
+    is consumed by the next ``transact``, committed or not.
+    """
+
+    def __init__(self, store: Store, policy_store: PolicyStore, *, writer_epoch: int) -> None:
+        verify_admitted_store_pair(store, policy_store, writer_epoch=writer_epoch)
+        self._store = store
+        self._policy_store = policy_store
+        self._writer_epoch = writer_epoch
+        self._stager = KernelBlobStager(store)
+        self._staged: list[StagedBlob] = []
+
+    def stage_blob(self, data: bytes) -> StagedBlob:
+        verify_admitted_store_pair(self._store, self._policy_store, writer_epoch=self._writer_epoch)
+        staged = self._stager.stage_blob(data)
+        self._staged.append(staged)
+        return staged
+
+    def transact(self, operation: Callable[[KernelTx], _T]) -> _T:
+        staged, self._staged = tuple(self._staged), []
+        strict = StrictKernelStore(
+            self._store,
+            self._policy_store,
+            staged_blobs=staged,
+            policy_store=self._policy_store,
+            writer_epoch=self._writer_epoch,
+        )
+        return strict.transact(operation)

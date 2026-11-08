@@ -5,7 +5,6 @@ from __future__ import annotations
 import copy
 from collections.abc import Mapping
 from dataclasses import dataclass
-from enum import StrEnum
 
 from superbrain.core._json_parse import parse_json
 from superbrain.core._kernel_auth import (
@@ -77,6 +76,37 @@ from superbrain.core._kernel_dispatch import (
     parse_canonical_utc,
     require_aware_utc,
 )
+from superbrain.core._kernel_jobs import (
+    DEAD_LETTER_RETENTION,
+    MAX_JOB_ATTEMPTS,
+    RECOVERY_BATCH,
+    TERMINAL_JOB_STATES,
+    AccountingStatus,
+    InvocationRecord,
+    InvocationState,
+    JobErrorCode,
+    JobLease,
+    JobOutcome,
+    JobRecord,
+    JobRef,
+    JobSpec,
+    JobState,
+    JobView,
+    RecoveryCounts,
+    UsageRecord,
+    UsageReservation,
+    WorkerCommand,
+    WorkerCompleted,
+    WorkerFailed,
+    WorkerUsage,
+    accounting_status_of,
+    decode_result_descriptor,
+    require_decimal,
+    reservation_descriptor,
+    result_descriptor,
+    retry_backoff,
+    usage_descriptor,
+)
 from superbrain.core._kernel_send_attempts import (
     ArtifactReadAck,
     ArtifactSendAttempt,
@@ -117,23 +147,6 @@ from superbrain.core._kernel_workspace import (
 from superbrain.core.canonical import canonical_json
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.jsonvalue import JsonValue
-
-
-class JobState(StrEnum):
-    QUEUED = "queued"
-    LEASED = "leased"
-    RUNNING = "running"
-    SUCCEEDED = "succeeded"
-    FAILED = "failed"
-    CANCELLED = "cancelled"
-    DEAD_LETTER = "dead_letter"
-
-
-class AccountingStatus(StrEnum):
-    NONE = "none"
-    RESERVED = "reserved"
-    SETTLED = "settled"
-    OUTCOME_UNKNOWN = "outcome_unknown"
 
 
 @dataclass(frozen=True)
@@ -376,6 +389,7 @@ __all__ = [
     "CallContext",
     "CallResult",
     "CredentialRecord",
+    "DEAD_LETTER_RETENTION",
     "DEFAULT_BLOCKED_PATH_PATTERNS",
     "DEFAULT_SENSITIVE_KEYS",
     "DEFAULT_STRUCTURAL_ID_FIELDS",
@@ -393,13 +407,23 @@ __all__ = [
     "IDEMPOTENCY_TTL",
     "IdempotencyRow",
     "Identity",
+    "InvocationRecord",
+    "InvocationState",
+    "JobErrorCode",
+    "JobLease",
+    "JobOutcome",
+    "JobRecord",
+    "JobRef",
+    "JobSpec",
     "JobState",
+    "JobView",
     "KernelRecord",
     "LOCAL_PHASE_BUDGET_NS",
     "LabeledDelivery",
     "LineageRef",
     "LineageSet",
     "LineagedField",
+    "MAX_JOB_ATTEMPTS",
     "MirrorCandidate",
     "OBJECT_KIND_PATTERN",
     "OBJECT_KIND_RE",
@@ -409,9 +433,11 @@ __all__ = [
     "Principal",
     "PrivateRequestAuth",
     "QueuedKernelRequest",
+    "RECOVERY_BATCH",
     "REDACTED_REASON_DEFAULT",
     "RESPONSE_RESERVE_NS",
     "ReadAckInput",
+    "RecoveryCounts",
     "RepoFlags",
     "RepoPolicy",
     "RequestAuthView",
@@ -435,22 +461,31 @@ __all__ = [
     "SourceSnapshot",
     "StagedBlob",
     "StoredResult",
+    "TERMINAL_JOB_STATES",
     "TOTAL_REQUEST_BUDGET_NS",
     "TaskBinding",
     "TlsMaterial",
     "ToolCatalog",
     "ToolSpec",
     "TrustedLocator",
+    "UsageRecord",
+    "UsageReservation",
     "VerifiedServerTls",
     "WORKSPACE_HINT_PATTERN",
     "WORKSPACE_HINT_RE",
+    "WorkerCommand",
+    "WorkerCompleted",
+    "WorkerFailed",
+    "WorkerUsage",
     "WorkspaceBinding",
     "WorkspaceRegistration",
     "WorkspaceSelector",
+    "accounting_status_of",
     "binding_identity_digest",
     "binding_lineage_ref",
     "canonicalize_resource_digests",
     "decode_resource_digests_json",
+    "decode_result_descriptor",
     "field_path_descriptor",
     "field_path_digest",
     "is_registrable_alias",
@@ -460,6 +495,7 @@ __all__ = [
     "parse_canonical_utc",
     "require_aware_utc",
     "require_canonical_timestamp",
+    "require_decimal",
     "require_object_kind",
     "require_opaque_id",
     "require_positive_int",
@@ -467,5 +503,9 @@ __all__ = [
     "require_uuid",
     "require_workspace_alias",
     "require_workspace_hint",
+    "reservation_descriptor",
+    "result_descriptor",
+    "retry_backoff",
+    "usage_descriptor",
     "verify_secret_digest",
 ]
