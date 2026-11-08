@@ -5,6 +5,7 @@ from __future__ import annotations
 import threading
 from collections import deque
 from collections.abc import Callable, Mapping
+from contextlib import suppress
 
 from superbrain.application._prequeue import (
     AtomicRequestAuthState,
@@ -253,5 +254,6 @@ class KernelDeadlineCoordinator:
         finally:
             won = self._reservations.finish_owner_execution(reservation, response)
             if not won and self._on_unsent_owner_response is not None:
-                self._on_unsent_owner_response(response)
+                with suppress(Exception):
+                    self._on_unsent_owner_response(response)
         return True

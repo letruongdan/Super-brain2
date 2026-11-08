@@ -42,6 +42,8 @@ from superbrain.ports.kernel import (
     KernelTx,
 )
 
+_PLACEHOLDER_RECEIPT_ID = "00000000-0000-7000-8000-000000000000"
+
 _STORED_KIND_ACTIONS: dict[str, str] = {
     "delivery_result": "prepare_task",
     "artifact_result": "get_artifact",
@@ -196,6 +198,7 @@ class KernelDispatcher:
         )
         if spec is None:
             return rendered
+        encode_envelope(make_success_envelope({**rendered, "served_receipt_id": _PLACEHOLDER_RECEIPT_ID}))
         attempt = self._send_attempts.record_pending_attempt(spec)
         return {**rendered, "served_receipt_id": attempt.served_receipt_id}
 

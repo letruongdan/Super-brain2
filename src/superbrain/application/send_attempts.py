@@ -35,6 +35,7 @@ def record_read_acks(
     effective_scope: Scope,
     expected_task_id: str,
     acks: Sequence[ReadAckInput],
+    action: str = "record_outcome",
 ) -> tuple[ArtifactReadAck, ...]:
     """Validate and persist client-declared ``ReadAckInput``s inside ``tx`` (C5:114-116).
 
@@ -48,6 +49,7 @@ def record_read_acks(
     """
     if not isinstance(principal, Principal) or not isinstance(effective_scope, Scope):
         raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+    require_opaque_id(action, label="action")
     if effective_scope.checkout_id is None:
         raise BrainError(ErrorCode.NOT_FOUND, "not found")
     require_opaque_id(expected_task_id, label="expected_task_id")
@@ -56,7 +58,7 @@ def record_read_acks(
     if not acks:
         return ()
 
-    if not policy.allows(principal, effective_scope, action="record_outcome"):
+    if not policy.allows(principal, effective_scope, action=action):
         raise BrainError(ErrorCode.NOT_FOUND, "not found")
 
     recorded: list[ArtifactReadAck] = []

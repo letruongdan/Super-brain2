@@ -244,7 +244,7 @@ class KernelSendAttemptStore(KernelSendAttemptPort):
                 raise BrainError(ErrorCode.REVISION_CONFLICT, "revision conflict")
 
             try:
-                txn.db.execute(
+                cur = txn.db.execute(
                     "UPDATE artifact_send_attempt SET state = ? WHERE id = ? AND state = ?",
                     (
                         SendAttemptState.SERVED_ONLY.value,
@@ -254,6 +254,8 @@ class KernelSendAttemptStore(KernelSendAttemptPort):
                 )
             except sqlite3.Error as exc:
                 raise sqlite_error("cannot finalize artifact_send_attempt row", exc) from exc
+            if cur.rowcount != 1:
+                raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
             return replace(existing, state=SendAttemptState.SERVED_ONLY)
 
     def interrupt_attempt(self, send_attempt_id: str) -> ArtifactSendAttempt:
@@ -267,7 +269,7 @@ class KernelSendAttemptStore(KernelSendAttemptPort):
             if existing.state is SendAttemptState.SERVED_ONLY:
                 raise BrainError(ErrorCode.REVISION_CONFLICT, "revision conflict")
             try:
-                txn.db.execute(
+                cur = txn.db.execute(
                     "UPDATE artifact_send_attempt SET state = ? WHERE id = ? AND state = ?",
                     (
                         SendAttemptState.UNKNOWN.value,
@@ -277,6 +279,8 @@ class KernelSendAttemptStore(KernelSendAttemptPort):
                 )
             except sqlite3.Error as exc:
                 raise sqlite_error("cannot interrupt artifact_send_attempt row", exc) from exc
+            if cur.rowcount != 1:
+                raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
             return replace(existing, state=SendAttemptState.UNKNOWN)
 
     def recover_pending_attempts(self) -> int:

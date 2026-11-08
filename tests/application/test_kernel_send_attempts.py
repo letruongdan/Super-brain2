@@ -1535,3 +1535,381 @@ def test_repeated_identical_read_ack_reuses_ack_id(trusted_tmp: Path, os_: OsAda
         assert _count_rows(rt.store, "p_fixture_domain_outcomes") == 2
     finally:
         rt.close()
+
+
+# --- Fix Round 1: pre-insert wire size check, unsent callback isolation, and post-insert 1,475 ms cutoff race ---------
+
+
+def test_r1_oversized_wire_envelope_records_no_pending_send_attempt(
+    trusted_tmp: Path, os_: OsAdapters, clock: FakeClock
+) -> None:
+    from superbrain.core.wire import MAX_WIRE_BODY_BYTES, make_success_envelope
+
+    mono = FakeMonotonicClock()
+    rt = _open_fixture_runtime(trusted_tmp / "root", os_)
+    try:
+        seeded = seed_principal_and_credential(rt.policy)
+        ws = _register_ws(rt, clock, seeded, alias="ws-main", checkout_dir=trusted_tmp / "chk")
+        scope = Scope(ws.repo_id, ws.checkout_id)
+        bridge, domain = _make_bridge_and_domain(rt, clock, mono)
+        task_id, _deliv_id = _prepare_task_on(bridge, token=seeded.token, scope=scope, idem_key="idem_prep_r1_over_1")
+
+        # Case A: 20 valid BoundedText resources (~56 KiB each, <= 64 KiB per string, > 1 MiB total envelope).
+        big_resources = tuple(
+            FixtureResourceSpec(
+                name=f"part-{idx:02d}.md",
+                content=(f"part-{idx:02d}-".encode() + b"x" * 56_000),
+                level="L1",
+            )
+            for idx in range(20)
+        )
+        domain.seed_artifact(
+            bridge,
+            artifact_id="art-oversized-1",
+            revision=1,
+            kind="skill",
+            owner_id=seeded.principal.owner_id,
+            repo_id=ws.repo_id,
+            checkout_id=ws.checkout_id,
+            resources=big_resources,
+        )
+        over_args: dict[str, JsonValue] = {
+            "schema_version": "2.0",
+            "workspace_id": ws.repo_id,
+            "task_id": task_id,
+            "artifact_id": "art-oversized-1",
+            "revision": 1,
+            "level": "L1",
+            "idempotency_key": "idem_art_oversized_01",
+        }
+
+        # 1) Initial call fails with INVALID_INPUT ("payload exceeds size limit") and records ZERO send attempts!
+        env_initial = _run_tool(bridge, "get_artifact", over_args, token=seeded.token, selected_scope=scope)
+        err_initial = _expect_err("get_artifact", env_initial, ErrorCode.INVALID_INPUT)
+        assert err_initial["message"] == "payload exceeds size limit"
+        assert "served_receipt_id" not in canonical_json(env_initial).decode("utf-8")
+        assert _count_rows(rt.store, "artifact_send_attempt") == 0
+
+        # 2) Replay of the same idempotency_key hits the retained StoredResult and ALSO records ZERO send attempts!
+        env_replay = _run_tool(bridge, "get_artifact", over_args, token=seeded.token, selected_scope=scope)
+        err_replay = _expect_err("get_artifact", env_replay, ErrorCode.INVALID_INPUT)
+        assert err_replay["message"] == "payload exceeds size limit"
+        assert domain.apply_calls == 2  # Replay did not re-execute apply()
+        assert _count_rows(rt.store, "artifact_send_attempt") == 0
+
+        # Case B: Near-boundary artifact that fits <= 1 MiB WITHOUT served_receipt_id, but exceeds 1 MiB WITH it!
+        base_chunks = [
+            FixtureResourceSpec(name=f"chunk-{idx:02d}.md", content=(b"c" * 64_000), level="L1") for idx in range(16)
+        ]
+        probe_resources: list[JsonValue] = [
+            {
+                "name": spec.name,
+                "digest": digest_bytes(spec.content),
+                "encoding": "utf-8",
+                "content": spec.content.decode("utf-8"),
+            }
+            for spec in base_chunks
+        ]
+        probe_resources.append(
+            {
+                "name": "tail.md",
+                "digest": "sha256:" + "0" * 64,
+                "encoding": "utf-8",
+                "content": "",
+            }
+        )
+        probe_rendered: dict[str, JsonValue] = {
+            "artifact_id": "art-boundary-1",
+            "revision": 1,
+            "level": "L1",
+            "status": "ok",
+            "resources": probe_resources,
+        }
+        empty_tail_len = len(canonical_json(make_success_envelope(probe_rendered)))
+        tail_len = MAX_WIRE_BODY_BYTES - empty_tail_len - 10  # 10 bytes below 1 MiB without served_receipt_id!
+        assert 1 <= tail_len <= 65_536
+        tail_spec = FixtureResourceSpec(name="tail.md", content=(b"t" * tail_len), level="L1")
+        domain.seed_artifact(
+            bridge,
+            artifact_id="art-boundary-1",
+            revision=1,
+            kind="skill",
+            owner_id=seeded.principal.owner_id,
+            repo_id=ws.repo_id,
+            checkout_id=ws.checkout_id,
+            resources=(*base_chunks, tail_spec),
+        )
+        bound_args: dict[str, JsonValue] = {
+            "schema_version": "2.0",
+            "workspace_id": ws.repo_id,
+            "task_id": task_id,
+            "artifact_id": "art-boundary-1",
+            "revision": 1,
+            "level": "L1",
+            "idempotency_key": "idem_art_boundary_01",
+        }
+        err_bound = _expect_err(
+            "get_artifact",
+            _run_tool(bridge, "get_artifact", bound_args, token=seeded.token, selected_scope=scope),
+            ErrorCode.INVALID_INPUT,
+        )
+        assert err_bound["message"] == "payload exceeds size limit"
+        assert _count_rows(rt.store, "artifact_send_attempt") == 0
+    finally:
+        rt.close()
+
+
+def test_r1_unsent_owner_response_callback_exception_isolated(
+    trusted_tmp: Path, os_: OsAdapters, clock: FakeClock
+) -> None:
+    from superbrain.application.deadlines import KernelDeadlineCoordinator, Reservation, enter_commit
+    from superbrain.core.kernel import Call, CallContext, PrivateRequestAuth
+
+    mono = FakeMonotonicClock()
+    rt = _open_fixture_runtime(trusted_tmp / "root", os_)
+    try:
+        seeded = seed_principal_and_credential(rt.policy)
+        ws = _register_ws(rt, clock, seeded, alias="ws-main", checkout_dir=trusted_tmp / "chk")
+        scope = Scope(ws.repo_id, ws.checkout_id)
+        bridge, _domain = _make_bridge_and_domain(rt, clock, mono)
+
+        seen_unsent: list[CallResult] = []
+
+        def _raising_unsent_hook(unsent: CallResult) -> None:
+            seen_unsent.append(unsent)
+            raise RuntimeError("boom inside on_unsent_owner_response")
+
+        def _owner_runner(
+            _call: Call, _ctx: CallContext, _auth: PrivateRequestAuth, reservation: Reservation
+        ) -> CallResult:
+            assert enter_commit(reservation, mono.monotonic_ns()) is True
+            mono.advance(1_475 * MS)
+            coord.arbitrate()
+            return {
+                "ok": True,
+                "data": {
+                    "artifact_id": "art-iso-1",
+                    "revision": 1,
+                    "level": "L1",
+                    "status": "ok",
+                    "served_receipt_id": new_id(),
+                    "resources": [
+                        {
+                            "name": "L1.md",
+                            "digest": "sha256:" + "a" * 64,
+                            "encoding": "utf-8",
+                            "content": "hello",
+                        }
+                    ],
+                },
+            }
+
+        coord = KernelDeadlineCoordinator(
+            store_id=rt.store.store_id,
+            writer_epoch=rt.lease.epoch,
+            instance_id=new_id(),
+            auth_state=bridge.auth_state,
+            monotonic_clock=mono,
+            owner_runner=_owner_runner,
+            on_unsent_owner_response=_raising_unsent_hook,
+        )
+        sub = coord.submit(
+            "get_artifact",
+            {
+                "schema_version": "2.0",
+                "workspace_id": ws.repo_id,
+                "task_id": new_id(),
+                "artifact_id": "art-iso-1",
+                "revision": 1,
+                "level": "L1",
+                "idempotency_key": "idem_art_unsent_iso_1",
+            },
+            token=seeded.token,
+            selected_scope=scope,
+        )
+        # Must NOT propagate RuntimeError out of process_next on the owner thread!
+        assert coord.process_next(block=False) is True
+        _expect_err("get_artifact", sub.wait(timeout=2.0), ErrorCode.COMMIT_OUTCOME_UNKNOWN)
+        assert len(seen_unsent) == 1
+    finally:
+        rt.close()
+
+
+def test_r1_post_insert_cutoff_race_interrupts_pending_send_attempt_to_unknown(
+    trusted_tmp: Path, os_: OsAdapters, clock: FakeClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from superbrain.application.send_attempts import record_read_acks
+    from superbrain.core.errors import BrainError
+    from superbrain.core.kernel import ArtifactSendAttempt, ArtifactSendSpec, Principal
+    from superbrain.ports.kernel import KernelPolicyPort
+
+    mono = FakeMonotonicClock()
+    rt = _open_fixture_runtime(trusted_tmp / "root", os_)
+    try:
+        seeded = seed_principal_and_credential(rt.policy)
+        ws = _register_ws(rt, clock, seeded, alias="ws-main", checkout_dir=trusted_tmp / "chk")
+        scope = Scope(ws.repo_id, ws.checkout_id)
+        bridge, domain = _make_bridge_and_domain(rt, clock, mono)
+
+        content = b"post-insert 1475ms cutoff race bytes"
+        res_digest = digest_bytes(content)
+        domain.seed_artifact(
+            bridge,
+            artifact_id="art-postcut-1",
+            revision=1,
+            kind="skill",
+            owner_id=seeded.principal.owner_id,
+            repo_id=ws.repo_id,
+            checkout_id=ws.checkout_id,
+            resources=(FixtureResourceSpec(name="L1.md", content=content, level="L1"),),
+        )
+        task_id, delivery_id = _prepare_task_on(bridge, token=seeded.token, scope=scope, idem_key="idem_prep_postcut_1")
+
+        orig_record = bridge._send_attempts.record_pending_attempt
+        raced_attempt_ids: list[str] = []
+
+        def _record_then_cutoff(spec: ArtifactSendSpec) -> ArtifactSendAttempt:
+            attempt = orig_record(spec)
+            raced_attempt_ids.append(attempt.send_attempt_id)
+            with rt.store.transaction() as stxn:
+                mid_row = stxn.db.execute(
+                    "SELECT state FROM artifact_send_attempt WHERE id = ?",
+                    (attempt.send_attempt_id,),
+                ).fetchone()
+            assert mid_row == ("pending",)
+            mono.advance(1_475 * MS)
+            bridge.arbitrate_deadlines()
+            return attempt
+
+        monkeypatch.setattr(bridge._send_attempts, "record_pending_attempt", _record_then_cutoff)
+
+        sub = bridge.submit_request(
+            "get_artifact",
+            {
+                "schema_version": "2.0",
+                "workspace_id": ws.repo_id,
+                "task_id": task_id,
+                "artifact_id": "art-postcut-1",
+                "revision": 1,
+                "level": "L1",
+                "idempotency_key": "idem_art_postcut_01",
+            },
+            token=seeded.token,
+            selected_scope=scope,
+        )
+        assert bridge.process_next_queued(block=False) is True
+        monkeypatch.undo()
+
+        cutoff_env = sub.wait(timeout=2.0)
+        _expect_err("get_artifact", cutoff_env, ErrorCode.COMMIT_OUTCOME_UNKNOWN)
+        assert "served_receipt_id" not in canonical_json(cutoff_env).decode("utf-8")
+
+        assert len(raced_attempt_ids) == 1
+        raced_id = raced_attempt_ids[0]
+        with rt.store.transaction() as stxn:
+            after_row = stxn.db.execute(
+                "SELECT id, state FROM artifact_send_attempt WHERE id = ?",
+                (raced_id,),
+            ).fetchone()
+        assert after_row == (raced_id, "unknown")
+
+        with pytest.raises(BrainError) as exc_fin:
+            bridge.finalize_send_attempt(bridge.build_send_completion(raced_id))
+        assert exc_fin.value.code is ErrorCode.REVISION_CONFLICT
+
+        ack = ReadAckInput(
+            served_receipt_id=raced_id,
+            task_id=task_id,
+            revision=1,
+            resource_digests=(ResourceDigest(name="L1.md", digest=res_digest),),
+        )
+        _expect_err(
+            "record_outcome",
+            _run_tool(
+                bridge,
+                "record_outcome",
+                {
+                    "schema_version": "2.0",
+                    "workspace_id": ws.repo_id,
+                    "delivery_id": delivery_id,
+                    "outcome": "unknown",
+                    "read_acks": [ack.to_dict()],
+                    "idempotency_key": "idem_out_postcut_01",
+                },
+                token=seeded.token,
+                selected_scope=scope,
+            ),
+            ErrorCode.NOT_FOUND,
+        )
+        assert _count_rows(rt.store, "artifact_read_ack") == 0
+
+        # Minor 1: record_read_acks forwards custom action (e.g. "submit_episode") to policy.allows.
+        ok_env = _run_tool(
+            bridge,
+            "get_artifact",
+            {
+                "schema_version": "2.0",
+                "workspace_id": ws.repo_id,
+                "task_id": task_id,
+                "artifact_id": "art-postcut-1",
+                "revision": 1,
+                "level": "L1",
+                "idempotency_key": "idem_art_postcut_02",
+            },
+            token=seeded.token,
+            selected_scope=scope,
+        )
+        ok_data = _expect_ok("get_artifact", ok_env)
+        ok_receipt = str(ok_data["served_receipt_id"])
+        bridge.finalize_send_attempt(bridge.build_send_completion(ok_receipt))
+
+        seen_actions: list[str] = []
+
+        class _EpisodeOnlyPolicyProxy:
+            def __init__(self, inner: KernelPolicyPort) -> None:
+                self._inner = inner
+
+            def allows(self, principal: Principal, s: Scope | None, *, action: str) -> bool:
+                seen_actions.append(action)
+                if action != "submit_episode":
+                    return False
+                return self._inner.allows(principal, s, action=action)
+
+            def __getattr__(self, name: str) -> object:
+                return getattr(self._inner, name)
+
+        proxy = cast(KernelPolicyPort, _EpisodeOnlyPolicyProxy(bridge._policy))
+        valid_ack = ReadAckInput(
+            served_receipt_id=ok_receipt,
+            task_id=task_id,
+            revision=1,
+            resource_digests=(ResourceDigest(name="L1.md", digest=res_digest),),
+        )
+
+        def _check_actions(ktx: KernelTx) -> None:
+            with pytest.raises(BrainError) as exc_default_action:
+                record_read_acks(
+                    ktx,
+                    policy=proxy,
+                    principal=seeded.principal,
+                    effective_scope=scope,
+                    expected_task_id=task_id,
+                    acks=(valid_ack,),
+                )
+            assert exc_default_action.value.code is ErrorCode.NOT_FOUND
+
+            persisted_acks = record_read_acks(
+                ktx,
+                policy=proxy,
+                principal=seeded.principal,
+                effective_scope=scope,
+                expected_task_id=task_id,
+                acks=(valid_ack,),
+                action="submit_episode",
+            )
+            assert len(persisted_acks) == 1
+
+        bridge.strict_store().transact(_check_actions)
+        assert seen_actions == ["record_outcome", "submit_episode"]
+    finally:
+        rt.close()
