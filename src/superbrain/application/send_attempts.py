@@ -2,22 +2,104 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.ids import new_id
+from superbrain.core.jsonvalue import JsonValue
 from superbrain.core.kernel import (
+    OPAQUE_ID_RE,
     ArtifactReadAck,
     Principal,
     ReadAckInput,
+    ResourceDigest,
     Scope,
     SendAttemptState,
     canonicalize_resource_digests,
+    is_strict_int,
     require_opaque_id,
 )
 from superbrain.ports.kernel import KernelPolicyPort, KernelTx
 
-__all__ = ["record_read_acks"]
+__all__ = [
+    "ProjectedReadAck",
+    "extract_projected_read_acks",
+    "record_projected_read_acks",
+    "record_read_acks",
+]
+
+
+@dataclass(frozen=True)
+class ProjectedReadAck:
+    """Post-``PrivacyFilter`` ``ReadAck`` projection deferring resource-name collision checks past auth/state."""
+
+    served_receipt_id: str
+    task_id: str
+    revision: int
+    resource_digests: tuple[tuple[str, str], ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.served_receipt_id, str) or not isinstance(self.task_id, str):
+            raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+        if not is_strict_int(self.revision) or self.revision < 1:
+            raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+        if not isinstance(self.resource_digests, tuple) or not all(
+            isinstance(pair, tuple) and len(pair) == 2 and isinstance(pair[0], str) and isinstance(pair[1], str)
+            for pair in self.resource_digests
+        ):
+            raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+
+
+def extract_projected_read_acks(safe_payload: Mapping[str, JsonValue]) -> tuple[ProjectedReadAck, ...]:
+    """Extract post-``PrivacyFilter`` ``read_acks`` (returns ``()`` when stripped by ``manual_submission=False``)."""
+    if not isinstance(safe_payload, Mapping):
+        raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+    raw_acks = safe_payload.get("read_acks")
+    if raw_acks is None:
+        return ()
+    if not isinstance(raw_acks, list):
+        raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+    extracted: list[ProjectedReadAck] = []
+    for raw_ack in raw_acks:
+        if not isinstance(raw_ack, Mapping) or set(raw_ack) != {
+            "served_receipt_id",
+            "task_id",
+            "revision",
+            "resource_digests",
+        }:
+            raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+        receipt_id = raw_ack["served_receipt_id"]
+        task_id = raw_ack["task_id"]
+        rev = raw_ack["revision"]
+        raw_digests = raw_ack["resource_digests"]
+        if (
+            not isinstance(receipt_id, str)
+            or not isinstance(task_id, str)
+            or type(rev) is not int
+            or not isinstance(rev, int)
+            or rev < 1
+            or not isinstance(raw_digests, list)
+        ):
+            raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+        pairs: list[tuple[str, str]] = []
+        for entry in raw_digests:
+            if not isinstance(entry, Mapping) or set(entry) != {"name", "digest"}:
+                raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+            name = entry["name"]
+            digest = entry["digest"]
+            if not isinstance(name, str) or not isinstance(digest, str):
+                raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+            pairs.append((name, digest))
+        extracted.append(
+            ProjectedReadAck(
+                served_receipt_id=receipt_id,
+                task_id=task_id,
+                revision=rev,
+                resource_digests=tuple(pairs),
+            )
+        )
+    return tuple(extracted)
 
 
 def _allocate_distinct_ack_id(served_receipt_id: str) -> str:
@@ -27,26 +109,17 @@ def _allocate_distinct_ack_id(served_receipt_id: str) -> str:
     return candidate
 
 
-def record_read_acks(
+def record_projected_read_acks(
     tx: KernelTx,
     *,
     policy: KernelPolicyPort,
     principal: Principal,
     effective_scope: Scope,
     expected_task_id: str,
-    acks: Sequence[ReadAckInput],
+    acks: Sequence[ProjectedReadAck],
     action: str = "record_outcome",
 ) -> tuple[ArtifactReadAck, ...]:
-    """Validate and persist client-declared ``ReadAckInput``s inside ``tx`` (C5:114-116).
-
-    Precedence per item:
-    1. Direct PK lookup ``tx.read_send_attempt(ack.served_receipt_id)`` (``None -> NOT_FOUND``).
-    2. Principal, task, durable task-binding scope, and live ``policy.allows`` BEFORE state/digest checks
-       (failure -> ``NOT_FOUND``, never leaking ``IN_PROGRESS`` or ``INVALID_INPUT``).
-    3. State check: ``PENDING -> IN_PROGRESS``; ``UNKNOWN -> NOT_FOUND``; only ``SERVED_ONLY`` proceeds.
-    4. Exact ``revision`` and complete unique ``(name, digest)`` set (mismatch -> static ``INVALID_INPUT``).
-    5. Idempotent ``UNIQUE(served_receipt_id)`` persistence reusing ``existing.ack_id`` across batches/keys.
-    """
+    """Validate and persist post-projection ``ProjectedReadAck``s inside ``tx`` (C5:114-116, I2-T4C-R01)."""
     if not isinstance(principal, Principal) or not isinstance(effective_scope, Scope):
         raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
     require_opaque_id(action, label="action")
@@ -63,8 +136,10 @@ def record_read_acks(
 
     recorded: list[ArtifactReadAck] = []
     for ack in acks:
-        if not isinstance(ack, ReadAckInput):
+        if not isinstance(ack, ProjectedReadAck):
             raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+        if OPAQUE_ID_RE.fullmatch(ack.served_receipt_id) is None:
+            raise BrainError(ErrorCode.NOT_FOUND, "not found")
 
         attempt = tx.read_send_attempt(ack.served_receipt_id)
         if attempt is None:
@@ -94,7 +169,14 @@ def record_read_acks(
         if attempt.state is not SendAttemptState.SERVED_ONLY:
             raise BrainError(ErrorCode.NOT_FOUND, "not found")
 
-        ordered_digests, _ = canonicalize_resource_digests(ack.resource_digests)
+        try:
+            typed_digests = tuple(ResourceDigest(name=n, digest=d) for n, d in ack.resource_digests)
+            ordered_digests, _ = canonicalize_resource_digests(typed_digests)
+        except BrainError as err:
+            if err.code is ErrorCode.INVALID_INPUT:
+                raise BrainError(ErrorCode.INVALID_INPUT, "invalid input") from err
+            raise
+
         if ack.revision != attempt.revision or ordered_digests != attempt.resource_digests:
             raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
 
@@ -127,3 +209,39 @@ def record_read_acks(
         recorded.append(created)
 
     return tuple(recorded)
+
+
+def record_read_acks(
+    tx: KernelTx,
+    *,
+    policy: KernelPolicyPort,
+    principal: Principal,
+    effective_scope: Scope,
+    expected_task_id: str,
+    acks: Sequence[ReadAckInput],
+    action: str = "record_outcome",
+) -> tuple[ArtifactReadAck, ...]:
+    """Validate and persist client-declared ``ReadAckInput``s inside ``tx`` (C5:114-116)."""
+    if not isinstance(acks, Sequence) or isinstance(acks, (str, bytes)):
+        raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+    projected: list[ProjectedReadAck] = []
+    for ack in acks:
+        if not isinstance(ack, ReadAckInput):
+            raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+        projected.append(
+            ProjectedReadAck(
+                served_receipt_id=ack.served_receipt_id,
+                task_id=ack.task_id,
+                revision=ack.revision,
+                resource_digests=tuple((rd.name, rd.digest) for rd in ack.resource_digests),
+            )
+        )
+    return record_projected_read_acks(
+        tx,
+        policy=policy,
+        principal=principal,
+        effective_scope=effective_scope,
+        expected_task_id=expected_task_id,
+        acks=tuple(projected),
+        action=action,
+    )

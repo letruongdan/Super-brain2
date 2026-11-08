@@ -161,6 +161,7 @@ class CallContext:
     identity: Identity
     deadline_ns: int
     selected_scope: Scope | None
+    local_deadline_ns: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.principal, Principal) or not isinstance(self.identity, Identity):
@@ -169,6 +170,10 @@ class CallContext:
             raise BrainError(ErrorCode.INVALID_INPUT, "boolean not allowed for integer")
         if self.selected_scope is not None and not isinstance(self.selected_scope, Scope):
             raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+        if self.local_deadline_ns is not None and (
+            isinstance(self.local_deadline_ns, bool) or type(self.local_deadline_ns) is not int
+        ):
+            raise BrainError(ErrorCode.INVALID_INPUT, "boolean not allowed for integer")
 
 
 @dataclass(frozen=True)

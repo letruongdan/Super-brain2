@@ -6,6 +6,7 @@ import threading
 from collections import deque
 from collections.abc import Callable, Mapping
 from contextlib import suppress
+from dataclasses import replace
 
 from superbrain.application._prequeue import (
     AtomicRequestAuthState,
@@ -26,6 +27,7 @@ from superbrain.application.idempotency import compute_canonical_payload_hmac
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.jsonvalue import JsonValue
 from superbrain.core.kernel import (
+    LOCAL_PHASE_BUDGET_NS,
     Call,
     CallContext,
     CallResult,
@@ -147,7 +149,8 @@ class KernelDeadlineCoordinator:
     ) -> SubmittedKernelRequest:
         reservation: Reservation | None = None
         try:
-            t0_ns = self._monotonic_clock.monotonic_ns() if receive_ns is None else receive_ns
+            adm_start_ns = self._monotonic_clock.monotonic_ns()
+            t0_ns = adm_start_ns if receive_ns is None else receive_ns
             deadlines = RequestDeadlines.from_receive_ns(t0_ns)
             queued = admit_prequeue_request(
                 expected_store_id=self._store_id,
@@ -161,8 +164,12 @@ class KernelDeadlineCoordinator:
                 expected_principal=expected_principal,
                 correlation_id=correlation_id,
             )
-            if receive_ns is not None and self._monotonic_clock.monotonic_ns() >= deadlines.handler_deadline_ns:
+            adm_end_ns = self._monotonic_clock.monotonic_ns()
+            prequeue_local_elapsed_ns = max(0, adm_end_ns - min(t0_ns, adm_start_ns))
+            if adm_end_ns >= deadlines.handler_deadline_ns or prequeue_local_elapsed_ns >= LOCAL_PHASE_BUDGET_NS:
                 raise BrainError(ErrorCode.DEADLINE_EXCEEDED, "deadline exceeded")
+            remaining_local_budget_ns = LOCAL_PHASE_BUDGET_NS - prequeue_local_elapsed_ns
+            queued = replace(queued, remaining_local_budget_ns=remaining_local_budget_ns)
             if queued.scope_key is not None:
                 assert queued.request_digest is not None
                 reservation = self._reservations.reserve(
@@ -232,6 +239,10 @@ class KernelDeadlineCoordinator:
         now_ns = self._monotonic_clock.monotonic_ns()
         if not self._reservations.try_claim_for_owner(reservation, now_ns):
             return True
+        owner_local_deadline_ns = min(
+            now_ns + queued.remaining_local_budget_ns,
+            queued.deadlines.handler_deadline_ns,
+        )
 
         response: CallResult = make_checked_error(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
         try:
@@ -245,6 +256,7 @@ class KernelDeadlineCoordinator:
                 ),
                 deadline_ns=queued.deadlines.total_deadline_ns,
                 selected_scope=queued.selected_scope,
+                local_deadline_ns=owner_local_deadline_ns,
             )
             response = self._owner_runner(call, ctx, queued.auth, reservation)
         except BrainError as err:

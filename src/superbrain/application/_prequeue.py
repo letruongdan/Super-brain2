@@ -82,17 +82,29 @@ class AtomicRequestAuthState(RequestAuthStatePort):
             self._view = None
 
 
-def begin_local_phase(monotonic_ns: Callable[[], int], total_deadline_ns: int) -> int:
-    """Start the shared <=100 ms local admission/filter/observer phase or fail closed with DEADLINE_EXCEEDED."""
-    if not is_strict_int(total_deadline_ns):
+def begin_local_phase(
+    monotonic_ns: Callable[[], int],
+    total_deadline_ns: int,
+    *,
+    local_deadline_ns: int | None = None,
+    local_budget_ns: int = LOCAL_PHASE_BUDGET_NS,
+) -> int:
+    """Start or continue the shared <=100 ms local admission/filter/observer phase or fail closed."""
+    if not is_strict_int(total_deadline_ns) or not is_strict_int(local_budget_ns):
         raise BrainError(ErrorCode.INVALID_INPUT, "boolean not allowed for integer")
+    if local_budget_ns <= 0 or local_budget_ns > LOCAL_PHASE_BUDGET_NS:
+        raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+    handler_deadline_ns = total_deadline_ns - HANDLER_RESERVE_NS
+    if local_deadline_ns is not None:
+        if not is_strict_int(local_deadline_ns):
+            raise BrainError(ErrorCode.INVALID_INPUT, "boolean not allowed for integer")
+        return min(local_deadline_ns, handler_deadline_ns)
     start_ns = monotonic_ns()
     if not is_strict_int(start_ns):
         raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
-    handler_deadline_ns = total_deadline_ns - HANDLER_RESERVE_NS
     if start_ns >= handler_deadline_ns:
         raise BrainError(ErrorCode.DEADLINE_EXCEEDED, "deadline exceeded")
-    return min(start_ns + LOCAL_PHASE_BUDGET_NS, handler_deadline_ns)
+    return min(start_ns + local_budget_ns, handler_deadline_ns)
 
 
 def _decode_scope(raw_scope: JsonValue) -> Scope | None:
@@ -207,6 +219,7 @@ def admit_prequeue_request(
     selected_scope: Scope | None = None,
     expected_principal: Principal | None = None,
     correlation_id: str | None = None,
+    remaining_local_budget_ns: int = LOCAL_PHASE_BUDGET_NS,
 ) -> QueuedKernelRequest:
     """Authenticate, normalize, authorize scope, and freeze canonical bytes using ONLY ``RequestAuthView`` (C3)."""
     require_opaque_id(expected_store_id, label="expected_store_id")
@@ -268,4 +281,5 @@ def admit_prequeue_request(
         scope_key=scope_key,
         request_digest_key_id=request_digest_key_id,
         request_digest=request_digest,
+        remaining_local_budget_ns=remaining_local_budget_ns,
     )

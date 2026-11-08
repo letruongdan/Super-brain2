@@ -32,7 +32,7 @@ from superbrain.application.lineage import (
     resolve_binding,
 )
 from superbrain.application.privacy import PrivacyFilter, filter_policy_for
-from superbrain.application.send_attempts import record_read_acks
+from superbrain.application.send_attempts import extract_projected_read_acks, record_projected_read_acks
 from superbrain.composition.kernel_projections import kernel_store_extensions
 from superbrain.core.canonical import canonical_json, digest_bytes
 from superbrain.core.errors import BrainError, ErrorCode
@@ -53,7 +53,6 @@ from superbrain.core.kernel import (
     LineageRef,
     ObjectRef,
     Principal,
-    ReadAckInput,
     RepoFlags,
     ResourceDigest,
     Scope,
@@ -647,7 +646,7 @@ class FixtureKernelDomain(KernelToolDomain):
         raise BrainError(ErrorCode.CAPABILITY_UNAVAILABLE, "capability unavailable")
 
     def _prepare_task_effect(self, call: Call, ctx: CallContext) -> PreparedEffect:
-        local_deadline = begin_local_phase(self.monotonic_ns, ctx.deadline_ns)
+        local_deadline = begin_local_phase(self.monotonic_ns, ctx.deadline_ns, local_deadline_ns=ctx.local_deadline_ns)
         args = call.arguments
         selector = WorkspaceSelector(
             workspace_id=cast(str | None, args.get("workspace_id")),
@@ -681,6 +680,8 @@ class FixtureKernelDomain(KernelToolDomain):
                 from superbrain.storage.workspaces import StoreKernelTx
 
                 admit_source_snapshot(StoreKernelTx(chk_txn, self.store.cas, self._policy_view()), binding, explicit)
+            if self.monotonic_ns() >= local_deadline:
+                raise BrainError(ErrorCode.DEADLINE_EXCEEDED, "deadline exceeded")
         else:
             observation = observe_within_budget(
                 self.observer,
@@ -874,7 +875,7 @@ class FixtureKernelDomain(KernelToolDomain):
         return PreparedEffect(blobs=tuple(blobs), apply=apply)
 
     def _prepare_get_artifact_effect(self, call: Call, ctx: CallContext) -> PreparedEffect:
-        local_deadline = begin_local_phase(self.monotonic_ns, ctx.deadline_ns)
+        local_deadline = begin_local_phase(self.monotonic_ns, ctx.deadline_ns, local_deadline_ns=ctx.local_deadline_ns)
         scope = call.selected_scope
         if scope is None or scope.checkout_id is None:
             raise BrainError(ErrorCode.NOT_FOUND, "not found")
@@ -957,7 +958,7 @@ class FixtureKernelDomain(KernelToolDomain):
         return PreparedEffect(blobs=(), apply=apply)
 
     def _prepare_record_outcome_effect(self, call: Call, ctx: CallContext) -> PreparedEffect:
-        local_deadline = begin_local_phase(self.monotonic_ns, ctx.deadline_ns)
+        local_deadline = begin_local_phase(self.monotonic_ns, ctx.deadline_ns, local_deadline_ns=ctx.local_deadline_ns)
         scope = call.selected_scope
         if scope is None or scope.checkout_id is None:
             raise BrainError(ErrorCode.NOT_FOUND, "not found")
@@ -980,22 +981,12 @@ class FixtureKernelDomain(KernelToolDomain):
             raise BrainError(ErrorCode.NOT_FOUND, "not found")
         task_id = str(d_row[0])
 
-        raw_read_acks = call.arguments.get("read_acks")
-        parsed_read_acks: list[ReadAckInput] = []
-        if raw_read_acks is not None:
-            if not isinstance(raw_read_acks, list):
-                raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
-            for raw_ack in raw_read_acks:
-                if not isinstance(raw_ack, Mapping):
-                    raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
-                parsed_read_acks.append(ReadAckInput.from_dict(raw_ack))
-        read_acks_tuple = tuple(parsed_read_acks)
-
         fpol = self._filter_policy_for_repo(scope.repo_id)
         safe = PrivacyFilter(self.monotonic_ns).apply(dict(call.arguments), fpol, deadline_ns=local_deadline)
         safe_dict = safe.value if isinstance(safe.value, dict) else {}
         kept_applied = safe_dict.get("applied_refs")
         applied_count = len(kept_applied) if isinstance(kept_applied, list) else 0
+        projected_acks = extract_projected_read_acks(safe_dict)
 
         result_id = new_id()
         outcome_id = new_id()
@@ -1004,14 +995,14 @@ class FixtureKernelDomain(KernelToolDomain):
             self.apply_calls += 1
             if self.before_apply_hook is not None:
                 self.before_apply_hook(tx)
-            if read_acks_tuple:
-                record_read_acks(
+            if projected_acks:
+                record_projected_read_acks(
                     tx,
                     policy=self.policy,
                     principal=ctx.principal,
                     effective_scope=scope,
                     expected_task_id=task_id,
-                    acks=read_acks_tuple,
+                    acks=projected_acks,
                 )
             rec_payload: dict[str, JsonValue] = {
                 "result_id": result_id,

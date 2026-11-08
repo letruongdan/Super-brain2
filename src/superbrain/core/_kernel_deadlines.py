@@ -120,6 +120,7 @@ class QueuedKernelRequest:
     scope_key: ReservationScopeKey | None = None
     request_digest_key_id: str | None = None
     request_digest: str | None = None
+    remaining_local_budget_ns: int = LOCAL_PHASE_BUDGET_NS
 
     def __post_init__(self) -> None:
         require_opaque_id(self.store_id, label="store_id")
@@ -145,4 +146,8 @@ class QueuedKernelRequest:
             require_opaque_id(self.request_digest_key_id, label="request_digest_key_id")
             require_sha256_digest(self.request_digest)
         elif self.request_digest_key_id is not None or self.request_digest is not None:
+            raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+        if not is_strict_int(self.remaining_local_budget_ns):
+            raise BrainError(ErrorCode.INVALID_INPUT, "boolean not allowed for integer")
+        if not (0 < self.remaining_local_budget_ns <= LOCAL_PHASE_BUDGET_NS):
             raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
