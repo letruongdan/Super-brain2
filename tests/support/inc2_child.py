@@ -130,6 +130,7 @@ class Inc2ChildProcess:
         self._inner_pid: int | None = None
         self._events: queue.Queue[dict[str, JsonValue] | None] = queue.Queue()
         self._buffered_events: list[dict[str, JsonValue]] = []
+        self._terminal_result_event: dict[str, JsonValue] | None = None
         self._stderr_lines: list[str] = []
         self._closed = False
 
@@ -204,10 +205,16 @@ class Inc2ChildProcess:
         accept_events: frozenset[str],
         timeout: float,
     ) -> dict[str, JsonValue]:
+        if "result" in accept_events and self._terminal_result_event is not None:
+            return self._terminal_result_event
+
         for idx, buffered in enumerate(self._buffered_events):
             ev_name = buffered.get("event")
             if isinstance(ev_name, str) and ev_name in accept_events:
-                return self._buffered_events.pop(idx)
+                popped = self._buffered_events.pop(idx)
+                if ev_name == "result":
+                    self._terminal_result_event = popped
+                return popped
 
         while True:
             try:
@@ -226,6 +233,8 @@ class Inc2ChildProcess:
                     f"stderr:\n{self.stderr_text()}"
                 )
             ev_name = item.get("event")
+            if ev_name == "result":
+                self._terminal_result_event = item
             if isinstance(ev_name, str) and ev_name in accept_events:
                 return item
             self._buffered_events.append(item)

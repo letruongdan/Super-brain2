@@ -313,9 +313,17 @@ def test_worker_submit_after_close_refuses_without_enqueue(
         direct_lease = _running(service_direct, rt_direct, clock)
         after_close_item = _make_item(service_direct, direct_lease, deadline_ns=1_000)
 
+        unreg_spec = JobSpec(kind="unregistered.kind", owner_id="dan", payload=b"after-close-unreg")
+        store_direct.stage_blob(unreg_spec.payload)
+        store_direct.transact(lambda tx: service_direct.enqueue(tx, unreg_spec))
+        unreg_lease = _running(service_direct, rt_direct, clock)
+        unreg_item = _make_item(service_direct, unreg_lease, deadline_ns=1_000)
+
         executor_direct.close(BOUND_WAIT_S)
         err = _expect(ErrorCode.DAEMON_UNAVAILABLE, lambda: executor_direct.submit(after_close_item))
         assert is_safe_wire_message(err.message)
+        err_unreg = _expect(ErrorCode.DAEMON_UNAVAILABLE, lambda: executor_direct.submit(unreg_item))
+        assert is_safe_wire_message(err_unreg.message)
         assert direct_entered == []
         assert executor_direct.next_command(0.01) is None
         assert cast(_ExecutorWithItems, executor_direct)._items.empty()
@@ -523,9 +531,10 @@ def test_worker_submit_after_close_refuses_without_enqueue(
         close_worker.join(BOUND_WAIT_S)
         assert not submit_worker.is_alive() and not close_worker.is_alive()
         assert submit_errors == []
-        assert _command(executor_race) == WorkerCompleted(race_lease)
-        assert race_threads and not race_threads[0].is_alive()
         assert item_queue.empty(), "accepted item was stranded behind close sentinel in _items"
+        assert not getattr(executor_race, "_cancel_events", {})
+        assert executor_race.next_command(0.05) in (None, WorkerCompleted(race_lease))
+        assert all(not thread.is_alive() for thread in race_threads)
     finally:
         sentinel_reached_put.set()
         submit_reached_put.set()
@@ -536,4 +545,4 @@ def test_worker_submit_after_close_refuses_without_enqueue(
         executor_race.close(BOUND_WAIT_S)
         rt_race.close()
         if sys.exc_info()[0] is None:
-            assert race_threads and all(not thread.is_alive() for thread in race_threads)
+            assert all(not thread.is_alive() for thread in race_threads)

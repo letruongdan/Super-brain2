@@ -191,9 +191,10 @@ def _make_module_trusted_dir(label: str, tmp_path_factory: pytest.TempPathFactor
         base.mkdir(parents=True)
         WindowsPermissionGuard().secure_directory(base)
         return base
-    base = tmp_path_factory.mktemp(label)
-    os.chmod(base, 0o700)
-    return base
+    else:
+        base = tmp_path_factory.mktemp(label)
+        os.chmod(base, 0o700)
+        return base
 
 
 def _clone_owner_only_tree(src: Path, dst: Path) -> None:
@@ -412,6 +413,19 @@ def _expect_brain_error(expected: ErrorCode, action: Callable[[], object]) -> Br
     return caught.value
 
 
+def _wait_until(
+    predicate: Callable[[], bool],
+    *,
+    timeout: float = BOUND_WAIT_S,
+    desc: str = "condition",
+) -> None:
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"Timed out after {timeout}s waiting for {desc}")
+        threading.Event().wait(0.001)
+
+
 def _loosen_permissions(path: Path) -> None:
     if sys.platform == "win32":
         from tests.support.winacl import grant
@@ -613,9 +627,10 @@ def test_two_daemons_have_one_writer(
         loser, lose_ev = losers[0]
         assert lose_ev.get("ok") is False
         assert lose_ev.get("error_code") == ErrorCode.WRITER_HELD.value
-        loser_out = loser.wait_result() if loser._proc.poll() is None else None
-        if loser_out is not None:
-            assert loser_out.returncode != 0
+        loser_out = loser.wait_result()
+        assert loser_out.ok is False
+        assert loser_out.error_code == ErrorCode.WRITER_HELD.value
+        assert loser_out.returncode != 0
 
         raw_ep = win_ev["endpoint"]
         assert isinstance(raw_ep, dict)
@@ -761,7 +776,25 @@ def test_missing_or_wrong_store_never_creates_root(
     assert not (no_lock_root / "writer.lock").exists()
     assert digest_tree(no_lock_root) == snap_no_lock
 
-    # 3. Missing store/brain.db OR missing policy/policy.db -> NOT_FOUND, writer_epoch unbumped, bytes unchanged.
+    # 3a. Existing uninitialized root with only writer.lock (both policy.db and brain.db absent, zero history)
+    #     -> NOT_FOUND without bumping writer_epoch or creating DB directories/files.
+    lock_only_root = trusted_tmp / "lock-only-uninitialized"
+    prepare_data_root(lock_only_root, adapters)
+    lock_only_cfg = DaemonConfig(
+        version=1,
+        data_root=lock_only_root,
+        expected_store_id=_daemon_template.store_id,
+        cert_path=_daemon_template.tls.cert_path,
+        key_path=_daemon_template.tls.key_path,
+    )
+    lock_only_before = (lock_only_root / "writer.lock").read_bytes()
+    snap_lock_only = digest_tree(lock_only_root)
+    _expect_brain_error(ErrorCode.NOT_FOUND, lambda: serve(lock_only_cfg, os_=adapters, clock=clock))
+    assert (lock_only_root / "writer.lock").read_bytes() == lock_only_before
+    assert digest_tree(lock_only_root) == snap_lock_only
+
+    # 3b. Incomplete initialized pair (only store/brain.db OR only policy/policy.db missing)
+    #     -> INTEGRITY_FAILURE without bumping writer_epoch or touching remaining bytes.
     for pair_label, rel_missing in (
         ("missing-db", Path("store/brain.db")),
         ("missing-policy", Path("policy/policy.db")),
@@ -770,7 +803,10 @@ def test_missing_or_wrong_store_never_creates_root(
         (no_pair_root / rel_missing).unlink()
         lock_before = (no_pair_root / "writer.lock").read_bytes()
         snap_no_pair = digest_data_root(no_pair_root)
-        _expect_brain_error(ErrorCode.NOT_FOUND, functools.partial(serve, no_pair_cfg, os_=adapters, clock=clock))
+        _expect_brain_error(
+            ErrorCode.INTEGRITY_FAILURE,
+            functools.partial(serve, no_pair_cfg, os_=adapters, clock=clock),
+        )
         assert not (no_pair_root / rel_missing).exists()
         assert (no_pair_root / "writer.lock").read_bytes() == lock_before
         assert digest_data_root(no_pair_root) == snap_no_pair
@@ -824,9 +860,11 @@ def test_missing_or_wrong_store_never_creates_root(
     assert digest_data_root(v1_root) == v1_snap_before
 
     mixed_root, _, mixed_cfg = _instantiate_case(trusted_tmp, "mixed-schema", _daemon_template)
-    with sqlite3.connect(mixed_root / "policy" / "policy.db") as raw_pol:
-        raw_pol.execute("UPDATE policy_schema SET schema_version = 2, min_reader_version = 2")
-        raw_pol.commit()
+    mixed_pol_db = mixed_root / "policy" / "policy.db"
+    with contextlib.closing(sqlite3.connect(mixed_pol_db)) as raw_pol, raw_pol:
+        raw_pol.execute("PRAGMA journal_mode=DELETE")
+        raw_pol.execute("UPDATE meta SET value = '2' WHERE key IN ('schema_version', 'min_reader_version')")
+    adapters.permissions.secure_file(mixed_pol_db)
     mixed_lock_before = (mixed_root / "writer.lock").read_bytes()
     mixed_snap_before = digest_data_root(mixed_root)
     _expect_brain_error(ErrorCode.MIGRATION_REQUIRED, lambda: serve(mixed_cfg, os_=adapters, clock=clock))
@@ -835,9 +873,11 @@ def test_missing_or_wrong_store_never_creates_root(
 
     # 6. Future unsupported schema version -> UNSUPPORTED_VERSION without modifying DBs or bumping epoch.
     fut_root, _, fut_cfg = _instantiate_case(trusted_tmp, "future-schema", _daemon_template)
-    with sqlite3.connect(fut_root / "store" / "brain.db") as raw_db:
-        raw_db.execute("UPDATE schema_info SET schema_version = 99, min_reader_version = 99")
-        raw_db.commit()
+    fut_store_db = fut_root / "store" / "brain.db"
+    with contextlib.closing(sqlite3.connect(fut_store_db)) as raw_db, raw_db:
+        raw_db.execute("PRAGMA journal_mode=DELETE")
+        raw_db.execute("UPDATE meta SET value = '99' WHERE key IN ('schema_version', 'min_reader_version')")
+    adapters.permissions.secure_file(fut_store_db)
     fut_lock_before = (fut_root / "writer.lock").read_bytes()
     fut_snap_before = digest_data_root(fut_root)
     _expect_brain_error(ErrorCode.UNSUPPORTED_VERSION, lambda: serve(fut_cfg, os_=adapters, clock=clock))
@@ -1428,27 +1468,60 @@ def test_legacy_projection_and_pending_attempt_recovered_before_ready(
         with contextlib.suppress(BrainError):
             loop.stop()
 
-    # Negative control: unknown/corrupt ledger kind during legacy projection rebuild fails closed pre-bind.
-    corrupt_root = trusted_tmp / "corrupt-rebuild"
-    _clone_owner_only_tree(root, corrupt_root)
-    with sqlite3.connect(corrupt_root / "store" / "brain.db") as raw_db:
+    # Negative control A: unsupported handler_version in ledger history fails closed in Store.open pre-bind.
+    corrupt_hist_root = trusted_tmp / "corrupt-history"
+    _clone_owner_only_tree(root, corrupt_hist_root)
+    corrupt_hist_db = corrupt_hist_root / "store" / "brain.db"
+    with contextlib.closing(sqlite3.connect(corrupt_hist_db)) as raw_db, raw_db:
+        raw_db.execute("PRAGMA journal_mode=DELETE")
         raw_db.execute(
             "UPDATE p_provider_invocations_state SET state = 'settled', usage_complete = 0 WHERE invocation_id = ?",
             (inv_v1_inc,),
         )
         raw_db.execute("UPDATE ledger SET handler_version = 99 WHERE kind = 'provider.settled'")
-        raw_db.commit()
-    corrupt_cfg = dataclasses.replace(cfg, data_root=corrupt_root)
-    corrupt_bound: list[BoundLoopbackListener] = []
-    corrupt_loop = create_daemon_owner_loop(
+    adapters.permissions.secure_file(corrupt_hist_db)
+    corrupt_hist_cfg = dataclasses.replace(cfg, data_root=corrupt_hist_root)
+    corrupt_hist_bound: list[BoundLoopbackListener] = []
+    corrupt_hist_loop = create_daemon_owner_loop(
         os_=adapters,
         clock=clock,
-        on_listener_bound=corrupt_bound.append,
+        on_listener_bound=corrupt_hist_bound.append,
     )
-    with pytest.raises(BrainError) as corrupt_err:
-        corrupt_loop.start(corrupt_cfg)
-    assert corrupt_err.value.code in {ErrorCode.UNSUPPORTED_VERSION, ErrorCode.INTEGRITY_FAILURE}
-    assert corrupt_bound == [] and not (corrupt_root / ENDPOINT_NAME).exists()
+    with pytest.raises(BrainError) as corrupt_hist_err:
+        corrupt_hist_loop.start(corrupt_hist_cfg)
+    assert corrupt_hist_err.value.code in {ErrorCode.UNSUPPORTED_VERSION, ErrorCode.INTEGRITY_FAILURE}
+    assert corrupt_hist_bound == [] and not (corrupt_hist_root / ENDPOINT_NAME).exists()
+
+    # Negative control B: Store.open succeeds, legacy (settled, usage_complete=0) row triggers
+    # store.rebuild_projections(), and corrupt ledger.meta blob fails closed with INTEGRITY_FAILURE pre-bind!
+    corrupt_rebuild_root = trusted_tmp / "corrupt-rebuild-meta"
+    _clone_owner_only_tree(root, corrupt_rebuild_root)
+    corrupt_rebuild_db = corrupt_rebuild_root / "store" / "brain.db"
+    with contextlib.closing(sqlite3.connect(corrupt_rebuild_db)) as raw_db, raw_db:
+        raw_db.execute("PRAGMA journal_mode=DELETE")
+        raw_db.execute(
+            "UPDATE p_provider_invocations_state SET state = 'settled', usage_complete = 0 WHERE invocation_id = ?",
+            (inv_v1_inc,),
+        )
+        raw_db.execute("UPDATE ledger SET meta = ? WHERE kind = 'provider.settled'", (b"{}",))
+    adapters.permissions.secure_file(corrupt_rebuild_db)
+    corrupt_rebuild_cfg = dataclasses.replace(cfg, data_root=corrupt_rebuild_root)
+    corrupt_rebuild_bound: list[BoundLoopbackListener] = []
+    rebuild_stages: list[str] = []
+    corrupt_rebuild_loop = create_daemon_owner_loop(
+        os_=adapters,
+        clock=clock,
+        hooks=DaemonTestHooks(
+            after_open_before_rebuild=lambda _rt: rebuild_stages.append("opened"),
+            before_job_recover=lambda _rt: rebuild_stages.append("recovered"),
+        ),
+        on_listener_bound=corrupt_rebuild_bound.append,
+    )
+    _expect_brain_error(ErrorCode.INTEGRITY_FAILURE, lambda: corrupt_rebuild_loop.start(corrupt_rebuild_cfg))
+    assert rebuild_stages == ["opened"]
+    assert corrupt_rebuild_bound == [] and not (corrupt_rebuild_root / ENDPOINT_NAME).exists()
+    with acquire_writer(DataRoot.at(corrupt_rebuild_root), adapters):
+        pass
 
 
 # ===========================================================================
@@ -2186,13 +2259,14 @@ def test_owner_cutoff_settles_once_while_commit_blocked(
     scope_a = Scope(ws_a.repo_id, ws_a.checkout_id)
     tok_a = _daemon_template.cred_a.token
 
+    handler_cutoff_offset_ns = TOTAL_REQUEST_BUDGET_NS - HANDLER_RESERVE_NS  # 1,300 ms
     cutoff_offset_ns = TOTAL_REQUEST_BUDGET_NS - RESPONSE_RESERVE_NS  # 1,475 ms
-    pre_commit_advance_Keys: dict[str, int] = {}
+    pre_commit_advance_keys: dict[str, int] = {}
     late_finish_keys: dict[str, int] = {}
 
     def _before_enter_commit(_res: Reservation | None) -> None:
-        if "active" in pre_commit_advance_Keys:
-            mono.set(pre_commit_advance_Keys.pop("active"))
+        if "active" in pre_commit_advance_keys:
+            mono.set(pre_commit_advance_keys.pop("active"))
 
     def _on_apply(idem_key: str, _res_uuid: str) -> None:
         if idem_key in late_finish_keys:
@@ -2212,14 +2286,52 @@ def test_owner_cutoff_settles_once_while_commit_blocked(
         domain=domain,
         hooks=DaemonTestHooks(before_enter_commit=_before_enter_commit),
     )
-    replay_send_id: str | None = None
+    expected_pending_send_ids: set[str] = set()
     try:
         loop.start(cfg)
 
+        # Subcase 0: Pre-commit 1,300 ms handler cutoff inside before_enter_commit -> enter_commit refuses,
+        # Future settles once with deadline_exceeded, _apply never executes, and scope_key is released!
+        t_pre = mono.now
+        pre_commit_advance_keys["active"] = t_pre + handler_cutoff_offset_ns
+        callbacks_pre: list[OwnerReply] = []
+        fut_pre = loop.submit_reply(
+            ToolCommand(
+                "get_artifact",
+                _artifact_args(ws_a, "idem-cutoff-precommit-0000"),
+                token=tok_a,
+                selected_scope=scope_a,
+            ),
+            t_pre + TOTAL_REQUEST_BUDGET_NS,
+        )
+        fut_pre.add_done_callback(lambda f: callbacks_pre.append(f.result()))
+        rep_pre = fut_pre.result(timeout=BOUND_WAIT_S)
+        assert rep_pre.envelope == {
+            "ok": False,
+            "error": {"code": "deadline_exceeded", "message": "deadline exceeded"},
+        }
+        assert rep_pre.grant_stamp is None and rep_pre.send_completion is None
+        assert len(callbacks_pre) == 1
+        loop.run_owner_action(lambda: None).result(timeout=BOUND_WAIT_S)
+        assert "idem-cutoff-precommit-0000" not in domain.executed_keys
+
+        retry_pre = loop.submit_reply(
+            ToolCommand(
+                "get_artifact",
+                _artifact_args(ws_a, "idem-cutoff-precommit-0000"),
+                token=tok_a,
+                selected_scope=scope_a,
+            ),
+            mono.now + TOTAL_REQUEST_BUDGET_NS,
+        ).result(timeout=BOUND_WAIT_S)
+        assert retry_pre.envelope["ok"] is True
+        assert retry_pre.send_completion is not None
+        expected_pending_send_ids.add(retry_pre.send_completion.send_attempt_id)
+
         # Subcase A: Owner blocked inside COMMITTING past 1,475 ms -> external arbiter settles Future once
         # with commit_outcome_unknown; retry gets in_progress until commit finishes, then replays once!
-        t0 = mono.now
-        pre_commit_advance_Keys["active"] = t0 + 1_290_000_000  # 1,290 ms (< 1,300 ms handler cutoff)
+        t0 = mono.advance(10_000_000)
+        pre_commit_advance_keys["active"] = t0 + 1_290_000_000  # 1,290 ms (< 1,300 ms handler cutoff)
         late_finish_keys["idem-cutoff-blocked-0001"] = t0 + cutoff_offset_ns  # exact 1,475 ms in COMMITTING
 
         callbacks_a: list[OwnerReply] = []
@@ -2259,8 +2371,9 @@ def test_owner_cutoff_settles_once_while_commit_blocked(
             "error": {"code": "in_progress", "message": "operation in progress"},
         }
 
-        # Release blocked commit and verify replay returns the single committed artifact result.
+        # Release blocked commit, fence owner completion, and verify replay returns the single committed result!
         domain.allow_apply_finish.set()
+        loop.run_owner_action(lambda: None).result(timeout=BOUND_WAIT_S)
         replay_a = loop.submit_reply(
             ToolCommand(
                 "get_artifact",
@@ -2272,7 +2385,7 @@ def test_owner_cutoff_settles_once_while_commit_blocked(
         ).result(timeout=BOUND_WAIT_S)
         assert replay_a.envelope["ok"] is True
         assert replay_a.send_completion is not None
-        replay_send_id = replay_a.send_completion.send_attempt_id
+        expected_pending_send_ids.add(replay_a.send_completion.send_attempt_id)
         assert domain.executed_keys.count("idem-cutoff-blocked-0001") == 1
 
         # Subcase B: Timer thread held below cutoff while owner finishes at exact 1,475 ms tick ->
@@ -2300,14 +2413,14 @@ def test_owner_cutoff_settles_once_while_commit_blocked(
             loop.stop()
 
     # Inspect durable artifact_send_attempt rows: zero orphaned PENDING attempts from cutoff-losing calls,
-    # except the explicit replay_a which won settlement and minted 1 pending receipt for 6b flush!
+    # except the explicit retries (retry_pre & replay_a) which won settlement for 6b flush!
     rt_check = reopen_kernel_job_runtime(data_root, _daemon_template.store_id, adapters)
     try:
         with rt_check.store.transaction() as txn:
             rows = txn.db.execute("SELECT id, state FROM artifact_send_attempt").fetchall()
         states_by_id = {str(r[0]): str(r[1]) for r in rows}
         for sid, st in states_by_id.items():
-            if replay_send_id is not None and sid == replay_send_id:
+            if sid in expected_pending_send_ids:
                 assert st == SendAttemptState.PENDING.value
             else:
                 assert st == SendAttemptState.UNKNOWN.value
@@ -2332,10 +2445,12 @@ def test_reserve_enqueue_race_settles_once_on_stop_or_full(
     paused_in_hook = threading.Event()
     release_hook = threading.Event()
     release_hook.set()
+    captured_res: list[Reservation] = []
 
     def _after_reserve_before_enqueue(_res: Reservation) -> None:
         if pause_next_reserve.is_set():
             pause_next_reserve.clear()
+            captured_res.append(_res)
             paused_in_hook.set()
             release_hook.wait(timeout=BOUND_WAIT_S)
 
@@ -2366,30 +2481,38 @@ def test_reserve_enqueue_race_settles_once_on_stop_or_full(
         assert domain.apply_entered.wait(timeout=BOUND_WAIT_S)
 
         # Subcase 1: Pause r_full between reserve and enqueue, fill all 32 slots, expire r_full's handler
-        # budget, and release -> settles once, never executes, and does not leak scope_key!
+        # budget, wait for the external arbiter to settle r_full with deadline_exceeded, and THEN release
+        # into STORE_BUSY rollback -> settles once, never executes, and does not leak scope_key!
         release_hook.clear()
         paused_in_hook.clear()
+        captured_res.clear()
         pause_next_reserve.set()
 
-        race_full_Holder: list[Future[CallResult]] = []
+        race_full_holder: list[Future[CallResult]] = []
         race_full_cbs: list[CallResult] = []
+        sub_full_errors: list[BaseException] = []
 
         def _submit_r_full() -> None:
-            f = loop.submit(
-                ToolCommand(
-                    "submit_episode",
-                    _episode_args(ws_a, "idem-race-full-0001"),
-                    token=tok_a,
-                    selected_scope=scope_a,
-                ),
-                t0 + TOTAL_REQUEST_BUDGET_NS,
-            )
-            f.add_done_callback(lambda done_f: race_full_cbs.append(done_f.result()))
-            race_full_Holder.append(f)
+            try:
+                f = loop.submit(
+                    ToolCommand(
+                        "submit_episode",
+                        _episode_args(ws_a, "idem-race-full-0001"),
+                        token=tok_a,
+                        selected_scope=scope_a,
+                    ),
+                    t0 + TOTAL_REQUEST_BUDGET_NS,
+                )
+                f.add_done_callback(lambda done_f: race_full_cbs.append(done_f.result()))
+                race_full_holder.append(f)
+            except BaseException as exc:  # noqa: BLE001
+                sub_full_errors.append(exc)
 
         t_sub_full = threading.Thread(target=_submit_r_full, daemon=True)
         t_sub_full.start()
         assert paused_in_hook.wait(timeout=BOUND_WAIT_S)
+        assert len(captured_res) == 1
+        paused_res = captured_res[0]
 
         fill_futs = [
             loop.submit(
@@ -2404,14 +2527,24 @@ def test_reserve_enqueue_race_settles_once_on_stop_or_full(
             for i in range(DAEMON_QUEUE_DEPTH)
         ]
 
-        # Advance monotonic clock past r_full's handler deadline (1,300 ms) while still < 10x budget of fillers.
+        # Advance monotonic clock to exact 1,300 ms handler cutoff and wait for arbiter settlement BEFORE release!
         mono.set(t0 + TOTAL_REQUEST_BUDGET_NS - HANDLER_RESERVE_NS)
+        settled_by_arbiter = paused_res.wait_response(timeout=BOUND_WAIT_S)
+        assert settled_by_arbiter == {
+            "ok": False,
+            "error": {"code": "deadline_exceeded", "message": "deadline exceeded"},
+        }
+
         release_hook.set()
         t_sub_full.join(timeout=BOUND_WAIT_S)
-        assert len(race_full_Holder) == 1
-        res_full = race_full_Holder[0].result(timeout=BOUND_WAIT_S)
-        assert res_full["ok"] is False
-        assert cast(dict[str, JsonValue], res_full["error"])["code"] in {"store_busy", "deadline_exceeded"}
+        assert not t_sub_full.is_alive()
+        assert sub_full_errors == []
+        assert len(race_full_holder) == 1
+        res_full = race_full_holder[0].result(timeout=BOUND_WAIT_S)
+        assert res_full == {
+            "ok": False,
+            "error": {"code": "deadline_exceeded", "message": "deadline exceeded"},
+        }
         assert len(race_full_cbs) == 1
 
         # Drain #0 and the 32 fillers, then prove "idem-race-full-0001" was NOT executed and is NOT leaked!
@@ -2461,12 +2594,11 @@ def test_reserve_enqueue_race_settles_once_on_stop_or_full(
         t_stopper = threading.Thread(target=lambda: stop_holder.append(loop.stop(grace_s=2.0).state), daemon=True)
         t_stopper.start()
 
-        # Wait with bounded deadline until stop() closes AuthGate, then release r_stop!
-        wait_deadline = time.monotonic() + BOUND_WAIT_S
-        while not loop.auth_gate.closed:
-            if time.monotonic() >= wait_deadline:
-                raise AssertionError("Timed out waiting for OwnerLoop.stop() to close AuthGate")
-            threading.Event().wait(0.001)
+        # Wait with bounded deadline until stop() clears ready and closes AuthGate, then release r_stop!
+        _wait_until(
+            lambda: loop.ready is None and loop.auth_gate.closed,
+            desc="OwnerLoop.stop() to clear ready and close AuthGate",
+        )
         release_hook.set()
 
         t_sub_stop.join(timeout=BOUND_WAIT_S)
@@ -2490,7 +2622,7 @@ def test_reserve_enqueue_race_settles_once_on_stop_or_full(
     rt_verify = reopen_kernel_job_runtime(data_root, _daemon_template.store_id, adapters)
     try:
         with rt_verify.store.transaction() as txn:
-            count = int(txn.db.execute("SELECT COUNT(*) FROM idempotency_entry").fetchone()[0])
+            count = int(txn.db.execute("SELECT COUNT(*) FROM idempotency").fetchone()[0])
         # 1 hold + 32 fillers + 1 retry_after_full = 34 (idem-race-stop-0002 was never committed).
         assert count == 1 + DAEMON_QUEUE_DEPTH + 1
     finally:
@@ -2569,11 +2701,7 @@ def test_shutdown_keeps_lock_until_handles_close(
 
         t_stop = threading.Thread(target=_do_clean_stop, daemon=True)
         t_stop.start()
-        clean_stop_deadline = time.monotonic() + BOUND_WAIT_S
-        while loop_clean.ready is not None:
-            if time.monotonic() >= clean_stop_deadline:
-                raise AssertionError("Timed out waiting for OwnerLoop.stop() to clear ready")
-            threading.Event().wait(0.001)
+        _wait_until(lambda: loop_clean.ready is None, desc="OwnerLoop.stop() to clear ready")
 
         # Post-stop submit is immediately refused while in-flight commit drains to completion.
         refused = loop_clean.submit(
@@ -2602,7 +2730,7 @@ def test_shutdown_keeps_lock_until_handles_close(
     rt_reopen = reopen_kernel_job_runtime(clean_root, _daemon_template.store_id, adapters)
     try:
         with rt_reopen.store.transaction() as txn:
-            assert int(txn.db.execute("SELECT COUNT(*) FROM idempotency_entry").fetchone()[0]) == 1
+            assert int(txn.db.execute("SELECT COUNT(*) FROM idempotency").fetchone()[0]) == 1
     finally:
         rt_reopen.close()
 
@@ -2621,7 +2749,7 @@ def test_shutdown_keeps_lock_until_handles_close(
 
     def _slow_job_handler(_spec: JobSpec, ctx: JobContext) -> tuple[ObjectRef, ...]:
         worker_entered.set()
-        if ctx.cancelled.wait(timeout=BOUND_WAIT_S):
+        if ctx.wait_cancelled(BOUND_WAIT_S) and ctx.cancelled():
             worker_saw_cancel.set()
         release_worker.wait(timeout=BOUND_WAIT_S)
         return ()
@@ -2710,7 +2838,7 @@ def test_shutdown_keeps_lock_until_handles_close(
     rt_after = reopen_kernel_job_runtime(over_root, _daemon_template.store_id, adapters)
     try:
         with rt_after.store.transaction() as txn:
-            assert int(txn.db.execute("SELECT COUNT(*) FROM idempotency_entry").fetchone()[0]) == 1
+            assert int(txn.db.execute("SELECT COUNT(*) FROM idempotency").fetchone()[0]) == 1
         svc_after, _ = kernel_job_service(rt_after, clock)
         rec = svc_after.recover(rt_after.lease.epoch)
         assert rec.jobs_requeued == 1
