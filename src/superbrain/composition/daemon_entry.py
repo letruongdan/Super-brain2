@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import contextlib
-import datetime as dt
 import signal
 import threading
 from collections.abc import Callable, Iterator, Mapping
+from datetime import datetime
 from pathlib import Path
 from types import FrameType
 
@@ -46,6 +46,7 @@ from superbrain.core.kernel import (
     SendAttemptCompletion,
     ShallowHealthMeta,
     ShutdownState,
+    require_aware_utc,
 )
 from superbrain.ports.clock import Clock, MonotonicClock
 from superbrain.ports.os import OsAdapters
@@ -66,6 +67,15 @@ __all__ = [
 ]
 
 
+def _check_tls_utc_window(clock: Clock, not_before: datetime, not_after: datetime) -> None:
+    try:
+        now_utc, _ = require_aware_utc(clock.now())
+    except BrainError as err:
+        raise BrainError(ErrorCode.INVALID_INPUT, "invalid input") from err
+    if not (not_before <= now_utc < not_after):
+        raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+
+
 def _open_owner_session(
     config: DaemonConfig,
     owner_wake: Callable[[], None],
@@ -84,6 +94,10 @@ def _open_owner_session(
     resolved_mono = monotonic_clock if monotonic_clock is not None else adapters.monotonic
     resolved_handlers = PRODUCTION_JOB_HANDLERS if job_handlers is None else job_handlers
 
+    try:
+        require_aware_utc(resolved_clock.now())
+    except BrainError as err:
+        raise BrainError(ErrorCode.INVALID_INPUT, "invalid input") from err
     verified_tls = verify_server_tls_files(config, resolved_clock, adapters)
     ssl_ctx = build_server_ssl_context(config)
     if hooks.after_tls_verify is not None:
@@ -102,6 +116,8 @@ def _open_owner_session(
             hooks.after_open_before_rebuild(rt)
         if has_legacy_incomplete_settled_projections(rt.store, rt.lease):
             rt.store.rebuild_projections()
+            if has_legacy_incomplete_settled_projections(rt.store, rt.lease):
+                raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
 
         if resolved_handlers:
             executor = JobExecutor(resolved_handlers, resolved_mono.monotonic_ns, on_command=owner_wake)
@@ -124,6 +140,8 @@ def _open_owner_session(
         reply_meta_lock = threading.Lock()
         reply_meta: dict[str, tuple[AuthGrantStamp | None, SendAttemptCompletion | None]] = {}
 
+        session_box: list[_AdmittedOwnerSession] = []
+
         def _on_reply_ready(
             res: Reservation,
             stamp: AuthGrantStamp | None,
@@ -136,6 +154,8 @@ def _open_owner_session(
             if not won:
                 with reply_meta_lock:
                     reply_meta.pop(res.reservation_id, None)
+            elif session_box:
+                session_box[0].record_request_drained()
 
         composite_domain = _DaemonCompositeDomain(job_service, domain)
         bridge = KernelBridge(
@@ -189,15 +209,13 @@ def _open_owner_session(
 
         if hooks.before_bind is not None:
             hooks.before_bind(rt)
-        now_prebind = resolved_clock.now().astimezone(dt.UTC)
-        if not (verified_tls.not_before <= now_prebind < verified_tls.not_after):
-            raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+        _check_tls_utc_window(resolved_clock, verified_tls.not_before, verified_tls.not_after)
 
         listener = bind_loopback_listener(ssl_ctx)
         if on_listener_bound is not None:
             on_listener_bound(listener)
 
-        endpoint = Endpoint(
+        candidate_endpoint = Endpoint(
             version=ENDPOINT_VERSION,
             host=ENDPOINT_HOST,
             port=listener.port,
@@ -206,14 +224,14 @@ def _open_owner_session(
             instance_id=instance_id,
         )
         if hooks.before_endpoint_publish is not None:
-            hooks.before_endpoint_publish(endpoint)
+            hooks.before_endpoint_publish(candidate_endpoint)
+        _check_tls_utc_window(resolved_clock, verified_tls.not_before, verified_tls.not_after)
+        endpoint = candidate_endpoint
         publish_endpoint(rt.root, rt.lease, endpoint, adapters)
 
         if hooks.after_endpoint_publish_before_final_tls_check is not None:
             hooks.after_endpoint_publish_before_final_tls_check(endpoint)
-        now_final = resolved_clock.now().astimezone(dt.UTC)
-        if not (verified_tls.not_before <= now_final < verified_tls.not_after):
-            raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+        _check_tls_utc_window(resolved_clock, verified_tls.not_before, verified_tls.not_after)
 
         if executor is not None:
             executor.start()
@@ -225,7 +243,7 @@ def _open_owner_session(
             tls_not_after=verified_tls.not_after,
             leaf_cert_sha256=verified_tls.leaf_cert_sha256,
         )
-        return _AdmittedOwnerSession(
+        session = _AdmittedOwnerSession(
             rt=rt,
             ready=ready,
             auth_gate=auth_gate,
@@ -240,6 +258,8 @@ def _open_owner_session(
             reply_meta_lock=reply_meta_lock,
             reply_meta=reply_meta,
         )
+        session_box.append(session)
+        return session
     except BaseException:
         if auth_gate is not None:
             auth_gate.close()

@@ -227,11 +227,14 @@ class KernelBridge(KernelBlobStagePort):
             self._on_clock_untrusted_changed(self._idempotency.clock_untrusted())
         if result.get("ok") is False:
             err_obj = result.get("error")
-            if isinstance(err_obj, Mapping) and err_obj.get("code") in (
+            err_code = err_obj.get("code") if isinstance(err_obj, Mapping) else None
+            if err_code in (
                 ErrorCode.IDENTITY_MISMATCH.value,
                 ErrorCode.POLICY_UNAVAILABLE.value,
             ):
                 self._auth_state.clear()
+            elif err_code == ErrorCode.UNAUTHENTICATED.value:
+                self._clear_auth_if_diverged(auth.credential_id)
             return result
         if self._on_owner_reply_ready is not None:
             stamp = self._mint_owner_grant_stamp(auth.credential_id)
@@ -244,9 +247,45 @@ class KernelBridge(KernelBlobStagePort):
             self._on_owner_reply_ready(reservation, stamp, completion)
         return result
 
-    def _mint_owner_grant_stamp(self, credential_id: str) -> AuthGrantStamp | None:
-        view = self._auth_state.current()
+    def _clear_auth_if_diverged(self, credential_id: str) -> None:
+        try:
+            view = self._auth_state.current()
+        except BrainError:
+            self._auth_state.clear()
+            return
         if view is None:
+            return
+        cred = view.auth.credentials.get(credential_id)
+        if (
+            cred is not None
+            and not cred.revoked
+            and view.auth.principals.get(cred.principal.principal_id) == cred.principal
+        ):
+            self._auth_state.clear()
+            return
+        try:
+            live_snap = self._policy.snapshot()
+        except BrainError:
+            self._auth_state.clear()
+            return
+        if view.auth != live_snap:
+            self._auth_state.clear()
+
+    def _mint_owner_grant_stamp(self, credential_id: str) -> AuthGrantStamp | None:
+        try:
+            view = self._auth_state.current()
+        except BrainError:
+            self._auth_state.clear()
+            return None
+        if view is None:
+            return None
+        try:
+            live_snap = self._policy.snapshot()
+        except BrainError:
+            self._auth_state.clear()
+            return None
+        if view.auth != live_snap:
+            self._auth_state.clear()
             return None
         cred = view.auth.credentials.get(credential_id)
         if cred is None or cred.revoked or view.auth.principals.get(cred.principal.principal_id) != cred.principal:

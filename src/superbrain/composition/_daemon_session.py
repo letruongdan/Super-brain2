@@ -168,6 +168,11 @@ class _AdmittedOwnerSession(OwnerSession):
         self._hooks = hooks
         self._reply_meta_lock = reply_meta_lock
         self._reply_meta = reply_meta
+        self._metrics_lock = threading.Lock()
+        self._stopping = False
+        self._overrun = False
+        self._drained_requests = 0
+        self._worker_join_failed = False
 
     @property
     def ready(self) -> Ready:
@@ -261,6 +266,26 @@ class _AdmittedOwnerSession(OwnerSession):
     def has_pending_owner_work(self) -> bool:
         return self._bridge.queue_depth() > 0
 
+    def mark_stopping(self) -> None:
+        with self._metrics_lock:
+            self._stopping = True
+
+    def mark_overrun(self) -> None:
+        with self._metrics_lock:
+            self._overrun = True
+
+    def record_request_drained(self) -> None:
+        with self._metrics_lock:
+            if self._stopping and not self._overrun:
+                self._drained_requests += 1
+
+    def shutdown_metrics(self) -> tuple[int, bool]:
+        with self._metrics_lock:
+            drained = self._drained_requests
+            join_failed = self._worker_join_failed
+        worker_drained = self._executor is None or (not join_failed and self._executor.is_drained)
+        return drained, worker_drained
+
     def begin_stop(self) -> None:
         self._listener.close()
         self._auth_gate.close()
@@ -271,7 +296,11 @@ class _AdmittedOwnerSession(OwnerSession):
     def join_worker(self, timeout_s: float) -> bool:
         if self._executor is None:
             return True
-        return self._executor.close(max(0.0, timeout_s))
+        drained = self._executor.close(max(0.0, timeout_s))
+        if not drained:
+            with self._metrics_lock:
+                self._worker_join_failed = True
+        return drained
 
     def cancel_uncommitted_for_shutdown(self) -> int:
         return self._bridge.cancel_uncommitted_for_shutdown()
@@ -304,17 +333,21 @@ class _AdmittedOwnerSession(OwnerSession):
     ) -> WorkspaceBinding:
         return self._bridge.register_workspace(registration, authorization)
 
-    def teardown_on_owner(self, *, overrun: bool) -> ShutdownReport:
+    def teardown_on_owner(self, *, overrun: bool, cancelled_requests: int = 0) -> ShutdownReport:
         self._listener.close()
         self._auth_gate.close()
         if self._executor is not None:
             self._executor.close(0.0)
+        drained, worker_drained = self.shutdown_metrics()
         removed = False
         try:
             removed = remove_own_endpoint(self._rt.root, self._rt.lease, self._ready.endpoint, self._rt.os_)
         except BrainError as err:
             return ShutdownReport(
                 state=ShutdownState.CLOSE_FAILED,
+                drained_requests=drained,
+                cancelled_requests=cancelled_requests,
+                worker_drained=worker_drained,
                 endpoint_removed=False,
                 error_code=err.code,
             )
@@ -325,23 +358,35 @@ class _AdmittedOwnerSession(OwnerSession):
         except BrainError as err:
             return ShutdownReport(
                 state=ShutdownState.CLOSE_FAILED,
+                drained_requests=drained,
+                cancelled_requests=cancelled_requests,
+                worker_drained=worker_drained,
                 endpoint_removed=removed,
                 error_code=err.code,
             )
         except Exception:  # noqa: BLE001
             return ShutdownReport(
                 state=ShutdownState.CLOSE_FAILED,
+                drained_requests=drained,
+                cancelled_requests=cancelled_requests,
+                worker_drained=worker_drained,
                 endpoint_removed=removed,
                 error_code=ErrorCode.IO_ERROR,
             )
         if overrun:
             return ShutdownReport(
                 state=ShutdownState.OVERRUN,
+                drained_requests=drained,
+                cancelled_requests=cancelled_requests,
+                worker_drained=worker_drained,
                 endpoint_removed=removed,
                 error_code=ErrorCode.DEADLINE_EXCEEDED,
             )
         return ShutdownReport(
             state=ShutdownState.STOPPED,
+            drained_requests=drained,
+            cancelled_requests=cancelled_requests,
+            worker_drained=worker_drained,
             endpoint_removed=removed,
             error_code=None,
         )

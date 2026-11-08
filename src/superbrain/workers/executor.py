@@ -129,6 +129,12 @@ class JobExecutor:
             self._thread = thread
         thread.start()
 
+    @property
+    def is_drained(self) -> bool:
+        with self._lock:
+            thread = self._thread
+        return thread is None or not thread.is_alive()
+
     def close(self, timeout_s: float = 5.0) -> bool:
         """Stop after the current item; items still queued are dropped (the owner recovers them by epoch)."""
         with self._lock:

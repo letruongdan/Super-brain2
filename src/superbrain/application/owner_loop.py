@@ -93,6 +93,12 @@ class OwnerSession(Protocol):
 
     def has_pending_owner_work(self) -> bool: ...
 
+    def mark_stopping(self) -> None: ...
+
+    def mark_overrun(self) -> None: ...
+
+    def shutdown_metrics(self) -> tuple[int, bool]: ...
+
     def begin_stop(self) -> None: ...
 
     def join_worker(self, timeout_s: float) -> bool: ...
@@ -113,7 +119,7 @@ class OwnerSession(Protocol):
         authorization: BootstrapAuthorization,
     ) -> WorkspaceBinding: ...
 
-    def teardown_on_owner(self, *, overrun: bool) -> ShutdownReport: ...
+    def teardown_on_owner(self, *, overrun: bool, cancelled_requests: int = 0) -> ShutdownReport: ...
 
     def adopt_after_owner_exit(self, exited_owner: threading.Thread) -> None: ...
 
@@ -144,6 +150,9 @@ class OwnerLoop:
 
         self._internal_lock = threading.Lock()
         self._internal_queue: deque[Callable[[], None]] = deque()
+        self._overrun_lock = threading.Lock()
+        self._overrun_cancelled = False
+        self._cancelled_requests = 0
         self._owner_thread: threading.Thread | None = None
         self._arbiter_thread: threading.Thread | None = None
 
@@ -334,6 +343,17 @@ class OwnerLoop:
             raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
         return self._enqueue_internal(lambda _s: action())
 
+    def _trigger_overrun(self, session: OwnerSession) -> int:
+        with self._overrun_lock:
+            if not self._overrun_cancelled and not self._closed_done.is_set():
+                self._overrun_cancelled = True
+                self._drain_expired = True
+                session.mark_overrun()
+                self._cancelled_requests += session.cancel_uncommitted_for_shutdown()
+                self._cancel_pending_internal()
+                self._owner_wake.set()
+            return self._cancelled_requests
+
     def stop(self, grace_s: float = DEFAULT_SHUTDOWN_GRACE_S) -> ShutdownReport:
         if (
             isinstance(grace_s, bool)
@@ -343,7 +363,7 @@ class OwnerLoop:
         ):
             raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
 
-        wall_deadline = time.perf_counter() + float(grace_s)
+        candidate_deadline = time.perf_counter() + float(grace_s)
         with self._lifecycle_lock:
             if not self._started or self._session is None:
                 raise _unavailable_error()
@@ -352,7 +372,11 @@ class OwnerLoop:
             if first_stopper:
                 self._stopping = True
                 self._ready_value = None
-                self._stop_wall_deadline = wall_deadline
+                self._stop_wall_deadline = candidate_deadline
+                session.mark_stopping()
+                wall_deadline = candidate_deadline
+            else:
+                wall_deadline = self._stop_wall_deadline
 
         if first_stopper:
             session.begin_stop()
@@ -366,16 +390,17 @@ class OwnerLoop:
             return self._final_report
 
         # Grace budget expired while owner thread is still busy/blocked -> cancel uncommitted & report OVERRUN!
-        self._drain_expired = True
-        session.cancel_uncommitted_for_shutdown()
-        self._cancel_pending_internal()
-        self._owner_wake.set()
+        cancelled_total = self._trigger_overrun(session)
         if self._closed_done.wait(timeout=0.02):
             self._join_and_adopt_if_failed(session)
             assert self._final_report is not None
             return self._final_report
+        drained, worker_drained = session.shutdown_metrics()
         return ShutdownReport(
             state=ShutdownState.OVERRUN,
+            drained_requests=drained,
+            cancelled_requests=cancelled_total,
+            worker_drained=worker_drained,
             endpoint_removed=False,
             error_code=ErrorCode.DEADLINE_EXCEEDED,
         )
@@ -483,7 +508,7 @@ class OwnerLoop:
                 if self._stopping and not self._has_internal() and not session.has_pending_owner_work():
                     rem_worker = max(0.0, self._stop_wall_deadline - time.perf_counter())
                     if not session.join_worker(rem_worker):
-                        self._drain_expired = True
+                        self._trigger_overrun(session)
                     else:
                         session.step_owner_work(allow_new_jobs=False)
                     break
@@ -497,5 +522,11 @@ class OwnerLoop:
             self._arbiter_stop = True
             self._arbiter_wake.set()
             arbiter.join(timeout=1.0)
-            self._final_report = session.teardown_on_owner(overrun=self._drain_expired)
+            with self._overrun_lock:
+                overrun = self._drain_expired
+                cancelled_total = self._cancelled_requests
+            self._final_report = session.teardown_on_owner(
+                overrun=overrun,
+                cancelled_requests=cancelled_total,
+            )
             self._closed_done.set()
