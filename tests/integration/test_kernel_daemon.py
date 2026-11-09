@@ -31,7 +31,7 @@ import threading
 import time
 import uuid
 import warnings
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -120,7 +120,7 @@ from superbrain.storage.layout import (
     check_endpoint_entries_under_lease,
     prepare_data_root,
 )
-from superbrain.storage.ledger import LedgerEntry, ProjectionHandler
+from superbrain.storage.ledger import LedgerEntry, ProjectionHandler, Txn
 from superbrain.storage.runtime import Runtime, open_runtime
 from superbrain.storage.schema import POLICY_MIGRATIONS, STORE_MIGRATIONS
 from superbrain.storage.send_attempts import KernelSendAttemptStore, read_send_attempt_row
@@ -4465,4 +4465,173 @@ def test_claim_admitted_before_stop_skips_handler_and_recovers_on_next_epoch(
         assert (fin_row.state, fin_row.attempt) == (JobState.SUCCEEDED, 2)
     finally:
         rt_fin.close()
+
+
+def test_first_and_concurrent_stop_honor_cutoff_while_job_leased_sqlite_append_blocked(
+    trusted_tmp: Path,
+    _daemon_template: _DaemonTemplate,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P2-B1: First & concurrent ``stop()`` honor shared cutoff while SQLite ``job.leased`` append is stalled."""
+    base_now = _daemon_template.base_time + dt.timedelta(minutes=5)
+    root, _, cfg = _instantiate_case(trusted_tmp, "p2-b1-lease-append-cutoff", _daemon_template)
+    clock = FakeClock(base_now)
+    adapters = os_adapters(clock=clock)
+
+    rt_seed = reopen_kernel_job_runtime(root, _daemon_template.store_id, adapters)
+    try:
+        svc_seed, st_seed = kernel_job_service(rt_seed, clock)
+        due = enqueue_job(svc_seed, st_seed, owner_id="dan", payload=b"p2-b1-sqlite-lease-stall")
+    finally:
+        rt_seed.close()
+
+    sqlite_paused = threading.Event()
+    release_sqlite = threading.Event()
+    sqlite_resumed = threading.Event()
+    progress_timed_out = threading.Event()
+    handler_ran = threading.Event()
+    before_close_checks: list[bool] = []
+
+    def _before_close(rt: Runtime) -> None:
+        assert not rt.store.closed and not rt.policy.closed and rt.lease.held
+        _expect_brain_error(ErrorCode.WRITER_HELD, lambda: acquire_writer(DataRoot.at(root), adapters))
+        before_close_checks.append(True)
+
+    def _handler(_spec: JobSpec, _ctx: JobContext) -> tuple[ObjectRef, ...]:
+        handler_ran.set()
+        return ()
+
+    orig_append = Txn.append
+    installed_for_due = False
+
+    def _patched_append(
+        tx: Txn,
+        kind: str,
+        *,
+        actor: str,
+        owner_id: str | None,
+        meta: Mapping[str, JsonValue],
+        refs: Sequence[str] = (),
+    ) -> LedgerEntry:
+        nonlocal installed_for_due
+        if not installed_for_due and kind == "job.leased" and meta.get("job_id") == due.job_id:
+            installed_for_due = True
+            paused_callback = False
+
+            def _progress() -> int:
+                nonlocal paused_callback
+                if not paused_callback:
+                    paused_callback = True
+                    sqlite_paused.set()
+                    if not release_sqlite.wait(BOUND_WAIT_S):
+                        progress_timed_out.set()
+                        return 1
+                    sqlite_resumed.set()
+                return 0
+
+            conn = tx.db
+            conn.set_progress_handler(_progress, 1)
+            try:
+                return orig_append(tx, kind, actor=actor, owner_id=owner_id, meta=meta, refs=refs)
+            finally:
+                conn.set_progress_handler(None, 0)
+        return orig_append(tx, kind, actor=actor, owner_id=owner_id, meta=meta, refs=refs)
+
+    monkeypatch.setattr(Txn, "append", _patched_append)
+
+    loop = create_daemon_owner_loop(
+        os_=adapters,
+        clock=clock,
+        job_handlers={FIXTURE_JOB_KIND: _handler},
+        hooks=DaemonTestHooks(before_runtime_close=_before_close),
+    )
+    first_rep: ShutdownReport | None = None
+    first_returned_before_sqlite_release = False
+    second_returned_before_sqlite_release = False
+    try:
+        ready = loop.start(cfg)
+        old_epoch = ready.identity.writer_epoch
+        assert sqlite_paused.wait(BOUND_WAIT_S), "owner did not enter SQLite Txn.append('job.leased')"
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first_fut = pool.submit(loop.stop, grace_s=0.08)
+            _wait_until(lambda: loop.ready is None, desc="first stop caller to lock shared cutoff")
+            second_fut = pool.submit(loop.stop, grace_s=2.0)
+            try:
+                second_rep = second_fut.result(timeout=1.5)
+                second_returned_before_sqlite_release = not sqlite_resumed.is_set()
+                try:
+                    first_rep = first_fut.result(timeout=0.35)
+                    first_returned_before_sqlite_release = not sqlite_resumed.is_set()
+                except TimeoutError:
+                    first_returned_before_sqlite_release = False
+                if first_returned_before_sqlite_release:
+                    assert not sqlite_resumed.is_set()
+                    assert loop.wait_closed(timeout=0.0) is None
+                    _expect_brain_error(
+                        ErrorCode.WRITER_HELD,
+                        lambda: acquire_writer(DataRoot.at(root), adapters),
+                    )
+            finally:
+                release_sqlite.set()
+
+            if first_rep is None:
+                first_rep = first_fut.result(timeout=BOUND_WAIT_S)
+            final_rep = loop.wait_closed(timeout=BOUND_WAIT_S)
+    finally:
+        release_sqlite.set()
+        with contextlib.suppress(BrainError):
+            loop.stop()
+        monkeypatch.undo()
+
+    assert not progress_timed_out.is_set()
+    assert second_returned_before_sqlite_release is True
+    assert first_returned_before_sqlite_release is True
+    assert first_rep is not None
+    assert (first_rep.state, first_rep.error_code, first_rep.endpoint_removed) == (
+        ShutdownState.OVERRUN,
+        ErrorCode.DEADLINE_EXCEEDED,
+        False,
+    )
+    assert (second_rep.state, second_rep.error_code, second_rep.endpoint_removed) == (
+        ShutdownState.OVERRUN,
+        ErrorCode.DEADLINE_EXCEEDED,
+        False,
+    )
+    assert final_rep is not None
+    assert (final_rep.state, final_rep.error_code, final_rep.endpoint_removed) == (
+        ShutdownState.OVERRUN,
+        ErrorCode.DEADLINE_EXCEEDED,
+        True,
+    )
+    assert before_close_checks == [True]
+    assert handler_ran.is_set() is False
+
+    reopened = reopen_kernel_job_runtime(root, _daemon_template.store_id, adapters)
+    try:
+        svc_re, st_re = kernel_job_service(reopened, clock)
+        pre_row = st_re.transact(lambda tx: tx.read_job(due.job_id))
+        assert pre_row is not None
+        assert (pre_row.state, pre_row.attempt, pre_row.writer_epoch) == (
+            JobState.LEASED,
+            1,
+            old_epoch,
+        )
+        assert pre_row.lease_id is not None
+        assert [
+            e.kind
+            for e in reopened.store.entries()
+            if e.kind in {"job.leased", "job.running"} and e.meta.get("job_id") == due.job_id
+        ] == ["job.leased"]
+        assert svc_re.recover(reopened.lease.epoch) == RecoveryCounts(0, 1, 0)
+        post_row = st_re.transact(lambda tx: tx.read_job(due.job_id))
+        assert post_row is not None
+        assert (post_row.state, post_row.attempt, post_row.writer_epoch, post_row.lease_id) == (
+            JobState.QUEUED,
+            2,
+            None,
+            None,
+        )
+    finally:
+        reopened.close()
+
 
