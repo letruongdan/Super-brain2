@@ -14,11 +14,7 @@ from dataclasses import replace
 from typing import Protocol, TypeVar
 
 from superbrain.application._auth_gate import AuthGate, evaluate_shallow_health
-from superbrain.application._future_notify import (
-    AsyncThunkNotifier,
-    safe_set_exception,
-    safe_set_result,
-)
+from superbrain.application._future_notify import AsyncThunkNotifier, safe_set_exception, safe_set_result
 from superbrain.application._reservation import make_checked_error
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.kernel import (
@@ -58,12 +54,6 @@ def _unavailable_error() -> BrainError:
     return BrainError(ErrorCode.DAEMON_UNAVAILABLE, "daemon unavailable")
 
 
-def _failed_future(error: BrainError) -> Future[_T]:
-    fut: Future[_T] = Future()
-    safe_set_exception(fut, error)
-    return fut
-
-
 def _resolved_reply_future(reply: OwnerReply) -> Future[OwnerReply]:
     fut: Future[OwnerReply] = Future()
     safe_set_result(fut, reply)
@@ -81,64 +71,33 @@ class OwnerSession(Protocol):
 
     @property
     def ready(self) -> Ready: ...
-
     @property
     def auth_gate(self) -> AuthGate: ...
-
     @property
     def clock(self) -> Clock: ...
-
     @property
     def monotonic_clock(self) -> MonotonicClock: ...
-
     @property
     def has_job_handlers(self) -> bool: ...
-
-    def submit_queued_reply(
-        self,
-        command: ToolCommand,
-        receive_ns: int,
-        future: Future[OwnerReply],
-    ) -> None: ...
-
+    def submit_queued_reply(self, command: ToolCommand, receive_ns: int, future: Future[OwnerReply]) -> None: ...
     def arbitrate_deadlines(self) -> bool: ...
-
     def step_owner_work(self, *, allow_new_jobs: bool) -> bool: ...
-
     def has_pending_owner_work(self) -> bool: ...
-
     def mark_stopping(self) -> None: ...
-
     def mark_overrun(self) -> None: ...
-
     def shutdown_metrics(self) -> tuple[int, bool]: ...
-
     def begin_stop(self) -> None: ...
-
     def join_worker(self, timeout_s: float) -> bool: ...
-
-    def prepare_cancel_uncommitted_for_shutdown(
-        self,
-    ) -> tuple[int, tuple[Callable[[], None], ...]]: ...
-
+    def prepare_cancel_uncommitted_for_shutdown(self) -> tuple[int, tuple[Callable[[], None], ...]]: ...
     def cancel_uncommitted_for_shutdown(self) -> int: ...
-
     def apply_worker_command(self, cmd: WorkerCommand) -> JobRecord | InvocationRecord: ...
-
     def finalize_send_attempt(self, completion: SendAttemptCompletion) -> ArtifactSendAttempt: ...
-
     def interrupt_send_attempt(self, send_attempt_id: str) -> ArtifactSendAttempt: ...
-
     def revoke_credential(self, credential_id: str, authorization: BootstrapAuthorization) -> Intent: ...
-
     def register_workspace(
-        self,
-        registration: WorkspaceRegistration,
-        authorization: BootstrapAuthorization,
+        self, registration: WorkspaceRegistration, authorization: BootstrapAuthorization
     ) -> WorkspaceBinding: ...
-
     def teardown_on_owner(self, *, overrun: bool, cancelled_requests: int = 0) -> ShutdownReport: ...
-
     def adopt_after_owner_exit(self, exited_owner: threading.Thread) -> None: ...
 
 
@@ -322,16 +281,12 @@ class OwnerLoop:
         return self._enqueue_internal(lambda s: s.interrupt_send_attempt(send_attempt_id))
 
     def revoke_credential(
-        self,
-        credential_id: str,
-        authorization: BootstrapAuthorization,
+        self, credential_id: str, authorization: BootstrapAuthorization
     ) -> Future[Intent]:
         return self._enqueue_internal(lambda s: s.revoke_credential(credential_id, authorization))
 
     def register_workspace(
-        self,
-        registration: WorkspaceRegistration,
-        authorization: BootstrapAuthorization,
+        self, registration: WorkspaceRegistration, authorization: BootstrapAuthorization
     ) -> Future[WorkspaceBinding]:
         return self._enqueue_internal(lambda s: s.register_workspace(registration, authorization))
 
@@ -484,9 +439,36 @@ class OwnerLoop:
 
     def _owner_main(self, config: DaemonConfig) -> None:
         assert self._session_factory is not None
+        session: OwnerSession | None = None
+        arbiter: threading.Thread | None = None
+        arbiter_started = False
         try:
             session = self._session_factory(config, self._owner_wake.set, self._arbiter_wake.set)
+            self._notifier.start(strict=True)
+            arbiter = threading.Thread(
+                target=self._arbiter_main,
+                args=(session,),
+                name="superbrain-deadline-arbiter",
+                daemon=True,
+            )
+            self._arbiter_thread = arbiter
+            try:
+                arbiter.start()
+            except RuntimeError as err:
+                raise BrainError(ErrorCode.DAEMON_UNAVAILABLE, "daemon unavailable") from err
+            arbiter_started = True
         except BaseException as err:  # noqa: BLE001
+            self._arbiter_stop = True
+            self._arbiter_wake.set()
+            if arbiter_started and arbiter is not None:
+                arbiter.join(timeout=1.0)
+            self._arbiter_thread = None
+            self._notifier.close()
+            if session is not None:
+                with contextlib.suppress(Exception):
+                    session.mark_stopping()
+                    session.begin_stop()
+                    session.teardown_on_owner(overrun=False, cancelled_requests=0)
             self._startup_error = err
             self._closed_done.set()
             self._startup_done.set()
@@ -495,15 +477,6 @@ class OwnerLoop:
         with self._lifecycle_lock:
             self._session = session
             self._ready_value = session.ready
-        self._notifier.start()
-        arbiter = threading.Thread(
-            target=self._arbiter_main,
-            args=(session,),
-            name="superbrain-deadline-arbiter",
-            daemon=True,
-        )
-        self._arbiter_thread = arbiter
-        arbiter.start()
         self._startup_done.set()
 
         unexpected_error_code: ErrorCode | None = None
@@ -568,11 +541,12 @@ class OwnerLoop:
                 overrun = self._drain_expired
                 self._drain_expired = True
             self._notifier.submit(self._drain_pending_internal())
-            self._notifier.close()
             self._arbiter_stop = True
             self._arbiter_wake.set()
             arb_wait = 1.0 if unplanned_exit else min(1.0, max(0.005, self._stop_wall_deadline - time.perf_counter()))
             arbiter.join(timeout=arb_wait)
+            if not unplanned_exit and arbiter.is_alive() and time.perf_counter() >= self._stop_wall_deadline:
+                overrun = True
             with self._overrun_lock:
                 overrun = overrun or self._overrun_cancelled
                 cancelled_total = self._cancelled_requests
@@ -590,3 +564,4 @@ class OwnerLoop:
             with self._lifecycle_lock:
                 self._final_report = report
             self._closed_done.set()
+            self._notifier.close()

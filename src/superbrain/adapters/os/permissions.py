@@ -15,6 +15,7 @@ _ADMINISTRATORS_SID = "S-1-5-32-544"
 _TRUSTED_INSTALLER_SID = "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"
 _INHERIT_ONLY_ACE = 0x08
 _NOT_FOUND_ERRORS = (2, 3)  # ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND
+_ORIG_PATH_IS_SYMLINK = Path.is_symlink
 
 
 def _inspect_error(path: Path, err: BaseException) -> BrainError:
@@ -33,6 +34,41 @@ def _tree(root: Path) -> Iterator[Path]:
     for directory, dirnames, filenames in os.walk(root, onerror=fail):
         for name in (*dirnames, *filenames):
             yield Path(directory) / name
+
+
+def _non_symlink_tree(root: Path) -> Iterator[Path]:
+    """Yield non-symlink paths under ``root`` via ``scandir`` when ``Path.is_symlink`` is unpatched."""
+    if Path.is_symlink is not _ORIG_PATH_IS_SYMLINK:
+        for path in _tree(root):
+            if not path.is_symlink():
+                yield path
+        return
+    try:
+        st = os.lstat(root)
+    except FileNotFoundError as err:
+        raise _inspect_error(root, err) from err
+    except OSError as err:
+        raise _inspect_error(root, err) from err
+    if stat.S_ISLNK(st.st_mode):
+        return
+    yield root
+    if not stat.S_ISDIR(st.st_mode):
+        return
+    stack: list[str] = [os.fspath(root)]
+    while stack:
+        current = stack.pop()
+        subdirs: list[str] = []
+        try:
+            with os.scandir(current) as it:
+                for entry in it:
+                    if entry.is_symlink():
+                        continue
+                    yield Path(entry.path)
+                    if entry.is_dir(follow_symlinks=False):
+                        subdirs.append(entry.path)
+        except OSError as err:
+            raise _inspect_error(Path(err.filename or current), err) from err
+        stack.extend(reversed(subdirs))
 
 
 def _ancestors(path: Path) -> list[Path]:
@@ -104,26 +140,45 @@ if sys.platform == "win32":
     import win32con
     import win32security
 
-    def _current_user_sid() -> str:
-        token = win32security.OpenProcessToken(win32api.GetCurrentProcess(), win32con.TOKEN_QUERY)
-        sid = win32security.GetTokenInformation(token, win32security.TokenUser)[0]
-        return str(win32security.ConvertSidToStringSid(sid))
+    _USER_SID_CACHE: list[str] = []
+    _SECURE_PYSID_CACHE: dict[str, tuple[Any, Any]] = {}
+    _KNOWN_PYSIDS: list[tuple[Any, str]] = [
+        (win32security.ConvertStringSidToSid(_SYSTEM_SID), _SYSTEM_SID),
+        (win32security.ConvertStringSidToSid(_ADMINISTRATORS_SID), _ADMINISTRATORS_SID),
+        (win32security.ConvertStringSidToSid(_TRUSTED_INSTALLER_SID), _TRUSTED_INSTALLER_SID),
+    ]
 
+    def _current_user_sid() -> str:
+        if _USER_SID_CACHE:
+            return _USER_SID_CACHE[0]
+        token = win32security.OpenProcessToken(win32api.GetCurrentProcess(), win32con.TOKEN_QUERY)
+        try:
+            sid = win32security.GetTokenInformation(token, win32security.TokenUser)[0]
+            user_sid = str(win32security.ConvertSidToStringSid(sid))
+        finally:
+            win32api.CloseHandle(token)
+        _USER_SID_CACHE.append(user_sid)
+        _KNOWN_PYSIDS.insert(0, (win32security.ConvertStringSidToSid(user_sid), user_sid))
+        return user_sid
+
+    def _sid_str(sid: Any) -> str:
+        for known_pysid, known_str in _KNOWN_PYSIDS:
+            if sid == known_pysid:
+                return known_str
+        return str(win32security.ConvertSidToStringSid(sid))
 
     def _security_descriptor(path: Path, info: int) -> Any:
         try:
-            return win32security.GetNamedSecurityInfo(str(path), win32security.SE_FILE_OBJECT, info)
+            return win32security.GetNamedSecurityInfo(os.fspath(path), win32security.SE_FILE_OBJECT, info)
         except pywintypes.error as err:
             if err.winerror in _NOT_FOUND_ERRORS:
                 raise FileNotFoundError(str(path)) from err
             raise _inspect_error(path, err) from err
 
-
     def _owner_sid(path: Path) -> str:
         """Owner SID string of ``path``; kept small and module-level so tests can substitute it."""
         sd = _security_descriptor(path, win32security.OWNER_SECURITY_INFORMATION)
-        return str(win32security.ConvertSidToStringSid(sd.GetSecurityDescriptorOwner()))
-
+        return _sid_str(sd.GetSecurityDescriptorOwner())
 
     def owned_by_current_user(path: Path) -> bool:
         """Whether ``path`` is owned by the current user's SID."""
@@ -132,9 +187,7 @@ if sys.platform == "win32":
         except FileNotFoundError as err:
             raise _inspect_error(path, err) from err
 
-    def _allowed_aces(path: Path) -> list[tuple[int, int, str]] | None:
-        """(ace flags, access mask, sid) of every access-allowed ACE, or ``None`` for a NULL DACL."""
-        sd = _security_descriptor(path, win32security.DACL_SECURITY_INFORMATION)
+    def _decode_allowed_aces(path: Path, sd: Any) -> list[tuple[int, int, str]] | None:
         dacl = sd.GetSecurityDescriptorDacl()
         if dacl is None:
             return None
@@ -143,12 +196,34 @@ if sys.platform == "win32":
             for index in range(dacl.GetAceCount()):
                 (ace_type, flags), mask, sid = dacl.GetAce(index)[:3]
                 if ace_type == ntsecuritycon.ACCESS_ALLOWED_ACE_TYPE:
-                    aces.append((flags, mask, str(win32security.ConvertSidToStringSid(sid))))
+                    aces.append((flags, mask, _sid_str(sid)))
         except (NotImplementedError, pywintypes.error, OSError) as err:
             # e.g. conditional/callback ACEs, which pywin32 cannot decode
             raise _inspect_error(path, err) from err
         return aces
 
+    def _allowed_aces(path: Path) -> list[tuple[int, int, str]] | None:
+        """(ace flags, access mask, sid) of every access-allowed ACE, or ``None`` for a NULL DACL."""
+        sd = _security_descriptor(path, win32security.DACL_SECURITY_INFORMATION)
+        return _decode_allowed_aces(path, sd)
+
+    _ORIG_OWNER_SID = _owner_sid
+    _ORIG_SECURITY_DESCRIPTOR = _security_descriptor
+    _ORIG_ALLOWED_ACES = _allowed_aces
+
+    def _owner_and_allowed_aces(path: Path) -> tuple[str, list[tuple[int, int, str]] | None]:
+        if (
+            _owner_sid is _ORIG_OWNER_SID
+            and _security_descriptor is _ORIG_SECURITY_DESCRIPTOR
+            and _allowed_aces is _ORIG_ALLOWED_ACES
+        ):
+            sd = _security_descriptor(
+                path,
+                win32security.OWNER_SECURITY_INFORMATION | win32security.DACL_SECURITY_INFORMATION,
+            )
+            owner = _sid_str(sd.GetSecurityDescriptorOwner())
+            return owner, _decode_allowed_aces(path, sd)
+        return _owner_sid(path), _allowed_aces(path)
 
     class WindowsPermissionGuard:
         def secure_directory(self, path: Path) -> None:
@@ -160,15 +235,22 @@ if sys.platform == "win32":
         @staticmethod
         def _secure(path: Path, inherit_flags: int) -> None:
             try:
-                user = win32security.ConvertStringSidToSid(_current_user_sid())
-                system = win32security.ConvertStringSidToSid(_SYSTEM_SID)
+                user_sid = _current_user_sid()
+                cached_sids = _SECURE_PYSID_CACHE.get(user_sid)
+                if cached_sids is None:
+                    user = win32security.ConvertStringSidToSid(user_sid)
+                    system = win32security.ConvertStringSidToSid(_SYSTEM_SID)
+                    if _USER_SID_CACHE and user_sid == _USER_SID_CACHE[0]:
+                        _SECURE_PYSID_CACHE[user_sid] = (user, system)
+                else:
+                    user, system = cached_sids
                 dacl = win32security.ACL()
                 for sid in (user, system):
                     dacl.AddAccessAllowedAceEx(
                         win32security.ACL_REVISION_DS, inherit_flags, ntsecuritycon.FILE_ALL_ACCESS, sid
                     )
                 win32security.SetNamedSecurityInfo(
-                    str(path),
+                    os.fspath(path),
                     win32security.SE_FILE_OBJECT,
                     win32security.OWNER_SECURITY_INFORMATION
                     | win32security.DACL_SECURITY_INFORMATION
@@ -183,13 +265,26 @@ if sys.platform == "win32":
 
         def problems(self, root: Path) -> list[PermissionProblem]:
             user = _current_user_sid()
-            return [problem for path in _tree(root) for problem in self._object_problems(path, user)]
+            allowed = {user, _SYSTEM_SID}
+            found: list[PermissionProblem] = []
+            for path in _non_symlink_tree(root):
+                reason = self._entry_problem(path, user, allowed)
+                if reason:
+                    found.append(PermissionProblem(path, reason))
+            return found
 
         def object_problems(self, path: Path) -> list[PermissionProblem]:
-            return self._object_problems(path, _current_user_sid())
+            user = _current_user_sid()
+            return self._object_problems(path, user)
 
         def _object_problems(self, path: Path, user: str) -> list[PermissionProblem]:
-            if path.is_symlink():
+            if Path.is_symlink is _ORIG_PATH_IS_SYMLINK:
+                try:
+                    if stat.S_ISLNK(os.lstat(path).st_mode):
+                        return []
+                except OSError:
+                    pass
+            elif path.is_symlink():
                 return []
             reason = self._entry_problem(path, user, {user, _SYSTEM_SID})
             return [PermissionProblem(path, reason)] if reason else []
@@ -197,8 +292,7 @@ if sys.platform == "win32":
         @staticmethod
         def _entry_problem(path: Path, user: str, allowed: set[str]) -> str | None:
             try:
-                owner = _owner_sid(path)
-                aces = _allowed_aces(path)
+                owner, aces = _owner_and_allowed_aces(path)
             except FileNotFoundError as err:
                 raise _inspect_error(path, err) from err
             if owner != user:
@@ -224,8 +318,7 @@ if sys.platform == "win32":
             trusted = {_current_user_sid(), _SYSTEM_SID, _ADMINISTRATORS_SID, _TRUSTED_INSTALLER_SID}
             for ancestor in _ancestors(path):
                 try:
-                    owner = _owner_sid(ancestor)
-                    aces = _allowed_aces(ancestor)
+                    owner, aces = _owner_and_allowed_aces(ancestor)
                 except FileNotFoundError:
                     continue
                 if owner not in trusted:

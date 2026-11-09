@@ -1,5 +1,7 @@
 """Path-safety adapter and default data-root resolution."""
 
+import os
+import stat
 import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
@@ -8,20 +10,34 @@ from superbrain.core.errors import BrainError, ErrorCode
 
 _REPARSE_POINT = 0x400
 _APP_DIR = "ensemble-brain"
+_ORIG_IS_SYMLINK = Path.is_symlink
+_ORIG_PATH_LSTAT = Path.lstat
+
+
+def _is_link_str(raw: str) -> bool:
+    try:
+        st = os.lstat(raw)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError as err:
+        raise BrainError(ErrorCode.UNSAFE_PATH, f"cannot inspect path for links: {err}") from err
+    return stat.S_ISLNK(st.st_mode) or bool(getattr(st, "st_file_attributes", 0) & _REPARSE_POINT)
 
 
 def _is_link(path: Path) -> bool:
     # Checked without resolving, so a link is detected before it is ever followed.
+    if Path.is_symlink is _ORIG_IS_SYMLINK and Path.lstat is _ORIG_PATH_LSTAT:
+        return _is_link_str(os.fspath(path))
     try:
-        if path.is_symlink():
+        if Path.is_symlink is not _ORIG_IS_SYMLINK and path.is_symlink():
             return True
-        attributes = getattr(path.lstat(), "st_file_attributes", 0)
+        st = path.lstat()
     except (FileNotFoundError, NotADirectoryError):
         # ENOTDIR: a parent is not a directory, so the path cannot exist.
         return False
     except OSError as err:
         raise BrainError(ErrorCode.UNSAFE_PATH, f"cannot inspect path for links: {err}") from err
-    return bool(attributes & _REPARSE_POINT)
+    return stat.S_ISLNK(st.st_mode) or bool(getattr(st, "st_file_attributes", 0) & _REPARSE_POINT)
 
 
 def is_link(path: Path) -> bool:
@@ -41,8 +57,38 @@ class OsPathSafety:
             raise BrainError(ErrorCode.UNSAFE_PATH, "':' is only allowed after a drive letter")
 
     def reject_links(self, path: Path, *, entries: Sequence[Path] = ()) -> None:
+        if Path.is_symlink is _ORIG_IS_SYMLINK and Path.lstat is _ORIG_PATH_LSTAT:
+            raw = os.fspath(path)
+            cur = os.path.normpath(raw) if os.path.isabs(raw) and ".." not in raw else str(Path(raw).absolute())
+            seen_str: set[str] = set()
+            while cur not in seen_str:
+                seen_str.add(cur)
+                if _is_link_str(cur):
+                    raise BrainError(ErrorCode.UNSAFE_PATH, "path must not contain symlink or reparse points")
+                parent = os.path.dirname(cur)
+                if parent == cur:
+                    break
+                cur = parent
+            for entry in entries:
+                eraw = os.fspath(entry)
+                ecur = (
+                    os.path.normpath(eraw)
+                    if os.path.isabs(eraw) and ".." not in eraw
+                    else str(Path(eraw).absolute())
+                )
+                if ecur in seen_str:
+                    continue
+                seen_str.add(ecur)
+                if _is_link_str(ecur):
+                    raise BrainError(ErrorCode.UNSAFE_PATH, "path must not contain symlink or reparse points")
+            return
+
         supplied = Path(path).absolute()
+        seen: set[Path] = set()
         for candidate in (supplied, *supplied.parents, *(Path(e).absolute() for e in entries)):
+            if candidate in seen:
+                continue
+            seen.add(candidate)
             if _is_link(candidate):
                 raise BrainError(ErrorCode.UNSAFE_PATH, "path must not contain symlink or reparse points")
 

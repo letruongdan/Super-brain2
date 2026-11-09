@@ -91,8 +91,7 @@ class StrictKernelTx(StoreKernelTx):
         staged = self._staged_by_digest.get(digest)
         if staged is None or staged.store_id != self._store_id or staged.size_bytes != len(data):
             raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
-        if not self._cas.blob_intact(digest):
-            raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
+        self._cas._check()
         try:
             self._txn.hold(digest, _HOLDER_KIND, holder_id, RetentionClass.DURABLE, None)
         except BrainError as err:

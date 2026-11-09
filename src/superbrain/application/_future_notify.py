@@ -9,6 +9,8 @@ from collections.abc import Callable, Sequence
 from concurrent.futures import Future, InvalidStateError
 from typing import TypeVar
 
+from superbrain.core.errors import BrainError, ErrorCode
+
 _T = TypeVar("_T")
 
 _MAX_NOTIFY_WORKERS = 128
@@ -55,10 +57,14 @@ class AsyncThunkNotifier:
         self._started = False
         self._closed = False
 
-    def start(self) -> None:
+    def start(self, *, strict: bool = False) -> None:
         """Pre-start one standby daemon worker so shutdown cancellation never depends on late thread creation."""
         with self._cond:
-            if self._started or self._closed:
+            if self._closed:
+                if strict:
+                    raise BrainError(ErrorCode.DAEMON_UNAVAILABLE, "daemon unavailable")
+                return
+            if self._started:
                 return
             self._started = True
             self._active_workers += 1
@@ -69,11 +75,13 @@ class AsyncThunkNotifier:
         )
         try:
             worker.start()
-        except RuntimeError:
+        except RuntimeError as err:
             with self._cond:
                 self._active_workers -= 1
                 self._started = False
             self._drain_if_workerless()
+            if strict:
+                raise BrainError(ErrorCode.DAEMON_UNAVAILABLE, "daemon unavailable") from err
 
     def submit(self, thunks: Sequence[Callable[[], None]]) -> None:
         """Enqueue ``thunks`` before spawning burst helpers; survive ``Thread.start`` ``RuntimeError`` without loss."""
