@@ -168,6 +168,23 @@ class JobService:
 
         return self._store.transact(read)
 
+    def resolve_leased_spec(self, lease: JobLease) -> JobSpec | None:
+        """Read ``JobSpec`` for a ``LEASED`` job, or fail it fenced with ``INVALID_PAYLOAD`` if policy-blocked."""
+        self._require_current(lease)
+        _, now = require_aware_utc(self._clock.now())
+
+        def resolve(tx: KernelTx) -> JobSpec | None:
+            row = self._fenced(tx, lease, JobState.LEASED)
+            if tx.holder_tombstoned(row.job_id) or tx.blob_restricted(row.payload_digest):
+                self._terminal(tx, row, JobState.FAILED, now, reason=JobErrorCode.INVALID_PAYLOAD)
+                return None
+            payload = tx.read_held_blob(row.payload_digest, holder_id=row.job_id)
+            if payload is None:
+                raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
+            return JobSpec(row.kind, row.owner_id, payload, repo_id=row.repo_id, checkout_id=row.checkout_id)
+
+        return self._store.transact(resolve)
+
     def complete(self, lease: JobLease, result: JobOutcome) -> None:
         """Finish the running attempt: succeeded, failed (nonretryable), queued again with backoff, or dead letter."""
         self._require_current(lease)
@@ -287,7 +304,7 @@ class JobService:
             row = self._authorized(tx.read_job(job_id), principal, selected_scope, caller_active)
             if row.state in TERMINAL_JOB_STATES:
                 raise _conflict()
-            self._terminal(tx, row, JobState.CANCELLED, now)
+            self._terminal(tx, row, JobState.CANCELLED, now, actor=f"principal:{principal.principal_id}")
             return row.state
 
         prior = self._store.transact(cancel)
@@ -390,6 +407,7 @@ class JobService:
         *,
         reason: JobErrorCode | None = None,
         result_digest: str | None = None,
+        actor: str = "system:kernel",
     ) -> None:
         meta: dict[str, JsonValue] = {
             **_row_fence(row),
@@ -399,7 +417,7 @@ class JobService:
             "result_digest": result_digest,
             "finished_at": now,
         }
-        tx.append_record(KernelRecord("job.terminal", meta))
+        tx.append_record(KernelRecord("job.terminal", meta, actor=actor))
 
     def _retry_or_dead_letter(
         self, tx: KernelTx, row: JobRecord, reason: JobErrorCode, *, retry_at: str, now: str
