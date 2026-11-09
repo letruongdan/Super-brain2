@@ -32,7 +32,7 @@ import threading
 import time
 import uuid
 import warnings
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -6095,5 +6095,493 @@ def test_burst_start_failure_with_blocking_standby_callback_still_settles_siblin
     )
     assert final_rep is not None and final_rep.endpoint_removed is True
     assert final_rep.cancelled_requests == 3
+    with acquire_writer(DataRoot.at(root), adapters):
+        pass
+
+
+def test_stop_callers_never_run_callbacks_inline_when_owner_closes_notifier_before_handoff_submit(
+    trusted_tmp: Path,
+    _daemon_template: _DaemonTemplate,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """I2-T6A-R05 (late-close): ``stop()`` never runs callbacks inline if owner closes notifier pre-submit."""
+    base_now = _daemon_template.base_time + dt.timedelta(minutes=5)
+    tok_a = _daemon_template.cred_a.token
+
+    root, _, cfg = _instantiate_case(trusted_tmp, "r05-late-close-handoff", _daemon_template)
+    clock = FakeClock(base_now)
+    adapters = os_adapters(clock=clock)
+
+    rt_seed = reopen_kernel_job_runtime(root, _daemon_template.store_id, adapters)
+    try:
+        svc_seed, st_seed = kernel_job_service(rt_seed, clock)
+        seeded_job = enqueue_job(svc_seed, st_seed, owner_id="dan", payload=b"r05-late-close-job")
+    finally:
+        rt_seed.close()
+
+    owner_entered = threading.Event()
+    release_owner = threading.Event()
+    before_submit_entered = threading.Event()
+    allow_submit = threading.Event()
+    cb_entered = threading.Event()
+    release_cb = threading.Event()
+    cb_released_marker = threading.Event()
+    cb_exited = threading.Event()
+
+    def _hold_owner() -> bool:
+        owner_entered.set()
+        return release_owner.wait(BOUND_WAIT_S)
+
+    cb_lock = threading.Lock()
+    cb_thread_ids: list[int] = []
+    cb_thread_names: list[str] = []
+    cb_envelopes: list[CallResult] = []
+    reply_cb_items: list[OwnerReply] = []
+    reply_cb_done = threading.Event()
+    internal_cb_items: list[BaseException | str] = []
+    internal_cb_done = threading.Event()
+
+    def _blocking_cb(done_f: Future[CallResult]) -> None:
+        try:
+            env = done_f.result()
+            with cb_lock:
+                cb_thread_ids.append(threading.get_ident())
+                cb_thread_names.append(threading.current_thread().name)
+                cb_envelopes.append(env)
+            cb_entered.set()
+            release_cb.wait(timeout=5.0)
+        finally:
+            cb_exited.set()
+
+    def _on_reply_done(done_f: Future[OwnerReply]) -> None:
+        with cb_lock:
+            reply_cb_items.append(done_f.result())
+        reply_cb_done.set()
+
+    def _on_internal_done(done_f: Future[str]) -> None:
+        exc = done_f.exception()
+        with cb_lock:
+            internal_cb_items.append(exc if exc is not None else done_f.result())
+        internal_cb_done.set()
+
+    loop = create_daemon_owner_loop(os_=adapters, clock=clock)
+    stop_caller_lock = threading.Lock()
+    stop_caller_tids: set[int] = set()
+    first_stop_done = threading.Event()
+    second_stop_done = threading.Event()
+    first_rep_box: list[ShutdownReport] = []
+    second_rep_box: list[ShutdownReport] = []
+    first_err_box: list[BaseException] = []
+    second_err_box: list[BaseException] = []
+    published_before_submit: list[bool] = []
+    closed_before_submit: ShutdownReport | None = None
+    first_returned_before_cb_release = False
+    second_returned_before_cb_release = False
+    post_rep: ShutdownReport | None = None
+
+    def _stop_1() -> None:
+        with stop_caller_lock:
+            stop_caller_tids.add(threading.get_ident())
+        try:
+            first_rep_box.append(loop.stop(grace_s=0.08))
+        except BaseException as exc:  # noqa: BLE001
+            first_err_box.append(exc)
+        finally:
+            first_stop_done.set()
+
+    def _stop_2() -> None:
+        with stop_caller_lock:
+            stop_caller_tids.add(threading.get_ident())
+        try:
+            second_rep_box.append(loop.stop(grace_s=1.5))
+        except BaseException as exc:  # noqa: BLE001
+            second_err_box.append(exc)
+        finally:
+            second_stop_done.set()
+
+    t_stop_1 = threading.Thread(target=_stop_1, name="test-r05-late-stop-1", daemon=True)
+    t_stop_2 = threading.Thread(target=_stop_2, name="test-r05-late-stop-2", daemon=True)
+    try:
+        loop.start(cfg)
+        hold_fut = loop.run_owner_action(_hold_owner)
+        assert owner_entered.wait(timeout=1.0), "owner did not enter hold barrier"
+
+        queued_fut = loop.submit(
+            ToolCommand("get_job", {"schema_version": "2.0", "job_id": seeded_job.job_id}, token=tok_a),
+            adapters.monotonic.monotonic_ns() + 10 * TOTAL_REQUEST_BUDGET_NS,
+        )
+        queued_fut.add_done_callback(_blocking_cb)
+
+        reply_fut = loop.submit_reply(
+            ToolCommand("get_job", {"schema_version": "2.0", "job_id": seeded_job.job_id}, token=tok_a),
+            adapters.monotonic.monotonic_ns() + 10 * TOTAL_REQUEST_BUDGET_NS,
+        )
+        reply_fut.add_done_callback(_on_reply_done)
+
+        internal_fut = loop.run_owner_action(lambda: "never-runs")
+        internal_fut.add_done_callback(_on_internal_done)
+
+        notifier_obj: Any = cast(Any, loop)._notifier
+        orig_submit: Callable[..., Any] = notifier_obj.submit
+        submit_gate_lock = threading.Lock()
+        gated_once = False
+
+        def _gated_submit(*args: Any, **kwargs: Any) -> Any:
+            nonlocal gated_once
+            if args and isinstance(args[0], Iterable) and not callable(args[0]):
+                batch = list(args[0])
+                has_work = len(batch) > 0
+                call_args: tuple[Any, ...] = (batch, *args[1:])
+            else:
+                has_work = bool(args or kwargs)
+                call_args = args
+            with stop_caller_lock:
+                is_stop_caller = threading.get_ident() in stop_caller_tids
+            should_gate = False
+            if has_work and is_stop_caller:
+                with submit_gate_lock:
+                    if not gated_once:
+                        gated_once = True
+                        should_gate = True
+            if should_gate:
+                published_before_submit.append(
+                    queued_fut.done() and reply_fut.done() and internal_fut.done()
+                )
+                before_submit_entered.set()
+                allow_submit.wait(timeout=5.0)
+            return orig_submit(*call_args, **kwargs)
+
+        monkeypatch.setattr(notifier_obj, "submit", _gated_submit)
+        t_stop_1.start()
+        _wait_until(lambda: loop.ready is None, desc="R05 late-close caller 1 to lock shared cutoff")
+        t_stop_2.start()
+        try:
+            assert before_submit_entered.wait(timeout=1.5), "overrun handoff did not reach notifier.submit"
+            assert published_before_submit == [True]
+
+            # Let owner finish runtime teardown, remove endpoint.json, and close notifier BEFORE orig_submit runs.
+            release_owner.set()
+            _ = hold_fut.result(timeout=1.0)
+            _wait_until(
+                lambda: not DataRoot.at(root).endpoint_path.exists(),
+                timeout=1.5,
+                desc="owner removed endpoint before overrun callback batch submit",
+            )
+            closed_before_submit = loop.wait_closed(timeout=1.5)
+            assert closed_before_submit is not None
+
+            # Resume notifier.submit while keeping _blocking_cb held on release_cb.
+            allow_submit.set()
+            assert cb_entered.wait(timeout=1.5), "cancelled Future callback did not start after submit resumed"
+
+            return_deadline = time.monotonic() + 0.45
+            if first_stop_done.wait(timeout=max(0.01, return_deadline - time.monotonic())):
+                first_returned_before_cb_release = (
+                    not cb_released_marker.is_set() and not release_cb.is_set()
+                )
+            if second_stop_done.wait(timeout=max(0.01, return_deadline - time.monotonic())):
+                second_returned_before_cb_release = (
+                    not cb_released_marker.is_set() and not release_cb.is_set()
+                )
+        finally:
+            allow_submit.set()
+            cb_released_marker.set()
+            release_cb.set()
+
+        t_stop_1.join(timeout=BOUND_WAIT_S)
+        t_stop_2.join(timeout=BOUND_WAIT_S)
+        assert cb_exited.wait(timeout=1.5)
+        assert reply_cb_done.wait(timeout=1.5)
+        assert internal_cb_done.wait(timeout=1.5)
+        post_rep = loop.stop(grace_s=0.05)
+    finally:
+        allow_submit.set()
+        cb_released_marker.set()
+        release_cb.set()
+        release_owner.set()
+        t_stop_1.join(timeout=BOUND_WAIT_S)
+        t_stop_2.join(timeout=BOUND_WAIT_S)
+        with contextlib.suppress(BrainError):
+            loop.stop(grace_s=0.05)
+        _ = loop.wait_closed(timeout=5.0)
+
+    assert first_err_box == []
+    assert second_err_box == []
+    assert first_returned_before_cb_release is True
+    assert second_returned_before_cb_release is True
+    assert set(cb_thread_ids).isdisjoint(stop_caller_tids)
+    assert len(first_rep_box) == 1
+    assert (first_rep_box[0].state, first_rep_box[0].error_code, first_rep_box[0].cancelled_requests) == (
+        ShutdownState.OVERRUN,
+        ErrorCode.DEADLINE_EXCEEDED,
+        2,
+    )
+    assert len(second_rep_box) == 1
+    assert (second_rep_box[0].state, second_rep_box[0].error_code, second_rep_box[0].cancelled_requests) == (
+        ShutdownState.OVERRUN,
+        ErrorCode.DEADLINE_EXCEEDED,
+        2,
+    )
+    assert cb_envelopes == [
+        {
+            "ok": False,
+            "error": {"code": ErrorCode.DAEMON_UNAVAILABLE.value, "message": "daemon unavailable"},
+        }
+    ]
+    assert len(reply_cb_items) == 1
+    assert reply_cb_items[0].envelope["ok"] is False
+    assert (
+        cast(dict[str, JsonValue], reply_cb_items[0].envelope["error"])["code"]
+        == ErrorCode.DAEMON_UNAVAILABLE.value
+    )
+    assert len(internal_cb_items) == 1
+    assert isinstance(internal_cb_items[0], BrainError)
+    assert internal_cb_items[0].code is ErrorCode.DAEMON_UNAVAILABLE
+    assert post_rep is not None
+    assert (post_rep.state, post_rep.error_code, post_rep.cancelled_requests) == (
+        ShutdownState.OVERRUN,
+        ErrorCode.DEADLINE_EXCEEDED,
+        2,
+    )
+    with acquire_writer(DataRoot.at(root), adapters):
+        pass
+
+
+def test_multiple_done_callbacks_on_same_cancelled_future_run_sequentially_while_sibling_future_progresses(
+    trusted_tmp: Path,
+    _daemon_template: _DaemonTemplate,
+) -> None:
+    """I2-T6A-R07: Same-``Future`` callbacks run sequentially in registration order while sibling Futures progress."""
+    base_now = _daemon_template.base_time + dt.timedelta(minutes=5)
+    tok_a = _daemon_template.cred_a.token
+
+    root, _, cfg = _instantiate_case(trusted_tmp, "r07-per-future-cb-order", _daemon_template)
+    clock = FakeClock(base_now)
+    adapters = os_adapters(clock=clock)
+
+    rt_seed = reopen_kernel_job_runtime(root, _daemon_template.store_id, adapters)
+    try:
+        svc_seed, st_seed = kernel_job_service(rt_seed, clock)
+        seeded_job = enqueue_job(svc_seed, st_seed, owner_id="dan", payload=b"r07-queued-job")
+    finally:
+        rt_seed.close()
+
+    futures_logger = logging.getLogger("concurrent.futures")
+    orig_propagate = futures_logger.propagate
+    futures_logger_records: list[str] = []
+
+    class _FuturesLogCollector(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            if record.levelno >= logging.ERROR:
+                futures_logger_records.append(self.format(record))
+
+    log_handler = _FuturesLogCollector(level=logging.ERROR)
+    futures_logger.propagate = False
+    futures_logger.addHandler(log_handler)
+
+    owner_entered = threading.Event()
+    release_owner = threading.Event()
+    cb_a_entered = threading.Event()
+    release_cb_a = threading.Event()
+    a_released_marker = threading.Event()
+    cb_a_done = threading.Event()
+    cb_b_entered = threading.Event()
+    cb_b_done = threading.Event()
+    reply_cbs_done = threading.Event()
+    internal_cbs_done = threading.Event()
+
+    def _hold_owner() -> bool:
+        owner_entered.set()
+        return release_owner.wait(BOUND_WAIT_S)
+
+    order_lock = threading.Lock()
+    submit_order: list[str] = []
+    cb_a_completed = False
+    b_saw_a_completed = False
+    reply_order: list[str] = []
+    internal_order: list[str] = []
+
+    def _cb_a(done_f: Future[CallResult]) -> None:
+        nonlocal cb_a_completed
+        try:
+            _ = done_f.result()
+            with order_lock:
+                submit_order.append("a_start")
+            cb_a_entered.set()
+            release_cb_a.wait(timeout=5.0)
+            with order_lock:
+                cb_a_completed = True
+                submit_order.append("a_end")
+        finally:
+            cb_a_done.set()
+
+    def _cb_b(done_f: Future[CallResult]) -> None:
+        nonlocal b_saw_a_completed
+        _ = done_f.result()
+        with order_lock:
+            b_saw_a_completed = cb_a_completed
+            submit_order.append("b_start")
+            submit_order.append("b_end")
+        cb_b_entered.set()
+        cb_b_done.set()
+
+    def _reply_cb_1(done_f: Future[OwnerReply]) -> None:
+        _ = done_f.result()
+        with order_lock:
+            reply_order.append("r1_start")
+            reply_order.append("r1_end")
+        raise RuntimeError("isolated-reply-cb1")
+
+    def _reply_cb_2(done_f: Future[OwnerReply]) -> None:
+        _ = done_f.result()
+        with order_lock:
+            reply_order.append("r2_start")
+            reply_order.append("r2_end")
+        reply_cbs_done.set()
+
+    def _internal_cb_1(done_f: Future[str]) -> None:
+        assert isinstance(done_f.exception(), BrainError)
+        with order_lock:
+            internal_order.append("i1_start")
+            internal_order.append("i1_end")
+
+    def _internal_cb_2(done_f: Future[str]) -> None:
+        assert isinstance(done_f.exception(), BrainError)
+        with order_lock:
+            internal_order.append("i2_start")
+            internal_order.append("i2_end")
+        internal_cbs_done.set()
+
+    loop = create_daemon_owner_loop(os_=adapters, clock=clock)
+    first_stop_done = threading.Event()
+    second_stop_done = threading.Event()
+    first_rep_box: list[ShutdownReport] = []
+    second_rep_box: list[ShutdownReport] = []
+    first_err_box: list[BaseException] = []
+    second_err_box: list[BaseException] = []
+    first_stop_before_a_release = False
+    second_stop_before_a_release = False
+    reply_done_before_a_release = False
+    internal_done_before_a_release = False
+    cb_b_started_before_a_release = False
+    final_rep: ShutdownReport | None = None
+
+    def _stop_1() -> None:
+        try:
+            first_rep_box.append(loop.stop(grace_s=0.08))
+        except BaseException as exc:  # noqa: BLE001
+            first_err_box.append(exc)
+        finally:
+            first_stop_done.set()
+
+    def _stop_2() -> None:
+        try:
+            second_rep_box.append(loop.stop(grace_s=1.5))
+        except BaseException as exc:  # noqa: BLE001
+            second_err_box.append(exc)
+        finally:
+            second_stop_done.set()
+
+    t_stop_1 = threading.Thread(target=_stop_1, name="test-r07-stop-1", daemon=True)
+    t_stop_2 = threading.Thread(target=_stop_2, name="test-r07-stop-2", daemon=True)
+    try:
+        loop.start(cfg)
+        hold_fut = loop.run_owner_action(_hold_owner)
+        assert owner_entered.wait(timeout=1.0), "owner did not enter hold barrier"
+
+        fut_submit = loop.submit(
+            ToolCommand("get_job", {"schema_version": "2.0", "job_id": seeded_job.job_id}, token=tok_a),
+            adapters.monotonic.monotonic_ns() + 10 * TOTAL_REQUEST_BUDGET_NS,
+        )
+        fut_submit.add_done_callback(_cb_a)
+        fut_submit.add_done_callback(_cb_b)
+
+        fut_reply = loop.submit_reply(
+            ToolCommand("get_job", {"schema_version": "2.0", "job_id": seeded_job.job_id}, token=tok_a),
+            adapters.monotonic.monotonic_ns() + 10 * TOTAL_REQUEST_BUDGET_NS,
+        )
+        fut_reply.add_done_callback(_reply_cb_1)
+        fut_reply.add_done_callback(_reply_cb_2)
+
+        fut_internal = loop.run_owner_action(lambda: "never-runs")
+        fut_internal.add_done_callback(_internal_cb_1)
+        fut_internal.add_done_callback(_internal_cb_2)
+
+        t_stop_1.start()
+        _wait_until(lambda: loop.ready is None, desc="R07 caller 1 to lock shared cutoff")
+        t_stop_2.start()
+        try:
+            cutoff_deadline = time.monotonic() + 0.45
+            if first_stop_done.wait(timeout=max(0.01, cutoff_deadline - time.monotonic())):
+                first_stop_before_a_release = (
+                    not a_released_marker.is_set() and not release_cb_a.is_set()
+                )
+            if second_stop_done.wait(timeout=max(0.01, cutoff_deadline - time.monotonic())):
+                second_stop_before_a_release = (
+                    not a_released_marker.is_set() and not release_cb_a.is_set()
+                )
+
+            assert cb_a_entered.wait(timeout=1.5), "_cb_a did not enter"
+            reply_done_before_a_release = (
+                reply_cbs_done.wait(timeout=1.5)
+                and not a_released_marker.is_set()
+                and not release_cb_a.is_set()
+            )
+            internal_done_before_a_release = (
+                internal_cbs_done.wait(timeout=1.5)
+                and not a_released_marker.is_set()
+                and not release_cb_a.is_set()
+            )
+            cb_b_started_before_a_release = cb_b_entered.wait(timeout=0.15)
+        finally:
+            a_released_marker.set()
+            release_cb_a.set()
+
+        t_stop_1.join(timeout=BOUND_WAIT_S)
+        t_stop_2.join(timeout=BOUND_WAIT_S)
+        assert cb_a_done.wait(timeout=1.5)
+        assert cb_b_done.wait(timeout=1.5)
+        release_owner.set()
+        _ = hold_fut.result(timeout=1.0)
+        final_rep = loop.wait_closed(timeout=5.0)
+    finally:
+        futures_logger.removeHandler(log_handler)
+        futures_logger.propagate = orig_propagate
+        a_released_marker.set()
+        release_cb_a.set()
+        release_owner.set()
+        t_stop_1.join(timeout=BOUND_WAIT_S)
+        t_stop_2.join(timeout=BOUND_WAIT_S)
+        with contextlib.suppress(BrainError):
+            loop.stop(grace_s=0.05)
+        _ = loop.wait_closed(timeout=5.0)
+
+    assert first_err_box == []
+    assert second_err_box == []
+    assert first_stop_before_a_release is True
+    assert second_stop_before_a_release is True
+    assert len(first_rep_box) == 1
+    assert (first_rep_box[0].state, first_rep_box[0].error_code, first_rep_box[0].cancelled_requests) == (
+        ShutdownState.OVERRUN,
+        ErrorCode.DEADLINE_EXCEEDED,
+        2,
+    )
+    assert len(second_rep_box) == 1
+    assert (second_rep_box[0].state, second_rep_box[0].error_code, second_rep_box[0].cancelled_requests) == (
+        ShutdownState.OVERRUN,
+        ErrorCode.DEADLINE_EXCEEDED,
+        2,
+    )
+    assert reply_done_before_a_release is True
+    assert internal_done_before_a_release is True
+    assert cb_b_started_before_a_release is False
+    assert b_saw_a_completed is True
+    assert submit_order == ["a_start", "a_end", "b_start", "b_end"]
+    assert reply_order == ["r1_start", "r1_end", "r2_start", "r2_end"]
+    assert internal_order == ["i1_start", "i1_end", "i2_start", "i2_end"]
+    assert len(futures_logger_records) == 1
+    assert "isolated-reply-cb1" in futures_logger_records[0]
+    assert final_rep is not None and final_rep.endpoint_removed is True
+    assert final_rep.cancelled_requests == 2
     with acquire_writer(DataRoot.at(root), adapters):
         pass
