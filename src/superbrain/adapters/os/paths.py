@@ -45,6 +45,16 @@ def is_link(path: Path) -> bool:
     return _is_link(path)
 
 
+def _fast_abs_str(raw: str) -> str:
+    if sys.platform == "win32":
+        if len(raw) >= 3 and raw[0].isalpha() and raw[1] == ":" and raw[2] in ("\\", "/") and ".." not in raw:
+            return os.path.normpath(raw)
+        return str(Path(raw).absolute())
+    if raw.startswith("/") and ".." not in raw:
+        return os.path.normpath(raw)
+    return str(Path(raw).absolute())
+
+
 class OsPathSafety:
     def reject_unsafe_path(self, raw: str) -> None:
         if sys.platform != "win32":
@@ -58,8 +68,7 @@ class OsPathSafety:
 
     def reject_links(self, path: Path, *, entries: Sequence[Path] = ()) -> None:
         if Path.is_symlink is _ORIG_IS_SYMLINK and Path.lstat is _ORIG_PATH_LSTAT:
-            raw = os.fspath(path)
-            cur = os.path.normpath(raw) if os.path.isabs(raw) and ".." not in raw else str(Path(raw).absolute())
+            cur = _fast_abs_str(os.fspath(path))
             seen_str: set[str] = set()
             while cur not in seen_str:
                 seen_str.add(cur)
@@ -70,12 +79,7 @@ class OsPathSafety:
                     break
                 cur = parent
             for entry in entries:
-                eraw = os.fspath(entry)
-                ecur = (
-                    os.path.normpath(eraw)
-                    if os.path.isabs(eraw) and ".." not in eraw
-                    else str(Path(eraw).absolute())
-                )
+                ecur = _fast_abs_str(os.fspath(entry))
                 if ecur in seen_str:
                     continue
                 seen_str.add(ecur)

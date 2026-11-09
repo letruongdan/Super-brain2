@@ -57,17 +57,20 @@ def _non_symlink_tree(root: Path) -> Iterator[Path]:
     stack: list[str] = [os.fspath(root)]
     while stack:
         current = stack.pop()
+        children: list[str] = []
         subdirs: list[str] = []
         try:
             with os.scandir(current) as it:
                 for entry in it:
                     if entry.is_symlink():
                         continue
-                    yield Path(entry.path)
+                    children.append(entry.path)
                     if entry.is_dir(follow_symlinks=False):
                         subdirs.append(entry.path)
         except OSError as err:
             raise _inspect_error(Path(err.filename or current), err) from err
+        for child in children:
+            yield Path(child)
         stack.extend(reversed(subdirs))
 
 
