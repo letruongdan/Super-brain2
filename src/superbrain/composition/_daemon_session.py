@@ -10,6 +10,7 @@ from concurrent.futures import Future
 from dataclasses import dataclass
 from datetime import datetime
 
+from superbrain.application._future_notify import safe_set_result
 from superbrain.application.deadlines import Reservation
 from superbrain.application.dispatch import KernelToolDomain, PreparedEffect
 from superbrain.application.jobs import JobService
@@ -225,19 +226,19 @@ class _AdmittedOwnerSession(OwnerSession):
     ) -> None:
         stamp: AuthGrantStamp | None = None
         completion: SendAttemptCompletion | None = None
-        if envelope.get("ok") is True and holder:
+        if holder:
             with self._reply_meta_lock:
                 meta = self._reply_meta.pop(holder[0].reservation_id, None)
-            if meta is not None:
+            if envelope.get("ok") is True and meta is not None:
                 stamp, completion = meta
-        if not future.done():
-            future.set_result(
-                OwnerReply(
-                    envelope=envelope,
-                    grant_stamp=stamp,
-                    send_completion=completion,
-                )
-            )
+        safe_set_result(
+            future,
+            OwnerReply(
+                envelope=envelope,
+                grant_stamp=stamp,
+                send_completion=completion,
+            ),
+        )
 
     def arbitrate_deadlines(self) -> bool:
         self._bridge.arbitrate_deadlines()
@@ -359,6 +360,11 @@ class _AdmittedOwnerSession(OwnerSession):
             with self._metrics_lock:
                 self._worker_join_failed = True
         return drained
+
+    def prepare_cancel_uncommitted_for_shutdown(
+        self,
+    ) -> tuple[int, tuple[Callable[[], None], ...]]:
+        return self._bridge.prepare_cancel_uncommitted_for_shutdown()
 
     def cancel_uncommitted_for_shutdown(self) -> int:
         return self._bridge.cancel_uncommitted_for_shutdown()

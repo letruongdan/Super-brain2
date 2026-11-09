@@ -415,6 +415,11 @@ class KernelBridge(KernelBlobStagePort):
     def close_admissions(self) -> None:
         self._coordinator.close_admissions()
 
+    def prepare_cancel_uncommitted_for_shutdown(
+        self,
+    ) -> tuple[int, tuple[Callable[[], None], ...]]:
+        return self._coordinator.prepare_cancel_uncommitted_for_shutdown()
+
     def cancel_uncommitted_for_shutdown(self) -> int:
         return self._coordinator.cancel_uncommitted_for_shutdown()
 

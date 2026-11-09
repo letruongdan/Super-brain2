@@ -150,13 +150,21 @@ class KernelDeadlineCoordinator:
             with suppress(Exception):
                 self._on_queue_wake()
 
-    def cancel_uncommitted_for_shutdown(self) -> int:
+    def prepare_cancel_uncommitted_for_shutdown(
+        self,
+    ) -> tuple[int, tuple[Callable[[], None], ...]]:
         with self._queue_cv:
             self._closed = True
             self._queue.clear()
             self._queue_cv.notify_all()
         err_env = make_checked_error(ErrorCode.DAEMON_UNAVAILABLE, "daemon unavailable")
-        return self._reservations.cancel_all_uncommitted(err_env)
+        return self._reservations.prepare_cancel_all_uncommitted(err_env)
+
+    def cancel_uncommitted_for_shutdown(self) -> int:
+        cancelled_count, thunks = self.prepare_cancel_uncommitted_for_shutdown()
+        for thunk in thunks:
+            thunk()
+        return cancelled_count
 
     def submit(
         self,

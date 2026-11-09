@@ -53,6 +53,13 @@ def _deliver_settled(
     invoke_response_callback(cb, response)
 
 
+def _make_response_thunk(cb: Callable[[CallResult], None], response: CallResult) -> Callable[[], None]:
+    def _run() -> None:
+        invoke_response_callback(cb, response)
+
+    return _run
+
+
 class Reservation:
     """In-flight execution & idempotency reservation synchronized under ``ReservationTable``'s single state lock."""
 
@@ -273,10 +280,14 @@ class ReservationTable:
             _deliver_settled(reservation, result_env, deliver_cb)
         return result_env
 
-    def cancel_all_uncommitted(self, error_envelope: CallResult) -> int:
-        """Cancel every ``QUEUED`` or ``PREPARING`` reservation once; ``COMMITTING`` stays active."""
+    def prepare_cancel_all_uncommitted(
+        self,
+        error_envelope: CallResult,
+    ) -> tuple[int, tuple[Callable[[], None], ...]]:
+        """Cancel ``QUEUED``/``PREPARING`` reservations under ``_lock`` and return deferred callback thunks."""
         encode_envelope(error_envelope)
-        to_deliver: list[tuple[Reservation, CallResult, Callable[[CallResult], None] | None]] = []
+        settled_events: list[threading.Event] = []
+        thunks: list[Callable[[], None]] = []
         cancelled_count = 0
 
         with self._lock:
@@ -293,12 +304,19 @@ class ReservationTable:
                     if not res._response_settled:
                         res._response_settled = True
                         res._response = error_envelope
-                        to_deliver.append((res, error_envelope, res._on_response))
+                        settled_events.append(res._response_event)
+                        if res._on_response is not None:
+                            thunks.append(_make_response_thunk(res._on_response, error_envelope))
 
-        for res, _env, _cb in to_deliver:
-            res._response_event.set()
-        for _res, env, cb in to_deliver:
-            invoke_response_callback(cb, env)
+        for ev in settled_events:
+            ev.set()
+        return cancelled_count, tuple(thunks)
+
+    def cancel_all_uncommitted(self, error_envelope: CallResult) -> int:
+        """Cancel every ``QUEUED`` or ``PREPARING`` reservation once; ``COMMITTING`` stays active."""
+        cancelled_count, thunks = self.prepare_cancel_all_uncommitted(error_envelope)
+        for thunk in thunks:
+            thunk()
         return cancelled_count
 
     def try_claim_for_owner(self, reservation: Reservation, now_ns: int) -> bool:

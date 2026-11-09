@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import logging
 import math
 import threading
 import time
@@ -12,6 +13,11 @@ from concurrent.futures import Future
 from typing import Protocol, TypeVar
 
 from superbrain.application._auth_gate import AuthGate, evaluate_shallow_health
+from superbrain.application._future_notify import (
+    dispatch_async_thunks,
+    safe_set_exception,
+    safe_set_result,
+)
 from superbrain.application._reservation import make_checked_error
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.kernel import (
@@ -42,6 +48,7 @@ _T = TypeVar("_T")
 
 _ARBITER_ACTIVE_POLL_S = 0.004
 _WORKER_IDLE_POLL_S = 0.05
+_LOGGER = logging.getLogger(__name__)
 
 __all__ = ["AuthGate", "OwnerLoop", "OwnerSession", "OwnerSessionFactory"]
 
@@ -52,13 +59,13 @@ def _unavailable_error() -> BrainError:
 
 def _failed_future(error: BrainError) -> Future[_T]:
     fut: Future[_T] = Future()
-    fut.set_exception(error)
+    safe_set_exception(fut, error)
     return fut
 
 
 def _resolved_reply_future(reply: OwnerReply) -> Future[OwnerReply]:
     fut: Future[OwnerReply] = Future()
-    fut.set_result(reply)
+    safe_set_result(fut, reply)
     return fut
 
 
@@ -103,6 +110,10 @@ class OwnerSession(Protocol):
 
     def join_worker(self, timeout_s: float) -> bool: ...
 
+    def prepare_cancel_uncommitted_for_shutdown(
+        self,
+    ) -> tuple[int, tuple[Callable[[], None], ...]]: ...
+
     def cancel_uncommitted_for_shutdown(self) -> int: ...
 
     def apply_worker_command(self, cmd: WorkerCommand) -> JobRecord | InvocationRecord: ...
@@ -134,6 +145,7 @@ class OwnerLoop:
         self._session_factory = session_factory
         self._lifecycle_lock = threading.Lock()
         self._started = False
+        self._stop_requested = False
         self._stopping = False
         self._drain_expired = False
         self._arbiter_stop = False
@@ -212,11 +224,9 @@ class OwnerLoop:
             try:
                 rep = done.result()
             except BaseException as exc:  # noqa: BLE001
-                if not out_fut.done():
-                    out_fut.set_exception(exc)
+                safe_set_exception(out_fut, exc)
                 return
-            if not out_fut.done():
-                out_fut.set_result(rep.envelope)
+            safe_set_result(out_fut, rep.envelope)
 
         reply_fut.add_done_callback(_forward)
         return out_fut
@@ -290,25 +300,21 @@ class OwnerLoop:
         with self._lifecycle_lock:
             session = self._session
             if session is None or self._stopping:
-                fut.set_exception(_unavailable_error())
+                safe_set_exception(fut, _unavailable_error())
                 return fut
 
             def _task() -> None:
                 if self._drain_expired:
-                    if not fut.done():
-                        fut.set_exception(_unavailable_error())
+                    safe_set_exception(fut, _unavailable_error())
                     return
                 try:
                     res = fn(session)
                 except BrainError as err:
-                    if not fut.done():
-                        fut.set_exception(err)
+                    safe_set_exception(fut, err)
                 except Exception:  # noqa: BLE001
-                    if not fut.done():
-                        fut.set_exception(BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure"))
+                    safe_set_exception(fut, BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure"))
                 else:
-                    if not fut.done():
-                        fut.set_result(res)
+                    safe_set_result(fut, res)
 
             with self._internal_lock:
                 self._internal_queue.append(_task)
@@ -344,15 +350,20 @@ class OwnerLoop:
         return self._enqueue_internal(lambda _s: action())
 
     def _trigger_overrun(self, session: OwnerSession) -> int:
+        reply_thunks: tuple[Callable[[], None], ...] = ()
+        internal_tasks: tuple[Callable[[], None], ...] = ()
         with self._overrun_lock:
             if not self._overrun_cancelled and not self._closed_done.is_set():
                 self._overrun_cancelled = True
                 self._drain_expired = True
                 session.mark_overrun()
-                self._cancelled_requests += session.cancel_uncommitted_for_shutdown()
-                self._cancel_pending_internal()
+                cancelled_now, reply_thunks = session.prepare_cancel_uncommitted_for_shutdown()
+                self._cancelled_requests += cancelled_now
+                internal_tasks = self._drain_pending_internal()
                 self._owner_wake.set()
-            return self._cancelled_requests
+            cancelled_total = self._cancelled_requests
+        dispatch_async_thunks((*reply_thunks, *internal_tasks))
+        return cancelled_total
 
     def stop(self, grace_s: float = DEFAULT_SHUTDOWN_GRACE_S) -> ShutdownReport:
         if (
@@ -368,8 +379,9 @@ class OwnerLoop:
             if not self._started or self._session is None:
                 raise _unavailable_error()
             session = self._session
-            first_stopper = not self._stopping
+            first_stopper = not self._stop_requested
             if first_stopper:
+                self._stop_requested = True
                 self._stopping = True
                 self._ready_value = None
                 self._stop_wall_deadline = candidate_deadline
@@ -391,7 +403,7 @@ class OwnerLoop:
 
         # Grace budget expired while owner thread is still busy/blocked -> cancel uncommitted & report OVERRUN!
         cancelled_total = self._trigger_overrun(session)
-        if self._closed_done.wait(timeout=0.02):
+        if self._closed_done.is_set():
             self._join_and_adopt_if_failed(session)
             assert self._final_report is not None
             return self._final_report
@@ -432,13 +444,11 @@ class OwnerLoop:
             ):
                 session.adopt_after_owner_exit(owner_thread)
 
-    def _cancel_pending_internal(self) -> None:
+    def _drain_pending_internal(self) -> tuple[Callable[[], None], ...]:
         with self._internal_lock:
-            pending = list(self._internal_queue)
+            pending = tuple(self._internal_queue)
             self._internal_queue.clear()
-        for task in pending:
-            with contextlib.suppress(Exception):
-                task()
+        return pending
 
     def _pop_internal(self) -> Callable[[], None] | None:
         with self._internal_lock:
@@ -484,6 +494,7 @@ class OwnerLoop:
         arbiter.start()
         self._startup_done.set()
 
+        unexpected_error_code: ErrorCode | None = None
         try:
             while True:
                 self._owner_wake.clear()
@@ -517,16 +528,50 @@ class OwnerLoop:
                     self._owner_wake.wait(timeout=_WORKER_IDLE_POLL_S)
                 else:
                     self._owner_wake.wait()
+        except Exception as err:  # noqa: BLE001
+            unexpected_error_code = err.code if isinstance(err, BrainError) else ErrorCode.INTEGRITY_FAILURE
+            _LOGGER.error("owner loop exited unexpectedly (code=%s)", unexpected_error_code.value)
+            with self._lifecycle_lock:
+                self._stopping = True
+                self._ready_value = None
+                self._drain_expired = True
+                session.mark_stopping()
+            with contextlib.suppress(Exception):
+                session.begin_stop()
+            self._trigger_overrun(session)
         finally:
-            self._cancel_pending_internal()
-            self._arbiter_stop = True
-            self._arbiter_wake.set()
-            arbiter.join(timeout=1.0)
+            with self._lifecycle_lock:
+                unplanned_exit = not self._stop_requested
+                self._stopping = True
+                self._ready_value = None
+                if unplanned_exit:
+                    self._drain_expired = True
+                session.mark_stopping()
+            if unplanned_exit and unexpected_error_code is None:
+                unexpected_error_code = ErrorCode.INTEGRITY_FAILURE
+                with contextlib.suppress(Exception):
+                    session.begin_stop()
+                self._trigger_overrun(session)
             with self._overrun_lock:
                 overrun = self._drain_expired
                 cancelled_total = self._cancelled_requests
-            self._final_report = session.teardown_on_owner(
+                self._drain_expired = True
+            dispatch_async_thunks(self._drain_pending_internal())
+            self._arbiter_stop = True
+            self._arbiter_wake.set()
+            arbiter.join(timeout=1.0)
+            report = session.teardown_on_owner(
                 overrun=overrun,
                 cancelled_requests=cancelled_total,
             )
+            if unexpected_error_code is not None and report.state is not ShutdownState.CLOSE_FAILED:
+                report = ShutdownReport(
+                    state=ShutdownState.CLOSE_FAILED,
+                    drained_requests=report.drained_requests,
+                    cancelled_requests=report.cancelled_requests,
+                    worker_drained=False,
+                    endpoint_removed=report.endpoint_removed,
+                    error_code=unexpected_error_code,
+                )
+            self._final_report = report
             self._closed_done.set()
