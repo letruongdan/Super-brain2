@@ -6366,16 +6366,29 @@ def test_multiple_done_callbacks_on_same_cancelled_future_run_sequentially_while
     finally:
         rt_seed.close()
 
+    sb_logger = logging.getLogger("superbrain")
     futures_logger = logging.getLogger("concurrent.futures")
-    orig_propagate = futures_logger.propagate
-    futures_logger_records: list[str] = []
+    orig_sb_level = sb_logger.level
+    orig_sb_propagate = sb_logger.propagate
+    orig_fut_level = futures_logger.level
+    orig_fut_propagate = futures_logger.propagate
+    log_lock = threading.Lock()
+    captured_records: list[logging.LogRecord] = []
+    formatted_records: list[str] = []
 
-    class _FuturesLogCollector(logging.Handler):
+    class _CallbackLogCollector(logging.Handler):
         def emit(self, record: logging.LogRecord) -> None:
-            if record.levelno >= logging.ERROR:
-                futures_logger_records.append(self.format(record))
+            if record.levelno >= logging.WARNING:
+                formatted = self.format(record)
+                with log_lock:
+                    captured_records.append(record)
+                    formatted_records.append(formatted)
 
-    log_handler = _FuturesLogCollector(level=logging.ERROR)
+    log_handler = _CallbackLogCollector(level=logging.WARNING)
+    sb_logger.setLevel(logging.WARNING)
+    sb_logger.propagate = False
+    sb_logger.addHandler(log_handler)
+    futures_logger.setLevel(logging.WARNING)
     futures_logger.propagate = False
     futures_logger.addHandler(log_handler)
 
@@ -6545,8 +6558,12 @@ def test_multiple_done_callbacks_on_same_cancelled_future_run_sequentially_while
         _ = hold_fut.result(timeout=1.0)
         final_rep = loop.wait_closed(timeout=5.0)
     finally:
+        sb_logger.removeHandler(log_handler)
+        sb_logger.setLevel(orig_sb_level)
+        sb_logger.propagate = orig_sb_propagate
         futures_logger.removeHandler(log_handler)
-        futures_logger.propagate = orig_propagate
+        futures_logger.setLevel(orig_fut_level)
+        futures_logger.propagate = orig_fut_propagate
         a_released_marker.set()
         release_cb_a.set()
         release_owner.set()
@@ -6579,9 +6596,209 @@ def test_multiple_done_callbacks_on_same_cancelled_future_run_sequentially_while
     assert submit_order == ["a_start", "a_end", "b_start", "b_end"]
     assert reply_order == ["r1_start", "r1_end", "r2_start", "r2_end"]
     assert internal_order == ["i1_start", "i1_end", "i2_start", "i2_end"]
-    assert len(futures_logger_records) == 1
-    assert "isolated-reply-cb1" in futures_logger_records[0]
+    assert len(captured_records) == 1
+    assert captured_records[0].name.startswith("superbrain.")
+    assert captured_records[0].exc_info is None and captured_records[0].exc_text is None
+    assert "phase=future_callback" in formatted_records[0]
+    assert f"code={ErrorCode.INTEGRITY_FAILURE.value}" in formatted_records[0]
+    assert "isolated-reply-cb1" not in formatted_records[0]
+    assert "Traceback" not in formatted_records[0]
     assert final_rep is not None and final_rep.endpoint_removed is True
     assert final_rep.cancelled_requests == 2
+    with acquire_writer(DataRoot.at(root), adapters):
+        pass
+
+
+def test_raising_future_callbacks_log_static_code_without_leaking_exception_text_or_traceback(
+    trusted_tmp: Path,
+    _daemon_template: _DaemonTemplate,
+) -> None:
+    """I2-T6A-R08: Raising ``Future`` callbacks log static ``phase=future_callback`` + ``code`` without leaks."""
+    base_now = _daemon_template.base_time + dt.timedelta(minutes=5)
+    tok_a = _daemon_template.cred_a.token
+
+    root, _, cfg = _instantiate_case(trusted_tmp, "r08-redacted-cb-logs", _daemon_template)
+    clock = FakeClock(base_now)
+    adapters = os_adapters(clock=clock)
+
+    rt_seed = reopen_kernel_job_runtime(root, _daemon_template.store_id, adapters)
+    try:
+        svc_seed, st_seed = kernel_job_service(rt_seed, clock)
+        seeded_job = enqueue_job(svc_seed, st_seed, owner_id="dan", payload=b"r08-queued-job")
+    finally:
+        rt_seed.close()
+
+    sb_logger = logging.getLogger("superbrain")
+    futures_logger = logging.getLogger("concurrent.futures")
+    orig_sb_level = sb_logger.level
+    orig_sb_propagate = sb_logger.propagate
+    orig_fut_level = futures_logger.level
+    orig_fut_propagate = futures_logger.propagate
+    log_lock = threading.Lock()
+    captured_records: list[logging.LogRecord] = []
+    formatted_records: list[str] = []
+
+    class _RedactionCollector(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            if record.levelno >= logging.WARNING:
+                formatted = self.format(record)
+                with log_lock:
+                    captured_records.append(record)
+                    formatted_records.append(formatted)
+
+    log_handler = _RedactionCollector(level=logging.WARNING)
+    sb_logger.setLevel(logging.WARNING)
+    sb_logger.propagate = False
+    sb_logger.addHandler(log_handler)
+    futures_logger.setLevel(logging.WARNING)
+    futures_logger.propagate = False
+    futures_logger.addHandler(log_handler)
+
+    gate_a_entered = threading.Event()
+    release_gate_a = threading.Event()
+    path_a_done = threading.Event()
+    path_b_done = threading.Event()
+    owner_c_entered = threading.Event()
+    release_owner_c = threading.Event()
+    path_c_done = threading.Event()
+    sibling_done = threading.Event()
+
+    events_lock = threading.Lock()
+    followup_events: list[str] = []
+
+    def _hold_gate_a() -> bool:
+        gate_a_entered.set()
+        return release_gate_a.wait(BOUND_WAIT_S)
+
+    def _hold_owner_c() -> bool:
+        owner_c_entered.set()
+        return release_owner_c.wait(BOUND_WAIT_S)
+
+    def _cb_a1(done_f: Future[str]) -> None:
+        assert done_f.result() == "done-ok"
+        raise BrainError(ErrorCode.UNAUTHENTICATED, "canary-secret-token-sb_live_normal_111")
+
+    def _cb_a2(done_f: Future[str]) -> None:
+        assert done_f.result() == "done-ok"
+        with events_lock:
+            followup_events.append("a2_after_brain_error")
+        path_a_done.set()
+
+    def _cb_b1(done_f: Future[str]) -> None:
+        assert done_f.result() == "done-ok"
+        raise ValueError("canary-pem-BEGIN-PRIVATE-KEY-late_222")
+
+    def _cb_b2(done_f: Future[str]) -> None:
+        assert done_f.result() == "done-ok"
+        with events_lock:
+            followup_events.append("b2_after_late_error")
+        path_b_done.set()
+
+    def _cb_c1(done_f: Future[CallResult]) -> None:
+        _ = done_f.result()
+        raise RuntimeError("canary-hmac-key-deadbeef_overrun_333")
+
+    def _cb_c2(done_f: Future[CallResult]) -> None:
+        env = done_f.result()
+        assert env["ok"] is False
+        with events_lock:
+            followup_events.append("c2_after_overrun_error")
+        path_c_done.set()
+
+    def _cb_sibling(done_f: Future[OwnerReply]) -> None:
+        rep = done_f.result()
+        assert rep.envelope["ok"] is False
+        sibling_done.set()
+
+    loop = create_daemon_owner_loop(os_=adapters, clock=clock)
+    rep_c: ShutdownReport | None = None
+    final_rep: ShutdownReport | None = None
+    try:
+        loop.start(cfg)
+
+        # Path A: Normal owner completion with pre-registered callbacks.
+        gate_a_fut = loop.run_owner_action(_hold_gate_a)
+        assert gate_a_entered.wait(timeout=1.0)
+        fut_ok = loop.run_owner_action(lambda: "done-ok")
+        fut_ok.add_done_callback(_cb_a1)
+        fut_ok.add_done_callback(_cb_a2)
+        assert not fut_ok.done()
+        release_gate_a.set()
+        assert gate_a_fut.result(timeout=1.0) is True
+        assert fut_ok.result(timeout=1.0) == "done-ok"
+        assert path_a_done.wait(timeout=1.5)
+
+        # Path B: Late add_done_callback on already-settled Future.
+        fut_ok.add_done_callback(_cb_b1)
+        fut_ok.add_done_callback(_cb_b2)
+        assert path_b_done.wait(timeout=1.5)
+
+        # Path C: Deferred shutdown overrun cancellation callbacks.
+        hold_c_fut = loop.run_owner_action(_hold_owner_c)
+        assert owner_c_entered.wait(timeout=1.0)
+        fut_cancel = loop.submit(
+            ToolCommand("get_job", {"schema_version": "2.0", "job_id": seeded_job.job_id}, token=tok_a),
+            adapters.monotonic.monotonic_ns() + 10 * TOTAL_REQUEST_BUDGET_NS,
+        )
+        fut_cancel.add_done_callback(_cb_c1)
+        fut_cancel.add_done_callback(_cb_c2)
+
+        fut_sibling = loop.submit_reply(
+            ToolCommand("get_job", {"schema_version": "2.0", "job_id": seeded_job.job_id}, token=tok_a),
+            adapters.monotonic.monotonic_ns() + 10 * TOTAL_REQUEST_BUDGET_NS,
+        )
+        fut_sibling.add_done_callback(_cb_sibling)
+
+        rep_c = loop.stop(grace_s=0.08)
+        assert path_c_done.wait(timeout=1.5)
+        assert sibling_done.wait(timeout=1.5)
+        release_owner_c.set()
+        assert hold_c_fut.result(timeout=1.0) is True
+        final_rep = loop.wait_closed(timeout=5.0)
+    finally:
+        sb_logger.removeHandler(log_handler)
+        sb_logger.setLevel(orig_sb_level)
+        sb_logger.propagate = orig_sb_propagate
+        futures_logger.removeHandler(log_handler)
+        futures_logger.setLevel(orig_fut_level)
+        futures_logger.propagate = orig_fut_propagate
+        release_gate_a.set()
+        release_owner_c.set()
+        with contextlib.suppress(BrainError):
+            loop.stop(grace_s=0.05)
+        _ = loop.wait_closed(timeout=5.0)
+
+    assert rep_c is not None
+    assert (rep_c.state, rep_c.error_code, rep_c.cancelled_requests) == (
+        ShutdownState.OVERRUN,
+        ErrorCode.DEADLINE_EXCEEDED,
+        2,
+    )
+    assert final_rep is not None and final_rep.endpoint_removed is True
+    assert followup_events == [
+        "a2_after_brain_error",
+        "b2_after_late_error",
+        "c2_after_overrun_error",
+    ]
+    assert len(captured_records) == 3
+    forbidden_tokens = (
+        "canary-secret-token-sb_live_normal_111",
+        "canary-pem-BEGIN-PRIVATE-KEY-late_222",
+        "canary-hmac-key-deadbeef_overrun_333",
+        "Traceback",
+        "ValueError",
+        "RuntimeError",
+    )
+    for rec, formatted in zip(captured_records, formatted_records, strict=True):
+        assert rec.name.startswith("superbrain.")
+        assert rec.exc_info is None and rec.exc_text is None
+        assert "phase=future_callback" in formatted
+        msg = rec.getMessage()
+        for forbidden in forbidden_tokens:
+            assert forbidden not in formatted
+            assert forbidden not in msg
+    assert f"code={ErrorCode.UNAUTHENTICATED.value}" in formatted_records[0]
+    assert f"code={ErrorCode.INTEGRITY_FAILURE.value}" in formatted_records[1]
+    assert f"code={ErrorCode.INTEGRITY_FAILURE.value}" in formatted_records[2]
     with acquire_writer(DataRoot.at(root), adapters):
         pass
