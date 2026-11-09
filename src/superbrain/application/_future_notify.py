@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import logging
 import threading
 from collections import deque
 from collections.abc import Callable, Iterator, Sequence
@@ -14,8 +15,7 @@ from superbrain.core.errors import BrainError, ErrorCode
 _T = TypeVar("_T")
 
 _MAX_NOTIFY_WORKERS = 128
-_SCALER_ACK_WAIT_S = 0.01
-_SCALER_SETTLE_WAIT_S = 0.002
+_FUTURES_LOGGER = logging.getLogger("concurrent.futures")
 _DEFER_LOCAL = threading.local()
 
 
@@ -25,13 +25,19 @@ def noop_thunk() -> None:
 
 
 def _invoke_user_cb(fut: Future[_T], fn: Callable[[Future[_T]], object]) -> None:
-    with contextlib.suppress(Exception):
+    try:
         fn(fut)
+    except Exception:
+        _FUTURES_LOGGER.critical("exception calling callback for %r", fut, exc_info=True)
 
 
-def _make_user_cb_thunk(fut: Future[_T], fn: Callable[[Future[_T]], object]) -> Callable[[], None]:
+def _make_future_cbs_thunk(
+    fut: Future[_T],
+    cbs: tuple[Callable[[Future[_T]], object], ...],
+) -> Callable[[], None]:
     def _run() -> None:
-        _invoke_user_cb(fut, fn)
+        for cb in cbs:
+            _invoke_user_cb(fut, cb)
 
     return _run
 
@@ -94,8 +100,8 @@ class DeferredCallbackFuture(Future[_T]):
             proj(self)
         collector: list[Callable[[], None]] | None = getattr(_DEFER_LOCAL, "collector", None)
         if collector is not None and not self.cancelled():
-            for cb in cbs:
-                collector.append(_make_user_cb_thunk(self, cb))
+            if cbs:
+                collector.append(_make_future_cbs_thunk(self, cbs))
             return
         for cb in cbs:
             _invoke_user_cb(self, cb)
@@ -140,10 +146,9 @@ class AsyncThunkNotifier:
         self._active_workers = 0
         self._idle_workers = 0
         self._pending_spawns = 0
+        self._pending_handoffs = 0
         self._burst_seq = 0
         self._scaler_alive = False
-        self._scaler_busy = False
-        self._spawn_waiters: list[tuple[threading.Event, threading.Event]] = []
         self._started = False
         self._closed = False
 
@@ -198,32 +203,42 @@ class AsyncThunkNotifier:
                         self._closed = False
                 raise BrainError(ErrorCode.DAEMON_UNAVAILABLE, "daemon unavailable") from err
 
+    def begin_handoff(self) -> bool:
+        """Reserve notifier worker liveness across an in-flight shutdown cancellation handoff."""
+        with self._cond:
+            if self._closed or not self._started or self._active_workers == 0:
+                return False
+            self._pending_handoffs += 1
+            return True
+
+    def end_handoff(self) -> None:
+        """Release a previously reserved shutdown cancellation handoff."""
+        with self._cond:
+            if self._pending_handoffs > 0:
+                self._pending_handoffs -= 1
+                self._cond.notify_all()
+
     def submit(self, thunks: Sequence[Callable[[], None]]) -> None:
-        """Enqueue ``thunks`` in RAM and signal background scaling without calling ``Thread.start`` on caller."""
+        """Enqueue ``thunks`` in RAM and wake workers without calling ``Thread.start`` or waiting on caller."""
         if not thunks:
             return
         if not self._started and not self._closed:
             self.start(strict=False)
-        wait_pair: tuple[threading.Event, threading.Event] | None = None
+        workerless = False
         with self._cond:
             self._queue.extend(thunks)
-            can_scale = self._scaler_alive and not self._closed
+            can_scale = self._scaler_alive and (not self._closed or self._pending_handoffs > 0)
             needed = len(self._queue) - (self._idle_workers + self._pending_spawns)
             avail = self._max_workers - self._active_workers
             to_spawn = min(needed, avail) if (can_scale and needed > 0 and avail > 0) else 0
             if to_spawn > 0:
                 self._active_workers += to_spawn
                 self._pending_spawns += to_spawn
-                if not self._scaler_busy:
-                    wait_pair = (threading.Event(), threading.Event())
-                    self._spawn_waiters.append(wait_pair)
+            workerless = self._active_workers == 0
             self._cond.notify_all()
 
-        if wait_pair is not None:
-            ack_ev, settled_ev = wait_pair
-            if ack_ev.wait(timeout=_SCALER_ACK_WAIT_S):
-                settled_ev.wait(timeout=_SCALER_SETTLE_WAIT_S)
-        self._drain_if_workerless()
+        if workerless:
+            self._drain_if_workerless()
 
     def _drain_if_workerless(self) -> None:
         while True:
@@ -235,7 +250,7 @@ class AsyncThunkNotifier:
                 fn()
 
     def close(self) -> None:
-        """Allow standby and scaler workers to exit once queued work and pending spawns finish."""
+        """Allow standby and scaler workers to exit once reserved handoffs, spawns, and queued work finish."""
         with self._cond:
             self._closed = True
             self._cond.notify_all()
@@ -243,21 +258,15 @@ class AsyncThunkNotifier:
     def _scaler_worker(self) -> None:
         while True:
             with self._cond:
-                while self._pending_spawns == 0 and not self._closed:
+                while self._pending_spawns == 0 and (not self._closed or self._pending_handoffs > 0):
                     self._cond.wait()
-                if self._pending_spawns == 0 and self._closed:
+                if self._pending_spawns == 0 and self._closed and self._pending_handoffs == 0:
                     self._scaler_alive = False
                     return
                 batch = self._pending_spawns
                 self._pending_spawns = 0
-                self._scaler_busy = True
-                waiters = tuple(self._spawn_waiters)
-                self._spawn_waiters.clear()
                 base_seq = self._burst_seq
                 self._burst_seq += batch
-
-            for ack_ev, _settled_ev in waiters:
-                ack_ev.set()
 
             unstarted = batch
             for offset in range(batch):
@@ -272,25 +281,21 @@ class AsyncThunkNotifier:
                 except RuntimeError:
                     break
 
-            with self._cond:
-                if unstarted:
+            if unstarted:
+                with self._cond:
                     self._active_workers -= unstarted
-                self._scaler_busy = False
-
-            for _ack_ev, settled_ev in waiters:
-                settled_ev.set()
             self._drain_if_workerless()
 
     def _standby_worker(self) -> None:
         while True:
             with self._cond:
-                while not self._queue and not self._closed:
+                while not self._queue and (not self._closed or self._pending_handoffs > 0):
                     self._idle_workers += 1
                     try:
                         self._cond.wait()
                     finally:
                         self._idle_workers -= 1
-                if not self._queue and self._closed:
+                if not self._queue and self._closed and self._pending_handoffs == 0:
                     self._active_workers -= 1
                     return
                 fn = self._queue.popleft()
@@ -306,6 +311,30 @@ class AsyncThunkNotifier:
                 fn = self._queue.popleft()
             with contextlib.suppress(Exception):
                 fn()
+
+
+def settle_and_submit_callbacks(
+    notifier: AsyncThunkNotifier,
+    settle_thunks: Sequence[Callable[[], object]],
+    *,
+    handoff_reserved: bool = False,
+) -> None:
+    """Publish deferred ``Future`` outcomes in RAM first, then submit user callback thunks to ``notifier``."""
+    try:
+        if not settle_thunks:
+            return
+        notify_thunks: list[Callable[[], None]] = []
+        for settle_fn in settle_thunks:
+            with collect_deferred_callbacks() as item_cbs, contextlib.suppress(Exception):
+                settle_fn()
+            if item_cbs:
+                notify_thunks.extend(item_cbs)
+            else:
+                notify_thunks.append(noop_thunk)
+        notifier.submit(notify_thunks)
+    finally:
+        if handoff_reserved:
+            notifier.end_handoff()
 
 
 def dispatch_async_thunks(thunks: Sequence[Callable[[], None]]) -> None:

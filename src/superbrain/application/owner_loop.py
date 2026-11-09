@@ -8,7 +8,7 @@ import math
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping
 from concurrent.futures import Future
 from dataclasses import replace
 from typing import Protocol, TypeVar
@@ -17,11 +17,10 @@ from superbrain.application._auth_gate import AuthGate, evaluate_shallow_health
 from superbrain.application._future_notify import (
     AsyncThunkNotifier,
     DeferredCallbackFuture,
-    collect_deferred_callbacks,
     is_collecting_deferred_callbacks,
-    noop_thunk,
     safe_set_exception,
     safe_set_result,
+    settle_and_submit_callbacks,
 )
 from superbrain.application._reservation import make_checked_error
 from superbrain.core.errors import BrainError, ErrorCode
@@ -269,7 +268,10 @@ class OwnerLoop:
                     if is_collecting_deferred_callbacks():
                         safe_set_exception(fut, _unavailable_error())
                     else:
-                        self._settle_cancelled_and_enqueue((lambda: safe_set_exception(fut, _unavailable_error()),))
+                        settle_and_submit_callbacks(
+                            self._notifier,
+                            (lambda: safe_set_exception(fut, _unavailable_error()),),
+                        )
                     return
                 try:
                     res = fn(session)
@@ -309,22 +311,10 @@ class OwnerLoop:
             raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
         return self._enqueue_internal(lambda _s: action())
 
-    def _settle_cancelled_and_enqueue(self, settle_thunks: Sequence[Callable[[], object]]) -> None:
-        if not settle_thunks:
-            return
-        notify_thunks: list[Callable[[], None]] = []
-        for settle_fn in settle_thunks:
-            with collect_deferred_callbacks() as item_cbs, contextlib.suppress(Exception):
-                settle_fn()
-            if item_cbs:
-                notify_thunks.extend(item_cbs)
-            else:
-                notify_thunks.append(noop_thunk)
-        self._notifier.submit(notify_thunks)
-
     def _trigger_overrun(self, session: OwnerSession) -> int:
         reply_thunks: tuple[Callable[[], None], ...] = ()
         internal_tasks: tuple[Callable[[], None], ...] = ()
+        handoff_reserved = False
         with self._overrun_lock:
             if not self._overrun_cancelled and not self._closed_done.is_set():
                 self._overrun_cancelled = True
@@ -333,9 +323,15 @@ class OwnerLoop:
                 cancelled_now, reply_thunks = session.prepare_cancel_uncommitted_for_shutdown()
                 self._cancelled_requests += cancelled_now
                 internal_tasks = self._drain_pending_internal()
+                if reply_thunks or internal_tasks:
+                    handoff_reserved = self._notifier.begin_handoff()
                 self._owner_wake.set()
             cancelled_total = self._cancelled_requests
-        self._settle_cancelled_and_enqueue((*reply_thunks, *internal_tasks))
+        settle_and_submit_callbacks(
+            self._notifier,
+            (*reply_thunks, *internal_tasks),
+            handoff_reserved=handoff_reserved,
+        )
         return cancelled_total
 
     def stop(self, grace_s: float = DEFAULT_SHUTDOWN_GRACE_S) -> ShutdownReport:
@@ -567,7 +563,7 @@ class OwnerLoop:
             with self._overrun_lock:
                 overrun = self._drain_expired
                 self._drain_expired = True
-            self._settle_cancelled_and_enqueue(self._drain_pending_internal())
+            settle_and_submit_callbacks(self._notifier, self._drain_pending_internal())
             self._arbiter_stop = True
             self._arbiter_wake.set()
             arb_wait = 1.0 if unplanned_exit else min(1.0, max(0.005, self._stop_wall_deadline - time.perf_counter()))
@@ -590,5 +586,6 @@ class OwnerLoop:
                 )
             with self._lifecycle_lock:
                 self._final_report = report
-            self._closed_done.set()
-            self._notifier.close()
+            with self._overrun_lock:
+                self._closed_done.set()
+                self._notifier.close()
