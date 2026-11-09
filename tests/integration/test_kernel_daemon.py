@@ -2255,6 +2255,7 @@ def test_late_auth_publish_cannot_reopen_stopped_gate(
         allow_publish.set()
         with contextlib.suppress(BrainError):
             loop.stop()
+        _ = loop.wait_closed(timeout=BOUND_WAIT_S)
 
 
 def test_owner_cutoff_settles_once_while_commit_blocked(
@@ -5136,4 +5137,456 @@ def test_cancelled_request_future_callback_does_not_delay_first_or_concurrent_st
     assert cast(dict[str, JsonValue], callback_envelopes[0]["error"])["code"] == ErrorCode.DAEMON_UNAVAILABLE.value
 
 
+def test_stop_applies_shared_cutoff_to_arbiter_join_and_reports_overrun_when_arbiter_callback_blocks(
+    trusted_tmp: Path,
+    _daemon_template: _DaemonTemplate,
+) -> None:
+    """I2-T6A-R03: ``stop()`` bounds deadline-arbiter join by shared cutoff and reports ``OVERRUN`` if still alive."""
+    base_now = _daemon_template.base_time + dt.timedelta(minutes=5)
+    tok_a = _daemon_template.cred_a.token
+    caller_tid = threading.get_ident()
 
+    # Part A: Arbiter callback blocked past shared stop() cutoff -> bounded return + ShutdownState.OVERRUN.
+    root_a, _, cfg_a = _instantiate_case(trusted_tmp, "r03-arbiter-join-overrun", _daemon_template)
+    clock_a = FakeClock(base_now)
+    adapters_a = os_adapters(clock=clock_a)
+
+    rt_seed_a = reopen_kernel_job_runtime(root_a, _daemon_template.store_id, adapters_a)
+    try:
+        svc_a, st_a = kernel_job_service(rt_seed_a, clock_a)
+        seeded_a = enqueue_job(svc_a, st_a, owner_id="dan", payload=b"r03-arbiter-overrun")
+    finally:
+        rt_seed_a.close()
+
+    arbiter_cb_entered = threading.Event()
+    release_arbiter_cb = threading.Event()
+    cb_released_marker = threading.Event()
+    arbiter_cb_exited = threading.Event()
+    arbiter_cb_tids: list[int] = []
+    arbiter_cb_envs: list[CallResult] = []
+
+    def _on_arbiter_done_a(done_fut: Future[CallResult]) -> None:
+        try:
+            arbiter_cb_tids.append(threading.get_ident())
+            arbiter_cb_envs.append(done_fut.result())
+            arbiter_cb_entered.set()
+            release_arbiter_cb.wait(timeout=2.4)
+        finally:
+            arbiter_cb_exited.set()
+
+    owner_held_a = threading.Event()
+    release_owner_a = threading.Event()
+
+    def _hold_owner_a() -> bool:
+        owner_held_a.set()
+        return release_owner_a.wait(BOUND_WAIT_S)
+
+    loop_a = create_daemon_owner_loop(os_=adapters_a, clock=clock_a)
+    first_rep: ShutdownReport | None = None
+    second_rep: ShutdownReport | None = None
+    third_rep: ShutdownReport | None = None
+    first_returned_before_cb_release = False
+    second_returned_before_cb_release = False
+    third_returned_before_cb_release = False
+    try:
+        ready_a = loop_a.start(cfg_a)
+        epoch_a = ready_a.identity.writer_epoch
+        owner_tid_a = loop_a.run_owner_action(threading.get_ident).result(timeout=1.0)
+
+        hold_fut_a = loop_a.run_owner_action(_hold_owner_a)
+        assert owner_held_a.wait(timeout=1.0), "owner did not enter hold barrier"
+
+        expiring_fut_a = loop_a.submit(
+            ToolCommand("get_job", {"schema_version": "2.0", "job_id": seeded_a.job_id}, token=tok_a),
+            adapters_a.monotonic.monotonic_ns() + TOTAL_REQUEST_BUDGET_NS,
+        )
+        expiring_fut_a.add_done_callback(_on_arbiter_done_a)
+        assert arbiter_cb_entered.wait(timeout=2.5), "deadline arbiter did not settle expiring get_job"
+        assert arbiter_cb_tids and arbiter_cb_tids[0] not in {caller_tid, owner_tid_a}
+        assert arbiter_cb_envs[0]["ok"] is False
+        assert cast(dict[str, JsonValue], arbiter_cb_envs[0]["error"])["code"] == ErrorCode.DEADLINE_EXCEEDED.value
+
+        release_owner_a.set()
+        assert hold_fut_a.result(timeout=1.0) is True
+
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            stop_started = time.monotonic()
+            first_stop_fut = pool.submit(loop_a.stop, grace_s=1.30)
+            _wait_until(lambda: loop_a.ready is None, desc="first stop caller to lock shared cutoff")
+            second_stop_fut = pool.submit(loop_a.stop, grace_s=3.0)
+            try:
+                pre_release_deadline = stop_started + 1.65
+                try:
+                    first_rep = first_stop_fut.result(
+                        timeout=max(0.01, pre_release_deadline - time.monotonic())
+                    )
+                    first_returned_before_cb_release = (
+                        not cb_released_marker.is_set() and not arbiter_cb_exited.is_set()
+                    )
+                except TimeoutError:
+                    first_returned_before_cb_release = False
+                try:
+                    second_rep = second_stop_fut.result(
+                        timeout=max(0.01, pre_release_deadline - time.monotonic())
+                    )
+                    second_returned_before_cb_release = (
+                        not cb_released_marker.is_set() and not arbiter_cb_exited.is_set()
+                    )
+                except TimeoutError:
+                    second_returned_before_cb_release = False
+                if first_returned_before_cb_release and second_returned_before_cb_release:
+                    third_stop_fut = pool.submit(loop_a.stop, grace_s=0.5)
+                    try:
+                        third_rep = third_stop_fut.result(timeout=0.35)
+                        third_returned_before_cb_release = (
+                            not cb_released_marker.is_set() and not arbiter_cb_exited.is_set()
+                        )
+                    except TimeoutError:
+                        third_returned_before_cb_release = False
+            finally:
+                cb_released_marker.set()
+                release_arbiter_cb.set()
+
+            if first_rep is None:
+                first_rep = first_stop_fut.result(timeout=BOUND_WAIT_S)
+            if second_rep is None:
+                second_rep = second_stop_fut.result(timeout=BOUND_WAIT_S)
+            assert arbiter_cb_exited.wait(timeout=1.0)
+            final_rep_a = loop_a.wait_closed(timeout=BOUND_WAIT_S)
+    finally:
+        cb_released_marker.set()
+        release_arbiter_cb.set()
+        release_owner_a.set()
+        with contextlib.suppress(BrainError):
+            loop_a.stop(grace_s=0.05)
+        _ = loop_a.wait_closed(timeout=BOUND_WAIT_S)
+
+    assert first_returned_before_cb_release is True
+    assert second_returned_before_cb_release is True
+    assert third_returned_before_cb_release is True
+    assert first_rep is not None
+    assert (first_rep.state, first_rep.error_code) == (ShutdownState.OVERRUN, ErrorCode.DEADLINE_EXCEEDED)
+    assert second_rep is not None
+    assert (second_rep.state, second_rep.error_code) == (ShutdownState.OVERRUN, ErrorCode.DEADLINE_EXCEEDED)
+    assert third_rep is not None
+    assert (third_rep.state, third_rep.error_code) == (ShutdownState.OVERRUN, ErrorCode.DEADLINE_EXCEEDED)
+    assert final_rep_a is not None and final_rep_a.endpoint_removed is True
+
+    # Verify clean next-epoch reopen after arbiter release & full close.
+    loop_a_next = create_daemon_owner_loop(os_=adapters_a, clock=clock_a)
+    try:
+        ready_a_next = loop_a_next.start(cfg_a)
+        assert ready_a_next.identity.writer_epoch == epoch_a + 1
+        rep_a_next = loop_a_next.stop(grace_s=1.0)
+        assert rep_a_next.state is ShutdownState.STOPPED
+    finally:
+        with contextlib.suppress(BrainError):
+            loop_a_next.stop(grace_s=0.05)
+        _ = loop_a_next.wait_closed(timeout=BOUND_WAIT_S)
+
+    # Part B: Positive control — arbiter callback releases within remaining shared cutoff -> ShutdownState.STOPPED.
+    root_b, _, cfg_b = _instantiate_case(trusted_tmp, "r03-arbiter-join-stopped", _daemon_template)
+    clock_b = FakeClock(base_now + dt.timedelta(minutes=1))
+    adapters_b = os_adapters(clock=clock_b)
+
+    rt_seed_b = reopen_kernel_job_runtime(root_b, _daemon_template.store_id, adapters_b)
+    try:
+        svc_b, st_b = kernel_job_service(rt_seed_b, clock_b)
+        seeded_b = enqueue_job(svc_b, st_b, owner_id="dan", payload=b"r03-arbiter-clean")
+    finally:
+        rt_seed_b.close()
+
+    arbiter_cb_entered_b = threading.Event()
+    release_arbiter_cb_b = threading.Event()
+    arbiter_cb_exited_b = threading.Event()
+    arbiter_cb_tids_b: list[int] = []
+
+    def _on_arbiter_done_b(_done_fut: Future[CallResult]) -> None:
+        try:
+            arbiter_cb_tids_b.append(threading.get_ident())
+            arbiter_cb_entered_b.set()
+            release_arbiter_cb_b.wait(timeout=2.5)
+        finally:
+            arbiter_cb_exited_b.set()
+
+    owner_held_b = threading.Event()
+    release_owner_b = threading.Event()
+
+    def _hold_owner_b() -> bool:
+        owner_held_b.set()
+        return release_owner_b.wait(BOUND_WAIT_S)
+
+    loop_b = create_daemon_owner_loop(os_=adapters_b, clock=clock_b)
+    try:
+        loop_b.start(cfg_b)
+        owner_tid_b = loop_b.run_owner_action(threading.get_ident).result(timeout=1.0)
+        hold_fut_b = loop_b.run_owner_action(_hold_owner_b)
+        assert owner_held_b.wait(timeout=1.0)
+
+        expiring_fut_b = loop_b.submit(
+            ToolCommand("get_job", {"schema_version": "2.0", "job_id": seeded_b.job_id}, token=tok_a),
+            adapters_b.monotonic.monotonic_ns() + TOTAL_REQUEST_BUDGET_NS,
+        )
+        expiring_fut_b.add_done_callback(_on_arbiter_done_b)
+        assert arbiter_cb_entered_b.wait(timeout=2.5), "Part B arbiter callback did not fire"
+        assert arbiter_cb_tids_b and arbiter_cb_tids_b[0] not in {caller_tid, owner_tid_b}
+
+        release_owner_b.set()
+        assert hold_fut_b.result(timeout=1.0) is True
+
+        with ThreadPoolExecutor(max_workers=1) as pool_b:
+            stop_fut_b = pool_b.submit(loop_b.stop, grace_s=1.50)
+            _wait_until(
+                lambda: not DataRoot.at(root_b).endpoint_path.exists(),
+                timeout=1.35,
+                desc="Part B owner closed runtime while arbiter callback remained held",
+            )
+            try:
+                with pytest.raises(TimeoutError):
+                    stop_fut_b.result(timeout=0.08)
+            finally:
+                release_arbiter_cb_b.set()
+            rep_b = stop_fut_b.result(timeout=1.5)
+
+        assert arbiter_cb_exited_b.wait(timeout=1.0)
+        assert (rep_b.state, rep_b.error_code) == (ShutdownState.STOPPED, None)
+        assert loop_b.wait_closed(timeout=0.0) == rep_b
+    finally:
+        release_arbiter_cb_b.set()
+        release_owner_b.set()
+        with contextlib.suppress(BrainError):
+            loop_b.stop(grace_s=0.05)
+        _ = loop_b.wait_closed(timeout=BOUND_WAIT_S)
+
+    # Part C: Foreground serve() waits for both owner & arbiter exit on OVERRUN and returns exit code 1.
+    root_c, _, cfg_c = _instantiate_case(trusted_tmp, "r03-arbiter-serve-overrun", _daemon_template)
+    clock_c = FakeClock(base_now + dt.timedelta(minutes=2))
+    adapters_c = os_adapters(clock=clock_c)
+
+    rt_seed_c = reopen_kernel_job_runtime(root_c, _daemon_template.store_id, adapters_c)
+    try:
+        svc_c, st_c = kernel_job_service(rt_seed_c, clock_c)
+        seeded_c = enqueue_job(svc_c, st_c, owner_id="dan", payload=b"r03-arbiter-serve")
+    finally:
+        rt_seed_c.close()
+
+    arbiter_cb_entered_c = threading.Event()
+    release_arbiter_cb_c = threading.Event()
+    arbiter_cb_exited_c = threading.Event()
+    arbiter_cb_tids_c: list[int] = []
+    owner_held_c = threading.Event()
+    release_owner_c = threading.Event()
+    stop_ev_c = threading.Event()
+    ready_ev_c = threading.Event()
+    serve_done_c = threading.Event()
+    serve_rc_c: list[int] = []
+    loop_c_ref: list[OwnerLoop] = []
+
+    def _on_arbiter_done_c(_done_fut: Future[CallResult]) -> None:
+        try:
+            arbiter_cb_tids_c.append(threading.get_ident())
+            arbiter_cb_entered_c.set()
+            release_arbiter_cb_c.wait(timeout=2.5)
+        finally:
+            arbiter_cb_exited_c.set()
+
+    def _hold_owner_c() -> bool:
+        owner_held_c.set()
+        return release_owner_c.wait(BOUND_WAIT_S)
+
+    def _on_ready_c(_ready: Ready, lp: OwnerLoop) -> None:
+        loop_c_ref.append(lp)
+        ready_ev_c.set()
+
+    def _run_serve_c() -> None:
+        try:
+            serve_rc_c.append(
+                serve(
+                    cfg_c,
+                    os_=adapters_c,
+                    clock=clock_c,
+                    stop_event=stop_ev_c,
+                    shutdown_grace_s=0.15,
+                    on_ready=_on_ready_c,
+                )
+            )
+        finally:
+            serve_done_c.set()
+
+    t_serve_c = threading.Thread(target=_run_serve_c, daemon=True)
+    t_serve_c.start()
+    try:
+        assert ready_ev_c.wait(timeout=BOUND_WAIT_S)
+        lp_c = loop_c_ref[0]
+        owner_tid_c = lp_c.run_owner_action(threading.get_ident).result(timeout=1.0)
+        hold_fut_c = lp_c.run_owner_action(_hold_owner_c)
+        assert owner_held_c.wait(timeout=1.0)
+
+        expiring_fut_c = lp_c.submit(
+            ToolCommand("get_job", {"schema_version": "2.0", "job_id": seeded_c.job_id}, token=tok_a),
+            adapters_c.monotonic.monotonic_ns() + TOTAL_REQUEST_BUDGET_NS,
+        )
+        expiring_fut_c.add_done_callback(_on_arbiter_done_c)
+        assert arbiter_cb_entered_c.wait(timeout=2.5), "Part C arbiter callback did not fire"
+        assert arbiter_cb_tids_c and arbiter_cb_tids_c[0] not in {caller_tid, owner_tid_c}
+
+        release_owner_c.set()
+        assert hold_fut_c.result(timeout=1.0) is True
+
+        stop_ev_c.set()
+        _wait_until(
+            lambda: not DataRoot.at(root_c).endpoint_path.exists(),
+            timeout=1.6,
+            desc="Part C owner to remove endpoint while arbiter callback remains held",
+        )
+        assert not serve_done_c.wait(timeout=0.10), "serve() returned while arbiter callback was still running"
+        release_arbiter_cb_c.set()
+        assert serve_done_c.wait(timeout=BOUND_WAIT_S)
+        assert arbiter_cb_exited_c.wait(timeout=1.0)
+        assert serve_rc_c == [1]
+    finally:
+        release_arbiter_cb_c.set()
+        release_owner_c.set()
+        stop_ev_c.set()
+        t_serve_c.join(timeout=BOUND_WAIT_S)
+
+
+def test_notifier_thread_start_failure_during_overrun_preserves_shutdown_report_and_settles_requests_once(
+    trusted_tmp: Path,
+    _daemon_template: _DaemonTemplate,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """I2-T6A-R04: Notifier ``Thread.start`` ``RuntimeError`` never crashes ``stop()`` or loses settlements."""
+    base_now = _daemon_template.base_time + dt.timedelta(minutes=5)
+    tok_a = _daemon_template.cred_a.token
+    orig_thread_start = threading.Thread.start
+
+    def _run_case(case_label: str, *, fail_all: bool) -> None:
+        root, _, cfg = _instantiate_case(trusted_tmp, case_label, _daemon_template)
+        clock = FakeClock(base_now)
+        adapters = os_adapters(clock=clock)
+
+        rt_seed = reopen_kernel_job_runtime(root, _daemon_template.store_id, adapters)
+        try:
+            svc_seed, st_seed = kernel_job_service(rt_seed, clock)
+            seeded_job = enqueue_job(svc_seed, st_seed, owner_id="dan", payload=b"r04-queued-job")
+        finally:
+            rt_seed.close()
+
+        owner_entered = threading.Event()
+        release_owner = threading.Event()
+
+        def _hold_owner() -> bool:
+            owner_entered.set()
+            return release_owner.wait(BOUND_WAIT_S)
+
+        settled_envelopes: list[CallResult] = []
+        settled_event = threading.Event()
+        internal_outcomes: list[BaseException | str] = []
+        internal_settled_event = threading.Event()
+
+        def _on_call_done(done_f: Future[CallResult]) -> None:
+            settled_envelopes.append(done_f.result())
+            settled_event.set()
+
+        def _on_internal_done(done_f: Future[str]) -> None:
+            exc = done_f.exception()
+            internal_outcomes.append(exc if exc is not None else done_f.result())
+            internal_settled_event.set()
+
+        start_attempts = 0
+        start_lock = threading.Lock()
+
+        def _failing_thread_start(thread_self: threading.Thread) -> None:
+            nonlocal start_attempts
+            with start_lock:
+                start_attempts += 1
+                should_fail = fail_all or start_attempts == 1
+            if should_fail:
+                raise RuntimeError("can't start new thread")
+            orig_thread_start(thread_self)
+
+        loop = create_daemon_owner_loop(os_=adapters, clock=clock)
+        stop_raised: RuntimeError | None = None
+        report1: ShutdownReport | None = None
+        report2: ShutdownReport | None = None
+        call_settled_in_time = False
+        internal_settled_in_time = False
+        final_rep: ShutdownReport | None = None
+        try:
+            loop.start(cfg)
+            hold_fut = loop.run_owner_action(_hold_owner)
+            assert owner_entered.wait(timeout=1.0), "owner did not enter blocking action"
+
+            queued_call_fut = loop.submit(
+                ToolCommand("get_job", {"schema_version": "2.0", "job_id": seeded_job.job_id}, token=tok_a),
+                adapters.monotonic.monotonic_ns() + 10 * TOTAL_REQUEST_BUDGET_NS,
+            )
+            queued_call_fut.add_done_callback(_on_call_done)
+
+            queued_internal_fut = loop.run_owner_action(lambda: "never-runs")
+            queued_internal_fut.add_done_callback(_on_internal_done)
+
+            monkeypatch.setattr(threading.Thread, "start", _failing_thread_start)
+            try:
+                try:
+                    report1 = loop.stop(grace_s=0.08)
+                except RuntimeError as exc:
+                    stop_raised = exc
+                try:
+                    report2 = loop.stop(grace_s=0.5)
+                except RuntimeError as exc:
+                    if stop_raised is None:
+                        stop_raised = exc
+
+                release_owner.set()
+                _ = hold_fut.result(timeout=1.0)
+                final_rep = loop.wait_closed(timeout=BOUND_WAIT_S)
+                call_settled_in_time = settled_event.wait(timeout=1.0 if stop_raised is None else 0.05)
+                internal_settled_in_time = internal_settled_event.wait(
+                    timeout=1.0 if stop_raised is None else 0.05
+                )
+            finally:
+                monkeypatch.setattr(threading.Thread, "start", orig_thread_start)
+        finally:
+            monkeypatch.setattr(threading.Thread, "start", orig_thread_start)
+            release_owner.set()
+            with contextlib.suppress(BrainError):
+                loop.stop(grace_s=0.05)
+            _ = loop.wait_closed(timeout=BOUND_WAIT_S)
+
+        assert stop_raised is None, f"stop() raised raw RuntimeError ({case_label}): {stop_raised}"
+        assert report1 is not None
+        assert (report1.state, report1.error_code, report1.cancelled_requests) == (
+            ShutdownState.OVERRUN,
+            ErrorCode.DEADLINE_EXCEEDED,
+            1,
+        )
+        assert report2 is not None
+        assert (report2.state, report2.error_code, report2.cancelled_requests) == (
+            ShutdownState.OVERRUN,
+            ErrorCode.DEADLINE_EXCEEDED,
+            1,
+        )
+        assert final_rep is not None and final_rep.endpoint_removed is True
+        assert (final_rep.state, final_rep.error_code, final_rep.cancelled_requests) == (
+            ShutdownState.OVERRUN,
+            ErrorCode.DEADLINE_EXCEEDED,
+            1,
+        )
+        assert call_settled_in_time is True and queued_call_fut.done()
+        assert queued_call_fut.result(timeout=0.1) == {
+            "ok": False,
+            "error": {"code": "daemon_unavailable", "message": "daemon unavailable"},
+        }
+        assert len(settled_envelopes) == 1
+        assert internal_settled_in_time is True and queued_internal_fut.done()
+        _expect_brain_error(ErrorCode.DAEMON_UNAVAILABLE, lambda: queued_internal_fut.result(timeout=0.1))
+        assert len(internal_outcomes) == 1
+        assert isinstance(internal_outcomes[0], BrainError)
+        assert internal_outcomes[0].code is ErrorCode.DAEMON_UNAVAILABLE
+        with acquire_writer(DataRoot.at(root), adapters):
+            pass
+
+    _run_case("r04-notifier-fail-first", fail_all=False)
+    _run_case("r04-notifier-fail-all", fail_all=True)
