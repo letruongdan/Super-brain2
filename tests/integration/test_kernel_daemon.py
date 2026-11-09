@@ -4095,3 +4095,374 @@ def test_policy_blocked_claim_yields_to_stop_without_claiming_next_job(
         )
     finally:
         reopened.close()
+
+
+def test_stop_during_claim_guard_leaves_due_job_queued_at_attempt_one(
+    trusted_tmp: Path,
+    _daemon_template: _DaemonTemplate,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CL-T5-B1: ``stop()`` winning inside the claim guard leaves the next due job at ``(QUEUED, 1)``."""
+    base_now = _daemon_template.base_time + dt.timedelta(minutes=5)
+    root, _, cfg = _instantiate_case(trusted_tmp, "cl-t5-b1-claim-guard", _daemon_template)
+    clock = FakeClock(base_now)
+    mono = _FakeMonotonicClock()
+    adapters = os_adapters(clock=clock, monotonic=mono)
+
+    blocked_payload = b"b1-guard-quarantined-payload"
+    rt_seed = reopen_kernel_job_runtime(root, _daemon_template.store_id, adapters)
+    try:
+        svc_seed, st_seed = kernel_job_service(rt_seed, clock)
+        blocked = enqueue_job(svc_seed, st_seed, owner_id="dan", payload=blocked_payload)
+        rt_seed.policy.record_intent(IntentKind.QUARANTINE, {"digest": digest_bytes(blocked_payload)})
+        clock.advance(dt.timedelta(milliseconds=1))
+        due = enqueue_job(svc_seed, st_seed, owner_id="dan", payload=b"b1-due-during-guard")
+    finally:
+        rt_seed.close()
+
+    blocked_disposed = threading.Event()
+    in_second_guard = threading.Event()
+    release_guard = threading.Event()
+    close_entered = threading.Event()
+    close_returned = threading.Event()
+    handler_ran = threading.Event()
+
+    orig_resolve = JobService.resolve_leased_spec
+    orig_in_flight_prop = JobExecutor.__dict__["in_flight"]
+    assert isinstance(orig_in_flight_prop, property) and orig_in_flight_prop.fget is not None
+    orig_in_flight = cast(Callable[[JobExecutor], int], orig_in_flight_prop.fget)
+    paused_guard = False
+
+    def _instrumented_resolve(service: JobService, lease: JobLease) -> JobSpec | None:
+        result = orig_resolve(service, lease)
+        if lease.job_id == blocked.job_id:
+            assert result is None
+            blocked_disposed.set()
+        return result
+
+    def _in_flight(executor: JobExecutor) -> int:
+        nonlocal paused_guard
+        if blocked_disposed.is_set() and not paused_guard:
+            paused_guard = True
+            in_second_guard.set()
+            assert release_guard.wait(BOUND_WAIT_S), "claim guard barrier timed out"
+        return orig_in_flight(executor)
+
+    def _handler(_spec: JobSpec, _ctx: JobContext) -> tuple[ObjectRef, ...]:
+        handler_ran.set()
+        return ()
+
+    monkeypatch.setattr(JobService, "resolve_leased_spec", _instrumented_resolve)
+    monkeypatch.setattr(JobExecutor, "in_flight", property(_in_flight))
+    _observe_executor_close(monkeypatch, close_entered, close_returned)
+
+    loop = create_daemon_owner_loop(
+        os_=adapters,
+        clock=clock,
+        monotonic_clock=mono,
+        job_handlers={FIXTURE_JOB_KIND: _handler},
+    )
+    try:
+        loop.start(cfg)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            try:
+                assert in_second_guard.wait(BOUND_WAIT_S), "owner did not enter second claim guard"
+                stop_fut = pool.submit(loop.stop, grace_s=3.0)
+                assert close_returned.wait(BOUND_WAIT_S), "worker did not close while claim guard paused"
+            finally:
+                release_guard.set()
+            shutdown = stop_fut.result(timeout=BOUND_WAIT_S)
+            assert loop.wait_closed(timeout=BOUND_WAIT_S) == shutdown
+    finally:
+        release_guard.set()
+        with contextlib.suppress(BrainError):
+            loop.stop()
+        monkeypatch.undo()
+
+    assert close_entered.is_set() and close_returned.is_set()
+    assert shutdown.state is ShutdownState.STOPPED
+    assert shutdown.worker_drained is True
+    assert handler_ran.is_set() is False
+
+    reopened = reopen_kernel_job_runtime(root, _daemon_template.store_id, adapters)
+    try:
+        svc_re, st_re = kernel_job_service(reopened, clock)
+        blocked_row = st_re.transact(lambda tx: tx.read_job(blocked.job_id))
+        due_row = st_re.transact(lambda tx: tx.read_job(due.job_id))
+        assert blocked_row is not None and due_row is not None
+        assert (blocked_row.state, blocked_row.attempt, blocked_row.reason) == (
+            JobState.FAILED,
+            1,
+            JobErrorCode.INVALID_PAYLOAD,
+        )
+        assert (due_row.state, due_row.attempt, due_row.writer_epoch, due_row.lease_id) == (
+            JobState.QUEUED,
+            1,
+            None,
+            None,
+        )
+        assert [
+            e.kind
+            for e in reopened.store.entries()
+            if e.kind in {"job.leased", "job.running"} and e.meta.get("job_id") == due.job_id
+        ] == []
+        assert svc_re.recover(reopened.lease.epoch) == RecoveryCounts(0, 0, 0)
+        due_after = st_re.transact(lambda tx: tx.read_job(due.job_id))
+        assert due_after is not None
+        assert (due_after.state, due_after.attempt, due_after.writer_epoch, due_after.lease_id) == (
+            JobState.QUEUED,
+            1,
+            None,
+            None,
+        )
+    finally:
+        reopened.close()
+
+
+def test_stop_during_due_jobs_before_claim_commit_leaves_due_job_queued_at_attempt_one(
+    trusted_tmp: Path,
+    _daemon_template: _DaemonTemplate,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CL-T5-B1: ``stop()`` winning during ``due_jobs`` before claim commit writes zero ``job.leased`` records."""
+    base_now = _daemon_template.base_time + dt.timedelta(minutes=5)
+    root, _, cfg = _instantiate_case(trusted_tmp, "cl-t5-b1-due-query", _daemon_template)
+    clock = FakeClock(base_now)
+    mono = _FakeMonotonicClock()
+    adapters = os_adapters(clock=clock, monotonic=mono)
+
+    rt_seed = reopen_kernel_job_runtime(root, _daemon_template.store_id, adapters)
+    try:
+        svc_seed, st_seed = kernel_job_service(rt_seed, clock)
+        tx_cls: type[Any] = st_seed.transact(lambda tx: type(tx))
+        due = enqueue_job(svc_seed, st_seed, owner_id="dan", payload=b"b1-due-query-stop")
+    finally:
+        rt_seed.close()
+
+    in_due_query = threading.Event()
+    release_due_query = threading.Event()
+    close_entered = threading.Event()
+    close_returned = threading.Event()
+    handler_ran = threading.Event()
+
+    orig_due_jobs = cast(Callable[[KernelTx, dt.datetime, int], tuple[JobRecord, ...]], tx_cls.due_jobs)
+    paused_due = False
+
+    def _due_jobs(tx: KernelTx, now: dt.datetime, limit: int) -> tuple[JobRecord, ...]:
+        nonlocal paused_due
+        rows = orig_due_jobs(tx, now, limit)
+        if not paused_due and rows and rows[0].job_id == due.job_id:
+            paused_due = True
+            in_due_query.set()
+            assert release_due_query.wait(BOUND_WAIT_S), "due_jobs barrier timed out"
+        return rows
+
+    def _handler(_spec: JobSpec, _ctx: JobContext) -> tuple[ObjectRef, ...]:
+        handler_ran.set()
+        return ()
+
+    monkeypatch.setattr(tx_cls, "due_jobs", _due_jobs)
+    _observe_executor_close(monkeypatch, close_entered, close_returned)
+
+    loop = create_daemon_owner_loop(
+        os_=adapters,
+        clock=clock,
+        monotonic_clock=mono,
+        job_handlers={FIXTURE_JOB_KIND: _handler},
+    )
+    try:
+        loop.start(cfg)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            try:
+                assert in_due_query.wait(BOUND_WAIT_S), "owner did not reach due_jobs query"
+                stop_fut = pool.submit(loop.stop, grace_s=3.0)
+                assert close_returned.wait(BOUND_WAIT_S), "worker did not close while due_jobs paused"
+            finally:
+                release_due_query.set()
+            shutdown = stop_fut.result(timeout=BOUND_WAIT_S)
+            assert loop.wait_closed(timeout=BOUND_WAIT_S) == shutdown
+    finally:
+        release_due_query.set()
+        with contextlib.suppress(BrainError):
+            loop.stop()
+        monkeypatch.undo()
+
+    assert close_entered.is_set() and close_returned.is_set()
+    assert shutdown.state is ShutdownState.STOPPED
+    assert shutdown.worker_drained is True
+    assert handler_ran.is_set() is False
+
+    reopened = reopen_kernel_job_runtime(root, _daemon_template.store_id, adapters)
+    try:
+        svc_re, st_re = kernel_job_service(reopened, clock)
+        due_row = st_re.transact(lambda tx: tx.read_job(due.job_id))
+        assert due_row is not None
+        assert (due_row.state, due_row.attempt, due_row.writer_epoch, due_row.lease_id) == (
+            JobState.QUEUED,
+            1,
+            None,
+            None,
+        )
+        assert [
+            e.kind
+            for e in reopened.store.entries()
+            if e.kind in {"job.leased", "job.running"} and e.meta.get("job_id") == due.job_id
+        ] == []
+        assert svc_re.recover(reopened.lease.epoch) == RecoveryCounts(0, 0, 0)
+        due_after = st_re.transact(lambda tx: tx.read_job(due.job_id))
+        assert due_after is not None
+        assert (due_after.state, due_after.attempt, due_after.writer_epoch, due_after.lease_id) == (
+            JobState.QUEUED,
+            1,
+            None,
+            None,
+        )
+    finally:
+        reopened.close()
+
+
+def test_claim_admitted_before_stop_skips_handler_and_recovers_on_next_epoch(
+    trusted_tmp: Path,
+    _daemon_template: _DaemonTemplate,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CL-T5-B1: A claim admitted before ``stop()`` skips handler entry and recovers on next epoch."""
+    base_now = _daemon_template.base_time + dt.timedelta(minutes=5)
+    root, _, cfg = _instantiate_case(trusted_tmp, "cl-t5-b1-admitted-before-stop", _daemon_template)
+    clock = FakeClock(base_now)
+    mono = _FakeMonotonicClock()
+    adapters = os_adapters(clock=clock, monotonic=mono)
+
+    admitted_payload = b"b1-admitted-before-stop"
+    rt_seed = reopen_kernel_job_runtime(root, _daemon_template.store_id, adapters)
+    try:
+        svc_seed, st_seed = kernel_job_service(rt_seed, clock)
+        admitted = enqueue_job(svc_seed, st_seed, owner_id="dan", payload=admitted_payload)
+    finally:
+        rt_seed.close()
+
+    claim_admitted = threading.Event()
+    release_after_claim = threading.Event()
+    close_entered = threading.Event()
+    close_returned = threading.Event()
+    handler_ran = threading.Event()
+
+    orig_lease_next = JobService.lease_next
+    paused_claim = False
+
+    def _lease_next(service: JobService, epoch: int, now: dt.datetime) -> JobLease | None:
+        nonlocal paused_claim
+        lease = orig_lease_next(service, epoch, now)
+        if not paused_claim and lease is not None and lease.job_id == admitted.job_id:
+            paused_claim = True
+            claim_admitted.set()
+            assert release_after_claim.wait(BOUND_WAIT_S), "post-claim barrier timed out"
+        return lease
+
+    def _first_epoch_handler(_spec: JobSpec, _ctx: JobContext) -> tuple[ObjectRef, ...]:
+        handler_ran.set()
+        return ()
+
+    monkeypatch.setattr(JobService, "lease_next", _lease_next)
+    _observe_executor_close(monkeypatch, close_entered, close_returned)
+
+    loop_1 = create_daemon_owner_loop(
+        os_=adapters,
+        clock=clock,
+        monotonic_clock=mono,
+        job_handlers={FIXTURE_JOB_KIND: _first_epoch_handler},
+    )
+    try:
+        ready_1 = loop_1.start(cfg)
+        old_epoch = ready_1.identity.writer_epoch
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            try:
+                assert claim_admitted.wait(BOUND_WAIT_S), "claim was not admitted before stop"
+                stop_fut = pool.submit(loop_1.stop, grace_s=3.0)
+                assert close_returned.wait(BOUND_WAIT_S), "worker did not close while post-claim paused"
+            finally:
+                release_after_claim.set()
+            shutdown = stop_fut.result(timeout=BOUND_WAIT_S)
+            assert loop_1.wait_closed(timeout=BOUND_WAIT_S) == shutdown
+    finally:
+        release_after_claim.set()
+        with contextlib.suppress(BrainError):
+            loop_1.stop()
+        monkeypatch.undo()
+
+    assert close_entered.is_set() and close_returned.is_set()
+    assert shutdown.state is ShutdownState.STOPPED
+    assert shutdown.worker_drained is True
+    assert handler_ran.is_set() is False
+
+    reopened = reopen_kernel_job_runtime(root, _daemon_template.store_id, adapters)
+    try:
+        svc_re, st_re = kernel_job_service(reopened, clock)
+        pre_row = st_re.transact(lambda tx: tx.read_job(admitted.job_id))
+        assert pre_row is not None
+        assert (pre_row.state, pre_row.attempt, pre_row.writer_epoch) == (JobState.LEASED, 1, old_epoch)
+        assert pre_row.lease_id is not None
+        assert [
+            e.kind
+            for e in reopened.store.entries()
+            if e.kind in {"job.leased", "job.running"} and e.meta.get("job_id") == admitted.job_id
+        ] == ["job.leased"]
+        assert svc_re.recover(reopened.lease.epoch) == RecoveryCounts(0, 1, 0)
+        post_row = st_re.transact(lambda tx: tx.read_job(admitted.job_id))
+        assert post_row is not None
+        assert (post_row.state, post_row.attempt, post_row.writer_epoch, post_row.lease_id) == (
+            JobState.QUEUED,
+            2,
+            None,
+            None,
+        )
+    finally:
+        reopened.close()
+
+    completed_event = threading.Event()
+    observed_attempts: list[int] = []
+
+    def _second_epoch_handler(spec: JobSpec, ctx: JobContext) -> tuple[ObjectRef, ...]:
+        observed_attempts.append(ctx.lease.attempt)
+        completed_event.set()
+        return (ObjectRef(kind="fixture_result", id=ctx.lease.job_id, revision=1, digest=digest_bytes(spec.payload)),)
+
+    loop_2 = create_daemon_owner_loop(
+        os_=adapters,
+        clock=clock,
+        monotonic_clock=mono,
+        job_handlers={FIXTURE_JOB_KIND: _second_epoch_handler},
+    )
+    try:
+        loop_2.start(cfg)
+        assert completed_event.wait(BOUND_WAIT_S), "recovered job did not enter handler on next epoch"
+
+        def _admitted_succeeded() -> bool:
+            res = loop_2.submit(
+                ToolCommand(
+                    "get_job",
+                    {"schema_version": "2.0", "job_id": admitted.job_id},
+                    token=_daemon_template.cred_a.token,
+                ),
+                mono.now + TOTAL_REQUEST_BUDGET_NS,
+            ).result(timeout=BOUND_WAIT_S)
+            return res.get("ok") is True and cast(dict[str, JsonValue], res["data"]).get("state") == "succeeded"
+
+        _wait_until(_admitted_succeeded, desc="recovered job succeeded at attempt 2")
+        assert observed_attempts == [2]
+        shutdown_2 = loop_2.stop(grace_s=3.0)
+        assert shutdown_2.state is ShutdownState.STOPPED
+        assert shutdown_2.worker_drained is True
+    finally:
+        with contextlib.suppress(BrainError):
+            loop_2.stop()
+
+    rt_fin = reopen_kernel_job_runtime(root, _daemon_template.store_id, adapters)
+    try:
+        _, st_fin = kernel_job_service(rt_fin, clock)
+        fin_row = st_fin.transact(lambda tx: tx.read_job(admitted.job_id))
+        assert fin_row is not None
+        assert (fin_row.state, fin_row.attempt) == (JobState.SUCCEEDED, 2)
+    finally:
+        rt_fin.close()
+
