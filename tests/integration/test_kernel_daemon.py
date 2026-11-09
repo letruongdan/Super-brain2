@@ -21,6 +21,7 @@ import contextlib
 import dataclasses
 import datetime as dt
 import functools
+import logging
 import math
 import os
 import shutil
@@ -4633,5 +4634,506 @@ def test_first_and_concurrent_stop_honor_cutoff_while_job_leased_sqlite_append_b
         )
     finally:
         reopened.close()
+
+
+def test_concurrent_future_cancel_and_unexpected_owner_exit_keep_loop_safe(
+    trusted_tmp: Path,
+    _daemon_template: _DaemonTemplate,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """I2-T6A-R01: Concurrent ``Future.cancel()`` during delivery keeps owner safe; unexpected exit fences admission."""
+    # Part A: Concurrent Future.cancel() racing set_result & set_exception on a real daemon.
+    base_now = _daemon_template.base_time + dt.timedelta(minutes=5)
+    root_a, _, cfg_a = _instantiate_case(trusted_tmp, "r01-future-cancel", _daemon_template)
+    clock_a = FakeClock(base_now)
+    adapters_a = os_adapters(clock=clock_a)
+    tok_a = _daemon_template.cred_a.token
+
+    rt_seed = reopen_kernel_job_runtime(root_a, _daemon_template.store_id, adapters_a)
+    try:
+        svc_seed, st_seed = kernel_job_service(rt_seed, clock_a)
+        crashed_job = enqueue_job(svc_seed, st_seed, owner_id="dan", payload=b"r01-crashed-inv")
+        crashed_lease = svc_seed.lease_next(rt_seed.lease.epoch, clock_a.now())
+        assert crashed_lease is not None and crashed_lease.job_id == crashed_job.job_id
+        svc_seed.start(crashed_lease)
+        invocation_id = svc_seed.reserve_invocation(crashed_lease, RESERVE)
+    finally:
+        rt_seed.close()
+
+    futures_logger = logging.getLogger("concurrent.futures")
+    futures_logger_errors: list[str] = []
+
+    class _FuturesErrorCollector(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            if record.levelno >= logging.ERROR:
+                futures_logger_errors.append(self.format(record))
+
+    err_collector = _FuturesErrorCollector(level=logging.ERROR)
+    futures_logger.addHandler(err_collector)
+
+    pending_events: list[threading.Event] = []
+    usage_committed = threading.Event()
+    get_job_ran = threading.Event()
+
+    orig_append_a = Txn.append
+
+    def _append_tracking_settled(
+        tx: Txn,
+        kind: str,
+        *,
+        actor: str,
+        owner_id: str | None,
+        meta: Mapping[str, JsonValue],
+        refs: Sequence[str] = (),
+    ) -> LedgerEntry:
+        entry = orig_append_a(tx, kind, actor=actor, owner_id=owner_id, meta=meta, refs=refs)
+        if kind == "provider.settled" and meta.get("invocation_id") == invocation_id:
+            usage_committed.set()
+        return entry
+
+    orig_get_job = JobService.get_job
+
+    def _tracking_get_job(
+        service: JobService,
+        job_id: str,
+        principal: Principal,
+        *,
+        selected_scope: Scope | None = None,
+    ) -> Any:
+        view = orig_get_job(service, job_id, principal, selected_scope=selected_scope)
+        get_job_ran.set()
+        return view
+
+    monkeypatch.setattr(Txn, "append", _append_tracking_settled)
+    monkeypatch.setattr(JobService, "get_job", _tracking_get_job)
+
+    def _arm_cancel_on_delivery(
+        fut: Future[Any],
+        expected_tid: int,
+        *,
+        armed_after: threading.Event,
+    ) -> tuple[threading.Event, threading.Event, threading.Event]:
+        owner_delivering = threading.Event()
+        caller_cancelled = threading.Event()
+        delivery_finished = threading.Event()
+        pending_events.append(caller_cancelled)
+        triggered = False
+        trig_lock = threading.Lock()
+        orig_done = fut.done
+        orig_set_result = fut.set_result
+        orig_set_exception = fut.set_exception
+
+        def _pause_once_for_cancel() -> bool:
+            nonlocal triggered
+            if threading.get_ident() != expected_tid or not armed_after.is_set():
+                return False
+            with trig_lock:
+                if triggered:
+                    return False
+                triggered = True
+            owner_delivering.set()
+            caller_cancelled.wait(timeout=2.0)
+            return True
+
+        def _wrapped_done() -> bool:
+            already_done = orig_done()
+            if not already_done and _pause_once_for_cancel():
+                return False
+            return already_done
+
+        def _wrapped_set_result(result: Any) -> None:
+            _pause_once_for_cancel()
+            try:
+                orig_set_result(result)
+            finally:
+                delivery_finished.set()
+
+        def _wrapped_set_exception(exception: BaseException | None) -> None:
+            _pause_once_for_cancel()
+            try:
+                orig_set_exception(exception)
+            finally:
+                delivery_finished.set()
+
+        monkeypatch.setattr(fut, "done", _wrapped_done)
+        monkeypatch.setattr(fut, "set_result", _wrapped_set_result)
+        monkeypatch.setattr(fut, "set_exception", _wrapped_set_exception)
+        return owner_delivering, caller_cancelled, delivery_finished
+
+    loop_a = create_daemon_owner_loop(os_=adapters_a, clock=clock_a)
+
+    def _hold_owner_gate() -> tuple[Future[bool], threading.Event]:
+        gate_entered = threading.Event()
+        release_gate = threading.Event()
+        pending_events.append(release_gate)
+
+        def _gate() -> bool:
+            gate_entered.set()
+            return release_gate.wait(BOUND_WAIT_S)
+
+        gate_fut = loop_a.run_owner_action(_gate)
+        assert gate_entered.wait(timeout=1.0), "owner did not enter gate action"
+        return gate_fut, release_gate
+
+    def _assert_owner_alive(tag: str) -> None:
+        probe_fut = loop_a.run_owner_action(lambda: tag)
+        try:
+            probe_val = probe_fut.result(timeout=0.5)
+        except (TimeoutError, BrainError) as exc:
+            pytest.fail(f"owner failed liveness probe ({tag}) after concurrent Future.cancel(): {exc}")
+        assert probe_val == tag
+
+    err_action_ran = threading.Event()
+
+    def _raise_not_found() -> None:
+        err_action_ran.set()
+        raise BrainError(ErrorCode.NOT_FOUND, "not found")
+
+    expected_usage = UsageRecord("0.0125", True)
+    try:
+        ready_a = loop_a.start(cfg_a)
+        endpoint_path_a = DataRoot.at(root_a).endpoint_path
+        assert ready_a.endpoint.port > 0
+        assert endpoint_path_a.exists()
+        owner_tid = loop_a.run_owner_action(threading.get_ident).result(timeout=1.0)
+
+        # Subcase A1: apply_worker_command(WorkerUsage(...)) racing Future.cancel() on set_result.
+        gate_1, release_1 = _hold_owner_gate()
+        usage_fut = loop_a.apply_worker_command(WorkerUsage(invocation_id, expected_usage))
+        usage_delivering, usage_cancelled, usage_delivered = _arm_cancel_on_delivery(
+            usage_fut,
+            owner_tid,
+            armed_after=usage_committed,
+        )
+        release_1.set()
+        assert gate_1.result(timeout=1.0) is True
+        assert usage_delivering.wait(timeout=2.0), "owner did not enter WorkerUsage Future delivery"
+        assert usage_fut.cancel() is True
+        usage_cancelled.set()
+        assert usage_delivered.wait(timeout=1.0), "WorkerUsage set_result was not attempted"
+        _assert_owner_alive("after-usage-set-result")
+
+        # Subcase A2: internal owner action racing Future.cancel() on set_exception.
+        gate_2, release_2 = _hold_owner_gate()
+        err_fut: Future[None] = loop_a.run_owner_action(_raise_not_found)
+        err_delivering, err_cancelled, err_delivered = _arm_cancel_on_delivery(
+            err_fut,
+            owner_tid,
+            armed_after=err_action_ran,
+        )
+        release_2.set()
+        assert gate_2.result(timeout=1.0) is True
+        assert err_delivering.wait(timeout=2.0), "owner did not enter set_exception Future delivery"
+        assert err_fut.cancel() is True
+        err_cancelled.set()
+        assert err_delivered.wait(timeout=1.0), "owner action set_exception was not attempted"
+        _assert_owner_alive("after-owner-set-exception")
+
+        # Subcase A3: projected Future[CallResult] from loop.submit(...) racing Future.cancel() on set_result.
+        get_job_ran.clear()
+        gate_3, release_3 = _hold_owner_gate()
+        call_fut = loop_a.submit(
+            ToolCommand("get_job", {"schema_version": "2.0", "job_id": crashed_job.job_id}, token=tok_a),
+            adapters_a.monotonic.monotonic_ns() + 10 * TOTAL_REQUEST_BUDGET_NS,
+        )
+        call_delivering, call_cancelled, call_delivered = _arm_cancel_on_delivery(
+            call_fut,
+            owner_tid,
+            armed_after=get_job_ran,
+        )
+        release_3.set()
+        assert gate_3.result(timeout=1.0) is True
+        assert call_delivering.wait(timeout=2.0), "owner did not enter submit() projected Future delivery"
+        assert call_fut.cancel() is True
+        call_cancelled.set()
+        assert call_delivered.wait(timeout=1.0), "submit() projected set_result was not attempted"
+        _assert_owner_alive("after-submit-project-cancel")
+
+        # Subcase A4: Reservation Future[OwnerReply] from loop.submit_reply(...) racing Future.cancel() on set_result.
+        get_job_ran.clear()
+        gate_4, release_4 = _hold_owner_gate()
+        reply_fut = loop_a.submit_reply(
+            ToolCommand("get_job", {"schema_version": "2.0", "job_id": crashed_job.job_id}, token=tok_a),
+            adapters_a.monotonic.monotonic_ns() + 10 * TOTAL_REQUEST_BUDGET_NS,
+        )
+        reply_delivering, reply_cancelled, reply_delivered = _arm_cancel_on_delivery(
+            reply_fut,
+            owner_tid,
+            armed_after=get_job_ran,
+        )
+        release_4.set()
+        assert gate_4.result(timeout=1.0) is True
+        assert reply_delivering.wait(timeout=2.0), "owner did not enter submit_reply() Future delivery"
+        assert reply_fut.cancel() is True
+        reply_cancelled.set()
+        assert reply_delivered.wait(timeout=1.0), "submit_reply() set_result was not attempted"
+        _assert_owner_alive("after-submit-reply-cancel")
+
+        assert futures_logger_errors == []
+        assert loop_a.ready == ready_a
+        assert not loop_a.auth_gate.closed
+        assert endpoint_path_a.exists()
+        assert loop_a.run_owner_action(lambda: "alive").result(timeout=1.0) == "alive"
+
+        health_env = loop_a.submit(
+            ToolCommand("get_health", {"schema_version": "2.0"}, token=tok_a),
+            adapters_a.monotonic.monotonic_ns() + TOTAL_REQUEST_BUDGET_NS,
+        ).result(timeout=1.0)
+        assert health_env["ok"] is True
+        assert cast(dict[str, JsonValue], health_env["data"])["ready"] is True
+
+        report_a = loop_a.stop(grace_s=2.0)
+        assert report_a.state is ShutdownState.STOPPED
+        assert report_a.error_code is None
+    finally:
+        futures_logger.removeHandler(err_collector)
+        for ev in pending_events:
+            ev.set()
+        with contextlib.suppress(BrainError):
+            loop_a.stop(grace_s=0.05)
+        _ = loop_a.wait_closed(timeout=BOUND_WAIT_S)
+
+    expected_usage_bytes = usage_descriptor(invocation_id, expected_usage)
+    expected_usage_digest = digest_bytes(expected_usage_bytes)
+    rt_verify_a = reopen_kernel_job_runtime(root_a, _daemon_template.store_id, adapters_a)
+    try:
+        _, st_verify_a = kernel_job_service(rt_verify_a, clock_a)
+        inv_row = st_verify_a.transact(lambda tx: tx.read_invocation(invocation_id))
+        assert inv_row is not None
+        assert inv_row.state is InvocationState.SETTLED
+        assert inv_row.usage_complete is True
+        assert inv_row.usage_digest == expected_usage_digest
+        held_usage_bytes = st_verify_a.transact(
+            lambda tx: tx.read_held_blob(expected_usage_digest, holder_id=invocation_id)
+        )
+        assert held_usage_bytes == expected_usage_bytes
+    finally:
+        rt_verify_a.close()
+
+    # Part B: Defense-in-depth admission fence if owner loop body exits unexpectedly without stop().
+    root_b, _, cfg_b = _instantiate_case(trusted_tmp, "r01-unexpected-exit", _daemon_template)
+    clock_b = FakeClock(base_now + dt.timedelta(minutes=1))
+    adapters_b = os_adapters(clock=clock_b)
+
+    rt_seed_b = reopen_kernel_job_runtime(root_b, _daemon_template.store_id, adapters_b)
+    try:
+        svc_b, st_b = kernel_job_service(rt_seed_b, clock_b)
+        due_b = enqueue_job(svc_b, st_b, owner_id="dan", payload=b"r01-step-boom")
+    finally:
+        rt_seed_b.close()
+
+    step_entered = threading.Event()
+    release_boom = threading.Event()
+    orig_lease_next = JobService.lease_next
+    crashed_once = False
+
+    def _boom_lease_next(service: JobService, epoch: int, now: dt.datetime) -> JobLease | None:
+        nonlocal crashed_once
+        if not crashed_once:
+            crashed_once = True
+            step_entered.set()
+            assert release_boom.wait(BOUND_WAIT_S), "unexpected-exit barrier timed out"
+            raise RuntimeError("injected unexpected owner step failure")
+        return orig_lease_next(service, epoch, now)
+
+    def _noop_job_handler(_spec: JobSpec, _ctx: JobContext) -> tuple[ObjectRef, ...]:
+        return ()
+
+    monkeypatch.setattr(JobService, "lease_next", _boom_lease_next)
+    loop_b = create_daemon_owner_loop(
+        os_=adapters_b,
+        clock=clock_b,
+        job_handlers={FIXTURE_JOB_KIND: _noop_job_handler},
+    )
+    try:
+        ready_b = loop_b.start(cfg_b)
+        endpoint_path_b = DataRoot.at(root_b).endpoint_path
+        assert ready_b.endpoint.port > 0
+        assert endpoint_path_b.exists()
+        assert step_entered.wait(timeout=1.0), "owner did not reach step_owner_work barrier"
+
+        queued_action_fut = loop_b.run_owner_action(lambda: "never-runs")
+        queued_tool_fut = loop_b.submit(
+            ToolCommand("get_job", {"schema_version": "2.0", "job_id": due_b.job_id}, token=tok_a),
+            adapters_b.monotonic.monotonic_ns() + 10 * TOTAL_REQUEST_BUDGET_NS,
+        )
+
+        # Let step_owner_work raise an unhandled RuntimeError WITHOUT calling loop_b.stop() first.
+        release_boom.set()
+
+        _wait_until(
+            lambda: loop_b.ready is None and loop_b.auth_gate.closed and not endpoint_path_b.exists(),
+            timeout=1.0,
+            desc="unexpected owner exit to fence admission and remove endpoint",
+        )
+        _expect_brain_error(ErrorCode.DAEMON_UNAVAILABLE, lambda: queued_action_fut.result(timeout=0.5))
+
+        queued_tool_env = queued_tool_fut.result(timeout=0.5)
+        assert queued_tool_env["ok"] is False
+        assert cast(dict[str, JsonValue], queued_tool_env["error"])["code"] == ErrorCode.DAEMON_UNAVAILABLE.value
+
+        post_submit_env = loop_b.submit(
+            ToolCommand("get_job", {"schema_version": "2.0", "job_id": due_b.job_id}, token=tok_a),
+            adapters_b.monotonic.monotonic_ns() + TOTAL_REQUEST_BUDGET_NS,
+        ).result(timeout=0.5)
+        assert post_submit_env["ok"] is False
+        assert cast(dict[str, JsonValue], post_submit_env["error"])["code"] == ErrorCode.DAEMON_UNAVAILABLE.value
+
+        _expect_brain_error(
+            ErrorCode.DAEMON_UNAVAILABLE,
+            lambda: loop_b.run_owner_action(lambda: "post-crash").result(timeout=0.5),
+        )
+
+        report_b = loop_b.stop(grace_s=1.0)
+        assert report_b.state is ShutdownState.CLOSE_FAILED
+        assert report_b.error_code is not None
+    finally:
+        release_boom.set()
+        with contextlib.suppress(BrainError):
+            loop_b.stop(grace_s=0.05)
+        _ = loop_b.wait_closed(timeout=BOUND_WAIT_S)
+        monkeypatch.undo()
+
+    with acquire_writer(DataRoot.at(root_b), adapters_b):
+        pass
+
+
+def test_cancelled_request_future_callback_does_not_delay_first_or_concurrent_stop_past_cutoff(
+    trusted_tmp: Path,
+    _daemon_template: _DaemonTemplate,
+) -> None:
+    """I2-T6A-R02: Blocking callback on cancelled queued ``Future`` never delays ``stop()`` or sibling futures."""
+    base_now = _daemon_template.base_time + dt.timedelta(minutes=5)
+    root, _, cfg = _instantiate_case(trusted_tmp, "r02-overrun-cb-cutoff", _daemon_template)
+    clock = FakeClock(base_now)
+    adapters = os_adapters(clock=clock)
+    ws_a = _daemon_template.ws_a
+    scope_a = Scope(ws_a.repo_id, ws_a.checkout_id)
+    tok_a = _daemon_template.cred_a.token
+
+    rt_seed = reopen_kernel_job_runtime(root, _daemon_template.store_id, adapters)
+    try:
+        svc_seed, st_seed = kernel_job_service(rt_seed, clock)
+        seeded_job = enqueue_job(svc_seed, st_seed, owner_id="dan", payload=b"r02-valid-job")
+    finally:
+        rt_seed.close()
+
+    callback_entered = threading.Event()
+    release_callback = threading.Event()
+    callback_released = threading.Event()
+    callback_timed_out = threading.Event()
+    callback_envelopes: list[CallResult] = []
+
+    def _on_slow_done(done_fut: Future[CallResult]) -> None:
+        callback_envelopes.append(done_fut.result())
+        callback_entered.set()
+        if not release_callback.wait(timeout=3.0):
+            callback_timed_out.set()
+
+    domain = _DaemonTestDomain(ws_a=ws_a, pause_idem_keys={"idem-r02-hold-0001"})
+    domain.allow_apply_finish.clear()
+    loop = create_daemon_owner_loop(os_=adapters, clock=clock, domain=domain)
+
+    first_rep: ShutdownReport | None = None
+    second_rep: ShutdownReport | None = None
+    sibling_env: CallResult | None = None
+    first_returned_before_callback_release = False
+    second_returned_before_callback_release = False
+    sibling_resolved_before_callback_release = False
+    try:
+        loop.start(cfg)
+        fut_hold = loop.submit(
+            ToolCommand(
+                "submit_episode",
+                _episode_args(ws_a, "idem-r02-hold-0001"),
+                token=tok_a,
+                selected_scope=scope_a,
+            ),
+            adapters.monotonic.monotonic_ns() + 10 * TOTAL_REQUEST_BUDGET_NS,
+        )
+        assert domain.apply_entered.wait(timeout=BOUND_WAIT_S)
+
+        slow_cb_fut = loop.submit(
+            ToolCommand("get_job", {"schema_version": "2.0", "job_id": seeded_job.job_id}, token=tok_a),
+            adapters.monotonic.monotonic_ns() + 10 * TOTAL_REQUEST_BUDGET_NS,
+        )
+        slow_cb_fut.add_done_callback(_on_slow_done)
+
+        sibling_fut = loop.submit(
+            ToolCommand("get_job", {"schema_version": "2.0", "job_id": seeded_job.job_id}, token=tok_a),
+            adapters.monotonic.monotonic_ns() + 10 * TOTAL_REQUEST_BUDGET_NS,
+        )
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first_stop_fut = pool.submit(loop.stop, grace_s=0.08)
+            _wait_until(lambda: loop.ready is None, desc="first stop caller to lock shared cutoff")
+            second_stop_fut = pool.submit(loop.stop, grace_s=2.0)
+            try:
+                assert callback_entered.wait(timeout=1.0), "cancelled request callback did not fire at cutoff"
+                pre_release_deadline = time.monotonic() + 0.5
+                try:
+                    first_rep = first_stop_fut.result(
+                        timeout=max(0.01, pre_release_deadline - time.monotonic())
+                    )
+                    first_returned_before_callback_release = not callback_released.is_set()
+                except TimeoutError:
+                    first_returned_before_callback_release = False
+                try:
+                    second_rep = second_stop_fut.result(
+                        timeout=max(0.01, pre_release_deadline - time.monotonic())
+                    )
+                    second_returned_before_callback_release = not callback_released.is_set()
+                except TimeoutError:
+                    second_returned_before_callback_release = False
+                try:
+                    sibling_env = sibling_fut.result(
+                        timeout=max(0.01, pre_release_deadline - time.monotonic())
+                    )
+                    sibling_resolved_before_callback_release = not callback_released.is_set()
+                except TimeoutError:
+                    sibling_resolved_before_callback_release = False
+            finally:
+                callback_released.set()
+                release_callback.set()
+                domain.allow_apply_finish.set()
+
+            if first_rep is None:
+                first_rep = first_stop_fut.result(timeout=BOUND_WAIT_S)
+            if second_rep is None:
+                second_rep = second_stop_fut.result(timeout=BOUND_WAIT_S)
+            if sibling_env is None:
+                sibling_env = sibling_fut.result(timeout=BOUND_WAIT_S)
+            _ = fut_hold.result(timeout=BOUND_WAIT_S)
+            final_rep = loop.wait_closed(timeout=BOUND_WAIT_S)
+    finally:
+        callback_released.set()
+        release_callback.set()
+        domain.allow_apply_finish.set()
+        with contextlib.suppress(BrainError):
+            loop.stop(grace_s=0.05)
+        _ = loop.wait_closed(timeout=BOUND_WAIT_S)
+
+    assert not callback_timed_out.is_set()
+    assert first_returned_before_callback_release is True
+    assert second_returned_before_callback_release is True
+    assert sibling_resolved_before_callback_release is True
+    assert first_rep is not None
+    assert (first_rep.state, first_rep.error_code, first_rep.cancelled_requests) == (
+        ShutdownState.OVERRUN,
+        ErrorCode.DEADLINE_EXCEEDED,
+        2,
+    )
+    assert second_rep is not None
+    assert (second_rep.state, second_rep.error_code, second_rep.cancelled_requests) == (
+        ShutdownState.OVERRUN,
+        ErrorCode.DEADLINE_EXCEEDED,
+        2,
+    )
+    assert final_rep is not None and final_rep.endpoint_removed is True
+    assert sibling_env is not None and sibling_env["ok"] is False
+    assert cast(dict[str, JsonValue], sibling_env["error"])["code"] == ErrorCode.DAEMON_UNAVAILABLE.value
+    assert len(callback_envelopes) == 1 and callback_envelopes[0]["ok"] is False
+    assert cast(dict[str, JsonValue], callback_envelopes[0]["error"])["code"] == ErrorCode.DAEMON_UNAVAILABLE.value
+
 
 
