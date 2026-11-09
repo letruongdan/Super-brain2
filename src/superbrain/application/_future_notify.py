@@ -15,7 +15,7 @@ from superbrain.core.errors import BrainError, ErrorCode
 _T = TypeVar("_T")
 
 _MAX_NOTIFY_WORKERS = 128
-_FUTURES_LOGGER = logging.getLogger("concurrent.futures")
+_LOGGER = logging.getLogger(__name__)
 _DEFER_LOCAL = threading.local()
 
 
@@ -27,8 +27,13 @@ def noop_thunk() -> None:
 def _invoke_user_cb(fut: Future[_T], fn: Callable[[Future[_T]], object]) -> None:
     try:
         fn(fut)
-    except Exception:
-        _FUTURES_LOGGER.critical("exception calling callback for %r", fut, exc_info=True)
+    except BrainError as err:
+        _LOGGER.error("future callback failed (phase=future_callback, code=%s)", err.code.value)
+    except Exception:  # noqa: BLE001
+        _LOGGER.error(
+            "future callback failed (phase=future_callback, code=%s)",
+            ErrorCode.INTEGRITY_FAILURE.value,
+        )
 
 
 def _make_future_cbs_thunk(
