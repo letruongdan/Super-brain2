@@ -32,10 +32,10 @@ import time
 import uuid
 import warnings
 from collections.abc import Callable, Iterator, Mapping
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import cast
+from typing import Any, Protocol, cast
 
 import pytest
 
@@ -45,6 +45,7 @@ from superbrain.adapters.os.tls_material import create_store_tls
 from superbrain.adapters.os.workspaces import build_registration
 from superbrain.application.deadlines import Reservation
 from superbrain.application.dispatch import KernelToolDomain, PreparedEffect
+from superbrain.application.jobs import JobService
 from superbrain.application.owner_loop import AuthGate, OwnerLoop
 from superbrain.composition.daemon_entry import (
     PRODUCTION_JOB_HANDLERS,
@@ -78,6 +79,7 @@ from superbrain.core.kernel import (
     Endpoint,
     InvocationState,
     JobErrorCode,
+    JobLease,
     JobOutcome,
     JobRecord,
     JobSpec,
@@ -99,6 +101,8 @@ from superbrain.core.kernel import (
     ToolCommand,
     UsageRecord,
     UsageReservation,
+    WorkerCommand,
+    WorkerCompleted,
     WorkerUsage,
     WorkspaceBinding,
     usage_descriptor,
@@ -3836,4 +3840,258 @@ def test_quarantined_or_tombstoned_queued_job_fails_fenced_and_next_valid_job_ru
         rt_v1.close()
 
 
+class _CommandQueue(Protocol):
+    put: Callable[..., None]
 
+
+class _ExecutorInternals(Protocol):
+    _commands: _CommandQueue
+    _closed: bool
+    _lock: threading.Lock
+
+
+def _observe_executor_close(
+    monkeypatch: pytest.MonkeyPatch,
+    entered: threading.Event,
+    returned: threading.Event,
+) -> None:
+    orig_close = JobExecutor.close
+
+    def _instrumented_close(executor: JobExecutor, timeout_s: float = 5.0) -> bool:
+        first = not entered.is_set()
+        if first:
+            entered.set()
+        result = orig_close(executor, timeout_s)
+        if first:
+            assert cast(_ExecutorInternals, executor)._closed is True
+            returned.set()
+        return result
+
+    monkeypatch.setattr(JobExecutor, "close", _instrumented_close)
+
+
+def test_worker_terminal_put_is_serialized_with_close_lock(
+    trusted_tmp: Path,
+    _daemon_template: _DaemonTemplate,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CL-T5-A1: ``JobExecutor`` terminal queue ``put`` executes inside the same ``_lock`` as ``close()``."""
+    base_now = _daemon_template.base_time + dt.timedelta(minutes=5)
+    root, _, cfg = _instantiate_case(trusted_tmp, "cl-t5-a1-put-lock", _daemon_template)
+    clock = FakeClock(base_now)
+    mono = _FakeMonotonicClock()
+    adapters = os_adapters(clock=clock, monotonic=mono)
+
+    rt_seed = reopen_kernel_job_runtime(root, _daemon_template.store_id, adapters)
+    try:
+        svc_seed, st_seed = kernel_job_service(rt_seed, clock)
+        job = enqueue_job(svc_seed, st_seed, owner_id="dan", payload=b"a1-put-under-close-lock")
+    finally:
+        rt_seed.close()
+
+    at_queue_put = threading.Event()
+    release_put = threading.Event()
+    close_entered = threading.Event()
+    close_returned = threading.Event()
+    published_after_close: list[bool] = []
+    orig_init = JobExecutor.__init__
+
+    def _instrumented_init(executor: JobExecutor, *args: Any, **kwargs: Any) -> None:
+        orig_init(executor, *args, **kwargs)
+        commands_q = cast(_ExecutorInternals, executor)._commands
+        orig_put = commands_q.put
+
+        def _instrumented_put(command: WorkerCommand, *put_args: Any, **put_kwargs: Any) -> None:
+            if isinstance(command, WorkerCompleted) and command.lease.job_id == job.job_id:
+                at_queue_put.set()
+                assert release_put.wait(BOUND_WAIT_S), "queue insertion barrier timed out"
+                published_after_close.append(
+                    close_returned.is_set() or bool(cast(_ExecutorInternals, executor)._closed)
+                )
+                orig_put(command, *put_args, **put_kwargs)
+            else:
+                orig_put(command, *put_args, **put_kwargs)
+
+        commands_q.put = _instrumented_put
+
+    monkeypatch.setattr(JobExecutor, "__init__", _instrumented_init)
+    _observe_executor_close(monkeypatch, close_entered, close_returned)
+
+    loop = create_daemon_owner_loop(
+        os_=adapters,
+        clock=clock,
+        monotonic_clock=mono,
+        job_handlers={FIXTURE_JOB_KIND: lambda _spec, _ctx: ()},
+    )
+    try:
+        loop.start(cfg)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            try:
+                assert at_queue_put.wait(BOUND_WAIT_S), "worker did not reach terminal queue insertion"
+                stop_fut = pool.submit(loop.stop, grace_s=3.0)
+                assert close_entered.wait(BOUND_WAIT_S), "stop() did not reach JobExecutor.close"
+                close_overtook_put = close_returned.wait(0.15)
+            finally:
+                release_put.set()
+            shutdown = stop_fut.result(timeout=BOUND_WAIT_S)
+            assert loop.wait_closed(timeout=BOUND_WAIT_S) == shutdown
+    finally:
+        release_put.set()
+        with contextlib.suppress(BrainError):
+            loop.stop()
+        monkeypatch.undo()
+
+    assert close_overtook_put is False
+    assert published_after_close == [False]
+    assert shutdown.state is ShutdownState.STOPPED
+    assert shutdown.worker_drained is True
+
+    reopened = reopen_kernel_job_runtime(root, _daemon_template.store_id, adapters)
+    try:
+        svc_re, st_re = kernel_job_service(reopened, clock)
+        row = st_re.transact(lambda tx: tx.read_job(job.job_id))
+        assert row is not None
+        assert (row.state, row.attempt) == (JobState.SUCCEEDED, 1)
+        assert svc_re.recover(reopened.lease.epoch) == RecoveryCounts(0, 0, 0)
+    finally:
+        reopened.close()
+
+    # Subcheck: on_command notification fires only AFTER non-reentrant _lock is released.
+    notify_unlocked: list[bool] = []
+    notify_seen = threading.Event()
+    exec_box: list[JobExecutor] = []
+
+    def _on_cmd() -> None:
+        lk = cast(_ExecutorInternals, exec_box[0])._lock
+        acquired = lk.acquire(blocking=False)
+        if acquired:
+            lk.release()
+        notify_unlocked.append(acquired)
+        notify_seen.set()
+
+    direct_exec = JobExecutor({FIXTURE_JOB_KIND: lambda _s, _c: ()}, mono.monotonic_ns, on_command=_on_cmd)
+    exec_box.append(direct_exec)
+    direct_exec.start()
+    try:
+        probe_lease = JobLease(job_id=new_id(), attempt=1, writer_epoch=1, lease_id=new_id())
+        direct_exec.submit(
+            WorkItem(
+                lease=probe_lease,
+                spec=JobSpec(kind=FIXTURE_JOB_KIND, owner_id="dan", payload=b"a1-notify-unlocked"),
+                invocation_ids=(),
+                deadline_ns=mono.now + TOTAL_REQUEST_BUDGET_NS,
+            )
+        )
+        assert notify_seen.wait(BOUND_WAIT_S), "on_command was never invoked"
+        assert direct_exec.next_command(BOUND_WAIT_S) == WorkerCompleted(probe_lease)
+        assert notify_unlocked == [True]
+    finally:
+        direct_exec.close(BOUND_WAIT_S)
+
+
+def test_policy_blocked_claim_yields_to_stop_without_claiming_next_job(
+    trusted_tmp: Path,
+    _daemon_template: _DaemonTemplate,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CL-T5-B1: Policy-blocked lease disposition yields to ``stop()`` before claiming the next queued job."""
+    base_now = _daemon_template.base_time + dt.timedelta(minutes=5)
+    root, _, cfg = _instantiate_case(trusted_tmp, "cl-t5-b1-stop-barrier", _daemon_template)
+    clock = FakeClock(base_now)
+    mono = _FakeMonotonicClock()
+    adapters = os_adapters(clock=clock, monotonic=mono)
+
+    blocked_payload = b"b1-stop-quarantined-payload"
+    rt_seed = reopen_kernel_job_runtime(root, _daemon_template.store_id, adapters)
+    try:
+        svc_seed, st_seed = kernel_job_service(rt_seed, clock)
+        blocked = enqueue_job(svc_seed, st_seed, owner_id="dan", payload=blocked_payload)
+        rt_seed.policy.record_intent(IntentKind.QUARANTINE, {"digest": digest_bytes(blocked_payload)})
+        clock.advance(dt.timedelta(milliseconds=1))
+        due = enqueue_job(svc_seed, st_seed, owner_id="dan", payload=b"b1-due-while-stopping")
+    finally:
+        rt_seed.close()
+
+    first_resolved = threading.Event()
+    release_owner = threading.Event()
+    close_entered = threading.Event()
+    close_returned = threading.Event()
+    handler_ran = threading.Event()
+    orig_resolve = JobService.resolve_leased_spec
+
+    def _instrumented_resolve(service: JobService, lease: JobLease) -> JobSpec | None:
+        result = orig_resolve(service, lease)
+        if lease.job_id == blocked.job_id:
+            assert result is None
+            first_resolved.set()
+            assert release_owner.wait(BOUND_WAIT_S), "claim barrier timed out"
+        return result
+
+    def _handler(_spec: JobSpec, _ctx: JobContext) -> tuple[ObjectRef, ...]:
+        handler_ran.set()
+        return ()
+
+    monkeypatch.setattr(JobService, "resolve_leased_spec", _instrumented_resolve)
+    _observe_executor_close(monkeypatch, close_entered, close_returned)
+
+    loop = create_daemon_owner_loop(
+        os_=adapters,
+        clock=clock,
+        monotonic_clock=mono,
+        job_handlers={FIXTURE_JOB_KIND: _handler},
+    )
+    try:
+        loop.start(cfg)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            try:
+                assert first_resolved.wait(BOUND_WAIT_S), "blocked job did not resolve to fenced failure"
+                stop_fut = pool.submit(loop.stop, grace_s=3.0)
+                assert close_returned.wait(BOUND_WAIT_S), "worker did not close while owner was paused"
+            finally:
+                release_owner.set()
+            shutdown = stop_fut.result(timeout=BOUND_WAIT_S)
+            assert loop.wait_closed(timeout=BOUND_WAIT_S) == shutdown
+    finally:
+        release_owner.set()
+        with contextlib.suppress(BrainError):
+            loop.stop()
+        monkeypatch.undo()
+
+    assert close_entered.is_set() and close_returned.is_set()
+    assert shutdown.state is ShutdownState.STOPPED
+    assert shutdown.worker_drained is True
+    assert handler_ran.is_set() is False
+
+    reopened = reopen_kernel_job_runtime(root, _daemon_template.store_id, adapters)
+    try:
+        svc_re, st_re = kernel_job_service(reopened, clock)
+        blocked_row = st_re.transact(lambda tx: tx.read_job(blocked.job_id))
+        due_row = st_re.transact(lambda tx: tx.read_job(due.job_id))
+        assert blocked_row is not None and due_row is not None
+        assert (blocked_row.state, blocked_row.attempt, blocked_row.reason) == (
+            JobState.FAILED,
+            1,
+            JobErrorCode.INVALID_PAYLOAD,
+        )
+        assert (due_row.state, due_row.attempt, due_row.writer_epoch, due_row.lease_id) == (
+            JobState.QUEUED,
+            1,
+            None,
+            None,
+        )
+        assert [
+            e.kind
+            for e in reopened.store.entries()
+            if e.kind in {"job.leased", "job.running"} and e.meta.get("job_id") == due.job_id
+        ] == []
+        assert svc_re.recover(reopened.lease.epoch) == RecoveryCounts(0, 0, 0)
+        due_after = st_re.transact(lambda tx: tx.read_job(due.job_id))
+        assert due_after is not None
+        assert (due_after.state, due_after.attempt, due_after.writer_epoch, due_after.lease_id) == (
+            JobState.QUEUED,
+            1,
+            None,
+            None,
+        )
+    finally:
+        reopened.close()

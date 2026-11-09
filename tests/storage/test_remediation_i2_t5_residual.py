@@ -34,6 +34,7 @@ from superbrain.core.kernel import (
     JobOutcome,
     JobRecord,
     JobState,
+    KernelRecord,
     Principal,
     RecoveryCounts,
     Scope,
@@ -44,6 +45,7 @@ from superbrain.core.kernel import (
 from superbrain.ports.os import OsAdapters
 from superbrain.storage.idempotency import StagedKernelStore
 from superbrain.storage.jobs import JobsProjection, ProviderInvocationProjection
+from superbrain.storage.kinds import validate_envelope
 from superbrain.storage.ledger import LedgerEntry, ProjectionHandler
 from superbrain.storage.runtime import Runtime
 from tests.support.clock import FakeClock
@@ -198,6 +200,65 @@ def test_cancel_records_authenticated_principal_actor_while_system_transitions_k
         assert cancelled_entries[job_l].actor == f"principal:{dan_global.principal_id}"
         assert cancelled_entries[job_r].actor == f"principal:{dan_ws.principal_id}"
         assert all(entry.actor != "system:kernel" for entry in cancelled_entries.values())
+
+        # 1b. Opaque Principal ID domain parity (mixed-case, 65-char, 128-char) + negative actor boundaries.
+        max_opaque_id = "Agent_Max.01-" + "Z" * 115
+        assert len(max_opaque_id) == 128
+        for label, opaque_pid in (
+            ("mixed-case", "Harness-A"),
+            ("len-65", "a" * 65),
+            ("len-128", max_opaque_id),
+        ):
+            seeded = seed_principal_and_credential(
+                rt1.policy,
+                owner_id=OWNER,
+                harness_id=f"opaque-{label}",
+                machine_id=f"m-{label}",
+                principal_id=opaque_pid,
+            )
+            resolved = rt1.policy.resolve_credential(seeded.token)
+            assert resolved == seeded.principal
+            assert resolved.principal_id == opaque_pid
+            opaque_job_id = enqueue_job(
+                service1,
+                store1,
+                owner_id=OWNER,
+                payload=f"a3-opaque-{label}".encode(),
+            ).job_id
+            assert service1.get_job(opaque_job_id, resolved, selected_scope=None).state is JobState.QUEUED
+            assert service1.cancel(opaque_job_id, resolved, selected_scope=None) is JobState.CANCELLED
+            expected_actor = f"principal:{opaque_pid}"
+            opaque_terminals = [
+                e
+                for e in _entries(rt1, frozenset({"job.terminal"}))
+                if e.meta.get("job_id") == opaque_job_id
+            ]
+            assert len(opaque_terminals) == 1
+            assert opaque_terminals[0].meta["state"] == "cancelled"
+            assert opaque_terminals[0].actor == expected_actor
+            assert KernelRecord(kind="test.item", meta={"k": 1}, refs=(), actor=expected_actor).actor == expected_actor
+            assert validate_envelope(expected_actor, OWNER, ()) == ()
+
+        before_opaque_rebuild = _tables(rt1)
+        rt1.store.rebuild_projections()
+        assert _tables(rt1) == before_opaque_rebuild
+
+        for bad_actor in (
+            "user:CLI",
+            "user:" + "a" * 65,
+            "system:UPPER",
+            "system:" + "a" * 65,
+            "principal:",
+            "principal:-bad",
+            "principal:a:b",
+            "principal:" + "a" * 129,
+        ):
+            with pytest.raises(BrainError) as kr_err:
+                KernelRecord(kind="test.item", meta={"k": 1}, refs=(), actor=bad_actor)
+            assert kr_err.value.code is ErrorCode.INVALID_INPUT
+            with pytest.raises(BrainError) as ve_err:
+                validate_envelope(bad_actor, OWNER, ())
+            assert ve_err.value.code is ErrorCode.INVALID_INPUT
 
         # 2. Control system transitions: enqueue, lease, start, reserve, settle, succeed, fail, dead-letter, prune.
         job_ok = enqueue_job(service1, store1, owner_id=OWNER, payload=b"a3-sys-ok").job_id
