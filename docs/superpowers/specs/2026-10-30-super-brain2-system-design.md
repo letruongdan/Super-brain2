@@ -1,14 +1,20 @@
 # Super-brain2: thiết kế hệ thống tổng thể
 
 - **Ngày:** 2026-10-30
-- **Phiên bản:** rev 4. Rev 1 là commit `7a1825e`, rev 2 là `3ca76f6`, rev 3 là `929d009`.
-- **Trạng thái:** chờ chủ dự án duyệt rev 4.
+- **Phiên bản:** rev 10. Rev 1 là commit `7a1825e`, rev 2 là `3ca76f6`, rev 3 là `929d009`, rev 4 là `92492f5`. Rev 5 tới rev 9 chỉ tồn tại trong working tree, SHA-256 lần lượt `a26d6a1b…c084`, `9af6776f…253c`, `d54457e8…9b90`, `1deb3317…a468` và `39b07ef8…503e`.
+- **Trạng thái:** chờ chủ dự án duyệt rev 10. Rev 4 đã được duyệt ngày 2026-10-30.
 - **Quy trình:** superpowers:brainstorming, nhánh kiến trúc.
   - Các phần thiết kế 1–12 đã được duyệt lần lượt trong hội thoại ngày 2026-10-29/30.
   - Rev 2 xử lý review `docs/reviews/2026-10-30-system-design-review.md` (SB2-S01…S18) và thêm Q17–Q19.
   - Rev 3 xử lý review `docs/reviews/2026-10-30-system-design-rev2-review.md` (SB2-R2-01…R2-15), chốt lại Q18 và thêm Q20.
   - Rev 4 xử lý review `docs/reviews/2026-10-30-system-design-rev3-review.md`: hai yêu cầu SB2-R3-01, R3-02, và các nghĩa vụ A–C cùng checklist cho plan SP1.
-  - Mục 21 ánh xạ từng phát hiện của cả ba review tới chỗ đã sửa.
+  - Rev 5 thêm sổ bàn giao giữa các harness (Q21, mục 7.4) theo thiết kế chủ dự án duyệt trong hội thoại ngày 2026-11-09. Rev 5 chỉ đổi tài liệu: `schemas/mcp-tools-v2.json` và code được cập nhật ở task đầu của SP2.
+  - Rev 6 xử lý review `docs/reviews/2026-11-09-system-design-rev5-review.md` (SB2-R5-01…R5-09). Rev 6 cũng chỉ đổi tài liệu.
+  - Rev 7 xử lý review `docs/reviews/2026-11-09-system-design-rev6-review.md`. Rev 7 bỏ cơ chế xác nhận bằng khớp câu chữ theo quyết định của chủ dự án ngày 2026-11-09, và cũng chỉ đổi tài liệu.
+  - Rev 8 xử lý review `docs/reviews/2026-11-09-system-design-rev7-review.md`, và cũng chỉ đổi tài liệu.
+  - Rev 9 xử lý review `docs/reviews/2026-11-09-system-design-rev8-review.md`, và cũng chỉ đổi tài liệu.
+  - Rev 10 xử lý review `docs/reviews/2026-11-09-system-design-rev9-review.md`, và cũng chỉ đổi tài liệu.
+  - Mục 21 ánh xạ từng phát hiện của cả tám review và từng thay đổi của rev 5 tới chỗ đã sửa.
 - **Thay thế:** mọi tài liệu thiết kế của repo cũ `D:\ensemble-agents\Super-brain`. Tài liệu cũ chỉ còn là tham chiếu (xem mục 16).
 
 ---
@@ -22,6 +28,7 @@ Super-brain2 là một "bộ não" chạy cục bộ, kết nối nhiều coding
 3. **Chọn nhanh và chính xác.** Jev (mô hình System One của TypeSafe) chọn skill, bài học, hướng dẫn tool và context. Khi Jev không dùng được thì rules thay thế.
 4. **Đo được bằng chứng.** "Thông minh hơn" phải được đo bằng tín hiệu thụ động và holdout ngẫu nhiên, không tự tuyên bố.
 5. **Chạy trên Windows, macOS và Linux** (Q19). Về sau có thể chia sẻ cho nhiều người dùng.
+6. **Bàn giao không đổi hướng** (Q21). Một harness dừng giữa chừng, kể cả đột ngột vì hết quota, thì harness khác làm tiếp được mà giữ nguyên mục tiêu, kế hoạch và các quyết định đã có.
 
 ### Ngoài phạm vi
 
@@ -49,13 +56,14 @@ Super-brain2 là một "bộ não" chạy cục bộ, kết nối nhiều coding
 | Q11 | harness2 | Chỉ lấy ý tưởng; không chạy probe |
 | Q12 | Phạm vi bài học | Chia sẻ giữa mọi repo của cùng một `owner_id`. Lọc ứng viên tại máy, Jev chọn. Chỉ nội dung bài học được chia sẻ; evidence thô, continuity và context nguồn không đi theo sang repo khác |
 | Q13 | Cách xây | Hướng B: viết theo spec. Tầng thấp trích xuất từ repo cũ kèm test; tầng domain/application viết mới bằng TDD |
-| Q14 | Ai viết câu chữ bài học | Agent đang làm việc viết ở cuối phiên qua `submit_episode`; brain chỉ xác minh. Phiên nào agent không gửi thì dùng mẫu trích xuất |
+| Q14 | Ai viết câu chữ bài học và sổ bàn giao | Agent đang làm việc viết qua `submit_episode`; brain chỉ xác minh. Bài học viết khi đã đủ chất liệu, chậm nhất ở cuối phiên. Sổ bàn giao viết **liên tục trong phiên** (mục 7.4), vì phiên có thể dừng mà không kịp viết gì thêm. Phiên nào agent không gửi thì dùng mẫu trích xuất |
 | Q15 | Thời hạn lưu sự kiện thô | Mặc định 90 ngày, chỉnh được |
 | Q16 | Tự chẩn đoán | Lệnh `brain doctor` cộng `get_health(deep=true)`; daemon tự chạy khi khởi động và mỗi ngày |
 | Q17 | Contract | Phát hành `mcp-tools-v2`: giữ 8 tên tool; schema canonical pin trong repo kèm fixtures request/response/error. Không làm adapter v1 |
 | Q18 | Cổng duyệt | Ba lớp (mục 11.3): rule văn bản trong harness; quyền `ask` của harness; brain tự xác minh. Rủi ro thấp: terminal (chỉ khi lớp 2 đã được xác minh). Rủi ro cao: passkey có user verification, **hoặc chữ ký SSH bằng bất kỳ khóa nào**. Mỗi approval ghi mức bảo đảm; khóa SSH thường được ghi là `key_authorization`. Bản review/apply tối thiểu nằm trong SP1 |
 | Q19 | Hệ điều hành | Đa OS ngay từ SP1 (Windows, macOS, Linux, chạy trong CI). Nhiều người dùng làm sau |
 | Q20 | Thử trước khi đề xuất | Không có bước thử ở kênh động trước khi tạo ChangeProposal cho kênh tĩnh. Mọi thay đổi kênh tĩnh đi thẳng tới cổng duyệt |
+| Q21 | Bàn giao giữa harness | Agent ghi sổ bàn giao liên tục, worker ghép phần quan sát được (mục 7.4). Harness nhận việc được đổi quyết định cũ khi có bằng chứng mới, phải ghi quyết định thay thế kèm lý do và báo người dùng. Ràng buộc do người dùng đặt thì harness phải hỏi trực tiếp. Phiên nghe trực tiếp được làm theo trong phiên đó; sổ chỉ ghi đề xuất, ràng buộc cũ không đổi, và phiên khác muốn dựa vào đề xuất thì phải hỏi lại. Chỉ giữ được những gì đã viết ra; suy luận nội bộ của model không chuyển được |
 
 ## 3. Các nguồn và phần lấy từ mỗi nguồn
 
@@ -157,7 +165,7 @@ Mỗi package được phân công cho một dự án con (mục 15). Một dự
 
 - **Principal** là danh tính truy cập, gắn với một credential. Mỗi credential cấp cho một cặp (harness, máy) của một owner.
 - Daemon **suy** `owner_id`, `harness_id`, `machine_id` từ credential. Payload khai owner/harness khác với principal thì bị từ chối (`identity_mismatch`), kể cả khi truy cập trực tiếp bằng ref của artifact, job hay context.
-- Tác nhân hệ thống có danh tính riêng: `system:doctor`, `system:worker:<tên>`, `system:catalog-import`, `user:cli`. Bản ghi của tác nhân hệ thống không bịa `session_id`; trường này để trống.
+- Tác nhân hệ thống có danh tính riêng: `system:doctor`, `system:worker:<tên>`, `system:catalog-import`, `user:cli`. Bản ghi của tác nhân hệ thống không bịa `session_ref`; trường này để trống.
 - Thu hồi credential: `brain credential revoke`, là hành động cần duyệt (mục 11.3). Request dùng credential đã thu hồi bị từ chối ngay.
 
 ### 5.2 Repo, checkout và snapshot
@@ -179,7 +187,7 @@ Quy tắc:
 
 ### 5.3 Các loại bản ghi
 
-Mọi bản ghi mang `owner_id`, `actor` (principal hoặc tác nhân hệ thống) và nếu có thì `repo_id`, `checkout_id`, `harness_id`, `session_id`, `machine_id`. ID dùng UUIDv7.
+Mọi bản ghi mang `owner_id`, `actor` (principal hoặc tác nhân hệ thống) và nếu có thì `repo_id`, `checkout_id`, `harness_id`, `session_ref` (định danh đã chuẩn hóa, không phải `session_id` gốc của harness, mục 7.4), `machine_id`. ID dùng UUIDv7.
 
 | Bản ghi | Nội dung chính | Tạo bởi |
 |---|---|---|
@@ -187,6 +195,7 @@ Mọi bản ghi mang `owner_id`, `actor` (principal hoặc tác nhân hệ thố
 | CaptureGap | Khoảng sự kiện bị mất: lý do, khoảng thời gian, số lượng ước tính; không chứa nội dung | capture, outbox |
 | Evidence | Bằng chứng có kiểu (lần chạy lệnh, exit code, digest output, diff); `source` do server gán theo kênh nhận (mục 8.2) | capture, `submit_episode`, CLI |
 | Episode | Một task (hoặc một phần task) kèm các evidence; trạng thái `open`, `checkpointed`, `closed` | `submit_episode`, capture |
+| Handoff | Sổ bàn giao của một task trên một checkout, có revision; gồm hai ref bất biến tới phần agent khai và phần quan sát (mục 7.4). Phần agent khai nằm trong CAS; phần quan sát chỉ chứa ref tới Event nguồn | `submit_episode`, worker capture |
 | Lesson | Bài học có phiên bản: nội dung, `kind ∈ {world, experience, belief}`, `claim_type ∈ {technical, preference}`, điều kiện áp dụng, nguồn gốc (lineage), trạng thái (mục 8.3), proof lineage | reflection |
 | Artifact | Skill, persona, rule… gắn `component ∈ {c1..c8}`. Có revision; nội dung và **toàn bộ resource đi kèm** nằm trong CAS; ghi nguồn gốc và license | catalog, improvement |
 | ChangeProposal | Diff, lý do, evidence, mức rủi ro do server xếp, các file đích kèm digest bản gốc, trạng thái duyệt, con trỏ rollback | improvement, bootstrap |
@@ -272,6 +281,8 @@ Mọi bản ghi mang `owner_id`, `actor` (principal hoặc tác nhân hệ thố
 |---|---|---|
 | Payload của Event | 90 ngày (Q15) | Bỏ holder của Event, ghi tombstone; giữ metadata (loại, thời gian, ID) |
 | Evidence | Còn được bài học, outcome hoặc proposal dẫn tới thì giữ; không thì theo Event | Như Event |
+| Sổ bàn giao, phần agent khai và `task_goal` | Holder theo từng revision. Revision còn được bài học, outcome hoặc proposal dẫn tới thì giữ; không thì 90 ngày từ lần agent ghi cuối (Q15). Worker làm mới không gia hạn | Như Event |
+| Sổ bàn giao, phần quan sát | Chỉ là ref, không giữ holder trên payload Event nên không gia hạn nguồn. Nội dung theo thời hạn của Event nguồn | Mục đó trả `expired`; giữ ID và digest |
 | Bản ghi idempotency | 30 ngày | Xóa; chỉ chứa ID/ref, không chứa nội dung (mục 6.3) |
 | Outbox đã ACK | Xóa ngay sau ACK | – |
 | Log, trace | 30 ngày | Xoay vòng; log không bao giờ chứa payload thô (mục 14.2) |
@@ -302,10 +313,15 @@ Mọi bản ghi mang `owner_id`, `actor` (principal hoặc tác nhân hệ thố
 - **Restore policy store** là một hành động riêng, rủi ro cao. Trước khi duyệt, brain hiện chính xác trạng thái nào bị quay lui: credential nào sống lại, người ký nào, quarantine nào bị gỡ.
   - Mỗi lần restore policy store, `trust_generation` **tăng lên** so với giá trị lớn nhất từng có. Giá trị này được ghi cả trong `writer.lock`, vốn không bao giờ bị hoán đổi.
   - Approval message mang `trust_generation`. Approval và nonce của thế hệ cũ đều mất hiệu lực, nên chữ ký cũ không thể dùng lại sau restore dù nonce trong snapshot đang ở trạng thái chưa dùng.
+  - Mỗi lần restore kho chính, `restore_epoch` được đặt bằng `writer_epoch` của lease đang giữ và ghi vào một file metadata bên trong `store/` đang dựng, **trước** khi hoán đổi, không đụng bytes của `brain.db`. Nó đổi cùng lúc với bản kho trong cùng một lần hoán đổi. `writer_epoch` tăng sau mỗi lần hoán đổi, nên mỗi lần restore có một giá trị riêng.
+  - Kho có schema từ SP2 trở lên **luôn có** file này; tạo kho mới hoặc nâng kho cũ lên schema SP2 thì ghi giá trị 0. Thiếu hoặc hỏng ở kho SP2, khi mở kho hay khi phục hồi swap, đều trả `INTEGRITY_FAILURE`. Chỉ kho có schema trước SP2 mới được đọc thiếu thành 0.
+  - Backup không chép file này; restore luôn cấp giá trị mới. `writer.lock` không đổi định dạng.
+  - Người giữ sổ bàn giao có `restore_epoch` khác giá trị hiện hành không còn hiệu lực (mục 7.4).
   - Bảo đảm này áp dụng cho mọi tổ hợp restore: chỉ kho, chỉ policy store, hay cả hai.
 
 ### 5.8 Phiên bản và migration
 
+- Migrate kho mang nguyên `restore_epoch` đã xác minh sang stage và làm bền trước khi đánh dấu stage là sẵn sàng hoán đổi (`READY`, mục 5.7).
 - Kho ghi `schema_version` và `min_reader_version`.
   - Binary gặp kho có schema mới hơn mức nó hỗ trợ thì từ chối **trước mọi thao tác ghi**.
   - Chỉ cho chạy `doctor` ở chế độ đọc.
@@ -336,10 +352,10 @@ Schema JSON canonical nằm trong repo (`schemas/mcp-tools-v2.json`), kèm fixtu
 
 | Tool | Loại | Hành vi |
 |---|---|---|
-| `prepare_task` | Ghi (có idempotency) | Lọc tại máy → Jev chọn → áp holdout → ghi Delivery. Trả về: 0–N skill, 0–K bài học, continuity của checkout, ref context, finishing gates, `delivery_id` |
+| `prepare_task` | `mode=work` (mặc định): ghi, có idempotency. `mode=discover`: chỉ đọc | `work`: lọc tại máy → Jev chọn → áp holdout → ghi Delivery. Trả về: 0–N skill, 0–K bài học, sổ bàn giao của task khi có `task_id`, ref context, finishing gates, `delivery_id`. `discover`: tìm sổ bàn giao, không tạo task, Delivery hay Job (mục 7.4) |
 | `search_knowledge` | Chỉ đọc | FTS5 kết hợp độ mới. Không gọi Jev |
-| `get_artifact` | Đọc, có ghi audit (ServedReceipt) | Trả nội dung ở cấp L0/L1/L2 kèm revision và digest từng resource |
-| `submit_episode` | Ghi (có idempotency) | Lưu Episode và evidence (`source=agent_reported`); nhận bài học đề xuất do agent viết (Q14); nhận `read_acks` |
+| `get_artifact` | Đọc, có ghi audit (ServedReceipt) | Trả nội dung ở cấp L0/L1/L2 kèm revision và digest từng resource, gồm cả sổ bàn giao |
+| `submit_episode` | Ghi (có idempotency) | Lưu Episode và evidence (`source=agent_reported`); nhận bài học đề xuất do agent viết (Q14); nhận `read_acks`; nhận `handoff` kèm `base_revision` và `takeover` (mục 7.4) |
 | `record_outcome` | Ghi (có idempotency) | Kết quả theo `delivery_id`, kèm ref đã áp dụng và `read_acks` |
 | `request_improvement` | Ghi (có idempotency), bất đồng bộ | Tạo Job reflection; trả `job_id` |
 | `get_job` | Chỉ đọc | Trạng thái và kết quả job |
@@ -353,9 +369,13 @@ Schema JSON canonical nằm trong repo (`schemas/mcp-tools-v2.json`), kèm fixtu
   - `store_busy`, `deadline_exceeded`;
   - `capability_unavailable`, `unsupported_version`.
 - Domain chưa được xây trả `capability_unavailable`, không trả success rỗng.
+  - Ngoại lệ duy nhất: tool có domain một phần (`prepare_task` ở SP2 chỉ có continuity) được trả success khi phần đang có là thật, và phải liệt kê phần chưa có trong `degraded_codes` (`skills_unavailable`, `lessons_unavailable`, `context_unavailable`, `finishing_gates_unavailable`). Mảng rỗng đi kèm các mã này nghĩa là "chưa có khả năng", không phải "không có gì phù hợp".
 - **Không tool MCP nào tạo được ApprovalReceipt** (mục 11.3).
 - Mỗi tool ghi rõ trong schema: đồng bộ hay bất đồng bộ, và side effect gì.
 - **Ngân sách context** tính bằng token, ước lượng bằng một tokenizer cố định có ghi tên trong schema. Mặc định 4.000.
+  - `utf8-byte-v1`: số token ước lượng = `ceil(số byte UTF-8 của nội dung trả về / 4)`. Đây là phép ước lượng xác định, không phụ thuộc model, và không phải số token thật của nhà cung cấp.
+  - Phép tính này chỉ dùng cho ngân sách context cục bộ và các giới hạn context ở mục 10. Nó không phải cận trên của token tính phí; giữ chỗ chi phí và usage theo mục 9.
+  - Đếm trên tổng byte của `summary` hoặc nội dung được chọn; `ceil` áp dụng một lần trên tổng; không tính envelope JSON.
 
 ### 6.3 Idempotency
 
@@ -432,6 +452,7 @@ hook/transcript → adapter dịch sang envelope v2 → privacy filter → outbo
 - **Khi nào tạo:**
   - Phiên kết thúc: tạo bản tóm tắt cuối.
   - Không hoạt động quá 30 phút: tạo **checkpoint** có nhãn `in_progress_unknown`, **không** phải kết thúc thành công hay thất bại.
+  - Trong suốt phiên: sổ bàn giao được cập nhật liên tục (mục 7.4). Hai mốc trên không còn là nguồn duy nhất.
 - **Checkpoint của việc chạy dài** ghi:
   - lệnh, thư mục làm việc, source revision;
   - PID/handle kèm thời điểm khởi động, nếu có;
@@ -440,11 +461,194 @@ hook/transcript → adapter dịch sang envelope v2 → privacy filter → outbo
 
   Phiên sau đọc receipt trước. Nếu chưa có receipt kết thúc, chỉ kiểm tra tiến trình gốc một lần; không khởi động lại chỉ vì quá timeout.
 - **Sự kiện đến muộn** tạo một revision mới của continuity và giữ lịch sử revision cũ; không ghi đè mà không để lại dấu vết.
-- **Nội dung:** L0 (≤50 từ) và L1 dạng dòng thời gian (≤300 từ): mục tiêu, file đã động tới, lệnh, lỗi, việc còn dở.
-  - Ưu tiên bản bàn giao do agent gửi qua `submit_episode`.
-  - Nếu không có thì trích xuất theo luật.
-- **Phạm vi:** gắn với **checkout** (mục 5.2). Được đưa vào `prepare_task` của phiên kế tiếp trên checkout đó, với bất kỳ harness nào.
+- **Nội dung:** sổ bàn giao, theo cấu trúc và giới hạn ở mục 7.4.
+  - Phần agent khai đến từ `submit_episode`.
+  - Agent không gửi thì chỉ còn phần quan sát được, trích xuất theo luật, và L0 ghi rõ là không có phần agent khai.
+- **Phạm vi:** gắn với **checkout** (mục 5.2). Được đưa vào `prepare_task` của phiên kế tiếp trên checkout đó, với bất kỳ harness nào. Chuyển việc sang checkout khác, kể cả worktree khác của cùng repo, chưa được hỗ trợ.
 - **Lineage:** continuity, checkpoint và bản bàn giao mang lineage của task tạo ra chúng (mục 14.2). Khi được đưa vào task mới, task mới kế thừa lineage đó.
+
+### 7.4 Sổ bàn giao (Q21)
+
+Mục đích: khi một harness dừng, harness khác làm tiếp mà không đổi hướng. **Thiết kế không dựa vào việc biết trước phiên sắp dừng**, nên không cần hook báo hết quota. Sổ luôn phải đủ mới từ trước đó.
+
+Sổ luôn mang nhãn `agent_reported` ở phần agent khai, không bao giờ được tính là bằng chứng cho bài học (mục 8.2), và là **dữ liệu, không phải lệnh**: không cấp thêm quyền, không thay cổng duyệt (mục 11.3).
+
+**Binding.** Mỗi sổ gắn với đúng một task, và task có binding đã xác minh `(owner_id, repo_id, checkout_id, task_id)`. Tìm sổ, đọc theo ref, resume, ghi và replay đều kiểm binding này, quyền hiện hành của principal và `selected_scope` **trước** khi trả L0 hoặc đọc CAS. Sai scope trả `not_found`, kể cả khi caller biết ID và revision. Với `kind=handoff`, `id` của item chính là `task_id`.
+
+**Phần agent khai:**
+
+| Mục | Nội dung | Cách cập nhật |
+|---|---|---|
+| `working_goal` | Cách hiểu hiện tại về mục tiêu | Thay thế |
+| `plan` | Các bước và bước đang làm; mỗi bước có tùy chọn `depends_on_change` | Thay thế |
+| `decisions` | `id` (agent đặt, duy nhất trong sổ), quyết định, lý do, `evidence_refs`, tùy chọn `supersedes` hoặc `reopens` | Chỉ thêm |
+| `rejected` | `id`, phương án đã loại, lý do, tùy chọn `merges` để gộp các mục cũ | Chỉ thêm |
+| `user_constraints` | `id`, ràng buộc do người dùng đặt | Chỉ thêm |
+| `constraint_changes` | Đề xuất đổi ràng buộc; `closed_changes` để đóng đề xuất (xem bên dưới) | Chỉ thêm |
+| `tooling` | Lệnh và công cụ cấp dự án, ghi theo mục đích; không ghi tên tool riêng của harness | Thay thế |
+| `hypotheses` | Giả thuyết đang kiểm tra | Thay thế |
+| `next_action` | Việc làm ngay tiếp theo; tùy chọn `depends_on_change` | Thay thế |
+| `long_running` | Việc chạy dài: các trường ở mục 7.3 | Thay thế |
+| `task_state` | `open`, `done` hoặc `abandoned` | Thay thế |
+
+`task_goal` là `description` ở lần tạo task, do server lưu thành một blob riêng, ghim và không sửa được. L0 hiện tối đa 200 byte, cắt đúng ranh giới ký tự UTF-8 và có dấu đã cắt. L1 hiện tối đa 2 KB; bản đầy đủ ở L2. L0 và L1 hiện cả `working_goal` khi nó khác `task_goal`.
+
+**Phần quan sát** (worker ghi, agent không sửa được). Đây là danh sách mục, mỗi mục chỉ gồm `kind`, `source_event_id` và `source_digest`: file đã đổi, lệnh và exit code, lỗi gần nhất, lời người dùng gần đây, câu trả lời gắn với đề xuất đổi ràng buộc. Kèm `observed_through` và số event kể từ lần agent ghi cuối. Harness không có hook hay transcript thì phần này là `unavailable`.
+
+**Trích đoạn giữ hiệu lực của nguồn.** Nội dung của từng mục quan sát được dựng từ Event nguồn **lúc phục vụ**, không sao vào sổ.
+- Mỗi lần phục vụ L1, L2, report, retry hoặc sau restore đều kiểm tra lại quyền, tombstone và quarantine theo digest nguồn.
+- Nguồn bị chặn thì mục đó trả `redacted`; nguồn hết hạn thì trả `expired`. ID và digest vẫn giữ, bytes không còn được phục vụ.
+- Digest của lần đã phục vụ nằm trong ServedReceipt. Bản phục vụ lại có digest theo nội dung thực tế.
+- L0 không chứa trích đoạn. L0 dựng sẵn mang digest của `agent_ref` và `task_goal`, và được kiểm tra tombstone, quarantine trước khi trả, kể cả khi tìm đúng theo `task_id`. Một trong hai bị chặn hoặc hết hạn thì trả RedactedItem kèm `reason`.
+- Phần agent khai và `task_goal` bị quarantine theo digest của chính chúng, ở từng revision.
+
+**Revision và merge.**
+- Sổ có hai ref bất biến: `agent_ref` và `observed_ref`. Owner thread commit `revision` của artifact bằng ref mới của phần vừa đổi và ref hiện hành của phần kia, đọc trong cùng transaction. Worker chụp dữ liệu cũ cũng không làm mất patch của agent.
+- `handoff_revision` chỉ tăng khi agent ghi patch; `base_revision` so với bộ đếm này. `revision` của artifact tăng khi một trong hai phần **hoặc người giữ** đổi; ServedReceipt gắn với bộ đếm này. Tiếp quản không kèm patch tăng `revision` và `writer_generation`, không tăng `handoff_revision`. Worker không bao giờ đổi tập đang hiệu lực, nên không cần tăng `handoff_revision`.
+- Mỗi `revision` của artifact giữ một bản ghi header bất biến gồm `handoff_revision` và fence của chính revision đó.
+- Worker có thể tạo sổ khi có task hợp lệ: `revision` dương, `handoff_revision=0` nghĩa là chưa có bản khai, `task_state=open` kèm `task_state_source=inferred`. L0 ghi rõ chưa có phần agent khai. Agent đầu tiên cập nhật bằng `base_revision=0`.
+- Độ cũ tính riêng: `agent_updated_at` cho phần khai, `observed_through` cho phần quan sát. Worker cập nhật liên tục không làm sổ khai đã cũ trông như mới.
+
+**Header.** L1 và L2 luôn có resource `handoff_header`: `artifact_id`, `revision`, digest của hai ref, `handoff_revision`, `task_id`, `task_state`, `task_state_source`, fence (`restore_epoch`, `writer_generation`), harness đang giữ sổ, trạng thái phiên, `agent_updated_at`, `observed_through`. Fence trong header là fence đã commit của đúng revision đó, nên có thể cũ sau restore; fence sống nằm trong `handoff_live`.
+
+**Cấp đọc và giới hạn** (đếm byte UTF-8 của bản đã render):
+
+| Cấp | Nội dung | Lấy bằng | Giới hạn mặc định |
+|---|---|---|---|
+| L0 | `task_goal` đã cắt, bước đang làm, việc tiếp theo, số quyết định, độ cũ, trạng thái phiên, cảnh báo có phiên khác đang chạy, số đề xuất đổi ràng buộc đang chờ | `prepare_task` | ≤600 byte |
+| L1 | Header; **toàn bộ** phần bắt buộc; phần quan sát | `get_artifact` | Mỗi resource ≤8 KB |
+| L2 | Lịch sử quyết định, đề xuất đã đóng, các revision trước, đoạn hội thoại gần nhất đã lọc (dựng từ ref như phần quan sát) | `get_artifact` | Tối đa 256 KB mới nhất; cũ hơn thì đọc theo `revision` đã ghim |
+
+- **Phần bắt buộc** gồm: ràng buộc đang hiệu lực, đề xuất đổi ràng buộc đang chờ, quyết định đang hiệu lực, phương án đã loại còn hiệu lực, `plan`, `next_action`, `tooling`, `long_running`. L1 không bao giờ cắt phần này: nội dung dài được chia thành nhiều resource trong cùng một response.
+- **Giới hạn ghi:** một mục ≤2 KB, một patch ≤16 KB, tổng phần bắt buộc ≤32 KB, trong đó ràng buộc đang hiệu lực ≤16 KB. Đề xuất đang chờ nằm trong vùng riêng ≤4 KB, không tính vào 32 KB.
+- Vượt giới hạn thì trả `invalid_input` và giữ nguyên sổ. **Patch không làm tăng tổng phần bắt buộc được miễn xét giới hạn tổng 32 KB**, kể cả khi sổ đang ở trần, nên agent luôn rút gọn được bằng `supersedes` hoặc `merges`. Miễn trừ này chỉ áp dụng cho giới hạn tổng; giới hạn một mục, một patch, vùng đề xuất đang chờ và quyền ghi vẫn áp dụng. Ràng buộc đang hiệu lực không rút gọn được; chạm trần 16 KB thì agent phải báo người dùng.
+- Các mục không bắt buộc thiếu chỗ thì L1 trả `incomplete_optional=true`.
+
+**Đường ghi của agent.** `submit_episode` với `handoff` chứa các mục đã đổi, kèm `base_revision` và `fence`. Mục không gửi thì giữ nguyên. `evidence` có thể rỗng. Mỗi lần ghi là một transaction cùng Episode và bản ghi idempotency (mục 6.3).
+- Agent cập nhật ở 6 thời điểm, không phải mỗi lượt: lập hoặc đổi kế hoạch; chốt quyết định hoặc loại phương án; người dùng đặt thêm ràng buộc; xong một bước; ngay trước lệnh chạy lâu; khi task kết thúc (đặt `task_state`).
+- Quy tắc này được cài vào file hướng dẫn của harness qua bootstrap, nên **model tự giác, server không ép được**. Harness có hook phù hợp thì hook có thể nhắc khi sổ đã cũ; hook chỉ nhắc, không bao giờ chặn.
+
+**Người giữ sổ và tiếp quản.** Không dùng khóa có hạn, vì harness hết quota không thể tự nhả khóa.
+- Mỗi sổ có `writer_generation` (ban đầu 0) và người giữ `(principal, session_ref, restore_epoch)`. **Fence** là cặp `(restore_epoch, writer_generation)`; header, `handoff_live` và mọi ACK ghi sổ đều mang fence.
+- `session_ref` là HMAC của `session_id` bằng khóa trong policy store. Mọi bản ghi và ledger chỉ dùng `session_ref` (mục 5.3); `session_id` gốc không xuất hiện trong L0, L1, L2, log hay ledger. `session_ref` được gắn với principal ở lần dùng đầu; principal khác khai cùng `session_id` thì trả `identity_mismatch`.
+- **Mọi lần ghi sổ** phải gửi `fence` hiện hành và phải đến từ đúng người giữ. Sai một trong hai thì trả `revision_conflict`, kể cả khi `base_revision` đúng. Nhờ `restore_epoch` nằm trong fence, request từ trước restore bị từ chối kể cả khi sau đó `writer_generation` và `handoff_revision` trùng lại.
+- Muốn giữ sổ phải tiếp quản rõ ràng: `submit_episode` kèm `takeover`, `base_revision` và `fence` hiện hành, có thể kèm hoặc không kèm `handoff`. Server so khớp trên trạng thái hiện hành, **luôn tăng** `writer_generation` và ghi `takeover_from`. Vì thế patch đến muộn của A sau chuỗi A → B → A vẫn bị từ chối. Hai bên cùng tiếp quản thì chỉ một bên thắng; bên thua nhận `revision_conflict`.
+- Lần ghi đầu của mọi phiên đều là tiếp quản, kể cả trên sổ mới (`writer_generation=0`).
+- Phiên giữ sổ còn `active` thì tiếp quản phải có `takeover.acknowledge_active=true`, và agent phải báo người dùng trước khi làm tiếp. Thiếu thì trả `invalid_input`.
+- Agent chỉ được đổi file trong checkout **sau khi nhận ACK của lần tiếp quản có `handoff_status=stored` và `writer_status=holder`**. ACK có `not_holder` nghĩa là quyền của lần tiếp quản đó không còn: không được đổi file, phải đọc lại. Nhận `commit_outcome_unknown` thì retry cùng khóa để biết kết quả trước.
+- **Restore:** `restore_epoch` đổi cùng lúc với bản kho (mục 5.7). Người giữ có `restore_epoch` khác giá trị hiện hành không còn hiệu lực, nên mọi phiên phải tiếp quản lại.
+- **Fence sống.** `handoff_live` gồm `revision`, `handoff_revision` và fence `(restore_epoch hiện hành, writer_generation của bản mới nhất)`. Trường này được tính lúc trả sau khi kiểm binding, không nằm trong resource, không tính vào digest và không lưu trong bản ghi idempotency. `get_artifact` với sổ bàn giao và `prepare_task` với `mode=work` đều trả trường này. Task mới chưa có sổ nhận `revision=null`, `handoff_revision=0` và fence `(restore_epoch hiện hành, 0)`. `mode=discover` không phát fence.
+- Hàng rào này chỉ kiểm soát việc ghi sổ. File trên đĩa vẫn dùng chung, nên agent phải đối chiếu trạng thái checkout và báo người dùng theo Q21.
+
+**Đổi quyết định.**
+- `decisions` và `rejected` không xóa được. `supersedes` phải trỏ tới một quyết định **đang hiệu lực**, kèm lý do. Trỏ sai loại, trỏ mục đã bị thay hoặc thiếu lý do thì trả `invalid_input`. Nhờ `base_revision`, hai đề xuất cùng trỏ một mục chỉ có một bên được ghi; bên còn lại đọc lại và thấy mục đã bị thay.
+- Mở lại phương án đã loại bằng một quyết định có `reopens` trỏ mục trong `rejected`, kèm lý do nêu bằng chứng mới và `evidence_refs` nếu có.
+- `merges` trên một mục `rejected` mới chỉ được trỏ tới các mục loại **còn hiệu lực**. Sau khi gộp, các mục nguồn rời tập đang hiệu lực và vẫn đọc được ở L2. Trỏ mục không còn hiệu lực thì trả `invalid_input`.
+- `evidence_refs` phải thuộc cùng binding, sai thì trả `not_found`. Tập đang hiệu lực được dựng lại một cách xác định từ chuỗi revision, nên replay cho đúng kết quả đó.
+
+**Đổi ràng buộc của người dùng.** Harness hỏi trực tiếp, người dùng trả lời tự nhiên. Không có mã xác nhận và SP2 không có trạng thái xác nhận chính thức.
+- Brain không hiểu nghĩa câu trả lời, nên sổ **không bao giờ tự đổi ràng buộc**. Ràng buộc cũ giữ nguyên trong tập đang hiệu lực.
+- Agent ghi một mục `constraint_changes` gồm `id`, ràng buộc đích, nội dung đề xuất và lý do, ở trạng thái `proposed`, rồi hỏi người dùng.
+- Worker tự gắn ref tới tin nhắn kế tiếp của người dùng sau khi đề xuất được commit, do adapter đã đăng ký ghi lại, trên đúng binding. Ref này nằm trong phần quan sát và chỉ để tham khảo: một câu từ chối hoặc câu không liên quan cũng được gắn như vậy và **không có hiệu lực gì**. L0 chỉ hiện số đề xuất đang chờ; L1 và `brain report` dựng trích đoạn ≤512 byte từ ref.
+- **Phiên đã trực tiếp hỏi và nhận câu trả lời được làm theo trong phiên đó.** Phiên khác muốn dựa vào đề xuất để hành động thì phải hỏi lại người dùng. Harness không capture được thì đề xuất không có ref, và quy tắc này vẫn áp dụng.
+- Bước trong `plan` hoặc `next_action` phụ thuộc vào ngoại lệ chỉ có hiệu lực trong phiên đó thì ghi `depends_on_change` trỏ tới đề xuất, để phiên sau biết phải hỏi lại trước khi làm. Trỏ đề xuất không tồn tại thì trả `invalid_input`.
+- Người giữ sổ đóng đề xuất bằng `closed_changes`: `rejected` khi người dùng từ chối, `withdrawn` khi agent rút lại. Đề xuất đã đóng rời khỏi vùng đang chờ và chỉ còn ở L2.
+- Ràng buộc mới do agent khai không được nới lỏng ràng buộc đang có. Server không phát hiện được mâu thuẫn về ngữ nghĩa; khi hai mục mâu thuẫn, agent áp dụng mục có trước và hỏi người dùng.
+
+| Nguồn của câu trả lời bị ảnh hưởng | Kết quả |
+|---|---|
+| Hết hạn | Trích đoạn trả `expired`, trạng thái đề xuất không đổi |
+| Quarantine, tombstone | Trích đoạn trả `redacted`, trạng thái đề xuất không đổi |
+| Restore | Theo mục 5.6, không phục sinh nội dung đã hết hạn |
+
+Vì SP2 không có trạng thái xác nhận, không policy nào làm mất hiệu lực một thay đổi ràng buộc: thay đổi đó chưa từng có hiệu lực trên sổ.
+
+**Đường ghi của worker.** Theo đường capture ở mục 7.1, chỉ dùng luật, không gọi LLM.
+- Worker nhận dạng theo task, session, `producer_stream` và watermark. Watermark tính riêng cho từng `producer_stream` và chỉ tăng; sự kiện đến muộn được gộp vào và tạo `revision` mới.
+- Làm mới được **lên lịch** sau 20 event hoặc 60 giây kể từ event đầu tiên chưa được làm mới, tùy điều kiện nào đến trước. Phiên im lặng khi mới có dưới 20 event vẫn được lên lịch nhờ mốc 60 giây.
+- Mỗi task có tối đa một job chờ. Job đang chạy mà có event mới thì đánh dấu, và chạy đúng một job tiếp theo.
+- 60 giây là mốc lên lịch, không phải cam kết phục vụ: thời điểm thực tế còn phụ thuộc hàng đợi job và retry. `observed_through` luôn cho biết dữ liệu mới tới đâu. Event chưa ACK không được bảo đảm, và được báo bằng `CaptureGap` theo mục 7.1.
+- `prepare_task` chỉ đọc bản đã dựng sẵn, không tính lại từ event, để giữ ngân sách xử lý tại máy ≤100 ms (mục 6.5).
+
+| `automatic_capture` | `manual_submission` | Worker quan sát | Phần agent khai |
+|---|---|---|---|
+| bật | bật | Chạy | Được lưu |
+| bật | tắt | Chạy (sổ chỉ có phần quan sát) | Không lưu, `not_stored_policy` |
+| tắt | bật | Không thêm mục mới | Được lưu |
+| tắt | tắt | Không thêm mục mới | Không lưu, `not_stored_policy` |
+
+Job kiểm tra cờ hiện hành khi bắt đầu và khi commit. Dữ liệu cũ sau khi tắt cờ vẫn được phục vụ tới khi hết hạn, trừ khi bị quarantine hoặc tombstone.
+
+**Trạng thái phiên.** Brain không đoán phiên đã kết thúc:
+
+| Trạng thái | Nghĩa |
+|---|---|
+| `active` | Có event trong 5 phút gần đây |
+| `in_progress_unknown` | Im lặng, không rõ đã dừng hay chưa |
+| `ended` | Harness báo phiên đã kết thúc. Event đến sau mốc này được gộp vào phần quan sát nhưng không đổi trạng thái; chỉ sự kiện `session_resumed` của adapter mới đổi |
+
+**Đường đọc:**
+1. **Tìm sổ.** Đầu phiên agent gọi `prepare_task` với `mode=discover`. Lần gọi này chỉ đọc, không có `idempotency_key`, không tạo task, Delivery hay Job, không gọi Jev, không có holdout, không thuộc mẫu số đo lường. Kết quả là L0 của tối đa 3 sổ còn mở trên checkout, mới nhất trước.
+   - Sổ còn mở là sổ có `task_state=open` và có cập nhật trong 14 ngày.
+   - Truyền `task_id` thì nhận đúng bản mới nhất của sổ đó dù nằm ngoài top 3 hoặc đã đóng, sau khi kiểm tra binding. Đây cũng là đường lấy bản mới nhất sau `revision_conflict`.
+2. **Đọc.** Agent chọn sổ và gọi `get_artifact` L1 với `task_id` bằng `id` của item. ServedReceipt gắn với principal và task đó.
+3. **Resume.** Agent gọi `prepare_task` với `mode=work`, `task_id` và `resume_ref` gồm `artifact_id`, `revision`, `handoff_revision`, `fence` và `served_receipt_id` nếu có. Delivery mới gắn với task cũ, dùng lại scope đã ghim, sau khi kiểm tra lại quyền và policy hiện hành. Snapshot thiếu xử lý theo S1 như mọi Delivery.
+   - Server so `handoff_revision` và `fence` trong `resume_ref` với header bất biến của chính `revision` đó, kể cả khi không có receipt. Không khớp thì trả `revision_conflict`.
+   - `served_receipt_id` phải là lần phục vụ **L1** của đúng principal, task, artifact và revision, và có tập digest của các resource bắt buộc, kể cả mục đã `redacted`. Sai thì trả `not_found`; receipt còn `pending` thì trả `in_progress`.
+   - Bằng chứng ghi vào `exposure_evidence`: có ReadAck khớp digest thực tế là `read_ack`; có receipt hợp lệ là `served_only`; không có receipt là `unknown`.
+   - Sau đó so với **header đã commit của bản mới nhất**: `handoff_revision` hoặc fence đã đổi kể từ `revision` đã đọc thì trả `revision_conflict`, phải đọc lại. Restore chỉ đổi fence sống, không đổi header, nên không chặn resume; agent vẫn phải tiếp quản bằng fence sống.
+   - Chỉ `revision` tăng (phần quan sát mới hơn) thì vẫn đi tiếp, và `degraded_codes` có `observed_newer`.
+4. **Kiểm tra trước khi làm.** Agent so sổ với trạng thái thật của code, nói lại ngắn gọn cho người dùng: mục tiêu, bước đang làm, các quyết định sẽ giữ.
+5. **Tiếp quản** bằng lần ghi đầu, dùng fence từ `handoff_live`, theo quy tắc ở trên.
+
+Sau restore hoặc `revision_conflict`, thứ tự phục hồi là: tìm sổ bằng `task_id`, đọc L1, lấy `handoff_live`, resume, rồi tiếp quản.
+
+Không có sổ phù hợp thì agent gọi `mode=work` như thường. `mode=work` không kèm `task_id` không trả nội dung sổ nào; nếu checkout có sổ còn mở thì `degraded_codes` có `open_handoffs_present`, để agent bỏ qua bước tìm sổ vẫn được nhắc. Agent dùng thông tin từ L0 đã xem cho một task mới thì khai `seen_handoff_refs`; server kiểm binding rồi thêm vào lineage. Không khai thì đó là nội dung agent tự chép, thuộc giới hạn ở mục 14.2.
+
+**Ngân sách.** L0 không bị cắt đôi. Brain lấy nhiều sổ nhất vừa `context_budget_tokens`, mới nhất trước, tính theo mục 6.2. Không đủ thì bỏ các sổ còn lại và trả `continuity_truncated`. Sổ bị bỏ vẫn tìm được bằng `task_id`.
+
+**Tranh chấp:**
+
+| Tình huống | Cách xử lý |
+|---|---|
+| Người giữ ghi trên bản cũ | `revision_conflict`, không tạo revision. Đọc lại rồi gộp; server không tự gộp |
+| Phiên không giữ sổ ghi, kể cả đúng revision | `revision_conflict` |
+| Tiếp quản khi phiên cũ vẫn `active` | Phải có `acknowledge_active`; L0 cảnh báo và agent phải báo người dùng |
+| Hai harness làm hai task khác nhau trên cùng checkout | Mỗi task một sổ, worker gán event theo phiên. L0 cảnh báo vì file trên đĩa dùng chung |
+
+**Retry.** Tra idempotency **trước** khi so `base_revision` và `fence`, nên retry hợp lệ nhận đúng kết quả đã commit thay vì `revision_conflict`. Kết quả phục vụ lại theo mục 6.3: giữ ID và revision đã commit, kiểm tra lại quyền hiện hành. Replay chỉ trả lại kết quả cũ, không trả lại quyền ghi. Mọi ACK ghi sổ mang `writer_status` tính **lúc trả**, kể cả khi replay: `holder` chỉ khi **fence đã commit trong ACK bằng fence sống** và người giữ hiện hành đúng là caller, còn lại là `not_holder`. Các trường khác giữ nguyên như đã commit. Hết deadline lúc commit trả `commit_outcome_unknown` và retry cùng khóa để biết kết quả thật.
+
+**Lỗi:**
+
+| Tình huống | Cách xử lý |
+|---|---|
+| Harness dừng giữa lời gọi ghi sổ | Giữ nguyên revision đã commit gần nhất |
+| Daemon tắt | Shim báo lỗi rõ ràng, không lưu sổ ở nơi khác. Agent gửi lại ở mốc sau. Phần quan sát được vẫn nằm trong outbox |
+| Privacy filter từ chối | Không lưu gì của lần ghi đó, trả lỗi có mã |
+| Nhánh `not_stored_policy` | Không có hiệu lực patch, không đổi người giữ, không tăng revision hay `writer_generation`, kể cả với request chỉ xin tiếp quản. Kết quả vẫn có `episode_id`, `evidence_ids`, kèm `handoff_status=not_stored_policy`, `handoff_revision=null` và `writer_status` hiện hành. Retry cùng khóa trả đúng kết quả đó |
+
+**Thay đổi contract** (áp dụng ở task đầu của SP2):
+- `PrepareTaskClientArgs`, `PrepareTaskDaemonArgs` tách theo `mode`:
+  - `discover`: bắt buộc `schema_version`, `mode`, selector workspace theo cùng quy tắc hiện có; tùy chọn `task_id`, `context_budget_tokens`; cấm `idempotency_key`, `description`, `resume_ref`, `seen_handoff_refs`.
+  - `work`: như hiện tại, thêm tùy chọn `resume_ref` (bắt buộc đi cùng `task_id`) và `seen_handoff_refs`.
+  - Hai nhánh được pin ở schema, normalizer, phân loại side effect, kiểm tra result và admission. `discover` có result riêng gồm `workspace_id`, `checkout_id`, `continuity`, `degraded_codes`.
+- `SubmitEpisodeClientArgs`, `SubmitEpisodeDaemonArgs`: thêm `handoff`, `base_revision`, `fence`, `takeover`; `base_revision` và `fence` bắt buộc khi có `handoff` hoặc `takeover`. `constraint_changes` và `closed_changes` nằm trong `handoff`.
+- `SubmitEpisodeResult`: thêm `handoff_revision`, `handoff_status` (`stored` hoặc `not_stored_policy`), `fence`, `writer_status`. Chỉ phát các trường này khi request có `handoff` hoặc `takeover`. Request chỉ xin tiếp quản là một nhánh có fixture riêng.
+- `ArtifactSendAttempt`: thêm `level` để kiểm receipt L1.
+- `GetArtifactOkResult` (với sổ bàn giao) và `PrepareTaskResult` (`mode=work`): thêm `handoff_live`.
+- `writer.lock` **không đổi định dạng**: `restore_epoch` nằm trong file metadata bên trong `store/` (mục 5.7).
+- Item trong `continuity` có `kind=handoff`, dùng `summary` cho L0. Thêm các `degraded_codes` `open_handoffs_present`, `continuity_truncated`, `observed_newer`.
+- **Nhận diện schema.** `GET /v2/identity` trả thêm `schema_digest`; shim so với digest catalog của mình trên socket đã pin trước khi gửi tool call. Shim cũng gửi `schema_digest` trong private envelope để daemon kiểm tra chiều ngược lại. Thiếu hoặc khác ở bất kỳ chiều nào đều trả `unsupported_version` và không chạy tool. Không có chế độ tương thích; nâng cấp bằng cách dừng daemon, cài bản mới, khởi động daemon, rồi khởi động lại các shim.
+- Đổi `x-implemented-in` và `x-side-effects` của `prepare_task`, `get_artifact`, cùng fixture request, response, error, mismatch và replay, phải sửa các file đang nằm trong seal, nên cần reviewer độc lập duyệt reseal.
+
+**Giới hạn được công bố:**
+- Chỉ giữ được những gì đã viết ra. Sổ chỉ mới tới lần agent cập nhật cuối; phần sau đó chỉ còn dữ liệu quan sát được.
+- Harness nhận là model khác nên vẫn có thể suy luận khác. Mục `tooling` giữ được ý định, không bảo đảm dùng đúng cùng một tool.
+- Brain không chặn được lệnh của harness. Việc tuân theo sổ và ràng buộc là do model tự giác; sổ chỉ bảo đảm thông tin được giữ và được trao đúng.
+- Khi chuyển harness giữa chừng, người dùng có thể bị hỏi lại một lần về một thay đổi ràng buộc đã trả lời.
+- Agent quên ghi thì sổ cũ; L0 báo độ cũ, không che giấu.
+- Hai tiến trình cùng principal dùng chung một `session_id` thì brain không phân biệt được.
+- Brain không phát hiện được về mặt ngữ nghĩa nội dung độc hại mà agent đã chép vào sổ, hay mâu thuẫn giữa các ràng buộc.
 
 ## 8. Bài học và thư viện kinh nghiệm
 
@@ -588,7 +792,7 @@ candidate → verified → pending_conflict_check → active
   - Đường dẫn thực (sau khi theo symlink, junction, reparse point) phải nằm trong thư mục của checkout.
   - Từ chối UNC/device path và alternate data stream trên Windows.
   - Kiểm tra lại danh tính file sau khi mở. Thuật toán cụ thể chốt trước SP5.
-- **Ghép context:** ngân sách mặc định 4.000 token, chỉnh được. Phân bổ theo chiều rộng trước; khi hết ngân sách thì hạ L1 → L0 → chỉ URI, không cắt đôi nội dung.
+- **Ghép context:** ngân sách mặc định 4.000 token, chỉnh được. Phân bổ theo chiều rộng trước; khi hết ngân sách thì hạ L1 → L0 → chỉ URI, không cắt đôi nội dung. L0 của sổ bàn giao được ghép trước và không bị cắt đôi; không đủ ngân sách thì bỏ nguyên sổ theo quy tắc ở mục 7.4.
 - **Không tuyên bố tiết kiệm token** khi chưa đo (mục 12).
 
 ## 11. Tự cải tiến và cổng duyệt
@@ -736,7 +940,8 @@ Tính theo task, harness, loại task và repo:
 - lỗi lặp lại sau khi đã có bài học;
 - tỷ lệ tool lỗi;
 - số lượt, token, thời gian mỗi phiên (`unavailable` nếu harness không cung cấp);
-- thời gian tới khi test xanh.
+- thời gian tới khi test xanh;
+- số lần cập nhật sổ bàn giao mỗi task, độ cũ của sổ lúc tiếp quản, số đề xuất đổi ràng buộc của người dùng.
 
 Mỗi số liệu kèm **độ phủ quan sát**: tầng capture, CaptureGap, mẫu số. Hai harness có mức capture khác nhau không được so như nhau. **Thiếu dữ liệu là `unknown`, không bao giờ được tính là "không có lỗi".**
 
@@ -744,7 +949,7 @@ Mỗi số liệu kèm **độ phủ quan sát**: tầng capture, CaptureGap, m�
 
 **Đã chốt:**
 - Gán nhóm trước khi biết kết quả. Retry với cùng `idempotency_key` giữ nguyên nhóm (mục 6.3).
-- **Không bao giờ giữ lại:** bài học gắn nhãn an toàn, bảo mật, mất dữ liệu, và quy ước/sở thích người dùng đã xác nhận.
+- **Không bao giờ giữ lại:** bài học gắn nhãn an toàn, bảo mật, mất dữ liệu, quy ước/sở thích người dùng đã xác nhận, và sổ bàn giao. Holdout chỉ áp dụng cho bài học. Lần gọi `prepare_task` với `mode=discover` không qua Jev, không có holdout và không thuộc mẫu số đo lường.
 - Mỗi Delivery lưu đủ dữ liệu để phân tích lại:
   - tập bài học đủ điều kiện;
   - xác suất được chọn và xác suất được gán nhóm;
@@ -852,7 +1057,7 @@ Mọi con số được ghi nhãn "nhân quả" (holdout đạt điều kiện) 
 
 **Đường vào.** Privacy filter chạy trước khi ghi bền vững ở **mọi** đường vào:
 - hook/transcript;
-- `submit_episode` (gồm evidence, diff, bài học đề xuất);
+- `submit_episode` (gồm evidence, diff, bài học đề xuất, sổ bàn giao);
 - `record_outcome`;
 - nhập artifact;
 - index context.
@@ -893,7 +1098,9 @@ Filter duyệt cả object và list lồng nhau. **Filter lỗi thì không lưu
 | Phân loại lời sửa | Tin nhắn người dùng đã lọc, kèm tối đa 2 lượt trước đã lọc |
 | Conflict Review | L0 và điều kiện áp dụng của hai bài học |
 
-- Không bao giờ gửi L2, evidence thô hay nội dung transcript ngoài các trường trên.
+- Không bao giờ gửi L2, evidence thô, sổ bàn giao hay nội dung transcript ngoài các trường trên.
+- Mọi trường do brain dẫn xuất từ sổ bàn giao là chỉ-tại-máy, kể cả ở repo cho phép egress. Brain không dựng `description` hay trường Jev nào từ sổ. `description` do agent tự viết đi theo lineage của task; nội dung agent tự chép từ sổ vào đó thuộc giới hạn đã công bố ở trên.
+- Ranh giới của egress là daemon. Dữ liệu daemon trả cho harness đã được cấp quyền sẽ do model của harness đó xử lý; việc này nằm ngoài kiểm soát của brain.
 - **Trước mỗi lời gọi** (kể cả retry và job nền), brain kiểm tra allowlist và kiểm tra `provider_egress` **hiện hành** của mọi nguồn trong lineage của từng mục. Brain không dựa vào nhãn đã sao chép lúc tạo.
 - Chia sẻ owner-wide (Q12) chỉ áp dụng cho nội dung bài học. Resolve ref tới nguồn vẫn kiểm tra quyền.
 
@@ -912,7 +1119,7 @@ Mỗi dự án con có plan riêng (superpowers:writing-plans) dựa trên spec 
 | # | Dự án con | Nội dung | Package sở hữu | Nguồn code |
 |---|---|---|---|---|
 | SP1 | Kernel | Xem danh sách bên dưới | `core`, `ports`, `storage`, `adapters.os`, `mcp`, `cli_api`, `review_web`, `cli`, `composition`, phần nền của `application` | **Trích xuất** từ repo cũ `f83271d` kèm test; phần còn lại viết mới |
-| SP2 | Capture và liên tục phiên | envelope v2, outbox, worker tín hiệu, task/session/episode, continuity; khảo sát + adapter cho Claude Code và Codex app, gồm **xác minh lớp 2** của hai harness này | `domain.capture`, `domain.continuity`, `adapters.harness.*` | Queue trích xuất; phần còn lại viết mới |
+| SP2 | Capture và liên tục phiên | envelope v2, outbox, worker tín hiệu, task/session/episode, continuity, sổ bàn giao và cập nhật contract v2 (mục 7.4); bản hẹp của `prepare_task` (`discover` và `work` chỉ có sổ bàn giao, không Jev, mục 6.2, 7.4) và `get_artifact` (chỉ sổ bàn giao); khảo sát + adapter cho Claude Code và Codex app, gồm **xác minh lớp 2** của hai harness này | `domain.capture`, `domain.continuity`, `adapters.harness.*` | Queue trích xuất; phần còn lại viết mới |
 | SP3 | Bài học | Vòng đời, xác minh, Conflict Review, thư viện kinh nghiệm | `domain.lessons` | Viết mới (TDD) |
 | SP4 | Catalog và bộ chọn | Nhập agency-agents và skill local; lọc → Jev → rules; tập chỉ-tại-máy; ngân sách; allowlist egress | `domain.catalog`, `domain.selection`, `adapters.jev` | Viết mới |
 | SP5 | Context L0/L1/L2 | Index, tree-sitter, ref live/immutable, ghép context | `domain.context` | Viết mới, tham khảo code cũ |
@@ -947,6 +1154,14 @@ Mọi phần đã giao cho SP1 ở trên đều phải nằm trong một đợt.
   - Cả hai được cài qua bootstrap ChangeProposal đã duyệt ở mức rủi ro cao. ApplyJournal ở `applied`.
   - Mỗi harness có NativeHostReceipt của host thật (mục 17.3). Trạng thái lớp 2 được ghi đúng như đã xác minh, kể cả khi là `unsupported`.
   - Phiên của harness này nhận được continuity của phiên trước từ harness kia **trên cùng checkout**. Một checkout khác của cùng remote không nhận nhầm.
+  - **Bài diễn tập bàn giao** trên host thật:
+    - **Dựng trước:** fixture task ghim trước `next_action` đúng, một phương án sai nhưng hấp dẫn đã bị loại, một ràng buộc của người dùng và một hành động bị cấm.
+    - **Kịch bản:** giết tiến trình Claude Code giữa chừng, không có sự kiện kết thúc phiên, rồi mở Codex app ngay trên cùng checkout.
+    - **Bằng chứng trước khi giết:** artifact `revision`, `handoff_revision`, digest và ACK của lần ghi cuối, source snapshot, trạng thái tiến trình, `CaptureGap` nếu có.
+    - **Bằng chứng phía nhận:** principal, `task_id`, Delivery, ServedReceipt, ReadAck nếu có, và chi phí thực của thao tác ghi sổ khi harness cung cấp được.
+    - **Đạt khi:** (1) Codex nêu đúng mục tiêu và bước đang làm; (2) giữ các quyết định và ràng buộc đang hiệu lực; (3) **lệnh và side effect thực tế** không thử lại phương án đã loại, không làm hành động bị cấm, và làm đúng `next_action`; (4) mọi phần đã ACK vẫn đọc được, và báo riêng phần khai và phần quan sát mới tới đâu.
+    - **Ca phủ định:** một checkout khác của cùng repo bị từ chối qua cả `mode=discover` lẫn đọc trực tiếp theo ref.
+    - Kết quả chỉ chứng minh cho lần diễn tập đó. Chiều ngược lại chạy nếu capture của Codex cho phép; không chạy thì ghi `not_run`.
 - **M2 (+ SP3, SP4):**
   - Một bài học được `verified` bằng proof `tool_observed` từ harness A.
   - Bài học qua Conflict Review, được **Jev** chọn (không phải rules) và đưa cho harness B.
@@ -1036,7 +1251,7 @@ Mọi phần đã giao cho SP1 ở trên đều phải nằm trong một đợt.
 | Trước | Cần chốt |
 |---|---|
 | Plan SP1 | Bảng điểm crash (tiến trình chết / mất điện) cho từng OS, syscall của `durable_publish` theo OS, bố cục data root và policy store, thứ tự ghi file và thuật toán ApplyJournal, thư viện WebAuthn, UI trang review, manifest trích xuất, tên package, O7 |
-| SP2 | Contract hook có giới hạn và trường hợp chưa bền vững, xử lý sự kiện muộn, ánh xạ task/session/episode của từng harness, checkpoint việc chạy dài, độ phủ capture theo harness, cách xác minh lớp 2 của Claude Code và Codex |
+| SP2 | Contract hook có giới hạn và trường hợp chưa bền vững, xử lý sự kiện muộn, ánh xạ task/session/episode của từng harness, checkpoint việc chạy dài, độ phủ capture theo harness, cách xác minh lớp 2 của Claude Code và Codex, schema chi tiết của `handoff`, đo lại nhịp worker (20 event, 60 giây), ngưỡng `active` (5 phút), mốc 14 ngày và các giới hạn của sổ (200 byte, 512 byte, 600 byte, 2 KB, 4 KB, 8 KB, 16 KB, 32 KB, 256 KB), đo chi phí quota mỗi lần ghi sổ, cách hook nhắc cập nhật theo từng harness |
 | SP3 | Bảng chuyển trạng thái đầy đủ (actor, evidence), taxonomy proof cho từng loại bài học, chi tiết proof độc lập, so điều kiện áp dụng, gộp/merge giữ lineage, lan truyền lineage khi gộp |
 | SP4 | Review artifact kèm resource closure, payload Jev chính xác theo allowlist, cách gộp tập chỉ-tại-máy với kết quả Jev, cache/policy, accounting lời gọi đang chạy, canary đo độ trễ |
 | SP5 | Thuật toán ranh giới filesystem trên từng OS, phát hiện file đổi trong lúc đọc, parser, chi tiết index |
@@ -1090,6 +1305,65 @@ Plan SP1 phải biến mỗi tình huống dưới đây thành test, hoặc ghi
 34. Crash giữa commit policy store và commit kho: khởi động lại hoàn tất đúng intent một lần, không tạo mutation trùng.
 35. Event và Evidence có payload nhỏ vẫn hết hạn đúng hạn; ledger không chứa nội dung của chúng.
 36. Delivery chỉ có ServedReceipt được ghi `exposure_evidence=served_only`, không bao giờ là `read_ack`.
+
+**Từ rev 5 (sổ bàn giao, thuộc SP2):**
+
+37. Cập nhật một phần giữ nguyên các mục không gửi; mục chỉ-thêm không xóa được; `supersedes` thiếu lý do hoặc trỏ sai trả `invalid_input`.
+38. `base_revision` cũ trả `revision_conflict` và không tạo revision; gọi lại cùng `idempotency_key` nhận đúng kết quả cũ.
+39. Worker làm mới phần quan sát được không đổi `handoff_revision` và không gây `revision_conflict` cho agent.
+40. Giết tiến trình harness, không có sự kiện kết thúc phiên: principal khác trên cùng checkout nhận revision đã commit gần nhất; trạng thái không phải `ended`.
+41. Secret mồi trong sổ không xuất hiện trên đĩa, log hay trace; checkout khác không nhận được sổ.
+42. Sổ không xuất hiện trong payload Jev và không giúp bài học đạt `verified`.
+43. `prepare_task` của SP2 liệt kê các phần chưa có trong `degraded_codes`, không trả mảng rỗng mà thiếu mã.
+44. Sổ có `task_state` khác `open`, hoặc quá 14 ngày không cập nhật, không xuất hiện trong danh sách của `mode=discover` nhưng vẫn tìm được khi truyền đúng `task_id`.
+
+**Từ review rev 5 (thuộc SP2):**
+
+45. A ghi, B tiếp quản, A đọc revision mới rồi ghi đúng `base_revision` mà không tiếp quản: bị từ chối.
+46. Principal khác khai `session_id` của B: `identity_mismatch`. `session_id` không xuất hiện trong L0, L1, L2, log hay ledger.
+47. Hai bên cùng tiếp quản từ một `writer_generation`: chỉ một bên thắng. Tiếp quản khi phiên giữ sổ còn `active` mà thiếu `acknowledge_active` bị từ chối.
+48. Principal cùng repo nhưng khác checkout bị từ chối ở `discover`, đọc theo ref, resume, ghi và replay, kể cả khi biết ID và revision.
+49. Đề xuất đổi ràng buộc, kèm câu trả lời đồng ý, câu phủ định chứa đoạn trùng, câu đồng ý về việc khác hoặc không có câu trả lời: ràng buộc cũ vẫn là hiện hành ở L1 và sau replay, L0 hiện đúng trạng thái và số đề xuất đang chờ, và đề xuất ở nguyên `proposed` cho tới khi người giữ sổ đóng nó.
+50. `supersedes` trỏ sai loại hoặc trỏ mục đã bị thay trả `invalid_input`. Mở lại phương án đã loại theo `reopens`. Replay dựng đúng tập đang hiệu lực.
+51. Event nguồn bị revoke hoặc quarantine sau khi đã vào sổ: L1, L2, retry, revision cũ và `description` do brain dựng đều không có bytes bị cấm; ref và trạng thái `redacted` đúng hợp đồng; digest đã phục vụ vẫn còn trong ServedReceipt.
+52. Event nguồn hết hạn: mục trả `expired`. Worker làm mới không gia hạn, restore không phục sinh.
+53. Worker chụp ref cũ, agent commit, worker xong sau: patch của agent vẫn còn. Sổ chỉ có worker được agent đầu tiên cập nhật bằng `base_revision=0`.
+54. Phiên chết khi mới có dưới 20 event: event đã ACK được lên lịch làm mới và `observed_through` phản ánh đúng. Event đến muộn không làm lùi watermark của `producer_stream` đó; event đến sau `ended` không đổi trạng thái, chỉ `session_resumed` mới đổi.
+55. `mode=discover` không tạo task, Delivery, Job, không gọi Jev và không vào mẫu số. Delivery resume gắn đúng task cũ và ref đã đọc.
+56. Crash trước commit, sau commit trước ACK, retry sau tiếp quản và retry sau revoke: cùng khóa nhận đúng kết quả đã commit trong phạm vi còn quyền, không tạo revision mới, không trả lại quyền ghi.
+57. Mục thứ 31 đang hiệu lực vẫn có trong L1. Nội dung đa byte tính đúng theo UTF-8. Một mục vượt 2 KB, một patch vượt 16 KB, phần bắt buộc vượt 32 KB hoặc ràng buộc vượt 16 KB trả `invalid_input` và giữ nguyên sổ. `task_goal` dài được cắt đúng ranh giới ký tự ở L0 và L1.
+58. `context_budget_tokens` thấp hơn L0: không cắt đôi, bỏ nguyên sổ, trả `continuity_truncated` và vẫn tìm được bằng `task_id`.
+59. Đủ bốn tổ hợp của `automatic_capture` và `manual_submission` theo bảng ở mục 7.4, gồm đường capture-only. Đổi cờ khi job worker đang chờ: job theo cờ hiện hành lúc bắt đầu và lúc commit. Dữ liệu cũ phục vụ đến hết hạn và nhánh `not_stored_policy` trả đúng kết quả, kể cả khi retry.
+
+**Từ review rev 6 (thuộc SP2):**
+
+60. Chuỗi A → B → A bằng tiếp quản: patch đến muộn của A mang fence cũ bị từ chối dù đúng người giữ và đúng `base_revision`. Tiếp quản thiếu `base_revision` hoặc `fence` trả `invalid_input`.
+61. Restore kho về snapshot cũ: người giữ cũ mất hiệu lực và patch cũ bị từ chối; phiên phải tiếp quản lại. Sau khi đã tiếp quản lại và `writer_generation`, `handoff_revision` trùng với request từ trước restore, request cũ đó vẫn bị từ chối.
+62. `schema_digest` thiếu hoặc khác ở từng chiều trên socket đã pin: trả `unsupported_version` và không chạy tool.
+63. Resume: receipt sai principal hoặc task trả `not_found`; không có receipt ghi `exposure_evidence=unknown`; ReadAck khớp digest thực tế của bản đã render; đổi người giữ hoặc `handoff_revision` giữa lúc đọc và resume trả `revision_conflict`; chỉ phần quan sát mới hơn thì đi tiếp với `observed_newer`.
+64. Sổ đầy: patch không làm tăng dung lượng vẫn được nhận; đề xuất đổi ràng buộc vào được vùng riêng; đề xuất bị từ chối rời vùng đang chờ; ràng buộc cũ vẫn còn.
+65. Câu trả lời gắn với đề xuất bị quarantine hoặc hết hạn: L0 không có trích đoạn; L1, report, replay và restore trả `redacted` hoặc `expired`; trạng thái đề xuất không đổi. `task_goal` hết hạn thì tìm đúng theo `task_id` trả RedactedItem.
+66. Agent thêm ràng buộc mâu thuẫn với mục đang có: mục cũ vẫn đang hiệu lực và không bị thay.
+
+**Từ review rev 7 (thuộc SP2):**
+
+67. A commit tiếp quản nhưng mất ACK, B tiếp quản, A retry cùng khóa: nhận kết quả đã commit với `writer_status=not_holder`, và patch tiếp theo của A bị từ chối.
+68. Request chỉ xin tiếp quản: thành công trả fence mới và `writer_status=holder`, tăng `revision`, không tăng `handoff_revision`; retry sau khi mất ACK nhận đúng kết quả; `manual_submission` tắt trả `not_stored_policy`, giữ nguyên người giữ, fence và revision.
+69. Receipt L0 của cùng artifact và revision trả `not_found`. Receipt cũ của `revision` 12 kèm counter mới của `revision` 13 trả `revision_conflict`. Không có receipt thì vẫn kiểm counter theo header của `revision` đó và ghi `unknown`.
+70. Crash trước khi hoán đổi kho: kho cũ vẫn nguyên và người giữ cũ vẫn hợp lệ. Crash giữa hai bước đổi tên được phục hồi với `restore_epoch` đi cùng đúng bản kho. `writer.lock` giữ nguyên định dạng hiện có.
+71. `merges` trên mục loại còn hiệu lực: mục nguồn rời tập đang hiệu lực và còn ở L2; trỏ mục không còn hiệu lực trả `invalid_input`. Miễn trừ giới hạn tổng không miễn giới hạn một mục, một patch, vùng đề xuất đang chờ hay quyền ghi.
+72. `depends_on_change` trỏ đề xuất không tồn tại trả `invalid_input`; phiên sau thấy đúng phụ thuộc ở L1.
+
+**Từ review rev 8 (thuộc SP2):**
+
+73. Sau restore: client mới đi qua tìm sổ, đọc L1, lấy `handoff_live`, resume và tiếp quản thành công; request từ trước restore vẫn bị từ chối; task mới tạo được sổ đầu tiên với fence `(restore_epoch hiện hành, 0)`.
+74. A → B → A: replay ACK tiếp quản cũ có fence `(5,9)` khi fence sống là `(5,11)` trả `not_holder`, dù người giữ hiện hành vẫn là A.
+75. Hai lần restore liên tiếp cho hai `restore_epoch` khác nhau. File metadata hỏng trả `INTEGRITY_FAILURE` trước khi phục vụ.
+
+**Từ review rev 9 (thuộc SP2):**
+
+76. Restore, rồi migrate trước bất kỳ lần tiếp quản nào: `restore_epoch` giữ nguyên sau migrate, và thử lại patch mang epoch cũ vẫn bị từ chối.
+77. Kho SP2 mất file metadata: từ chối phục vụ bằng `INTEGRITY_FAILURE`, cả khi mở kho và khi phục hồi swap. Kho schema trước SP2 đọc thiếu thành 0, và nâng lên SP2 ghi giá trị 0.
 
 ## 21. Ánh xạ review → spec
 
@@ -1148,3 +1422,65 @@ Plan SP1 phải biến mỗi tình huống dưới đây thành test, hoặc ghi
 | Checklist 3: phạm vi bảng crash | Mục 5.4 |
 | Checklist 4: payload có thời hạn nằm ngoài ledger | Mục 5.3; tình huống 35 |
 | Checklist 6: chia SP1 thành đợt | Mục 15 |
+
+**Rev 5** (thiết kế do chủ dự án duyệt ngày 2026-11-09, không đến từ review):
+
+| Thay đổi | Ở đâu |
+|---|---|
+| Mục tiêu bàn giao không đổi hướng | Mục 1, Q21 |
+| Sổ bàn giao viết liên tục trong phiên | Q14, mục 5.3, 5.6, 7.3, 7.4 |
+| Đơn vị của `utf8-byte-v1` | Mục 6.2 |
+| Tool có domain một phần báo bằng `degraded_codes` | Mục 6.2 |
+| Sổ bàn giao trong context, đo lường, holdout, privacy | Mục 10, 12.1, 12.2, 14.2 |
+| SP2 làm bản hẹp của `prepare_task`, `get_artifact`; bài diễn tập ở M1 | Mục 15, 19 |
+| Tình huống nghiệm thu 37–44 | Mục 20 |
+
+**Review rev 5** (`2026-11-09-system-design-rev5-review.md`):
+
+| Review | Đã xử lý ở |
+|---|---|
+| SB2-R5-01 quyền đọc cùng checkout, tiếp quản | Mục 7.4 (Binding, Người giữ sổ và tiếp quản); tình huống 45–48 |
+| SB2-R5-02 ràng buộc còn hiệu lực sau `supersedes`, `goal` | Q21, mục 7.4 (Đổi quyết định, Đổi ràng buộc của người dùng); tình huống 49, 50 |
+| SB2-R5-03 trích đoạn giữ quyền và thời hạn của nguồn | Mục 5.3, 5.6, 7.4 (Trích đoạn), 14.2; tình huống 51, 52, 59 |
+| SB2-R5-04 hai revision, tìm head đã cấp quyền, wire | Mục 7.4 (Header, Đường đọc, Thay đổi contract) |
+| SB2-R5-05 quy tắc merge, sổ chỉ có worker | Mục 7.4 (Revision và merge, Đường ghi của worker); tình huống 53, 54 |
+| SB2-R5-06 tách discover và resume, retry | Mục 6.1, 7.4 (Đường đọc, Retry), 12.2; tình huống 55, 56 |
+| SB2-R5-07 giới hạn làm mất nội dung bắt buộc | Mục 7.4 (Cấp đọc và giới hạn); tình huống 57 |
+| SB2-R5-08 budget thấp, token nội bộ và tính phí | Mục 6.2, 7.4, 10; tình huống 58 |
+| SB2-R5-09 oracle của diễn tập M1 | Mục 15 (M1) |
+
+**Review rev 6** (`2026-11-09-system-design-rev6-review.md`):
+
+| Review | Đã xử lý ở |
+|---|---|
+| SB2-R5-02 khớp câu chữ không chứng minh đồng ý | Q21, mục 7.4 (Đổi ràng buộc của người dùng): bỏ cơ chế xác nhận; tình huống 49, 66 |
+| SB2-R5-03 câu xác nhận theo ranh giới của nguồn | Mục 7.4 (Trích đoạn, Đổi ràng buộc); tình huống 65 |
+| SB2-R5-01 fence qua nhiều lần tiếp quản, restore | Mục 5.3, 5.7, 7.4 (Người giữ sổ và tiếp quản); tình huống 60, 61 |
+| SB2-R5-04 trao đổi `schema_digest`, nhánh theo mode | Mục 7.4 (Thay đổi contract); tình huống 62 |
+| SB2-R5-05 revision, watermark, policy của worker | Mục 7.4 (Revision và merge, Đường ghi của worker, Trạng thái phiên); tình huống 54, 59 |
+| SB2-R5-06 `resume_ref` đã được phục vụ | Mục 7.4 (Đường đọc); tình huống 63 |
+| SB2-R5-07 sổ hết chỗ, `task_goal` | Mục 7.4 (Cấp đọc và giới hạn, Đổi ràng buộc); tình huống 57, 64 |
+
+**Review rev 7** (`2026-11-09-system-design-rev7-review.md`):
+
+| Review | Đã xử lý ở |
+|---|---|
+| SB2-R5-01 fence qua restore, ACK lịch sử | Mục 5.7, 7.4 (Người giữ sổ và tiếp quản, Retry, Thay đổi contract); tình huống 61, 67, 70 |
+| SB2-R5-04 ACK của request chỉ xin tiếp quản | Mục 7.4 (Revision và merge, Lỗi, Thay đổi contract); tình huống 68 |
+| SB2-R5-06 receipt L1 và counter của đúng revision | Mục 7.4 (Revision và merge, Đường đọc, Thay đổi contract); tình huống 69 |
+| Chi tiết `merges`, miễn trừ giới hạn | Mục 7.4 (Cấp đọc và giới hạn, Đổi quyết định); tình huống 71 |
+| Chi tiết phụ thuộc ngoại lệ theo phiên, ca 49 | Mục 7.4 (Đổi ràng buộc của người dùng); tình huống 49, 72 |
+
+**Review rev 8** (`2026-11-09-system-design-rev8-review.md`):
+
+| Review | Đã xử lý ở |
+|---|---|
+| SB2-R8-01 slot mới bị writer cũ ghi đè | Mục 5.7, 7.4 (Thay đổi contract): không đổi định dạng `writer.lock`; tình huống 70, 75 |
+| SB2-R5-01 fence sống, `writer_status` của ACK cũ | Mục 7.4 (Header, Người giữ sổ và tiếp quản, Đường đọc, Retry); tình huống 73, 74 |
+| Nhãn phiên bản | Đầu tài liệu |
+
+**Review rev 9** (`2026-11-09-system-design-rev9-review.md`):
+
+| Review | Đã xử lý ở |
+|---|---|
+| SB2-R9-01 migrate làm mất `restore_epoch` | Mục 5.7, 5.8; tình huống 75–77 |
