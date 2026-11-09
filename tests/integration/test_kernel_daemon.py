@@ -5590,3 +5590,510 @@ def test_notifier_thread_start_failure_during_overrun_preserves_shutdown_report_
 
     _run_case("r04-notifier-fail-first", fail_all=False)
     _run_case("r04-notifier-fail-all", fail_all=True)
+
+
+def test_stop_callers_return_at_cutoff_without_waiting_on_burst_notifier_bootstrap(
+    trusted_tmp: Path,
+    _daemon_template: _DaemonTemplate,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """I2-T6A-R05: ``stop()`` cutoff never waits on ``superbrain-cancel-notify-*`` ``Thread.start`` bootstrap."""
+    base_now = _daemon_template.base_time + dt.timedelta(minutes=5)
+    tok_a = _daemon_template.cred_a.token
+    orig_thread_start = threading.Thread.start
+
+    root, _, cfg = _instantiate_case(trusted_tmp, "r05-burst-bootstrap-cutoff", _daemon_template)
+    clock = FakeClock(base_now)
+    adapters = os_adapters(clock=clock)
+
+    rt_seed = reopen_kernel_job_runtime(root, _daemon_template.store_id, adapters)
+    try:
+        svc_seed, st_seed = kernel_job_service(rt_seed, clock)
+        seeded_job = enqueue_job(svc_seed, st_seed, owner_id="dan", payload=b"r05-queued-job")
+    finally:
+        rt_seed.close()
+
+    owner_entered = threading.Event()
+    release_owner = threading.Event()
+    first_cb_entered = threading.Event()
+    burst_bootstrap_entered = threading.Event()
+    release_burst_bootstrap = threading.Event()
+    bootstrap_released_marker = threading.Event()
+
+    def _hold_owner() -> bool:
+        owner_entered.set()
+        return release_owner.wait(BOUND_WAIT_S)
+
+    first_cb_envelopes: list[CallResult] = []
+    first_cb_done = threading.Event()
+    second_cb_replies: list[OwnerReply] = []
+    second_cb_done = threading.Event()
+    internal_cb_outcomes: list[BaseException | str] = []
+    internal_cb_done = threading.Event()
+
+    def _on_first_done(done_f: Future[CallResult]) -> None:
+        try:
+            first_cb_envelopes.append(done_f.result())
+            first_cb_entered.set()
+            release_burst_bootstrap.wait(timeout=5.0)
+        finally:
+            first_cb_done.set()
+
+    def _on_second_done(done_f: Future[OwnerReply]) -> None:
+        second_cb_replies.append(done_f.result())
+        second_cb_done.set()
+
+    def _on_internal_done(done_f: Future[str]) -> None:
+        exc = done_f.exception()
+        internal_cb_outcomes.append(exc if exc is not None else done_f.result())
+        internal_cb_done.set()
+
+    burst_lock = threading.Lock()
+    burst_thread_names: list[str] = []
+    burst_spawner_tids: list[int] = []
+
+    def _gated_thread_start(thread_self: threading.Thread) -> None:
+        t_name = thread_self.name
+        if isinstance(t_name, str) and t_name.startswith("superbrain-cancel-notify-"):
+            with burst_lock:
+                burst_thread_names.append(t_name)
+                burst_spawner_tids.append(threading.get_ident())
+            burst_bootstrap_entered.set()
+            release_burst_bootstrap.wait(timeout=5.0)
+        orig_thread_start(thread_self)
+
+    loop = create_daemon_owner_loop(os_=adapters, clock=clock)
+    first_stop_done = threading.Event()
+    second_stop_done = threading.Event()
+    stop_caller_tids: list[int] = []
+    stop_caller_lock = threading.Lock()
+    first_rep_box: list[ShutdownReport] = []
+    second_rep_box: list[ShutdownReport] = []
+    first_err_box: list[BaseException] = []
+    second_err_box: list[BaseException] = []
+    first_returned_before_release = False
+    second_returned_before_release = False
+    post_rep: ShutdownReport | None = None
+    final_rep: ShutdownReport | None = None
+
+    def _stop_caller_1() -> None:
+        with stop_caller_lock:
+            stop_caller_tids.append(threading.get_ident())
+        try:
+            first_rep_box.append(loop.stop(grace_s=0.08))
+        except BaseException as exc:  # noqa: BLE001
+            first_err_box.append(exc)
+        finally:
+            first_stop_done.set()
+
+    def _stop_caller_2() -> None:
+        with stop_caller_lock:
+            stop_caller_tids.append(threading.get_ident())
+        try:
+            second_rep_box.append(loop.stop(grace_s=1.5))
+        except BaseException as exc:  # noqa: BLE001
+            second_err_box.append(exc)
+        finally:
+            second_stop_done.set()
+
+    t_stop_1 = threading.Thread(target=_stop_caller_1, name="test-r05-stop-1", daemon=True)
+    t_stop_2 = threading.Thread(target=_stop_caller_2, name="test-r05-stop-2", daemon=True)
+    try:
+        loop.start(cfg)
+        hold_fut = loop.run_owner_action(_hold_owner)
+        assert owner_entered.wait(timeout=1.0), "owner did not enter hold barrier"
+
+        first_fut = loop.submit(
+            ToolCommand("get_job", {"schema_version": "2.0", "job_id": seeded_job.job_id}, token=tok_a),
+            adapters.monotonic.monotonic_ns() + 10 * TOTAL_REQUEST_BUDGET_NS,
+        )
+        first_fut.add_done_callback(_on_first_done)
+
+        second_fut = loop.submit_reply(
+            ToolCommand("get_job", {"schema_version": "2.0", "job_id": seeded_job.job_id}, token=tok_a),
+            adapters.monotonic.monotonic_ns() + 10 * TOTAL_REQUEST_BUDGET_NS,
+        )
+        second_fut.add_done_callback(_on_second_done)
+
+        pending_internal_fut = loop.run_owner_action(lambda: "never-runs")
+        pending_internal_fut.add_done_callback(_on_internal_done)
+
+        monkeypatch.setattr(threading.Thread, "start", _gated_thread_start)
+        try:
+            t_stop_1.start()
+            _wait_until(lambda: loop.ready is None, desc="R05 caller 1 to lock shared cutoff")
+            t_stop_2.start()
+            try:
+                cutoff_wait_deadline = time.monotonic() + 0.45
+                if first_stop_done.wait(timeout=max(0.01, cutoff_wait_deadline - time.monotonic())):
+                    first_returned_before_release = (
+                        not bootstrap_released_marker.is_set() and not release_burst_bootstrap.is_set()
+                    )
+                if second_stop_done.wait(timeout=max(0.01, cutoff_wait_deadline - time.monotonic())):
+                    second_returned_before_release = (
+                        not bootstrap_released_marker.is_set() and not release_burst_bootstrap.is_set()
+                    )
+            finally:
+                bootstrap_released_marker.set()
+                release_burst_bootstrap.set()
+
+            t_stop_1.join(timeout=BOUND_WAIT_S)
+            t_stop_2.join(timeout=BOUND_WAIT_S)
+            release_owner.set()
+            _ = hold_fut.result(timeout=1.0)
+            assert first_cb_done.wait(timeout=1.5)
+            assert second_cb_done.wait(timeout=1.5)
+            assert internal_cb_done.wait(timeout=1.5)
+            post_rep = loop.stop(grace_s=0.05)
+            final_rep = loop.wait_closed(timeout=5.0)
+        finally:
+            monkeypatch.setattr(threading.Thread, "start", orig_thread_start)
+    finally:
+        monkeypatch.setattr(threading.Thread, "start", orig_thread_start)
+        bootstrap_released_marker.set()
+        release_burst_bootstrap.set()
+        release_owner.set()
+        t_stop_1.join(timeout=BOUND_WAIT_S)
+        t_stop_2.join(timeout=BOUND_WAIT_S)
+        with contextlib.suppress(BrainError):
+            loop.stop(grace_s=0.05)
+        _ = loop.wait_closed(timeout=5.0)
+
+    assert first_err_box == []
+    assert second_err_box == []
+    assert first_returned_before_release is True
+    assert second_returned_before_release is True
+    assert set(burst_spawner_tids).isdisjoint(stop_caller_tids)
+    assert len(first_rep_box) == 1
+    assert (first_rep_box[0].state, first_rep_box[0].error_code, first_rep_box[0].cancelled_requests) == (
+        ShutdownState.OVERRUN,
+        ErrorCode.DEADLINE_EXCEEDED,
+        2,
+    )
+    assert len(second_rep_box) == 1
+    assert (second_rep_box[0].state, second_rep_box[0].error_code, second_rep_box[0].cancelled_requests) == (
+        ShutdownState.OVERRUN,
+        ErrorCode.DEADLINE_EXCEEDED,
+        2,
+    )
+    assert len(first_cb_envelopes) == 1
+    assert first_cb_envelopes[0] == {
+        "ok": False,
+        "error": {"code": ErrorCode.DAEMON_UNAVAILABLE.value, "message": "daemon unavailable"},
+    }
+    assert first_fut.result(timeout=0.1) == first_cb_envelopes[0]
+    assert len(second_cb_replies) == 1
+    assert second_cb_replies[0].envelope["ok"] is False
+    assert (
+        cast(dict[str, JsonValue], second_cb_replies[0].envelope["error"])["code"]
+        == ErrorCode.DAEMON_UNAVAILABLE.value
+    )
+    assert second_fut.result(timeout=0.1) == second_cb_replies[0]
+    assert len(internal_cb_outcomes) == 1
+    assert isinstance(internal_cb_outcomes[0], BrainError)
+    assert internal_cb_outcomes[0].code is ErrorCode.DAEMON_UNAVAILABLE
+    _expect_brain_error(ErrorCode.DAEMON_UNAVAILABLE, lambda: pending_internal_fut.result(timeout=0.1))
+    assert post_rep is not None
+    assert (post_rep.state, post_rep.error_code, post_rep.cancelled_requests) == (
+        ShutdownState.OVERRUN,
+        ErrorCode.DEADLINE_EXCEEDED,
+        2,
+    )
+    assert final_rep is not None and final_rep.endpoint_removed is True
+    assert final_rep.cancelled_requests == 2
+    with acquire_writer(DataRoot.at(root), adapters):
+        pass
+
+
+def test_burst_start_failure_with_blocking_standby_callback_still_settles_sibling_futures_before_callback_release(
+    trusted_tmp: Path,
+    _daemon_template: _DaemonTemplate,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """I2-T6A-R06: Burst ``Thread.start`` failure + blocked standby callback never strands sibling settlements."""
+    base_now = _daemon_template.base_time + dt.timedelta(minutes=5)
+    tok_a = _daemon_template.cred_a.token
+    orig_thread_start = threading.Thread.start
+
+    root, _, cfg = _instantiate_case(trusted_tmp, "r06-standby-cb-siblings", _daemon_template)
+    clock = FakeClock(base_now)
+    adapters = os_adapters(clock=clock)
+
+    rt_seed = reopen_kernel_job_runtime(root, _daemon_template.store_id, adapters)
+    try:
+        svc_seed, st_seed = kernel_job_service(rt_seed, clock)
+        seeded_job = enqueue_job(svc_seed, st_seed, owner_id="dan", payload=b"r06-queued-job")
+    finally:
+        rt_seed.close()
+
+    futures_logger = logging.getLogger("concurrent.futures")
+    futures_logger_errors: list[str] = []
+
+    class _FuturesErrorCollector(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            if record.levelno >= logging.ERROR:
+                futures_logger_errors.append(self.format(record))
+
+    log_handler = _FuturesErrorCollector(level=logging.ERROR)
+    futures_logger.addHandler(log_handler)
+
+    owner_entered = threading.Event()
+    release_owner = threading.Event()
+    first_cb_entered = threading.Event()
+    release_first_cb = threading.Event()
+    cb_released_marker = threading.Event()
+    first_cb_exited = threading.Event()
+
+    def _hold_owner() -> bool:
+        owner_entered.set()
+        return release_owner.wait(BOUND_WAIT_S)
+
+    cb_lock = threading.Lock()
+    first_cb_count = 0
+    first_cb_threads: list[str] = []
+    first_cb_envelopes: list[CallResult] = []
+    sibling_submit_cb_count = 0
+    sibling_submit_cb_done = threading.Event()
+    sibling_reply_cb_count = 0
+    sibling_reply_cb_done = threading.Event()
+    sibling_internal_cb_count = 0
+    sibling_internal_cb_done = threading.Event()
+
+    def _blocking_first_cb(done_f: Future[CallResult]) -> None:
+        nonlocal first_cb_count
+        try:
+            env = done_f.result()
+            with cb_lock:
+                first_cb_count += 1
+                first_cb_threads.append(threading.current_thread().name)
+                first_cb_envelopes.append(env)
+            first_cb_entered.set()
+            release_first_cb.wait(timeout=5.0)
+        finally:
+            first_cb_exited.set()
+
+    def _on_sibling_submit_done(_done_f: Future[CallResult]) -> None:
+        nonlocal sibling_submit_cb_count
+        with cb_lock:
+            sibling_submit_cb_count += 1
+        sibling_submit_cb_done.set()
+
+    def _on_sibling_reply_done(_done_f: Future[OwnerReply]) -> None:
+        nonlocal sibling_reply_cb_count
+        with cb_lock:
+            sibling_reply_cb_count += 1
+        sibling_reply_cb_done.set()
+
+    def _on_sibling_internal_done(_done_f: Future[str]) -> None:
+        nonlocal sibling_internal_cb_count
+        with cb_lock:
+            sibling_internal_cb_count += 1
+        sibling_internal_cb_done.set()
+
+    failed_burst_names: list[str] = []
+    burst_lock = threading.Lock()
+
+    def _failing_burst_start(thread_self: threading.Thread) -> None:
+        t_name = thread_self.name
+        if isinstance(t_name, str) and t_name.startswith("superbrain-cancel-notify-"):
+            with burst_lock:
+                failed_burst_names.append(t_name)
+            raise RuntimeError("can't start new thread")
+        orig_thread_start(thread_self)
+
+    loop = create_daemon_owner_loop(os_=adapters, clock=clock)
+    first_stop_done = threading.Event()
+    second_stop_done = threading.Event()
+    first_rep_box: list[ShutdownReport] = []
+    second_rep_box: list[ShutdownReport] = []
+    first_err_box: list[BaseException] = []
+    second_err_box: list[BaseException] = []
+    first_stop_before_cb_release = False
+    second_stop_before_cb_release = False
+    sibling_submit_settled_before_release = False
+    sibling_submit_env_before_release: CallResult | None = None
+    sibling_reply_settled_before_release = False
+    sibling_reply_before_release: OwnerReply | None = None
+    sibling_internal_settled_before_release = False
+    sibling_internal_exc_before_release: BaseException | None = None
+    post_rep: ShutdownReport | None = None
+    final_rep: ShutdownReport | None = None
+
+    def _stop_1() -> None:
+        try:
+            first_rep_box.append(loop.stop(grace_s=0.08))
+        except BaseException as exc:  # noqa: BLE001
+            first_err_box.append(exc)
+        finally:
+            first_stop_done.set()
+
+    def _stop_2() -> None:
+        try:
+            second_rep_box.append(loop.stop(grace_s=1.5))
+        except BaseException as exc:  # noqa: BLE001
+            second_err_box.append(exc)
+        finally:
+            second_stop_done.set()
+
+    t_stop_1 = threading.Thread(target=_stop_1, name="test-r06-stop-1", daemon=True)
+    t_stop_2 = threading.Thread(target=_stop_2, name="test-r06-stop-2", daemon=True)
+    try:
+        loop.start(cfg)
+        hold_fut = loop.run_owner_action(_hold_owner)
+        assert owner_entered.wait(timeout=1.0), "owner did not enter hold barrier"
+
+        first_fut = loop.submit(
+            ToolCommand("get_job", {"schema_version": "2.0", "job_id": seeded_job.job_id}, token=tok_a),
+            adapters.monotonic.monotonic_ns() + 10 * TOTAL_REQUEST_BUDGET_NS,
+        )
+        first_fut.add_done_callback(_blocking_first_cb)
+
+        sibling_submit_fut = loop.submit(
+            ToolCommand("get_job", {"schema_version": "2.0", "job_id": seeded_job.job_id}, token=tok_a),
+            adapters.monotonic.monotonic_ns() + 10 * TOTAL_REQUEST_BUDGET_NS,
+        )
+        sibling_submit_fut.add_done_callback(_on_sibling_submit_done)
+
+        sibling_reply_fut = loop.submit_reply(
+            ToolCommand("get_job", {"schema_version": "2.0", "job_id": seeded_job.job_id}, token=tok_a),
+            adapters.monotonic.monotonic_ns() + 10 * TOTAL_REQUEST_BUDGET_NS,
+        )
+        sibling_reply_fut.add_done_callback(_on_sibling_reply_done)
+
+        sibling_internal_fut = loop.run_owner_action(lambda: "never-runs")
+        sibling_internal_fut.add_done_callback(_on_sibling_internal_done)
+
+        monkeypatch.setattr(threading.Thread, "start", _failing_burst_start)
+        try:
+            t_stop_1.start()
+            _wait_until(lambda: loop.ready is None, desc="R06 caller 1 to lock shared cutoff")
+            t_stop_2.start()
+            try:
+                stop_cutoff_deadline = time.monotonic() + 0.45
+                if first_stop_done.wait(timeout=max(0.01, stop_cutoff_deadline - time.monotonic())):
+                    first_stop_before_cb_release = (
+                        not cb_released_marker.is_set() and not release_first_cb.is_set()
+                    )
+                if second_stop_done.wait(timeout=max(0.01, stop_cutoff_deadline - time.monotonic())):
+                    second_stop_before_cb_release = (
+                        not cb_released_marker.is_set() and not release_first_cb.is_set()
+                    )
+
+                assert first_cb_entered.wait(timeout=1.5), "first cancelled Future callback did not fire"
+
+                sibling_deadline = time.monotonic() + 0.35
+                try:
+                    sibling_submit_env_before_release = sibling_submit_fut.result(
+                        timeout=max(0.01, sibling_deadline - time.monotonic())
+                    )
+                    sibling_submit_settled_before_release = (
+                        sibling_submit_fut.done()
+                        and not cb_released_marker.is_set()
+                        and not release_first_cb.is_set()
+                    )
+                except TimeoutError:
+                    sibling_submit_settled_before_release = False
+
+                try:
+                    sibling_reply_before_release = sibling_reply_fut.result(
+                        timeout=max(0.01, sibling_deadline - time.monotonic())
+                    )
+                    sibling_reply_settled_before_release = (
+                        sibling_reply_fut.done()
+                        and not cb_released_marker.is_set()
+                        and not release_first_cb.is_set()
+                    )
+                except TimeoutError:
+                    sibling_reply_settled_before_release = False
+
+                try:
+                    sibling_internal_exc_before_release = sibling_internal_fut.exception(
+                        timeout=max(0.01, sibling_deadline - time.monotonic())
+                    )
+                    sibling_internal_settled_before_release = (
+                        sibling_internal_fut.done()
+                        and not cb_released_marker.is_set()
+                        and not release_first_cb.is_set()
+                    )
+                except TimeoutError:
+                    sibling_internal_settled_before_release = False
+            finally:
+                cb_released_marker.set()
+                release_first_cb.set()
+
+            t_stop_1.join(timeout=BOUND_WAIT_S)
+            t_stop_2.join(timeout=BOUND_WAIT_S)
+            release_owner.set()
+            _ = hold_fut.result(timeout=1.0)
+            assert first_cb_exited.wait(timeout=1.5)
+            assert sibling_submit_cb_done.wait(timeout=1.5)
+            assert sibling_reply_cb_done.wait(timeout=1.5)
+            assert sibling_internal_cb_done.wait(timeout=1.5)
+            post_rep = loop.stop(grace_s=0.05)
+            final_rep = loop.wait_closed(timeout=5.0)
+        finally:
+            monkeypatch.setattr(threading.Thread, "start", orig_thread_start)
+    finally:
+        futures_logger.removeHandler(log_handler)
+        monkeypatch.setattr(threading.Thread, "start", orig_thread_start)
+        cb_released_marker.set()
+        release_first_cb.set()
+        release_owner.set()
+        t_stop_1.join(timeout=BOUND_WAIT_S)
+        t_stop_2.join(timeout=BOUND_WAIT_S)
+        with contextlib.suppress(BrainError):
+            loop.stop(grace_s=0.05)
+        _ = loop.wait_closed(timeout=5.0)
+
+    assert futures_logger_errors == []
+    assert first_err_box == []
+    assert second_err_box == []
+    assert first_stop_before_cb_release is True
+    assert second_stop_before_cb_release is True
+    assert len(first_rep_box) == 1
+    assert (first_rep_box[0].state, first_rep_box[0].error_code, first_rep_box[0].cancelled_requests) == (
+        ShutdownState.OVERRUN,
+        ErrorCode.DEADLINE_EXCEEDED,
+        3,
+    )
+    assert len(second_rep_box) == 1
+    assert (second_rep_box[0].state, second_rep_box[0].error_code, second_rep_box[0].cancelled_requests) == (
+        ShutdownState.OVERRUN,
+        ErrorCode.DEADLINE_EXCEEDED,
+        3,
+    )
+    assert sibling_submit_settled_before_release is True
+    assert sibling_submit_env_before_release == {
+        "ok": False,
+        "error": {"code": ErrorCode.DAEMON_UNAVAILABLE.value, "message": "daemon unavailable"},
+    }
+    assert sibling_reply_settled_before_release is True
+    assert sibling_reply_before_release is not None
+    assert sibling_reply_before_release.envelope["ok"] is False
+    assert (
+        cast(dict[str, JsonValue], sibling_reply_before_release.envelope["error"])["code"]
+        == ErrorCode.DAEMON_UNAVAILABLE.value
+    )
+    assert sibling_internal_settled_before_release is True
+    assert isinstance(sibling_internal_exc_before_release, BrainError)
+    assert sibling_internal_exc_before_release.code is ErrorCode.DAEMON_UNAVAILABLE
+    assert first_cb_count == 1
+    assert first_cb_envelopes == [
+        {
+            "ok": False,
+            "error": {"code": ErrorCode.DAEMON_UNAVAILABLE.value, "message": "daemon unavailable"},
+        }
+    ]
+    assert sibling_submit_cb_count == 1
+    assert sibling_reply_cb_count == 1
+    assert sibling_internal_cb_count == 1
+    assert post_rep is not None
+    assert (post_rep.state, post_rep.error_code, post_rep.cancelled_requests) == (
+        ShutdownState.OVERRUN,
+        ErrorCode.DEADLINE_EXCEEDED,
+        3,
+    )
+    assert final_rep is not None and final_rep.endpoint_removed is True
+    assert final_rep.cancelled_requests == 3
+    with acquire_writer(DataRoot.at(root), adapters):
+        pass
