@@ -147,6 +147,11 @@ class JobExecutor:
         with self._cancel_lock:
             return self._in_flight
 
+    def can_claim(self) -> bool:
+        """True iff the worker is open and has zero in-flight items under one atomic critical section."""
+        with self._lock, self._cancel_lock:
+            return not self._closed and self._in_flight == 0
+
     @property
     def is_drained(self) -> bool:
         with self._lock:
@@ -227,8 +232,16 @@ class JobExecutor:
         self._commands.put(cmd)
         self._notify_command()
 
-    def _emit_terminal_command(self, cmd: WorkerCompleted | WorkerFailed) -> None:
+    def _emit_terminal_command(
+        self,
+        cmd: WorkerCompleted | WorkerFailed,
+        *,
+        decrement_in_flight: bool = False,
+    ) -> None:
         with self._lock:
+            if decrement_in_flight:
+                with self._cancel_lock:
+                    self._in_flight -= 1
             if self._closed:
                 return
             self._commands.put(cmd)
@@ -251,10 +264,8 @@ class JobExecutor:
                 try:
                     if not is_closed and not cancelled.is_set():
                         result_cmd = self._execute(item, cancelled)
-                        with self._cancel_lock:
-                            self._in_flight -= 1
-                            decremented = True
-                        self._emit_terminal_command(result_cmd)
+                        decremented = True
+                        self._emit_terminal_command(result_cmd, decrement_in_flight=True)
                 finally:
                     with self._cancel_lock:
                         if not decremented:

@@ -170,11 +170,14 @@ class _AdmittedOwnerSession(OwnerSession):
         self._hooks = hooks
         self._reply_meta_lock = reply_meta_lock
         self._reply_meta = reply_meta
+        self._claim_lock = threading.Lock()
+        self._claim_closed = False
         self._metrics_lock = threading.Lock()
         self._stopping = False
         self._overrun = False
         self._drained_requests = 0
         self._worker_join_failed = False
+        self._job_service.set_claim_commit_guard(self._admit_claim_commit)
 
     @property
     def ready(self) -> Ready:
@@ -253,9 +256,44 @@ class _AdmittedOwnerSession(OwnerSession):
             did_work = True
         return did_work
 
+    def _is_stopping(self) -> bool:
+        with self._metrics_lock:
+            return self._stopping
+
+    def _is_claim_open(self) -> bool:
+        if self._executor is None:
+            return False
+        with self._claim_lock:
+            if self._claim_closed or self._is_stopping():
+                return False
+            return self._executor.can_claim()
+
+    def _admit_claim_commit(self, append_lease: Callable[[], None]) -> bool:
+        if self._executor is None:
+            return False
+        with self._claim_lock:
+            if self._claim_closed or self._is_stopping() or not self._executor.can_claim():
+                return False
+            append_lease()
+            return True
+
+    def _can_start_claimed_job(self) -> bool:
+        if self._executor is None:
+            return False
+        with self._claim_lock:
+            return not self._claim_closed and not self._is_stopping() and not self._executor.is_closed
+
+    def _close_claim_gate(self) -> None:
+        with self._claim_lock:
+            self._claim_closed = True
+            if self._executor is not None:
+                self._executor.close(0.0)
+
     def _claim_and_submit_job(self) -> bool:
         assert self._executor is not None
-        if self._executor.is_closed or self._executor.in_flight != 0:
+        if self._is_stopping() or self._executor.is_closed or self._executor.in_flight != 0:
+            return False
+        if not self._is_claim_open():
             return False
         try:
             lease = self._job_service.lease_next(self._rt.lease.epoch, self._clock.now())
@@ -270,7 +308,7 @@ class _AdmittedOwnerSession(OwnerSession):
             spec = self._job_service.resolve_leased_spec(lease)
             if spec is None:
                 return True
-            if self._executor.is_closed:
+            if not self._can_start_claimed_job():
                 return True
             self._job_service.start(lease)
             item = WorkItem(
@@ -282,7 +320,7 @@ class _AdmittedOwnerSession(OwnerSession):
             self._executor.submit(item)
             return True
         except BrainError as err:
-            if err.code is ErrorCode.REVISION_CONFLICT:
+            if err.code in (ErrorCode.REVISION_CONFLICT, ErrorCode.DAEMON_UNAVAILABLE):
                 return True
             if err.code is ErrorCode.POLICY_UNAVAILABLE:
                 self._auth_gate.invalidate()
@@ -316,8 +354,7 @@ class _AdmittedOwnerSession(OwnerSession):
         self._listener.close()
         self._auth_gate.close()
         self._bridge.close_admissions()
-        if self._executor is not None:
-            self._executor.close(0.0)
+        self._close_claim_gate()
 
     def join_worker(self, timeout_s: float) -> bool:
         if self._executor is None:
@@ -362,8 +399,7 @@ class _AdmittedOwnerSession(OwnerSession):
     def teardown_on_owner(self, *, overrun: bool, cancelled_requests: int = 0) -> ShutdownReport:
         self._listener.close()
         self._auth_gate.close()
-        if self._executor is not None:
-            self._executor.close(0.0)
+        self._close_claim_gate()
         drained, worker_drained = self.shutdown_metrics()
         removed = False
         try:
