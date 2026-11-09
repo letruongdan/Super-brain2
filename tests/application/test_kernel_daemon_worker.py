@@ -9,7 +9,9 @@ Requirement sources:
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
+import os
 import sys
 import threading
 from collections.abc import Callable, Iterator
@@ -19,9 +21,13 @@ from typing import Any, Protocol, cast
 import pytest
 
 from superbrain.adapters.os import os_adapters
+from superbrain.adapters.os.daemon_config import read_daemon_config
+from superbrain.adapters.os.tls_material import create_store_tls
 from superbrain.application.jobs import JobService
-from superbrain.core.canonical import digest_bytes
+from superbrain.composition.daemon_entry import create_daemon_owner_loop
+from superbrain.core.canonical import canonical_json, digest_bytes
 from superbrain.core.errors import BrainError, ErrorCode, is_safe_wire_message
+from superbrain.core.ids import new_id
 from superbrain.core.kernel import (
     AccountingStatus,
     InvocationRecord,
@@ -43,7 +49,7 @@ from superbrain.core.kernel import (
 from superbrain.ports.os import OsAdapters
 from superbrain.storage.idempotency import StagedKernelStore
 from superbrain.storage.runtime import Runtime
-from superbrain.workers.executor import JobContext, JobExecutor, WorkItem
+from superbrain.workers.executor import JobContext, JobExecutor, JobHandlerError, WorkItem
 from tests.support.clock import FakeClock
 from tests.support.inc2_fixture import (
     FIXTURE_JOB_KIND,
@@ -52,7 +58,7 @@ from tests.support.inc2_fixture import (
     open_kernel_job_runtime,
     reopen_kernel_job_runtime,
 )
-from tests.support.kernel_auth import seed_principal_and_credential
+from tests.support.kernel_auth import make_bootstrap_auth, seed_principal_and_credential
 
 RESERVE = UsageReservation(max_amount="2")
 BOUND_WAIT_S = 5.0
@@ -408,9 +414,7 @@ def test_worker_submit_after_close_refuses_without_enqueue(
         executor_slow.close(BOUND_WAIT_S)
         assert not slow_threads[0].is_alive()
         late_usage_cmd = _command(executor_slow)
-        late_done_cmd = _command(executor_slow)
         assert late_usage_cmd == WorkerUsage(slow_inv_id, UsageRecord("0.15", complete=True))
-        assert isinstance(late_done_cmd, WorkerCompleted) and late_done_cmd.lease == slow_lease
         assert executor_slow.next_command(0.01) is None
         assert not refused_entered.is_set()
         assert cast(_ExecutorWithItems, executor_slow)._items.empty()
@@ -444,7 +448,7 @@ def test_worker_submit_after_close_refuses_without_enqueue(
             )
 
             # Stale completion from epoch1 is fenced; valid late usage ("0.15", complete=True) settles once per S1=A.
-            _expect(ErrorCode.REVISION_CONFLICT, lambda: service2.apply_command(late_done_cmd))
+            _expect(ErrorCode.REVISION_CONFLICT, lambda: service2.apply_command(WorkerCompleted(slow_lease)))
             service2.apply_command(late_usage_cmd)
             service2.apply_command(late_usage_cmd)  # identical retry: no-op
             _expect(
@@ -546,3 +550,205 @@ def test_worker_submit_after_close_refuses_without_enqueue(
         rt_race.close()
         if sys.exc_info()[0] is None:
             assert all(not thread.is_alive() for thread in race_threads)
+
+
+def test_worker_hardening_guards_clock_malformed_error_and_reports_unexpected_exit(
+    trusted_tmp: Path,
+    clock: FakeClock,
+    os_: OsAdapters,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CL-T5-A2: Strict ``JobHandlerError`` validation, clock fault isolation, and ``SystemExit`` drain reporting."""
+
+    def _synthetic_item(payload: bytes, *, deadline_ns: int = 1_000) -> tuple[JobLease, WorkItem]:
+        lease = JobLease(job_id=new_id(), attempt=1, writer_epoch=1, lease_id=new_id())
+        spec = JobSpec(kind=FIXTURE_JOB_KIND, owner_id="dan", payload=payload)
+        return lease, WorkItem(lease=lease, spec=spec, invocation_ids=(), deadline_ns=deadline_ns)
+
+    # (a) JobHandlerError strict validation + worker survival on malformed error raised inside handler.
+    _expect(ErrorCode.INVALID_INPUT, lambda: JobHandlerError(JobErrorCode.HANDLER_FAILED, retryable=cast(Any, "bad")))
+    _expect(ErrorCode.INVALID_INPUT, lambda: JobHandlerError(JobErrorCode.HANDLER_FAILED, retryable=cast(Any, 1)))
+    _expect(ErrorCode.INVALID_INPUT, lambda: JobHandlerError(cast(Any, "handler_failed"), retryable=False))
+
+    lease_a1, item_a1 = _synthetic_item(b"a2-malformed-err")
+    lease_a2, item_a2 = _synthetic_item(b"a2-after-malformed")
+
+    entered_a: list[str] = []
+
+    def _handler_a(spec: JobSpec, ctx: JobContext) -> tuple[ObjectRef, ...]:
+        entered_a.append(ctx.lease.job_id)
+        if spec.payload == b"a2-malformed-err":
+            raise JobHandlerError(JobErrorCode.HANDLER_FAILED, retryable=cast(Any, "bad"))
+        return ()
+
+    executor_a = JobExecutor({FIXTURE_JOB_KIND: _handler_a}, _Mono(initial_ns=100))
+    executor_a.start()
+    try:
+        executor_a.submit(item_a1)
+        executor_a.submit(item_a2)
+        assert _command(executor_a) == WorkerFailed(lease_a1, False, JobErrorCode.HANDLER_FAILED)
+        assert _command(executor_a) == WorkerCompleted(lease_a2)
+        assert entered_a == [lease_a1.job_id, lease_a2.job_id]
+        assert executor_a.close(BOUND_WAIT_S) is True
+        assert executor_a.is_drained is True
+    finally:
+        executor_a.close(BOUND_WAIT_S)
+
+    # (b1) Monotonic clock RuntimeError BEFORE handler entry (clock_pre).
+    lease_pre_1, item_pre_1 = _synthetic_item(b"a2-clock-pre-1")
+    lease_pre_2, item_pre_2 = _synthetic_item(b"a2-clock-pre-2")
+
+    pre_calls = 0
+    pre_entered: list[str] = []
+
+    def _clock_pre_fault() -> int:
+        nonlocal pre_calls
+        pre_calls += 1
+        if pre_calls == 1:
+            raise RuntimeError("monotonic clock pre-handler failure")
+        return 100
+
+    def _handler_pre(_spec: JobSpec, ctx: JobContext) -> tuple[ObjectRef, ...]:
+        pre_entered.append(ctx.lease.job_id)
+        return ()
+
+    executor_pre = JobExecutor({FIXTURE_JOB_KIND: _handler_pre}, _clock_pre_fault)
+    executor_pre.start()
+    try:
+        executor_pre.submit(item_pre_1)
+        executor_pre.submit(item_pre_2)
+        assert _command(executor_pre) == WorkerFailed(lease_pre_1, False, JobErrorCode.HANDLER_FAILED)
+        assert _command(executor_pre) == WorkerCompleted(lease_pre_2)
+        assert pre_entered == [lease_pre_2.job_id]
+        assert executor_pre.close(BOUND_WAIT_S) is True
+        assert executor_pre.is_drained is True
+    finally:
+        executor_pre.close(BOUND_WAIT_S)
+
+    # (b2) Monotonic clock RuntimeError AFTER handler return (clock_post).
+    lease_post_1, item_post_1 = _synthetic_item(b"a2-clock-post-1")
+    lease_post_2, item_post_2 = _synthetic_item(b"a2-clock-post-2")
+
+    post_calls = 0
+    post_entered: list[str] = []
+
+    def _clock_post_fault() -> int:
+        nonlocal post_calls
+        post_calls += 1
+        if post_calls == 2:
+            raise RuntimeError("monotonic clock post-handler failure")
+        return 100
+
+    def _handler_post(_spec: JobSpec, ctx: JobContext) -> tuple[ObjectRef, ...]:
+        post_entered.append(ctx.lease.job_id)
+        return ()
+
+    executor_post = JobExecutor({FIXTURE_JOB_KIND: _handler_post}, _clock_post_fault)
+    executor_post.start()
+    try:
+        executor_post.submit(item_post_1)
+        executor_post.submit(item_post_2)
+        assert _command(executor_post) == WorkerFailed(lease_post_1, False, JobErrorCode.HANDLER_FAILED)
+        assert _command(executor_post) == WorkerCompleted(lease_post_2)
+        assert post_entered == [lease_post_1.job_id, lease_post_2.job_id]
+        assert executor_post.close(BOUND_WAIT_S) is True
+        assert executor_post.is_drained is True
+    finally:
+        executor_post.close(BOUND_WAIT_S)
+
+    # (c) SystemExit inside handler is NOT swallowed into WorkerCompleted and reports worker_drained=False.
+    hook_types: list[type[BaseException]] = []
+    monkeypatch.setattr(threading, "excepthook", lambda args: hook_types.append(args.exc_type))
+
+    _, item_sys = _synthetic_item(b"a2-sysexit-unit")
+
+    sysexit_entered = threading.Event()
+    sysexit_threads: list[threading.Thread] = []
+
+    def _handler_sysexit(_spec: JobSpec, _ctx: JobContext) -> tuple[ObjectRef, ...]:
+        sysexit_threads.append(threading.current_thread())
+        sysexit_entered.set()
+        raise SystemExit(1)
+
+    executor_sys = JobExecutor({FIXTURE_JOB_KIND: _handler_sysexit}, _Mono(initial_ns=100))
+    executor_sys.start()
+    try:
+        executor_sys.submit(item_sys)
+        assert sysexit_entered.wait(BOUND_WAIT_S)
+        sysexit_threads[0].join(BOUND_WAIT_S)
+        assert not sysexit_threads[0].is_alive()
+        assert hook_types == [SystemExit]
+        assert executor_sys.next_command(0.02) is None
+        assert executor_sys.is_drained is False
+        assert executor_sys.close(BOUND_WAIT_S) is False
+        assert executor_sys.is_drained is False
+    finally:
+        executor_sys.close(BOUND_WAIT_S)
+
+    # Real create_daemon_owner_loop check: handler raising SystemExit(1) -> ShutdownReport.worker_drained is False.
+    daemon_base = trusted_tmp / "a2-daemon-sysexit"
+    daemon_base.mkdir(parents=True, exist_ok=True)
+    if sys.platform != "win32":
+        os.chmod(daemon_base, 0o700)
+    daemon_root = daemon_base / "data"
+    rt_d = open_kernel_job_runtime(daemon_root, os_)
+    store_id_d = rt_d.store.store_id
+    try:
+        seed_principal_and_credential(rt_d.policy, owner_id="dan")
+        rt_d.store.reconcile_policy()
+        svc_d, st_d = kernel_job_service(rt_d, clock)
+        enqueue_job(svc_d, st_d, owner_id="dan", payload=b"a2-sysexit-daemon")
+    finally:
+        rt_d.close()
+
+    tls_dir = daemon_base / "tls"
+    tls_auth = make_bootstrap_auth(
+        store_id=store_id_d,
+        owner_id="dan",
+        action="provision_tls",
+        subject_id=store_id_d,
+        trust_generation=1,
+        expires_at=clock.now() + dt.timedelta(hours=1),
+        destination=tls_dir,
+    )
+    tls_d = create_store_tls(store_id_d, tls_dir, tls_auth, clock, os_)
+    cfg_path = daemon_base / "daemon-config.json"
+    os_.publisher.write_new(
+        cfg_path,
+        canonical_json(
+            {
+                "version": 1,
+                "data_root": str(daemon_root),
+                "expected_store_id": store_id_d,
+                "cert_path": str(tls_d.cert_path),
+                "key_path": str(tls_d.key_path),
+            }
+        ),
+    )
+    os_.permissions.secure_file(cfg_path)
+    cfg_d = read_daemon_config(cfg_path, os_)
+
+    daemon_exit_entered = threading.Event()
+    daemon_worker_threads: list[threading.Thread] = []
+
+    def _daemon_sysexit_handler(_spec: JobSpec, _ctx: JobContext) -> tuple[ObjectRef, ...]:
+        daemon_worker_threads.append(threading.current_thread())
+        daemon_exit_entered.set()
+        raise SystemExit(1)
+
+    loop_d = create_daemon_owner_loop(
+        os_=os_,
+        clock=clock,
+        job_handlers={FIXTURE_JOB_KIND: _daemon_sysexit_handler},
+    )
+    try:
+        loop_d.start(cfg_d)
+        assert daemon_exit_entered.wait(BOUND_WAIT_S)
+        daemon_worker_threads[0].join(BOUND_WAIT_S)
+        assert not daemon_worker_threads[0].is_alive()
+        rep_d = loop_d.stop(grace_s=1.0)
+        assert rep_d.worker_drained is False
+    finally:
+        with contextlib.suppress(BrainError):
+            loop_d.stop()
+

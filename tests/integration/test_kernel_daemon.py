@@ -79,6 +79,7 @@ from superbrain.core.kernel import (
     InvocationState,
     JobErrorCode,
     JobOutcome,
+    JobRecord,
     JobSpec,
     JobState,
     KernelRecord,
@@ -86,6 +87,7 @@ from superbrain.core.kernel import (
     OwnerReply,
     Principal,
     Ready,
+    RecoveryCounts,
     RequestAuthView,
     ResourceDigest,
     Scope,
@@ -103,7 +105,8 @@ from superbrain.core.kernel import (
 )
 from superbrain.ports.kernel import KernelTx
 from superbrain.ports.os import DurabilityReport, OsAdapters
-from superbrain.ports.policy import PolicyView
+from superbrain.ports.policy import IntentKind, PolicyView
+from superbrain.storage.cas import held_digests
 from superbrain.storage.kernel_schema import KERNEL_POLICY_MIGRATIONS, KERNEL_STORE_MIGRATIONS
 from superbrain.storage.kinds import EntryKind, FieldType, KindRegistry
 from superbrain.storage.layout import (
@@ -118,11 +121,12 @@ from superbrain.storage.runtime import Runtime, open_runtime
 from superbrain.storage.schema import POLICY_MIGRATIONS, STORE_MIGRATIONS
 from superbrain.storage.send_attempts import KernelSendAttemptStore, read_send_attempt_row
 from superbrain.storage.writer import acquire_writer, acquire_writer_unbumped
-from superbrain.workers.executor import JobContext
+from superbrain.workers.executor import JobContext, JobExecutor, WorkItem
 from tests.support.clock import FakeClock
 from tests.support.fs import digest_data_root, digest_tree, fake_link, file_identity
 from tests.support.inc2_child import spawn_migrate_child, spawn_serve_child
 from tests.support.inc2_fixture import (
+    FIXTURE_JOB_KIND,
     enqueue_job,
     kernel_job_service,
     open_kernel_job_runtime,
@@ -3458,4 +3462,378 @@ def test_shutdown_report_metrics_and_shared_concurrent_stop_cutoff(
         release_worker.set()
         closed_rep = loop_b2.wait_closed(timeout=BOUND_WAIT_S)
         assert closed_rep is not None and closed_rep.endpoint_removed is True
+
+
+def test_shutdown_interrupted_handler_does_not_commit_succeeded_and_requeues_next_epoch(
+    trusted_tmp: Path,
+    _daemon_template: _DaemonTemplate,
+) -> None:
+    """CL-T5-A1: Shutdown-aborted handler returning ``()`` stays ``RUNNING`` for next-epoch ``recover()``."""
+    base_now = _daemon_template.base_time + dt.timedelta(minutes=5)
+    root_a1, _, cfg_a1 = _instantiate_case(trusted_tmp, "cl-t5-a1-shutdown", _daemon_template)
+    clock_a1 = FakeClock(base_now)
+    mono_a1 = _FakeMonotonicClock()
+    adapters_a1 = os_adapters(clock=clock_a1, monotonic=mono_a1)
+
+    control_payload = b"a1-control-empty"
+    aborted_payload = b"a1-aborted-on-stop"
+
+    rt_seed = reopen_kernel_job_runtime(root_a1, _daemon_template.store_id, adapters_a1)
+    try:
+        svc_seed, st_seed = kernel_job_service(rt_seed, clock_a1)
+        control_job_id = enqueue_job(svc_seed, st_seed, owner_id="dan", payload=control_payload).job_id
+        clock_a1.advance(dt.timedelta(milliseconds=1))
+        aborted_job_id = enqueue_job(svc_seed, st_seed, owner_id="dan", payload=aborted_payload).job_id
+    finally:
+        rt_seed.close()
+
+    control_finished = threading.Event()
+    aborted_entered = threading.Event()
+    observed_cancelled: list[bool] = []
+
+    def _a1_handler(spec: JobSpec, ctx: JobContext) -> tuple[ObjectRef, ...]:
+        if spec.payload == control_payload:
+            control_finished.set()
+            return ()
+        aborted_entered.set()
+        if ctx.wait_cancelled(BOUND_WAIT_S) and ctx.cancelled():
+            observed_cancelled.append(True)
+        return ()
+
+    loop_a1 = create_daemon_owner_loop(
+        os_=adapters_a1,
+        clock=clock_a1,
+        monotonic_clock=mono_a1,
+        job_handlers={FIXTURE_JOB_KIND: _a1_handler},
+    )
+    try:
+        ready_a1 = loop_a1.start(cfg_a1)
+        epoch_daemon = ready_a1.identity.writer_epoch
+        assert aborted_entered.wait(timeout=BOUND_WAIT_S), "aborted_job never entered running"
+        assert control_finished.is_set(), "control_job must complete before aborted_job enters on single worker"
+
+        rep_a1 = loop_a1.stop(grace_s=3.0)
+        assert rep_a1.state is ShutdownState.STOPPED
+        assert rep_a1.worker_drained is True
+        assert observed_cancelled == [True]
+    finally:
+        with contextlib.suppress(BrainError):
+            loop_a1.stop()
+
+    clock_a1.advance(dt.timedelta(seconds=2))
+    rt_next = reopen_kernel_job_runtime(root_a1, _daemon_template.store_id, adapters_a1)
+    try:
+        assert rt_next.lease.epoch == epoch_daemon + 1
+        svc_next, st_next = kernel_job_service(rt_next, clock_a1)
+
+        ctrl_pre = st_next.transact(lambda tx: tx.read_job(control_job_id))
+        abort_pre = st_next.transact(lambda tx: tx.read_job(aborted_job_id))
+        assert ctrl_pre is not None and abort_pre is not None
+        assert (ctrl_pre.state, ctrl_pre.attempt, ctrl_pre.result_digest) == (JobState.SUCCEEDED, 1, None)
+        ctrl_view = svc_next.get_job(control_job_id, _daemon_template.dan, selected_scope=None)
+        assert (ctrl_view.state, ctrl_view.attempt, ctrl_view.result_refs) == (JobState.SUCCEEDED, 1, ())
+        assert (abort_pre.state, abort_pre.attempt) == (JobState.RUNNING, 1)
+
+        counts = svc_next.recover(rt_next.lease.epoch)
+        assert counts == RecoveryCounts(invocations_unknown=0, jobs_requeued=1, jobs_dead_lettered=0)
+
+        ctrl_post = st_next.transact(lambda tx: tx.read_job(control_job_id))
+        abort_post = st_next.transact(lambda tx: tx.read_job(aborted_job_id))
+        assert ctrl_post is not None and abort_post is not None
+        assert (ctrl_post.state, ctrl_post.attempt) == (JobState.SUCCEEDED, 1)
+        assert (abort_post.state, abort_post.attempt) == (JobState.QUEUED, 2)
+
+        # Companion S1=A check: WorkerUsage published during close() settles while WorkerCompleted is suppressed.
+        lease_a2 = svc_next.lease_next(rt_next.lease.epoch, clock_a1.now())
+        assert lease_a2 is not None and (lease_a2.job_id, lease_a2.attempt) == (aborted_job_id, 2)
+        svc_next.start(lease_a2)
+        inv_a2 = svc_next.reserve_invocation(lease_a2, RESERVE)
+
+        usage_entered = threading.Event()
+
+        def _usage_on_cancel(_spec: JobSpec, ctx: JobContext) -> tuple[ObjectRef, ...]:
+            usage_entered.set()
+            assert ctx.wait_cancelled(BOUND_WAIT_S) and ctx.cancelled()
+            ctx.report_usage(ctx.invocation_ids[0], UsageRecord("0.25", complete=True))
+            return ()
+
+        executor_u = JobExecutor({FIXTURE_JOB_KIND: _usage_on_cancel}, mono_a1.monotonic_ns)
+        executor_u.start()
+        try:
+            executor_u.submit(
+                WorkItem(
+                    lease=lease_a2,
+                    spec=svc_next.job_spec(lease_a2),
+                    deadline_ns=mono_a1.now + TOTAL_REQUEST_BUDGET_NS,
+                    invocation_ids=(inv_a2,),
+                )
+            )
+            assert usage_entered.wait(timeout=BOUND_WAIT_S)
+            assert executor_u.close(BOUND_WAIT_S) is True
+            cmd_usage = executor_u.next_command(BOUND_WAIT_S)
+            assert cmd_usage == WorkerUsage(inv_a2, UsageRecord("0.25", complete=True))
+            assert executor_u.next_command(0.01) is None
+
+            svc_next.apply_command(cmd_usage)
+            view_a2 = svc_next.get_job(aborted_job_id, _daemon_template.dan, selected_scope=None)
+            assert (view_a2.state, view_a2.attempt, view_a2.accounting_status) == (
+                JobState.RUNNING,
+                2,
+                AccountingStatus.SETTLED,
+            )
+        finally:
+            executor_u.close(BOUND_WAIT_S)
+    finally:
+        rt_next.close()
+
+
+def test_quarantined_or_tombstoned_queued_job_fails_fenced_and_next_valid_job_runs(
+    trusted_tmp: Path,
+    _daemon_template: _DaemonTemplate,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CL-T5-B1: Policy-blocked leased jobs fail fenced with ``INVALID_PAYLOAD`` without blocking valid jobs."""
+    base_now = _daemon_template.base_time + dt.timedelta(minutes=5)
+    tok_a = _daemon_template.cred_a.token
+
+    root_1, _, cfg_1 = _instantiate_case(trusted_tmp, "cl-t5-b1", _daemon_template)
+    clock_1 = FakeClock(base_now)
+    mono_1 = _FakeMonotonicClock()
+    adapters_1 = os_adapters(clock=clock_1, monotonic=mono_1)
+
+    quarantined_payload = b"b1-quarantined-payload"
+    quarantined_digest = digest_bytes(quarantined_payload)
+    valid_payload_1 = b"b1-valid-control"
+    tombstoned_payload = b"b1-tombstoned-payload"
+    tombstoned_digest = digest_bytes(tombstoned_payload)
+    valid_payload_2 = b"b1-valid-after-tombstone"
+    corrupt_payload = b"b1-missing-cas-blob"
+    corrupt_hex = digest_bytes(corrupt_payload).removeprefix("sha256:")
+
+    # Seed Subcase 1 while store is offline: quarantined payload digest while queued + valid control job.
+    rt_seed_1 = reopen_kernel_job_runtime(root_1, _daemon_template.store_id, adapters_1)
+    try:
+        svc_1, st_1 = kernel_job_service(rt_seed_1, clock_1)
+        quarantined_job_id = enqueue_job(svc_1, st_1, owner_id="dan", payload=quarantined_payload).job_id
+        clock_1.advance(dt.timedelta(milliseconds=1))
+        valid_job_1_id = enqueue_job(svc_1, st_1, owner_id="dan", payload=valid_payload_1).job_id
+        rt_seed_1.policy.record_intent(IntentKind.QUARANTINE, {"digest": quarantined_digest})
+        assert rt_seed_1.policy.is_quarantined(quarantined_digest) is True
+    finally:
+        rt_seed_1.close()
+
+    entered_ids: list[str] = []
+    valid_1_entered = threading.Event()
+    valid_2_entered = threading.Event()
+
+    def _b1_handler(spec: JobSpec, ctx: JobContext) -> tuple[ObjectRef, ...]:
+        entered_ids.append(ctx.lease.job_id)
+        if spec.payload == valid_payload_1:
+            valid_1_entered.set()
+        elif spec.payload == valid_payload_2:
+            valid_2_entered.set()
+        return (ObjectRef(kind="fixture_result", id=ctx.lease.job_id, revision=1, digest=digest_bytes(spec.payload)),)
+
+    rt_box: list[Runtime] = []
+    loop_1 = create_daemon_owner_loop(
+        os_=adapters_1,
+        clock=clock_1,
+        monotonic_clock=mono_1,
+        job_handlers={FIXTURE_JOB_KIND: _b1_handler},
+        hooks=DaemonTestHooks(before_bind=rt_box.append),
+    )
+    tombstoned_ids: list[str] = []
+    valid_2_ids: list[str] = []
+    corrupt_ids: list[str] = []
+    pol_job_ids: list[str] = []
+    try:
+        loop_1.start(cfg_1)
+        rt_live = rt_box[0]
+        dl_1 = mono_1.now + TOTAL_REQUEST_BUDGET_NS
+
+        # Subcase 1: Quarantined payload digest while queued -> FAILED(INVALID_PAYLOAD), valid_job_1 succeeds.
+        assert valid_1_entered.wait(timeout=BOUND_WAIT_S)
+
+        def _job_succeeded(jid: str) -> Callable[[], bool]:
+            def _pred() -> bool:
+                res = loop_1.submit(
+                    ToolCommand("get_job", {"schema_version": "2.0", "job_id": jid}, token=tok_a),
+                    dl_1,
+                ).result(timeout=BOUND_WAIT_S)
+                return res.get("ok") is True and cast(dict[str, JsonValue], res["data"]).get("state") == "succeeded"
+
+            return _pred
+
+        _wait_until(_job_succeeded(valid_job_1_id), desc="valid_job_1 succeeded")
+        assert entered_ids == [valid_job_1_id]
+
+        res_q = loop_1.submit(
+            ToolCommand("get_job", {"schema_version": "2.0", "job_id": quarantined_job_id}, token=tok_a),
+            dl_1,
+        ).result(timeout=BOUND_WAIT_S)
+        assert res_q == {
+            "ok": True,
+            "data": {
+                "job_id": quarantined_job_id,
+                "state": "failed",
+                "attempt": 1,
+                "result_refs": [],
+                "accounting_status": "none",
+            },
+        }
+
+        # Subcase 2: Live TOMBSTONE("event", job_id) before reconcile while OwnerLoop is already running.
+        def _enqueue_and_tombstone_live() -> None:
+            svc_live, st_live = kernel_job_service(rt_live, clock_1)
+            clock_1.advance(dt.timedelta(milliseconds=1))
+            t_id = enqueue_job(svc_live, st_live, owner_id="dan", payload=tombstoned_payload).job_id
+            clock_1.advance(dt.timedelta(milliseconds=1))
+            v_id = enqueue_job(svc_live, st_live, owner_id="dan", payload=valid_payload_2).job_id
+            rt_live.policy.record_intent(IntentKind.TOMBSTONE, {"holder_kind": "event", "holder_id": t_id})
+            assert rt_live.policy.is_tombstoned("event", t_id) is True
+            tombstoned_ids.append(t_id)
+            valid_2_ids.append(v_id)
+
+        loop_1.run_owner_action(_enqueue_and_tombstone_live).result(timeout=BOUND_WAIT_S)
+        tombstoned_job_id = tombstoned_ids[0]
+        valid_job_2_id = valid_2_ids[0]
+
+        assert valid_2_entered.wait(timeout=BOUND_WAIT_S)
+        _wait_until(_job_succeeded(valid_job_2_id), desc="valid_job_2 succeeded")
+        assert entered_ids == [valid_job_1_id, valid_job_2_id]
+
+        res_t = loop_1.submit(
+            ToolCommand("get_job", {"schema_version": "2.0", "job_id": tombstoned_job_id}, token=tok_a),
+            dl_1,
+        ).result(timeout=BOUND_WAIT_S)
+        assert res_t == {
+            "ok": True,
+            "data": {
+                "job_id": tombstoned_job_id,
+                "state": "failed",
+                "attempt": 1,
+                "result_refs": [],
+                "accounting_status": "none",
+            },
+        }
+
+        def _verify_live_holds_unreleased() -> None:
+            with rt_live.store.transaction() as txn:
+                assert held_digests(txn.db, "event", quarantined_job_id) == [quarantined_digest]
+                assert held_digests(txn.db, "event", tombstoned_job_id) == [tombstoned_digest]
+
+        loop_1.run_owner_action(_verify_live_holds_unreleased).result(timeout=BOUND_WAIT_S)
+
+        # Subcase 3a: Missing CAS blob without policy restriction raises INTEGRITY_FAILURE, NOT INVALID_PAYLOAD.
+        def _enqueue_and_unlink_cas() -> None:
+            svc_live, st_live = kernel_job_service(rt_live, clock_1)
+            clock_1.advance(dt.timedelta(milliseconds=1))
+            c_id = enqueue_job(svc_live, st_live, owner_id="dan", payload=corrupt_payload).job_id
+            cas_blob_file = root_1 / "store" / "cas" / corrupt_hex[:2] / corrupt_hex
+            assert cas_blob_file.is_file()
+            cas_blob_file.unlink()
+            corrupt_ids.append(c_id)
+
+        loop_1.run_owner_action(_enqueue_and_unlink_cas).result(timeout=BOUND_WAIT_S)
+        loop_1.run_owner_action(lambda: None).result(timeout=BOUND_WAIT_S)
+        corrupt_job_id = corrupt_ids[0]
+        res_3a = loop_1.submit(
+            ToolCommand("get_job", {"schema_version": "2.0", "job_id": corrupt_job_id}, token=tok_a),
+            dl_1,
+        ).result(timeout=BOUND_WAIT_S)
+        assert res_3a["ok"] is True
+        assert cast(dict[str, JsonValue], res_3a["data"])["state"] == "leased"
+        assert entered_ids == [valid_job_1_id, valid_job_2_id]
+
+        # Subcase 3b: POLICY_UNAVAILABLE during owner claim invalidates AuthGate and does NOT mark INVALID_PAYLOAD.
+        assert loop_1.auth_gate.current() is not None
+
+        def _raise_pol_unavailable(*_args: object, **_kwargs: object) -> bool:
+            raise BrainError(ErrorCode.POLICY_UNAVAILABLE, "policy unavailable")
+
+        def _enqueue_and_break_policy() -> None:
+            svc_live, st_live = kernel_job_service(rt_live, clock_1)
+            clock_1.advance(dt.timedelta(milliseconds=1))
+            p_id = enqueue_job(svc_live, st_live, owner_id="dan", payload=b"b1-policy-down").job_id
+            pol_job_ids.append(p_id)
+            monkeypatch.setattr(rt_live.policy, "is_tombstoned", _raise_pol_unavailable)
+            monkeypatch.setattr(rt_live.policy, "is_quarantined", _raise_pol_unavailable)
+
+        loop_1.run_owner_action(_enqueue_and_break_policy).result(timeout=BOUND_WAIT_S)
+        _wait_until(lambda: loop_1.auth_gate.current() is None, desc="AuthGate invalidated on POLICY_UNAVAILABLE")
+        assert entered_ids == [valid_job_1_id, valid_job_2_id]
+
+        rep_1 = loop_1.stop(grace_s=3.0)
+        assert rep_1.state is ShutdownState.STOPPED
+    finally:
+        with contextlib.suppress(BrainError):
+            loop_1.stop()
+        monkeypatch.undo()
+
+    rt_v1 = reopen_kernel_job_runtime(root_1, _daemon_template.store_id, adapters_1)
+    try:
+        svc_v1, st_v1 = kernel_job_service(rt_v1, clock_1)
+
+        def _read_v1(jid: str) -> JobRecord:
+            row = st_v1.transact(lambda tx: tx.read_job(jid))
+            assert row is not None
+            return row
+
+        for blocked_id in (quarantined_job_id, tombstoned_ids[0]):
+            b_row = _read_v1(blocked_id)
+            assert (b_row.state, b_row.attempt, b_row.reason, b_row.result_digest) == (
+                JobState.FAILED,
+                1,
+                JobErrorCode.INVALID_PAYLOAD,
+                None,
+            )
+            terminals = [
+                e for e in rt_v1.store.entries() if e.kind == "job.terminal" and e.meta.get("job_id") == blocked_id
+            ]
+            assert len(terminals) == 1
+            assert (
+                terminals[0].meta["prior_state"],
+                terminals[0].meta["state"],
+                terminals[0].meta["reason"],
+                terminals[0].actor,
+            ) == ("leased", "failed", "invalid_payload", "system:kernel")
+
+        # Spec §5.6: QUARANTINE preserves CAS hold across reopen; TOMBSTONE is reconciled on Store.open() by policy.
+        with rt_v1.store.transaction() as txn:
+            assert held_digests(txn.db, "event", quarantined_job_id) == [quarantined_digest]
+            assert held_digests(txn.db, "event", tombstoned_ids[0]) == []
+        assert [
+            e
+            for e in rt_v1.store.entries()
+            if e.kind == "cas.release" and e.meta.get("holder_id") == quarantined_job_id
+        ] == []
+        assert [
+            (e.actor, e.meta.get("reason"))
+            for e in rt_v1.store.entries()
+            if e.kind == "cas.release" and e.meta.get("holder_id") == tombstoned_ids[0]
+        ] == [("system:cas", "tombstoned")]
+        assert [
+            e.actor
+            for e in rt_v1.store.entries()
+            if e.kind == "policy.tombstone" and e.meta.get("holder_id") == tombstoned_ids[0]
+        ] == ["system:policy"]
+
+        for negative_id in (corrupt_ids[0], pol_job_ids[0]):
+            n_row = _read_v1(negative_id)
+            assert (n_row.state, n_row.attempt, n_row.reason) == (JobState.LEASED, 1, None)
+            assert [
+                e for e in rt_v1.store.entries() if e.kind == "job.terminal" and e.meta.get("job_id") == negative_id
+            ] == []
+
+        # Only the 2 negative-control leased jobs are requeued; policy-blocked FAILED jobs are never requeued.
+        assert svc_v1.recover(rt_v1.lease.epoch) == RecoveryCounts(
+            invocations_unknown=0, jobs_requeued=2, jobs_dead_lettered=0
+        )
+        for blocked_id in (quarantined_job_id, tombstoned_ids[0]):
+            b_after = _read_v1(blocked_id)
+            assert (b_after.state, b_after.attempt) == (JobState.FAILED, 1)
+    finally:
+        rt_v1.close()
+
+
 
