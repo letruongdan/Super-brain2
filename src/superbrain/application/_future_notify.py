@@ -1,4 +1,4 @@
-"""Safe concurrent ``Future`` settlement and off-cutoff-path callback dispatch helpers."""
+"""Safe concurrent ``Future`` settlement and fault-tolerant off-cutoff callback notifier."""
 
 from __future__ import annotations
 
@@ -43,26 +43,111 @@ def safe_cancel(fut: Future[_T]) -> bool:
     return False
 
 
-def dispatch_async_thunks(thunks: Sequence[Callable[[], None]]) -> None:
-    """Execute notification thunks on bounded daemon worker threads outside caller locks & cutoff path."""
-    if not thunks:
-        return
-    queue: deque[Callable[[], None]] = deque(thunks)
-    q_lock = threading.Lock()
-    worker_count = min(len(queue), _MAX_NOTIFY_WORKERS)
+class AsyncThunkNotifier:
+    """Retained-queue async callback notifier with pre-started standby worker and ``Thread.start`` fallback."""
 
-    def _drain() -> None:
+    def __init__(self, *, max_workers: int = _MAX_NOTIFY_WORKERS) -> None:
+        self._max_workers = max(1, max_workers)
+        self._cond = threading.Condition()
+        self._queue: deque[Callable[[], None]] = deque()
+        self._active_workers = 0
+        self._idle_workers = 0
+        self._started = False
+        self._closed = False
+
+    def start(self) -> None:
+        """Pre-start one standby daemon worker so shutdown cancellation never depends on late thread creation."""
+        with self._cond:
+            if self._started or self._closed:
+                return
+            self._started = True
+            self._active_workers += 1
+        worker = threading.Thread(
+            target=self._standby_worker,
+            name="superbrain-cancel-notifier",
+            daemon=True,
+        )
+        try:
+            worker.start()
+        except RuntimeError:
+            with self._cond:
+                self._active_workers -= 1
+                self._started = False
+            self._drain_if_workerless()
+
+    def submit(self, thunks: Sequence[Callable[[], None]]) -> None:
+        """Enqueue ``thunks`` before spawning burst helpers; survive ``Thread.start`` ``RuntimeError`` without loss."""
+        if not thunks:
+            return
+        with self._cond:
+            self._queue.extend(thunks)
+            needed = len(self._queue) - self._idle_workers
+            avail = self._max_workers - self._active_workers
+            to_spawn = min(needed, avail) if needed > 0 and avail > 0 else 0
+            self._active_workers += to_spawn
+            self._cond.notify_all()
+
+        unstarted = to_spawn
+        for idx in range(to_spawn):
+            helper = threading.Thread(
+                target=self._burst_worker,
+                name=f"superbrain-cancel-notify-{idx}",
+                daemon=True,
+            )
+            try:
+                helper.start()
+                unstarted -= 1
+            except RuntimeError:
+                break
+        if unstarted:
+            with self._cond:
+                self._active_workers -= unstarted
+        self._drain_if_workerless()
+
+    def _drain_if_workerless(self) -> None:
         while True:
-            with q_lock:
-                if not queue:
+            with self._cond:
+                if not self._queue or self._active_workers > 0:
                     return
-                fn = queue.popleft()
+                fn = self._queue.popleft()
             with contextlib.suppress(Exception):
                 fn()
 
-    for idx in range(worker_count):
-        threading.Thread(
-            target=_drain,
-            name=f"superbrain-cancel-notify-{idx}",
-            daemon=True,
-        ).start()
+    def close(self) -> None:
+        """Allow the standby worker to exit once all queued thunks have drained."""
+        with self._cond:
+            self._closed = True
+            self._cond.notify_all()
+
+    def _standby_worker(self) -> None:
+        while True:
+            with self._cond:
+                while not self._queue and not self._closed:
+                    self._idle_workers += 1
+                    try:
+                        self._cond.wait()
+                    finally:
+                        self._idle_workers -= 1
+                if not self._queue and self._closed:
+                    self._active_workers -= 1
+                    return
+                fn = self._queue.popleft()
+            with contextlib.suppress(Exception):
+                fn()
+
+    def _burst_worker(self) -> None:
+        while True:
+            with self._cond:
+                if not self._queue:
+                    self._active_workers -= 1
+                    return
+                fn = self._queue.popleft()
+            with contextlib.suppress(Exception):
+                fn()
+
+
+def dispatch_async_thunks(thunks: Sequence[Callable[[], None]]) -> None:
+    """Execute notification thunks asynchronously with retained-queue ``Thread.start`` fallback."""
+    if not thunks:
+        return
+    AsyncThunkNotifier().submit(thunks)

@@ -373,7 +373,7 @@ def serve(
         with _signal_stop_guard(effective_stop):
             try:
                 while not effective_stop.wait(timeout=0.25):
-                    if loop.wait_closed(timeout=0.0) is not None:
+                    if loop.is_stopping or loop.wait_closed(timeout=0.0) is not None:
                         break
             except KeyboardInterrupt:
                 effective_stop.set()

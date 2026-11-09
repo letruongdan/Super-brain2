@@ -10,11 +10,12 @@ import time
 from collections import deque
 from collections.abc import Callable, Mapping
 from concurrent.futures import Future
+from dataclasses import replace
 from typing import Protocol, TypeVar
 
 from superbrain.application._auth_gate import AuthGate, evaluate_shallow_health
 from superbrain.application._future_notify import (
-    dispatch_async_thunks,
+    AsyncThunkNotifier,
     safe_set_exception,
     safe_set_result,
 )
@@ -67,6 +68,12 @@ def _resolved_reply_future(reply: OwnerReply) -> Future[OwnerReply]:
     fut: Future[OwnerReply] = Future()
     safe_set_result(fut, reply)
     return fut
+
+
+def _error_reply_future(code: ErrorCode, message: str) -> Future[OwnerReply]:
+    return _resolved_reply_future(
+        OwnerReply(envelope=make_checked_error(code, message), grant_stamp=None, send_completion=None)
+    )
 
 
 class OwnerSession(Protocol):
@@ -165,8 +172,14 @@ class OwnerLoop:
         self._overrun_lock = threading.Lock()
         self._overrun_cancelled = False
         self._cancelled_requests = 0
+        self._notifier = AsyncThunkNotifier()
         self._owner_thread: threading.Thread | None = None
         self._arbiter_thread: threading.Thread | None = None
+
+    @property
+    def is_stopping(self) -> bool:
+        with self._lifecycle_lock:
+            return self._stopping
 
     @property
     def ready(self) -> Ready | None:
@@ -242,13 +255,7 @@ class OwnerLoop:
             stopping = self._stopping
 
         if session is None or stopping:
-            return _resolved_reply_future(
-                OwnerReply(
-                    envelope=make_checked_error(ErrorCode.DAEMON_UNAVAILABLE, "daemon unavailable"),
-                    grant_stamp=None,
-                    send_completion=None,
-                )
-            )
+            return _error_reply_future(ErrorCode.DAEMON_UNAVAILABLE, "daemon unavailable")
 
         is_shallow_health = command.tool == "get_health" and not (
             isinstance(command.arguments, Mapping) and command.arguments.get("deep") is True
@@ -264,31 +271,15 @@ class OwnerLoop:
                     loop_ready=(self.ready is not None),
                 )
             except BrainError as err:
-                reply = OwnerReply(
-                    envelope=make_checked_error(err.code, err.message),
-                    grant_stamp=None,
-                    send_completion=None,
-                )
+                return _error_reply_future(err.code, err.message)
             return _resolved_reply_future(reply)
 
         try:
             now_utc, _ = require_aware_utc(session.clock.now())
         except BrainError as err:
-            return _resolved_reply_future(
-                OwnerReply(
-                    envelope=make_checked_error(err.code, err.message),
-                    grant_stamp=None,
-                    send_completion=None,
-                )
-            )
+            return _error_reply_future(err.code, err.message)
         if now_utc >= session.ready.tls_not_after:
-            return _resolved_reply_future(
-                OwnerReply(
-                    envelope=make_checked_error(ErrorCode.DAEMON_UNAVAILABLE, "daemon unavailable"),
-                    grant_stamp=None,
-                    send_completion=None,
-                )
-            )
+            return _error_reply_future(ErrorCode.DAEMON_UNAVAILABLE, "daemon unavailable")
 
         receive_ns = deadline_ns - TOTAL_REQUEST_BUDGET_NS
         fut: Future[OwnerReply] = Future()
@@ -310,7 +301,7 @@ class OwnerLoop:
                 try:
                     res = fn(session)
                 except BrainError as err:
-                    safe_set_exception(fut, err)
+                    safe_set_exception(fut, BrainError(err.code, err.message))
                 except Exception:  # noqa: BLE001
                     safe_set_exception(fut, BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure"))
                 else:
@@ -362,7 +353,7 @@ class OwnerLoop:
                 internal_tasks = self._drain_pending_internal()
                 self._owner_wake.set()
             cancelled_total = self._cancelled_requests
-        dispatch_async_thunks((*reply_thunks, *internal_tasks))
+        self._notifier.submit((*reply_thunks, *internal_tasks))
         return cancelled_total
 
     def stop(self, grace_s: float = DEFAULT_SHUTDOWN_GRACE_S) -> ShutdownReport:
@@ -397,16 +388,12 @@ class OwnerLoop:
 
         remaining = max(0.0, wall_deadline - time.perf_counter())
         if self._closed_done.wait(timeout=remaining):
-            self._join_and_adopt_if_failed(session)
-            assert self._final_report is not None
-            return self._final_report
+            return self._join_and_adopt_if_failed(session, wall_deadline)
 
         # Grace budget expired while owner thread is still busy/blocked -> cancel uncommitted & report OVERRUN!
         cancelled_total = self._trigger_overrun(session)
         if self._closed_done.is_set():
-            self._join_and_adopt_if_failed(session)
-            assert self._final_report is not None
-            return self._final_report
+            return self._join_and_adopt_if_failed(session, wall_deadline)
         drained, worker_drained = session.shutdown_metrics()
         return ShutdownReport(
             state=ShutdownState.OVERRUN,
@@ -418,22 +405,46 @@ class OwnerLoop:
         )
 
     def wait_closed(self, timeout: float | None = None) -> ShutdownReport | None:
-        if not self._closed_done.wait(timeout=timeout):
+        deadline = None if timeout is None else time.perf_counter() + max(0.0, float(timeout))
+        rem = None if deadline is None else max(0.0, deadline - time.perf_counter())
+        if not self._closed_done.wait(timeout=rem):
             return None
         if self._owner_thread is not None and threading.current_thread() is not self._owner_thread:
-            self._owner_thread.join(timeout=timeout)
-            if self._session is not None and not self._owner_thread.is_alive():
+            rem = None if deadline is None else max(0.0, deadline - time.perf_counter())
+            self._owner_thread.join(timeout=rem)
+            if self._owner_thread.is_alive():
+                return None
+            if self._session is not None:
                 self._adopt_failed_close(self._session, self._owner_thread)
         if self._arbiter_thread is not None and threading.current_thread() is not self._arbiter_thread:
-            self._arbiter_thread.join(timeout=timeout)
-        return self._final_report
+            rem = None if deadline is None else max(0.0, deadline - time.perf_counter())
+            self._arbiter_thread.join(timeout=rem)
+            if self._arbiter_thread.is_alive():
+                return None
+        with self._lifecycle_lock:
+            return self._final_report
 
-    def _join_and_adopt_if_failed(self, session: OwnerSession) -> None:
+    def _join_and_adopt_if_failed(self, session: OwnerSession, wall_deadline: float) -> ShutdownReport:
         if self._owner_thread is not None and threading.current_thread() is not self._owner_thread:
-            self._owner_thread.join()
+            self._owner_thread.join(timeout=max(0.01, wall_deadline - time.perf_counter()))
             self._adopt_failed_close(session, self._owner_thread)
         if self._arbiter_thread is not None and threading.current_thread() is not self._arbiter_thread:
-            self._arbiter_thread.join()
+            self._arbiter_thread.join(timeout=max(0.005, wall_deadline - time.perf_counter()))
+        owner_alive = self._owner_thread is not None and self._owner_thread.is_alive()
+        arbiter_alive = self._arbiter_thread is not None and self._arbiter_thread.is_alive()
+        if owner_alive or arbiter_alive:
+            with self._overrun_lock:
+                self._drain_expired = True
+            with self._lifecycle_lock:
+                rep = self._final_report
+                assert rep is not None
+                if rep.state is ShutdownState.STOPPED:
+                    rep = replace(rep, state=ShutdownState.OVERRUN, error_code=ErrorCode.DEADLINE_EXCEEDED)
+                    self._final_report = rep
+                return rep
+        with self._lifecycle_lock:
+            assert self._final_report is not None
+            return self._final_report
 
     def _adopt_failed_close(self, session: OwnerSession, owner_thread: threading.Thread) -> None:
         with self._lifecycle_lock:
@@ -484,6 +495,7 @@ class OwnerLoop:
         with self._lifecycle_lock:
             self._session = session
             self._ready_value = session.ready
+        self._notifier.start()
         arbiter = threading.Thread(
             target=self._arbiter_main,
             args=(session,),
@@ -554,24 +566,27 @@ class OwnerLoop:
                 self._trigger_overrun(session)
             with self._overrun_lock:
                 overrun = self._drain_expired
-                cancelled_total = self._cancelled_requests
                 self._drain_expired = True
-            dispatch_async_thunks(self._drain_pending_internal())
+            self._notifier.submit(self._drain_pending_internal())
+            self._notifier.close()
             self._arbiter_stop = True
             self._arbiter_wake.set()
-            arbiter.join(timeout=1.0)
+            arb_wait = 1.0 if unplanned_exit else min(1.0, max(0.005, self._stop_wall_deadline - time.perf_counter()))
+            arbiter.join(timeout=arb_wait)
+            with self._overrun_lock:
+                overrun = overrun or self._overrun_cancelled
+                cancelled_total = self._cancelled_requests
             report = session.teardown_on_owner(
                 overrun=overrun,
                 cancelled_requests=cancelled_total,
             )
             if unexpected_error_code is not None and report.state is not ShutdownState.CLOSE_FAILED:
-                report = ShutdownReport(
+                report = replace(
+                    report,
                     state=ShutdownState.CLOSE_FAILED,
-                    drained_requests=report.drained_requests,
-                    cancelled_requests=report.cancelled_requests,
                     worker_drained=False,
-                    endpoint_removed=report.endpoint_removed,
                     error_code=unexpected_error_code,
                 )
-            self._final_report = report
+            with self._lifecycle_lock:
+                self._final_report = report
             self._closed_done.set()
