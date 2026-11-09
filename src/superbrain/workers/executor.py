@@ -118,14 +118,17 @@ class JobExecutor:
         self._items: queue.Queue[WorkItem | None] = queue.Queue()
         self._commands: queue.Queue[WorkerCommand] = queue.Queue()
         self._cancel_events: dict[str, threading.Event] = {}
+        self._submit_lock = threading.Lock()
         self._lock = threading.Lock()
+        self._cancel_lock = threading.Lock()
         self._closed = False
         self._clean_stop = False
         self._unexpected_exit = False
+        self._in_flight = 0
         self._thread: threading.Thread | None = None
 
     def start(self) -> None:
-        with self._lock:
+        with self._submit_lock, self._lock:
             if self._closed:
                 raise BrainError(ErrorCode.DAEMON_UNAVAILABLE, "daemon unavailable")
             if self._thread is not None:
@@ -133,6 +136,16 @@ class JobExecutor:
             thread = threading.Thread(target=self._run, name="superbrain-job-worker", daemon=True)
             self._thread = thread
         thread.start()
+
+    @property
+    def is_closed(self) -> bool:
+        with self._lock:
+            return self._closed
+
+    @property
+    def in_flight(self) -> int:
+        with self._cancel_lock:
+            return self._in_flight
 
     @property
     def is_drained(self) -> bool:
@@ -145,11 +158,13 @@ class JobExecutor:
 
     def close(self, timeout_s: float = 5.0) -> bool:
         """Stop after the current item; items still queued are dropped (the owner recovers them by epoch)."""
-        with self._lock:
+        with self._submit_lock, self._lock:
             thread = self._thread
             if not self._closed:
                 self._closed = True
-                for event in self._cancel_events.values():
+                with self._cancel_lock:
+                    events = tuple(self._cancel_events.values())
+                for event in events:
                     event.set()
                 if thread is not None:
                     self._items.put(None)
@@ -165,21 +180,34 @@ class JobExecutor:
         if not isinstance(item, WorkItem):
             raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
         unregistered = False
-        with self._lock:
+        with self._submit_lock:
             if self._closed:
                 raise BrainError(ErrorCode.DAEMON_UNAVAILABLE, "daemon unavailable")
             if item.spec.kind not in self._handlers:
-                self._commands.put(WorkerFailed(item.lease, False, JobErrorCode.HANDLER_UNAVAILABLE))
+                with self._lock:
+                    if self._closed:
+                        raise BrainError(ErrorCode.DAEMON_UNAVAILABLE, "daemon unavailable")
+                    self._commands.put(WorkerFailed(item.lease, False, JobErrorCode.HANDLER_UNAVAILABLE))
                 unregistered = True
             else:
-                self._cancel_events[item.lease.job_id] = threading.Event()
-                self._items.put(item)
+                event = threading.Event()
+                with self._cancel_lock:
+                    self._cancel_events[item.lease.job_id] = event
+                    self._in_flight += 1
+                try:
+                    self._items.put(item)
+                except BaseException:
+                    with self._cancel_lock:
+                        self._in_flight -= 1
+                        if self._cancel_events.get(item.lease.job_id) is event:
+                            self._cancel_events.pop(item.lease.job_id, None)
+                    raise
         if unregistered:
             self._notify_command()
 
     def cancel(self, job_id: str) -> None:
         """Signal the cooperative cancel of ``job_id`` (no-op when the worker does not hold it)."""
-        with self._lock:
+        with self._cancel_lock:
             event = self._cancel_events.get(job_id)
         if event is not None:
             event.set()
@@ -203,7 +231,7 @@ class JobExecutor:
         with self._lock:
             if self._closed:
                 return
-        self._commands.put(cmd)
+            self._commands.put(cmd)
         self._notify_command()
 
     def _run(self) -> None:
@@ -216,13 +244,21 @@ class JobExecutor:
                     return
                 with self._lock:
                     is_closed = self._closed
+                with self._cancel_lock:
                     registered = self._cancel_events.get(item.lease.job_id)
                     cancelled = registered if registered is not None else threading.Event()
+                decremented = False
                 try:
                     if not is_closed and not cancelled.is_set():
-                        self._emit_terminal_command(self._execute(item, cancelled))
+                        result_cmd = self._execute(item, cancelled)
+                        with self._cancel_lock:
+                            self._in_flight -= 1
+                            decremented = True
+                        self._emit_terminal_command(result_cmd)
                 finally:
-                    with self._lock:
+                    with self._cancel_lock:
+                        if not decremented:
+                            self._in_flight -= 1
                         if registered is not None and self._cancel_events.get(item.lease.job_id) is registered:
                             self._cancel_events.pop(item.lease.job_id, None)
         finally:

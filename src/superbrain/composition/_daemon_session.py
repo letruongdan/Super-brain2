@@ -255,39 +255,39 @@ class _AdmittedOwnerSession(OwnerSession):
 
     def _claim_and_submit_job(self) -> bool:
         assert self._executor is not None
-        claimed_any = False
-        while True:
-            try:
-                lease = self._job_service.lease_next(self._rt.lease.epoch, self._clock.now())
-            except BrainError as err:
-                if err.code is ErrorCode.POLICY_UNAVAILABLE:
-                    self._auth_gate.invalidate()
-                _LOGGER.warning("daemon job lease failed (code=%s)", err.code.value)
-                break
-            if lease is None:
-                break
-            claimed_any = True
-            try:
-                spec = self._job_service.resolve_leased_spec(lease)
-                if spec is None:
-                    continue
-                self._job_service.start(lease)
-                item = WorkItem(
-                    lease=lease,
-                    spec=spec,
-                    invocation_ids=(),
-                    deadline_ns=self._monotonic_clock.monotonic_ns() + _DAEMON_WORKER_ITEM_BUDGET_NS,
-                )
-                self._executor.submit(item)
-                break
-            except BrainError as err:
-                if err.code is ErrorCode.REVISION_CONFLICT:
-                    continue
-                if err.code is ErrorCode.POLICY_UNAVAILABLE:
-                    self._auth_gate.invalidate()
-                _LOGGER.warning("daemon job claim failed (code=%s)", err.code.value)
-                break
-        return claimed_any
+        if self._executor.is_closed or self._executor.in_flight != 0:
+            return False
+        try:
+            lease = self._job_service.lease_next(self._rt.lease.epoch, self._clock.now())
+        except BrainError as err:
+            if err.code is ErrorCode.POLICY_UNAVAILABLE:
+                self._auth_gate.invalidate()
+            _LOGGER.warning("daemon job lease failed (code=%s)", err.code.value)
+            return False
+        if lease is None:
+            return False
+        try:
+            spec = self._job_service.resolve_leased_spec(lease)
+            if spec is None:
+                return True
+            if self._executor.is_closed:
+                return True
+            self._job_service.start(lease)
+            item = WorkItem(
+                lease=lease,
+                spec=spec,
+                invocation_ids=(),
+                deadline_ns=self._monotonic_clock.monotonic_ns() + _DAEMON_WORKER_ITEM_BUDGET_NS,
+            )
+            self._executor.submit(item)
+            return True
+        except BrainError as err:
+            if err.code is ErrorCode.REVISION_CONFLICT:
+                return True
+            if err.code is ErrorCode.POLICY_UNAVAILABLE:
+                self._auth_gate.invalidate()
+            _LOGGER.warning("daemon job claim failed (code=%s)", err.code.value)
+            return False
 
     def has_pending_owner_work(self) -> bool:
         return self._bridge.queue_depth() > 0

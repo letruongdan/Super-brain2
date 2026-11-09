@@ -20,7 +20,7 @@ from superbrain.core.jsonvalue import JsonValue
 
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 _OPAQUE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
-_ACTOR = re.compile(r"(user|system|principal):[a-z0-9][a-z0-9._:-]{0,63}")
+_ACTOR = re.compile(r"(?:(?:user|system):[a-z0-9][a-z0-9._:-]{0,63}|principal:[A-Za-z0-9][A-Za-z0-9._-]{0,127})")
 _OWNER_ID = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 _KIND_NAME = re.compile(r"[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+")
 _TIMESTAMP = re.compile(r"([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})(\.[0-9]{1,6})?Z")

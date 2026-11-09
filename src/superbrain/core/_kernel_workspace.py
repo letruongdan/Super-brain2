@@ -116,7 +116,7 @@ DEFAULT_STRUCTURAL_ID_FIELDS: frozenset[str] = frozenset(
 
 _TIMESTAMP_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}Z")
 _KIND_NAME_RE = re.compile(r"[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+")
-_ACTOR_RE = re.compile(r"(user|system|principal):[a-z0-9][a-z0-9._:-]{0,63}")
+_ACTOR_RE = re.compile(r"(?:(?:user|system):[a-z0-9][a-z0-9._:-]{0,63}|principal:[A-Za-z0-9][A-Za-z0-9._-]{0,127})")
 _PATH_SEGMENT_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}")
 _MAX_FIELD_PATH_DEPTH = 32
 
