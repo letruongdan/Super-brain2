@@ -98,7 +98,7 @@ class JobService:
         *,
         writer_epoch: int,
         cancel_signal: Callable[[str], None] | None = None,
-        claim_commit_guard: Callable[[Callable[[], None]], bool] | None = None,
+        claim_commit_guard: Callable[[], bool] | None = None,
     ) -> None:
         self._store = store
         self._stager = stager
@@ -106,11 +106,11 @@ class JobService:
         self._clock = clock
         self._writer_epoch = require_positive_int(writer_epoch)
         self._cancel_signal = cancel_signal
-        self._claim_commit_guard: Callable[[Callable[[], None]], bool] | None = None
+        self._claim_commit_guard: Callable[[], bool] | None = None
         self.set_claim_commit_guard(claim_commit_guard)
 
-    def set_claim_commit_guard(self, guard: Callable[[Callable[[], None]], bool] | None) -> None:
-        """Install or clear the owner-side admission fence guarding ``job.leased`` record append."""
+    def set_claim_commit_guard(self, guard: Callable[[], bool] | None) -> None:
+        """Install or clear the zero-argument RAM predicate guarding ``job.leased`` record append."""
         if guard is not None and not callable(guard):
             raise _invalid()
         self._claim_commit_guard = guard
@@ -147,20 +147,10 @@ class JobService:
             due = tx.due_jobs(now_utc, 1)
             if not due:
                 return None
+            if guard is not None and not guard():
+                return None
             claimed = JobLease(job_id=due[0].job_id, attempt=due[0].attempt, writer_epoch=epoch, lease_id=new_id())
-            record = KernelRecord("job.leased", _lease_meta(claimed))
-            if guard is not None:
-                appended = False
-
-                def append_lease() -> None:
-                    nonlocal appended
-                    tx.append_record(record)
-                    appended = True
-
-                if not guard(append_lease) or not appended:
-                    return None
-            else:
-                tx.append_record(record)
+            tx.append_record(KernelRecord("job.leased", _lease_meta(claimed)))
             return claimed
 
         return self._store.transact(lease)

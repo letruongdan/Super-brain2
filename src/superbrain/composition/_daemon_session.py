@@ -268,20 +268,13 @@ class _AdmittedOwnerSession(OwnerSession):
                 return False
             return self._executor.can_claim()
 
-    def _admit_claim_commit(self, append_lease: Callable[[], None]) -> bool:
-        if self._executor is None:
-            return False
-        with self._claim_lock:
-            if self._claim_closed or self._is_stopping() or not self._executor.can_claim():
-                return False
-            append_lease()
-            return True
+    def _admit_claim_commit(self) -> bool:
+        return self._is_claim_open()
 
     def _can_start_claimed_job(self) -> bool:
-        if self._executor is None:
+        if self._executor is None or self._is_stopping() or self._executor.is_closed:
             return False
-        with self._claim_lock:
-            return not self._claim_closed and not self._is_stopping() and not self._executor.is_closed
+        return self._is_claim_open()
 
     def _close_claim_gate(self) -> None:
         with self._claim_lock:
@@ -304,6 +297,8 @@ class _AdmittedOwnerSession(OwnerSession):
             return False
         if lease is None:
             return False
+        if not self._can_start_claimed_job():
+            return True
         try:
             spec = self._job_service.resolve_leased_spec(lease)
             if spec is None:
