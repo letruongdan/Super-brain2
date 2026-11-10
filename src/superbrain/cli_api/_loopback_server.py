@@ -203,7 +203,7 @@ class LoopbackServer:
 
         if abort_thread is not None:
             rem_abort = max(0.0, effective_dl - time.perf_counter())
-            _safe_join(abort_thread, rem_abort if timed_out else max(0.005, rem_abort))
+            _safe_join(abort_thread, rem_abort)
 
         with self._lock:
             still_alive = any(w.is_alive() for w in self._workers.values()) or (
