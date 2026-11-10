@@ -594,9 +594,12 @@ def test_pin_checked_before_any_http(
             assert exc_emfile_call.value.request_may_have_run is False
 
         # 2. wrap_socket() raises ConnectionResetError(ECONNRESET) -> underlying raw socket closed
+        orig_wrap = ssl.SSLContext.wrap_socket
         wrap_reset_socks: list[socket.socket] = []
 
         def fail_wrap_reset(_self: ssl.SSLContext, sock: socket.socket, *args: Any, **kwargs: Any) -> Any:
+            if kwargs.get("server_side"):
+                return orig_wrap(_self, sock, *args, **kwargs)
             wrap_reset_socks.append(sock)
             raise ConnectionResetError(errno.ECONNRESET, "fixture wrap reset")
 
@@ -620,6 +623,8 @@ def test_pin_checked_before_any_http(
         wrap_timeout_socks: list[socket.socket] = []
 
         def fail_wrap_timeout(_self: ssl.SSLContext, sock: socket.socket, *args: Any, **kwargs: Any) -> Any:
+            if kwargs.get("server_side"):
+                return orig_wrap(_self, sock, *args, **kwargs)
             wrap_timeout_socks.append(sock)
             raise TimeoutError("fixture wrap timeout")
 
@@ -636,6 +641,8 @@ def test_pin_checked_before_any_http(
         wrap_cert_socks: list[socket.socket] = []
 
         def fail_wrap_cert(_self: ssl.SSLContext, sock: socket.socket, *args: Any, **kwargs: Any) -> Any:
+            if kwargs.get("server_side"):
+                return orig_wrap(_self, sock, *args, **kwargs)
             wrap_cert_socks.append(sock)
             raise ssl.SSLCertVerificationError("fixture wrap cert verify")
 
@@ -650,7 +657,6 @@ def test_pin_checked_before_any_http(
 
         # 5. getpeercert() raises OSError(ECONNRESET) -> DAEMON_UNAVAILABLE and ssl_sock closed
         wrapped_ssl_socks: list[ssl.SSLSocket] = []
-        orig_wrap = ssl.SSLContext.wrap_socket
 
         def intercept_wrap_peercert(
             self_ctx: ssl.SSLContext,
@@ -658,6 +664,8 @@ def test_pin_checked_before_any_http(
             *args: Any,
             **kwargs: Any,
         ) -> ssl.SSLSocket:
+            if kwargs.get("server_side"):
+                return orig_wrap(self_ctx, sock, *args, **kwargs)
             ssl_sock = orig_wrap(self_ctx, sock, *args, **kwargs)
             wrapped_ssl_socks.append(ssl_sock)
 
