@@ -30,6 +30,7 @@ from superbrain.core._wire_jsonrpc import (
     validate_jsonrpc_id,
 )
 from superbrain.core.canonical import canonical_json
+from superbrain.core.client_profile import SelectedWorkspace
 from superbrain.core.errors import (
     BrainError,
     ErrorCode,
@@ -70,6 +71,7 @@ __all__ = [
     "MAX_WIRE_TEXT_BYTES",
     "MCP_PROTOCOL_VERSION",
     "SCHEMA_VERSION",
+    "WORKSPACE_SCOPED_TOOLS",
     "canonical_request_payload",
     "encode_envelope",
     "encode_jsonrpc_error",
@@ -79,6 +81,7 @@ __all__ = [
     "make_mcp_tool_result",
     "make_success_envelope",
     "normalize_call",
+    "normalize_shim_args",
     "parse_json",
     "parse_jsonrpc_request",
     "validate_jsonrpc_id",
@@ -92,6 +95,16 @@ MAX_CONTEXT_BUDGET_TOKENS = 4_000
 DEFAULT_SEARCH_LIMIT = 20
 MAX_SEARCH_LIMIT = 100
 
+WORKSPACE_SCOPED_TOOLS: frozenset[str] = frozenset(
+    {
+        "prepare_task",
+        "search_knowledge",
+        "get_artifact",
+        "submit_episode",
+        "record_outcome",
+        "request_improvement",
+    }
+)
 _KNOWN_TOOLS = frozenset(EXPECTED_TOOL_ORDER)
 _IDENTITY_FIELDS = ("principal_id", "owner_id", "harness_id", "machine_id")
 _FORBIDDEN_AUTHORITY_KEYS = frozenset(
@@ -401,6 +414,73 @@ def normalize_call(
         correlation_id=correlation_id,
         selected_scope=selected_scope,
     )
+
+
+def _check_shim_selector_match(
+    tool: str,
+    out: dict[str, JsonValue],
+    selected: SelectedWorkspace,
+) -> None:
+    has_hint = "workspace_hint" in out
+    has_ws = "workspace_id" in out
+    has_chk = "checkout_id" in out
+
+    if tool == "prepare_task":
+        if not has_hint and not has_ws and not has_chk:
+            out["workspace_hint"] = selected.alias
+            return
+        if has_hint and not has_ws and not has_chk:
+            hint = require_workspace_hint(out["workspace_hint"])
+            if hint != selected.alias:
+                raise BrainError(ErrorCode.IDENTITY_MISMATCH, "identity mismatch")
+            return
+        if not has_hint and has_ws and has_chk:
+            ws_id = require_opaque_id(out["workspace_id"], label="workspace_id")
+            chk_id = require_opaque_id(out["checkout_id"], label="checkout_id")
+            if ws_id != selected.scope.repo_id or chk_id != selected.scope.checkout_id:
+                raise BrainError(ErrorCode.IDENTITY_MISMATCH, "identity mismatch")
+            return
+        raise BrainError(ErrorCode.INVALID_INPUT, "mixed or invalid workspace selector")
+
+    if has_hint:
+        hint = require_workspace_hint(out["workspace_hint"])
+        if hint != selected.alias:
+            raise BrainError(ErrorCode.IDENTITY_MISMATCH, "identity mismatch")
+    if has_ws:
+        ws_id = require_opaque_id(out["workspace_id"], label="workspace_id")
+        if ws_id != selected.scope.repo_id:
+            raise BrainError(ErrorCode.IDENTITY_MISMATCH, "identity mismatch")
+    if has_chk:
+        chk_id = require_opaque_id(out["checkout_id"], label="checkout_id")
+        if chk_id != selected.scope.checkout_id:
+            raise BrainError(ErrorCode.IDENTITY_MISMATCH, "identity mismatch")
+
+
+def normalize_shim_args(
+    tool: str,
+    args: JsonValue | Mapping[str, JsonValue],
+    selected: SelectedWorkspace | None,
+) -> dict[str, JsonValue]:
+    """Normalize client shim arguments against the profile's bound ``SelectedWorkspace`` before fingerprinting."""
+    if not isinstance(tool, str) or tool not in _KNOWN_TOOLS:
+        raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+    if not isinstance(args, dict):
+        raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+    if selected is not None and not isinstance(selected, SelectedWorkspace):
+        raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+    _validate_wire_structure(args)
+
+    out: dict[str, JsonValue] = copy.deepcopy(args)
+    if "selected_scope" in out:
+        raise BrainError(ErrorCode.INVALID_INPUT, "forbidden client-supplied authority field")
+
+    if selected is None:
+        if tool in WORKSPACE_SCOPED_TOOLS:
+            raise BrainError(ErrorCode.CAPABILITY_UNAVAILABLE, "capability unavailable")
+        return out
+
+    _check_shim_selector_match(tool, out, selected)
+    return out
 
 
 def canonical_request_payload(call: Call) -> bytes:
