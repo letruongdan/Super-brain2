@@ -126,19 +126,21 @@ def run_installed_command(
 
 def verify_installed_wheel_isolation(env: InstalledEnv, *, cwd: Path) -> dict[str, JsonValue]:
     """Verify ``env.venv_python -I`` loads ``superbrain`` and packaged schema strictly from ``site-packages``."""
-    probe_code = (
-        "import importlib.resources, json, pathlib, superbrain; "
-        "from superbrain.core.wire import load_catalog; "
-        "cat = load_catalog(); "
-        "ref = importlib.resources.files('superbrain.core').joinpath('data', 'mcp-tools-v2.json'); "
-        "with importlib.resources.as_file(ref) as p: "
-        "    schema_file = str(pathlib.Path(p).resolve()); "
-        "print(json.dumps({"
-        "'module_file': str(pathlib.Path(superbrain.__file__).resolve()), "
-        "'schema_file': schema_file, "
-        "'schema_sha256': cat.schema_sha256, "
-        "'tool_names': list(cat.tools.keys())"
-        "}))"
+    probe_code = "\n".join(
+        [
+            "import importlib.resources, json, pathlib, superbrain",
+            "from superbrain.core.wire import load_catalog",
+            "cat = load_catalog()",
+            "ref = importlib.resources.files('superbrain.core').joinpath('data', 'mcp-tools-v2.json')",
+            "with importlib.resources.as_file(ref) as p:",
+            "    schema_file = str(pathlib.Path(p).resolve())",
+            "print(json.dumps({",
+            "    'module_file': str(pathlib.Path(superbrain.__file__).resolve()),",
+            "    'schema_file': schema_file,",
+            "    'schema_sha256': cat.schema_sha256,",
+            "    'tool_names': list(cat.tools.keys()),",
+            "}))",
+        ]
     )
     proc = subprocess.run(
         [str(env.venv_python), "-I", "-c", probe_code],

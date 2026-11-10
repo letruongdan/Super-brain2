@@ -490,9 +490,8 @@ def test_installed_migrate_respects_offline_lease(
         assert rc == 0
 
     # Verify original CAS blob is still intact after migration and serve.
-    shard = blob_digest.removeprefix("sha256:")[:2]
-    rest = blob_digest.removeprefix("sha256:")[2:]
-    assert (layout.cas_dir / shard / rest).read_bytes() == blob_payload
+    hex_ = blob_digest.removeprefix("sha256:")
+    assert (layout.cas_dir / hex_[:2] / hex_).read_bytes() == blob_payload
 
     # 6. Config pointing to missing root or wrong store_id is refused by `brain migrate --offline`.
     missing_mig_root = case_dir / "missing-migrate-root"
