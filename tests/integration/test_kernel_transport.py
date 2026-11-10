@@ -351,27 +351,31 @@ class TestTransportAdmission:
 
             # 3. Non-loopback peer IP accept guard (closed immediately before TLS/HTTP)
             orig_accept = socket.socket.accept
+            inject_active = True
 
             def mock_non_loopback_accept(sock_self: socket.socket) -> tuple[socket.socket, tuple[str, int]]:
+                nonlocal inject_active
                 conn, addr = orig_accept(sock_self)
-                if sock_self is h.bound.sock:
+                if inject_active and sock_self is h.bound.sock:
+                    inject_active = False
                     return conn, ("192.0.2.99", addr[1])
                 return conn, addr
 
-            monkeypatch.setattr(socket.socket, "accept", mock_non_loopback_accept)
-            try:
-                # Raw connect should be disconnected immediately
-                with socket.create_connection((h.ready.endpoint.host, h.ready.endpoint.port), timeout=2.0) as s_raw:
-                    # Reading raw socket should yield immediate EOF (b"")
-                    s_raw.settimeout(2.0)
-                    try:
-                        read_data = s_raw.recv(1024)
-                        assert read_data == b""
-                    except (ConnectionResetError, BrokenPipeError):
-                        pass
-                assert h.submit_count == 0
-            finally:
-                monkeypatch.undo()
+            with monkeypatch.context() as mp:
+                mp.setattr(socket.socket, "accept", mock_non_loopback_accept)
+                try:
+                    # Raw connect should be disconnected immediately
+                    with socket.create_connection((h.ready.endpoint.host, h.ready.endpoint.port), timeout=2.0) as s_raw:
+                        # Reading raw socket should yield immediate EOF (b"")
+                        s_raw.settimeout(2.0)
+                        try:
+                            read_data = s_raw.recv(1024)
+                            assert read_data == b""
+                        except (ConnectionResetError, BrokenPipeError):
+                            pass
+                    assert h.submit_count == 0
+                finally:
+                    inject_active = False
 
             # 4. Method / Route / Version / State validation
             # Wrong method on identity

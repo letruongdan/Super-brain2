@@ -24,7 +24,6 @@ from concurrent.futures import Future
 from pathlib import Path
 
 from superbrain.adapters.os import os_adapters
-from superbrain.adapters.os.permissions import WindowsPermissionGuard
 from superbrain.adapters.os.tls_material import create_store_tls
 from superbrain.application.owner_loop import OwnerLoop
 from superbrain.cli_api._loopback_server import (
@@ -58,11 +57,11 @@ def make_trusted_test_dir(label: str) -> Path:
     if sys.platform == "win32":
         base = Path(os.environ["LOCALAPPDATA"]) / "superbrain-tests" / f"{label}-{uuid.uuid4()}"
         base.mkdir(parents=True)
-        WindowsPermissionGuard().secure_directory(base)
+        os_adapters().permissions.secure_directory(base)
         return base
     base = Path(os.environ.get("TMPDIR", "/tmp")) / f"{label}-{uuid.uuid4()}"
     base.mkdir(parents=True, exist_ok=True)
-    base.chmod(0o700)
+    os_adapters().permissions.secure_directory(base)
     return base
 
 
@@ -235,14 +234,14 @@ class TransportHarness:
         return LoopbackTarget(
             endpoint=self.ready.endpoint,
             expected_store_id=self.store_id,
-            ca_pem=self.tls.cert_path.read_text(),
+            ca_pem=self.tls.ca_cert_path.read_text(encoding="utf-8"),
             leaf_cert_sha256=self.ready.leaf_cert_sha256,
         )
 
     def open_raw_tls_socket(self, timeout: float = 2.0) -> ssl.SSLSocket:
         """Open a raw TLS client connection to this listener."""
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        ctx.load_verify_locations(cadata=self.tls.cert_path.read_text())
+        ctx.load_verify_locations(cadata=self.tls.ca_cert_path.read_text(encoding="utf-8"))
         ctx.check_hostname = True
         raw_sock = socket.create_connection(
             (self.ready.endpoint.host, self.ready.endpoint.port),
