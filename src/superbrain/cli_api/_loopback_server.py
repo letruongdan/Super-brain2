@@ -21,7 +21,14 @@ from superbrain.cli_api._server_http import (
     write_json_response,
 )
 from superbrain.core.errors import BrainError, ErrorCode
-from superbrain.core.kernel import TOTAL_REQUEST_BUDGET_NS, CallResult, OwnerReply, Ready
+from superbrain.core.kernel import (
+    TOTAL_REQUEST_BUDGET_NS,
+    ArtifactSendAttempt,
+    CallResult,
+    OwnerReply,
+    Ready,
+    SendAttemptCompletion,
+)
 from superbrain.core.wire import encode_envelope, make_error_envelope
 
 MAX_ACTIVE_CONNECTIONS = 32
@@ -323,6 +330,7 @@ class LoopbackServer:
         while True:
             rem_ns = deadline_ns - int(self._monotonic_ns())
             if rem_ns <= 0 or self._past_stop_deadline():
+                self._abandon_reply_future(reply_fut)
                 return None
             wait_s = min(_REPLY_WAIT_SLICE_S, max(0.001, rem_ns / 1_000_000_000.0))
             with self._lock:
@@ -330,12 +338,154 @@ class LoopbackServer:
             if stop_dl is not None:
                 stop_rem = stop_dl - time.perf_counter()
                 if stop_rem <= 0:
+                    self._abandon_reply_future(reply_fut)
                     return None
                 wait_s = min(wait_s, max(0.001, stop_rem))
             try:
                 return reply_fut.result(timeout=wait_s)
             except FuturesTimeoutError:
                 continue
+
+    def _abandon_reply_future(self, reply_fut: Future[OwnerReply]) -> None:
+        claimed = False
+
+        def _on_late_reply(fut: Future[OwnerReply]) -> None:
+            nonlocal claimed
+            with self._lock:
+                if claimed:
+                    return
+                claimed = True
+            with contextlib.suppress(BaseException):
+                rep = fut.result()
+                if rep.send_completion is not None:
+                    wait_for_settle = threading.current_thread().name != "superbrain-owner-loop"
+                    self._interrupt_send(rep.send_completion, wait=wait_for_settle)
+
+        if reply_fut.done():
+            _on_late_reply(reply_fut)
+            return
+        reply_fut.add_done_callback(_on_late_reply)
+
+    def _settle_send_future(
+        self,
+        fut: Future[ArtifactSendAttempt],
+        phase: str,
+        *,
+        wait: bool,
+    ) -> None:
+        if not wait:
+            return
+        with self._lock:
+            stop_dl = self._stop_deadline if self._quiesced else None
+        timeout_s = max(0.01, min(1.0, stop_dl - time.perf_counter())) if stop_dl is not None else 1.0
+        try:
+            fut.result(timeout=timeout_s)
+        except FuturesTimeoutError:
+            return
+        except BrainError as err:
+            if err.code is not ErrorCode.DAEMON_UNAVAILABLE:
+                _LOGGER.error("loopback send settle failed (phase=%s, code=%s)", phase, err.code.value)
+        except Exception:  # noqa: BLE001
+            _LOGGER.error(
+                "loopback send settle failed (phase=%s, code=%s)",
+                phase,
+                ErrorCode.INTEGRITY_FAILURE.value,
+            )
+
+    def _finalize_send(self, completion: SendAttemptCompletion) -> None:
+        try:
+            fut = self._owner.finalize_send_attempt(completion)
+        except BrainError as err:
+            if err.code is not ErrorCode.DAEMON_UNAVAILABLE:
+                _LOGGER.error(
+                    "loopback finalize_send_attempt failed (phase=loopback_finalize_send, code=%s)",
+                    err.code.value,
+                )
+            return
+        self._settle_send_future(fut, "loopback_finalize_send", wait=True)
+
+    def _interrupt_send(self, completion: SendAttemptCompletion, *, wait: bool = True) -> None:
+        try:
+            fut = self._owner.interrupt_send_attempt(completion.send_attempt_id)
+        except BrainError as err:
+            if err.code is not ErrorCode.DAEMON_UNAVAILABLE:
+                _LOGGER.error(
+                    "loopback interrupt_send_attempt failed (phase=loopback_interrupt_send, code=%s)",
+                    err.code.value,
+                )
+            return
+        self._settle_send_future(fut, "loopback_interrupt_send", wait=wait)
+
+    def _write_200_best_effort(self, ssl_sock: ssl.SSLSocket, body: bytes, deadline_ns: int) -> None:
+        if int(self._monotonic_ns()) >= deadline_ns or self._past_stop_deadline():
+            return
+        with contextlib.suppress(HttpFramingError, TimeoutError, ssl.SSLError, OSError):
+            write_json_response(
+                ssl_sock,
+                status=200,
+                body=body,
+                close_conn=True,
+                deadline_ns=deadline_ns,
+                monotonic_ns=self._monotonic_ns,
+            )
+
+    def _release_owner_reply(
+        self,
+        ssl_sock: ssl.SSLSocket,
+        reply: OwnerReply,
+        tool_deadline_ns: int,
+    ) -> None:
+        attempt_settled = False
+        try:
+            payload = encode_envelope(reply.envelope)
+            if reply.envelope.get("ok") is True:
+                if int(self._monotonic_ns()) >= tool_deadline_ns or self._past_stop_deadline():
+                    return
+                try:
+                    granted = (
+                        reply.grant_stamp is not None
+                        and self._owner.auth_gate.authorize_stamp(reply.grant_stamp)
+                    )
+                except BrainError:
+                    granted = False
+
+                if not granted:
+                    revoked_env: CallResult = make_error_envelope(
+                        BrainError(ErrorCode.POLICY_UNAVAILABLE, "policy unavailable")
+                    )
+                    revoked_payload = encode_envelope(revoked_env)
+                    if reply.send_completion is not None:
+                        attempt_settled = True
+                        self._interrupt_send(reply.send_completion, wait=True)
+                    self._write_200_best_effort(ssl_sock, revoked_payload, tool_deadline_ns)
+                    return
+
+                if int(self._monotonic_ns()) >= tool_deadline_ns or self._past_stop_deadline():
+                    return
+                try:
+                    write_json_response(
+                        ssl_sock,
+                        status=200,
+                        body=payload,
+                        close_conn=True,
+                        deadline_ns=tool_deadline_ns,
+                        monotonic_ns=self._monotonic_ns,
+                    )
+                except (HttpFramingError, TimeoutError, ssl.SSLError, OSError):
+                    if reply.send_completion is not None:
+                        attempt_settled = True
+                        self._interrupt_send(reply.send_completion, wait=True)
+                    return
+
+                if reply.send_completion is not None:
+                    attempt_settled = True
+                    self._finalize_send(reply.send_completion)
+                return
+
+            self._write_200_best_effort(ssl_sock, payload, tool_deadline_ns)
+        finally:
+            if reply.send_completion is not None and not attempt_settled:
+                self._interrupt_send(reply.send_completion, wait=True)
 
     def _conn_worker(self, conn_id: int, raw_sock: socket.socket, accept_ns: int) -> None:
         ssl_sock: ssl.SSLSocket | None = None
@@ -399,39 +549,20 @@ class LoopbackServer:
                 unavail: CallResult = make_error_envelope(
                     BrainError(ErrorCode.DAEMON_UNAVAILABLE, "daemon unavailable")
                 )
-                with contextlib.suppress(HttpFramingError, OSError):
-                    write_json_response(
-                        ssl_sock,
-                        status=200,
-                        body=encode_envelope(unavail),
-                        close_conn=True,
-                        deadline_ns=tool_deadline_ns,
-                        monotonic_ns=self._monotonic_ns,
-                    )
+                self._write_200_best_effort(ssl_sock, encode_envelope(unavail), tool_deadline_ns)
                 return
 
             try:
                 reply_fut = self._owner.submit_reply(command, tool_deadline_ns)
                 reply = self._await_owner_reply(reply_fut, tool_deadline_ns)
             except BrainError as err:
-                envelope: CallResult = make_error_envelope(err)
-            else:
-                if reply is None:
-                    return
-                envelope = reply.envelope
-
-            if int(self._monotonic_ns()) >= tool_deadline_ns or self._past_stop_deadline():
+                err_env: CallResult = make_error_envelope(err)
+                self._write_200_best_effort(ssl_sock, encode_envelope(err_env), tool_deadline_ns)
                 return
-            payload = encode_envelope(envelope)
-            with contextlib.suppress(HttpFramingError, OSError):
-                write_json_response(
-                    ssl_sock,
-                    status=200,
-                    body=payload,
-                    close_conn=True,
-                    deadline_ns=tool_deadline_ns,
-                    monotonic_ns=self._monotonic_ns,
-                )
+
+            if reply is None:
+                return
+            self._release_owner_reply(ssl_sock, reply, tool_deadline_ns)
         except (TimeoutError, ssl.SSLError, OSError):
             return
         except BrainError as err:
