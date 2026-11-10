@@ -1,0 +1,937 @@
+"""Test support helpers for SP1 Increment 2 Task 7 (`T7b.2`: CLI, MCP shim, and wheel).
+
+Provides:
+- Installed wheel console-script runners (``brain`` and ``brain-mcp``) executing with a clean
+  environment (``PYTHONPATH``/``VIRTUAL_ENV`` stripped) and outside the repository checkout.
+- Owner-only file writers for ``ClientProfile``, ``DaemonConfig``, ``ca.pem``, and ``credential.txt``.
+- Foreground ``brain serve`` subprocess controller with Windows ``CreateToolhelp32Snapshot``
+  descendant worker PID tracking, ``CTRL_BREAK_EVENT`` / ``SIGTERM`` graceful stop, and
+  ``writer.lock`` release verification.
+- ``ShimTestDomain`` implementing ``KernelToolDomain`` over ``kernel_store_extensions()`` for
+  both in-process loopback tests and installed-wheel fixture-daemon subprocess tests.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import ctypes
+import ctypes.wintypes
+import datetime as dt
+import io
+import os
+import signal
+import subprocess
+import sys
+import threading
+import time
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
+from pathlib import Path
+from types import TracebackType
+from typing import TYPE_CHECKING, cast
+
+from superbrain.adapters.os import os_adapters
+from superbrain.adapters.os.daemon_config import read_client_endpoint
+from superbrain.adapters.os.locks import OsLockFactory
+from superbrain.application.dispatch import KernelToolDomain, PreparedEffect
+from superbrain.composition.daemon_entry import serve_config_path
+from superbrain.core.canonical import canonical_json, digest_bytes
+from superbrain.core.errors import BrainError, ErrorCode
+from superbrain.core.ids import new_id
+from superbrain.core.jsonvalue import JsonValue
+from superbrain.core.kernel import (
+    ArtifactSendSpec,
+    Call,
+    CallContext,
+    Endpoint,
+    ObjectRef,
+    Principal,
+    ResourceDigest,
+    Scope,
+    StoredResult,
+    require_opaque_id,
+)
+from superbrain.core.wire import load_catalog, parse_json
+from superbrain.mcp.stdio import ToolCaller, run_stdio
+from superbrain.ports.kernel import KernelTx
+
+if TYPE_CHECKING:
+    from tests.support.inc2_fixture import InstalledEnv
+
+INC2_CLI_PATH = Path(__file__).resolve()
+
+_STRIPPED_ENV_KEYS: frozenset[str] = frozenset(
+    {
+        "VIRTUAL_ENV",
+        "UV_PROJECT_ENVIRONMENT",
+        "PYTHONPATH",
+        "PYTHONHOME",
+        "SUPERBRAIN_CRASHPOINT",
+        "SUPERBRAIN_PAUSEPOINT",
+        "SUPERBRAIN_HOME",
+    }
+)
+
+
+# ---------------------------------------------------------------------------
+# Installed wheel & console script helpers
+# ---------------------------------------------------------------------------
+
+
+def installed_script_path(env: InstalledEnv, script_name: str) -> Path:
+    """Locate an installed console script (``brain`` or ``brain-mcp``) inside ``env.venv_dir``."""
+    if sys.platform == "win32":
+        scripts_dir = env.venv_dir / "Scripts"
+        exe_candidate = scripts_dir / f"{script_name}.exe"
+        if exe_candidate.exists():
+            return exe_candidate
+        return scripts_dir / script_name
+    return env.venv_dir / "bin" / script_name
+
+
+def clean_installed_subprocess_env(extra: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Return a clean environment dictionary with repo/venv/fault variables stripped."""
+    env = {k: v for k, v in os.environ.items() if k not in _STRIPPED_ENV_KEYS}
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    if extra is not None:
+        for key, value in extra.items():
+            env[key] = value
+    return env
+
+
+def run_installed_command(
+    env: InstalledEnv,
+    script_name: str,
+    args: Sequence[str],
+    *,
+    cwd: Path,
+    stdin_bytes: bytes = b"",
+    extra_env: Mapping[str, str] | None = None,
+    timeout: float = 15.0,
+) -> subprocess.CompletedProcess[bytes]:
+    """Run an installed wheel console script (``brain`` or ``brain-mcp``) in a clean environment."""
+    script = installed_script_path(env, script_name)
+    assert script.is_file(), f"Installed console script not found: {script}"
+    return subprocess.run(
+        [str(script), *args],
+        cwd=cwd,
+        env=clean_installed_subprocess_env(extra_env),
+        input=stdin_bytes,
+        capture_output=True,
+        timeout=timeout,
+        check=False,
+    )
+
+
+def verify_installed_wheel_isolation(env: InstalledEnv, *, cwd: Path) -> dict[str, JsonValue]:
+    """Verify ``env.venv_python -I`` loads ``superbrain`` and packaged schema strictly from ``site-packages``."""
+    probe_code = (
+        "import json, pathlib, superbrain; "
+        "from superbrain.core import _wire_catalog; "
+        "from superbrain.core.wire import load_catalog; "
+        "cat = load_catalog(); "
+        "print(json.dumps({"
+        "'module_file': str(pathlib.Path(superbrain.__file__).resolve()), "
+        "'schema_file': str(pathlib.Path(_wire_catalog._SCHEMA_PATH).resolve()), "
+        "'schema_sha256': cat.schema_sha256, "
+        "'tool_names': list(cat.tools_by_name.keys())"
+        "}))"
+    )
+    proc = subprocess.run(
+        [str(env.venv_python), "-I", "-c", probe_code],
+        cwd=cwd,
+        env=clean_installed_subprocess_env(),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=15.0,
+        check=True,
+    )
+    parsed = parse_json(proc.stdout.strip().encode("utf-8"))
+    assert isinstance(parsed, dict)
+    return parsed
+
+
+# ---------------------------------------------------------------------------
+# Owner-only configuration & profile writers
+# ---------------------------------------------------------------------------
+
+
+def write_owner_only_bytes(path: Path, data: bytes) -> Path:
+    """Write ``data`` to ``path`` and restrict file permissions to the current owner."""
+    adapters = os_adapters()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    adapters.permissions.secure_directory(path.parent)
+    path.write_bytes(data)
+    adapters.permissions.secure_file(path)
+    return path
+
+
+def write_credential_file(path: Path, token: str, *, line_ending: str = "\n") -> Path:
+    """Write an owner-only bearer credential file."""
+    return write_owner_only_bytes(path, f"{token}{line_ending}".encode())
+
+
+def write_ca_file(path: Path, ca_pem: str | bytes) -> Path:
+    """Write an owner-only CA PEM file."""
+    raw = ca_pem.encode("utf-8") if isinstance(ca_pem, str) else ca_pem
+    return write_owner_only_bytes(path, raw)
+
+
+def write_daemon_config_file(
+    path: Path,
+    *,
+    data_root: Path,
+    expected_store_id: str,
+    cert_path: Path,
+    key_path: Path,
+) -> Path:
+    """Write an owner-only ``DaemonConfig`` v1 JSON file."""
+    payload: dict[str, JsonValue] = {
+        "version": 1,
+        "data_root": str(data_root),
+        "expected_store_id": expected_store_id,
+        "cert_path": str(cert_path),
+        "key_path": str(key_path),
+    }
+    return write_owner_only_bytes(path, canonical_json(payload))
+
+
+def write_client_profile_file(
+    path: Path,
+    *,
+    endpoint_path: Path,
+    expected_store_id: str,
+    ca_file: Path,
+    leaf_cert_sha256: str,
+    credential_file: Path,
+    workspace: Mapping[str, JsonValue] | None = None,
+) -> tuple[Path, str]:
+    """Write an owner-only ``ClientProfile`` v1 JSON file and return ``(path, sha256_digest)``."""
+    payload: dict[str, JsonValue] = {
+        "version": 1,
+        "endpoint_path": str(endpoint_path),
+        "expected_store_id": expected_store_id,
+        "ca_file": str(ca_file),
+        "leaf_cert_sha256": leaf_cert_sha256,
+        "credential_file": str(credential_file),
+    }
+    if workspace is not None:
+        payload["workspace"] = dict(workspace)
+    raw = canonical_json(payload)
+    write_owner_only_bytes(path, raw)
+    return path, digest_bytes(raw)
+
+
+# ---------------------------------------------------------------------------
+# Process tree inspection & foreground serve controller
+# ---------------------------------------------------------------------------
+
+
+def _win32_descendant_pids(root_pid: int) -> list[int]:
+    """Enumerate all live descendant PIDs of ``root_pid`` on Windows via Toolhelp32 snapshot."""
+    if sys.platform != "win32":
+        return []
+
+    th32cs_snapprocess = 0x00000002
+    invalid_handle_value = ctypes.c_void_p(-1).value
+
+    class PROCESSENTRY32(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", ctypes.wintypes.DWORD),
+            ("cntUsage", ctypes.wintypes.DWORD),
+            ("th32ProcessID", ctypes.wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.c_size_t),
+            ("th32ModuleID", ctypes.wintypes.DWORD),
+            ("cntThreads", ctypes.wintypes.DWORD),
+            ("th32ParentProcessID", ctypes.wintypes.DWORD),
+            ("pcPriClassBase", ctypes.wintypes.LONG),
+            ("dwFlags", ctypes.wintypes.DWORD),
+            ("szExeFile", ctypes.c_char * 260),
+        ]
+
+    kernel32 = ctypes.windll.kernel32
+    snap = kernel32.CreateToolhelp32Snapshot(th32cs_snapprocess, 0)
+    if snap == invalid_handle_value:
+        return []
+    children_by_parent: dict[int, list[int]] = {}
+    try:
+        entry = PROCESSENTRY32()
+        entry.dwSize = ctypes.sizeof(PROCESSENTRY32)
+        if kernel32.Process32First(snap, ctypes.byref(entry)):
+            while True:
+                pid = int(entry.th32ProcessID)
+                ppid = int(entry.th32ParentProcessID)
+                if pid > 0 and pid != ppid:
+                    children_by_parent.setdefault(ppid, []).append(pid)
+                if not kernel32.Process32Next(snap, ctypes.byref(entry)):
+                    break
+    finally:
+        kernel32.CloseHandle(snap)
+
+    descendants: list[int] = []
+    frontier = [root_pid]
+    seen = {root_pid}
+    while frontier:
+        curr = frontier.pop(0)
+        for child_pid in children_by_parent.get(curr, ()):
+            if child_pid not in seen:
+                seen.add(child_pid)
+                descendants.append(child_pid)
+                frontier.append(child_pid)
+    return descendants
+
+
+def _win32_wait_or_terminate_pid(pid: int, *, terminate: bool, timeout_s: float) -> bool:
+    """Wait for ``pid`` to exit on Windows (optionally terminating it first); return ``True`` once exited."""
+    assert sys.platform == "win32"
+    import pywintypes
+    import win32api
+    import win32con
+    import win32event
+    import win32process
+
+    access = win32con.SYNCHRONIZE | win32con.PROCESS_QUERY_LIMITED_INFORMATION
+    if terminate:
+        access |= win32con.PROCESS_TERMINATE
+    try:
+        handle = win32api.OpenProcess(access, False, pid)
+    except pywintypes.error:
+        return True
+    try:
+        if terminate:
+            with contextlib.suppress(pywintypes.error):
+                win32process.TerminateProcess(handle, 9)
+        timeout_ms = max(1, int(timeout_s * 1000))
+        wait_rc = win32event.WaitForSingleObject(handle, timeout_ms)
+        if wait_rc != win32event.WAIT_OBJECT_0:
+            return False
+        code = win32process.GetExitCodeProcess(handle)
+        return bool(code != win32con.STILL_ACTIVE)
+    finally:
+        win32api.CloseHandle(handle)
+
+
+def is_writer_lock_held(data_root: Path) -> bool:
+    """Return ``True`` iff ``data_root / 'writer.lock'`` is currently held by another process/handle."""
+    lock_path = data_root / "writer.lock"
+    if not lock_path.exists():
+        return False
+    factory = OsLockFactory()
+    try:
+        handle = factory.acquire(lock_path)
+    except BrainError as err:
+        if err.code is ErrorCode.WRITER_HELD:
+            return True
+        raise
+    handle.release()
+    return False
+
+
+class InstalledServeProcess:
+    """Subprocess controller for foreground ``brain serve --config <abs>`` or wheel fixture daemon."""
+
+    def __init__(
+        self,
+        args: Sequence[str],
+        *,
+        data_root: Path,
+        cwd: Path,
+        extra_env: Mapping[str, str] | None = None,
+    ) -> None:
+        self._data_root = data_root
+        self._endpoint_path = data_root / "endpoint.json"
+        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if sys.platform == "win32" else 0
+        start_new_session = sys.platform != "win32"
+        self._proc: subprocess.Popen[bytes] = subprocess.Popen(
+            list(args),
+            cwd=cwd,
+            env=clean_installed_subprocess_env(extra_env),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            creationflags=creationflags,
+            start_new_session=start_new_session,
+        )
+        self._descendant_pids: list[int] = []
+        self._closed = False
+
+    @property
+    def pid(self) -> int:
+        return self._proc.pid
+
+    @property
+    def descendant_pids(self) -> tuple[int, ...]:
+        return tuple(self._descendant_pids)
+
+    def poll(self) -> int | None:
+        return self._proc.poll()
+
+    def snapshot_descendant_pids(self) -> tuple[int, ...]:
+        if sys.platform == "win32":
+            for pid in _win32_descendant_pids(self._proc.pid):
+                if pid not in self._descendant_pids:
+                    self._descendant_pids.append(pid)
+        return tuple(self._descendant_pids)
+
+    def wait_ready(self, timeout: float = 15.0) -> Endpoint:
+        """Poll ``endpoint.json`` until published and verified, ensuring the foreground process stays alive."""
+        adapters = os_adapters()
+        deadline = time.perf_counter() + timeout
+        last_err: Exception | None = None
+        while time.perf_counter() < deadline:
+            rc = self._proc.poll()
+            if rc is not None:
+                out_b, err_b = self._proc.communicate(timeout=2.0)
+                raise AssertionError(
+                    f"Serve process exited prematurely with code {rc}.\n"
+                    f"stdout: {out_b.decode('utf-8', errors='replace')}\n"
+                    f"stderr: {err_b.decode('utf-8', errors='replace')}"
+                )
+            if self._endpoint_path.exists():
+                try:
+                    ep = read_client_endpoint(self._endpoint_path, adapters)
+                    self.snapshot_descendant_pids()
+                    return ep
+                except (BrainError, OSError) as err:
+                    last_err = err
+            time.sleep(0.01)
+        raise AssertionError(f"Timed out waiting for endpoint.json at {self._endpoint_path} (last_err={last_err})")
+
+    def signal_and_wait_exit(self, timeout: float = 15.0) -> tuple[int, str, str, tuple[int, ...]]:
+        """Send graceful foreground stop signal and verify launcher + all worker descendants exit."""
+        tracked_pids = self.snapshot_descendant_pids()
+        if sys.platform == "win32":
+            ctrl_break = getattr(signal, "CTRL_BREAK_EVENT", None)
+            assert ctrl_break is not None
+            os.kill(self._proc.pid, int(ctrl_break))
+        else:
+            self._proc.send_signal(signal.SIGTERM)
+
+        out_b, err_b = self._proc.communicate(timeout=timeout)
+        rc = self._proc.returncode
+        assert rc is not None
+
+        if sys.platform == "win32":
+            for child_pid in tracked_pids:
+                exited = _win32_wait_or_terminate_pid(child_pid, terminate=False, timeout_s=timeout)
+                assert exited, f"Descendant worker process pid={child_pid} still running after serve exit"
+
+        self._closed = True
+        return (
+            rc,
+            out_b.decode("utf-8", errors="replace"),
+            err_b.decode("utf-8", errors="replace"),
+            tracked_pids,
+        )
+
+    def close(self, timeout: float = 10.0) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        tracked_pids = self.snapshot_descendant_pids()
+        if self._proc.poll() is None:
+            with contextlib.suppress(OSError, ValueError, subprocess.TimeoutExpired):
+                if sys.platform == "win32":
+                    ctrl_break = getattr(signal, "CTRL_BREAK_EVENT", None)
+                    if ctrl_break is not None:
+                        os.kill(self._proc.pid, int(ctrl_break))
+                else:
+                    self._proc.send_signal(signal.SIGTERM)
+                self._proc.communicate(timeout=min(3.0, timeout))
+        if self._proc.poll() is None:
+            with contextlib.suppress(OSError):
+                self._proc.kill()
+            with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+                self._proc.communicate(timeout=2.0)
+        if sys.platform == "win32":
+            for pid in (*tracked_pids, self._proc.pid):
+                with contextlib.suppress(Exception):
+                    _win32_wait_or_terminate_pid(pid, terminate=True, timeout_s=2.0)
+
+    def __enter__(self) -> InstalledServeProcess:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        self.close()
+
+
+def spawn_installed_brain_serve(
+    env: InstalledEnv,
+    config_path: Path,
+    *,
+    data_root: Path,
+    cwd: Path,
+    extra_env: Mapping[str, str] | None = None,
+) -> InstalledServeProcess:
+    """Spawn ``brain serve --config <config_path>`` from the installed wheel venv."""
+    brain_bin = installed_script_path(env, "brain")
+    return InstalledServeProcess(
+        [str(brain_bin), "serve", "--config", str(config_path)],
+        data_root=data_root,
+        cwd=cwd,
+        extra_env=extra_env,
+    )
+
+
+def spawn_installed_fixture_daemon(
+    env: InstalledEnv,
+    config_path: Path,
+    *,
+    data_root: Path,
+    cwd: Path,
+    extra_env: Mapping[str, str] | None = None,
+) -> InstalledServeProcess:
+    """Spawn ``venv_python -I inc2_cli.py serve-fixture-domain <config_path>`` on the installed wheel."""
+    return InstalledServeProcess(
+        [str(env.venv_python), "-I", str(INC2_CLI_PATH), "serve-fixture-domain", str(config_path)],
+        data_root=data_root,
+        cwd=cwd,
+        extra_env=extra_env,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Stdio JSON-RPC framing helpers
+# ---------------------------------------------------------------------------
+
+
+def mcp_init_frames(
+    req_id: int | str = 1,
+    protocol_version: str = "2025-06-18",
+) -> list[dict[str, JsonValue]]:
+    """Return canonical ``initialize`` + ``notifications/initialized`` MCP stdio frames."""
+    return [
+        {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": protocol_version,
+                "capabilities": {},
+                "clientInfo": {"name": "inc2-test-host", "version": "1.0.0"},
+            },
+        },
+        {
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+            "params": {},
+        },
+    ]
+
+
+def mcp_call_frame(
+    req_id: int | str,
+    name: str,
+    arguments: Mapping[str, JsonValue],
+    *,
+    meta: Mapping[str, JsonValue] | None = None,
+) -> dict[str, JsonValue]:
+    """Build a ``tools/call`` JSON-RPC request frame."""
+    params: dict[str, JsonValue] = {
+        "name": name,
+        "arguments": dict(arguments),
+    }
+    if meta is not None:
+        params["_meta"] = dict(meta)
+    return {
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "method": "tools/call",
+        "params": params,
+    }
+
+
+def encode_stdio_frames(frames: Sequence[Mapping[str, JsonValue]], *, line_ending: bytes = b"\n") -> bytes:
+    """Encode JSON-RPC frames as newline-delimited UTF-8 bytes."""
+    return b"".join(canonical_json(dict(frame)) + line_ending for frame in frames)
+
+
+def decode_stdio_frames(raw_stdout: bytes) -> list[dict[str, JsonValue]]:
+    """Decode newline-delimited JSON-RPC response frames from ``stdout``."""
+    out: list[dict[str, JsonValue]] = []
+    for raw_line in raw_stdout.splitlines():
+        if not raw_line.strip():
+            continue
+        parsed = parse_json(raw_line)
+        assert isinstance(parsed, dict)
+        out.append(parsed)
+    return out
+
+
+def run_inprocess_stdio(
+    caller: ToolCaller,
+    frames: Sequence[Mapping[str, JsonValue]],
+) -> tuple[int, list[dict[str, JsonValue]]]:
+    """Run ``run_stdio`` in-process over ``frames`` and return ``(exit_code, decoded_responses)``."""
+    stdin_buf = io.BytesIO(encode_stdio_frames(frames))
+    stdout_buf = io.BytesIO()
+    rc = run_stdio(stdin_buf, stdout_buf, caller)
+    return rc, decode_stdio_frames(stdout_buf.getvalue())
+
+
+# ---------------------------------------------------------------------------
+# ShimTestDomain implementing KernelToolDomain
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ShimTestDomain(KernelToolDomain):
+    """Fixture ``KernelToolDomain`` for Task 7 integration and wheel tests.
+
+    Supports ``prepare_task``, ``get_artifact``, ``record_outcome``, and ``submit_episode`` with:
+    - Strict ``selected_scope`` and checkout-level authorization for ``get_artifact`` and
+      ``record_outcome`` BEFORE staging CAS blobs or mutating the ledger.
+    - Optional ``pause_idem_keys`` barrier inside ``apply(tx)`` for commit-cutoff testing.
+    - Packaged ``mcp-tools-v2.json`` schema SHA-256 recorded in ``prepare_task`` CAS blob and
+      ``context.summary_md`` for wheel-to-daemon catalog verification.
+    """
+
+    alias_to_scope: dict[str, Scope] = field(default_factory=dict)
+    checkout_scoped_artifacts: dict[str, Scope] = field(default_factory=dict)
+    pause_idem_keys: set[str] = field(default_factory=set)
+    apply_entered: threading.Event = field(default_factory=threading.Event)
+    allow_apply_finish: threading.Event = field(default_factory=threading.Event)
+    on_apply_hook: Callable[[str, str], None] | None = None
+    received_calls: list[Call] = field(default_factory=list)
+    prepared_calls: list[Call] = field(default_factory=list)
+    task_scopes: dict[str, tuple[str, Scope]] = field(default_factory=dict)
+    deliveries: dict[str, tuple[str, Scope, str, str]] = field(default_factory=dict)
+    stored_meta: dict[str, dict[str, JsonValue]] = field(default_factory=dict)
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def __post_init__(self) -> None:
+        self.allow_apply_finish.set()
+
+    def supports_tool(self, tool: str, *, deep: bool = False) -> bool:
+        if deep:
+            return False
+        return tool in {"prepare_task", "get_artifact", "record_outcome", "submit_episode"}
+
+    def _require_concrete_scope(self, call: Call, *, expected_repo_id: str | None = None) -> Scope:
+        scope = call.selected_scope
+        if scope is None or scope.checkout_id is None:
+            raise BrainError(ErrorCode.CAPABILITY_UNAVAILABLE, "capability unavailable")
+        if expected_repo_id is not None and scope.repo_id != expected_repo_id:
+            raise BrainError(ErrorCode.NOT_FOUND, "not found")
+        return scope
+
+    def prepare_mutation(self, call: Call, ctx: CallContext, *, now: dt.datetime) -> PreparedEffect:
+        del now
+        with self._lock:
+            self.received_calls.append(call)
+
+        if call.tool == "prepare_task":
+            return self._prepare_task_mutation(call, ctx)
+        if call.tool == "get_artifact":
+            return self._prepare_get_artifact(call, ctx)
+        if call.tool == "record_outcome":
+            return self._prepare_record_outcome(call, ctx)
+        if call.tool == "submit_episode":
+            return self._prepare_submit_episode(call, ctx)
+        raise BrainError(ErrorCode.CAPABILITY_UNAVAILABLE, "capability unavailable")
+
+    def _prepare_task_mutation(self, call: Call, ctx: CallContext) -> PreparedEffect:
+        scope = self._require_concrete_scope(call)
+        assert scope.checkout_id is not None
+
+        args = call.arguments
+        if "workspace_hint" in args:
+            hint = str(args["workspace_hint"])
+            expected_by_alias = self.alias_to_scope.get(hint)
+            if expected_by_alias is not None and expected_by_alias != scope:
+                raise BrainError(ErrorCode.NOT_FOUND, "not found")
+        elif "workspace_id" in args and "checkout_id" in args:
+            if (str(args["workspace_id"]), str(args["checkout_id"])) != (scope.repo_id, scope.checkout_id):
+                raise BrainError(ErrorCode.NOT_FOUND, "not found")
+        else:
+            raise BrainError(ErrorCode.INVALID_INPUT, "missing workspace selector")
+
+        task_id = require_opaque_id(args["task_id"], label="task_id")
+        with self._lock:
+            existing_task = self.task_scopes.get(task_id)
+            if existing_task is not None and existing_task != (ctx.principal.owner_id, scope):
+                raise BrainError(ErrorCode.NOT_FOUND, "not found")
+            self.prepared_calls.append(call)
+
+        res_id = new_id()
+        delivery_id = new_id()
+        assignment_id = new_id()
+        catalog_sha256 = load_catalog().schema_sha256
+        meta: dict[str, JsonValue] = {
+            "kind": "delivery_result",
+            "result_id": res_id,
+            "delivery_id": delivery_id,
+            "assignment_id": assignment_id,
+            "task_id": task_id,
+            "owner_id": ctx.principal.owner_id,
+            "repo_id": scope.repo_id,
+            "checkout_id": scope.checkout_id,
+            "schema_sha256": catalog_sha256,
+        }
+        blob = canonical_json(meta)
+        ref = ObjectRef(kind="delivery_result", id=res_id, revision=1, digest=digest_bytes(blob))
+
+        def _apply(tx: KernelTx) -> StoredResult:
+            tx.hold_blob(blob, holder_id=res_id)
+            with self._lock:
+                self.task_scopes[task_id] = (ctx.principal.owner_id, scope)
+                self.deliveries[delivery_id] = (ctx.principal.owner_id, scope, assignment_id, task_id)
+                self.stored_meta[res_id] = meta
+            return StoredResult(result_id=res_id, assignment_id=assignment_id, refs=(ref,))
+
+        return PreparedEffect(blobs=(blob,), apply=_apply)
+
+    def _prepare_get_artifact(self, call: Call, ctx: CallContext) -> PreparedEffect:
+        ws_id = require_opaque_id(call.arguments["workspace_id"], label="workspace_id")
+        scope = self._require_concrete_scope(call, expected_repo_id=ws_id)
+        assert scope.checkout_id is not None
+
+        task_id = require_opaque_id(call.arguments["task_id"], label="task_id")
+        artifact_id = require_opaque_id(call.arguments["artifact_id"], label="artifact_id")
+        revision = int(cast(int, call.arguments["revision"]))
+        level = str(call.arguments["level"])
+
+        with self._lock:
+            task_binding = self.task_scopes.get(task_id)
+            if task_binding is not None and task_binding != (ctx.principal.owner_id, scope):
+                raise BrainError(ErrorCode.NOT_FOUND, "not found")
+            bound_art_scope = self.checkout_scoped_artifacts.get(artifact_id)
+            if bound_art_scope is not None and bound_art_scope != scope:
+                raise BrainError(ErrorCode.NOT_FOUND, "not found")
+            self.prepared_calls.append(call)
+
+        res_id = new_id()
+        meta: dict[str, JsonValue] = {
+            "kind": "artifact_result",
+            "result_id": res_id,
+            "task_id": task_id,
+            "artifact_id": artifact_id,
+            "revision": revision,
+            "level": level,
+            "owner_id": ctx.principal.owner_id,
+            "repo_id": scope.repo_id,
+            "checkout_id": scope.checkout_id,
+        }
+        blob = canonical_json(meta)
+        ref = ObjectRef(kind="artifact_result", id=res_id, revision=1, digest=digest_bytes(blob))
+
+        def _apply(tx: KernelTx) -> StoredResult:
+            tx.hold_blob(blob, holder_id=res_id)
+            with self._lock:
+                self.stored_meta[res_id] = meta
+            return StoredResult(result_id=res_id, assignment_id=None, refs=(ref,))
+
+        return PreparedEffect(blobs=(blob,), apply=_apply)
+
+    def _prepare_record_outcome(self, call: Call, ctx: CallContext) -> PreparedEffect:
+        ws_arg = call.arguments.get("workspace_id")
+        expected_repo = require_opaque_id(ws_arg, label="workspace_id") if isinstance(ws_arg, str) else None
+        scope = self._require_concrete_scope(call, expected_repo_id=expected_repo)
+        assert scope.checkout_id is not None
+
+        task_id = require_opaque_id(call.arguments["task_id"], label="task_id")
+        delivery_id = require_opaque_id(call.arguments["delivery_id"], label="delivery_id")
+        assignment_id = require_opaque_id(call.arguments["assignment_id"], label="assignment_id")
+
+        with self._lock:
+            deliv = self.deliveries.get(delivery_id)
+            if deliv is None:
+                raise BrainError(ErrorCode.NOT_FOUND, "not found")
+            d_owner, d_scope, d_assign, d_task = deliv
+            if d_owner != ctx.principal.owner_id or d_scope != scope:
+                raise BrainError(ErrorCode.NOT_FOUND, "not found")
+            if d_assign != assignment_id or d_task != task_id:
+                raise BrainError(ErrorCode.IDENTITY_MISMATCH, "identity mismatch")
+
+            raw_refs = call.arguments.get("applied_refs")
+            if isinstance(raw_refs, list):
+                for item in raw_refs:
+                    if isinstance(item, Mapping):
+                        ref_id = str(item.get("id", ""))
+                        bound_scope = self.checkout_scoped_artifacts.get(ref_id)
+                        if bound_scope is not None and bound_scope != scope:
+                            raise BrainError(ErrorCode.NOT_FOUND, "not found")
+            self.prepared_calls.append(call)
+
+        outcome_id = new_id()
+        meta: dict[str, JsonValue] = {
+            "kind": "outcome_result",
+            "result_id": outcome_id,
+            "owner_id": ctx.principal.owner_id,
+            "repo_id": scope.repo_id,
+            "checkout_id": scope.checkout_id,
+        }
+        blob = canonical_json(meta)
+        ref = ObjectRef(kind="outcome_result", id=outcome_id, revision=1, digest=digest_bytes(blob))
+
+        def _apply(tx: KernelTx) -> StoredResult:
+            tx.hold_blob(blob, holder_id=outcome_id)
+            with self._lock:
+                self.stored_meta[outcome_id] = meta
+            return StoredResult(result_id=outcome_id, assignment_id=assignment_id, refs=(ref,))
+
+        return PreparedEffect(blobs=(blob,), apply=_apply)
+
+    def _prepare_submit_episode(self, call: Call, ctx: CallContext) -> PreparedEffect:
+        ws_id = require_opaque_id(call.arguments["workspace_id"], label="workspace_id")
+        chk_id = require_opaque_id(call.arguments["checkout_id"], label="checkout_id")
+        scope = self._require_concrete_scope(call, expected_repo_id=ws_id)
+        if scope.checkout_id != chk_id:
+            raise BrainError(ErrorCode.NOT_FOUND, "not found")
+
+        idem_key = str(call.arguments.get("idempotency_key", ""))
+        with self._lock:
+            self.prepared_calls.append(call)
+
+        episode_id = new_id()
+        meta: dict[str, JsonValue] = {
+            "kind": "episode_result",
+            "result_id": episode_id,
+            "owner_id": ctx.principal.owner_id,
+            "repo_id": scope.repo_id,
+            "checkout_id": scope.checkout_id,
+        }
+        blob = canonical_json(meta)
+        ref = ObjectRef(kind="episode_result", id=episode_id, revision=1, digest=digest_bytes(blob))
+
+        def _apply(tx: KernelTx) -> StoredResult:
+            with self._lock:
+                should_pause = idem_key in self.pause_idem_keys
+            if self.on_apply_hook is not None:
+                self.on_apply_hook(idem_key, episode_id)
+            if should_pause:
+                self.apply_entered.set()
+                if not self.allow_apply_finish.wait(timeout=15.0):
+                    raise BrainError(ErrorCode.DEADLINE_EXCEEDED, "deadline exceeded")
+            tx.hold_blob(blob, holder_id=episode_id)
+            with self._lock:
+                self.stored_meta[episode_id] = meta
+            return StoredResult(result_id=episode_id, assignment_id=None, refs=(ref,))
+
+        return PreparedEffect(blobs=(blob,), apply=_apply)
+
+    def execute_readonly(self, call: Call, ctx: CallContext) -> dict[str, JsonValue]:
+        del call, ctx
+        raise BrainError(ErrorCode.CAPABILITY_UNAVAILABLE, "capability unavailable")
+
+    def render_stored(
+        self,
+        result: StoredResult,
+        principal: Principal,
+        *,
+        selected_scope: Scope | None,
+    ) -> dict[str, JsonValue]:
+        with self._lock:
+            meta = self.stored_meta.get(result.result_id)
+        if meta is None:
+            raise BrainError(ErrorCode.NOT_FOUND, "not found")
+
+        owner_id = str(meta["owner_id"])
+        repo_id = str(meta["repo_id"])
+        checkout_id = str(meta["checkout_id"])
+        expected_scope = Scope(repo_id=repo_id, checkout_id=checkout_id)
+        if principal.owner_id != owner_id or selected_scope != expected_scope:
+            raise BrainError(ErrorCode.NOT_FOUND, "not found")
+
+        kind = str(meta["kind"])
+        if kind == "delivery_result":
+            schema_sha256 = str(meta["schema_sha256"])
+            return {
+                "workspace_id": repo_id,
+                "checkout_id": checkout_id,
+                "source_snapshot_id": None,
+                "snapshot_status": "unavailable",
+                "degraded_codes": ["snapshot_unavailable"],
+                "task_id": str(meta["task_id"]),
+                "delivery_id": str(meta["delivery_id"]),
+                "assignment_id": str(meta["assignment_id"]),
+                "skills": [],
+                "lessons": [],
+                "continuity": [],
+                "context": {
+                    "summary_md": f"catalog_sha256={schema_sha256}",
+                    "sources": [],
+                    "unknown_source": False,
+                },
+                "finishing_gates": [],
+            }
+        if kind == "artifact_result":
+            artifact_id = str(meta["artifact_id"])
+            revision = int(cast(int, meta["revision"]))
+            level = str(meta["level"])
+            content = f"# Skill {artifact_id}@{revision} ({level})\n"
+            return {
+                "artifact_id": artifact_id,
+                "revision": revision,
+                "level": level,
+                "status": "ok",
+                "resources": [
+                    {
+                        "name": f"{level}.md",
+                        "digest": digest_bytes(content.encode("utf-8")),
+                        "encoding": "utf-8",
+                        "content": content,
+                    }
+                ],
+            }
+        if kind == "outcome_result":
+            return {
+                "outcome_id": str(meta["result_id"]),
+                "status": "declared",
+            }
+        if kind == "episode_result":
+            return {
+                "episode_id": str(meta["result_id"]),
+                "evidence_ids": [],
+                "candidate_lesson_id": None,
+            }
+        raise BrainError(ErrorCode.INTEGRITY_FAILURE, "unknown stored result kind")
+
+    def describe_artifact_send(
+        self,
+        result: StoredResult,
+        rendered: Mapping[str, JsonValue],
+        principal: Principal,
+        *,
+        selected_scope: Scope | None,
+    ) -> ArtifactSendSpec | None:
+        del rendered, selected_scope
+        if not result.refs or result.refs[0].kind != "artifact_result":
+            return None
+        with self._lock:
+            meta = self.stored_meta.get(result.result_id)
+        if meta is None:
+            return None
+        artifact_id = str(meta["artifact_id"])
+        revision = int(cast(int, meta["revision"]))
+        level = str(meta["level"])
+        task_id = str(meta["task_id"])
+        content = f"# Skill {artifact_id}@{revision} ({level})\n"
+        return ArtifactSendSpec(
+            logical_result_id=result.result_id,
+            principal_id=principal.principal_id,
+            task_id=task_id,
+            artifact_id=artifact_id,
+            revision=revision,
+            resource_digests=(ResourceDigest(name=f"{level}.md", digest=digest_bytes(content.encode("utf-8"))),),
+        )
+
+
+def _cli_main(argv: Sequence[str]) -> int:
+    if len(argv) == 3 and argv[1] == "serve-fixture-domain":
+        config_path = Path(argv[2])
+        domain = ShimTestDomain()
+        return serve_config_path(config_path, domain=domain)
+    sys.stderr.write("invalid_input\n")
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(_cli_main(sys.argv))
