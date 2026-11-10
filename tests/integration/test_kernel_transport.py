@@ -20,6 +20,7 @@ Covers all mandatory invariants from interface-spec.md Section 4, task-6b-3-brie
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import hashlib
 import json
@@ -796,6 +797,10 @@ class TestTransportLifecycleAndRelease:
                 ctx.load_verify_locations(cadata=transport_template.tls.ca_cert_path.read_text(encoding="utf-8"))
                 s_post_raw = socket.create_connection(("127.0.0.1", ep.port), timeout=2.0)
                 s_post = ctx.wrap_socket(s_post_raw, server_hostname="127.0.0.1")
+                # Complete State 0 (GET /v2/identity) on s_post first
+                s_post.sendall(f"GET /v2/identity HTTP/1.1\r\nHost: 127.0.0.1:{ep.port}\r\n\r\n".encode("ascii"))
+                assert b"200 OK" in read_raw_http_response(s_post)
+
                 s_post.sendall(
                     (
                         f"POST /v2/tools/call HTTP/1.1\r\nHost: 127.0.0.1:{ep.port}\r\n"
@@ -828,13 +833,16 @@ class TestTransportLifecycleAndRelease:
                     token=transport_template.cred.token,
                     selected_scope=Scope(transport_template.ws_a.repo_id, transport_template.ws_a.checkout_id),
                 )
-                th_call = threading.Thread(
-                    target=lambda: client.call(
-                        target,
-                        cmd_pause,
-                        deadline_ns=time.monotonic_ns() + 1_500_000_000,
-                    )
-                )
+
+                def _run_pause_call() -> None:
+                    with contextlib.suppress(LoopbackTransportError):
+                        client.call(
+                            target,
+                            cmd_pause,
+                            deadline_ns=time.monotonic_ns() + 1_500_000_000,
+                        )
+
+                th_call = threading.Thread(target=_run_pause_call)
                 th_call.start()
                 assert domain.apply_entered.wait(timeout=2.0)
 
@@ -1256,6 +1264,12 @@ class TestTransportLifecycleAndRelease:
                 allow_flush_ev.set()
                 th.join(timeout=2.0)
 
+                # Poll boundedly until server worker finishes finalize_send_attempt
+                deadline = time.perf_counter() + 1.0
+                while time.perf_counter() < deadline and h.count_send_attempts("served_only") == 0:
+                    time.sleep(0.005)
+                h.loop.run_owner_action(lambda: None).result(timeout=2.0)
+
                 res = res_box[0]
                 assert res["ok"] is True
                 assert isinstance(res["data"], dict)
@@ -1324,6 +1338,12 @@ class TestTransportLifecycleAndRelease:
             assert exc_info.value.request_may_have_run is True
             assert disconnect_done.wait(timeout=2.0)
 
+            # Poll boundedly until server worker finishes interrupt_send_attempt
+            deadline = time.perf_counter() + 1.0
+            while time.perf_counter() < deadline and h.count_send_attempts("unknown") == 0:
+                time.sleep(0.005)
+            h.loop.run_owner_action(lambda: None).result(timeout=2.0)
+
             # Attempt transitioned to unknown (0 served_only, 0 read_ack)
             assert h.count_send_attempts("unknown") == 1
             assert h.count_send_attempts("served_only") == 0
@@ -1335,6 +1355,12 @@ class TestTransportLifecycleAndRelease:
             assert res_retry["ok"] is True
             assert isinstance(res_retry["data"], dict)
             new_receipt_id = str(res_retry["data"]["served_receipt_id"])
+
+            deadline = time.perf_counter() + 1.0
+            while time.perf_counter() < deadline and h.count_send_attempts("served_only") == 0:
+                time.sleep(0.005)
+            h.loop.run_owner_action(lambda: None).result(timeout=2.0)
+
             assert h.count_send_attempts("served_only") == 1
             assert h.get_send_attempt_state(new_receipt_id) == "served_only"
 
