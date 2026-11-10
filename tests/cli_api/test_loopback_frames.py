@@ -6,7 +6,8 @@ import contextlib
 import random
 import socket
 import ssl
-from collections.abc import Iterator
+import threading
+from collections.abc import Callable, Iterator
 from typing import Any
 
 import pytest
@@ -61,16 +62,35 @@ class FakeClock:
 
 
 class TrackingSocket(socket.socket):
-    """Socket subclass recording all settimeout invocations."""
+    """Socket subclass recording settimeout invocations and supporting custom recv/send hooks."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.recorded_timeouts: list[float] = []
+        self.recv_hook: Callable[[int, int], bytes] | None = None
+        self.send_hook: Callable[[Any, int], int] | None = None
 
     def settimeout(self, value: float | None) -> None:
         if value is not None:
             self.recorded_timeouts.append(value)
         super().settimeout(value)
+
+    def raw_recv(self, bufsize: int, flags: int = 0) -> bytes:
+        data = super().recv(bufsize, flags)
+        return data if isinstance(data, bytes) else bytes(data)
+
+    def raw_send(self, data: Any, flags: int = 0) -> int:
+        return int(super().send(data, flags))
+
+    def recv(self, bufsize: int, flags: int = 0) -> bytes:
+        if self.recv_hook is not None:
+            return self.recv_hook(bufsize, flags)
+        return self.raw_recv(bufsize, flags)
+
+    def send(self, data: Any, flags: int = 0) -> int:
+        if self.send_hook is not None:
+            return self.send_hook(data, flags)
+        return self.raw_send(data, flags)
 
 
 @contextlib.contextmanager
@@ -115,8 +135,29 @@ def tls_pair(
     raw_server, _ = listener.accept()
     listener.close()
 
-    server_ssl = server_ctx.wrap_socket(raw_server, server_side=True)
-    client_ssl = client_ctx.wrap_socket(raw_client, server_hostname="127.0.0.1")
+    server_ssl = server_ctx.wrap_socket(raw_server, server_side=True, do_handshake_on_connect=False)
+    client_ssl = client_ctx.wrap_socket(raw_client, server_hostname="127.0.0.1", do_handshake_on_connect=False)
+
+    handshake_err: list[OSError] = []
+
+    def run_server_handshake() -> None:
+        try:
+            server_ssl.do_handshake()
+        except OSError as err:
+            handshake_err.append(err)
+
+    handshake_thread = threading.Thread(target=run_server_handshake, daemon=True)
+    handshake_thread.start()
+    try:
+        client_ssl.do_handshake()
+    finally:
+        handshake_thread.join(timeout=5.0)
+
+    if handshake_thread.is_alive():
+        raise TimeoutError("TLS handshake timed out")
+    if handshake_err:
+        raise handshake_err[0]
+
     try:
         yield client_ssl, server_ssl
     finally:
@@ -505,8 +546,8 @@ def test_malformed_http_corpus_is_refused() -> None:
             assert exc_fuzz.value.code is ErrorCode.INVALID_INPUT
 
 
-def test_slow_header_and_body_share_absolute_deadline(inc2_tls_material: SampleTlsMaterial) -> None:
-    """Fake monotonic clock verifies monotonically shrinking settimeout and exact boundary DEADLINE_EXCEEDED."""
+def test_slow_header_and_body_share_absolute_deadline() -> None:
+    """Fake monotonic clock verifies monotonically shrinking settimeout across slow chunks."""
     clock = FakeClock(1_000_000_000)
     start_ns = clock.now_ns
     shared_deadline_ns = start_ns + 1_500_000_000  # 1.5 s absolute budget
@@ -524,18 +565,26 @@ def test_slow_header_and_body_share_absolute_deadline(inc2_tls_material: SampleT
         b"67890",
     ]
 
+    chunks_to_send = list(chunks)
+
     with tracking_socket_pair() as (track_sock, server_sock):
-        orig_recv = track_sock.recv
+        def drip_recv(bufsize: int, flags: int = 0) -> bytes:
+            if chunks_to_send:
+                server_sock.sendall(chunks_to_send.pop(0))
+                data = track_sock.raw_recv(bufsize, flags)
+                clock.advance(200_000_000)  # advance 200 ms per chunk
+                return data
+            return b""
 
-        def recv_with_clock_step(bufsize: int, flags: int = 0) -> bytes:
-            result = orig_recv(bufsize, flags)
-            clock.advance(200_000_000)  # advance 200 ms per chunk
-            return result
+        track_sock.recv_hook = drip_recv
 
-        track_sock.recv = recv_with_clock_step  # type: ignore[method-assign]
-
-        for chunk in chunks:
-            server_sock.sendall(chunk)
+        # Verify drip hook delivers one chunk at a time before calling reader
+        test_probe = track_sock.recv(1024)
+        assert test_probe == chunks[0]
+        assert clock.now_ns == start_ns + 200_000_000
+        # Reset chunks_to_send and clock for the FramedReader test
+        chunks_to_send = list(chunks)
+        clock.set(start_ns)
 
         reader = FramedReader(track_sock, clock)
         with pytest.raises(HttpFramingError) as exc_slow:
@@ -551,7 +600,11 @@ def test_slow_header_and_body_share_absolute_deadline(inc2_tls_material: SampleT
         for i in range(len(track_sock.recorded_timeouts) - 1):
             assert track_sock.recorded_timeouts[i] >= track_sock.recorded_timeouts[i + 1]
 
-    # 2. Exact now == deadline_ns boundary tested in all 3 required cases.
+
+def test_slow_header_exact_deadline_boundary_cases() -> None:
+    """Exact now == deadline_ns boundary tested in all 3 required cases."""
+    clock = FakeClock(1_000_000_000)
+
     # Case (a): Bytes already prefetched inside FramedReader's internal buffer before read.
     with socket_pair() as (client_sock, server_sock):
         server_sock.sendall(b"0123456789")
@@ -573,7 +626,6 @@ def test_slow_header_and_body_share_absolute_deadline(inc2_tls_material: SampleT
         server_sock.sendall(b"GET /v2/identity HTTP/1.1\r\n\r\n")
         clock.set(1_000_000_000)
         reader = FramedReader(client_sock, clock)
-        # Prefetch into buffer.
         assert reader.has_pipelined_bytes(clock.now_ns + 10_000_000_000) is True
 
         exact_dl = clock.now_ns + 100_000_000
@@ -595,40 +647,51 @@ def test_slow_header_and_body_share_absolute_deadline(inc2_tls_material: SampleT
         assert exc_resp_buffered.value.code is ErrorCode.DEADLINE_EXCEEDED
 
     # Case (b): Clock reaching deadline_ns immediately after sock.recv delivers the final byte.
-    with socket_pair() as (client_sock, server_sock):
+    with tracking_socket_pair() as (track_client, server_sock):
         server_sock.sendall(b"GET / HTTP/1.1\r\n\r\n")
         clock.set(1_000_000_000)
         target_dl = clock.now_ns + 500_000_000
 
-        orig_recv = client_sock.recv
-
         def recv_hit_deadline(bufsize: int, flags: int = 0) -> bytes:
-            data = orig_recv(bufsize, flags)
+            data = track_client.raw_recv(bufsize, flags)
             clock.set(target_dl)  # reach exact deadline immediately after recv
             return data
 
-        client_sock.recv = recv_hit_deadline  # type: ignore[method-assign]
-        reader = FramedReader(client_sock, clock)
+        track_client.recv_hook = recv_hit_deadline
+        # Self-verify hook functionality
+        probe_chunk = track_client.recv(4)
+        assert probe_chunk == b"GET "
+        assert clock.now_ns == target_dl
+
+        # Reset clock for FramedReader invocation
+        clock.set(1_000_000_000)
+        reader = FramedReader(track_client, clock)
         with pytest.raises(HttpFramingError) as exc_post_recv:
             reader.read_request_head(target_dl)
         assert exc_post_recv.value.code is ErrorCode.DEADLINE_EXCEEDED
+        assert exc_post_recv.value.http_status == 408
 
     # Case (c): Clock reaching deadline_ns immediately after final sock.send in write_all.
-    with socket_pair() as (client_sock, server_sock):
+    with tracking_socket_pair() as (track_client, server_sock):
         clock.set(1_000_000_000)
         target_dl = clock.now_ns + 500_000_000
 
-        orig_send = client_sock.send
-
         def send_hit_deadline(data: bytes, flags: int = 0) -> int:
-            sent = orig_send(data, flags)
+            sent = track_client.raw_send(data, flags)
             clock.set(target_dl)  # reach exact deadline immediately after send
             return sent
 
-        client_sock.send = send_hit_deadline  # type: ignore[method-assign,assignment]
+        track_client.send_hook = send_hit_deadline
+        probe_sent = track_client.send(b"ping")
+        assert probe_sent == 4
+        assert clock.now_ns == target_dl
+
+        # Reset clock for write_all invocation
+        clock.set(1_000_000_000)
         with pytest.raises(HttpFramingError) as exc_post_send:
-            write_all(client_sock, b"HTTP/1.1 200 OK\r\n\r\n", target_dl, clock)
+            write_all(track_client, b"HTTP/1.1 200 OK\r\n\r\n", target_dl, clock)
         assert exc_post_send.value.code is ErrorCode.DEADLINE_EXCEEDED
+        assert exc_post_send.value.http_status == 408
 
     # Also verify write_all at entry when now >= deadline_ns.
     with socket_pair() as (client_sock, _):
@@ -637,8 +700,29 @@ def test_slow_header_and_body_share_absolute_deadline(inc2_tls_material: SampleT
             write_all(client_sock, b"", 2_000_000_000, clock)
         assert exc_write_entry.value.code is ErrorCode.DEADLINE_EXCEEDED
 
-    # 3. Shared buffer across two sequential requests and has_pipelined_bytes.
-    # (i) Prefetched bytes already in FramedReader buffer -> True.
+
+def test_slow_header_pipelined_bytes_and_tls(inc2_tls_material: SampleTlsMaterial) -> None:
+    """Shared buffer across two sequential requests and has_pipelined_bytes over raw and TLS sockets."""
+    clock = FakeClock(1_000_000_000)
+
+    # (i) Real TLS socket with unread SSLSocket.pending() / OS-readable bytes (exercises tls_pair handshake).
+    with tls_pair(inc2_tls_material) as (client_ssl, server_ssl):
+        # Self-verify live TLS communication
+        server_ssl.sendall(b"TLS_READY")
+        assert client_ssl.recv(9) == b"TLS_READY"
+
+        orig_to = client_ssl.gettimeout()
+        server_ssl.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+        clock.set(1_000_000_000)
+        tls_reader = FramedReader(client_ssl, clock)
+        assert tls_reader.has_pipelined_bytes(clock.now_ns + 10_000_000_000) is True
+        # Verify original timeout was restored.
+        assert client_ssl.gettimeout() == orig_to
+        # Verify bytes are preserved and readable.
+        tls_resp = tls_reader.read_response_head(clock.now_ns + 10_000_000_000)
+        assert tls_resp.status == 200
+
+    # (ii) Prefetched bytes already in FramedReader buffer -> True.
     req1 = b"GET /v2/identity HTTP/1.1\r\n\r\n"
     req2 = b"POST /v2/tools/call HTTP/1.1\r\nContent-Length: 0\r\n\r\n"
     with socket_pair() as (client_sock, server_sock):
@@ -650,19 +734,6 @@ def test_slow_header_and_body_share_absolute_deadline(inc2_tls_material: SampleT
         assert reader.has_pipelined_bytes(clock.now_ns + 10_000_000_000) is True
         head2 = reader.read_request_head(clock.now_ns + 10_000_000_000)
         assert head2.target == "/v2/tools/call"
-
-    # (ii) Real TLS socket with unread SSLSocket.pending() / OS-readable bytes.
-    with tls_pair(inc2_tls_material) as (client_ssl, server_ssl):
-        orig_to = client_ssl.gettimeout()
-        server_ssl.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
-        clock.set(1_000_000_000)
-        tls_reader = FramedReader(client_ssl, clock)
-        assert tls_reader.has_pipelined_bytes(clock.now_ns + 10_000_000_000) is True
-        # Verify original timeout was restored.
-        assert client_ssl.gettimeout() == orig_to
-        # Verify bytes are preserved and readable.
-        tls_resp = tls_reader.read_response_head(clock.now_ns + 10_000_000_000)
-        assert tls_resp.status == 200
 
     # (iii) Clean peer half-close -> False.
     with socket_pair() as (client_sock, server_sock):
