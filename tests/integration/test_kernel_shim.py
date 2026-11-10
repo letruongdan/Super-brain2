@@ -47,7 +47,6 @@ from superbrain.composition.client_entry import (
     select_workspace,
 )
 from superbrain.core.canonical import canonical_json, digest_bytes
-from superbrain.core.client_profile import WORKSPACE_SCOPED_TOOLS
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.ids import new_id
 from superbrain.core.jsonvalue import JsonValue
@@ -57,7 +56,7 @@ from superbrain.core.kernel import (
     Scope,
     WorkspaceBinding,
 )
-from superbrain.core.wire import load_catalog
+from superbrain.core.wire import WORKSPACE_SCOPED_TOOLS, load_catalog
 from superbrain.mcp.stdio import MCP_PROTOCOL_VERSION, run_stdio
 from tests.support.clock import FakeClock
 from tests.support.inc2_cli import (
