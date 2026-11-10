@@ -32,15 +32,16 @@ from superbrain.composition.client_entry import (
     main as client_main,
 )
 from superbrain.core.canonical import canonical_json
+from superbrain.core.ids import new_id
 from superbrain.core.wire import parse_json
 from superbrain.storage.cas import RetentionClass
+from superbrain.storage.kernel_schema import (
+    KERNEL_POLICY_MIGRATIONS,
+    KERNEL_STORE_MIGRATIONS,
+)
 from superbrain.storage.layout import DataRoot
 from superbrain.storage.runtime import open_runtime
-from superbrain.storage.schema import (
-    POLICY_MIGRATIONS,
-    STORE_MIGRATIONS,
-    read_schema_info,
-)
+from superbrain.storage.schema import read_schema_info
 from tests.support.clock import FakeClock
 from tests.support.inc2_cli import (
     installed_script_path,
@@ -243,7 +244,6 @@ def test_installed_cli_uses_only_explicit_config_and_releases_lease(
         "error": {
             "code": "daemon_unavailable",
             "message": "daemon unavailable",
-            "retryable": True,
         },
     }
     assert res_offline.stdout == canonical_json(offline_env) + b"\n"
@@ -281,14 +281,14 @@ def test_installed_cli_uses_only_explicit_config_and_releases_lease(
         assert data_obj.get("ready") is True
         assert data_obj.get("store_id") == cli_transport_template.store_id
         assert data_obj.get("writer_epoch") == ep.writer_epoch
-        assert data_obj.get("instance_id") == ep.instance_id
         assert res_online.stdout == canonical_json(online_env) + b"\n"
 
         # In-process `read_status` matches the CLI status output.
         inproc_status = read_status(profile_path, os_adapters())
         assert inproc_status.get("ok") is True
-        assert isinstance(inproc_status.get("data"), dict)
-        assert inproc_status["data"].get("store_id") == cli_transport_template.store_id
+        inproc_data = inproc_status.get("data")
+        assert isinstance(inproc_data, dict)
+        assert inproc_data.get("store_id") == cli_transport_template.store_id
 
         # While daemon holds writer.lock, `brain migrate --offline --config <abs>` fails with writer_held.
         res_mig_held = run_installed_command(
@@ -351,12 +351,12 @@ def test_installed_migrate_respects_offline_lease(
     rt = open_runtime(
         legacy_root,
         adapters,
-        store_migrations=STORE_MIGRATIONS,
-        policy_migrations=POLICY_MIGRATIONS,
+        store_migrations=KERNEL_STORE_MIGRATIONS[:2],
+        policy_migrations=KERNEL_POLICY_MIGRATIONS[:2],
     )
     store_id = rt.store.store_id
     blob_payload = b"legacy-increment-1-cas-payload"
-    blob_digest = rt.store.store_content(blob_payload, "evidence", "holder-legacy-1", RetentionClass.DURABLE, None)
+    blob_digest = rt.store.store_content(blob_payload, "evidence", new_id(), RetentionClass.DURABLE, None)
     rt.close()
 
     layout = DataRoot.at(legacy_root)

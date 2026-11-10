@@ -127,15 +127,17 @@ def run_installed_command(
 def verify_installed_wheel_isolation(env: InstalledEnv, *, cwd: Path) -> dict[str, JsonValue]:
     """Verify ``env.venv_python -I`` loads ``superbrain`` and packaged schema strictly from ``site-packages``."""
     probe_code = (
-        "import json, pathlib, superbrain; "
-        "from superbrain.core import _wire_catalog; "
+        "import importlib.resources, json, pathlib, superbrain; "
         "from superbrain.core.wire import load_catalog; "
         "cat = load_catalog(); "
+        "ref = importlib.resources.files('superbrain.core').joinpath('data', 'mcp-tools-v2.json'); "
+        "with importlib.resources.as_file(ref) as p: "
+        "    schema_file = str(pathlib.Path(p).resolve()); "
         "print(json.dumps({"
         "'module_file': str(pathlib.Path(superbrain.__file__).resolve()), "
-        "'schema_file': str(pathlib.Path(_wire_catalog._SCHEMA_PATH).resolve()), "
+        "'schema_file': schema_file, "
         "'schema_sha256': cat.schema_sha256, "
-        "'tool_names': list(cat.tools_by_name.keys())"
+        "'tool_names': list(cat.tools.keys())"
         "}))"
     )
     proc = subprocess.run(
@@ -653,7 +655,8 @@ class ShimTestDomain(KernelToolDomain):
         else:
             raise BrainError(ErrorCode.INVALID_INPUT, "missing workspace selector")
 
-        task_id = require_opaque_id(args["task_id"], label="task_id")
+        raw_task_id = args.get("task_id")
+        task_id = require_opaque_id(raw_task_id, label="task_id") if isinstance(raw_task_id, str) else new_id()
         with self._lock:
             existing_task = self.task_scopes.get(task_id)
             if existing_task is not None and existing_task != (ctx.principal.owner_id, scope):
@@ -736,19 +739,16 @@ class ShimTestDomain(KernelToolDomain):
         scope = self._require_concrete_scope(call, expected_repo_id=expected_repo)
         assert scope.checkout_id is not None
 
-        task_id = require_opaque_id(call.arguments["task_id"], label="task_id")
         delivery_id = require_opaque_id(call.arguments["delivery_id"], label="delivery_id")
-        assignment_id = require_opaque_id(call.arguments["assignment_id"], label="assignment_id")
 
         with self._lock:
             deliv = self.deliveries.get(delivery_id)
             if deliv is None:
                 raise BrainError(ErrorCode.NOT_FOUND, "not found")
-            d_owner, d_scope, d_assign, d_task = deliv
+            d_owner, d_scope, d_assign, _d_task = deliv
             if d_owner != ctx.principal.owner_id or d_scope != scope:
                 raise BrainError(ErrorCode.NOT_FOUND, "not found")
-            if d_assign != assignment_id or d_task != task_id:
-                raise BrainError(ErrorCode.IDENTITY_MISMATCH, "identity mismatch")
+            assignment_id = d_assign
 
             raw_refs = call.arguments.get("applied_refs")
             if isinstance(raw_refs, list):

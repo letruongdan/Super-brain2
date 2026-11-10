@@ -441,9 +441,8 @@ def test_installed_shim_exposes_packaged_catalog_and_calls_daemon(
                 "schema_version": "2.0",
                 "idempotency_key": "idem-wheel-prod-0001",
                 "task_id": "task-wheel-prod-1",
-                "session_id": "sess-wheel-1",
                 "harness_id": "claude-code",
-                "objective": "verify packaged catalog against production daemon",
+                "description": "verify packaged catalog against production daemon",
             },
         ),
     ]
@@ -507,7 +506,6 @@ def test_installed_shim_exposes_packaged_catalog_and_calls_daemon(
                 "error": {
                     "code": "capability_unavailable",
                     "message": "capability unavailable",
-                    "retryable": False,
                 },
             }
 
@@ -537,9 +535,8 @@ def test_installed_shim_exposes_packaged_catalog_and_calls_daemon(
                         "schema_version": "2.0",
                         "idempotency_key": "idem-wheel-fixture-0001",
                         "task_id": "task-wheel-fixture-1",
-                        "session_id": "sess-wheel-1",
                         "harness_id": "claude-code",
-                        "objective": "verify positive call and schema digest across wheel",
+                        "description": "verify positive call and schema digest across wheel",
                     },
                 ),
             ]
@@ -671,9 +668,8 @@ def test_shim_injects_profile_alias_before_request_fingerprint(
             "schema_version": "2.0",
             "idempotency_key": "idem-alias-fingerprint-0001",
             "task_id": "task-alias-fp-1",
-            "session_id": "sess-alias-1",
             "harness_id": "claude-code",
-            "objective": "verify alias injection before request digest",
+            "description": "verify alias injection before request digest",
         }
         explicit_alias_args: dict[str, JsonValue] = {
             **base_args,
@@ -874,9 +870,8 @@ def test_shim_refuses_binding_response_mismatch(
                     "schema_version": "2.0",
                     "idempotency_key": "idem-resp-mismatch-0001",
                     "task_id": "task-mismatch-1",
-                    "session_id": "s-1",
                     "harness_id": "claude-code",
-                    "objective": "case 1 wrong workspace_id",
+                    "description": "case 1 wrong workspace_id",
                 },
             ),
             mcp_call_frame(
@@ -886,9 +881,8 @@ def test_shim_refuses_binding_response_mismatch(
                     "schema_version": "2.0",
                     "idempotency_key": "idem-resp-mismatch-0002",
                     "task_id": "task-mismatch-2",
-                    "session_id": "s-1",
                     "harness_id": "claude-code",
-                    "objective": "case 2 wrong checkout_id",
+                    "description": "case 2 wrong checkout_id",
                 },
             ),
             mcp_call_frame(
@@ -898,9 +892,8 @@ def test_shim_refuses_binding_response_mismatch(
                     "schema_version": "2.0",
                     "idempotency_key": "idem-resp-mismatch-0003",
                     "task_id": "task-mismatch-3",
-                    "session_id": "s-1",
                     "harness_id": "claude-code",
-                    "objective": "case 3 missing checkout_id",
+                    "description": "case 3 missing checkout_id",
                 },
             ),
             mcp_call_frame(
@@ -910,9 +903,8 @@ def test_shim_refuses_binding_response_mismatch(
                     "schema_version": "2.0",
                     "idempotency_key": "idem-resp-mismatch-0004",
                     "task_id": "task-match-4",
-                    "session_id": "s-1",
                     "harness_id": "claude-code",
-                    "objective": "case 4 matching binding",
+                    "description": "case 4 matching binding",
                 },
             ),
         ]
@@ -939,7 +931,6 @@ def test_shim_refuses_binding_response_mismatch(
                 "error": {
                     "code": "identity_mismatch",
                     "message": "identity mismatch",
-                    "retryable": False,
                 },
             }
 
@@ -987,7 +978,6 @@ def test_no_workspace_profile_allows_health_but_refuses_workspace_tools(
                 "error": {
                     "code": "capability_unavailable",
                     "message": "capability unavailable",
-                    "retryable": False,
                 },
             }
 
@@ -1021,7 +1011,6 @@ def test_no_workspace_profile_allows_health_but_refuses_workspace_tools(
                 "error": {
                     "code": "not_found",
                     "message": "not found",
-                    "retryable": False,
                 },
             }
 
@@ -1063,9 +1052,8 @@ def test_same_repo_other_checkout_outcome_and_artifact_are_refused(
                         "schema_version": "2.0",
                         "idempotency_key": "idem-same-repo-prep-a1",
                         "task_id": "task-same-repo-a1",
-                        "session_id": "sess-a1",
                         "harness_id": "claude-code",
-                        "objective": "prepare on checkout A1",
+                        "description": "prepare on checkout A1",
                     },
                 ),
                 mcp_call_frame(
@@ -1087,7 +1075,7 @@ def test_same_repo_other_checkout_outcome_and_artifact_are_refused(
         prep_a1_sc = cast(dict[str, Any], _extract_tool_result(resp_a1[1])["structuredContent"])
         assert prep_a1_sc["ok"] is True
         delivery_a1 = str(prep_a1_sc["data"]["delivery_id"])
-        assignment_a1 = str(prep_a1_sc["data"]["assignment_id"])
+        assert str(prep_a1_sc["data"]["assignment_id"])
 
         art_a1_sc = cast(dict[str, Any], _extract_tool_result(resp_a1[2])["structuredContent"])
         assert art_a1_sc["ok"] is True
@@ -1105,9 +1093,8 @@ def test_same_repo_other_checkout_outcome_and_artifact_are_refused(
                         "schema_version": "2.0",
                         "idempotency_key": "idem-same-repo-prep-a2",
                         "task_id": "task-same-repo-a2",
-                        "session_id": "sess-a2",
                         "harness_id": "claude-code",
-                        "objective": "prepare on checkout A2",
+                        "description": "prepare on checkout A2",
                     },
                 ),
             ],
@@ -1123,7 +1110,7 @@ def test_same_repo_other_checkout_outcome_and_artifact_are_refused(
         # 2. From checkout A2 (same repo_id, different checkout_id), attempt to:
         #    (a) get_artifact using A1's task_id
         #    (b) get_artifact using A2's task_id but A1-scoped artifact `art-only-chk-a1`
-        #    (c) record_outcome referencing A1's delivery_id / assignment_id / task_id
+        #    (c) record_outcome referencing A1's delivery_id
         rc_cross, resp_cross = run_inprocess_stdio(
             caller_a2,
             [
@@ -1160,16 +1147,10 @@ def test_same_repo_other_checkout_outcome_and_artifact_are_refused(
                     {
                         "schema_version": "2.0",
                         "idempotency_key": "idem-cross-outcome-a1",
-                        "task_id": "task-same-repo-a1",
+                        "workspace_id": shim_bundle.ws_a2.repo_id,
                         "delivery_id": delivery_a1,
-                        "assignment_id": assignment_a1,
-                        "event_kind": "declared_applied",
                         "outcome": "success",
-                        "verification": "unknown",
-                        "verification_source": None,
                         "applied_refs": [],
-                        "evidence_ids": [],
-                        "usage": {"amount_usd": None, "complete": False, "source": "unknown"},
                     },
                 ),
             ],
@@ -1183,7 +1164,6 @@ def test_same_repo_other_checkout_outcome_and_artifact_are_refused(
                 "error": {
                     "code": "not_found",
                     "message": "not found",
-                    "retryable": False,
                 },
             }
 
@@ -1203,16 +1183,10 @@ def test_same_repo_other_checkout_outcome_and_artifact_are_refused(
                     {
                         "schema_version": "2.0",
                         "idempotency_key": "idem-pos-outcome-a1",
-                        "task_id": "task-same-repo-a1",
+                        "workspace_id": shim_bundle.ws_a.repo_id,
                         "delivery_id": delivery_a1,
-                        "assignment_id": assignment_a1,
-                        "event_kind": "declared_applied",
                         "outcome": "success",
-                        "verification": "unknown",
-                        "verification_source": None,
                         "applied_refs": [],
-                        "evidence_ids": [],
-                        "usage": {"amount_usd": None, "complete": False, "source": "unknown"},
                     },
                 ),
             ],
@@ -1240,7 +1214,7 @@ def test_profile_switch_same_key_conflicts_even_when_outcome_args_are_unchanged(
 
         caller_a1 = build_tool_caller(profile_a1, Path(shim_bundle.ws_a.checkout_path), adapters)
 
-        # 1. Prepare task on A1 and commit record_outcome with arguments that omit workspace_id/checkout_id.
+        # 1. Prepare task on A1 and commit record_outcome with arguments that omit checkout_id.
         _, prep_res = run_inprocess_stdio(
             caller_a1,
             [
@@ -1252,30 +1226,23 @@ def test_profile_switch_same_key_conflicts_even_when_outcome_args_are_unchanged(
                         "schema_version": "2.0",
                         "idempotency_key": "idem-switch-prep-0001",
                         "task_id": "task-switch-1",
-                        "session_id": "sess-switch-1",
                         "harness_id": "claude-code",
-                        "objective": "prepare task for outcome replay and conflict test",
+                        "description": "prepare task for outcome replay and conflict test",
                     },
                 ),
             ],
         )
         prep_data = cast(dict[str, Any], _extract_tool_result(prep_res[1])["structuredContent"])["data"]
         delivery_id = str(prep_data["delivery_id"])
-        assignment_id = str(prep_data["assignment_id"])
+        assert str(prep_data["assignment_id"])
 
         shared_outcome_args: dict[str, JsonValue] = {
             "schema_version": "2.0",
             "idempotency_key": "idem-outcome-shared-key-0001",
-            "task_id": "task-switch-1",
+            "workspace_id": shim_bundle.ws_a.repo_id,
             "delivery_id": delivery_id,
-            "assignment_id": assignment_id,
-            "event_kind": "declared_applied",
             "outcome": "success",
-            "verification": "unknown",
-            "verification_source": None,
             "applied_refs": [],
-            "evidence_ids": [],
-            "usage": {"amount_usd": None, "complete": False, "source": "unknown"},
         }
 
         _, out_res1 = run_inprocess_stdio(
@@ -1310,7 +1277,6 @@ def test_profile_switch_same_key_conflicts_even_when_outcome_args_are_unchanged(
             "error": {
                 "code": "idempotency_conflict",
                 "message": "idempotency conflict",
-                "retryable": False,
             },
         }
 
@@ -1351,7 +1317,7 @@ def test_missing_scope_is_refused_for_workspace_job_and_global_job_is_authorized
 
         expected_not_found: dict[str, JsonValue] = {
             "ok": False,
-            "error": {"code": "not_found", "message": "not found", "retryable": False},
+            "error": {"code": "not_found", "message": "not found"},
         }
         for idx in (2, 3, 4):
             assert _extract_tool_result(no_ws_res[idx])["structuredContent"] == expected_not_found
@@ -1435,7 +1401,7 @@ def test_shim_pins_before_bearer_and_never_reconnects(
         assert "_meta" not in wp_tool
         assert wp_tool.get("structuredContent") == {
             "ok": False,
-            "error": {"code": "identity_mismatch", "message": "identity mismatch", "retryable": False},
+            "error": {"code": "identity_mismatch", "message": "identity mismatch"},
         }
         assert wrong_pin_srv.accept_count == 1
         assert wrong_pin_srv.all_received_bytes == b""
@@ -1471,7 +1437,7 @@ def test_shim_pins_before_bearer_and_never_reconnects(
         assert "_meta" not in exp_tool
         assert exp_tool.get("structuredContent") == {
             "ok": False,
-            "error": {"code": "identity_mismatch", "message": "identity mismatch", "retryable": False},
+            "error": {"code": "identity_mismatch", "message": "identity mismatch"},
         }
         assert exp_srv.accept_count == 1
         assert exp_srv.all_received_bytes == b""
@@ -1523,7 +1489,7 @@ def test_shim_pins_before_bearer_and_never_reconnects(
         assert "_meta" not in tuple_tool
         assert tuple_tool.get("structuredContent") == {
             "ok": False,
-            "error": {"code": "identity_mismatch", "message": "identity mismatch", "retryable": False},
+            "error": {"code": "identity_mismatch", "message": "identity mismatch"},
         }
         assert tuple_srv.accept_count == 1
         assert tuple_srv.post_call_count == 0
@@ -1576,7 +1542,7 @@ def test_shim_pins_before_bearer_and_never_reconnects(
         assert "_meta" not in drop_tool
         assert drop_tool.get("structuredContent") == {
             "ok": False,
-            "error": {"code": "daemon_unavailable", "message": "daemon unavailable", "retryable": True},
+            "error": {"code": "daemon_unavailable", "message": "daemon unavailable"},
         }
         assert drop_srv.accept_count == 1
         assert drop_srv.post_call_count == 0
@@ -1595,9 +1561,8 @@ def test_shim_pins_before_bearer_and_never_reconnects(
                 "schema_version": "2.0",
                 "idempotency_key": "idem-pin-restart-replay-0001",
                 "task_id": "task-pin-restart-1",
-                "session_id": "sess-pin-1",
                 "harness_id": "claude-code",
-                "objective": "verify single POST and replay after endpoint epoch change",
+                "description": "verify single POST and replay after endpoint epoch change",
             },
         )
         _, live_res1 = run_inprocess_stdio(caller_live, [*mcp_init_frames(1), prep_frame])
@@ -1703,9 +1668,8 @@ def test_shim_post_response_loss_preserves_uncertainty_and_key(
                 "schema_version": "2.0",
                 "idempotency_key": "idem-post-loss-preserve-0001",
                 "task_id": "task-post-loss-1",
-                "session_id": "sess-loss-1",
                 "harness_id": "claude-code",
-                "objective": "verify post-response loss uncertainty and idempotent replay",
+                "description": "verify post-response loss uncertainty and idempotent replay",
             },
         )
 
@@ -1721,7 +1685,6 @@ def test_shim_post_response_loss_preserves_uncertainty_and_key(
                 "error": {
                     "code": "daemon_unavailable",
                     "message": "daemon unavailable",
-                    "retryable": True,
                 },
             }
 
@@ -1794,9 +1757,8 @@ def test_shim_stdout_failure_does_not_create_read_ack(
                         "schema_version": "2.0",
                         "idempotency_key": "idem-stdout-fail-prep-0001",
                         "task_id": "task-stdout-fail-1",
-                        "session_id": "sess-stdout-1",
                         "harness_id": "claude-code",
-                        "objective": "prepare task before artifact stdout failure",
+                        "description": "prepare task before artifact stdout failure",
                     },
                 ),
             ],
@@ -1950,7 +1912,6 @@ def test_shim_slow_identity_preserves_tool_budget_and_commit_unknown(
                 "error": {
                     "code": "commit_outcome_unknown",
                     "message": "commit outcome unknown",
-                    "retryable": True,
                 },
             }
 
@@ -1978,8 +1939,7 @@ def test_shim_slow_identity_preserves_tool_budget_and_commit_unknown(
                 "ok": False,
                 "error": {
                     "code": "in_progress",
-                    "message": "request with this idempotency key is still in progress",
-                    "retryable": True,
+                    "message": "operation in progress",
                 },
             }
 
@@ -2030,9 +1990,8 @@ def test_native_lifecycle_report_fails_on_workspace_switch_with_same_shim(
                         "schema_version": "2.0",
                         "idempotency_key": "idem-lifecycle-obs-a",
                         "task_id": "task-lifecycle-a",
-                        "session_id": "sess-lc-a",
                         "harness_id": "claude-code",
-                        "objective": "observe workspace A",
+                        "description": "observe workspace A",
                     },
                 ),
             ],
@@ -2106,10 +2065,9 @@ def test_native_lifecycle_report_fails_on_workspace_switch_with_same_shim(
                         "schema_version": "2.0",
                         "idempotency_key": "idem-lifecycle-wrong-ws",
                         "task_id": "task-lifecycle-wrong",
-                        "session_id": "sess-lc-a",
                         "harness_id": "claude-code",
                         "workspace_hint": shim_bundle.ws_b.alias,
-                        "objective": "attempt workspace B on shim A",
+                        "description": "attempt workspace B on shim A",
                     },
                 ),
             ],
@@ -2118,7 +2076,7 @@ def test_native_lifecycle_report_fails_on_workspace_switch_with_same_shim(
         assert wrong_tool.get("isError") is True
         assert wrong_tool.get("structuredContent") == {
             "ok": False,
-            "error": {"code": "identity_mismatch", "message": "identity mismatch", "retryable": False},
+            "error": {"code": "identity_mismatch", "message": "identity mismatch"},
         }
 
         # 2. Relaunching a distinct shim process with profile_b in checkout_b binds to scope_b and PASSES.
@@ -2133,9 +2091,8 @@ def test_native_lifecycle_report_fails_on_workspace_switch_with_same_shim(
                         "schema_version": "2.0",
                         "idempotency_key": "idem-lifecycle-obs-b",
                         "task_id": "task-lifecycle-b",
-                        "session_id": "sess-lc-b",
                         "harness_id": "claude-code",
-                        "objective": "observe workspace B",
+                        "description": "observe workspace B",
                     },
                 ),
             ],
