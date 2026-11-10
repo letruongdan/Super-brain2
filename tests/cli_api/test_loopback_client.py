@@ -524,6 +524,41 @@ def test_pin_checked_before_any_http(inc2_tls_material: SampleTlsMaterial, tmp_p
         assert server.get_count == 0
         assert server.post_count == 0
 
+    # Subcase E: Invalid CA strings (non-ASCII or malformed PEM) fail closed before network connect
+    with MockTlsServer(valid_server_ctx) as server:
+        ep = Endpoint(
+            version=1,
+            host="127.0.0.1",
+            port=server.port,
+            store_id="store-1",
+            writer_epoch=1,
+            instance_id="inst-1",
+            contract="mcp-tools-v2",
+        )
+        bad_ca = LoopbackTarget(
+            endpoint=ep,
+            expected_store_id="store-1",
+            ca_pem="non-ASCII PEM \u00e9",
+            leaf_cert_sha256="a" * 64,
+        )
+        bad_pem = LoopbackTarget(
+            endpoint=ep,
+            expected_store_id="store-1",
+            ca_pem="not-a-valid-pem",
+            leaf_cert_sha256="a" * 64,
+        )
+        with pytest.raises(LoopbackTransportError) as exc_ca:
+            client.connect(bad_ca)
+        assert exc_ca.value.code == ErrorCode.INVALID_INPUT
+        assert exc_ca.value.request_may_have_run is False
+        assert server.accept_count == 0
+
+        with pytest.raises(LoopbackTransportError) as exc_pem:
+            client.call(bad_pem, command)
+        assert exc_pem.value.code == ErrorCode.INVALID_INPUT
+        assert exc_pem.value.request_may_have_run is False
+        assert server.accept_count == 0
+
 
 # -----------------------------------------------------------------------------
 # Test 2: test_wrong_identity_receives_only_probe
@@ -678,6 +713,30 @@ def test_wrong_identity_receives_only_probe(inc2_tls_material: SampleTlsMaterial
             # Verify zero token or tool args leaked across raw decrypted wire
             assert secret_token.encode() not in server.raw_http_bytes
             assert b"get_health" not in server.raw_http_bytes
+
+    # Subcase: Overlong 5,000-digit Content-Length on GET /v2/identity fails identity verification with 0 POSTs
+    def overlong_cl_identity_handler(req: MockHttpRequest, sock: ssl.SSLSocket) -> bytes | None:
+        if req.method == "GET":
+            return b"HTTP/1.1 200 OK\r\nContent-Length: " + (b"9" * 5000) + b"\r\n\r\n"
+        return None
+
+    with MockTlsServer(valid_server_ctx, handler=overlong_cl_identity_handler) as server:
+        ep = Endpoint(
+            version=1,
+            host="127.0.0.1",
+            port=server.port,
+            store_id="store-1",
+            writer_epoch=1,
+            instance_id="inst-1",
+            contract="mcp-tools-v2",
+        )
+        target = LoopbackTarget(ep, "store-1", valid_ca_pem, valid_leaf_sha)
+        with pytest.raises(LoopbackTransportError) as exc_info:
+            client.call(target, command)
+        assert exc_info.value.code == ErrorCode.IDENTITY_MISMATCH
+        assert exc_info.value.request_may_have_run is False
+        assert server.get_count == 1
+        assert server.post_count == 0
 
 
 # -----------------------------------------------------------------------------
@@ -1027,6 +1086,43 @@ def test_response_loss_after_post_is_transport_uncertain(inc2_tls_material: Samp
         assert exc_info.value.request_may_have_run is True
         assert isinstance(cmd4.arguments, dict)
         assert cmd4.arguments["idempotency_key"] == "k-502"
+        assert server.post_count == 1
+
+    # Subcase 5: Overlong 5,000-digit Content-Length on POST /v2/tools/call response
+    # is DAEMON_UNAVAILABLE with request_may_have_run=True
+    def overlong_cl_post_handler(req: MockHttpRequest, sock: ssl.SSLSocket) -> bytes | None:
+        if req.method == "GET":
+            body = json.dumps(
+                {"store_id": "store-1", "writer_epoch": 1, "instance_id": "inst-1", "contract": "mcp-tools-v2"}
+            ).encode()
+            return (
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
+                + str(len(body)).encode()
+                + b"\r\n\r\n"
+                + body
+            )
+        if req.method == "POST":
+            return b"HTTP/1.1 200 OK\r\nContent-Length: " + (b"9" * 5000) + b"\r\n\r\n"
+        return None
+
+    with MockTlsServer(valid_server_ctx, handler=overlong_cl_post_handler) as server:
+        ep = Endpoint(
+            version=1,
+            host="127.0.0.1",
+            port=server.port,
+            store_id="store-1",
+            writer_epoch=1,
+            instance_id="inst-1",
+            contract="mcp-tools-v2",
+        )
+        target = LoopbackTarget(ep, "store-1", valid_ca_pem, valid_leaf_sha)
+        cmd_cl = ToolCommand(tool="get_health", arguments={"idempotency_key": "k-cl-5000"}, token="tok-cl")
+
+        with pytest.raises(LoopbackTransportError) as exc_info:
+            client.call(target, cmd_cl)
+        assert exc_info.value.code == ErrorCode.DAEMON_UNAVAILABLE
+        assert exc_info.value.request_may_have_run is True
+        assert server.get_count == 1
         assert server.post_count == 1
 
     # Complementary success cases: valid daemon error envelopes returned intact

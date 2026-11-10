@@ -322,6 +322,69 @@ def test_header_caps_apply_before_stdlib_parser() -> None:
         assert exc_body_resp.value.code is ErrorCode.INVALID_INPUT
         assert exc_body_resp.value.http_status == 413
 
+    # 5a. Content-Length with 5,000 digits: '9' * 5000 raises HttpFramingError(413) on both request and response
+    cl_9_5000 = b"Content-Length: " + (b"9" * 5000) + b"\r\n\r\n"
+    with socket_pair() as (client_sock, server_sock):
+        server_sock.sendall(b"POST /v2/tools/call HTTP/1.1\r\n" + cl_9_5000)
+        reader = FramedReader(client_sock, clock)
+        with pytest.raises(HttpFramingError) as exc_cl_req:
+            reader.read_request_head(ample_deadline)
+        assert exc_cl_req.value.code is ErrorCode.INVALID_INPUT
+        assert exc_cl_req.value.http_status == 413
+
+    with socket_pair() as (client_sock, server_sock):
+        server_sock.sendall(b"HTTP/1.1 200 OK\r\n" + cl_9_5000)
+        reader = FramedReader(client_sock, clock)
+        with pytest.raises(HttpFramingError) as exc_cl_resp:
+            reader.read_response_head(ample_deadline)
+        assert exc_cl_resp.value.code is ErrorCode.INVALID_INPUT
+        assert exc_cl_resp.value.http_status == 413
+
+    # 5b. Content-Length: '0' * 5000 succeeds with content_length == 0
+    cl_0_5000 = b"Content-Length: " + (b"0" * 5000) + b"\r\n\r\n"
+    with socket_pair() as (client_sock, server_sock):
+        server_sock.sendall(b"GET /v2/identity HTTP/1.1\r\n" + cl_0_5000)
+        reader = FramedReader(client_sock, clock)
+        head_cl0 = reader.read_request_head(ample_deadline)
+        assert head_cl0.content_length == 0
+
+    with socket_pair() as (client_sock, server_sock):
+        server_sock.sendall(b"HTTP/1.1 200 OK\r\n" + cl_0_5000)
+        reader = FramedReader(client_sock, clock)
+        resp_cl0 = reader.read_response_head(ample_deadline)
+        assert resp_cl0.content_length == 0
+
+    # 5c. Content-Length: '0' * 5000 + '1048576' succeeds; '0' * 5000 + '1048577' raises 413
+    cl_zeros_exact = b"Content-Length: " + (b"0" * 5000) + b"1048576\r\n\r\n"
+    with socket_pair() as (client_sock, server_sock):
+        server_sock.sendall(b"POST /v2/tools/call HTTP/1.1\r\n" + cl_zeros_exact)
+        reader = FramedReader(client_sock, clock)
+        head_cl_exact = reader.read_request_head(ample_deadline)
+        assert head_cl_exact.content_length == 1_048_576
+
+    with socket_pair() as (client_sock, server_sock):
+        server_sock.sendall(b"HTTP/1.1 200 OK\r\n" + cl_zeros_exact)
+        reader = FramedReader(client_sock, clock)
+        resp_cl_exact = reader.read_response_head(ample_deadline)
+        assert resp_cl_exact.content_length == 1_048_576
+
+    cl_zeros_over = b"Content-Length: " + (b"0" * 5000) + b"1048577\r\n\r\n"
+    with socket_pair() as (client_sock, server_sock):
+        server_sock.sendall(b"POST /v2/tools/call HTTP/1.1\r\n" + cl_zeros_over)
+        reader = FramedReader(client_sock, clock)
+        with pytest.raises(HttpFramingError) as exc_cl_over_req:
+            reader.read_request_head(ample_deadline)
+        assert exc_cl_over_req.value.code is ErrorCode.INVALID_INPUT
+        assert exc_cl_over_req.value.http_status == 413
+
+    with socket_pair() as (client_sock, server_sock):
+        server_sock.sendall(b"HTTP/1.1 200 OK\r\n" + cl_zeros_over)
+        reader = FramedReader(client_sock, clock)
+        with pytest.raises(HttpFramingError) as exc_cl_over_resp:
+            reader.read_response_head(ample_deadline)
+        assert exc_cl_over_resp.value.code is ErrorCode.INVALID_INPUT
+        assert exc_cl_over_resp.value.http_status == 413
+
     with socket_pair() as (client_sock, _):
         reader = FramedReader(client_sock, clock)
         with pytest.raises(HttpFramingError) as exc_exact_max:
@@ -568,6 +631,7 @@ def test_slow_header_and_body_share_absolute_deadline() -> None:
     chunks_to_send = list(chunks)
 
     with tracking_socket_pair() as (track_sock, server_sock):
+
         def drip_recv(bufsize: int, flags: int = 0) -> bytes:
             if chunks_to_send:
                 server_sock.sendall(chunks_to_send.pop(0))
@@ -890,9 +954,7 @@ def test_wire_call_preserves_scope_and_arguments() -> None:
     assert exc_cid_utf8.value.code is ErrorCode.INVALID_INPUT
 
     # Unpaired UTF-16 surrogate
-    unpaired_json = (
-        b'{"tool":"get_health","arguments":{},"correlation_id":"\\ud800","selected_scope":null}'
-    )
+    unpaired_json = b'{"tool":"get_health","arguments":{},"correlation_id":"\\ud800","selected_scope":null}'
     with pytest.raises(BrainError) as exc_unpaired:
         decode_call(unpaired_json, token="t")
     assert exc_unpaired.value.code is ErrorCode.INVALID_INPUT
