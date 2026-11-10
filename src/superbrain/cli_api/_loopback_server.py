@@ -33,8 +33,8 @@ from superbrain.core.wire import encode_envelope, make_error_envelope
 
 MAX_ACTIVE_CONNECTIONS = 32
 SERVER_HANDSHAKE_BUDGET_NS = 1_000_000_000
-_ACCEPT_POLL_S = 0.05
-_REPLY_WAIT_SLICE_S = 0.02
+_ACCEPT_POLL_S = 0.005
+_REPLY_WAIT_SLICE_S = 0.005
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -65,7 +65,7 @@ def _graceful_close_conn(
             target.shutdown(socket.SHUT_WR)
         if drain:
             with contextlib.suppress(ssl.SSLError, OSError):
-                target.settimeout(0.05)
+                target.settimeout(0.002)
                 drained = 0
                 while drained < 65_536:
                     chunk = target.recv(4096)
@@ -490,6 +490,7 @@ class LoopbackServer:
     def _conn_worker(self, conn_id: int, raw_sock: socket.socket, accept_ns: int) -> None:
         ssl_sock: ssl.SSLSocket | None = None
         handshake_completed = False
+        clean_done = False
         try:
             handshake_deadline_ns = accept_ns + SERVER_HANDSHAKE_BUDGET_NS
             rem_s = self._handshake_timeout_s(handshake_deadline_ns)
@@ -563,6 +564,7 @@ class LoopbackServer:
             if reply is None:
                 return
             self._release_owner_reply(ssl_sock, reply, tool_deadline_ns)
+            clean_done = True
         except (TimeoutError, ssl.SSLError, OSError):
             return
         except BrainError as err:
@@ -573,7 +575,7 @@ class LoopbackServer:
                 ErrorCode.INTEGRITY_FAILURE.value,
             )
         finally:
-            self._release_conn(conn_id, raw_sock, ssl_sock, drain=handshake_completed)
+            self._release_conn(conn_id, raw_sock, ssl_sock, drain=handshake_completed and not clean_done)
 
     def _release_conn(
         self,
