@@ -238,9 +238,9 @@ class MockTlsServer:
     def __init__(
         self,
         ssl_ctx: ssl.SSLContext,
-        store_id: str = "store-test-1",
+        store_id: str = "store-1",
         writer_epoch: int = 1,
-        instance_id: str = "inst-test-1",
+        instance_id: str = "inst-1",
         handler: Callable[[MockHttpRequest, ssl.SSLSocket], bytes | None] | None = None,
         port: int = 0,
     ) -> None:
@@ -445,12 +445,12 @@ def test_pin_checked_before_any_http(inc2_tls_material: SampleTlsMaterial, tmp_p
             version=1,
             host="127.0.0.1",
             port=server.port,
-            store_id="store-test-1",
+            store_id="store-1",
             writer_epoch=1,
-            instance_id="inst-test-1",
+            instance_id="inst-1",
             contract="mcp-tools-v2",
         )
-        target = LoopbackTarget(ep, "store-test-1", valid_ca_pem, valid_leaf_sha)
+        target = LoopbackTarget(ep, "store-1", valid_ca_pem, valid_leaf_sha)
         with pytest.raises(LoopbackTransportError) as exc_info:
             client.connect(target)
         assert exc_info.value.code == ErrorCode.IDENTITY_MISMATCH
@@ -466,12 +466,12 @@ def test_pin_checked_before_any_http(inc2_tls_material: SampleTlsMaterial, tmp_p
             version=1,
             host="127.0.0.1",
             port=server.port,
-            store_id="store-test-1",
+            store_id="store-1",
             writer_epoch=1,
-            instance_id="inst-test-1",
+            instance_id="inst-1",
             contract="mcp-tools-v2",
         )
-        target = LoopbackTarget(ep, "store-test-1", valid_ca_pem, valid_leaf_sha)
+        target = LoopbackTarget(ep, "store-1", valid_ca_pem, valid_leaf_sha)
         with pytest.raises(LoopbackTransportError) as exc_info:
             client.call(target, command)
         assert exc_info.value.code == ErrorCode.IDENTITY_MISMATCH
@@ -487,12 +487,12 @@ def test_pin_checked_before_any_http(inc2_tls_material: SampleTlsMaterial, tmp_p
             version=1,
             host="127.0.0.1",
             port=server.port,
-            store_id="store-test-1",
+            store_id="store-1",
             writer_epoch=1,
-            instance_id="inst-test-1",
+            instance_id="inst-1",
             contract="mcp-tools-v2",
         )
-        target = LoopbackTarget(ep, "store-test-1", valid_ca_pem, valid_leaf_sha)
+        target = LoopbackTarget(ep, "store-1", valid_ca_pem, valid_leaf_sha)
         with pytest.raises(LoopbackTransportError) as exc_info:
             client.connect(target)
         assert exc_info.value.code == ErrorCode.IDENTITY_MISMATCH
@@ -508,14 +508,14 @@ def test_pin_checked_before_any_http(inc2_tls_material: SampleTlsMaterial, tmp_p
             version=1,
             host="127.0.0.1",
             port=server.port,
-            store_id="store-test-1",
+            store_id="store-1",
             writer_epoch=1,
-            instance_id="inst-test-1",
+            instance_id="inst-1",
             contract="mcp-tools-v2",
         )
         # Flip the last character of the valid pin
         corrupted_pin = valid_leaf_sha[:-1] + ("0" if valid_leaf_sha[-1] != "0" else "1")
-        target = LoopbackTarget(ep, "store-test-1", valid_ca_pem, corrupted_pin)
+        target = LoopbackTarget(ep, "store-1", valid_ca_pem, corrupted_pin)
         with pytest.raises(LoopbackTransportError) as exc_info:
             client.connect(target)
         assert exc_info.value.code == ErrorCode.IDENTITY_MISMATCH
