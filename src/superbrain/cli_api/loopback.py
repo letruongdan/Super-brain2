@@ -188,6 +188,12 @@ class PinnedConnection:
             except BrainError as err:
                 msg = err.message if is_safe_wire_message(err.message) else SAFE_WIRE_MESSAGES_BY_CODE[err.code]
                 raise LoopbackTransportError(err.code, msg, request_may_have_run=False) from err
+            except (TypeError, ValueError, UnicodeError) as err:
+                raise LoopbackTransportError(
+                    ErrorCode.INVALID_INPUT,
+                    "invalid input",
+                    request_may_have_run=False,
+                ) from err
 
             _remaining_budget_s(self._monotonic_ns, eff_deadline_ns, request_may_have_run=False)
             if reader.has_pipelined_bytes(eff_deadline_ns):
@@ -343,6 +349,12 @@ class LoopbackClient:
             else min(explicit_dl, start_ns + CLIENT_CONNECT_BUDGET_NS)
         )
         _remaining_budget_s(self._monotonic_ns, connect_deadline_ns, request_may_have_run=False)
+        if not target.ca_pem.strip() or not target.ca_pem.isascii():
+            raise LoopbackTransportError(
+                ErrorCode.INVALID_INPUT,
+                "invalid input",
+                request_may_have_run=False,
+            )
 
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ctx.minimum_version = ssl.TLSVersion.TLSv1_2
@@ -350,7 +362,7 @@ class LoopbackClient:
         ctx.check_hostname = True
         try:
             ctx.load_verify_locations(cadata=target.ca_pem)
-        except ssl.SSLError as err:
+        except (ssl.SSLError, ValueError, TypeError) as err:
             raise LoopbackTransportError(
                 ErrorCode.INVALID_INPUT,
                 "invalid input",

@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+import contextlib
+import math
 import socket
+import ssl
+import threading
+import time
 from collections.abc import Callable
 
 from superbrain.cli_api._http_frames import (
@@ -238,3 +243,66 @@ def read_admitted_tool_command(
     except HttpFramingError as err:
         handle_framing_failure(sock, err, deadline_ns=deadline_ns, monotonic_ns=monotonic_ns)
         return None
+
+
+def _graceful_reject_socket(sock: socket.socket) -> None:
+    with contextlib.suppress(OSError):
+        sock.shutdown(socket.SHUT_WR)
+    with contextlib.suppress(OSError):
+        sock.close()
+
+
+def _abort_socket(sock: socket.socket) -> None:
+    with contextlib.suppress(OSError):
+        sock.shutdown(socket.SHUT_RDWR)
+    with contextlib.suppress(OSError):
+        sock.close()
+
+
+def _graceful_close_conn(
+    ssl_sock: ssl.SSLSocket | None,
+    raw_sock: socket.socket | None,
+    *,
+    drain: bool,
+    stop_deadline: float | None = None,
+) -> None:
+    target: socket.socket | None = ssl_sock if ssl_sock is not None else raw_sock
+    if target is not None:
+        with contextlib.suppress(OSError):
+            target.shutdown(socket.SHUT_WR)
+        if drain:
+            drain_deadline = time.perf_counter() + 0.002
+            if stop_deadline is not None:
+                drain_deadline = min(drain_deadline, stop_deadline)
+            with contextlib.suppress(ssl.SSLError, OSError):
+                for _ in range(4):
+                    rem = drain_deadline - time.perf_counter()
+                    if rem <= 0:
+                        break
+                    target.settimeout(rem)
+                    chunk = target.recv(4096)
+                    if not chunk:
+                        break
+    if ssl_sock is not None:
+        with contextlib.suppress(OSError):
+            ssl_sock.close()
+    if raw_sock is not None and raw_sock is not ssl_sock:
+        with contextlib.suppress(OSError):
+            raw_sock.close()
+
+
+def _safe_join(thread: threading.Thread | None, timeout: float) -> None:
+    if thread is None or threading.current_thread() is thread:
+        return
+    with contextlib.suppress(RuntimeError):
+        thread.join(timeout=max(0.0, timeout))
+
+
+def _validate_stop_deadline(stop_deadline: float) -> float:
+    if (
+        isinstance(stop_deadline, bool)
+        or not isinstance(stop_deadline, (int, float))
+        or not math.isfinite(stop_deadline)
+    ):
+        raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+    return float(stop_deadline)

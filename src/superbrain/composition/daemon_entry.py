@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import math
 import signal
 import threading
 import time
@@ -361,6 +362,13 @@ def serve(
     """Run the foreground kernel daemon lifecycle for ``config`` and return process exit status."""
     if not isinstance(config, DaemonConfig):
         raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+    if (
+        isinstance(shutdown_grace_s, bool)
+        or not isinstance(shutdown_grace_s, (int, float))
+        or not math.isfinite(shutdown_grace_s)
+        or shutdown_grace_s <= 0
+    ):
+        raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
 
     adapters = os_ if os_ is not None else os_adapters(clock=clock, monotonic=monotonic_clock)
     resolved_clock = clock if clock is not None else adapters.clock
@@ -395,16 +403,16 @@ def serve(
     except BaseException as err:  # noqa: BLE001
         code = err.code if isinstance(err, BrainError) else ErrorCode.INTEGRITY_FAILURE
         _LOGGER.error("loopback server startup failed (phase=loopback_startup, code=%s)", code.value)
-        stop_deadline = time.perf_counter() + max(0.0, float(shutdown_grace_s))
+        stop_deadline = time.perf_counter() + float(shutdown_grace_s)
         if server is not None:
-            with contextlib.suppress(BrainError):
+            with contextlib.suppress(Exception):
                 server.quiesce(stop_deadline)
         with contextlib.suppress(BrainError):
             rep = loop.stop(grace_s=max(0.0, stop_deadline - time.perf_counter()))
             if rep.state is ShutdownState.OVERRUN:
                 loop.wait_closed()
         if server is not None:
-            with contextlib.suppress(BrainError):
+            with contextlib.suppress(Exception):
                 server.finish(stop_deadline)
         if isinstance(err, (KeyboardInterrupt, SystemExit)):
             raise
@@ -421,10 +429,17 @@ def serve(
             except KeyboardInterrupt:
                 effective_stop.set()
     finally:
-        stop_deadline = time.perf_counter() + max(0.0, float(shutdown_grace_s))
-        server.quiesce(stop_deadline)
+        stop_deadline = time.perf_counter() + float(shutdown_grace_s)
+        quiesce_ok = True
+        try:
+            server.quiesce(stop_deadline)
+        except Exception:  # noqa: BLE001
+            quiesce_ok = False
         report = loop.stop(grace_s=max(0.0, stop_deadline - time.perf_counter()))
-        transport_ok = server.finish(stop_deadline)
+        try:
+            transport_ok = server.finish(stop_deadline) and quiesce_ok
+        except Exception:  # noqa: BLE001
+            transport_ok = False
         if report.state is ShutdownState.OVERRUN:
             loop.wait_closed()
     return 0 if (report.state is ShutdownState.STOPPED and report.endpoint_removed and transport_ok) else 1
