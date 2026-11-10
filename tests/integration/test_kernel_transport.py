@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import contextlib
 import datetime as dt
+import errno
 import hashlib
 import json
 import logging
@@ -68,6 +69,7 @@ from superbrain.core.kernel import (
     Ready,
     Scope,
     SendAttemptState,
+    ShutdownReport,
     StoredResult,
     ToolCommand,
 )
@@ -1332,6 +1334,158 @@ class TestTransportLifecycleAndRelease:
                 domain_cutoff.allow_apply_finish.set()
                 stop_cutoff.set()
                 shutil.rmtree(case_dir_cutoff, ignore_errors=True)
+
+            # (g) Pre-set stop_event returns 1 cleanly without publishing endpoint or invoking on_ready (I2-T6B-R01)
+            case_dir_preset = make_trusted_test_dir("t6b4-stop-preset")
+            data_root_preset = case_dir_preset / "data"
+            clone_owner_only_tree(transport_template.root, data_root_preset)
+            cfg_preset = DaemonConfig(
+                version=1,
+                data_root=data_root_preset,
+                expected_store_id=transport_template.store_id,
+                cert_path=transport_template.tls.cert_path,
+                key_path=transport_template.tls.key_path,
+            )
+            try:
+                preset_stop = threading.Event()
+                preset_stop.set()
+                ready_preset: list[Ready] = []
+
+                def _on_ready_preset(r: Ready, _l: OwnerLoop) -> None:
+                    ready_preset.append(r)
+
+                rc_preset = serve(
+                    cfg_preset,
+                    stop_event=preset_stop,
+                    on_ready=_on_ready_preset,
+                )
+                assert rc_preset == 1, f"Expected returncode 1 for preset stop_event, got {rc_preset}"
+                assert ready_preset == [], "on_ready must not be called when stop_event is pre-set"
+                assert not (data_root_preset / "endpoint.json").exists(), "endpoint.json must not exist"
+                with admit_existing_pair(
+                    data_root_preset, transport_template.store_id, os_adapters(), purpose="serve"
+                ) as admitted:
+                    assert admitted is not None
+            finally:
+                shutil.rmtree(case_dir_preset, ignore_errors=True)
+
+            # (h) Startup partial-accept failure while owner is held in OVERRUN aborts
+            # accepted peer socket within grace (<= 0.09s) (I2-T6B-R01)
+            case_dir_partial = make_trusted_test_dir("t6b4-fail-start-partial")
+            data_root_partial = case_dir_partial / "data"
+            clone_owner_only_tree(transport_template.root, data_root_partial)
+            cfg_partial = DaemonConfig(
+                version=1,
+                data_root=data_root_partial,
+                expected_store_id=transport_template.store_id,
+                cert_path=transport_template.tls.cert_path,
+                key_path=transport_template.tls.key_path,
+            )
+            client_sock_partial: socket.socket | None = None
+            t_partial_serve: threading.Thread | None = None
+            owner_release_ev = threading.Event()
+            try:
+                serve_res_partial: list[int] = []
+                ready_partial: list[Ready] = []
+
+                def _on_ready_partial(r: Ready, _l: OwnerLoop) -> None:
+                    ready_partial.append(r)
+
+                listener_filenos: set[int] = set()
+                orig_init = LoopbackServer.__init__
+                client_connected = threading.Event()
+                error_injected = threading.Event()
+
+                def mock_server_init(self_srv: LoopbackServer, *args: Any, **kwargs: Any) -> None:
+                    nonlocal client_sock_partial
+                    orig_init(self_srv, *args, **kwargs)
+                    listener_filenos.add(self_srv._listener.fileno())
+                    srv_port = self_srv._listener.getsockname()[1]
+                    client_sock_partial = socket.create_connection(("127.0.0.1", srv_port))
+                    client_connected.set()
+
+                    orig_ready_wait = self_srv._accept_ready.wait
+
+                    def mock_ready_wait(timeout: float | None = None) -> bool:
+                        res = orig_ready_wait(timeout)
+                        error_injected.wait(timeout=2.0)
+                        return res
+
+                    self_srv._accept_ready.wait = mock_ready_wait  # type: ignore[method-assign]
+
+                orig_accept = socket.socket.accept
+                accept_count = 0
+
+                def mock_accept(self_sock: socket.socket) -> tuple[socket.socket, Any]:
+                    nonlocal accept_count
+                    if self_sock.fileno() in listener_filenos:
+                        accept_count += 1
+                        if accept_count == 1:
+                            return orig_accept(self_sock)
+                        error_injected.set()
+                        raise OSError(errno.ECONNABORTED, "Software caused connection abort")
+                    return orig_accept(self_sock)
+
+                orig_loop_stop = OwnerLoop.stop
+
+                def mock_loop_stop(self_loop: OwnerLoop, grace_s: float = 0.0) -> ShutdownReport:
+                    owner_release_ev.wait(timeout=0.22)
+                    return orig_loop_stop(self_loop, grace_s)
+
+                with monkeypatch.context() as mp:
+                    mp.setattr(LoopbackServer, "__init__", mock_server_init)
+                    mp.setattr(socket.socket, "accept", mock_accept)
+                    mp.setattr(OwnerLoop, "stop", mock_loop_stop)
+
+                    t_partial_serve = threading.Thread(
+                        target=lambda: serve_res_partial.append(
+                            serve(
+                                cfg_partial,
+                                shutdown_grace_s=0.045,
+                                on_ready=_on_ready_partial,
+                            )
+                        )
+                    )
+                    t_partial_serve.start()
+
+                    assert client_connected.wait(timeout=2.0), "client_sock_partial was never connected"
+                    assert client_sock_partial is not None
+
+                    # The peer socket must be aborted by transport within grace (<= 0.09s),
+                    # even while owner loop stop is held for 0.22s.
+                    client_sock_partial.settimeout(0.5)
+                    t_wait_abort = time.perf_counter()
+                    try:
+                        data = client_sock_partial.recv(1024)
+                        assert data == b""
+                    except (ConnectionResetError, BrokenPipeError):
+                        pass
+                    except TimeoutError:
+                        pytest.fail("accepted peer socket was not aborted within cutoff grace")
+                    finally:
+                        owner_release_ev.set()
+
+                    abort_elapsed = time.perf_counter() - t_wait_abort
+                    assert abort_elapsed <= 0.09, f"Peer socket abort took {abort_elapsed:.4f}s (> 0.09s)"
+
+                    t_partial_serve.join(timeout=3.0)
+                    assert serve_res_partial == [1], f"Expected returncode 1, got {serve_res_partial!r}"
+                    assert ready_partial == [], "on_ready must not be called on startup failure"
+                    assert not (data_root_partial / "endpoint.json").exists(), "endpoint.json must not exist"
+                    with admit_existing_pair(
+                        data_root_partial, transport_template.store_id, os_adapters(), purpose="serve"
+                    ) as admitted:
+                        assert admitted is not None
+            finally:
+                owner_release_ev.set()
+                if client_sock_partial is not None:
+                    try:
+                        client_sock_partial.close()
+                    except OSError:
+                        pass
+                if t_partial_serve is not None and t_partial_serve.is_alive():
+                    t_partial_serve.join(timeout=3.0)
+                shutil.rmtree(case_dir_partial, ignore_errors=True)
         finally:
             shutil.rmtree(case_dir, ignore_errors=True)
 

@@ -18,6 +18,7 @@ Covers all mandatory invariants from interface-spec.md Section 3 and task-6b-2-b
 from __future__ import annotations
 
 import datetime as dt
+import errno
 import ipaddress
 import json
 import socket
@@ -431,7 +432,11 @@ def _make_server_ctx(tls: SampleTlsMaterial) -> ssl.SSLContext:
 # -----------------------------------------------------------------------------
 
 
-def test_pin_checked_before_any_http(inc2_tls_material: SampleTlsMaterial, tmp_path: Path) -> None:
+def test_pin_checked_before_any_http(
+    inc2_tls_material: SampleTlsMaterial,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Verify wrong CA, missing IP SAN, expired leaf, and wrong leaf pin emit zero HTTP bytes."""
     valid_ca_pem = inc2_tls_material.ca_cert_path.read_text()
     valid_leaf_sha = inc2_tls_material.leaf_cert_sha256
@@ -558,6 +563,118 @@ def test_pin_checked_before_any_http(inc2_tls_material: SampleTlsMaterial, tmp_p
         assert exc_pem.value.code == ErrorCode.INVALID_INPUT
         assert exc_pem.value.request_may_have_run is False
         assert server.accept_count == 0
+
+    # Subcase F: Pre-HTTP OS/SSL failure normalization and socket cleanup in connect() and call()
+    with MockTlsServer(valid_server_ctx) as server:
+        ep_valid = Endpoint(
+            version=1,
+            host="127.0.0.1",
+            port=server.port,
+            store_id="store-1",
+            writer_epoch=1,
+            instance_id="inst-1",
+            contract="mcp-tools-v2",
+        )
+        valid_target = LoopbackTarget(ep_valid, "store-1", valid_ca_pem, valid_leaf_sha)
+
+        # 1. socket.socket() raises OSError(EMFILE)
+        def fail_socket(*_args: Any, **_kwargs: Any) -> Any:
+            raise OSError(errno.EMFILE, "fixture emfile")
+
+        with monkeypatch.context() as mp:
+            mp.setattr("superbrain.cli_api.loopback.socket.socket", fail_socket)
+            with pytest.raises(LoopbackTransportError) as exc_emfile_conn:
+                client.connect(valid_target)
+            assert exc_emfile_conn.value.code == ErrorCode.DAEMON_UNAVAILABLE
+            assert exc_emfile_conn.value.request_may_have_run is False
+
+            with pytest.raises(LoopbackTransportError) as exc_emfile_call:
+                client.call(valid_target, command)
+            assert exc_emfile_call.value.code == ErrorCode.DAEMON_UNAVAILABLE
+            assert exc_emfile_call.value.request_may_have_run is False
+
+        # 2. wrap_socket() raises ConnectionResetError(ECONNRESET) -> underlying raw socket closed
+        wrap_reset_socks: list[socket.socket] = []
+
+        def fail_wrap_reset(_self: ssl.SSLContext, sock: socket.socket, *args: Any, **kwargs: Any) -> Any:
+            wrap_reset_socks.append(sock)
+            raise ConnectionResetError(errno.ECONNRESET, "fixture wrap reset")
+
+        with monkeypatch.context() as mp:
+            mp.setattr(ssl.SSLContext, "wrap_socket", fail_wrap_reset)
+            with pytest.raises(LoopbackTransportError) as exc_reset_conn:
+                client.connect(valid_target)
+            assert exc_reset_conn.value.code == ErrorCode.DAEMON_UNAVAILABLE
+            assert exc_reset_conn.value.request_may_have_run is False
+            assert len(wrap_reset_socks) == 1
+            assert wrap_reset_socks[0].fileno() == -1
+
+            with pytest.raises(LoopbackTransportError) as exc_reset_call:
+                client.call(valid_target, command)
+            assert exc_reset_call.value.code == ErrorCode.DAEMON_UNAVAILABLE
+            assert exc_reset_call.value.request_may_have_run is False
+            assert len(wrap_reset_socks) == 2
+            assert wrap_reset_socks[1].fileno() == -1
+
+        # 3. wrap_socket() raises TimeoutError -> DEADLINE_EXCEEDED and underlying socket closed
+        wrap_timeout_socks: list[socket.socket] = []
+
+        def fail_wrap_timeout(_self: ssl.SSLContext, sock: socket.socket, *args: Any, **kwargs: Any) -> Any:
+            wrap_timeout_socks.append(sock)
+            raise TimeoutError("fixture wrap timeout")
+
+        with monkeypatch.context() as mp:
+            mp.setattr(ssl.SSLContext, "wrap_socket", fail_wrap_timeout)
+            with pytest.raises(LoopbackTransportError) as exc_wrap_to:
+                client.connect(valid_target)
+            assert exc_wrap_to.value.code == ErrorCode.DEADLINE_EXCEEDED
+            assert exc_wrap_to.value.request_may_have_run is False
+            assert len(wrap_timeout_socks) == 1
+            assert wrap_timeout_socks[0].fileno() == -1
+
+        # 4. wrap_socket() raises SSLCertVerificationError -> IDENTITY_MISMATCH and underlying socket closed
+        wrap_cert_socks: list[socket.socket] = []
+
+        def fail_wrap_cert(_self: ssl.SSLContext, sock: socket.socket, *args: Any, **kwargs: Any) -> Any:
+            wrap_cert_socks.append(sock)
+            raise ssl.SSLCertVerificationError("fixture wrap cert verify")
+
+        with monkeypatch.context() as mp:
+            mp.setattr(ssl.SSLContext, "wrap_socket", fail_wrap_cert)
+            with pytest.raises(LoopbackTransportError) as exc_wrap_cert:
+                client.connect(valid_target)
+            assert exc_wrap_cert.value.code == ErrorCode.IDENTITY_MISMATCH
+            assert exc_wrap_cert.value.request_may_have_run is False
+            assert len(wrap_cert_socks) == 1
+            assert wrap_cert_socks[0].fileno() == -1
+
+        # 5. getpeercert() raises OSError(ECONNRESET) -> DAEMON_UNAVAILABLE and ssl_sock closed
+        wrapped_ssl_socks: list[ssl.SSLSocket] = []
+        orig_wrap = ssl.SSLContext.wrap_socket
+
+        def intercept_wrap_peercert(
+            self_ctx: ssl.SSLContext,
+            sock: socket.socket,
+            *args: Any,
+            **kwargs: Any,
+        ) -> ssl.SSLSocket:
+            ssl_sock = orig_wrap(self_ctx, sock, *args, **kwargs)
+            wrapped_ssl_socks.append(ssl_sock)
+
+            def fail_peercert(*_a: Any, **_k: Any) -> Any:
+                raise OSError(errno.ECONNRESET, "fixture getpeercert reset")
+
+            ssl_sock.getpeercert = fail_peercert  # type: ignore[method-assign]
+            return ssl_sock
+
+        with monkeypatch.context() as mp:
+            mp.setattr(ssl.SSLContext, "wrap_socket", intercept_wrap_peercert)
+            with pytest.raises(LoopbackTransportError) as exc_peer_conn:
+                client.connect(valid_target)
+            assert exc_peer_conn.value.code == ErrorCode.DAEMON_UNAVAILABLE
+            assert exc_peer_conn.value.request_may_have_run is False
+            assert len(wrapped_ssl_socks) == 1
+            assert wrapped_ssl_socks[0].fileno() == -1
 
 
 # -----------------------------------------------------------------------------
