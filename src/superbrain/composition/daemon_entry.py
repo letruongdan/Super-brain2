@@ -407,13 +407,15 @@ def serve(
         if server is not None:
             with contextlib.suppress(Exception):
                 server.quiesce(stop_deadline)
+        rep = None
         with contextlib.suppress(BrainError):
             rep = loop.stop(grace_s=max(0.0, stop_deadline - time.perf_counter()))
-            if rep.state is ShutdownState.OVERRUN:
-                loop.wait_closed()
         if server is not None:
             with contextlib.suppress(Exception):
                 server.finish(stop_deadline)
+        if rep is not None and rep.state is ShutdownState.OVERRUN:
+            with contextlib.suppress(BrainError):
+                loop.wait_closed()
         if isinstance(err, (KeyboardInterrupt, SystemExit)):
             raise
         return 1

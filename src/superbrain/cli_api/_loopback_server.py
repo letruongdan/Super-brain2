@@ -82,6 +82,7 @@ class LoopbackServer:
         self._quiesced = False
         self._aborted = False
         self._unexpected_error = False
+        self._accept_ready_ok = False
         self._stop_deadline: float | None = None
         self._conn_seq = 0
         self._active_slots = 0
@@ -96,6 +97,7 @@ class LoopbackServer:
         self._stop_event.set()
         with contextlib.suppress(OSError):
             self._listener.close()
+        self._abort_all_active_sockets()
         _safe_join(accept_thread, 0.05)
 
     def start(self) -> None:
@@ -129,7 +131,7 @@ class LoopbackServer:
             self._fail_start_cleanup()
             raise BrainError(ErrorCode.DAEMON_UNAVAILABLE, "daemon unavailable")
         with self._lock:
-            failed = self._unexpected_error
+            failed = not self._accept_ready_ok or self._unexpected_error or self._quiesced or self._stop_event.is_set()
         if failed:
             self._fail_start_cleanup()
             raise BrainError(ErrorCode.DAEMON_UNAVAILABLE, "daemon unavailable")
@@ -138,12 +140,11 @@ class LoopbackServer:
         dl = _validate_stop_deadline(stop_deadline)
         start_abort_timer = False
         with self._lock:
-            already_quiesced = self._quiesced
             self._quiesced = True
             if self._stop_deadline is None:
                 self._stop_deadline = dl
             effective_dl = self._stop_deadline
-            if not already_quiesced and self._started:
+            if self._started and self._abort_thread is None:
                 start_abort_timer = True
 
         with contextlib.suppress(OSError):
@@ -258,6 +259,9 @@ class LoopbackServer:
                     if not ready_signaled:
                         with contextlib.suppress(OSError):
                             self._listener.settimeout(_ACCEPT_POLL_S)
+                        with self._lock:
+                            if not self._quiesced and not self._stop_event.is_set() and not self._unexpected_error:
+                                self._accept_ready_ok = True
                         ready_signaled = True
                         self._accept_ready.set()
                     continue
@@ -272,12 +276,6 @@ class LoopbackServer:
                     )
                     self._stop_event.set()
                     break
-
-                if not ready_signaled:
-                    with contextlib.suppress(OSError):
-                        self._listener.settimeout(_ACCEPT_POLL_S)
-                    ready_signaled = True
-                    self._accept_ready.set()
 
                 accept_ns = int(self._monotonic_ns())
                 peer_ip = peer_addr[0] if isinstance(peer_addr, tuple) and len(peer_addr) >= 1 else ""
@@ -425,10 +423,7 @@ class LoopbackServer:
                 if int(self._monotonic_ns()) >= tool_deadline_ns or self._past_stop_deadline():
                     return
                 try:
-                    granted = (
-                        reply.grant_stamp is not None
-                        and self._owner.auth_gate.authorize_stamp(reply.grant_stamp)
-                    )
+                    granted = reply.grant_stamp is not None and self._owner.auth_gate.authorize_stamp(reply.grant_stamp)
                 except BrainError:
                     granted = False
 
@@ -570,7 +565,18 @@ class LoopbackServer:
     ) -> None:
         with self._lock:
             stop_dl = self._stop_deadline if self._quiesced else None
-        _graceful_close_conn(ssl_sock, raw_sock, drain=drain, stop_deadline=stop_dl)
+            aborted = self._aborted
+        if aborted:
+            if ssl_sock is not None:
+                _abort_socket(ssl_sock)
+            if raw_sock is not None and raw_sock is not ssl_sock:
+                _abort_socket(raw_sock)
+        _graceful_close_conn(
+            ssl_sock,
+            raw_sock,
+            drain=drain and not aborted,
+            stop_deadline=stop_dl,
+        )
         with self._lock:
             self._sockets.pop(conn_id, None)
             self._workers.pop(conn_id, None)

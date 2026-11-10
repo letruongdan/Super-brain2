@@ -376,26 +376,7 @@ class LoopbackClient:
             raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             rem_s = _remaining_budget_s(self._monotonic_ns, connect_deadline_ns, request_may_have_run=False)
             raw_sock.settimeout(rem_s)
-            try:
-                raw_sock.connect(("127.0.0.1", target.endpoint.port))
-            except TimeoutError as err:
-                raise LoopbackTransportError(
-                    ErrorCode.DEADLINE_EXCEEDED,
-                    "deadline exceeded",
-                    request_may_have_run=False,
-                ) from err
-            except OSError as err:
-                if int(self._monotonic_ns()) >= connect_deadline_ns:
-                    raise LoopbackTransportError(
-                        ErrorCode.DEADLINE_EXCEEDED,
-                        "deadline exceeded",
-                        request_may_have_run=False,
-                    ) from err
-                raise LoopbackTransportError(
-                    ErrorCode.DAEMON_UNAVAILABLE,
-                    "daemon unavailable",
-                    request_may_have_run=False,
-                ) from err
+            raw_sock.connect(("127.0.0.1", target.endpoint.port))
 
             _remaining_budget_s(self._monotonic_ns, connect_deadline_ns, request_may_have_run=False)
             ssl_sock = ctx.wrap_socket(
@@ -403,48 +384,10 @@ class LoopbackClient:
                 server_hostname="127.0.0.1",
                 do_handshake_on_connect=False,
             )
-            raw_sock = None
 
             rem_s = _remaining_budget_s(self._monotonic_ns, connect_deadline_ns, request_may_have_run=False)
             ssl_sock.settimeout(rem_s)
-            try:
-                ssl_sock.do_handshake()
-            except (TimeoutError, ssl.SSLWantReadError, ssl.SSLWantWriteError) as err:
-                raise LoopbackTransportError(
-                    ErrorCode.DEADLINE_EXCEEDED,
-                    "deadline exceeded",
-                    request_may_have_run=False,
-                ) from err
-            except ssl.SSLCertVerificationError as err:
-                raise LoopbackTransportError(
-                    ErrorCode.IDENTITY_MISMATCH,
-                    "identity mismatch",
-                    request_may_have_run=False,
-                ) from err
-            except ssl.SSLError as err:
-                if int(self._monotonic_ns()) >= connect_deadline_ns:
-                    raise LoopbackTransportError(
-                        ErrorCode.DEADLINE_EXCEEDED,
-                        "deadline exceeded",
-                        request_may_have_run=False,
-                    ) from err
-                raise LoopbackTransportError(
-                    ErrorCode.IDENTITY_MISMATCH,
-                    "identity mismatch",
-                    request_may_have_run=False,
-                ) from err
-            except OSError as err:
-                if int(self._monotonic_ns()) >= connect_deadline_ns:
-                    raise LoopbackTransportError(
-                        ErrorCode.DEADLINE_EXCEEDED,
-                        "deadline exceeded",
-                        request_may_have_run=False,
-                    ) from err
-                raise LoopbackTransportError(
-                    ErrorCode.DAEMON_UNAVAILABLE,
-                    "daemon unavailable",
-                    request_may_have_run=False,
-                ) from err
+            ssl_sock.do_handshake()
 
             _remaining_budget_s(self._monotonic_ns, connect_deadline_ns, request_may_have_run=False)
             der_cert = ssl_sock.getpeercert(binary_form=True)
@@ -464,10 +407,9 @@ class LoopbackClient:
 
             _remaining_budget_s(self._monotonic_ns, connect_deadline_ns, request_may_have_run=False)
             reader = FramedReader(ssl_sock, self._monotonic_ns)
-            probe_frame = (
-                f"GET {IDENTITY_PATH} HTTP/1.1\r\n"
-                f"Host: 127.0.0.1:{target.endpoint.port}\r\n\r\n"
-            ).encode("ascii")
+            probe_frame = (f"GET {IDENTITY_PATH} HTTP/1.1\r\nHost: 127.0.0.1:{target.endpoint.port}\r\n\r\n").encode(
+                "ascii"
+            )
 
             try:
                 write_all(ssl_sock, probe_frame, connect_deadline_ns, self._monotonic_ns)
@@ -567,6 +509,44 @@ class LoopbackClient:
             )
             handed_off = True
             return conn
+        except LoopbackTransportError:
+            raise
+        except (TimeoutError, ssl.SSLWantReadError, ssl.SSLWantWriteError) as err:
+            raise LoopbackTransportError(
+                ErrorCode.DEADLINE_EXCEEDED,
+                "deadline exceeded",
+                request_may_have_run=False,
+            ) from err
+        except ssl.SSLCertVerificationError as err:
+            raise LoopbackTransportError(
+                ErrorCode.IDENTITY_MISMATCH,
+                "identity mismatch",
+                request_may_have_run=False,
+            ) from err
+        except ssl.SSLError as err:
+            if int(self._monotonic_ns()) >= connect_deadline_ns:
+                raise LoopbackTransportError(
+                    ErrorCode.DEADLINE_EXCEEDED,
+                    "deadline exceeded",
+                    request_may_have_run=False,
+                ) from err
+            raise LoopbackTransportError(
+                ErrorCode.IDENTITY_MISMATCH,
+                "identity mismatch",
+                request_may_have_run=False,
+            ) from err
+        except OSError as err:
+            if int(self._monotonic_ns()) >= connect_deadline_ns:
+                raise LoopbackTransportError(
+                    ErrorCode.DEADLINE_EXCEEDED,
+                    "deadline exceeded",
+                    request_may_have_run=False,
+                ) from err
+            raise LoopbackTransportError(
+                ErrorCode.DAEMON_UNAVAILABLE,
+                "daemon unavailable",
+                request_may_have_run=False,
+            ) from err
         finally:
             if not handed_off:
                 _quiet_close(ssl_sock)
