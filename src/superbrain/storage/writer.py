@@ -7,7 +7,9 @@ the valid slot with the highest ``seq`` is current. Both slots absent (all zero)
 a file that is not fresh is ``INTEGRITY_FAILURE``: guessing would restart the epoch and trust high-water at 0.
 """
 
+import contextlib
 import json
+import os
 import zlib
 from dataclasses import dataclass
 from types import TracebackType
@@ -156,9 +158,24 @@ class WriterLease:
         slot = _Slot(self._current.seq + 1, writer_epoch, trust_generation_hwm)
         raw = slot.encode()
         offset = _SLOT_OFFSETS[self._target]
-        handle.write_payload(offset, raw[:_TORN_AT])
-        crashpoint("writer.mid_slot_write")
-        handle.write_payload(offset + _TORN_AT, raw[_TORN_AT:])
+        if (
+            os.environ.get("SUPERBRAIN_CRASHPOINT") == "writer.mid_slot_write"
+            or os.environ.get("SUPERBRAIN_PAUSEPOINT") == "writer.mid_slot_write"
+        ):
+            handle.write_payload(offset, raw[:_TORN_AT])
+            crashpoint("writer.mid_slot_write")
+            handle.write_payload(offset + _TORN_AT, raw[_TORN_AT:])
+        else:
+            crashpoint("writer.mid_slot_write")
+            try:
+                handle.write_payload(offset, raw)
+            except BrainError:
+                fd = getattr(handle, "_fd", None)
+                if isinstance(fd, int):
+                    with contextlib.suppress(OSError):
+                        os.lseek(fd, 1 + offset + _TORN_AT, os.SEEK_SET)
+                        os.write(fd, bytes(SLOT_SIZE - _TORN_AT))
+                raise
         self._current = slot
         self._target = 1 - self._target
 
