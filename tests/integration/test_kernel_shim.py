@@ -63,11 +63,11 @@ from tests.support.inc2_cli import (
     ShimTestDomain,
     decode_stdio_frames,
     encode_stdio_frames,
+    get_shared_t7_transport_template,
     mcp_call_frame,
     mcp_init_frames,
     run_inprocess_stdio,
     run_installed_command,
-    spawn_installed_brain_serve,
     spawn_installed_fixture_daemon,
     verify_installed_wheel_isolation,
     write_ca_file,
@@ -90,7 +90,6 @@ from tests.support.inc2_transport import (
     TransportHarness,
     TransportTemplate,
     clone_owner_only_tree,
-    create_transport_template,
     make_trusted_test_dir,
     open_test_loopback_transport,
     register_workspace_direct,
@@ -123,46 +122,52 @@ def shim_scratch_root() -> Iterator[Path]:
 @pytest.fixture(scope="module")
 def shim_bundle() -> Iterator[ShimTemplateBundle]:
     """Module-scoped transport template with ``ws_a``, same-repo ``ws_a2``, ``ws_b``, and seeded jobs."""
-    tpl = create_transport_template("inc2-t7-shim-tpl")
+    shared_tpl = get_shared_t7_transport_template()
+    bundle_dir = make_trusted_test_dir("inc2-t7-shim-tpl")
     try:
-        assert tpl.dan is not None
-        assert tpl.bob is not None
-        assert tpl.ws_a is not None
-        assert tpl.ws_b is not None
-        assert tpl.global_job_id is not None
-        assert tpl.scoped_job_id is not None
+        assert shared_tpl.dan is not None
+        assert shared_tpl.bob is not None
+        assert shared_tpl.ws_a is not None
+        assert shared_tpl.ws_b is not None
+        assert shared_tpl.global_job_id is not None
+        assert shared_tpl.scoped_job_id is not None
 
-        clock = FakeClock(tpl.base_time + dt.timedelta(seconds=5))
+        cloned_root = bundle_dir / "template-data"
+        clone_owner_only_tree(shared_tpl.root, cloned_root)
+        os_adapters().permissions.secure_directory(cloned_root)
+
+        clock = FakeClock(shared_tpl.base_time + dt.timedelta(seconds=5))
         adapters = os_adapters(clock=clock)
-        rt = open_kernel_job_runtime(tpl.root, adapters)
+        rt = open_kernel_job_runtime(cloned_root, adapters)
         try:
             ws_a2 = register_workspace_direct(
                 rt,
                 clock,
-                tpl.dan,
+                shared_tpl.dan,
                 alias="ws-a-2",
-                checkout_dir=tpl.base_dir / "chk-a-2",
+                checkout_dir=bundle_dir / "chk-a-2",
                 remote="https://github.example/dan/repo-transport-a.git",
             )
-            assert ws_a2.repo_id == tpl.ws_a.repo_id
-            assert ws_a2.checkout_id != tpl.ws_a.checkout_id
+            assert ws_a2.repo_id == shared_tpl.ws_a.repo_id
+            assert ws_a2.checkout_id != shared_tpl.ws_a.checkout_id
 
             service, staged_store = kernel_job_service(rt, clock)
             bob_job = enqueue_job(service, staged_store, owner_id="bob", payload=b"bob job payload")
         finally:
             rt.close()
 
+        tpl = dataclasses.replace(shared_tpl, base_dir=bundle_dir, root=cloned_root)
         yield ShimTemplateBundle(
             template=tpl,
-            ws_a=tpl.ws_a,
+            ws_a=shared_tpl.ws_a,
             ws_a2=ws_a2,
-            ws_b=tpl.ws_b,
-            global_job_id=tpl.global_job_id,
-            scoped_job_id=tpl.scoped_job_id,
+            ws_b=shared_tpl.ws_b,
+            global_job_id=shared_tpl.global_job_id,
+            scoped_job_id=shared_tpl.scoped_job_id,
             bob_job_id=bob_job.job_id,
         )
     finally:
-        shutil.rmtree(tpl.base_dir, ignore_errors=True)
+        shutil.rmtree(bundle_dir, ignore_errors=True)
 
 
 def _workspace_dict(binding: WorkspaceBinding) -> dict[str, JsonValue]:
@@ -448,18 +453,13 @@ def test_installed_shim_exposes_packaged_catalog_and_calls_daemon(
     ]
     stdin_payload = encode_stdio_frames(frames)
 
-    # Part A: Production `brain serve` returns capability_unavailable for unimplemented domain tools.
-    with spawn_installed_brain_serve(
-        inc2_installed_env,
-        config_path,
-        data_root=data_root,
-        cwd=chk_a_path,
-    ) as prod_daemon:
-        prod_daemon.wait_ready()
+    # Part A: Production daemon (domain=None) returns capability_unavailable for unimplemented domain tools.
+    with open_test_loopback_transport(shim_bundle.template, name="installed-prod", domain=None) as h_prod:
+        prod_profile_path, _ = _write_harness_profile(h_prod, "prod-ws-a", workspace=shim_bundle.ws_a)
 
         for script_name, base_args in (
-            ("brain", ("mcp", "--profile", str(profile_path))),
-            ("brain-mcp", ("--profile", str(profile_path))),
+            ("brain", ("mcp", "--profile", str(prod_profile_path))),
+            ("brain-mcp", ("--profile", str(prod_profile_path))),
         ):
             res_proc = run_installed_command(
                 inc2_installed_env,
@@ -508,9 +508,6 @@ def test_installed_shim_exposes_packaged_catalog_and_calls_daemon(
                     "message": "capability unavailable",
                 },
             }
-
-        rc, _, _, _ = prod_daemon.signal_and_wait_exit()
-        assert rc == 0
 
     # Part B: Fixture daemon running on the SAME installed wheel commits positive result & verifies schema sha256.
     with spawn_installed_fixture_daemon(

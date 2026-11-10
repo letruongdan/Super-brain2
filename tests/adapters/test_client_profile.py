@@ -27,8 +27,10 @@ def _write_secure_file(path: Path, data: bytes) -> Path:
     from superbrain.adapters.os import os_adapters
 
     os_ = os_adapters()
+    parent_existed = path.parent.exists()
     path.parent.mkdir(parents=True, exist_ok=True)
-    os_.permissions.secure_directory(path.parent)
+    if not parent_existed:
+        os_.permissions.secure_directory(path.parent)
     path.write_bytes(data)
     os_.permissions.secure_file(path)
     return path

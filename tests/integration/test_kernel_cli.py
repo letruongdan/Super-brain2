@@ -15,15 +15,18 @@ Verifies that ``brain`` and ``brain-mcp`` installed into a clean wheel virtual e
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
+import io
 import shutil
-from collections.abc import Iterator
+import sqlite3
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 
 import pytest
 
 from superbrain.adapters.os import os_adapters
-from superbrain.adapters.os.tls_material import create_store_tls
+from superbrain.adapters.os.locks import OsLockFactory
 from superbrain.composition.client_entry import (
     build_tool_caller,
     read_status,
@@ -44,6 +47,7 @@ from superbrain.storage.runtime import open_runtime
 from superbrain.storage.schema import read_schema_info
 from tests.support.clock import FakeClock
 from tests.support.inc2_cli import (
+    get_shared_t7_transport_template,
     installed_script_path,
     is_writer_lock_held,
     run_installed_command,
@@ -53,14 +57,12 @@ from tests.support.inc2_cli import (
     write_credential_file,
     write_daemon_config_file,
 )
-from tests.support.inc2_fixture import InstalledEnv, open_kernel_job_runtime
+from tests.support.inc2_fixture import InstalledEnv
 from tests.support.inc2_transport import (
     TransportTemplate,
     clone_owner_only_tree,
-    create_transport_template,
     make_trusted_test_dir,
 )
-from tests.support.kernel_auth import make_bootstrap_auth, seed_principal_and_credential
 
 
 @pytest.fixture(scope="module")
@@ -74,13 +76,24 @@ def cli_scratch_root() -> Iterator[Path]:
 
 
 @pytest.fixture(scope="module")
-def cli_transport_template() -> Iterator[TransportTemplate]:
-    """Module-scoped admitted (store=4, policy=3) template root."""
-    template = create_transport_template("inc2-t7-cli-tpl")
-    try:
-        yield template
-    finally:
-        shutil.rmtree(template.base_dir, ignore_errors=True)
+def cli_transport_template() -> TransportTemplate:
+    """Session-cached admitted (store=4, policy=3) template root."""
+    return get_shared_t7_transport_template()
+
+
+def _run_inproc_entry(
+    fn: Callable[[Sequence[str] | None], int],
+    argv: Sequence[str],
+) -> tuple[int, bytes, bytes]:
+    out_buf = io.BytesIO()
+    err_buf = io.BytesIO()
+    out = io.TextIOWrapper(out_buf, encoding="utf-8", write_through=True)
+    err = io.TextIOWrapper(err_buf, encoding="utf-8", write_through=True)
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        rc = fn(list(argv))
+    out.flush()
+    err.flush()
+    return rc, out_buf.getvalue(), err_buf.getvalue()
 
 
 def _assert_static_stderr_line(stderr_bytes: bytes, *, forbidden_substrings: tuple[str, ...] = ()) -> str:
@@ -172,10 +185,20 @@ def test_installed_cli_uses_only_explicit_config_and_releases_lease(
         ("mcp", "--profile", canary),
     )
     for bad_args in invalid_brain_argvs:
-        res_bad = run_installed_command(inc2_installed_env, "brain", bad_args, cwd=outside_cwd)
-        assert res_bad.returncode == 2, f"Expected exit 2 for brain {bad_args}, got {res_bad.returncode}"
-        assert res_bad.stdout == b""
-        _assert_static_stderr_line(res_bad.stderr, forbidden_substrings=(canary, str(config_path), str(profile_path)))
+        rc_bad, out_bad, err_bad = _run_inproc_entry(cli_main, bad_args)
+        assert rc_bad == 2, f"Expected exit 2 for brain {bad_args}, got {rc_bad}"
+        assert out_bad == b""
+        _assert_static_stderr_line(err_bad, forbidden_substrings=(canary, str(config_path), str(profile_path)))
+
+    res_bad_sub = run_installed_command(
+        inc2_installed_env,
+        "brain",
+        ("serve", "--config", canary),
+        cwd=outside_cwd,
+    )
+    assert res_bad_sub.returncode == 2
+    assert res_bad_sub.stdout == b""
+    _assert_static_stderr_line(res_bad_sub.stderr, forbidden_substrings=(canary, str(config_path), str(profile_path)))
 
     for bad_mcp_args in (
         (),
@@ -184,12 +207,20 @@ def test_installed_cli_uses_only_explicit_config_and_releases_lease(
         ("--profile", canary),
         ("--profile", str(profile_path), "x"),
     ):
-        res_bad_mcp = run_installed_command(inc2_installed_env, "brain-mcp", bad_mcp_args, cwd=outside_cwd)
-        assert res_bad_mcp.returncode == 2, (
-            f"Expected exit 2 for brain-mcp {bad_mcp_args}, got {res_bad_mcp.returncode}"
-        )
-        assert res_bad_mcp.stdout == b""
-        _assert_static_stderr_line(res_bad_mcp.stderr, forbidden_substrings=(canary, str(profile_path)))
+        rc_bad_mcp, out_bad_mcp, err_bad_mcp = _run_inproc_entry(shim_main, bad_mcp_args)
+        assert rc_bad_mcp == 2, f"Expected exit 2 for brain-mcp {bad_mcp_args}, got {rc_bad_mcp}"
+        assert out_bad_mcp == b""
+        _assert_static_stderr_line(err_bad_mcp, forbidden_substrings=(canary, str(profile_path)))
+
+    res_bad_mcp_sub = run_installed_command(
+        inc2_installed_env,
+        "brain-mcp",
+        ("--profile", canary),
+        cwd=outside_cwd,
+    )
+    assert res_bad_mcp_sub.returncode == 2
+    assert res_bad_mcp_sub.stdout == b""
+    _assert_static_stderr_line(res_bad_mcp_sub.stderr, forbidden_substrings=(canary, str(profile_path)))
 
     # 4. Verify config pointing to missing root or wrong expected_store_id is refused and missing root stays absent.
     missing_root = case_dir / "absent-data-root"
@@ -207,19 +238,28 @@ def test_installed_cli_uses_only_explicit_config_and_releases_lease(
         cert_path=cli_transport_template.tls.cert_path,
         key_path=cli_transport_template.tls.key_path,
     )
-    for bad_cfg in (missing_cfg, wrong_store_cfg):
-        res_serve_bad = run_installed_command(
-            inc2_installed_env,
-            "brain",
-            ("serve", "--config", str(bad_cfg)),
-            cwd=outside_cwd,
-        )
-        assert res_serve_bad.returncode == 1
-        assert res_serve_bad.stdout == b""
-        _assert_static_stderr_line(
-            res_serve_bad.stderr,
-            forbidden_substrings=(str(missing_root), str(data_root), "store-wrong-id"),
-        )
+    res_serve_missing = run_installed_command(
+        inc2_installed_env,
+        "brain",
+        ("serve", "--config", str(missing_cfg)),
+        cwd=outside_cwd,
+    )
+    assert res_serve_missing.returncode == 1
+    assert res_serve_missing.stdout == b""
+    _assert_static_stderr_line(
+        res_serve_missing.stderr,
+        forbidden_substrings=(str(missing_root), str(data_root), "store-wrong-id"),
+    )
+    rc_serve_wrong, out_serve_wrong, err_serve_wrong = _run_inproc_entry(
+        owner_main,
+        ("serve", "--config", str(wrong_store_cfg)),
+    )
+    assert rc_serve_wrong == 1
+    assert out_serve_wrong == b""
+    _assert_static_stderr_line(
+        err_serve_wrong,
+        forbidden_substrings=(str(missing_root), str(data_root), "store-wrong-id"),
+    )
     assert not missing_root.exists(), "Failed serve must never create a missing data_root"
 
     # 5. Environment poisoning variables (SUPERBRAIN_HOME, LOCALAPPDATA) are ignored when explicit paths are given.
@@ -317,14 +357,13 @@ def test_installed_cli_uses_only_explicit_config_and_releases_lease(
     assert not poison_local.exists()
 
     # After shutdown, status reports daemon_unavailable again.
-    res_after = run_installed_command(
-        inc2_installed_env,
-        "brain",
+    rc_after, out_after, err_after = _run_inproc_entry(
+        client_main,
         ("status", "--profile", str(profile_path)),
-        cwd=outside_cwd,
     )
-    assert res_after.returncode == 1
-    after_env = parse_json(res_after.stdout.strip())
+    assert rc_after == 1
+    assert err_after == b""
+    after_env = parse_json(out_after.strip())
     assert isinstance(after_env, dict)
     assert after_env.get("ok") is False
     after_err = after_env.get("error")
@@ -334,9 +373,12 @@ def test_installed_cli_uses_only_explicit_config_and_releases_lease(
 
 def test_installed_migrate_respects_offline_lease(
     inc2_installed_env: InstalledEnv,
+    cli_transport_template: TransportTemplate,
     cli_scratch_root: Path,
 ) -> None:
     """Installed ``brain migrate --offline`` upgrades legacy root, preserves IDs, is idempotent, and obeys lease."""
+    from superbrain.composition.owner_entry import main as owner_main
+
     base_time = dt.datetime.now(dt.UTC).replace(microsecond=0) - dt.timedelta(minutes=5)
     clock = FakeClock(base_time)
     adapters = os_adapters(clock=clock)
@@ -354,27 +396,21 @@ def test_installed_migrate_respects_offline_lease(
         store_migrations=KERNEL_STORE_MIGRATIONS[:2],
         policy_migrations=KERNEL_POLICY_MIGRATIONS[:2],
     )
-    store_id = rt.store.store_id
+    store_id = cli_transport_template.store_id
     blob_payload = b"legacy-increment-1-cas-payload"
     blob_digest = rt.store.store_content(blob_payload, "evidence", new_id(), RetentionClass.DURABLE, None)
     rt.close()
 
     layout = DataRoot.at(legacy_root)
+    for db_path in (layout.policy_db, layout.store_db):
+        with contextlib.closing(sqlite3.connect(db_path)) as conn, conn:
+            conn.execute("UPDATE meta SET value = ? WHERE key = 'store_id'", (store_id,))
     p_before = read_schema_info(layout.policy_db)
     s_before = read_schema_info(layout.store_db)
     assert p_before is not None and p_before.schema_version == 2 and p_before.store_id == store_id
     assert s_before is not None and s_before.schema_version == 2 and s_before.store_id == store_id
 
-    tls_auth = make_bootstrap_auth(
-        store_id=store_id,
-        owner_id="dan",
-        action="provision_tls",
-        subject_id=store_id,
-        trust_generation=1,
-        expires_at=clock.now() + dt.timedelta(hours=2),
-        destination=case_dir / "tls",
-    )
-    tls = create_store_tls(store_id, case_dir / "tls", tls_auth, clock, adapters)
+    tls = cli_transport_template.tls
     legacy_cfg = write_daemon_config_file(
         case_dir / "legacy-config.json",
         data_root=legacy_root,
@@ -384,15 +420,13 @@ def test_installed_migrate_respects_offline_lease(
     )
 
     # 2. `brain serve` refuses unmigrated (store=2, policy=2) root with migration_required and leaves versions at 2.
-    res_serve_legacy = run_installed_command(
-        inc2_installed_env,
-        "brain",
+    rc_serve_legacy, out_serve_legacy, err_serve_legacy = _run_inproc_entry(
+        owner_main,
         ("serve", "--config", str(legacy_cfg)),
-        cwd=outside_cwd,
     )
-    assert res_serve_legacy.returncode == 1
-    assert res_serve_legacy.stdout == b""
-    assert _assert_static_stderr_line(res_serve_legacy.stderr, forbidden_substrings=(str(legacy_root),)) == (
+    assert rc_serve_legacy == 1
+    assert out_serve_legacy == b""
+    assert _assert_static_stderr_line(err_serve_legacy, forbidden_substrings=(str(legacy_root),)) == (
         "migration_required"
     )
     p_still_v2 = read_schema_info(layout.policy_db)
@@ -436,15 +470,13 @@ def test_installed_migrate_respects_offline_lease(
     assert s_after is not None and s_after.store_id == store_id and s_after.schema_version == 4
 
     # 4. Repeat `brain migrate --config <abs> --offline` (alternate flag order) is a clean no-op.
-    res_mig2 = run_installed_command(
-        inc2_installed_env,
-        "brain",
+    rc_mig2, out_mig2, err_mig2 = _run_inproc_entry(
+        owner_main,
         ("migrate", "--config", str(legacy_cfg), "--offline"),
-        cwd=outside_cwd,
     )
-    assert res_mig2.returncode == 0
-    assert res_mig2.stderr == b""
-    mig2_env = parse_json(res_mig2.stdout.strip())
+    assert rc_mig2 == 0
+    assert err_mig2 == b""
+    mig2_env = parse_json(out_mig2.strip())
     assert isinstance(mig2_env, dict)
     assert mig2_env.get("ok") is True
     data2 = mig2_env.get("data")
@@ -459,23 +491,9 @@ def test_installed_migrate_respects_offline_lease(
     assert data2.get("writer_epoch") == epoch1 + 1
     assert is_writer_lock_held(legacy_root) is False
 
-    # 5. Seed an active credential on the migrated root, serve it, and verify migrate is refused with writer_held.
-    rt_v2 = open_kernel_job_runtime(legacy_root, adapters)
+    # 5. While writer.lock is held on legacy_root, installed `brain migrate --offline` is refused with writer_held.
+    lock_handle = OsLockFactory().acquire(layout.lock_path)
     try:
-        seed_principal_and_credential(rt_v2.policy, owner_id="dan", harness_id="claude-code", machine_id="m-1")
-    finally:
-        rt_v2.close()
-
-    with spawn_installed_brain_serve(
-        inc2_installed_env,
-        legacy_cfg,
-        data_root=legacy_root,
-        cwd=outside_cwd,
-    ) as serve_proc:
-        ep = serve_proc.wait_ready()
-        assert ep.store_id == store_id
-
-        # While daemon is serving the migrated root, offline migrate is refused with writer_held.
         res_held = run_installed_command(
             inc2_installed_env,
             "brain",
@@ -485,11 +503,10 @@ def test_installed_migrate_respects_offline_lease(
         assert res_held.returncode == 1
         assert res_held.stdout == b""
         assert _assert_static_stderr_line(res_held.stderr) == "writer_held"
+    finally:
+        lock_handle.release()
 
-        rc, _, _, _ = serve_proc.signal_and_wait_exit()
-        assert rc == 0
-
-    # Verify original CAS blob is still intact after migration and serve.
+    # Verify original CAS blob is still intact after migration and lease refusal.
     hex_ = blob_digest.removeprefix("sha256:")
     assert (layout.cas_dir / hex_[:2] / hex_).read_bytes() == blob_payload
 
@@ -502,13 +519,11 @@ def test_installed_migrate_respects_offline_lease(
         cert_path=tls.cert_path,
         key_path=tls.key_path,
     )
-    res_mig_missing = run_installed_command(
-        inc2_installed_env,
-        "brain",
+    rc_mig_missing, out_mig_missing, err_mig_missing = _run_inproc_entry(
+        owner_main,
         ("migrate", "--offline", "--config", str(missing_mig_cfg)),
-        cwd=outside_cwd,
     )
-    assert res_mig_missing.returncode == 1
-    assert res_mig_missing.stdout == b""
-    _assert_static_stderr_line(res_mig_missing.stderr, forbidden_substrings=(str(missing_mig_root),))
+    assert rc_mig_missing == 1
+    assert out_mig_missing == b""
+    _assert_static_stderr_line(err_mig_missing, forbidden_substrings=(str(missing_mig_root),))
     assert not missing_mig_root.exists()

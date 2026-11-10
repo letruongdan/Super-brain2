@@ -13,12 +13,14 @@ Provides:
 
 from __future__ import annotations
 
+import atexit
 import contextlib
 import ctypes
 import ctypes.wintypes
 import datetime as dt
 import io
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -57,8 +59,12 @@ from superbrain.ports.kernel import KernelTx
 
 if TYPE_CHECKING:
     from tests.support.inc2_fixture import InstalledEnv
+    from tests.support.inc2_transport import TransportTemplate
 
 INC2_CLI_PATH = Path(__file__).resolve()
+_WHEEL_ISOLATION_CACHE: dict[str, dict[str, JsonValue]] = {}
+_SHARED_T7_TEMPLATE: list[TransportTemplate] = []
+_SHARED_T7_TEMPLATE_LOCK = threading.Lock()
 
 _STRIPPED_ENV_KEYS: frozenset[str] = frozenset(
     {
@@ -126,6 +132,10 @@ def run_installed_command(
 
 def verify_installed_wheel_isolation(env: InstalledEnv, *, cwd: Path) -> dict[str, JsonValue]:
     """Verify ``env.venv_python -I`` loads ``superbrain`` and packaged schema strictly from ``site-packages``."""
+    cache_key = str(env.venv_dir)
+    cached = _WHEEL_ISOLATION_CACHE.get(cache_key)
+    if cached is not None:
+        return dict(cached)
     probe_code = "\n".join(
         [
             "import importlib.resources, json, pathlib, superbrain",
@@ -154,7 +164,21 @@ def verify_installed_wheel_isolation(env: InstalledEnv, *, cwd: Path) -> dict[st
     )
     parsed = parse_json(proc.stdout.strip().encode("utf-8"))
     assert isinstance(parsed, dict)
+    _WHEEL_ISOLATION_CACHE[cache_key] = dict(parsed)
     return parsed
+
+
+def get_shared_t7_transport_template() -> TransportTemplate:
+    """Return a session-cached ``TransportTemplate`` shared across T7 CLI and shim tests."""
+    with _SHARED_T7_TEMPLATE_LOCK:
+        if _SHARED_T7_TEMPLATE:
+            return _SHARED_T7_TEMPLATE[0]
+        from tests.support.inc2_transport import create_transport_template
+
+        tpl = create_transport_template("inc2-t7-shared-tpl")
+        atexit.register(lambda: shutil.rmtree(tpl.base_dir, ignore_errors=True))
+        _SHARED_T7_TEMPLATE.append(tpl)
+        return tpl
 
 
 # ---------------------------------------------------------------------------
@@ -165,8 +189,10 @@ def verify_installed_wheel_isolation(env: InstalledEnv, *, cwd: Path) -> dict[st
 def write_owner_only_bytes(path: Path, data: bytes) -> Path:
     """Write ``data`` to ``path`` and restrict file permissions to the current owner."""
     adapters = os_adapters()
+    parent_existed = path.parent.exists()
     path.parent.mkdir(parents=True, exist_ok=True)
-    adapters.permissions.secure_directory(path.parent)
+    if not parent_existed:
+        adapters.permissions.secure_directory(path.parent)
     path.write_bytes(data)
     adapters.permissions.secure_file(path)
     return path
