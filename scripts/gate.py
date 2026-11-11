@@ -25,9 +25,12 @@ import uuid
 import xml.etree.ElementTree as ET
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Lock
 
 from superbrain.adapters.os import environment as environment_facts
 from superbrain.adapters.os.environment import EnvironmentFacts as EnvironmentFacts
@@ -47,6 +50,7 @@ PHASE_TIMEOUTS_S = {"ruff": 120.0, "mypy": 300.0, "lint-imports": 120.0, "pytest
 GIT_TIMEOUT_S = 120.0
 SYNC_TIMEOUT_S = 600.0
 COLLECT_TIMEOUT_S = 300.0
+PYTEST_SHARDS = min(4, os.cpu_count() or 1)
 KILL_GRACE_S = 30.0
 KILL_HANG_MARKER = "<process did not exit after being killed; output lost>"
 
@@ -258,6 +262,19 @@ def parse_collected(text: str) -> list[str]:
     return ids
 
 
+def shard_files(collected_ids: Sequence[str], shards: int) -> list[list[str]]:
+    """Group whole test files, using the number of collected cases as the cost estimate."""
+    counts = Counter(node.split("::", 1)[0] for node in collected_ids)
+    size = min(max(1, shards), len(counts))
+    groups: list[list[str]] = [[] for _ in range(size)]
+    loads = [0] * size
+    for file, count in sorted(counts.items(), key=lambda item: (-item[1], item[0])):
+        index = loads.index(min(loads))
+        groups[index].append(file)
+        loads[index] += count
+    return groups
+
+
 def _split_classname(classname: str, root: Path | None) -> tuple[str, list[str]]:
     """Split a dotted JUnit ``classname`` into a module file path and its enclosing classes."""
     parts = classname.split(".")
@@ -331,9 +348,13 @@ def parse_junit(path: Path, *, root: Path | None = None) -> tuple[list[str], dic
     function with its parametrization. ``root`` (the pytest rootdir) resolves the dotted path exactly, by
     finding the module file.
     """
+    return _parse_junit(path.read_bytes(), root=root)
+
+
+def _parse_junit(report: bytes, *, root: Path | None) -> tuple[list[str], dict[str, str]]:
     ids: list[str] = []
     outcomes: dict[str, str] = {}
-    for case in ET.parse(path).getroot().iter("testcase"):
+    for case in ET.fromstring(report).iter("testcase"):
         classname = case.get("classname") or ""
         name = case.get("name") or ""
         if classname:
@@ -373,13 +394,11 @@ def _kill_tree(proc: subprocess.Popen[str]) -> None:
     proc.kill()
 
 
-LAST_PID: int | None = None
-"""The PID of the process ``run`` started last; the step recorder reads it (``None`` when a stand-in ran)."""
+_STEP_PID: ContextVar[int | None] = ContextVar("_STEP_PID", default=None)
 
 
 def run(cmd: Sequence[str], *, cwd: Path, timeout_s: float) -> tuple[int | None, str, float]:
     """Run ``cmd``; return ``(exit_code or None on timeout, combined output, seconds)``."""
-    global LAST_PID
     began = time.monotonic()
     proc = subprocess.Popen(
         list(cmd),
@@ -392,7 +411,7 @@ def run(cmd: Sequence[str], *, cwd: Path, timeout_s: float) -> tuple[int | None,
         errors="replace",
         start_new_session=sys.platform != "win32",
     )
-    LAST_PID = proc.pid
+    _STEP_PID.set(proc.pid)
     try:
         output, _ = proc.communicate(timeout=timeout_s)
         return proc.returncode, output, time.monotonic() - began
@@ -502,12 +521,13 @@ class EvidenceDirError(OSError):
 
 
 def run_gate(
-    repo: Path, python: str, *, evidence_dir: Path | None = None
+    repo: Path, python: str, *, evidence_dir: Path | None = None, shards: int = PYTEST_SHARDS
 ) -> tuple[dict[str, JsonValue], str]:
     """Run the gate in a detached worktree of the resolved HEAD. Returns the receipt and a printable log.
 
     One monotonic deadline of ``TEST_JOB_BUDGET_S`` starts just before the interpreter preflight; collect and every
-    phase get ``min(cap, remaining)`` and no step starts once it is spent. With ``evidence_dir`` every step's
+    phase get ``min(cap, remaining)`` and no step starts once it is spent. Pytest shards partition the collected
+    files under that same deadline. With ``evidence_dir`` every step's
     command, cwd, PID, start, exit, time and output, the raw JUnit report and the terminal receipt (written last)
     go into a new attempt dir under it, outside the worktree; only failing to create that dir raises
     (``EvidenceDirError``). Every other failure becomes a reason in a refused receipt.
@@ -523,31 +543,33 @@ def run_gate(
             raise EvidenceDirError(f"{type(err).__name__}: {err}") from err
     ev = _Evidence(attempt_dir)
     steps: list[JsonValue] = []
+    record_lock = Lock()
 
     def step(name: str, cmd: list[str], cwd: Path, timeout_s: float) -> tuple[int | None, str, float, str | None]:
         """Run one command and record it; ``(exit or None, output, seconds, error)``. ``error`` says the step did not
         reach an exit code: "could not start: …" (no process) or "failed while running: …" (a process had started)."""
-        global LAST_PID
-        LAST_PID = None
+        _STEP_PID.set(None)
         started_at, error = _now(), None
         try:
             code, output, seconds = run(cmd, cwd=cwd, timeout_s=timeout_s)
         except Exception as err:  # noqa: BLE001 - recorded as a refusal reason, the attempt still ends in a receipt
-            stage = "could not start" if LAST_PID is None and isinstance(err, OSError) else "failed while running"
+            never_started = _STEP_PID.get() is None
+            stage = "could not start" if never_started and isinstance(err, OSError) else "failed while running"
             code, output, seconds, error = None, "", 0.0, f"{stage}: {type(err).__name__}: {err}"
-        rel = ev.write(f"steps/{len(steps):02d}-{name}.log", output.encode("utf-8", "replace"))
-        steps.append({
-            "name": name,
-            "command": list(cmd),
-            "cwd": str(cwd),
-            "pid": LAST_PID,
-            "started_at": started_at,
-            "timeout_s": timeout_s,
-            "exit_code": code,
-            "duration_s": seconds,
-            "output": rel,
-            "error": error,
-        })
+        with record_lock:
+            rel = ev.write(f"steps/{len(steps):02d}-{name}.log", output.encode("utf-8", "replace"))
+            steps.append({
+                "name": name,
+                "command": list(cmd),
+                "cwd": str(cwd),
+                "pid": _STEP_PID.get(),
+                "started_at": started_at,
+                "timeout_s": timeout_s,
+                "exit_code": code,
+                "duration_s": seconds,
+                "output": rel,
+                "error": error,
+            })
         return code, output, seconds, error
 
     worktree = Path(tempfile.gettempdir()) / f"superbrain-gate-{uuid.uuid4().hex[:12]}"
@@ -564,10 +586,94 @@ def run_gate(
     created = False
     cleanup_error: str | None = None
     junit = worktree.parent / f"{worktree.name}-junit.xml"
+    junit_paths = [junit]
     pytest_output = ""
     environment: dict[str, JsonValue] | None = None
     job_began: float | None = None
     job_ended: float | None = None
+
+    def read_report(
+        path: Path, artifact: str, output: str, *, shard: str | None = None
+    ) -> tuple[list[str], dict[str, str]]:
+        label = "junit" if shard is None else f"junit {shard}"
+        if not path.is_file():
+            extra.append(f"{label}: pytest wrote no JUnit report")
+            return [], {}
+        report = path.read_bytes()
+        ev.write(artifact, report)
+        try:
+            ids, observed = _parse_junit(report, root=worktree)
+        except (ValueError, ET.ParseError) as err:
+            extra.append(f"{label}: the report could not be parsed: {err}")
+            ids, observed = [], {}
+        xpassed, problems = parse_xpassed(output, observed)
+        prefix = "xpass" if shard is None else f"xpass {shard}"
+        extra.extend(f"{prefix}: {problem}" for problem in problems)
+        for node in xpassed:  # JUnit shows a non-strict XPASS as a pass; the terminal summary does not
+            if observed[node] == "passed":
+                observed[node] = "xpassed"
+            else:
+                extra.append(f"{prefix}: {node} is XPASS in the terminal but {observed[node]} in JUnit")
+        return ids, observed
+
+    def run_sharded_pytest(groups: list[list[str]], deadline: float) -> tuple[PhaseResult, float]:
+        started = time.monotonic()
+        paths = [junit.with_name(f"{junit.stem}-shard-{index}.xml") for index in range(len(groups))]
+        junit_paths.extend(paths)
+
+        def run_shard(index: int) -> tuple[int | None, str, float, str | None] | None:
+            timeout = min(PHASE_TIMEOUTS_S["pytest"], deadline - time.monotonic())
+            if timeout <= 0:
+                return None
+            cmd = _uv(worktree, python, "pytest", f"--junitxml={paths[index]}", "-q", "-rfEX", *groups[index])
+            return step(f"pytest-shard-{index}", cmd, worktree, timeout)
+
+        with ThreadPoolExecutor(max_workers=len(groups)) as pool:
+            results = list(pool.map(run_shard, range(len(groups))))
+        ended = time.monotonic()
+        codes: list[int | None] = []
+        runner_error = False
+        expected: dict[str, set[str]] = {file: set() for group in groups for file in group}
+        for node in collected:
+            expected[node.split("::", 1)[0]].add(node)
+        for index, result in enumerate(results):
+            name = f"pytest-shard-{index}"
+            if result is None:
+                extra.append(f"phase {name} not started: the {TEST_JOB_BUDGET_S:.0f}s test-job budget was spent")
+                codes.append(None)
+                continue
+            code, output, _, error = result
+            codes.append(code)
+            if error is not None:
+                runner_error = True
+                extra.append(f"phase {name} {error}")
+            elif code is None:
+                extra.append(f"phase {name} timed out")
+            elif code != 0:
+                extra.append(f"phase {name} exited with {code}")
+            if KILL_HANG_MARKER in output:
+                extra.append(f"phase {name} did not exit after being killed")
+            if code != 0:
+                log.append(f"--- {name} (exit {code}) ---\n{output[-4000:]}")
+            try:
+                ids, observed = read_report(paths[index], f"junit-shard-{index}.xml", output, shard=name)
+            except OSError as err:
+                extra.append(f"junit {name}: the report could not be read: {err}")
+                continue
+            if set(ids) != set().union(*(expected[file] for file in groups[index])):
+                extra.append(f"inventory {name}: JUnit node IDs differ from this shard's collected IDs")
+            duplicates = outcomes.keys() & observed.keys()
+            if duplicates:
+                extra.append(f"junit {name}: node IDs duplicated across shards: {sorted(duplicates)}")
+            junit_ids.extend(ids)
+            outcomes.update({node: value for node, value in observed.items() if node not in outcomes})
+        code = next((status for status in codes if status), 0)
+        if runner_error:
+            code = code or 1
+        elif None in codes:
+            code = None
+        return PhaseResult("pytest", code, ended - started), ended
+
     try:
         facts = collect_environment(OsEnvironmentProbe(), env=os.environ, platform=sys.platform)
         environment = assess_environment(facts)
@@ -648,9 +754,14 @@ def run_gate(
                     "lint-imports": _uv(worktree, python, "lint-imports"),
                     "pytest": _uv(worktree, python, "pytest", f"--junitxml={junit}", "-q", "-rfEX"),
                 }
+                groups = shard_files(collected, shards)
                 for name in REQUIRED_PHASES:
                     timeout = bounded(f"phase {name}", PHASE_TIMEOUTS_S[name])
                     if timeout is None:
+                        continue
+                    if name == "pytest" and len(groups) > 1:
+                        phase, job_ended = run_sharded_pytest(groups, deadline)
+                        phases.append(phase)
                         continue
                     code, output, seconds, error = step(name, commands[name], worktree, timeout)
                     if error is not None:
@@ -664,22 +775,10 @@ def run_gate(
                         extra.append(f"phase {name} did not exit after being killed")
                     if code != 0:
                         log.append(f"--- {name} (exit {code}) ---\n{output[-4000:]}")
-                job_ended = time.monotonic()
-                if junit.is_file():  # a read error here is caught below as an aborted run, still with a receipt
-                    ev.write("junit.xml", junit.read_bytes())  # raw bytes kept before parsing and before cleanup
-                    try:
-                        junit_ids, outcomes = parse_junit(junit, root=worktree)
-                    except (ValueError, OSError, ET.ParseError) as err:
-                        extra.append(f"junit: the report could not be parsed: {err}")
-                    xpassed, problems = parse_xpassed(pytest_output, outcomes)
-                    extra.extend(f"xpass: {problem}" for problem in problems)
-                    for node in xpassed:  # JUnit shows a non-strict XPASS as a pass; the terminal summary does not
-                        if outcomes[node] == "passed":
-                            outcomes[node] = "xpassed"
-                        else:
-                            extra.append(f"xpass: {node} is XPASS in the terminal but {outcomes[node]} in JUnit")
-                else:
-                    extra.append("junit: pytest wrote no JUnit report")
+                if job_ended is None:
+                    job_ended = time.monotonic()
+                    if len(groups) <= 1:
+                        junit_ids, outcomes = read_report(junit, "junit.xml", pytest_output)
         if created:
             try:
                 end = source_identity(worktree)
@@ -688,10 +787,11 @@ def run_gate(
     except Exception as err:  # noqa: BLE001 - never lost: a refusal reason, and the evidence is still written
         extra.append(f"gate run aborted: {type(err).__name__}: {err}")
     finally:
-        try:
-            junit.unlink(missing_ok=True)
-        except OSError as err:
-            extra.append(f"junit temp file was not removed: {err}")
+        for path in junit_paths:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as err:
+                extra.append(f"junit temp file was not removed: {err}")
         if created:
             try:
                 if worktree.exists():
@@ -711,7 +811,7 @@ def run_gate(
             "host": _host(),
         }),
     )
-    test_job_s =None if job_began is None else (job_ended if job_ended is not None else finished) - job_began
+    test_job_s = None if job_began is None else (job_ended if job_ended is not None else finished) - job_began
     receipt = build_receipt(
         start=start,
         end=end,
@@ -762,7 +862,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run the default gate and write a receipt.")
     parser.add_argument("--python", required=True, help="Python version to run the gate with, e.g. 3.14")
     parser.add_argument("--evidence-dir", help="absolute directory; each run writes a new attempt dir under it")
+    parser.add_argument("--shards", type=int, default=PYTEST_SHARDS, help="maximum parallel pytest processes")
     args = parser.parse_args(argv)
+    if args.shards < 1:
+        print("gate refused: --shards must be at least 1", file=sys.stderr)
+        return 2
     evidence: Path | None = None
     if args.evidence_dir is not None:
         evidence = Path(args.evidence_dir)
@@ -777,7 +881,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("gate refused: the working tree has uncommitted changes to tracked files", file=sys.stderr)
         return 2
     try:
-        receipt, log = run_gate(repo, args.python, evidence_dir=evidence)
+        receipt, log = run_gate(repo, args.python, evidence_dir=evidence, shards=args.shards)
     except EvidenceDirError as err:  # the attempt dir could not be created; nothing ran
         print(f"gate refused: the evidence dir could not be prepared: {err}", file=sys.stderr)
         return 2
