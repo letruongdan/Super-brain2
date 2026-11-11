@@ -56,6 +56,9 @@ class LoopbackTransportError(BrainError):
         super().__init__(code, message)
         self.request_may_have_run = request_may_have_run
 
+    def __str__(self) -> str:
+        return self.message
+
 
 @dataclass(frozen=True)
 class LoopbackTarget:
@@ -188,6 +191,12 @@ class PinnedConnection:
             except BrainError as err:
                 msg = err.message if is_safe_wire_message(err.message) else SAFE_WIRE_MESSAGES_BY_CODE[err.code]
                 raise LoopbackTransportError(err.code, msg, request_may_have_run=False) from err
+            except (TypeError, ValueError, UnicodeError) as err:
+                raise LoopbackTransportError(
+                    ErrorCode.INVALID_INPUT,
+                    "invalid input",
+                    request_may_have_run=False,
+                ) from err
 
             _remaining_budget_s(self._monotonic_ns, eff_deadline_ns, request_may_have_run=False)
             if reader.has_pipelined_bytes(eff_deadline_ns):
@@ -343,47 +352,35 @@ class LoopbackClient:
             else min(explicit_dl, start_ns + CLIENT_CONNECT_BUDGET_NS)
         )
         _remaining_budget_s(self._monotonic_ns, connect_deadline_ns, request_may_have_run=False)
-
-        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-        ctx.verify_mode = ssl.CERT_REQUIRED
-        ctx.check_hostname = True
-        try:
-            ctx.load_verify_locations(cadata=target.ca_pem)
-        except ssl.SSLError as err:
+        if not target.ca_pem.strip() or not target.ca_pem.isascii():
             raise LoopbackTransportError(
                 ErrorCode.INVALID_INPUT,
                 "invalid input",
                 request_may_have_run=False,
-            ) from err
+            )
 
         raw_sock: socket.socket | None = None
         ssl_sock: ssl.SSLSocket | None = None
         handed_off = False
+        in_handshake = False
         try:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+            ctx.verify_mode = ssl.CERT_REQUIRED
+            ctx.check_hostname = True
+            try:
+                ctx.load_verify_locations(cadata=target.ca_pem)
+            except (ssl.SSLError, ValueError, TypeError) as err:
+                raise LoopbackTransportError(
+                    ErrorCode.INVALID_INPUT,
+                    "invalid input",
+                    request_may_have_run=False,
+                ) from err
+
             raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             rem_s = _remaining_budget_s(self._monotonic_ns, connect_deadline_ns, request_may_have_run=False)
             raw_sock.settimeout(rem_s)
-            try:
-                raw_sock.connect(("127.0.0.1", target.endpoint.port))
-            except TimeoutError as err:
-                raise LoopbackTransportError(
-                    ErrorCode.DEADLINE_EXCEEDED,
-                    "deadline exceeded",
-                    request_may_have_run=False,
-                ) from err
-            except OSError as err:
-                if int(self._monotonic_ns()) >= connect_deadline_ns:
-                    raise LoopbackTransportError(
-                        ErrorCode.DEADLINE_EXCEEDED,
-                        "deadline exceeded",
-                        request_may_have_run=False,
-                    ) from err
-                raise LoopbackTransportError(
-                    ErrorCode.DAEMON_UNAVAILABLE,
-                    "daemon unavailable",
-                    request_may_have_run=False,
-                ) from err
+            raw_sock.connect(("127.0.0.1", target.endpoint.port))
 
             _remaining_budget_s(self._monotonic_ns, connect_deadline_ns, request_may_have_run=False)
             ssl_sock = ctx.wrap_socket(
@@ -391,48 +388,12 @@ class LoopbackClient:
                 server_hostname="127.0.0.1",
                 do_handshake_on_connect=False,
             )
-            raw_sock = None
 
             rem_s = _remaining_budget_s(self._monotonic_ns, connect_deadline_ns, request_may_have_run=False)
             ssl_sock.settimeout(rem_s)
-            try:
-                ssl_sock.do_handshake()
-            except (TimeoutError, ssl.SSLWantReadError, ssl.SSLWantWriteError) as err:
-                raise LoopbackTransportError(
-                    ErrorCode.DEADLINE_EXCEEDED,
-                    "deadline exceeded",
-                    request_may_have_run=False,
-                ) from err
-            except ssl.SSLCertVerificationError as err:
-                raise LoopbackTransportError(
-                    ErrorCode.IDENTITY_MISMATCH,
-                    "identity mismatch",
-                    request_may_have_run=False,
-                ) from err
-            except ssl.SSLError as err:
-                if int(self._monotonic_ns()) >= connect_deadline_ns:
-                    raise LoopbackTransportError(
-                        ErrorCode.DEADLINE_EXCEEDED,
-                        "deadline exceeded",
-                        request_may_have_run=False,
-                    ) from err
-                raise LoopbackTransportError(
-                    ErrorCode.IDENTITY_MISMATCH,
-                    "identity mismatch",
-                    request_may_have_run=False,
-                ) from err
-            except OSError as err:
-                if int(self._monotonic_ns()) >= connect_deadline_ns:
-                    raise LoopbackTransportError(
-                        ErrorCode.DEADLINE_EXCEEDED,
-                        "deadline exceeded",
-                        request_may_have_run=False,
-                    ) from err
-                raise LoopbackTransportError(
-                    ErrorCode.DAEMON_UNAVAILABLE,
-                    "daemon unavailable",
-                    request_may_have_run=False,
-                ) from err
+            in_handshake = True
+            ssl_sock.do_handshake()
+            in_handshake = False
 
             _remaining_budget_s(self._monotonic_ns, connect_deadline_ns, request_may_have_run=False)
             der_cert = ssl_sock.getpeercert(binary_form=True)
@@ -452,10 +413,9 @@ class LoopbackClient:
 
             _remaining_budget_s(self._monotonic_ns, connect_deadline_ns, request_may_have_run=False)
             reader = FramedReader(ssl_sock, self._monotonic_ns)
-            probe_frame = (
-                f"GET {IDENTITY_PATH} HTTP/1.1\r\n"
-                f"Host: 127.0.0.1:{target.endpoint.port}\r\n\r\n"
-            ).encode("ascii")
+            probe_frame = (f"GET {IDENTITY_PATH} HTTP/1.1\r\nHost: 127.0.0.1:{target.endpoint.port}\r\n\r\n").encode(
+                "ascii"
+            )
 
             try:
                 write_all(ssl_sock, probe_frame, connect_deadline_ns, self._monotonic_ns)
@@ -555,6 +515,50 @@ class LoopbackClient:
             )
             handed_off = True
             return conn
+        except LoopbackTransportError:
+            raise
+        except (TimeoutError, ssl.SSLWantReadError, ssl.SSLWantWriteError) as err:
+            raise LoopbackTransportError(
+                ErrorCode.DEADLINE_EXCEEDED,
+                "deadline exceeded",
+                request_may_have_run=False,
+            ) from err
+        except ssl.SSLCertVerificationError as err:
+            raise LoopbackTransportError(
+                ErrorCode.IDENTITY_MISMATCH,
+                "identity mismatch",
+                request_may_have_run=False,
+            ) from err
+        except ssl.SSLError as err:
+            if int(self._monotonic_ns()) >= connect_deadline_ns:
+                raise LoopbackTransportError(
+                    ErrorCode.DEADLINE_EXCEEDED,
+                    "deadline exceeded",
+                    request_may_have_run=False,
+                ) from err
+            if in_handshake and not isinstance(err, (ssl.SSLEOFError, ssl.SSLZeroReturnError, ssl.SSLSyscallError)):
+                raise LoopbackTransportError(
+                    ErrorCode.IDENTITY_MISMATCH,
+                    "identity mismatch",
+                    request_may_have_run=False,
+                ) from err
+            raise LoopbackTransportError(
+                ErrorCode.DAEMON_UNAVAILABLE,
+                "daemon unavailable",
+                request_may_have_run=False,
+            ) from err
+        except (OSError, ValueError) as err:
+            if int(self._monotonic_ns()) >= connect_deadline_ns:
+                raise LoopbackTransportError(
+                    ErrorCode.DEADLINE_EXCEEDED,
+                    "deadline exceeded",
+                    request_may_have_run=False,
+                ) from err
+            raise LoopbackTransportError(
+                ErrorCode.DAEMON_UNAVAILABLE,
+                "daemon unavailable",
+                request_may_have_run=False,
+            ) from err
         finally:
             if not handed_off:
                 _quiet_close(ssl_sock)

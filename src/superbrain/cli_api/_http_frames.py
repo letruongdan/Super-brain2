@@ -160,7 +160,10 @@ def _validate_framed_headers(
     raw_cl = content_lengths[0].strip(" \t")
     if not raw_cl or not raw_cl.isascii() or not raw_cl.isdigit():
         raise HttpFramingError(ErrorCode.INVALID_INPUT, "invalid input", http_status=400)
-    length = int(raw_cl)
+    significant = raw_cl.lstrip("0") or "0"
+    if len(significant) > len(str(MAX_BODY_BYTES)):
+        raise HttpFramingError(ErrorCode.INVALID_INPUT, "payload exceeds size limit", http_status=413)
+    length = int(significant)
     if length > MAX_BODY_BYTES:
         raise HttpFramingError(ErrorCode.INVALID_INPUT, "payload exceeds size limit", http_status=413)
     return length

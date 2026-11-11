@@ -18,6 +18,7 @@ Covers all mandatory invariants from interface-spec.md Section 3 and task-6b-2-b
 from __future__ import annotations
 
 import datetime as dt
+import errno
 import ipaddress
 import json
 import socket
@@ -431,7 +432,11 @@ def _make_server_ctx(tls: SampleTlsMaterial) -> ssl.SSLContext:
 # -----------------------------------------------------------------------------
 
 
-def test_pin_checked_before_any_http(inc2_tls_material: SampleTlsMaterial, tmp_path: Path) -> None:
+def test_pin_checked_before_any_http(
+    inc2_tls_material: SampleTlsMaterial,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Verify wrong CA, missing IP SAN, expired leaf, and wrong leaf pin emit zero HTTP bytes."""
     valid_ca_pem = inc2_tls_material.ca_cert_path.read_text()
     valid_leaf_sha = inc2_tls_material.leaf_cert_sha256
@@ -523,6 +528,245 @@ def test_pin_checked_before_any_http(inc2_tls_material: SampleTlsMaterial, tmp_p
         assert len(server.raw_http_bytes) == 0
         assert server.get_count == 0
         assert server.post_count == 0
+
+    # Subcase E: Invalid CA strings (non-ASCII or malformed PEM) fail closed before network connect
+    with MockTlsServer(valid_server_ctx) as server:
+        ep = Endpoint(
+            version=1,
+            host="127.0.0.1",
+            port=server.port,
+            store_id="store-1",
+            writer_epoch=1,
+            instance_id="inst-1",
+            contract="mcp-tools-v2",
+        )
+        bad_ca = LoopbackTarget(
+            endpoint=ep,
+            expected_store_id="store-1",
+            ca_pem="non-ASCII PEM \u00e9",
+            leaf_cert_sha256="a" * 64,
+        )
+        bad_pem = LoopbackTarget(
+            endpoint=ep,
+            expected_store_id="store-1",
+            ca_pem="not-a-valid-pem",
+            leaf_cert_sha256="a" * 64,
+        )
+        with pytest.raises(LoopbackTransportError) as exc_ca:
+            client.connect(bad_ca)
+        assert exc_ca.value.code == ErrorCode.INVALID_INPUT
+        assert exc_ca.value.request_may_have_run is False
+        assert server.accept_count == 0
+
+        with pytest.raises(LoopbackTransportError) as exc_pem:
+            client.call(bad_pem, command)
+        assert exc_pem.value.code == ErrorCode.INVALID_INPUT
+        assert exc_pem.value.request_may_have_run is False
+        assert server.accept_count == 0
+
+    # Subcase F: Pre-HTTP OS/SSL failure normalization and socket cleanup in connect() and call()
+    with MockTlsServer(valid_server_ctx) as server:
+        ep_valid = Endpoint(
+            version=1,
+            host="127.0.0.1",
+            port=server.port,
+            store_id="store-1",
+            writer_epoch=1,
+            instance_id="inst-1",
+            contract="mcp-tools-v2",
+        )
+        valid_target = LoopbackTarget(ep_valid, "store-1", valid_ca_pem, valid_leaf_sha)
+
+        # 1. socket.socket() raises OSError(EMFILE)
+        def fail_socket(*_args: Any, **_kwargs: Any) -> Any:
+            raise OSError(errno.EMFILE, "fixture emfile")
+
+        with monkeypatch.context() as mp:
+            mp.setattr("superbrain.cli_api.loopback.socket.socket", fail_socket)
+            with pytest.raises(LoopbackTransportError) as exc_emfile_conn:
+                client.connect(valid_target)
+            assert exc_emfile_conn.value.code == ErrorCode.DAEMON_UNAVAILABLE
+            assert exc_emfile_conn.value.request_may_have_run is False
+
+            with pytest.raises(LoopbackTransportError) as exc_emfile_call:
+                client.call(valid_target, command)
+            assert exc_emfile_call.value.code == ErrorCode.DAEMON_UNAVAILABLE
+            assert exc_emfile_call.value.request_may_have_run is False
+
+        # 2. wrap_socket() raises ConnectionResetError(ECONNRESET) -> underlying raw socket closed
+        orig_wrap = ssl.SSLContext.wrap_socket
+        wrap_reset_socks: list[socket.socket] = []
+
+        def fail_wrap_reset(_self: ssl.SSLContext, sock: socket.socket, *args: Any, **kwargs: Any) -> Any:
+            if kwargs.get("server_side"):
+                return orig_wrap(_self, sock, *args, **kwargs)
+            wrap_reset_socks.append(sock)
+            raise ConnectionResetError(errno.ECONNRESET, "fixture wrap reset")
+
+        with monkeypatch.context() as mp:
+            mp.setattr(ssl.SSLContext, "wrap_socket", fail_wrap_reset)
+            with pytest.raises(LoopbackTransportError) as exc_reset_conn:
+                client.connect(valid_target)
+            assert exc_reset_conn.value.code == ErrorCode.DAEMON_UNAVAILABLE
+            assert exc_reset_conn.value.request_may_have_run is False
+            assert len(wrap_reset_socks) == 1
+            assert wrap_reset_socks[0].fileno() == -1
+
+            with pytest.raises(LoopbackTransportError) as exc_reset_call:
+                client.call(valid_target, command)
+            assert exc_reset_call.value.code == ErrorCode.DAEMON_UNAVAILABLE
+            assert exc_reset_call.value.request_may_have_run is False
+            assert len(wrap_reset_socks) == 2
+            assert wrap_reset_socks[1].fileno() == -1
+
+        # 3. wrap_socket() raises TimeoutError -> DEADLINE_EXCEEDED and underlying socket closed
+        wrap_timeout_socks: list[socket.socket] = []
+
+        def fail_wrap_timeout(_self: ssl.SSLContext, sock: socket.socket, *args: Any, **kwargs: Any) -> Any:
+            if kwargs.get("server_side"):
+                return orig_wrap(_self, sock, *args, **kwargs)
+            wrap_timeout_socks.append(sock)
+            raise TimeoutError("fixture wrap timeout")
+
+        with monkeypatch.context() as mp:
+            mp.setattr(ssl.SSLContext, "wrap_socket", fail_wrap_timeout)
+            with pytest.raises(LoopbackTransportError) as exc_wrap_to:
+                client.connect(valid_target)
+            assert exc_wrap_to.value.code == ErrorCode.DEADLINE_EXCEEDED
+            assert exc_wrap_to.value.request_may_have_run is False
+            assert len(wrap_timeout_socks) == 1
+            assert wrap_timeout_socks[0].fileno() == -1
+
+        # 4. wrap_socket() raises SSLCertVerificationError -> IDENTITY_MISMATCH and underlying socket closed
+        wrap_cert_socks: list[socket.socket] = []
+
+        def fail_wrap_cert(_self: ssl.SSLContext, sock: socket.socket, *args: Any, **kwargs: Any) -> Any:
+            if kwargs.get("server_side"):
+                return orig_wrap(_self, sock, *args, **kwargs)
+            wrap_cert_socks.append(sock)
+            raise ssl.SSLCertVerificationError("fixture wrap cert verify")
+
+        with monkeypatch.context() as mp:
+            mp.setattr(ssl.SSLContext, "wrap_socket", fail_wrap_cert)
+            with pytest.raises(LoopbackTransportError) as exc_wrap_cert:
+                client.connect(valid_target)
+            assert exc_wrap_cert.value.code == ErrorCode.IDENTITY_MISMATCH
+            assert exc_wrap_cert.value.request_may_have_run is False
+            assert len(wrap_cert_socks) == 1
+            assert wrap_cert_socks[0].fileno() == -1
+
+        # 5. getpeercert() raises OSError(ECONNRESET) -> DAEMON_UNAVAILABLE and ssl_sock closed
+        wrapped_ssl_socks: list[ssl.SSLSocket] = []
+
+        def intercept_wrap_peercert(
+            self_ctx: ssl.SSLContext,
+            sock: socket.socket,
+            *args: Any,
+            **kwargs: Any,
+        ) -> ssl.SSLSocket:
+            if kwargs.get("server_side"):
+                return orig_wrap(self_ctx, sock, *args, **kwargs)
+            ssl_sock = orig_wrap(self_ctx, sock, *args, **kwargs)
+            wrapped_ssl_socks.append(ssl_sock)
+
+            def fail_peercert(*_a: Any, **_k: Any) -> Any:
+                raise OSError(errno.ECONNRESET, "fixture getpeercert reset")
+
+            ssl_sock.getpeercert = fail_peercert  # type: ignore[method-assign]
+            return ssl_sock
+
+        with monkeypatch.context() as mp:
+            mp.setattr(ssl.SSLContext, "wrap_socket", intercept_wrap_peercert)
+            with pytest.raises(LoopbackTransportError) as exc_peer_conn:
+                client.connect(valid_target)
+            assert exc_peer_conn.value.code == ErrorCode.DAEMON_UNAVAILABLE
+            assert exc_peer_conn.value.request_may_have_run is False
+            assert len(wrapped_ssl_socks) == 1
+            assert wrapped_ssl_socks[0].fileno() == -1
+
+        # 6. ssl.SSLContext creation raises ssl.SSLError or OSError(ENOMEM) (I2-T6B-R04 Round 12)
+        def fail_ssl_ctx_ssl_error(*_args: Any, **_kwargs: Any) -> Any:
+            raise ssl.SSLError("fixture SSL context failure")
+
+        with monkeypatch.context() as mp:
+            mp.setattr("superbrain.cli_api.loopback.ssl.SSLContext", fail_ssl_ctx_ssl_error)
+            with pytest.raises(LoopbackTransportError) as exc_ctx_ssl_conn:
+                client.connect(valid_target)
+            assert exc_ctx_ssl_conn.value.code == ErrorCode.DAEMON_UNAVAILABLE
+            assert exc_ctx_ssl_conn.value.request_may_have_run is False
+            assert str(exc_ctx_ssl_conn.value) == "daemon unavailable"
+
+            with pytest.raises(LoopbackTransportError) as exc_ctx_ssl_call:
+                client.call(valid_target, command)
+            assert exc_ctx_ssl_call.value.code == ErrorCode.DAEMON_UNAVAILABLE
+            assert exc_ctx_ssl_call.value.request_may_have_run is False
+            assert str(exc_ctx_ssl_call.value) == "daemon unavailable"
+
+        def fail_ssl_ctx_oom(*_args: Any, **_kwargs: Any) -> Any:
+            raise OSError(errno.ENOMEM, "fixture SSL context oom")
+
+        with monkeypatch.context() as mp:
+            mp.setattr("superbrain.cli_api.loopback.ssl.SSLContext", fail_ssl_ctx_oom)
+            with pytest.raises(LoopbackTransportError) as exc_ctx_oom_conn:
+                client.connect(valid_target)
+            assert exc_ctx_oom_conn.value.code == ErrorCode.DAEMON_UNAVAILABLE
+            assert exc_ctx_oom_conn.value.request_may_have_run is False
+            assert str(exc_ctx_oom_conn.value) == "daemon unavailable"
+
+            with pytest.raises(LoopbackTransportError) as exc_ctx_oom_call:
+                client.call(valid_target, command)
+            assert exc_ctx_oom_call.value.code == ErrorCode.DAEMON_UNAVAILABLE
+            assert exc_ctx_oom_call.value.request_may_have_run is False
+            assert str(exc_ctx_oom_call.value) == "daemon unavailable"
+
+        # 7. load_verify_locations non-SSL OSError raises DAEMON_UNAVAILABLE
+        orig_load_verify = ssl.SSLContext.load_verify_locations
+
+        def fail_load_verify(self_ctx: ssl.SSLContext, *args: Any, **kwargs: Any) -> Any:
+            if self_ctx is valid_server_ctx:
+                return orig_load_verify(self_ctx, *args, **kwargs)
+            raise OSError(errno.EIO, "fixture ca load io")
+
+        with monkeypatch.context() as mp:
+            mp.setattr(ssl.SSLContext, "load_verify_locations", fail_load_verify)
+            with pytest.raises(LoopbackTransportError) as exc_load_conn:
+                client.connect(valid_target)
+            assert exc_load_conn.value.code == ErrorCode.DAEMON_UNAVAILABLE
+            assert exc_load_conn.value.request_may_have_run is False
+            assert str(exc_load_conn.value) == "daemon unavailable"
+
+            with pytest.raises(LoopbackTransportError) as exc_load_call:
+                client.call(valid_target, command)
+            assert exc_load_call.value.code == ErrorCode.DAEMON_UNAVAILABLE
+            assert exc_load_call.value.request_may_have_run is False
+            assert str(exc_load_call.value) == "daemon unavailable"
+
+        # 8. wrap_socket generic ssl.SSLError (non-cert) normalizes and closes underlying socket
+        wrap_generic_ssl_socks: list[socket.socket] = []
+
+        def fail_wrap_generic_ssl(_self: ssl.SSLContext, sock: socket.socket, *args: Any, **kwargs: Any) -> Any:
+            if kwargs.get("server_side"):
+                return orig_wrap(_self, sock, *args, **kwargs)
+            wrap_generic_ssl_socks.append(sock)
+            raise ssl.SSLError("fixture wrap ssl error")
+
+        with monkeypatch.context() as mp:
+            mp.setattr(ssl.SSLContext, "wrap_socket", fail_wrap_generic_ssl)
+            with pytest.raises(LoopbackTransportError) as exc_wrap_gen_conn:
+                client.connect(valid_target)
+            assert exc_wrap_gen_conn.value.code == ErrorCode.DAEMON_UNAVAILABLE
+            assert exc_wrap_gen_conn.value.request_may_have_run is False
+            assert str(exc_wrap_gen_conn.value) == "daemon unavailable"
+            assert len(wrap_generic_ssl_socks) == 1
+            assert wrap_generic_ssl_socks[0].fileno() == -1
+
+            with pytest.raises(LoopbackTransportError) as exc_wrap_gen_call:
+                client.call(valid_target, command)
+            assert exc_wrap_gen_call.value.code == ErrorCode.DAEMON_UNAVAILABLE
+            assert exc_wrap_gen_call.value.request_may_have_run is False
+            assert str(exc_wrap_gen_call.value) == "daemon unavailable"
+            assert len(wrap_generic_ssl_socks) == 2
+            assert wrap_generic_ssl_socks[1].fileno() == -1
 
 
 # -----------------------------------------------------------------------------
@@ -678,6 +922,30 @@ def test_wrong_identity_receives_only_probe(inc2_tls_material: SampleTlsMaterial
             # Verify zero token or tool args leaked across raw decrypted wire
             assert secret_token.encode() not in server.raw_http_bytes
             assert b"get_health" not in server.raw_http_bytes
+
+    # Subcase: Overlong 5,000-digit Content-Length on GET /v2/identity fails identity verification with 0 POSTs
+    def overlong_cl_identity_handler(req: MockHttpRequest, sock: ssl.SSLSocket) -> bytes | None:
+        if req.method == "GET":
+            return b"HTTP/1.1 200 OK\r\nContent-Length: " + (b"9" * 5000) + b"\r\n\r\n"
+        return None
+
+    with MockTlsServer(valid_server_ctx, handler=overlong_cl_identity_handler) as server:
+        ep = Endpoint(
+            version=1,
+            host="127.0.0.1",
+            port=server.port,
+            store_id="store-1",
+            writer_epoch=1,
+            instance_id="inst-1",
+            contract="mcp-tools-v2",
+        )
+        target = LoopbackTarget(ep, "store-1", valid_ca_pem, valid_leaf_sha)
+        with pytest.raises(LoopbackTransportError) as exc_info:
+            client.call(target, command)
+        assert exc_info.value.code == ErrorCode.IDENTITY_MISMATCH
+        assert exc_info.value.request_may_have_run is False
+        assert server.get_count == 1
+        assert server.post_count == 0
 
 
 # -----------------------------------------------------------------------------
@@ -1027,6 +1295,43 @@ def test_response_loss_after_post_is_transport_uncertain(inc2_tls_material: Samp
         assert exc_info.value.request_may_have_run is True
         assert isinstance(cmd4.arguments, dict)
         assert cmd4.arguments["idempotency_key"] == "k-502"
+        assert server.post_count == 1
+
+    # Subcase 5: Overlong 5,000-digit Content-Length on POST /v2/tools/call response
+    # is DAEMON_UNAVAILABLE with request_may_have_run=True
+    def overlong_cl_post_handler(req: MockHttpRequest, sock: ssl.SSLSocket) -> bytes | None:
+        if req.method == "GET":
+            body = json.dumps(
+                {"store_id": "store-1", "writer_epoch": 1, "instance_id": "inst-1", "contract": "mcp-tools-v2"}
+            ).encode()
+            return (
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
+                + str(len(body)).encode()
+                + b"\r\n\r\n"
+                + body
+            )
+        if req.method == "POST":
+            return b"HTTP/1.1 200 OK\r\nContent-Length: " + (b"9" * 5000) + b"\r\n\r\n"
+        return None
+
+    with MockTlsServer(valid_server_ctx, handler=overlong_cl_post_handler) as server:
+        ep = Endpoint(
+            version=1,
+            host="127.0.0.1",
+            port=server.port,
+            store_id="store-1",
+            writer_epoch=1,
+            instance_id="inst-1",
+            contract="mcp-tools-v2",
+        )
+        target = LoopbackTarget(ep, "store-1", valid_ca_pem, valid_leaf_sha)
+        cmd_cl = ToolCommand(tool="get_health", arguments={"idempotency_key": "k-cl-5000"}, token="tok-cl")
+
+        with pytest.raises(LoopbackTransportError) as exc_info:
+            client.call(target, cmd_cl)
+        assert exc_info.value.code == ErrorCode.DAEMON_UNAVAILABLE
+        assert exc_info.value.request_may_have_run is True
+        assert server.get_count == 1
         assert server.post_count == 1
 
     # Complementary success cases: valid daemon error envelopes returned intact
