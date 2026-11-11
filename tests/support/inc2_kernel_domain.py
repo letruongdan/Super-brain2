@@ -19,8 +19,6 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import cast
 
-import jsonschema
-
 from superbrain.application._lineage_delivery import aggregate_delivery_fields
 from superbrain.application.deadlines import begin_local_phase
 from superbrain.application.dispatch import KernelToolDomain, PreparedEffect
@@ -480,6 +478,8 @@ def fixture_store_extensions() -> tuple[tuple[ProjectionHandler, ...], KindRegis
 
 def validate_response_envelope(tool: str, envelope: Mapping[str, JsonValue]) -> dict[str, JsonValue]:
     """Validate ``envelope`` against both strict wire rules and packaged ``mcp-tools-v2.json`` output schema."""
+    import jsonschema
+
     env_dict: dict[str, JsonValue] = dict(envelope)
     encode_envelope(env_dict)
     catalog = load_catalog()

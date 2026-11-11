@@ -37,8 +37,10 @@ from tests.support.crash_cases import (
 from tests.support.inc2_cli import get_shared_t7_transport_template, is_writer_lock_held
 from tests.support.inc2_fixture import InstalledEnv
 
-_DAEMON_CASES = [c for c in KERNEL_CRASH_CASES if c.operation == "serve"]
+_DAEMON_CASES = [c for c in KERNEL_CRASH_CASES if c.operation == "serve"]  # startup crashpoints (8.1)
 _MIGRATE_CASES = [c for c in KERNEL_CRASH_CASES if c.operation == "migrate"]
+_BEFORE_COMMIT_CASES = [c for c in KERNEL_CRASH_CASES if c.crashpoint == "kernel.before_commit"]
+_AFTER_COMMIT_CASES = [c for c in KERNEL_CRASH_CASES if c.crashpoint == "kernel.after_commit_before_response"]
 
 
 def _context(env: InstalledEnv, trusted_tmp: Path) -> KernelCrashContext:
@@ -56,6 +58,20 @@ def test_daemon_crash_preserves_store_and_fences_old_endpoint(
 
 @pytest.mark.parametrize("case", _MIGRATE_CASES, ids=lambda c: c.node_id)
 def test_policy_swap_crash_requires_explicit_migration_resume(
+    inc2_installed_env: InstalledEnv, trusted_tmp: Path, case: KernelCrashCase
+) -> None:
+    run_kernel_case(case, _context(inc2_installed_env, trusted_tmp))
+
+
+@pytest.mark.parametrize("case", _BEFORE_COMMIT_CASES, ids=lambda c: c.node_id)
+def test_crash_before_commit_leaves_no_effect_and_one_retry_applies(
+    inc2_installed_env: InstalledEnv, trusted_tmp: Path, case: KernelCrashCase
+) -> None:
+    run_kernel_case(case, _context(inc2_installed_env, trusted_tmp))
+
+
+@pytest.mark.parametrize("case", _AFTER_COMMIT_CASES, ids=lambda c: c.node_id)
+def test_replay_after_response_loss_through_real_shim(
     inc2_installed_env: InstalledEnv, trusted_tmp: Path, case: KernelCrashCase
 ) -> None:
     run_kernel_case(case, _context(inc2_installed_env, trusted_tmp))

@@ -1,19 +1,25 @@
 """Wheel-side owner driver for the SP1 increment 2 Task 8 crash cases.
 
-Run as ``<wheel venv python> -I inc2_t8_child.py <serve|migrate> <absolute DaemonConfig path>``. ``-I`` keeps the
-checkout and ``PYTHONPATH`` off ``sys.path``, so ``superbrain`` is imported from the installed wheel; the driver checks
-that ``superbrain.__file__`` lies inside the running venv before it adds the repository (test support) path.
+Run as ``<wheel venv python> -I inc2_t8_child.py <serve|serve-fixture|migrate> <absolute DaemonConfig path>``.
+``-I`` keeps the checkout and ``PYTHONPATH`` off ``sys.path``, so ``superbrain`` is imported from the installed wheel;
+the driver checks that ``superbrain.__file__`` lies inside the running venv before it adds the repository (test
+support) path.
 
 Channels: stdout carries only what the owner CLI prints (``migrate`` envelope, nothing for ``serve``). Control markers
 go to stderr, one per line, next to the owner's own static error code and ``CRASHPOINT_HIT``:
 
 - ``PPID <pid>``: the parent PID (on Windows the venv ``python.exe`` redirector is a separate launcher process).
+- ``MODULE <abs path>``: resolved ``superbrain.__file__`` recorded before adding the test-support path.
+- ``SCHEMA <sha256>``: the digest of the packaged ``mcp-tools-v2.json`` catalog the wheel loaded.
 - ``ENTERED <pid> <start>``: this interpreter's real PID and process start time, printed before the owner operation.
-- ``READY <endpoint canonical JSON>``: ``serve`` only, from ``on_ready`` after the endpoint was published.
+- ``READY <endpoint canonical JSON>``: ``serve`` modes only, from ``on_ready`` after the endpoint was published.
 
-``serve`` uses the owner CLI's composition (``owner_entry._explicit_owner_adapters`` + ``daemon_entry.serve``) with an
-``on_ready`` that also prints ``READY``; ``migrate`` calls ``owner_entry.main`` exactly as ``brain migrate`` does.
-Fault injection stays the product's own ``SUPERBRAIN_CRASHPOINT`` environment hook; the driver adds none.
+``serve`` uses the owner CLI's composition (``owner_entry._explicit_owner_adapters`` +
+``daemon_entry.serve_config_path``) with an ``on_ready`` that also prints ``READY``; ``migrate`` calls
+``owner_entry.main`` exactly as ``brain migrate`` does. ``serve-fixture`` is ``serve`` with the durable test domain of
+``tests/support/inc2_t8_domain.py``: the store opens with the fixture projections and a ``FixtureDomainProxy`` is bound
+on the owner thread in ``before_job_recover``. Fault injection stays the product's own ``SUPERBRAIN_CRASHPOINT``
+environment hook; the driver adds none.
 """
 
 from __future__ import annotations
@@ -22,7 +28,7 @@ import os
 import sys
 from pathlib import Path
 
-_MODES = ("serve", "migrate")
+_MODES = ("serve", "serve-fixture", "migrate")
 
 
 def _mark(tag: str, value: str) -> None:
@@ -53,22 +59,32 @@ def _process_start() -> str:
     return "_".join(out.stdout.split())
 
 
-def _serve(config_path: Path) -> int:
+def _serve(config_path: Path, *, fixture: bool = False) -> int:
     import shutil
 
     from superbrain.application.owner_loop import OwnerLoop
-    from superbrain.composition.daemon_entry import serve
+    from superbrain.composition.daemon_entry import serve_config_path
     from superbrain.composition.owner_entry import _explicit_owner_adapters
     from superbrain.core.kernel import Ready
 
-    cfg, adapters, scratch_base = _explicit_owner_adapters(config_path)
+    _cfg, adapters, scratch_base = _explicit_owner_adapters(config_path)
 
     def _on_ready(ready: Ready, _loop: OwnerLoop) -> None:
         shutil.rmtree(scratch_base, ignore_errors=True)
         _mark("READY", ready.endpoint.encode_canonical().decode("utf-8"))
 
+    if not fixture:
+        try:
+            return serve_config_path(config_path, os_=adapters, on_ready=_on_ready)
+        finally:
+            shutil.rmtree(scratch_base, ignore_errors=True)
+    from tests.support.inc2_t8_domain import FixtureDomainProxy, fixture_hooks, use_fixture_store_extensions
+
+    use_fixture_store_extensions()
+    proxy = FixtureDomainProxy()
+    hooks = fixture_hooks(proxy, monotonic_ns=adapters.monotonic.monotonic_ns)
     try:
-        return serve(cfg, os_=adapters, on_ready=_on_ready)
+        return serve_config_path(config_path, os_=adapters, on_ready=_on_ready, domain=proxy, hooks=hooks)
     finally:
         shutil.rmtree(scratch_base, ignore_errors=True)
 
@@ -79,6 +95,9 @@ def main(argv: list[str]) -> int:
         return 2
     import superbrain
 
+    if superbrain.__file__ is None:
+        _mark("DRIVER_ERROR", "superbrain.__file__ is None")
+        return 3
     module = Path(superbrain.__file__).resolve()
     venv = Path(sys.prefix).resolve()
     if sys.prefix == sys.base_prefix or not module.is_relative_to(venv):
@@ -88,14 +107,17 @@ def main(argv: list[str]) -> int:
 
     from superbrain.composition import owner_entry
     from superbrain.core.errors import BrainError, ErrorCode
+    from superbrain.core.wire import load_catalog
 
     mode, config_path = argv[1], Path(argv[2])
     _mark("PPID", str(os.getppid()))
+    _mark("MODULE", str(module))
+    _mark("SCHEMA", load_catalog().schema_sha256)
     _mark("ENTERED", f"{os.getpid()} {_process_start()}")
     if mode == "migrate":
         return owner_entry.main(["migrate", "--offline", "--config", str(config_path)])
     try:  # the same mapping as owner_entry.main
-        return _serve(config_path)
+        return _serve(config_path, fixture=mode == "serve-fixture")
     except BrainError as err:
         owner_entry._write_stderr(err.code.value)
         return 1

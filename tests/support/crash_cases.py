@@ -431,7 +431,7 @@ CRASH_CASES: tuple[CrashCase, ...] = (
 T8_CHILD = Path(__file__).resolve().with_name("inc2_t8_child.py")
 T8_CHILD_TIMEOUT = 60.0
 T8_STOP_TIMEOUT = 15.0
-_MARKERS = ("PPID", "ENTERED", "READY", "CRASHPOINT_HIT", "PAUSED", "DRIVER_ERROR")
+_MARKERS = ("PPID", "MODULE", "SCHEMA", "ENTERED", "READY", "CRASHPOINT_HIT", "PAUSED", "DRIVER_ERROR")
 
 
 @dataclass(frozen=True)
@@ -622,15 +622,19 @@ class KernelSeed:
     snapshot: dict[str, list[tuple[object, ...]]]
     stale: Endpoint | None = None
     """An ``endpoint.json`` of a previous epoch present before the crashing run."""
+    notes: dict[str, object] = dataclasses.field(default_factory=dict)
+    """What a request-triggered crash observed (the old shim's response frame), for the expectation."""
 
 
 @dataclass(frozen=True)
 class KernelCrashCase:
-    operation: Literal["serve", "migrate"]
+    operation: Literal["serve", "serve-fixture", "migrate"]
     """The ``inc2_t8_child.py`` mode."""
     crashpoint: str
     seed: Callable[[KernelCrashContext], KernelSeed]
     expect: Callable[[KernelCrashContext, KernelSeed, MarkedRun], None]
+    trigger: Callable[[KernelCrashContext, KernelSeed, Endpoint], None] | None = None
+    """For a crashpoint on a request path: runs once the daemon is READY (the crash must come from it)."""
 
     @property
     def node_id(self) -> str:
@@ -639,9 +643,31 @@ class KernelCrashCase:
 
 def run_kernel_case(case: KernelCrashCase, ctx: KernelCrashContext) -> None:
     seeded = case.seed(ctx)
-    run = run_t8_child(ctx.env, case.operation, seeded.config, cwd=ctx.cwd, crashpoint=case.crashpoint)
-    assert_t8_crashed(run, case.crashpoint)
+    if case.trigger is None:
+        run = run_t8_child(ctx.env, case.operation, seeded.config, cwd=ctx.cwd, crashpoint=case.crashpoint)
+        assert_t8_crashed(run, case.crashpoint)
+    else:
+        trigger = case.trigger
+        run = run_t8_child(
+            ctx.env,
+            case.operation,
+            seeded.config,
+            cwd=ctx.cwd,
+            crashpoint=case.crashpoint,
+            while_ready=lambda ready: trigger(ctx, seeded, ready),
+        )
+        assert_request_crashed(run, case.crashpoint)
     case.expect(ctx, seeded, run)
+
+
+def assert_request_crashed(run: MarkedRun, crashpoint: str) -> None:
+    """The daemon reached READY, then the triggering request made this invocation exit 86 at ``crashpoint``."""
+    r = run.result
+    assert r.returncode == CRASH_EXIT and r.hit == crashpoint and run.ready is not None and not run.timed_out, (
+        f"the request did not crash the daemon at {crashpoint!r}: {run.describe()}"
+    )
+    assert_entered(run)
+    assert r.stderr.index("READY ") < r.stderr.index("CRASHPOINT_HIT "), run.describe()
 
 
 # --- kernel reads without a runtime --------------------------------------------------------------------------------
@@ -996,10 +1022,398 @@ def expect_crash_after_policy_swap(ctx: KernelCrashContext, seed: KernelSeed, ru
     }
 
 
+# --- request-path kernel cases (Task 8.2): the durable fixture domain behind the installed daemon -----------------
+#
+# ``serve-fixture`` runs the installed wheel's owner composition with ``FixtureKernelDomain`` bound on the owner thread
+# (``inc2_t8_child.py``). The trigger sends one ``prepare_task`` with an explicit task and key through an installed
+# ``brain-mcp`` once the daemon is READY; the crashpoint on the request path must kill the daemon during that request.
+# The expectation reads what the dead process left without a runtime, then restarts ``serve-fixture`` on the same root
+# and retries through a new shim of the same principal.
+
+T8_TASK_ID = "task-t8-response-loss"
+T8_KEY = "idem-t8-response-loss-0001"
+FIXTURE_DELIVERY_KIND = "fixture.delivery_result_recorded"
+REQUEST_TABLES = ("deliveries", "delivery_items", "task_bindings", "holders", "idempotency", "hwm")
+"""Every row a ``prepare_task`` effect writes besides its ledger entries (projection, ref holders, idempotency,
+C4 high-water mark)."""
+
+
+def t8_prepare_args(description: str = "t8 response loss") -> dict[str, JsonValue]:
+    """``prepare_task`` with an explicit task and key; the shim adds the workspace hint of its profile."""
+    return {"schema_version": "2.0", "task_id": T8_TASK_ID, "description": description, "idempotency_key": T8_KEY}
+
+
+def fixture_rows(data_root: Path, scratch: Path) -> dict[str, list[tuple[object, ...]]]:
+    """Ledger, applied intents and every request table of the fixture store, read-only (the daemon may be live)."""
+    db = DataRoot.at(data_root).store_db
+
+    def q(sql: str) -> list[tuple[object, ...]]:
+        return _rows(db, scratch, sql)
+
+    return {
+        **store_rows(data_root, scratch),
+        "deliveries": q(
+            "SELECT result_id, delivery_id, assignment_id, task_id, record_digest FROM p_fixture_domain_deliveries "
+            "ORDER BY 1"
+        ),
+        "delivery_items": q(
+            "SELECT result_id, slot, position, ref_id, ref_revision, ref_digest FROM p_fixture_domain_delivery_items "
+            "ORDER BY 1, 2, 3"
+        ),
+        "task_bindings": q(
+            "SELECT task_id, delivery_id, assignment_id, snapshot_status FROM p_task_lineage_bindings ORDER BY 1"
+        ),
+        "holders": q("SELECT holder_kind, holder_id, digest FROM p_cas_holders_ ORDER BY 1, 2, 3"),
+        "idempotency": q(
+            "SELECT principal_id, tool, key_hash, request_digest, result_id, assignment_id FROM idempotency "
+            "ORDER BY 1, 2, 3"
+        ),
+        "hwm": q("SELECT value FROM meta WHERE key = 'idempotency_clock_hwm_utc'"),
+        "artifacts": q("SELECT artifact_id, revision, artifact_digest FROM p_fixture_domain_artifacts ORDER BY 1"),
+    }
+
+
+def open_fixture_runtime(data_root: Path, store_id: str) -> Runtime:
+    from superbrain.storage.runtime import admit_existing_pair, open_runtime_under_lease
+    from tests.support.inc2_kernel_domain import fixture_store_extensions
+
+    handlers, kinds = fixture_store_extensions()
+    return open_runtime_under_lease(
+        admit_existing_pair(data_root, store_id, os_adapters(), purpose="serve"), handlers=handlers, kinds=kinds
+    )
+
+
+def seed_fixture_root(ctx: KernelCrashContext) -> KernelSeed:
+    """The admitted template plus the fixture scenario (three artifacts of ``ws-a``), seeded before any daemon."""
+    from tests.support.inc2_kernel_domain import FixtureKernelDomain
+    from tests.support.inc2_t8_domain import seed_scenario
+
+    tpl = ctx.template
+    data_root = ctx.case_dir / "data"
+    clone_owner_only_tree(tpl.root, data_root)
+    config = write_daemon_config_file(
+        ctx.case_dir / "daemon-config.json",
+        data_root=data_root,
+        expected_store_id=tpl.store_id,
+        cert_path=tpl.tls.cert_path,
+        key_path=tpl.tls.key_path,
+    )
+    rt = open_fixture_runtime(data_root, tpl.store_id)
+    try:
+        seed_scenario(FixtureKernelDomain(store=rt.store, policy=rt.policy, clock=rt.os_.clock), rt)
+    finally:
+        rt.close()
+    snapshot = fixture_rows(data_root, ctx.case_dir / "ro-scratch")
+    assert snapshot["ledger"] and len(snapshot["artifacts"]) == 3, "the scenario was not seeded"
+    assert snapshot["deliveries"] == [] and snapshot["idempotency"] == [] and snapshot["task_bindings"] == []
+    return KernelSeed(data_root, config, tpl.store_id, lock_epoch(data_root), snapshot)
+
+
+def _ws_profile(ctx: KernelCrashContext, seed: KernelSeed, name: str, token: str) -> Path:
+    ws = ctx.template.ws_a
+    assert ws is not None
+    client = ctx.case_dir / f"client-{name}"
+    cred = write_credential_file(client / "credential.txt", token)
+    profile, _ = write_client_profile_file(
+        client / "profile.json",
+        endpoint_path=DataRoot.at(seed.data_root).endpoint_path,
+        expected_store_id=seed.store_id,
+        ca_file=ctx.template.tls.ca_cert_path,
+        leaf_cert_sha256=ctx.template.tls.leaf_cert_sha256,
+        credential_file=cred,
+        workspace={
+            "alias": ws.alias,
+            "checkout_path": str(ws.checkout_path),
+            "expected_workspace_id": ws.repo_id,
+            "expected_checkout_id": ws.checkout_id,
+        },
+    )
+    return profile
+
+
+def shim_calls(
+    ctx: KernelCrashContext,
+    seed: KernelSeed,
+    name: str,
+    token: str,
+    calls: Sequence[tuple[str, dict[str, JsonValue]]],
+    *,
+    entrypoint: Literal["brain-mcp", "brain"] = "brain-mcp",
+    quiet: bool = True,
+) -> list[dict[str, JsonValue]]:
+    """Tool results (``result`` objects) of ``calls`` through one installed shim in the workspace: ``brain-mcp`` or
+    the equivalent ``brain mcp``. ``quiet`` also requires an empty shim stderr."""
+    ws = ctx.template.ws_a
+    assert ws is not None
+    profile = _ws_profile(ctx, seed, name, token)
+    args = ("--profile", str(profile)) if entrypoint == "brain-mcp" else ("mcp", "--profile", str(profile))
+    init, initialized = mcp_init_frames(1)
+    results: list[dict[str, JsonValue]] = []
+    with InstalledMcpPipeSession(ctx.env, entrypoint, args, cwd=Path(ws.checkout_path)) as s:
+        assert s.send_frames_and_expect_response([init], timeout=10.0).get("id") == 1
+        for i, (tool, tool_args) in enumerate(calls):
+            frames = [initialized] if i == 0 else []
+            frame = s.send_frames_and_expect_response([*frames, mcp_call_frame(i + 2, tool, tool_args)], timeout=10.0)
+            result = frame.get("result")
+            assert "error" not in frame and isinstance(result, dict), frame
+            results.append(result)
+        rc, stderr = s.finish()
+    assert rc == 0, (rc, stderr)
+    if quiet:
+        assert stderr == b"", stderr
+    return results
+
+
+def content(result: dict[str, JsonValue]) -> dict[str, JsonValue]:
+    sc = result.get("structuredContent")
+    assert isinstance(sc, dict), result
+    return sc
+
+
+def assert_uncertain(result: dict[str, JsonValue]) -> None:
+    """The old shim sent the request and got no success: an uncertain ``daemon_unavailable`` tool error."""
+    assert result.get("isError") is True, result
+    meta = result.get("_meta")
+    assert isinstance(meta, dict) and meta.get("superbrain/request_may_have_run") is True, result
+    error = content(result).get("error")
+    assert isinstance(error, dict) and error.get("code") == ErrorCode.DAEMON_UNAVAILABLE.value, result
+
+
+def ok_data(result: dict[str, JsonValue]) -> dict[str, JsonValue]:
+    sc = content(result)
+    assert result.get("isError") is False and sc.get("ok") is True, result
+    data = sc["data"]
+    assert isinstance(data, dict)
+    return data
+
+
+def error_code(result: dict[str, JsonValue]) -> str:
+    sc = content(result)
+    error = sc.get("error")
+    assert result.get("isError") is True and sc.get("ok") is False and isinstance(error, dict), result
+    return str(error["code"])
+
+
+def cast_result(value: object) -> dict[str, JsonValue]:
+    assert isinstance(value, dict), value
+    return value
+
+
+def trigger_prepare_task(ctx: KernelCrashContext, seed: KernelSeed, ready: Endpoint) -> None:
+    """With the daemon READY: record the durable state, then send the request the crashpoint must interrupt."""
+    assert (ready.store_id, ready.writer_epoch) == (seed.store_id, seed.epoch + 1)
+    seed.notes["before"] = fixture_rows(seed.data_root, ctx.case_dir / "ro-scratch")
+    (result,) = shim_calls(
+        ctx, seed, "crash", ctx.template.cred.token, [("prepare_task", t8_prepare_args())], quiet=False
+    )
+    seed.notes["first"] = result
+
+
+def _restart_fixture(
+    ctx: KernelCrashContext, seed: KernelSeed, during: Callable[[Endpoint], None], *, crashpoint: str | None = None
+) -> MarkedRun:
+    """``serve-fixture`` again on the same root (new epoch); ``during`` runs while it serves. With ``crashpoint`` the
+    fault env stays set and the run must still not hit it."""
+    epoch = lock_epoch(seed.data_root) + 1
+    run = run_t8_child(ctx.env, "serve-fixture", seed.config, cwd=ctx.cwd, crashpoint=crashpoint, while_ready=during)
+    assert run.ready is not None and run.result.hit is None and run.result.returncode == 0, run.describe()
+    assert (run.ready.store_id, run.ready.writer_epoch) == (seed.store_id, epoch), run.describe()
+    assert_wheel_provenance(run, ctx)
+    return run
+
+
+def assert_wheel_provenance(run: MarkedRun, ctx: KernelCrashContext) -> None:
+    """The driver imported ``superbrain`` from the installed wheel venv and loaded the packaged tool schema whose
+    digest equals the checkout's ``schemas/mcp-tools-v2.json``."""
+    module = _tagged(run.result.stderr, "MODULE")
+    assert module is not None, run.describe()
+    assert Path(module).resolve().is_relative_to(ctx.env.venv_dir.resolve()), (module, ctx.env.venv_dir)
+    schema = _tagged(run.result.stderr, "SCHEMA")
+    assert schema is not None and schema.removeprefix("sha256:") == ctx.env.source_schema_sha256.removeprefix(
+        "sha256:"
+    ), run.describe()
+
+
+def _request_tables(rows: dict[str, list[tuple[object, ...]]]) -> dict[str, list[tuple[object, ...]]]:
+    return {k: rows[k] for k in REQUEST_TABLES}
+
+
+def _replay_stable(rows: dict[str, list[tuple[object, ...]]]) -> dict[str, list[tuple[object, ...]]]:
+    """The request tables a replay must leave alone: all but the C4 high-water mark, which a replay advances."""
+    return {k: v for k, v in _request_tables(rows).items() if k != "hwm"}
+
+
+def _delivery_events(data_root: Path, scratch: Path) -> int:
+    rows = _rows(DataRoot.at(data_root).store_db, scratch, "SELECT kind FROM ledger")
+    return sum(1 for (kind,) in rows if kind == FIXTURE_DELIVERY_KIND)
+
+
+def _items_by_id(data: dict[str, JsonValue], slot: str) -> dict[str, dict[str, JsonValue]]:
+    items = data[slot]
+    assert isinstance(items, list), data
+    return {str(item["id"]): item for item in items if isinstance(item, dict)}
+
+
+def expect_crash_before_commit(ctx: KernelCrashContext, seed: KernelSeed, run: MarkedRun) -> None:
+    """Rolled back: no event, projection, ref holder, idempotency row or HWM move; the ACKed ledger is exactly what it
+    was when the request arrived (a staged blob may stay in ``cas/`` without a holder). A new daemon applies the retry
+    with the same key exactly once, and a second retry replays the same Delivery and assignment."""
+    scratch = ctx.case_dir / "ro-scratch"
+    assert_wheel_provenance(run, ctx)
+    assert_uncertain(cast_result(seed.notes["first"]))
+    before = seed.notes["before"]
+    assert isinstance(before, dict)
+    after = fixture_rows(seed.data_root, scratch)
+    assert after == before, "the transaction that crashed before COMMIT left durable state"
+    assert _delivery_events(seed.data_root, scratch) == 0
+    retried: list[dict[str, JsonValue]] = []
+
+    def retry(ready: Endpoint) -> None:
+        retried.extend(
+            shim_calls(
+                ctx,
+                seed,
+                "retry",
+                ctx.template.cred.token,
+                [("prepare_task", t8_prepare_args()), ("prepare_task", t8_prepare_args())],
+            )
+        )
+
+    _restart_fixture(ctx, seed, retry)
+    first, again = (ok_data(r) for r in retried)
+    assert first["task_id"] == T8_TASK_ID
+    assert (again["delivery_id"], again["assignment_id"]) == (first["delivery_id"], first["assignment_id"])
+    final = fixture_rows(seed.data_root, scratch)
+    ((_result_id, delivery_id, assignment_id, task_id, _digest),) = final["deliveries"]
+    assert (delivery_id, assignment_id, task_id) == (first["delivery_id"], first["assignment_id"], T8_TASK_ID)
+    assert len(final["idempotency"]) == 1 and _delivery_events(seed.data_root, scratch) == 1
+    assert [row[:3] for row in final["task_bindings"]] == [(T8_TASK_ID, delivery_id, assignment_id)]
+    assert final["delivery_items"] and len(final["holders"]) >= len(before["holders"])
+    assert final["ledger"][: len(before["ledger"])] == before["ledger"]
+
+
+def tighten_policy_offline(ctx: KernelCrashContext, seed: KernelSeed) -> str:
+    """With no daemon running: quarantine the redactable ref's digest and revoke the second credential of the same
+    principal. Returns that digest."""
+    from tests.support.inc2_t8_domain import ART_REDACTABLE
+
+    cred_b = ctx.template.cred_b
+    assert cred_b is not None and cred_b.principal == ctx.template.cred.principal
+    rt = open_fixture_runtime(seed.data_root, seed.store_id)
+    try:
+        with rt.store.transaction() as txn:
+            row = txn.db.execute(
+                "SELECT artifact_digest FROM p_fixture_domain_artifacts WHERE artifact_id = ?", (ART_REDACTABLE,)
+            ).fetchone()
+        assert row is not None
+        digest = str(row[0])
+        rt.policy.record_intent(IntentKind.QUARANTINE, {"digest": digest})
+        auth = make_bootstrap_auth(
+            store_id=seed.store_id,
+            owner_id=cred_b.principal.owner_id,
+            action="credential_revoke",
+            subject_id=cred_b.credential_id,
+            trust_generation=rt.policy.trust_generation(),
+            expires_at=rt.os_.clock.now() + dt.timedelta(hours=1),
+        )
+        rt.policy.record_authorized_revocation(cred_b.credential_id, auth)
+        rt.store.reconcile_policy()
+    finally:
+        rt.close()
+    return digest
+
+
+def expect_crash_after_commit(ctx: KernelCrashContext, seed: KernelSeed, run: MarkedRun) -> None:
+    """Committed, response lost. A new daemon (fault env still set, never hit on replay) and a new shim of the same
+    principal replay the same Delivery, result and assignment from durable state (one event, one effect), under the
+    current policy: the allowed ref keeps its digest, the ref tightened since is redacted, a changed payload under the
+    old key is ``idempotency_conflict``, a revoked credential of that same principal is refused before any replay
+    (unchanged or changed payload). ``brain mcp`` replays the same IDs as ``brain-mcp``."""
+    from tests.support.inc2_t8_domain import ART_ALLOWED, ART_REDACTABLE
+
+    scratch = ctx.case_dir / "ro-scratch"
+    assert_wheel_provenance(run, ctx)
+    assert_uncertain(cast_result(seed.notes["first"]))
+    before = seed.notes["before"]
+    assert isinstance(before, dict)
+    committed = fixture_rows(seed.data_root, scratch)
+    assert committed["ledger"][: len(before["ledger"])] == before["ledger"]
+    assert len(committed["deliveries"]) == len(before["deliveries"]) + 1 == 1
+    assert len(committed["idempotency"]) == len(before["idempotency"]) + 1 == 1
+    ((result_id, delivery_id, assignment_id, task_id, record_digest),) = committed["deliveries"]
+    assert task_id == T8_TASK_ID and assignment_id is not None
+    assert committed["idempotency"][0][4:] == (result_id, assignment_id)
+    assert [row[:3] for row in committed["task_bindings"]] == [(T8_TASK_ID, delivery_id, assignment_id)]
+    assert _delivery_events(seed.data_root, scratch) == 1
+    allowed_digest = next(d for a, _r, d in committed["artifacts"] if a == ART_ALLOWED)
+    redacted_digest = tighten_policy_offline(ctx, seed)
+    tightened = _replay_stable(fixture_rows(seed.data_root, scratch))
+    assert {k: v for k, v in tightened.items() if k != "holders"} == {
+        k: v for k, v in _replay_stable(committed).items() if k != "holders"
+    }
+    cred_b = ctx.template.cred_b
+    assert cred_b is not None
+    seen: dict[str, list[dict[str, JsonValue]]] = {}
+
+    def replay(ready: Endpoint) -> None:
+        seen["cred"] = shim_calls(
+            ctx,
+            seed,
+            "replay",
+            ctx.template.cred.token,
+            [("prepare_task", t8_prepare_args()), ("prepare_task", t8_prepare_args("a changed payload"))],
+        )
+        seen["revoked"] = shim_calls(
+            ctx,
+            seed,
+            "revoked",
+            cred_b.token,
+            [("prepare_task", t8_prepare_args()), ("prepare_task", t8_prepare_args("a changed payload"))],
+        )
+        seen["brain"] = shim_calls(
+            ctx, seed, "brain", ctx.template.cred.token, [("prepare_task", t8_prepare_args())], entrypoint="brain"
+        )
+
+    _restart_fixture(ctx, seed, replay, crashpoint=run.result.hit)
+    replayed, changed = seen["cred"]
+    data = ok_data(replayed)
+    assert (data["delivery_id"], data["assignment_id"], data["task_id"]) == (delivery_id, assignment_id, T8_TASK_ID)
+    skills = _items_by_id(data, "skills")
+    assert set(skills) == {ART_ALLOWED, ART_REDACTABLE}, skills
+    assert skills[ART_ALLOWED].get("status") == "ok" and skills[ART_ALLOWED].get("digest") == allowed_digest, skills
+    redacted = skills[ART_REDACTABLE]
+    assert redacted.get("status") == "redacted" and "digest" not in redacted and redacted.get("reason"), skills
+    assert redacted_digest not in str(data), "the tightened ref's digest leaked in the replay"
+    assert error_code(changed) == ErrorCode.IDEMPOTENCY_CONFLICT.value
+    assert [error_code(r) for r in seen["revoked"]] == [ErrorCode.UNAUTHENTICATED.value] * 2
+    (via_brain,) = seen["brain"]
+    brain_data = ok_data(via_brain)
+    assert (brain_data["delivery_id"], brain_data["assignment_id"]) == (delivery_id, assignment_id)
+    assert _items_by_id(brain_data, "skills") == skills
+    final = fixture_rows(seed.data_root, scratch)
+    assert _replay_stable(final) == tightened, "a replay or refusal wrote request state"
+    assert final["deliveries"] == [(result_id, delivery_id, assignment_id, T8_TASK_ID, record_digest)]
+    assert _delivery_events(seed.data_root, scratch) == 1
+
+
 KERNEL_CRASH_CASES: tuple[KernelCrashCase, ...] = (
     KernelCrashCase(
         "serve", "daemon.after_bind_before_endpoint", seed_daemon_root_with_stale_endpoint, expect_crash_after_bind
     ),
     KernelCrashCase("serve", "daemon.after_endpoint_publish", seed_daemon_root, expect_crash_after_publish),
     KernelCrashCase("migrate", "kernel.migrate.after_policy_swap", seed_legacy_pair, expect_crash_after_policy_swap),
+    KernelCrashCase(
+        "serve-fixture",
+        "kernel.before_commit",
+        seed_fixture_root,
+        expect_crash_before_commit,
+        trigger=trigger_prepare_task,
+    ),
+    KernelCrashCase(
+        "serve-fixture",
+        "kernel.after_commit_before_response",
+        seed_fixture_root,
+        expect_crash_after_commit,
+        trigger=trigger_prepare_task,
+    ),
 )
