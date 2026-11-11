@@ -99,6 +99,7 @@ class LoopbackServer:
             self._listener.close()
         self._abort_all_active_sockets()
         _safe_join(accept_thread, 0.05)
+        self._abort_all_active_sockets()
 
     def start(self) -> None:
         with self._lock:
@@ -108,17 +109,17 @@ class LoopbackServer:
                 raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
             self._started = True
 
+        if self._stop_event.is_set():
+            self._fail_start_cleanup()
+            raise BrainError(ErrorCode.DAEMON_UNAVAILABLE, "daemon unavailable")
+
         try:
             self._listener.settimeout(0.001)
         except OSError as err:
             self._fail_start_cleanup()
             raise BrainError(ErrorCode.DAEMON_UNAVAILABLE, "daemon unavailable") from err
 
-        accept_thread = threading.Thread(
-            target=self._accept_loop,
-            name="superbrain-loopback-accept",
-            daemon=True,
-        )
+        accept_thread = threading.Thread(target=self._accept_loop, name="superbrain-loopback-accept", daemon=True)
         try:
             accept_thread.start()
         except RuntimeError as err:
@@ -247,6 +248,17 @@ class LoopbackServer:
             rem_s = min(rem_s, max(0.0, stop_dl - time.perf_counter()))
         return rem_s
 
+    def _signal_accept_ready(self, ready_signaled: bool) -> bool:
+        if ready_signaled:
+            return True
+        with contextlib.suppress(OSError):
+            self._listener.settimeout(_ACCEPT_POLL_S)
+        with self._lock:
+            if not (self._quiesced or self._stop_event.is_set() or self._unexpected_error or self._aborted):
+                self._accept_ready_ok = True
+        self._accept_ready.set()
+        return True
+
     def _accept_loop(self) -> None:
         ready_signaled = False
         try:
@@ -256,14 +268,7 @@ class LoopbackServer:
                 try:
                     raw_sock, peer_addr = self._listener.accept()
                 except TimeoutError:
-                    if not ready_signaled:
-                        with contextlib.suppress(OSError):
-                            self._listener.settimeout(_ACCEPT_POLL_S)
-                        with self._lock:
-                            if not self._quiesced and not self._stop_event.is_set() and not self._unexpected_error:
-                                self._accept_ready_ok = True
-                        ready_signaled = True
-                        self._accept_ready.set()
+                    ready_signaled = self._signal_accept_ready(ready_signaled)
                     continue
                 except OSError:
                     if self._is_quiesced() or self._stop_event.is_set():
@@ -281,10 +286,12 @@ class LoopbackServer:
                 peer_ip = peer_addr[0] if isinstance(peer_addr, tuple) and len(peer_addr) >= 1 else ""
                 if peer_ip != "127.0.0.1":
                     _abort_socket(raw_sock)
+                    ready_signaled = self._signal_accept_ready(ready_signaled)
                     continue
 
                 with self._lock:
-                    if self._quiesced or self._stop_event.is_set() or self._active_slots >= MAX_ACTIVE_CONNECTIONS:
+                    shutting_down = self._quiesced or self._stop_event.is_set() or self._aborted
+                    if shutting_down or self._active_slots >= MAX_ACTIVE_CONNECTIONS:
                         admitted = False
                         conn_id = -1
                     else:
@@ -296,7 +303,11 @@ class LoopbackServer:
                         admitted = True
 
                 if not admitted:
+                    if shutting_down:
+                        _abort_socket(raw_sock)
+                        break
                     _graceful_reject_socket(raw_sock)
+                    ready_signaled = self._signal_accept_ready(ready_signaled)
                     continue
 
                 worker = threading.Thread(
@@ -311,6 +322,7 @@ class LoopbackServer:
                     worker.start()
                 except RuntimeError:
                     self._release_conn(conn_id, raw_sock, None, drain=False)
+                ready_signaled = self._signal_accept_ready(ready_signaled)
         finally:
             self._accept_ready.set()
 
@@ -353,11 +365,7 @@ class LoopbackServer:
             return
         reply_fut.add_done_callback(_on_late_reply)
 
-    def _attach_send_settle_log(
-        self,
-        fut: Future[ArtifactSendAttempt],
-        phase: str,
-    ) -> None:
+    def _attach_send_settle_log(self, fut: Future[ArtifactSendAttempt], phase: str) -> None:
         def _on_done(done_fut: Future[ArtifactSendAttempt]) -> None:
             try:
                 done_fut.result()
@@ -410,12 +418,7 @@ class LoopbackServer:
                 monotonic_ns=self._monotonic_ns,
             )
 
-    def _release_owner_reply(
-        self,
-        ssl_sock: ssl.SSLSocket,
-        reply: OwnerReply,
-        tool_deadline_ns: int,
-    ) -> None:
+    def _release_owner_reply(self, ssl_sock: ssl.SSLSocket, reply: OwnerReply, tool_deadline_ns: int) -> None:
         attempt_settled = False
         try:
             payload = encode_envelope(reply.envelope)
@@ -476,11 +479,7 @@ class LoopbackServer:
                 return
 
             raw_sock.setblocking(True)
-            ssl_sock = self._ssl_context.wrap_socket(
-                raw_sock,
-                server_side=True,
-                do_handshake_on_connect=False,
-            )
+            ssl_sock = self._ssl_context.wrap_socket(raw_sock, server_side=True, do_handshake_on_connect=False)
             with self._lock:
                 if self._aborted:
                     return
@@ -571,12 +570,7 @@ class LoopbackServer:
                 _abort_socket(ssl_sock)
             if raw_sock is not None and raw_sock is not ssl_sock:
                 _abort_socket(raw_sock)
-        _graceful_close_conn(
-            ssl_sock,
-            raw_sock,
-            drain=drain and not aborted,
-            stop_deadline=stop_dl,
-        )
+        _graceful_close_conn(ssl_sock, raw_sock, drain=drain and not aborted, stop_deadline=stop_dl)
         with self._lock:
             self._sockets.pop(conn_id, None)
             self._workers.pop(conn_id, None)
