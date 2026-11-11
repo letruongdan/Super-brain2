@@ -17,6 +17,7 @@ import sys
 import uuid
 import warnings
 from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -143,79 +144,86 @@ def _run_checked(
     return completed.stdout
 
 
-@pytest.fixture(scope="session")
-def inc2_installed_env(tmp_path_factory: pytest.TempPathFactory) -> Iterator[InstalledEnv]:
-    """Build the project wheel offline and install it into a clean venv without editable ``src/``."""
+@contextmanager
+def open_inc2_installed_env(scratch: Path) -> Iterator[InstalledEnv]:
+    """Build and install a wheel in caller-owned scratch, reusable by the explicit benchmark."""
     assert SOURCE_SCHEMA_PATH.is_file(), f"missing canonical schema file: {SOURCE_SCHEMA_PATH}"
     source_schema_sha256 = hashlib.sha256(SOURCE_SCHEMA_PATH.read_bytes()).hexdigest()
 
+    dist_dir = scratch / "dist"
+    dist_dir.mkdir()
+    venv_dir = scratch / "venv"
+
+    _run_checked(
+        [
+            "uv",
+            "build",
+            "--wheel",
+            "--no-build-isolation",
+            "--offline",
+            "--python",
+            sys.executable,
+            "--out-dir",
+            str(dist_dir),
+            str(REPO_ROOT),
+        ],
+        cwd=REPO_ROOT,
+    )
+    wheels = sorted(dist_dir.glob("super_brain2-*.whl"))
+    if len(wheels) != 1:
+        raise RuntimeError(f"expected exactly 1 built super_brain2 wheel, found {wheels}")
+    wheel_path = wheels[0]
+
+    _run_checked(
+        [
+            "uv",
+            "sync",
+            "--project",
+            str(REPO_ROOT),
+            "--locked",
+            "--offline",
+            "--no-dev",
+            "--no-install-project",
+            "--link-mode=copy",
+            "--python",
+            sys.executable,
+        ],
+        cwd=REPO_ROOT,
+        extra_env={"UV_PROJECT_ENVIRONMENT": str(venv_dir)},
+    )
+    venv_python = venv_dir / "Scripts" / "python.exe" if sys.platform == "win32" else venv_dir / "bin" / "python"
+
+    _run_checked(
+        [
+            "uv",
+            "pip",
+            "install",
+            "--offline",
+            "--no-deps",
+            "--link-mode=copy",
+            "--python",
+            str(venv_python),
+            str(wheel_path),
+        ],
+        cwd=scratch,
+    )
+
+    yield InstalledEnv(
+        venv_dir=venv_dir,
+        venv_python=venv_python,
+        wheel_path=wheel_path,
+        source_schema_path=SOURCE_SCHEMA_PATH,
+        source_schema_sha256=source_schema_sha256,
+    )
+
+
+@pytest.fixture(scope="session")
+def inc2_installed_env(tmp_path_factory: pytest.TempPathFactory) -> Iterator[InstalledEnv]:
+    """Build the project wheel once per session and clean its isolated scratch afterwards."""
     scratch = _make_trusted_session_dir("inc2-wheel", tmp_path_factory)
     try:
-        dist_dir = scratch / "dist"
-        dist_dir.mkdir()
-        venv_dir = scratch / "venv"
-
-        _run_checked(
-            [
-                "uv",
-                "build",
-                "--wheel",
-                "--no-build-isolation",
-                "--offline",
-                "--python",
-                sys.executable,
-                "--out-dir",
-                str(dist_dir),
-                str(REPO_ROOT),
-            ],
-            cwd=REPO_ROOT,
-        )
-        wheels = sorted(dist_dir.glob("super_brain2-*.whl"))
-        if len(wheels) != 1:
-            raise RuntimeError(f"expected exactly 1 built super_brain2 wheel, found {wheels}")
-        wheel_path = wheels[0]
-
-        _run_checked(
-            [
-                "uv",
-                "sync",
-                "--project",
-                str(REPO_ROOT),
-                "--locked",
-                "--offline",
-                "--no-dev",
-                "--no-install-project",
-                "--link-mode=copy",
-                "--python",
-                sys.executable,
-            ],
-            cwd=REPO_ROOT,
-            extra_env={"UV_PROJECT_ENVIRONMENT": str(venv_dir)},
-        )
-        venv_python = venv_dir / "Scripts" / "python.exe" if sys.platform == "win32" else venv_dir / "bin" / "python"
-
-        _run_checked(
-            [
-                "uv",
-                "pip",
-                "install",
-                "--offline",
-                "--no-deps",
-                "--link-mode=copy",
-                "--python",
-                str(venv_python),
-                str(wheel_path),
-            ],
-            cwd=scratch,
-        )
-
-        yield InstalledEnv(
-            venv_dir=venv_dir,
-            venv_python=venv_python,
-            wheel_path=wheel_path,
-            source_schema_path=SOURCE_SCHEMA_PATH,
-            source_schema_sha256=source_schema_sha256,
-        )
+        with open_inc2_installed_env(scratch) as installed:
+            yield installed
     finally:
         _cleanup_dir(scratch)
 
