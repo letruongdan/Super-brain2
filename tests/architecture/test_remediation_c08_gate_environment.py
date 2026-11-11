@@ -49,6 +49,7 @@ required role absent -> contains the role and "missing"; a path not resolved -> 
 ``collect_environment`` raises, ``receipt["environment"]`` is ``None`` and a reason contains "environment preflight".
 """
 
+import inspect
 import json
 import os
 import shutil
@@ -127,6 +128,9 @@ def receipt_args(**overrides: Any) -> dict[str, Any]:
         "worktree": str(worktree),
         "requested_python": "3.14",
     }
+    # T8.5 makes ``test_job_seconds`` a required keyword; supplied once the gate exposes it (see test_gate_receipt.ok).
+    if "test_job_seconds" in inspect.signature(gate.build_receipt).parameters:
+        args["test_job_seconds"] = 10.0
     args.update(overrides)
     return args
 
