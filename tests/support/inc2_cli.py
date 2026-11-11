@@ -57,7 +57,6 @@ from superbrain.core.kernel import (
 from superbrain.core.wire import load_catalog, parse_json
 from superbrain.mcp.stdio import ToolCaller, run_stdio
 from superbrain.ports.kernel import KernelTx
-from tests.support.bounded_worker import DIAGNOSTIC_TAIL_BYTES
 
 if TYPE_CHECKING:
     from tests.support.inc2_fixture import InstalledEnv
@@ -69,6 +68,7 @@ _SHARED_T7_TEMPLATE: list[TransportTemplate] = []
 _SHARED_T7_TEMPLATE_LOCK = threading.Lock()
 _STDIN_WRITE_TIMEOUT_S = 15.0
 _STDERR_DRAIN_TIMEOUT_S = 2.0
+_DIAGNOSTIC_TAIL_BYTES = 64 * 1024  # Not imported from tests: this module also runs as a standalone fixture daemon.
 
 _STRIPPED_ENV_KEYS: frozenset[str] = frozenset(
     {
@@ -666,7 +666,7 @@ class InstalledMcpPipeSession:
                 self._stderr_bytes += chunk
 
     def _stderr_tail(self) -> str:
-        return bytes(self._stderr_bytes[-DIAGNOSTIC_TAIL_BYTES:]).decode("utf-8", errors="replace")
+        return bytes(self._stderr_bytes[-_DIAGNOSTIC_TAIL_BYTES:]).decode("utf-8", errors="replace")
 
     def _write_chunks(self, chunks: Sequence[bytes]) -> None:
         try:
