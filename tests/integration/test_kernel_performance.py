@@ -9,9 +9,9 @@ import math
 import runpy
 import sys
 from collections.abc import Iterator
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import jsonschema
 import pytest
@@ -458,6 +458,92 @@ def test_module_entrypoint_delegates_to_benchmark_main(monkeypatch: pytest.Monke
 
 def test_benchmark_cli_rejects_relative_evidence_directory() -> None:
     assert perf_gate.main(["--evidence-dir", "relative"]) == 2
+
+
+def test_benchmark_abort_keeps_observed_failed_samples_and_raw_artifact_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(perf_gate, "source_identity", lambda repo: SOURCE)
+    observed: list[JsonValue] = [
+        {"status": "ok", "idempotency_key": "observed-success", "elapsed_ns": 10_000_000},
+        {"status": "transport_error", "idempotency_key": "observed-failure", "elapsed_ns": 20_000_000},
+    ]
+    partial = perf_gate.ProbeMeasurements(
+        WHEEL, SCHEMA, {"version": "3.14.3", "implementation": "cpython", "executable": sys.executable},
+        {"accepted": False, "reasons": ["sample transport failed"], "samples": observed},
+        {"accepted": False}, {"accepted": False},
+    )
+    artifacts: dict[str, bytes] = {
+        "measurements-progress.json": json.dumps(asdict(partial)).encode(),
+        "samples.jsonl": b'{"sample":"observed-success"}\n{"sample":"observed-failure"}\n',
+        "daemon.stderr": b"fixture daemon stopped before the next sample\n",
+    }
+
+    def measure_then_abort(repo: Path, attempt: Path) -> perf_gate.ProbeMeasurements:
+        for name, data in artifacts.items():
+            (attempt / name).write_bytes(data)
+        raise RuntimeError("fixture collector aborted after its second observed sample")
+
+    monkeypatch.setattr(perf_gate, "_measure", measure_then_abort)
+    observed_receipt, path = perf_gate.run_benchmark(tmp_path, evidence_dir=tmp_path / "evidence")
+    receipt = cast(dict[str, Any], observed_receipt)
+    assert_refused(receipt)
+    assert receipt["warm_prepare"]["samples"] == observed
+    assert "measurement failed" in " ".join(receipt["reasons"])
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved == receipt
+    for name, raw in artifacts.items():
+        assert (path.parent / name).read_bytes() == raw
+        assert receipt["evidence"]["manifest"][name] == digest_bytes(raw)
+    claimed = saved.pop("receipt_digest")
+    assert claimed == digest_bytes(canonical_json(saved))
+
+
+@pytest.mark.parametrize(
+    "progress",
+    [b'{"warm_prepare":', b'{"wheel_digest":true,"warm_prepare":{"accepted":true}}'],
+)
+def test_benchmark_abort_keeps_invalid_progress_bytes_without_admitting_them(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, progress: bytes
+) -> None:
+    monkeypatch.setattr(perf_gate, "source_identity", lambda repo: SOURCE)
+
+    def abort_with_invalid_progress(repo: Path, attempt: Path) -> perf_gate.ProbeMeasurements:
+        (attempt / "measurements-progress.json").write_bytes(progress)
+        raise RuntimeError("fixture collector interrupted during checkpoint")
+
+    monkeypatch.setattr(perf_gate, "_measure", abort_with_invalid_progress)
+    observed_receipt, path = perf_gate.run_benchmark(tmp_path, evidence_dir=tmp_path / "evidence")
+    receipt = cast(dict[str, Any], observed_receipt)
+    assert_refused(receipt)
+    assert receipt["evidence"]["manifest"]["measurements-progress.json"] == digest_bytes(progress)
+    assert (path.parent / "measurements-progress.json").read_bytes() == progress
+    assert receipt["wheel_digest"] is None
+    assert receipt["warm_prepare"].get("accepted") is not True
+
+
+def test_privacy_probe_refuses_superlinear_growth_even_when_each_size_meets_the_time_cap() -> None:
+    sizes, wire = privacy_inputs()
+    for kib, milliseconds in ((256, 1), (512, 9), (768, 36), (1024, 99)):
+        for row in sizes[kib]:
+            row["elapsed_ns"] = milliseconds * 1_000_000
+    probe: dict[str, Any] = perf_gate.evaluate_privacy_probe(sizes, wire)
+    assert_refused(probe)
+    assert probe["growth_ratio_1024_256"] == pytest.approx(24.75)
+    assert any("growth" in str(reason).lower() or "linear" in str(reason).lower() for reason in probe["reasons"])
+    for kib, rows in sizes.items():
+        assert probe["sizes"][str(kib)]["samples"] == rows
+
+
+@pytest.mark.parametrize("bad_id", [True, False, 1.0, "1", None])
+def test_cold_probe_requires_the_exact_integer_initialize_request_id(bad_id: JsonValue) -> None:
+    spawns = cold_inputs()
+    frame = spawns["brain-mcp"][0]["first_frame"]
+    assert isinstance(frame, dict)
+    frame["id"] = bad_id
+    probe: dict[str, Any] = perf_gate.evaluate_cold_client_probe(spawns)
+    assert_refused(probe)
+    assert probe["entrypoints"]["brain-mcp"]["samples"] == spawns["brain-mcp"]
 
 
 if __name__ == "__main__":
