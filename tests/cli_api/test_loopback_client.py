@@ -684,6 +684,90 @@ def test_pin_checked_before_any_http(
             assert len(wrapped_ssl_socks) == 1
             assert wrapped_ssl_socks[0].fileno() == -1
 
+        # 6. ssl.SSLContext creation raises ssl.SSLError or OSError(ENOMEM) (I2-T6B-R04 Round 12)
+        def fail_ssl_ctx_ssl_error(*_args: Any, **_kwargs: Any) -> Any:
+            raise ssl.SSLError("fixture SSL context failure")
+
+        with monkeypatch.context() as mp:
+            mp.setattr("superbrain.cli_api.loopback.ssl.SSLContext", fail_ssl_ctx_ssl_error)
+            with pytest.raises(LoopbackTransportError) as exc_ctx_ssl_conn:
+                client.connect(valid_target)
+            assert exc_ctx_ssl_conn.value.code == ErrorCode.DAEMON_UNAVAILABLE
+            assert exc_ctx_ssl_conn.value.request_may_have_run is False
+            assert str(exc_ctx_ssl_conn.value) == "daemon unavailable"
+
+            with pytest.raises(LoopbackTransportError) as exc_ctx_ssl_call:
+                client.call(valid_target, command)
+            assert exc_ctx_ssl_call.value.code == ErrorCode.DAEMON_UNAVAILABLE
+            assert exc_ctx_ssl_call.value.request_may_have_run is False
+            assert str(exc_ctx_ssl_call.value) == "daemon unavailable"
+
+        def fail_ssl_ctx_oom(*_args: Any, **_kwargs: Any) -> Any:
+            raise OSError(errno.ENOMEM, "fixture SSL context oom")
+
+        with monkeypatch.context() as mp:
+            mp.setattr("superbrain.cli_api.loopback.ssl.SSLContext", fail_ssl_ctx_oom)
+            with pytest.raises(LoopbackTransportError) as exc_ctx_oom_conn:
+                client.connect(valid_target)
+            assert exc_ctx_oom_conn.value.code == ErrorCode.DAEMON_UNAVAILABLE
+            assert exc_ctx_oom_conn.value.request_may_have_run is False
+            assert str(exc_ctx_oom_conn.value) == "daemon unavailable"
+
+            with pytest.raises(LoopbackTransportError) as exc_ctx_oom_call:
+                client.call(valid_target, command)
+            assert exc_ctx_oom_call.value.code == ErrorCode.DAEMON_UNAVAILABLE
+            assert exc_ctx_oom_call.value.request_may_have_run is False
+            assert str(exc_ctx_oom_call.value) == "daemon unavailable"
+
+        # 7. load_verify_locations non-SSL OSError raises DAEMON_UNAVAILABLE
+        orig_load_verify = ssl.SSLContext.load_verify_locations
+
+        def fail_load_verify(self_ctx: ssl.SSLContext, *args: Any, **kwargs: Any) -> Any:
+            if self_ctx is valid_server_ctx:
+                return orig_load_verify(self_ctx, *args, **kwargs)
+            raise OSError(errno.EIO, "fixture ca load io")
+
+        with monkeypatch.context() as mp:
+            mp.setattr(ssl.SSLContext, "load_verify_locations", fail_load_verify)
+            with pytest.raises(LoopbackTransportError) as exc_load_conn:
+                client.connect(valid_target)
+            assert exc_load_conn.value.code == ErrorCode.DAEMON_UNAVAILABLE
+            assert exc_load_conn.value.request_may_have_run is False
+            assert str(exc_load_conn.value) == "daemon unavailable"
+
+            with pytest.raises(LoopbackTransportError) as exc_load_call:
+                client.call(valid_target, command)
+            assert exc_load_call.value.code == ErrorCode.DAEMON_UNAVAILABLE
+            assert exc_load_call.value.request_may_have_run is False
+            assert str(exc_load_call.value) == "daemon unavailable"
+
+        # 8. wrap_socket generic ssl.SSLError (non-cert) normalizes and closes underlying socket
+        wrap_generic_ssl_socks: list[socket.socket] = []
+
+        def fail_wrap_generic_ssl(_self: ssl.SSLContext, sock: socket.socket, *args: Any, **kwargs: Any) -> Any:
+            if kwargs.get("server_side"):
+                return orig_wrap(_self, sock, *args, **kwargs)
+            wrap_generic_ssl_socks.append(sock)
+            raise ssl.SSLError("fixture wrap ssl error")
+
+        with monkeypatch.context() as mp:
+            mp.setattr(ssl.SSLContext, "wrap_socket", fail_wrap_generic_ssl)
+            with pytest.raises(LoopbackTransportError) as exc_wrap_gen_conn:
+                client.connect(valid_target)
+            assert exc_wrap_gen_conn.value.code == ErrorCode.DAEMON_UNAVAILABLE
+            assert exc_wrap_gen_conn.value.request_may_have_run is False
+            assert str(exc_wrap_gen_conn.value) == "daemon unavailable"
+            assert len(wrap_generic_ssl_socks) == 1
+            assert wrap_generic_ssl_socks[0].fileno() == -1
+
+            with pytest.raises(LoopbackTransportError) as exc_wrap_gen_call:
+                client.call(valid_target, command)
+            assert exc_wrap_gen_call.value.code == ErrorCode.DAEMON_UNAVAILABLE
+            assert exc_wrap_gen_call.value.request_may_have_run is False
+            assert str(exc_wrap_gen_call.value) == "daemon unavailable"
+            assert len(wrap_generic_ssl_socks) == 2
+            assert wrap_generic_ssl_socks[1].fileno() == -1
+
 
 # -----------------------------------------------------------------------------
 # Test 2: test_wrong_identity_receives_only_probe

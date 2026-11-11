@@ -1394,7 +1394,6 @@ class TestTransportLifecycleAndRelease:
                 listener_filenos: set[int] = set()
                 orig_init = LoopbackServer.__init__
                 client_connected = threading.Event()
-                error_injected = threading.Event()
 
                 def mock_server_init(self_srv: LoopbackServer, *args: Any, **kwargs: Any) -> None:
                     nonlocal client_sock_partial
@@ -1408,7 +1407,7 @@ class TestTransportLifecycleAndRelease:
 
                     def mock_ready_wait(timeout: float | None = None) -> bool:
                         res = orig_ready_wait(timeout)
-                        error_injected.wait(timeout=2.0)
+                        self_srv._stop_event.wait(timeout=2.0)
                         return res
 
                     self_srv._accept_ready.wait = mock_ready_wait  # type: ignore[method-assign]
@@ -1422,7 +1421,6 @@ class TestTransportLifecycleAndRelease:
                         accept_count += 1
                         if accept_count == 1:
                             return orig_accept(self_sock)
-                        error_injected.set()
                         raise OSError(errno.ECONNABORTED, "Software caused connection abort")
                     return orig_accept(self_sock)
 
@@ -1486,6 +1484,160 @@ class TestTransportLifecycleAndRelease:
                 if t_partial_serve is not None and t_partial_serve.is_alive():
                     t_partial_serve.join(timeout=3.0)
                 shutil.rmtree(case_dir_partial, ignore_errors=True)
+
+            # (i) Busy-listener startup under continuous inbound backlog including > 32-slot saturation (I2-T6B-R01)
+            case_dir_busy = make_trusted_test_dir("t6b4-busy-startup")
+            data_root_busy = case_dir_busy / "data"
+            clone_owner_only_tree(transport_template.root, data_root_busy)
+            cfg_busy = DaemonConfig(
+                version=1,
+                data_root=data_root_busy,
+                expected_store_id=transport_template.store_id,
+                cert_path=transport_template.tls.cert_path,
+                key_path=transport_template.tls.key_path,
+            )
+            held_busy_socks: list[socket.socket] = []
+            overflow_socks: list[socket.socket] = []
+            transient_socks: list[socket.socket] = []
+            t_busy_serve: threading.Thread | None = None
+            busy_stop = threading.Event()
+            stop_feeding = threading.Event()
+            overflow_done_ev = threading.Event()
+            busy_ready_ev = threading.Event()
+            ready_busy: list[Ready] = []
+            serve_rc_busy: list[int] = []
+
+            def _on_ready_busy(r: Ready, _l: OwnerLoop) -> None:
+                ready_busy.append(r)
+                busy_ready_ev.set()
+
+            orig_accept_busy = socket.socket.accept
+            accept_feed_count = 0
+
+            def mock_accept_busy(self_sock: socket.socket) -> tuple[socket.socket, Any]:
+                nonlocal accept_feed_count
+                if threading.current_thread().name == "superbrain-loopback-accept" and not stop_feeding.is_set():
+                    srv_addr = self_sock.getsockname()
+                    accept_feed_count += 1
+                    if accept_feed_count <= MAX_ACTIVE_CONNECTIONS:
+                        s_held = socket.create_connection(srv_addr, timeout=0.5)
+                        held_busy_socks.append(s_held)
+                    elif accept_feed_count <= MAX_ACTIVE_CONNECTIONS + 6:
+                        s_over = socket.create_connection(srv_addr, timeout=0.5)
+                        overflow_socks.append(s_over)
+                        if len(overflow_socks) == 6:
+                            overflow_done_ev.set()
+                    else:
+                        s_trans = socket.create_connection(srv_addr, timeout=0.5)
+                        transient_socks.append(s_trans)
+                        time.sleep(0.01)
+                return orig_accept_busy(self_sock)
+
+            try:
+                t0_busy = time.perf_counter()
+                with monkeypatch.context() as mp:
+                    mp.setattr(socket.socket, "accept", mock_accept_busy)
+                    t_busy_serve = threading.Thread(
+                        target=lambda: serve_rc_busy.append(
+                            serve(
+                                cfg_busy,
+                                stop_event=busy_stop,
+                                shutdown_grace_s=0.5,
+                                on_ready=_on_ready_busy,
+                            )
+                        )
+                    )
+                    t_busy_serve.start()
+
+                    # 1. on_ready must fire promptly (< 1.0s) despite busy accept backlog
+                    assert busy_ready_ev.wait(timeout=2.5), "serve did not emit on_ready under busy accept backlog"
+                    startup_elapsed = time.perf_counter() - t0_busy
+                    assert len(ready_busy) == 1
+                    assert startup_elapsed < 1.0, f"Busy startup took too long: {startup_elapsed:.4f}s (>= 1.0s)"
+
+                    # 2. Wait for 6 overflow connections to be admitted/processed at cap
+                    assert overflow_done_ev.wait(timeout=2.0), "overflow connections not generated"
+                    stop_feeding.set()
+
+                    # 3. All 6 overflow sockets must receive EOF or reset within 1.0s
+                    for s_over in overflow_socks:
+                        s_over.settimeout(1.0)
+                        try:
+                            data = s_over.recv(1024)
+                            assert data == b""
+                        except (ConnectionResetError, BrokenPipeError):
+                            pass
+                        except TimeoutError:
+                            pytest.fail("overflow socket was not gracefully closed or reset at connection cap")
+
+                    # With all 32 held sockets open, a new call is rejected at transport cap
+                    ep_busy = ready_busy[0].endpoint
+                    target_busy = LoopbackTarget(
+                        ep_busy,
+                        transport_template.store_id,
+                        transport_template.tls.ca_cert_path.read_text(encoding="utf-8"),
+                        transport_template.tls.leaf_cert_sha256,
+                    )
+                    client_busy = LoopbackClient(monotonic_ns=time.monotonic_ns)
+                    cmd_health = ToolCommand(
+                        "get_health",
+                        {"schema_version": "2.0"},
+                        token=transport_template.cred.token,
+                    )
+                    with pytest.raises(LoopbackTransportError) as exc_cap:
+                        client_busy.call(target_busy, cmd_health, deadline_ns=time.monotonic_ns() + 1_000_000_000)
+                    assert exc_cap.value.code != ErrorCode.STORE_BUSY
+                    assert exc_cap.value.request_may_have_run is False
+
+                    # 4. Free one slot from held_busy_socks and execute positive twin call
+                    freed_sock = held_busy_socks.pop()
+                    try:
+                        freed_sock.close()
+                    except OSError:
+                        pass
+
+                    call_deadline = time.perf_counter() + 0.5
+                    res_call: dict[str, Any] | None = None
+                    last_exc: Exception | None = None
+                    while time.perf_counter() < call_deadline:
+                        try:
+                            res_call = client_busy.call(
+                                target_busy,
+                                cmd_health,
+                                deadline_ns=time.monotonic_ns() + 500_000_000,
+                            )
+                            break
+                        except LoopbackTransportError as err:
+                            last_exc = err
+                            time.sleep(0.02)
+                    assert res_call is not None, f"Expected successful health call after freeing slot: {last_exc}"
+                    assert res_call.get("ok") is True
+
+                    # 5. Clean shutdown after closing held sockets
+                    for busy_s in held_busy_socks + overflow_socks + transient_socks:
+                        try:
+                            busy_s.close()
+                        except OSError:
+                            pass
+                    busy_stop.set()
+                    t_busy_serve.join(timeout=3.0)
+                    assert serve_rc_busy == [0], f"Expected returncode 0, got {serve_rc_busy!r}"
+                    assert not (data_root_busy / "endpoint.json").exists()
+                    with admit_existing_pair(
+                        data_root_busy, transport_template.store_id, os_adapters(), purpose="serve"
+                    ) as admitted:
+                        assert admitted is not None
+            finally:
+                busy_stop.set()
+                stop_feeding.set()
+                for busy_s in held_busy_socks + overflow_socks + transient_socks:
+                    try:
+                        busy_s.close()
+                    except OSError:
+                        pass
+                if t_busy_serve is not None and t_busy_serve.is_alive():
+                    t_busy_serve.join(timeout=3.0)
+                shutil.rmtree(case_dir_busy, ignore_errors=True)
         finally:
             shutil.rmtree(case_dir, ignore_errors=True)
 
