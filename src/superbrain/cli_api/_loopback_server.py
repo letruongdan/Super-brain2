@@ -530,8 +530,6 @@ class LoopbackServer:
                 self._write_200_best_effort(ssl_sock, encode_envelope(unavail), tool_deadline_ns)
                 return
 
-            t0_admit = int(self._monotonic_ns())
-            tool_deadline_ns = t0_admit + TOTAL_REQUEST_BUDGET_NS
             try:
                 reply_fut = self._owner.submit_reply(command, tool_deadline_ns)
                 reply = self._await_owner_reply(reply_fut, tool_deadline_ns)

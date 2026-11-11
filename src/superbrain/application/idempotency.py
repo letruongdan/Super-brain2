@@ -54,12 +54,9 @@ def compute_canonical_payload_hmac(key_bytes: bytes, canonical_payload: bytes) -
         raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
     if type(canonical_payload) is not bytes or not canonical_payload:
         raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
-    digest_hex = hmac.new(
-        key_bytes,
-        b"request-v1\0" + canonical_payload,
-        hashlib.sha256,
-    ).hexdigest()
-    return f"sha256:{digest_hex}"
+    mac = hmac.new(key_bytes, b"request-v1\0", hashlib.sha256)
+    mac.update(canonical_payload)
+    return f"sha256:{mac.hexdigest()}"
 
 
 def compute_request_hmac(key_bytes: bytes, call: Call) -> str:

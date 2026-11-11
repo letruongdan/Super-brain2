@@ -87,10 +87,8 @@ _DEFAULT_PATH_TOKEN = re.compile(
 )
 _FIXED_TOKEN_PREFIX = re.compile(r"github_pat_|gh[pousr]_|sk-|AKIA|ASIA|xox[baprs]-|AIza|eyJ")
 _DEFAULT_PATH_NEEDLE = re.compile(
-    r"\.env|\.ssh|id_|\.aws|credentials|\.npmrc|\.pypirc|\.netrc|_netrc|\.pem|\.key|\.p12|\.pfx"
+    r"\.(?:env|ssh|aws|npmrc|pypirc|netrc|pem|key|p12|pfx)|id_|credentials|_netrc"
 )
-_AUTH_SCHEME_NEEDLE = re.compile(r"bearer|basic|token")
-_KEY_VALUE_NEEDLE = re.compile(r"pass|pwd|secret|api|access|refresh|client|auth|private")
 _PATH_SPLIT = re.compile(r"[\\/]+")
 _PATH_LEAD = "`*([{<\"'"
 _PATH_TRAIL = "`*)]}>\"'.,:;!?"
@@ -145,6 +143,27 @@ def _shannon_bits(text: str) -> float:
 def _entropy_weights(total: int) -> tuple[float, ...]:
     """Cache bounded numeric probability tables, without retaining input text."""
     return (0.0, *((count / total) * math.log2(count / total) for count in range(1, total + 1)))
+
+
+@lru_cache(maxsize=32)
+def _min_u_table(min_bits: float) -> tuple[int, ...]:
+    """Lowest distinct character count guaranteeing Shannon entropy above ``min_bits`` for length <= 256."""
+    out = [0] * 257
+    out[0] = 1
+    target = min_bits + 1e-9
+    for total in range(1, 257):
+        found = total + 1
+        inv_total = 1.0 / total
+        log_inv = math.log2(inv_total)
+        for u in range(1, total + 1):
+            c1 = total - u + 1
+            p1 = c1 * inv_total
+            worst_bits = -(p1 * math.log2(p1)) - ((u - 1) * inv_total) * log_inv
+            if worst_bits >= target:
+                found = u
+                break
+        out[total] = found
+    return tuple(out)
 
 
 def _high_entropy(text: str, minimum: float) -> bool:
@@ -265,6 +284,9 @@ class _Run:
         self._contained = tuple(sorted(name for name in self._sensitive if len(name) >= _CONTAINMENT_MIN))
         self._redactions: dict[tuple[str, bool], tuple[str, int]] = {}
         self._candidate = re.compile(rf"[\x21-\x7e]{{{self.policy.entropy_min_length},}}")
+        self._entropy_thresh = 2 ** -(policy.entropy_min_bits + 1e-12)
+        self._entropy_min_distinct = 2 ** (policy.entropy_min_bits - 1e-12)
+        self._min_u = _min_u_table(float(policy.entropy_min_bits))
 
     def tick(self) -> None:
         if self._deadline_ns is not None and self._monotonic_ns() >= self._deadline_ns:
@@ -403,14 +425,40 @@ class _Run:
         A marker is ``<`` [ws] [``/``] [ws] ``private`` [ws] ``>`` (case-insensitive). Each ``private`` occurrence
         is inspected once, looking back over the whitespace run before it and forward over the one after it.
         """
-        if "<" not in text or "private" not in text.lower():
+        if "<" not in text:
             return text
         low = text.lower()
+        if "private" not in low:
+            return text
         if len(low) != len(text):  # a few characters lowercase to two; keep offsets aligned with ``text``
             low = "".join(ch.lower() if len(ch.lower()) == 1 else ch for ch in text)
-        markers: list[tuple[int, int, bool]] = []
-        index = low.find("private")
+        n = len(low)
+        out: list[str] = []
+        cursor = 0
+        open_at = -1
+        find = low.find
+        index = find("private")
         while index != -1:
+            end = index + 7
+            if index >= 1 and end < n:
+                prev_ch = low[index - 1]
+                next_ch = low[end]
+                if prev_ch == "<" and next_ch == ">":
+                    if open_at >= 0:
+                        raise _Reject
+                    out.append(text[cursor : index - 1])
+                    open_at = index - 1
+                    index = find("private", end)
+                    continue
+                if prev_ch == "/" and index >= 2 and low[index - 2] == "<" and next_ch == ">":
+                    if open_at < 0:
+                        raise _Reject
+                    out.append(REDACTED)
+                    self.redacted += 1
+                    cursor = end + 1
+                    open_at = -1
+                    index = find("private", end)
+                    continue
             j = index - 1
             while j >= 0 and low[j].isspace():
                 j -= 1
@@ -420,27 +468,23 @@ class _Run:
                 while j >= 0 and low[j].isspace():
                     j -= 1
             if j >= 0 and low[j] == "<":
-                k = index + 7
-                while k < len(low) and low[k].isspace():
+                k = end
+                while k < n and low[k].isspace():
                     k += 1
-                if k >= len(low) or low[k] != ">":
+                if k >= n or low[k] != ">":
                     raise _Reject
-                markers.append((j, k + 1, closing))
-            index = low.find("private", index + 7)
-        out: list[str] = []
-        cursor, open_at = 0, -1
-        for start, end, closing in markers:
-            if not closing:
-                if open_at >= 0:
-                    raise _Reject
-                out.append(text[cursor:start])
-                open_at = start
-            else:
-                if open_at < 0:
-                    raise _Reject
-                out.append(REDACTED)
-                self.redacted += 1
-                cursor, open_at = end, -1
+                if not closing:
+                    if open_at >= 0:
+                        raise _Reject
+                    out.append(text[cursor:j])
+                    open_at = j
+                else:
+                    if open_at < 0:
+                        raise _Reject
+                    out.append(REDACTED)
+                    self.redacted += 1
+                    cursor, open_at = k + 1, -1
+            index = find("private", end)
         if open_at >= 0:
             raise _Reject
         out.append(text[cursor:])
@@ -521,22 +565,96 @@ class _Run:
         ``[redacted]`` sentinel is a run boundary, never part of a candidate.
         """
         masked = text.replace(REDACTED, " " * len(REDACTED)) if REDACTED in text else text
-        parts: list[str] = []
+        min_len = self._min_segment
+        min_bits = self.policy.entropy_min_bits
+        thresh = self._entropy_thresh
+        min_distinct = self._entropy_min_distinct
+        min_u_table = self._min_u
+        count_elements = _count_elements
+        shannon_from_counts = _shannon_from_counts
+        is_structural = _is_structural_id
+        edge = _ENTROPY_EDGE
+        redacted_sentinel = REDACTED
+
+        if masked.isascii():
+            candidates = [word for word in masked.split() if len(word) >= min_len]
+            if not candidates:
+                return text
+            if masked.isprintable() or all(word.isprintable() for word in candidates):
+                parts: list[str] = []
+                cursor = 0
+                search_pos = 0
+                count = 0
+                find = masked.find
+                for token in candidates:
+                    total = len(token)
+                    idx = find(token, search_pos)
+                    search_pos = idx + total
+                    if total < min_distinct:
+                        continue
+                    if total >= 36:
+                        clean = token.strip(edge) if (token[0] in edge or token[-1] in edge) else token
+                        if is_structural(clean):
+                            continue
+                    distinct = len(set(token))
+                    if distinct < min_distinct:
+                        continue
+                    if total <= 256 and distinct >= min_u_table[total]:
+                        parts.extend((text[cursor:idx], redacted_sentinel))
+                        cursor = search_pos
+                        count += 1
+                        continue
+                    counts: dict[str, int] = {}
+                    count_elements(counts, token)
+                    if (
+                        sum([c * c for c in counts.values()]) < thresh * (total * total)
+                        or shannon_from_counts(counts, total) >= min_bits
+                    ):
+                        parts.extend((text[cursor:idx], redacted_sentinel))
+                        cursor = search_pos
+                        count += 1
+                if not count:
+                    return text
+                parts.append(text[cursor:])
+                self.redacted += count
+                return "".join(parts)
+
+        parts_fb: list[str] = []
         cursor = 0
         count = 0
         for match in self._candidate.finditer(masked):
             token = match.group(0)
-            clean = token.strip(_ENTROPY_EDGE) if (token[0] in _ENTROPY_EDGE or token[-1] in _ENTROPY_EDGE) else token
-            if _is_structural_id(clean):
+            total = len(token)
+            if total < min_distinct:
                 continue
-            if _high_entropy(token, self.policy.entropy_min_bits):
+            if total >= 36:
+                clean = token.strip(edge) if (token[0] in edge or token[-1] in edge) else token
+                if is_structural(clean):
+                    continue
+            distinct = len(set(token))
+            if distinct < min_distinct:
+                continue
+            if total <= 256 and distinct >= min_u_table[total]:
                 start, end = match.span()
-                parts.extend((text[cursor:start], REDACTED))
+                parts_fb.extend((text[cursor:start], redacted_sentinel))
                 cursor = end
                 count += 1
-        parts.append(text[cursor:])
+                continue
+            counts_fb: dict[str, int] = {}
+            count_elements(counts_fb, token)
+            if (
+                sum([c * c for c in counts_fb.values()]) < thresh * (total * total)
+                or shannon_from_counts(counts_fb, total) >= min_bits
+            ):
+                start, end = match.span()
+                parts_fb.extend((text[cursor:start], redacted_sentinel))
+                cursor = end
+                count += 1
+        if not count:
+            return text
+        parts_fb.append(text[cursor:])
         self.redacted += count
-        return "".join(parts)
+        return "".join(parts_fb)
 
     def redact(self, text: str, *, entropy: bool = True) -> str:
         self.tick()
@@ -552,26 +670,130 @@ class _Run:
         if "-----BEGIN " in text:
             text = self._pem(text)
         ascii_text = text.isascii()
-        lowered = text.lower() if ascii_text else ""
-        if not ascii_text or "authorization" in lowered:
-            text = self._sub(_AUTH_HEADER, rf"\1\2{REDACTED}", text)
-        self.tick()
-        if not ascii_text or _AUTH_SCHEME_NEEDLE.search(lowered):
-            text = _AUTH_SCHEME.sub(self._auth_scheme, text)
-        if _FIXED_TOKEN_PREFIX.search(text):
-            for pattern in _FIXED_TOKENS:
-                text = self._sub(pattern, REDACTED, text)
-                self.tick()
-        text = self._userinfo(text)
-        if not ascii_text or _KEY_VALUE_NEEDLE.search(lowered):
-            text = self._sub(_KEY_VALUE_SECRET, rf"\1\2{REDACTED}", text)
-        self.tick()
-        # The cheap candidate scan keeps the full component matcher as the authority.
-        if self.policy.blocked_path_patterns == DEFAULT_BLOCKED_PATH_PATTERNS:
-            if not ascii_text or _DEFAULT_PATH_NEEDLE.search(lowered):
-                text = _DEFAULT_PATH_TOKEN.sub(self._blocked_path, text)
+        if ascii_text:
+            lowered = text.lower()
+            if "authorization" in lowered:
+                new = self._sub(_AUTH_HEADER, rf"\1\2{REDACTED}", text)
+                if new != text:
+                    text = new
+                    lowered = ""
+            self.tick()
+            if not lowered:
+                lowered = text.lower()
+            if "bearer" in lowered or "basic" in lowered or "token" in lowered:
+                new = _AUTH_SCHEME.sub(self._auth_scheme, text)
+                if new != text:
+                    text = new
+                    lowered = ""
+            fixed_changed = False
+            if "github_pat_" in text:
+                new = self._sub(_FIXED_TOKENS[0], REDACTED, text)
+                if new != text:
+                    text, fixed_changed = new, True
+            self.tick()
+            if "gh" in text and "_" in text and (
+                "ghp_" in text or "gho_" in text or "ghu_" in text or "ghs_" in text or "ghr_" in text
+            ):
+                new = self._sub(_FIXED_TOKENS[1], REDACTED, text)
+                if new != text:
+                    text, fixed_changed = new, True
+            self.tick()
+            if "sk-" in text:
+                new = self._sub(_FIXED_TOKENS[2], REDACTED, text)
+                if new != text:
+                    text, fixed_changed = new, True
+            self.tick()
+            if "AKIA" in text or "ASIA" in text:
+                new = self._sub(_FIXED_TOKENS[3], REDACTED, text)
+                if new != text:
+                    text, fixed_changed = new, True
+            self.tick()
+            if "xox" in text and "-" in text:
+                new = self._sub(_FIXED_TOKENS[4], REDACTED, text)
+                if new != text:
+                    text, fixed_changed = new, True
+            self.tick()
+            if "AIza" in text:
+                new = self._sub(_FIXED_TOKENS[5], REDACTED, text)
+                if new != text:
+                    text, fixed_changed = new, True
+            self.tick()
+            if "eyJ" in text and "." in text:
+                new = self._sub(_FIXED_TOKENS[6], REDACTED, text)
+                if new != text:
+                    text, fixed_changed = new, True
+            self.tick()
+            if fixed_changed:
+                lowered = ""
+            new = self._userinfo(text)
+            if new != text:
+                text = new
+                lowered = ""
+            has_eq = "=" in text
+            if has_eq or ":" in text:
+                if not lowered:
+                    lowered = text.lower()
+                if (
+                    "pass" in lowered
+                    or "pwd" in lowered
+                    or "secret" in lowered
+                    or "key" in lowered
+                    or "token" in lowered
+                ) and (
+                    (
+                        ":" in text
+                        and (
+                            "d:" in lowered
+                            or "t:" in lowered
+                            or "y:" in lowered
+                            or "n:" in lowered
+                            or "e:" in lowered
+                            or " :" in lowered
+                            or "\t:" in lowered
+                        )
+                    )
+                    or (
+                        has_eq
+                        and (
+                            "d=" in lowered
+                            or "t=" in lowered
+                            or "y=" in lowered
+                            or "n=" in lowered
+                            or "e=" in lowered
+                            or " =" in lowered
+                            or "\t=" in lowered
+                        )
+                    )
+                ):
+                    new = self._sub(_KEY_VALUE_SECRET, rf"\1\2{REDACTED}", text)
+                    if new != text:
+                        text = new
+                        lowered = ""
+            self.tick()
+            # The cheap candidate scan keeps the full component matcher as the authority.
+            if self.policy.blocked_path_patterns == DEFAULT_BLOCKED_PATH_PATTERNS:
+                if not lowered:
+                    lowered = text.lower()
+                if _DEFAULT_PATH_NEEDLE.search(lowered):
+                    text = _DEFAULT_PATH_TOKEN.sub(self._blocked_path, text)
+            else:
+                text = _PATH_TOKEN.sub(self._blocked_path, text)
         else:
-            text = _PATH_TOKEN.sub(self._blocked_path, text)
+            text = self._sub(_AUTH_HEADER, rf"\1\2{REDACTED}", text)
+            self.tick()
+            text = _AUTH_SCHEME.sub(self._auth_scheme, text)
+            if _FIXED_TOKEN_PREFIX.search(text):
+                for pattern in _FIXED_TOKENS:
+                    text = self._sub(pattern, REDACTED, text)
+                    self.tick()
+            text = self._userinfo(text)
+            text = self._sub(_KEY_VALUE_SECRET, rf"\1\2{REDACTED}", text)
+            self.tick()
+            # The cheap candidate scan keeps the full component matcher as the authority.
+            if self.policy.blocked_path_patterns == DEFAULT_BLOCKED_PATH_PATTERNS:
+                text = _DEFAULT_PATH_TOKEN.sub(self._blocked_path, text)
+            else:
+                text = _PATH_TOKEN.sub(self._blocked_path, text)
         self.tick()
         if entropy:
             text = self._entropy(text)

@@ -10,7 +10,6 @@ from superbrain.application.idempotency import (
     compute_idempotency_key_hash,
     tool_uses_idempotency,
 )
-from superbrain.core.canonical import canonical_json
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.jsonvalue import JsonValue
 from superbrain.core.kernel import (
@@ -125,8 +124,6 @@ def reconstruct_queued_call(queued: QueuedKernelRequest) -> Call:
         raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
     parsed = parse_json(queued.canonical_payload)
     if not isinstance(parsed, dict) or set(parsed) != {"tool", "selected_scope", "arguments"}:
-        raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
-    if canonical_json(parsed) != queued.canonical_payload:
         raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
     tool = parsed["tool"]
     arguments = parsed["arguments"]

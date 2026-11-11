@@ -91,11 +91,11 @@ def child(config: Path) -> int:
 
     def filtered(self: PrivacyFilter, value: Any, policy: Any, **kwargs: Any) -> Any:
         active["filter_ran"] = True
-        active["filter_bytes"] = len(canonical_json(value))
         active["filter_start_ns"] = time.perf_counter_ns()
         try:
             result = original_filter(self, value, policy, **kwargs)
             active["filter_end_ns"] = time.perf_counter_ns()
+            active["filter_bytes"] = len(canonical_json(value))
             active.update(
                 redacted_count=result.redacted_count, stripped_keys_count=result.stripped_keys_count,
                 positive_control_preserved=_positive(result.value),
@@ -103,6 +103,7 @@ def child(config: Path) -> int:
             return result
         finally:
             active.setdefault("filter_end_ns", time.perf_counter_ns())
+            active.setdefault("filter_bytes", len(canonical_json(value)))
 
     def commit(self: KernelIdempotencyStore, **kwargs: Any) -> tuple[StoredResult, bool]:
         active["commit_start_ns"] = time.perf_counter_ns()

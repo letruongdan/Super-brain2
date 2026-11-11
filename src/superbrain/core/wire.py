@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 from collections.abc import Mapping
 
 from superbrain.core._json_parse import (
@@ -279,6 +278,14 @@ def _normalize_submit_episode(business: dict[str, JsonValue]) -> None:
     _require_idempotency_key(business["idempotency_key"])
 
 
+def _clone_json(value: JsonValue) -> JsonValue:
+    if isinstance(value, dict):
+        return {key: _clone_json(child) for key, child in value.items()}
+    if isinstance(value, list):
+        return [_clone_json(child) for child in value]
+    return value
+
+
 def normalize_call(
     tool: str,
     args: JsonValue | Mapping[str, JsonValue],
@@ -320,7 +327,7 @@ def normalize_call(
                 raise BrainError(ErrorCode.IDENTITY_MISMATCH, "principal identity mismatch")
 
     business: dict[str, JsonValue] = {
-        key: copy.deepcopy(val) for key, val in args.items() if key not in _IDENTITY_FIELDS
+        key: _clone_json(val) for key, val in args.items() if key not in _IDENTITY_FIELDS
     }
 
     if tool == "prepare_task":
@@ -470,7 +477,9 @@ def normalize_shim_args(
         raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
     _validate_wire_structure(args)
 
-    out: dict[str, JsonValue] = copy.deepcopy(args)
+    raw_out = _clone_json(args)
+    assert isinstance(raw_out, dict)
+    out: dict[str, JsonValue] = raw_out
     if "selected_scope" in out:
         raise BrainError(ErrorCode.INVALID_INPUT, "forbidden client-supplied authority field")
 

@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from superbrain.core._json_parse import MAX_WIRE_BODY_BYTES, _validate_wire_structure
 from superbrain.core._wire_catalog import EXPECTED_TOOL_ORDER
-from superbrain.core.canonical import canonical_json, validate_json
+from superbrain.core.canonical import canonical_json
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.jsonvalue import JsonValue
 from superbrain.core.kernel import (
@@ -62,9 +63,10 @@ def encode_call(command: ToolCommand) -> bytes:
         "correlation_id": correlation_id,
         "selected_scope": command.selected_scope.to_dict() if command.selected_scope is not None else None,
     }
-    validate_json(payload)
+    _validate_wire_structure(payload)
     encoded = canonical_json(payload)
-    parse_json(encoded)
+    if len(encoded) > MAX_WIRE_BODY_BYTES:
+        raise BrainError(ErrorCode.INVALID_INPUT, "payload exceeds size limit")
     return encoded
 
 
