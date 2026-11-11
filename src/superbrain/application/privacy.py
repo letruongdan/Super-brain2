@@ -194,6 +194,7 @@ class _Run:
         # to a joined multi-word name matches; ``_prefixes`` only prunes windows that can no longer reach one.
         self._prefixes = frozenset(name[:i] for name in self._sensitive for i in range(1, len(name) + 1))
         self._contained = tuple(sorted(name for name in self._sensitive if len(name) >= _CONTAINMENT_MIN))
+        self._redactions: dict[tuple[str, bool], tuple[str, int]] = {}
 
     def tick(self) -> None:
         if self._deadline_ns is not None and self._monotonic_ns() >= self._deadline_ns:
@@ -255,6 +256,8 @@ class _Run:
                 and any(name in word for name in self._contained)
             ):
                 return True
+            if word not in self._prefixes:
+                continue
             joined = ""
             for size in range(1, min(self._max_words, len(words) - start) + 1):
                 joined += words[start + size - 1]
@@ -459,6 +462,14 @@ class _Run:
         return text
 
     def redact(self, text: str, *, entropy: bool = True) -> str:
+        self.tick()
+        key = (text, entropy)
+        cached = self._redactions.get(key)
+        if cached is not None:
+            value, redacted = cached
+            self.redacted += redacted
+            return value
+        before = self.redacted
         text = self._private(text)
         self.tick()
         text = self._pem(text)
@@ -476,6 +487,8 @@ class _Run:
         if entropy:
             text = self._entropy(text)
         self.tick()  # after the last phase too: a late expiry is never hidden by returning
+        if len(self._redactions) < 1024:
+            self._redactions[key] = (text, self.redacted - before)
         return text
 
 
