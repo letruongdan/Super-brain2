@@ -161,7 +161,8 @@ def build_receipt(
         reasons.append("working tree was not clean at start")
     if end is not None and not end.tree_clean:
         reasons.append("working tree was not clean at end")
-    job_s = test_job_seconds if isinstance(test_job_seconds, (int, float)) else None
+    is_number = isinstance(test_job_seconds, (int, float)) and not isinstance(test_job_seconds, bool)
+    job_s = test_job_seconds if is_number else None
     if job_s is None or not math.isfinite(job_s) or job_s < 0:
         reasons.append(f"the test-job time {test_job_seconds!r} is not a measured, finite, non-negative value")
         job_s = None
@@ -396,12 +397,20 @@ def run(cmd: Sequence[str], *, cwd: Path, timeout_s: float) -> tuple[int | None,
         output, _ = proc.communicate(timeout=timeout_s)
         return proc.returncode, output, time.monotonic() - began
     except subprocess.TimeoutExpired:
-        _kill_tree(proc)
+        kill_note = ""
+        try:
+            _kill_tree(proc)
+        except (OSError, subprocess.SubprocessError) as err:  # still a timeout; never "could not start"
+            kill_note = f"\n<killing the timed-out process tree failed: {type(err).__name__}: {err}>"
+            try:
+                proc.kill()
+            except OSError:
+                pass
         try:
             output, _ = proc.communicate(timeout=KILL_GRACE_S)
         except subprocess.TimeoutExpired:
             output = KILL_HANG_MARKER
-        return None, output or "", time.monotonic() - began
+        return None, (output or "") + kill_note, time.monotonic() - began
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -488,6 +497,10 @@ def _host() -> dict[str, JsonValue]:
     }
 
 
+class EvidenceDirError(OSError):
+    """The attempt dir under ``--evidence-dir`` could not be created: nothing has run yet."""
+
+
 def run_gate(
     repo: Path, python: str, *, evidence_dir: Path | None = None
 ) -> tuple[dict[str, JsonValue], str]:
@@ -496,26 +509,32 @@ def run_gate(
     One monotonic deadline of ``TEST_JOB_BUDGET_S`` starts just before the interpreter preflight; collect and every
     phase get ``min(cap, remaining)`` and no step starts once it is spent. With ``evidence_dir`` every step's
     command, cwd, PID, start, exit, time and output, the raw JUnit report and the terminal receipt (written last)
-    go into a new attempt dir under it, outside the worktree; ``OSError`` from creating that dir propagates.
+    go into a new attempt dir under it, outside the worktree; only failing to create that dir raises
+    (``EvidenceDirError``). Every other failure becomes a reason in a refused receipt.
     """
     began = time.monotonic()
     attempt_dir: Path | None = None
     if evidence_dir is not None:
-        evidence_dir.mkdir(parents=True, exist_ok=True)
-        attempt_dir = evidence_dir / f"attempt-{datetime.now(UTC):%Y%m%dT%H%M%S%fZ}-{uuid.uuid4().hex[:8]}"
-        attempt_dir.mkdir()
+        try:
+            evidence_dir.mkdir(parents=True, exist_ok=True)
+            attempt_dir = evidence_dir / f"attempt-{datetime.now(UTC):%Y%m%dT%H%M%S%fZ}-{uuid.uuid4().hex[:8]}"
+            attempt_dir.mkdir()
+        except OSError as err:
+            raise EvidenceDirError(f"{type(err).__name__}: {err}") from err
     ev = _Evidence(attempt_dir)
     steps: list[JsonValue] = []
 
     def step(name: str, cmd: list[str], cwd: Path, timeout_s: float) -> tuple[int | None, str, float, str | None]:
-        """Run one command and record it; ``(exit or None, output, seconds, error)``; ``error`` means it never ran."""
+        """Run one command and record it; ``(exit or None, output, seconds, error)``. ``error`` says the step did not
+        reach an exit code: "could not start: …" (no process) or "failed while running: …" (a process had started)."""
         global LAST_PID
         LAST_PID = None
         started_at, error = _now(), None
         try:
             code, output, seconds = run(cmd, cwd=cwd, timeout_s=timeout_s)
-        except OSError as err:
-            code, output, seconds, error = None, "", 0.0, f"{type(err).__name__}: {err}"
+        except Exception as err:  # noqa: BLE001 - recorded as a refusal reason, the attempt still ends in a receipt
+            stage = "could not start" if LAST_PID is None and isinstance(err, OSError) else "failed while running"
+            code, output, seconds, error = None, "", 0.0, f"{stage}: {type(err).__name__}: {err}"
         rel = ev.write(f"steps/{len(steps):02d}-{name}.log", output.encode("utf-8", "replace"))
         steps.append({
             "name": name,
@@ -589,8 +608,8 @@ def run_gate(
                 def failed_to_run(label: str, code: int | None, error: str | None, output: str) -> bool:
                     nonlocal halted
                     if error is not None:
-                        extra.append(f"{label} could not start: {error}")
-                        halted = f"{label} could not start"
+                        extra.append(f"{label} {error}")
+                        halted = "an earlier step did not complete"
                     elif code is None:
                         extra.append(f"{label} timed out")
                     elif code != 0:
@@ -635,8 +654,8 @@ def run_gate(
                         continue
                     code, output, seconds, error = step(name, commands[name], worktree, timeout)
                     if error is not None:
-                        extra.append(f"phase {name} could not start: {error}")
-                        halted = f"phase {name} could not start"
+                        extra.append(f"phase {name} {error}")
+                        halted = "an earlier step did not complete"
                         continue
                     phases.append(PhaseResult(name, code, seconds))
                     if name == "pytest":
@@ -646,12 +665,17 @@ def run_gate(
                     if code != 0:
                         log.append(f"--- {name} (exit {code}) ---\n{output[-4000:]}")
                 job_ended = time.monotonic()
-                if junit.is_file():
-                    raw = junit.read_bytes()
+                raw: bytes | None = None
+                try:
+                    if junit.is_file():
+                        raw = junit.read_bytes()
+                except OSError as err:
+                    extra.append(f"junit: the report could not be read: {type(err).__name__}: {err}")
+                if raw is not None:
                     ev.write("junit.xml", raw)  # raw bytes kept before parsing and before cleanup
                     try:
                         junit_ids, outcomes = parse_junit(junit, root=worktree)
-                    except (ValueError, ET.ParseError) as err:
+                    except (ValueError, OSError, ET.ParseError) as err:
                         extra.append(f"junit: the report could not be parsed: {err}")
                     xpassed, problems = parse_xpassed(pytest_output, outcomes)
                     extra.extend(f"xpass: {problem}" for problem in problems)
@@ -660,13 +684,15 @@ def run_gate(
                             outcomes[node] = "xpassed"
                         else:
                             extra.append(f"xpass: {node} is XPASS in the terminal but {outcomes[node]} in JUnit")
-                else:
+                elif not any(r.startswith("junit: the report could not be read") for r in extra):
                     extra.append("junit: pytest wrote no JUnit report")
         if created:
             try:
                 end = source_identity(worktree)
             except (RuntimeError, OSError) as err:
                 extra.append(f"source identity could not be read at end: {type(err).__name__}: {err}")
+    except Exception as err:  # noqa: BLE001 - never lost: a refusal reason, and the evidence is still written
+        extra.append(f"gate run aborted: {type(err).__name__}: {err}")
     finally:
         try:
             junit.unlink(missing_ok=True)
@@ -725,11 +751,13 @@ def run_gate(
     }
     receipt["receipt_digest"] = digest_bytes(canonical_json(receipt))
     failure = ev.write_receipt(receipt)
-    if failure is not None:  # the evidence is incomplete: never an accepted run
+    if failure is not None:  # the evidence is incomplete: never an accepted run; re-digest the changed payload
+        del receipt["receipt_digest"]
         receipt["accepted"] = False
         reasons = receipt["reasons"]
         assert isinstance(reasons, list)
         reasons.append(failure)
+        receipt["receipt_digest"] = digest_bytes(canonical_json(receipt))
     log.extend(ev.errors)
     if failure is not None:
         log.append(failure)
@@ -756,8 +784,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
     try:
         receipt, log = run_gate(repo, args.python, evidence_dir=evidence)
-    except OSError as err:  # the attempt dir could not be created; nothing ran
-        print(f"gate refused: the evidence dir could not be prepared: {type(err).__name__}: {err}", file=sys.stderr)
+    except EvidenceDirError as err:  # the attempt dir could not be created; nothing ran
+        print(f"gate refused: the evidence dir could not be prepared: {err}", file=sys.stderr)
         return 2
     out_dir = repo / ".gate"
     path = out_dir / receipt_name(receipt)
