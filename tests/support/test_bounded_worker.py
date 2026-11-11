@@ -19,8 +19,12 @@ from typing import TypeVar
 
 import pytest
 
+from superbrain.core.jsonvalue import JsonValue
+from tests.support import crash, inc2_child, inc2_cli
 from tests.support.bounded_worker import DIAGNOSTIC_TAIL_BYTES, MAX_RESPONSE_BYTES, BoundedJsonWorker, WorkerFailure
-from tests.support.inc2_cli import _win32_wait_or_terminate_pid
+from tests.support.inc2_cli import InstalledMcpPipeSession, _win32_wait_or_terminate_pid
+from tests.support.inc2_fixture import InstalledEnv
+from tests.support.platform import windows_only
 
 _T = TypeVar("_T")
 
@@ -319,3 +323,208 @@ def test_both_historical_workers_use_the_bounded_harness() -> None:
     names = [fn.id if isinstance(fn, ast.Name) else fn.attr if isinstance(fn, ast.Attribute) else "" for fn in calls]
     assert names.count("BoundedJsonWorker") == 2
     assert names.count("Popen") == 0
+
+
+# Sibling helpers with the same invariant: every blocking operation ends in a response or an error within a bound.
+
+_MCP_CHILD = r"""
+import os, sys, time
+
+mode = sys.argv[1]
+if mode == "flood":
+    sys.stderr.write("d" * (1 << 20) + "\nflood-end-9c1e\n")
+    sys.stderr.flush()
+for raw in sys.stdin.buffer:
+    sys.stdout.write('{"jsonrpc":"2.0","id":1,"result":{"pid":%d}}\n' % os.getpid())
+    sys.stdout.flush()
+    if mode == "stop_after_first":
+        sys.stderr.write("diagnostic-note-7f3a\n")
+        sys.stderr.flush()
+        time.sleep(120)
+"""
+# Starts a grandchild that inherits one stream and outlives this process, so that stream never reaches EOF.
+_HOLDER_CHILD = r"""
+import os, subprocess, sys
+
+pid_path, held = sys.argv[1:3]
+grandchild = subprocess.Popen(
+    [getattr(sys, "_base_executable", sys.executable), "-I", "-S", "-c", "import time; time.sleep(60)"],
+    stdin=subprocess.DEVNULL,
+    stdout=sys.stdout if held == "stdout" else subprocess.DEVNULL,
+    stderr=sys.stderr if held == "stderr" else subprocess.DEVNULL,
+)
+with open(pid_path + ".tmp", "w") as fh:
+    fh.write(str(grandchild.pid))
+os.replace(pid_path + ".tmp", pid_path)
+sys.stderr.write("PAUSED writer.held\n")
+sys.stderr.flush()
+sys.stdin.readline()
+sys.stdout.write('{"jsonrpc":"2.0","id":1,"result":{"pid":0}}\n')
+sys.stdout.flush()
+sys.stdin.readline()
+"""
+_FRAME = b'{"jsonrpc":"2.0","id":1,"method":"ping"}\n'
+_LARGE_FRAME = b'{"pad":"' + b"X" * _FLOOD_BYTES + b'"}\n'
+
+_OpenSession = Callable[..., InstalledMcpPipeSession]
+
+
+@pytest.fixture
+def open_session(tmp_path: Path) -> Iterator[_OpenSession]:
+    sessions: list[InstalledMcpPipeSession] = []
+    python = Path(sys.executable)
+    env = InstalledEnv(python.parent.parent, python, Path(), Path(), "")
+
+    def _open(script: str, *args: str) -> InstalledMcpPipeSession:
+        session = InstalledMcpPipeSession(env, python.stem, ["-I", "-S", "-c", script, *args], cwd=tmp_path)
+        sessions.append(session)
+        return session
+
+    yield _open
+    for session in sessions:
+        session._proc.kill()  # Frees anything still blocked, so this teardown cannot hang.
+        _bounded(session.close)
+
+
+def _pid_of(response: dict[str, JsonValue]) -> int:
+    result = response["result"]
+    assert isinstance(result, dict) and isinstance(result["pid"], int)
+    return result["pid"]
+
+
+def _wait_for_pid(pid_path: Path) -> int:
+    deadline = time.monotonic() + _WATCHDOG_S
+    while True:
+        try:
+            return int(pid_path.read_text(encoding="ascii"))
+        except OSError:  # Not written yet, or Windows denies the read during the child's rename.
+            assert time.monotonic() < deadline, "holder child never started its grandchild"
+            time.sleep(0.005)
+
+
+def _assert_alive_then_end(pid: int) -> None:
+    """The stream was really held: the grandchild outlived the call under test. End it."""
+    assert not _win32_wait_or_terminate_pid(pid, terminate=False, timeout_s=0.001), "grandchild did not hold the stream"
+    assert _win32_wait_or_terminate_pid(pid, terminate=True, timeout_s=5.0)
+
+
+def test_mcp_session_large_frame_after_large_diagnostics_gets_response(open_session: _OpenSession) -> None:
+    """Positive twin: a chatty child still reads a cap-sized frame, and finish() returns all diagnostics."""
+    session = open_session(_MCP_CHILD, "flood")
+    response = _bounded(lambda: session.write_chunks_and_expect_response([_LARGE_FRAME], timeout=_WATCHDOG_S))
+    assert _pid_of(response) > 0
+    rc, stderr = _bounded(session.finish)
+    assert rc == 0
+    assert len(stderr) > _FLOOD_BYTES and stderr.rstrip().endswith(_FLOOD_END.encode())
+
+
+def test_mcp_session_keeps_split_chunks_one_frame(open_session: _OpenSession) -> None:
+    session = open_session(_MCP_CHILD, "serve")
+    chunks = [_FRAME[:7], _FRAME[7:20], _FRAME[20:]]
+    assert _pid_of(_bounded(lambda: session.write_chunks_and_expect_response(chunks, timeout=_WATCHDOG_S))) > 0
+    assert session._lines.empty()
+    assert _bounded(session.finish) == (0, b"")
+
+
+def test_mcp_session_write_to_child_not_reading_is_bounded_and_close_ends_it(
+    open_session: _OpenSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A child that stopped reading for a reason unrelated to stderr cannot block the write or the teardown."""
+    monkeypatch.setattr(inc2_cli, "_STDIN_WRITE_TIMEOUT_S", _SHORT_TIMEOUT_S, raising=False)
+    session = open_session(_MCP_CHILD, "stop_after_first")
+    with monkeypatch.context() as mp:
+        mp.setattr(inc2_cli, "_STDIN_WRITE_TIMEOUT_S", _WATCHDOG_S, raising=False)
+        inner = _pid_of(_bounded(lambda: session.write_chunks_and_expect_response([_FRAME], timeout=_WATCHDOG_S)))
+    _wait_for_diagnostic(session)
+    with pytest.raises(AssertionError) as exc:
+        _bounded(lambda: session.write_chunks_and_expect_response([_LARGE_FRAME]))
+    assert "stdin write did not finish" in str(exc.value) and _NOTE in str(exc.value)
+    _bounded(session.close)
+    assert session._proc.poll() is not None
+    assert _process_gone(inner)
+
+
+def _wait_for_diagnostic(session: InstalledMcpPipeSession) -> None:
+    deadline = time.monotonic() + _WATCHDOG_S
+    while _NOTE.encode() not in getattr(session, "_stderr_bytes", _NOTE.encode()):
+        assert time.monotonic() < deadline, "diagnostic never arrived"
+        time.sleep(0.005)
+
+
+def test_mcp_session_response_timeout_carries_diagnostics(open_session: _OpenSession) -> None:
+    session = open_session(_MCP_CHILD, "stop_after_first")
+    _bounded(lambda: session.write_chunks_and_expect_response([_FRAME], timeout=_WATCHDOG_S))
+    _wait_for_diagnostic(session)
+    with pytest.raises(AssertionError) as exc:
+        _bounded(lambda: session.write_chunks_and_expect_response([_FRAME], timeout=_SHORT_TIMEOUT_S))
+    assert "timed out" in str(exc.value) and _NOTE in str(exc.value)
+
+
+@windows_only
+def test_mcp_session_finish_fails_when_descendant_holds_stderr(
+    open_session: _OpenSession, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(inc2_cli, "_STDERR_DRAIN_TIMEOUT_S", _SHORT_TIMEOUT_S, raising=False)
+    pid_path = tmp_path / "holder.pid"
+    session = open_session(_HOLDER_CHILD, str(pid_path), "stderr")
+    grandchild = _wait_for_pid(pid_path)
+    try:
+        _bounded(lambda: session.write_chunks_and_expect_response([_FRAME], timeout=_WATCHDOG_S))
+        with pytest.raises(AssertionError, match="still holds stderr"):
+            _bounded(lambda: session.finish(timeout=_WATCHDOG_S))
+    finally:
+        _assert_alive_then_end(grandchild)
+
+
+@windows_only
+def test_mcp_session_close_is_bounded_when_untracked_descendant_holds_stderr(
+    open_session: _OpenSession, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(inc2_cli, "_STDERR_DRAIN_TIMEOUT_S", _SHORT_TIMEOUT_S, raising=False)
+    pid_path = tmp_path / "holder.pid"
+    session = open_session(_HOLDER_CHILD, str(pid_path), "stderr")
+    grandchild = _wait_for_pid(pid_path)
+    try:
+        session._stdin.write(b"\n\n")  # Raw write: no descendant snapshot, so close() cannot end the grandchild.
+        session._stdin.flush()
+        assert _bounded(lambda: session._proc.wait(timeout=_WATCHDOG_S)) == 0
+        _bounded(session.close)
+    finally:
+        _assert_alive_then_end(grandchild)
+
+
+@windows_only
+def test_paused_child_teardown_is_bounded_when_descendant_holds_stdout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pid_path = tmp_path / "holder.pid"
+    monkeypatch.setattr(
+        crash, "child_command", lambda *_: [sys.executable, "-I", "-S", "-c", _HOLDER_CHILD, str(pid_path), "stdout"]
+    )
+    monkeypatch.setattr(crash, "PUMP_JOIN_S", _SHORT_TIMEOUT_S, raising=False)
+
+    def _pause_and_resume() -> None:
+        with crash.paused_child("probe", "writer.held", tmp_path):
+            pass
+
+    try:
+        _bounded(_pause_and_resume)
+    finally:
+        _assert_alive_then_end(_wait_for_pid(pid_path))
+
+
+@windows_only
+def test_inc2_child_close_is_bounded_when_descendant_holds_stdout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pid_path = tmp_path / "holder.pid"
+    monkeypatch.setattr(inc2_child, "_PUMP_JOIN_S", _SHORT_TIMEOUT_S, raising=False)
+    child = inc2_child.Inc2ChildProcess([sys.executable, "-I", "-S", "-c", _HOLDER_CHILD, str(pid_path), "stdout"])
+    grandchild = _wait_for_pid(pid_path)
+    try:
+        child.send_command("resume")
+        child.send_command("exit")
+        assert _bounded(lambda: child._proc.wait(timeout=_WATCHDOG_S)) == 0
+        _bounded(child.close)
+    finally:
+        _assert_alive_then_end(grandchild)

@@ -57,6 +57,7 @@ from superbrain.core.kernel import (
 from superbrain.core.wire import load_catalog, parse_json
 from superbrain.mcp.stdio import ToolCaller, run_stdio
 from superbrain.ports.kernel import KernelTx
+from tests.support.bounded_worker import DIAGNOSTIC_TAIL_BYTES
 
 if TYPE_CHECKING:
     from tests.support.inc2_fixture import InstalledEnv
@@ -66,6 +67,8 @@ INC2_CLI_PATH = Path(__file__).resolve()
 _WHEEL_ISOLATION_CACHE: dict[str, dict[str, JsonValue]] = {}
 _SHARED_T7_TEMPLATE: list[TransportTemplate] = []
 _SHARED_T7_TEMPLATE_LOCK = threading.Lock()
+_STDIN_WRITE_TIMEOUT_S = 15.0
+_STDERR_DRAIN_TIMEOUT_S = 2.0
 
 _STRIPPED_ENV_KEYS: frozenset[str] = frozenset(
     {
@@ -639,6 +642,11 @@ class InstalledMcpPipeSession:
         self._lines: queue.Queue[bytes] = queue.Queue()
         self._reader = threading.Thread(target=self._read_stdout_lines, daemon=True)
         self._reader.start()
+        self._stderr_bytes = bytearray()
+        self._stderr_pump = threading.Thread(target=self._drain_stderr, daemon=True)
+        self._stderr_pump.start()
+        self._writer: threading.Thread | None = None
+        self._write_error: OSError | ValueError | None = None
         self._descendants: list[int] = []
         self._closed = False
 
@@ -651,6 +659,27 @@ class InstalledMcpPipeSession:
                     break
         except (OSError, ValueError):
             self._lines.put(b"")
+
+    def _drain_stderr(self) -> None:
+        with contextlib.suppress(OSError, ValueError):
+            while chunk := os.read(self._stderr.fileno(), 65536):
+                self._stderr_bytes += chunk
+
+    def _stderr_tail(self) -> str:
+        return bytes(self._stderr_bytes[-DIAGNOSTIC_TAIL_BYTES:]).decode("utf-8", errors="replace")
+
+    def _write_chunks(self, chunks: Sequence[bytes]) -> None:
+        try:
+            for chunk in chunks:
+                self._stdin.write(chunk)
+                self._stdin.flush()
+        except (OSError, ValueError) as err:
+            self._write_error = err
+
+    def _close_stdin(self) -> None:
+        if self._writer is None or not self._writer.is_alive():  # Closing under a blocked write would block too.
+            with contextlib.suppress(OSError, ValueError):
+                self._stdin.close()
 
     def _snapshot_descendants(self) -> tuple[int, ...]:
         if sys.platform == "win32":
@@ -669,9 +698,17 @@ class InstalledMcpPipeSession:
         """Write raw byte chunks to open ``stdin``, flush each, and wait for one response line."""
         assert not self._stdin.closed, f"{self._label}: stdin must remain open before sending frame"
         assert self._proc.poll() is None, f"{self._label}: process exited before frame was sent"
-        for chunk in chunks:
-            self._stdin.write(chunk)
-            self._stdin.flush()
+        assert self._writer is None or not self._writer.is_alive(), f"{self._label}: previous write is still blocked"
+        self._writer = threading.Thread(target=self._write_chunks, args=(chunks,), daemon=True)
+        self._writer.start()
+        self._writer.join(_STDIN_WRITE_TIMEOUT_S)
+        if self._writer.is_alive():
+            raise AssertionError(
+                f"{self._label}: stdin write did not finish within {_STDIN_WRITE_TIMEOUT_S:.1f}s "
+                f"(process_alive={self._proc.poll() is None})\nstderr tail:\n{self._stderr_tail()}"
+            )
+        if self._write_error is not None:
+            raise self._write_error
         self._snapshot_descendants()
         try:
             raw_line = self._lines.get(timeout=timeout)
@@ -679,9 +716,12 @@ class InstalledMcpPipeSession:
             alive = self._proc.poll() is None
             raise AssertionError(
                 f"{self._label}: timed out after {timeout:.1f}s waiting for MCP response while stdin open "
-                f"(process_alive={alive}, stdin_closed={self._stdin.closed})"
+                f"(process_alive={alive}, stdin_closed={self._stdin.closed})\nstderr tail:\n{self._stderr_tail()}"
             ) from err
-        assert raw_line, f"{self._label}: stdout reached EOF without emitting expected MCP response"
+        assert raw_line, (
+            f"{self._label}: stdout reached EOF without emitting expected MCP response\n"
+            f"stderr tail:\n{self._stderr_tail()}"
+        )
         assert not self._stdin.closed, f"{self._label}: stdin was unexpectedly closed"
         if require_alive_after:
             assert self._proc.poll() is None, f"{self._label}: process exited while interactive pipe should stay open"
@@ -701,11 +741,17 @@ class InstalledMcpPipeSession:
     def finish(self, *, timeout: float = 5.0) -> tuple[int, bytes]:
         """Close ``stdin``, wait for clean process exit, and return ``(returncode, stderr_bytes)``."""
         self._snapshot_descendants()
-        if not self._stdin.closed:
-            self._stdin.close()
-        rc = self._proc.wait(timeout=timeout)
+        self._close_stdin()
+        try:
+            rc = self._proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired as err:
+            raise AssertionError(
+                f"{self._label}: did not exit within {timeout:.1f}s of stdin close\nstderr tail:\n{self._stderr_tail()}"
+            ) from err
         self._reader.join(timeout=2.0)
-        stderr_bytes = self._stderr.read()
+        self._stderr_pump.join(timeout=_STDERR_DRAIN_TIMEOUT_S)
+        assert not self._stderr_pump.is_alive(), f"{self._label}: a descendant still holds stderr after exit"
+        stderr_bytes = bytes(self._stderr_bytes)
         self.close()
         return rc, stderr_bytes
 
@@ -714,10 +760,8 @@ class InstalledMcpPipeSession:
             return
         self._closed = True
         tracked = self._snapshot_descendants()
-        with contextlib.suppress(OSError, ValueError):
-            if not self._stdin.closed:
-                self._stdin.close()
-        if self._proc.poll() is None:
+        self._close_stdin()
+        if self._proc.poll() is None and self._stdin.closed:
             with contextlib.suppress(subprocess.TimeoutExpired, OSError):
                 self._proc.wait(timeout=2.0)
         if self._proc.poll() is None:
@@ -729,11 +773,14 @@ class InstalledMcpPipeSession:
             for pid in (*tracked, self._proc.pid):
                 with contextlib.suppress(Exception):
                     _win32_wait_or_terminate_pid(pid, terminate=True, timeout_s=2.0)
-        self._reader.join(timeout=1.0)
-        with contextlib.suppress(OSError, ValueError):
-            self._stdout.close()
-        with contextlib.suppress(OSError, ValueError):
-            self._stderr.close()
+        if self._writer is not None:
+            self._writer.join(timeout=1.0)
+        self._close_stdin()
+        for thread, stream in ((self._reader, self._stdout), (self._stderr_pump, self._stderr)):
+            thread.join(timeout=_STDERR_DRAIN_TIMEOUT_S)
+            if not thread.is_alive():  # Closing under a blocked reader would block on its lock.
+                with contextlib.suppress(OSError, ValueError):
+                    stream.close()
 
     def __enter__(self) -> InstalledMcpPipeSession:
         return self

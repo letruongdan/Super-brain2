@@ -36,6 +36,7 @@ from superbrain.core.kernel import DEFAULT_SHUTDOWN_GRACE_S, Endpoint, Ready
 INC2_CHILD_PATH = Path(__file__).resolve()
 DEFAULT_CHILD_TIMEOUT_S = 15.0
 _CHILD_PAUSE_TIMEOUT_S = 30.0
+_PUMP_JOIN_S = 2.0
 _RUNPY = "import runpy,sys; sys.argv=sys.argv[1:]; runpy.run_path(sys.argv[0], run_name='__main__')"
 _STRIPPED_ENV_VARS: tuple[str, ...] = (
     "VIRTUAL_ENV",
@@ -349,14 +350,11 @@ class Inc2ChildProcess:
         if self._proc.stdin is not None:
             with contextlib.suppress(OSError, ValueError):
                 self._proc.stdin.close()
-        self._ctrl_pump.join(timeout=2.0)
-        self._err_pump.join(timeout=2.0)
-        if self._proc.stdout is not None:
-            with contextlib.suppress(OSError, ValueError):
-                self._proc.stdout.close()
-        if self._proc.stderr is not None:
-            with contextlib.suppress(OSError, ValueError):
-                self._proc.stderr.close()
+        for pump, stream in ((self._ctrl_pump, self._proc.stdout), (self._err_pump, self._proc.stderr)):
+            pump.join(timeout=_PUMP_JOIN_S)
+            if stream is not None and not pump.is_alive():  # Closing under a blocked reader would block on its lock.
+                with contextlib.suppress(OSError, ValueError):
+                    stream.close()
 
     def close(self, timeout: float = 10.0) -> None:
         """Idempotent teardown ensuring zero leaked child or launcher processes."""
