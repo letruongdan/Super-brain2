@@ -19,7 +19,22 @@ jobs:
         with:
           version: "0.12.15"
       - name: Run the gate
-        run: uv run python scripts/gate.py --python ${{ matrix.python }}
+        shell: bash
+        run: |
+          ev="${{ runner.temp }}/gate-evidence"
+          mkdir -p "$ev"
+          set +e
+          uv run --locked --python ${{ matrix.python }} python scripts/gate.py --python ${{ matrix.python }} --evidence-dir "$ev" > "$ev/launcher.out" 2> "$ev/launcher.err"
+          code=$?
+          echo "$code" > "$ev/launcher.exit"
+          cat "$ev/launcher.out"
+          cat "$ev/launcher.err" >&2
+          exit $code
+      - name: Benchmark
+        shell: bash
+        run: |
+          mkdir -p "${{ runner.temp }}/perf-evidence"
+          uv run --locked --python ${{ matrix.python }} python -m tests.integration.test_kernel_performance --evidence-dir "${{ runner.temp }}/perf-evidence"
       - name: Upload receipt
         if: always()
         uses: actions/upload-artifact@v4
@@ -28,3 +43,19 @@ jobs:
           path: .gate/
           include-hidden-files: true
           if-no-files-found: error
+      - name: Upload gate evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-evidence-${{ matrix.os }}-${{ matrix.python }}
+          path: ${{ runner.temp }}/gate-evidence/
+          include-hidden-files: true
+          if-no-files-found: error
+      - name: Upload benchmark evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-evidence-${{ matrix.os }}-${{ matrix.python }}
+          path: ${{ runner.temp }}/perf-evidence/
+          include-hidden-files: true
+          if-no-files-found: ignore

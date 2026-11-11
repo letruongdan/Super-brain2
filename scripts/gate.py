@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
+import platform as host_platform
 import re
 import subprocess
 import sys
@@ -24,6 +26,7 @@ import xml.etree.ElementTree as ET
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 from superbrain.adapters.os import environment as environment_facts
@@ -38,6 +41,8 @@ from superbrain.core.jsonvalue import JsonValue
 REQUIRED_PHASES = ("ruff", "mypy", "lint-imports", "pytest")
 TERMINAL_OUTCOMES = {"passed", "failed", "error", "skipped", "xfailed", "xpassed"}
 NON_FAILING = {"passed", "skipped", "xfailed"}
+TEST_JOB_BUDGET_S = 300.0  # spec 17: interpreter preflight through the end of pytest
+PREFLIGHT_TIMEOUT_S = 120.0
 PHASE_TIMEOUTS_S = {"ruff": 120.0, "mypy": 300.0, "lint-imports": 120.0, "pytest": 300.0}
 GIT_TIMEOUT_S = 120.0
 SYNC_TIMEOUT_S = 600.0
@@ -114,8 +119,8 @@ def _under(path: str, parent: Path) -> bool:
 
 def build_receipt(
     *,
-    start: SourceIdentity,
-    end: SourceIdentity,
+    start: SourceIdentity | None,
+    end: SourceIdentity | None,
     phases: Sequence[PhaseResult],
     collected_ids: Sequence[str],
     junit_ids: Sequence[str],
@@ -126,7 +131,8 @@ def build_receipt(
     interpreter: InterpreterInfo | None,
     worktree: str,
     requested_python: str,
-    time_budget_s: float = 300.0,
+    test_job_seconds: float | None,
+    time_budget_s: float = TEST_JOB_BUDGET_S,
     cleanup_error: str | None = None,
     extra_reasons: Sequence[str] = (),
     environment: Mapping[str, JsonValue] | None = None,
@@ -134,6 +140,9 @@ def build_receipt(
     """Judge a run. The interpreter binding is mandatory: ``interpreter=None`` means the preflight failed.
 
     ``environment`` is the ``assess_environment`` section; each of its problems is a reason.
+    ``test_job_seconds`` is the aggregate from just before the interpreter preflight to the end of pytest; ``None``
+    (not measured), a non-finite or negative value, or one at or above ``time_budget_s`` is refused.
+    ``start``/``end`` are ``None`` when the source identity could not be read: the source is unverified.
     """
     reasons: list[str] = list(extra_reasons)
     if environment is not None:
@@ -142,12 +151,22 @@ def build_receipt(
             reasons.append("environment: the section has no problem list")
         else:
             reasons.extend(f"environment: {problem}" for problem in problems)
-    if start != end:
+    if start is None:
+        reasons.append("source identity could not be read at start: the source is unverified")
+    if end is None:
+        reasons.append("source identity could not be read at end: the source is unverified")
+    if start is not None and end is not None and start != end:
         reasons.append("source identity changed between start and end of the run")
-    if not start.tree_clean:
+    if start is not None and not start.tree_clean:
         reasons.append("working tree was not clean at start")
-    if not end.tree_clean:
+    if end is not None and not end.tree_clean:
         reasons.append("working tree was not clean at end")
+    job_s = test_job_seconds if isinstance(test_job_seconds, (int, float)) else None
+    if job_s is None or not math.isfinite(job_s) or job_s < 0:
+        reasons.append(f"the test-job time {test_job_seconds!r} is not a measured, finite, non-negative value")
+        job_s = None
+    elif job_s >= time_budget_s:
+        reasons.append(f"the test job took {job_s:.3f}s, at or over the {time_budget_s:.1f}s aggregate budget")
 
     names = [p.name for p in phases]
     if sorted(names) != sorted(REQUIRED_PHASES):
@@ -193,12 +212,15 @@ def build_receipt(
         reasons.append(f"sealed worktree was not removed: {cleanup_error}")
 
     return {
-        "start": asdict(start),
-        "end": asdict(end),
+        "start": asdict(start) if start is not None else None,
+        "end": asdict(end) if end is not None else None,
+        "test_job_seconds": job_s,
+        "time_budget_s": time_budget_s,
         "test_inventory_digest": digest_bytes(canonical_json(sorted(collected_ids))),
         "junit_inventory_digest": digest_bytes(canonical_json(sorted(junit_ids))),
         "test_count": len(collected_ids),
         "counts": counts,
+        "outcomes": {node: str(value) for node, value in sorted(junit_outcomes.items())},
         "phases": [asdict(p) for p in phases],
         "python": python,
         "implementation": implementation,
@@ -350,8 +372,13 @@ def _kill_tree(proc: subprocess.Popen[str]) -> None:
     proc.kill()
 
 
+LAST_PID: int | None = None
+"""The PID of the process ``run`` started last; the step recorder reads it (``None`` when a stand-in ran)."""
+
+
 def run(cmd: Sequence[str], *, cwd: Path, timeout_s: float) -> tuple[int | None, str, float]:
     """Run ``cmd``; return ``(exit_code or None on timeout, combined output, seconds)``."""
+    global LAST_PID
     began = time.monotonic()
     proc = subprocess.Popen(
         list(cmd),
@@ -364,6 +391,7 @@ def run(cmd: Sequence[str], *, cwd: Path, timeout_s: float) -> tuple[int | None,
         errors="replace",
         start_new_session=sys.platform != "win32",
     )
+    LAST_PID = proc.pid
     try:
         output, _ = proc.communicate(timeout=timeout_s)
         return proc.returncode, output, time.monotonic() - began
@@ -398,21 +426,112 @@ def source_identity(repo: Path) -> SourceIdentity:
 
 
 def _uv(worktree: Path, python: str, *tool: str) -> list[str]:
-    return ["uv", "run", "--project", str(worktree), "--python", python, *tool]
+    return ["uv", "run", "--locked", "--project", str(worktree), "--python", python, *tool]
 
 
 def receipt_name(receipt: Mapping[str, JsonValue]) -> str:
     start = receipt["start"]
-    assert isinstance(start, dict)
-    commit, lock = str(start["commit"]), str(start["lock_digest"])
     impl, version, platform = receipt["implementation"], receipt["python"], receipt["platform"]
+    if not isinstance(start, dict):  # the source could not be read: never named after a commit
+        return f"receipt-unverified-{impl}{version}-{platform}-{uuid.uuid4().hex[:12]}.json"
+    commit, lock = str(start["commit"]), str(start["lock_digest"])
     return f"receipt-{commit[:12]}-{impl}{version}-{platform}-{lock[7:19]}.json"
 
 
-def run_gate(repo: Path, python: str) -> tuple[dict[str, JsonValue], str]:
-    """Run the gate in a sealed worktree of HEAD. Returns the receipt and a printable log of failures."""
+class _Evidence:
+    """The artifacts of one attempt. Each file is written once and its digest enters the manifest; a write that
+    fails becomes an error (a refusal reason), never a silent gap. Without an attempt dir nothing is written."""
+
+    def __init__(self, root: Path | None) -> None:
+        self.root = root
+        self.manifest: dict[str, JsonValue] = {}
+        self.errors: list[str] = []
+
+    def write(self, rel: str, data: bytes) -> str | None:
+        if self.root is None:
+            return None
+        try:
+            path = self.root / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+        except OSError as err:
+            self.errors.append(f"evidence: could not write {rel}: {type(err).__name__}: {err}")
+            return None
+        self.manifest[rel] = digest_bytes(data)
+        return rel
+
+    def write_receipt(self, receipt: dict[str, JsonValue]) -> str | None:
+        """Write the terminal receipt last and atomically; returns an error or ``None``."""
+        if self.root is None:
+            return None
+        try:
+            tmp = self.root / f".receipt-{uuid.uuid4().hex[:8]}.tmp"
+            tmp.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            os.replace(tmp, self.root / "receipt.json")
+        except OSError as err:
+            return f"evidence: could not write the terminal receipt: {type(err).__name__}: {err}"
+        return None
+
+
+def _now() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def _host() -> dict[str, JsonValue]:
+    return {
+        "node": host_platform.node(),
+        "system": host_platform.system(),
+        "release": host_platform.release(),
+        "version": host_platform.version(),
+        "machine": host_platform.machine(),
+        "platform": sys.platform,
+    }
+
+
+def run_gate(
+    repo: Path, python: str, *, evidence_dir: Path | None = None
+) -> tuple[dict[str, JsonValue], str]:
+    """Run the gate in a detached worktree of the resolved HEAD. Returns the receipt and a printable log.
+
+    One monotonic deadline of ``TEST_JOB_BUDGET_S`` starts just before the interpreter preflight; collect and every
+    phase get ``min(cap, remaining)`` and no step starts once it is spent. With ``evidence_dir`` every step's
+    command, cwd, PID, start, exit, time and output, the raw JUnit report and the terminal receipt (written last)
+    go into a new attempt dir under it, outside the worktree; ``OSError`` from creating that dir propagates.
+    """
+    began = time.monotonic()
+    attempt_dir: Path | None = None
+    if evidence_dir is not None:
+        evidence_dir.mkdir(parents=True, exist_ok=True)
+        attempt_dir = evidence_dir / f"attempt-{datetime.now(UTC):%Y%m%dT%H%M%S%fZ}-{uuid.uuid4().hex[:8]}"
+        attempt_dir.mkdir()
+    ev = _Evidence(attempt_dir)
+    steps: list[JsonValue] = []
+
+    def step(name: str, cmd: list[str], cwd: Path, timeout_s: float) -> tuple[int | None, str, float, str | None]:
+        """Run one command and record it; ``(exit or None, output, seconds, error)``; ``error`` means it never ran."""
+        global LAST_PID
+        LAST_PID = None
+        started_at, error = _now(), None
+        try:
+            code, output, seconds = run(cmd, cwd=cwd, timeout_s=timeout_s)
+        except OSError as err:
+            code, output, seconds, error = None, "", 0.0, f"{type(err).__name__}: {err}"
+        rel = ev.write(f"steps/{len(steps):02d}-{name}.log", output.encode("utf-8", "replace"))
+        steps.append({
+            "name": name,
+            "command": list(cmd),
+            "cwd": str(cwd),
+            "pid": LAST_PID,
+            "started_at": started_at,
+            "timeout_s": timeout_s,
+            "exit_code": code,
+            "duration_s": seconds,
+            "output": rel,
+            "error": error,
+        })
+        return code, output, seconds, error
+
     worktree = Path(tempfile.gettempdir()) / f"superbrain-gate-{uuid.uuid4().hex[:12]}"
-    _git(repo, "worktree", "add", "--detach", str(worktree), "HEAD")
     extra: list[str] = []
     log: list[str] = []
     phases: list[PhaseResult] = []
@@ -420,88 +539,159 @@ def run_gate(repo: Path, python: str) -> tuple[dict[str, JsonValue], str]:
     collected: list[str] = []
     junit_ids: list[str] = []
     outcomes: dict[str, str] = {}
-    start = end = None
+    start: SourceIdentity | None = None
+    end: SourceIdentity | None = None
+    resolved: str | None = None
+    created = False
     cleanup_error: str | None = None
     junit = worktree.parent / f"{worktree.name}-junit.xml"
     pytest_output = ""
     environment: dict[str, JsonValue] | None = None
+    job_began: float | None = None
+    job_ended: float | None = None
     try:
         facts = collect_environment(OsEnvironmentProbe(), env=os.environ, platform=sys.platform)
         environment = assess_environment(facts)
     except Exception as err:  # noqa: BLE001 - never swallowed: any failure is a reason, the receipt is not accepted
         extra.append(f"environment preflight failed: {type(err).__name__}: {err}")
     try:
-        start = source_identity(worktree)
-        code, output, _ = run(
-            ["uv", "sync", "--project", str(worktree), "--python", python], cwd=worktree, timeout_s=SYNC_TIMEOUT_S
-        )
-        if code != 0:
-            extra.append(f"uv sync failed ({code})")
-            log.append(output)
-        else:
-            code, output, _ = run(
-                _uv(worktree, python, "python", "-I", "-c", PREFLIGHT_CODE), cwd=worktree, timeout_s=120.0
-            )
-            if code != 0:
-                extra.append(f"interpreter preflight exited with {code}")
-                log.append(output)
-            else:
-                try:
-                    interpreter = InterpreterInfo(**json.loads(output.strip().splitlines()[-1]))
-                except (ValueError, TypeError, IndexError):
-                    extra.append("interpreter preflight output was not understood")
-                    log.append(output)
-
-            commands: dict[str, list[str]] = {
-                "ruff": _uv(worktree, python, "ruff", "check", "src", "tests", "scripts"),
-                "mypy": _uv(worktree, python, "mypy"),
-                "lint-imports": _uv(worktree, python, "lint-imports"),
-                "pytest": _uv(worktree, python, "pytest", f"--junitxml={junit}", "-q", "-rfEX"),
-            }
-            code, output, _ = run(
-                _uv(worktree, python, "pytest", "--collect-only", "-q"), cwd=worktree, timeout_s=COLLECT_TIMEOUT_S
-            )
-            if code != 0:
-                extra.append(f"pytest --collect-only exited with {code}")
-                log.append(output)
-            else:
-                try:
-                    collected = parse_collected(output)
-                except ValueError as err:
-                    extra.append(f"inventory: {err}")
-            for name in REQUIRED_PHASES:
-                code, output, seconds = run(commands[name], cwd=worktree, timeout_s=PHASE_TIMEOUTS_S[name])
-                phases.append(PhaseResult(name, code, seconds))
-                if name == "pytest":
-                    pytest_output = output
-                if KILL_HANG_MARKER in output:
-                    extra.append(f"phase {name} did not exit after being killed")
-                if code != 0:
-                    log.append(f"--- {name} (exit {code}) ---\n{output[-4000:]}")
-            if junit.is_file():
-                try:
-                    junit_ids, outcomes = parse_junit(junit, root=worktree)
-                except (ValueError, ET.ParseError) as err:
-                    extra.append(f"junit: {err}")
-                xpassed, problems = parse_xpassed(pytest_output, outcomes)
-                extra.extend(f"xpass: {problem}" for problem in problems)
-                for node in xpassed:  # JUnit shows a non-strict XPASS as a pass; the terminal summary does not
-                    if outcomes[node] == "passed":
-                        outcomes[node] = "xpassed"
-                    else:
-                        extra.append(f"xpass: {node} is XPASS in the terminal but {outcomes[node]} in JUnit")
-            else:
-                extra.append("pytest wrote no JUnit report")
-        end = source_identity(worktree)
-    finally:
-        junit.unlink(missing_ok=True)
         try:
-            _git(repo, "worktree", "remove", "--force", str(worktree))
-        except RuntimeError as err:
-            cleanup_error = str(err)
+            resolved = _git(repo, "rev-parse", "HEAD").strip()
+            _git(repo, "worktree", "add", "--detach", str(worktree), resolved)
+            created = True
+            start = source_identity(worktree)
+        except (RuntimeError, OSError) as err:
+            extra.append(f"source identity could not be read at start: {type(err).__name__}: {err}")
+        if start is not None:
+            code, output, _, error = step(
+                "uv-sync", ["uv", "sync", "--locked", "--project", str(worktree), "--python", python], worktree,
+                SYNC_TIMEOUT_S,
+            )
+            if code != 0:
+                extra.append(f"uv sync failed ({error or ('timed out' if code is None else code)})")
+                log.append(output)
+            else:
+                job_began = time.monotonic()
+                deadline = job_began + TEST_JOB_BUDGET_S
+                halted: str | None = None  # why no further step of the test job may start
 
-    if start is None or end is None:
-        raise RuntimeError("could not take the source identity of the sealed worktree")
+                def bounded(name: str, cap: float) -> float | None:
+                    """The timeout for the next step, or ``None`` (with a reason) when it must not start."""
+                    left = deadline - time.monotonic()
+                    if halted is not None:
+                        extra.append(f"{name} not started: {halted}")
+                        return None
+                    if left <= 0:
+                        extra.append(f"{name} not started: the {TEST_JOB_BUDGET_S:.0f}s test-job budget was spent")
+                        return None
+                    return min(cap, left)
+
+                def failed_to_run(label: str, code: int | None, error: str | None, output: str) -> bool:
+                    nonlocal halted
+                    if error is not None:
+                        extra.append(f"{label} could not start: {error}")
+                        halted = f"{label} could not start"
+                    elif code is None:
+                        extra.append(f"{label} timed out")
+                    elif code != 0:
+                        extra.append(f"{label} exited with {code}")
+                    else:
+                        return False
+                    log.append(f"--- {label} (exit {code}) ---\n{output[-4000:]}")
+                    return True
+
+                timeout = bounded("interpreter preflight", PREFLIGHT_TIMEOUT_S)
+                if timeout is not None:
+                    code, output, _, error = step(
+                        "preflight", _uv(worktree, python, "python", "-I", "-c", PREFLIGHT_CODE), worktree, timeout
+                    )
+                    if not failed_to_run("interpreter preflight", code, error, output):
+                        try:
+                            interpreter = InterpreterInfo(**json.loads(output.strip().splitlines()[-1]))
+                        except (ValueError, TypeError, IndexError):
+                            extra.append("interpreter preflight output was not understood")
+                            log.append(output)
+
+                timeout = bounded("pytest --collect-only", COLLECT_TIMEOUT_S)
+                if timeout is not None:
+                    code, output, _, error = step(
+                        "collect", _uv(worktree, python, "pytest", "--collect-only", "-q"), worktree, timeout
+                    )
+                    if not failed_to_run("pytest --collect-only", code, error, output):
+                        try:
+                            collected = parse_collected(output)
+                        except ValueError as err:
+                            extra.append(f"inventory: {err}")
+
+                commands: dict[str, list[str]] = {
+                    "ruff": _uv(worktree, python, "ruff", "check", "src", "tests", "scripts"),
+                    "mypy": _uv(worktree, python, "mypy"),
+                    "lint-imports": _uv(worktree, python, "lint-imports"),
+                    "pytest": _uv(worktree, python, "pytest", f"--junitxml={junit}", "-q", "-rfEX"),
+                }
+                for name in REQUIRED_PHASES:
+                    timeout = bounded(f"phase {name}", PHASE_TIMEOUTS_S[name])
+                    if timeout is None:
+                        continue
+                    code, output, seconds, error = step(name, commands[name], worktree, timeout)
+                    if error is not None:
+                        extra.append(f"phase {name} could not start: {error}")
+                        halted = f"phase {name} could not start"
+                        continue
+                    phases.append(PhaseResult(name, code, seconds))
+                    if name == "pytest":
+                        pytest_output = output
+                    if KILL_HANG_MARKER in output:
+                        extra.append(f"phase {name} did not exit after being killed")
+                    if code != 0:
+                        log.append(f"--- {name} (exit {code}) ---\n{output[-4000:]}")
+                job_ended = time.monotonic()
+                if junit.is_file():
+                    raw = junit.read_bytes()
+                    ev.write("junit.xml", raw)  # raw bytes kept before parsing and before cleanup
+                    try:
+                        junit_ids, outcomes = parse_junit(junit, root=worktree)
+                    except (ValueError, ET.ParseError) as err:
+                        extra.append(f"junit: the report could not be parsed: {err}")
+                    xpassed, problems = parse_xpassed(pytest_output, outcomes)
+                    extra.extend(f"xpass: {problem}" for problem in problems)
+                    for node in xpassed:  # JUnit shows a non-strict XPASS as a pass; the terminal summary does not
+                        if outcomes[node] == "passed":
+                            outcomes[node] = "xpassed"
+                        else:
+                            extra.append(f"xpass: {node} is XPASS in the terminal but {outcomes[node]} in JUnit")
+                else:
+                    extra.append("junit: pytest wrote no JUnit report")
+        if created:
+            try:
+                end = source_identity(worktree)
+            except (RuntimeError, OSError) as err:
+                extra.append(f"source identity could not be read at end: {type(err).__name__}: {err}")
+    finally:
+        try:
+            junit.unlink(missing_ok=True)
+        except OSError as err:
+            extra.append(f"junit temp file was not removed: {err}")
+        if created:
+            try:
+                if worktree.exists():
+                    _git(repo, "worktree", "remove", "--force", str(worktree))
+                else:  # the worktree disappeared during the run: drop git's record of it
+                    _git(repo, "worktree", "prune")
+            except (RuntimeError, OSError) as err:
+                cleanup_error = str(err)
+
+    finished = time.monotonic()
+    ev.write(  # the source probes as observed, also when they failed (the receipt then says unverified)
+        "source.json",
+        canonical_json({
+            "resolved_commit": resolved,
+            "start": asdict(start) if start is not None else None,
+            "end": asdict(end) if end is not None else None,
+            "host": _host(),
+        }),
+    )
+    test_job_s =None if job_began is None else (job_ended if job_ended is not None else finished) - job_began
     receipt = build_receipt(
         start=start,
         end=end,
@@ -515,26 +705,68 @@ def run_gate(repo: Path, python: str) -> tuple[dict[str, JsonValue], str]:
         interpreter=interpreter,
         worktree=str(worktree),
         requested_python=python,
+        test_job_seconds=test_job_s,
         cleanup_error=cleanup_error,
-        extra_reasons=extra,
+        extra_reasons=[*extra, *ev.errors],
         environment=environment,
     )
+    receipt["resolved_commit"] = resolved
+    receipt["timing"] = {
+        "setup_s": None if job_began is None else job_began - began,
+        "test_job_s": test_job_s,
+        "teardown_s": None if job_ended is None else finished - job_ended,
+        "total_s": finished - began,
+    }
+    receipt["steps"] = steps
+    receipt["host"] = _host()
+    receipt["evidence"] = {
+        "attempt_dir": str(attempt_dir) if attempt_dir is not None else None,
+        "manifest": dict(ev.manifest),
+    }
+    receipt["receipt_digest"] = digest_bytes(canonical_json(receipt))
+    failure = ev.write_receipt(receipt)
+    if failure is not None:  # the evidence is incomplete: never an accepted run
+        receipt["accepted"] = False
+        reasons = receipt["reasons"]
+        assert isinstance(reasons, list)
+        reasons.append(failure)
+    log.extend(ev.errors)
+    if failure is not None:
+        log.append(failure)
     return receipt, "\n".join(log)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run the default gate and write a receipt.")
     parser.add_argument("--python", required=True, help="Python version to run the gate with, e.g. 3.14")
+    parser.add_argument("--evidence-dir", help="absolute directory; each run writes a new attempt dir under it")
     args = parser.parse_args(argv)
+    evidence: Path | None = None
+    if args.evidence_dir is not None:
+        evidence = Path(args.evidence_dir)
+        if not evidence.is_absolute():
+            print(f"gate refused: --evidence-dir must be an absolute path, got {args.evidence_dir!r}", file=sys.stderr)
+            return 2
+        if evidence.exists() and not evidence.is_dir():
+            print(f"gate refused: the evidence dir {evidence} is not a directory", file=sys.stderr)
+            return 2
     repo = Path(__file__).resolve().parent.parent
     if not tree_is_clean(repo):
         print("gate refused: the working tree has uncommitted changes to tracked files", file=sys.stderr)
         return 2
-    receipt, log = run_gate(repo, args.python)
+    try:
+        receipt, log = run_gate(repo, args.python, evidence_dir=evidence)
+    except OSError as err:  # the attempt dir could not be created; nothing ran
+        print(f"gate refused: the evidence dir could not be prepared: {type(err).__name__}: {err}", file=sys.stderr)
+        return 2
     out_dir = repo / ".gate"
-    out_dir.mkdir(exist_ok=True)
     path = out_dir / receipt_name(receipt)
-    path.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    try:
+        out_dir.mkdir(exist_ok=True)
+        path.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    except OSError as err:
+        print(f"gate: evidence: the legacy receipt could not be written: {err}", file=sys.stderr)
+        return 1
     if log:
         print(log, file=sys.stderr)
     counts = receipt["counts"]
