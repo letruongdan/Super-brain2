@@ -6,6 +6,7 @@ import copy
 import hashlib
 import json
 import math
+import re
 import runpy
 import sys
 from collections.abc import Iterator
@@ -544,6 +545,43 @@ def test_cold_probe_requires_the_exact_integer_initialize_request_id(bad_id: Jso
     probe: dict[str, Any] = perf_gate.evaluate_cold_client_probe(spawns)
     assert_refused(probe)
     assert probe["entrypoints"]["brain-mcp"]["samples"] == spawns["brain-mcp"]
+
+
+def test_worst_case_corpus_has_distinct_full_blocks_and_distinct_secret_tokens_inside_each_block() -> None:
+    payload, length = perf_gate.build_privacy_corpus_sample(1024, 0)
+    assert length == len(canonical_json(payload)) == 1_048_576
+    full_blocks = [text for text in string_leaves(payload) if len(text.encode()) == 65536]
+    assert len(full_blocks) >= 2
+    assert len(set(full_blocks)) == len(full_blocks), "worst-case corpus repeated a complete cached text block"
+    for text in full_blocks:
+        credentials = re.findall(r"https://([^/@\s]+:[^/@\s]+)@", text)
+        entropy_tokens = re.findall(r"(?<!\S)[A-Za-z0-9_-]{24,}(?!\S)", text)
+        assert len(set(credentials)) > 1, "credential workload repeats one userinfo token"
+        assert len(set(entropy_tokens)) > 1, "entropy workload repeats one token"
+
+
+def test_unclosed_tail_exercises_filter_with_full_size_valid_positive_twin() -> None:
+    payload, length = perf_gate.build_unclosed_private_tail_sample(1024)
+    assert length == len(canonical_json(payload)) == 1_048_576
+    assert max(len(text.encode()) for text in string_leaves(payload)) == 65536
+    twin = copy.deepcopy(payload)
+    pending = [twin]
+    repaired = 0
+    while pending:
+        node = pending.pop()
+        for key, value in node.items():
+            if isinstance(value, dict):
+                pending.append(value)
+            elif isinstance(value, str) and "<private>" in value and "</private>" not in value:
+                node[key] = value.replace("<private>", "ordinary ")
+                repaired += 1
+    assert repaired >= 1, "malformed corpus lacks its unclosed private tail"
+    assert len(canonical_json(twin)) == length
+    safe = PrivacyFilter().apply(twin, FilterPolicy())
+    assert has_positive(safe.value), "the same-size repaired corpus must reach and complete filtering"
+    with pytest.raises(BrainError) as caught:
+        PrivacyFilter().apply(payload, FilterPolicy())
+    assert caught.value.code is ErrorCode.INVALID_INPUT
 
 
 if __name__ == "__main__":
