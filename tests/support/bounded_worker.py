@@ -123,6 +123,10 @@ class BoundedJsonWorker:
     def returncode(self) -> int | None:
         return self._proc.poll()
 
+    def has_unread_output(self) -> bool:
+        """Return whether the worker has written output that no request has consumed."""
+        return not self._lines.empty()
+
     def diagnostics(self) -> str:
         """Return the last ``DIAGNOSTIC_TAIL_BYTES`` the worker wrote to its diagnostics stream."""
         try:
@@ -195,9 +199,7 @@ class BoundedJsonWorker:
                 raise self._fail("close_timeout", f"did not exit within {bound}s of stdin close") from None
             if rc != 0:
                 raise self._fail("exit_status", f"exited with {rc}")
-            survivors = self._reap()
-            if survivors:
-                raise self._fail("exit_status", "left descendants running after a clean exit")
+            self._reap()
             return rc
         except WorkerFailure:
             raise

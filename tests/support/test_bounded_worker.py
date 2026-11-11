@@ -6,6 +6,7 @@ of hanging the suite.
 
 from __future__ import annotations
 
+import ast
 import os
 import sys
 import threading
@@ -52,6 +53,11 @@ os.replace(pid_path + ".tmp", pid_path)
 if on_eof == "never_read":
     time.sleep(HANG_S)
     sys.exit(0)
+if on_eof == "answer_early":
+    sys.stdin.buffer.read(1)
+    reply({"early": True})
+    time.sleep(HANG_S)
+    sys.exit(0)
 
 for raw in sys.stdin:
     req = json.loads(raw)
@@ -65,6 +71,9 @@ for raw in sys.stdin:
         sys.stderr.write("d" * FLOOD_BYTES + "\n" + req["end"] + "\n")
         sys.stderr.flush()
         reply({"status": "accepted"})
+    elif op == "two_lines":
+        reply({"line": 1})
+        reply({"line": 2})
     elif op == "hang":
         time.sleep(HANG_S)
     elif op == "exit":
@@ -157,6 +166,7 @@ def spawn(tmp_path: Path) -> Iterator[_Spawn]:
         workers.append(worker)
         deadline = time.monotonic() + _WATCHDOG_S
         while not pid_path.exists():
+            assert worker.returncode is None, f"probe child exited at startup:\n{worker.diagnostics()}"
             assert time.monotonic() < deadline, "probe child never started"
             time.sleep(0.005)
         return _Probe(worker, int(pid_path.read_text(encoding="ascii")))
@@ -229,6 +239,7 @@ def test_quiet_worker_answers_in_order_and_closes_cleanly(spawn: _Spawn) -> None
     assert _bounded(probe.worker.close) == 0
     probe.assert_gone()
     assert _bounded(probe.worker.close) == 0
+    assert _bounded_failure(lambda: probe.worker.request({"op": "echo", "value": 4})).kind == "protocol"
 
 
 def test_worker_that_stops_reading_stdin_cannot_block_the_request(spawn: _Spawn) -> None:
@@ -237,6 +248,27 @@ def test_worker_that_stops_reading_stdin_cannot_block_the_request(spawn: _Spawn)
     payload: dict[str, object] = {"op": "echo", "value": "p" * _FLOOD_BYTES}
     failure = _bounded_failure(lambda: probe.worker.request(payload, timeout_s=_SHORT_TIMEOUT_S))
     assert failure.kind == "timeout"
+    probe.assert_gone()
+
+
+def test_answer_before_reading_the_whole_request_fails_closed(spawn: _Spawn) -> None:
+    """A reply cannot belong to a request the worker has not finished reading."""
+    probe = spawn("answer_early")
+    payload: dict[str, object] = {"op": "echo", "value": "p" * _FLOOD_BYTES}
+    failure = _bounded_failure(lambda: probe.worker.request(payload, timeout_s=_SHORT_TIMEOUT_S))
+    assert failure.kind in {"protocol", "timeout"}  # "timeout" only if the host delays the early reply past the bound.
+    probe.assert_gone()
+
+
+def test_unsolicited_output_is_not_taken_as_the_next_response(spawn: _Spawn) -> None:
+    probe = spawn()
+    assert _bounded(lambda: probe.worker.request({"op": "two_lines"})) == {"line": 1}
+    deadline = time.monotonic() + _WATCHDOG_S
+    while not probe.worker.has_unread_output():
+        assert time.monotonic() < deadline, "second line never arrived"
+        time.sleep(0.005)
+    failure = _bounded_failure(lambda: probe.worker.request({"op": "echo", "value": 1}))
+    assert failure.kind == "protocol"
     probe.assert_gone()
 
 
@@ -274,3 +306,14 @@ def test_malformed_response_fails_closed_and_ends_worker(spawn: _Spawn, payload:
     failure = _bounded_failure(lambda: probe.worker.request(payload))
     assert failure.kind == "protocol"
     probe.assert_gone()
+
+
+def test_both_historical_workers_use_the_bounded_harness() -> None:
+    """The persistent workers cannot be exercised with injected diagnostics, so pin that they use this harness."""
+    source = Path(__file__).resolve().parents[1] / "storage" / "test_kernel_revocation.py"
+    calls = [
+        node.func for node in ast.walk(ast.parse(source.read_text(encoding="utf-8"))) if isinstance(node, ast.Call)
+    ]
+    names = [fn.id if isinstance(fn, ast.Name) else fn.attr if isinstance(fn, ast.Attribute) else "" for fn in calls]
+    assert names.count("BoundedJsonWorker") == 2
+    assert names.count("Popen") == 0
