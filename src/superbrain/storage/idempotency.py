@@ -10,6 +10,7 @@ from typing import TypeVar, cast
 
 from superbrain.core.canonical import digest_bytes
 from superbrain.core.errors import BrainError, ErrorCode
+from superbrain.core.faults import crashpoint
 from superbrain.core.kernel import (
     IDEMPOTENCY_TTL,
     IdempotencyRow,
@@ -253,6 +254,7 @@ class KernelIdempotencyStore(KernelIdempotencyPort):
         apply: Callable[[KernelTx], StoredResult],
     ) -> tuple[StoredResult, bool]:
         clock_state: list[tuple[datetime, str, str | None]] = []
+        wrote_effect = False
 
         def _before(txn: Txn) -> None:
             clock_state.append(self._validate_clock(txn.db, now))
@@ -260,8 +262,11 @@ class KernelIdempotencyStore(KernelIdempotencyPort):
         def _after(txn: Txn) -> None:
             _now_utc, now_str, durable_hwm = clock_state[0]
             advance_c4_hwm(txn.db, now_str, current_hwm=durable_hwm)
+            if wrote_effect:
+                crashpoint("kernel.before_commit")
 
         def _body(strict_tx: KernelTx) -> tuple[StoredResult, bool]:
+            nonlocal wrote_effect
             _now_utc, now_str, _durable_hwm = clock_state[0]
             existing = strict_tx.read_idempotency(principal_id, tool, key_hash)
             if existing is not None and verify_raced_row(existing):
@@ -289,6 +294,7 @@ class KernelIdempotencyStore(KernelIdempotencyPort):
                 committed_at=now_str,
             )
             strict_tx.save_idempotency(new_row)
+            wrote_effect = True
             return stored, False
 
         strict_store = StrictKernelStore(

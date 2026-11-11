@@ -27,6 +27,8 @@ KNOWN_CRASHPOINTS: frozenset[str] = frozenset({
     "daemon.after_bind_before_endpoint",
     "daemon.after_endpoint_publish",
     "kernel.migrate.after_policy_swap",
+    "kernel.before_commit",
+    "kernel.after_commit_before_response",
 })
 
 KNOWN_PAUSEPOINTS: frozenset[str] = KNOWN_CRASHPOINTS | {"writer.held"}

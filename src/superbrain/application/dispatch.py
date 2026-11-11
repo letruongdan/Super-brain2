@@ -16,6 +16,7 @@ from superbrain.application.idempotency import (
     verify_request_hmac,
 )
 from superbrain.core.errors import BrainError, ErrorCode
+from superbrain.core.faults import crashpoint
 from superbrain.core.jsonvalue import JsonValue
 from superbrain.core.kernel import (
     HANDLER_RESERVE_NS,
@@ -345,15 +346,17 @@ class KernelDispatcher:
             verify_raced_row=lambda r: self._check_raced_row(r, call, now=commit_now),
             apply=prepared.apply,
         )
-        if not was_raced_replay and self._on_commit_completed is not None:
-            try:
-                self._on_commit_completed(stored)
-            except BrainError as err:
-                if err.code is ErrorCode.COMMIT_OUTCOME_UNKNOWN:
-                    raise
-                raise BrainError(ErrorCode.COMMIT_OUTCOME_UNKNOWN, "commit outcome unknown") from err
-            except Exception as exc:  # noqa: BLE001 — lost completion callback after durable commit (4a line 160)
-                raise BrainError(ErrorCode.COMMIT_OUTCOME_UNKNOWN, "commit outcome unknown") from exc
+        if not was_raced_replay:
+            crashpoint("kernel.after_commit_before_response")
+            if self._on_commit_completed is not None:
+                try:
+                    self._on_commit_completed(stored)
+                except BrainError as err:
+                    if err.code is ErrorCode.COMMIT_OUTCOME_UNKNOWN:
+                        raise
+                    raise BrainError(ErrorCode.COMMIT_OUTCOME_UNKNOWN, "commit outcome unknown") from err
+                except Exception as exc:  # noqa: BLE001 — lost completion callback after durable commit (4a line 160)
+                    raise BrainError(ErrorCode.COMMIT_OUTCOME_UNKNOWN, "commit outcome unknown") from exc
 
         rendered_fresh = self._render_dict(stored, live_principal, selected_scope=call.selected_scope)
         return self._attach_pending_send_attempt(
