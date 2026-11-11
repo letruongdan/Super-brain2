@@ -576,3 +576,46 @@ def test_flush_file_of_a_missing_file_is_io_error(tmp_path: Path, publisher: Dur
     with pytest.raises(BrainError) as e:
         publisher.flush_file(tmp_path / "missing")
     assert_io_error(e)
+
+
+def test_durable_typechecks_across_platforms_and_preserves_windows_move_semantics(tmp_path: Path) -> None:
+    """R04: ``durable.py`` type-checks cleanly on linux/darwin and preserves native Windows move/volume behavior."""
+    from mypy import api as mypy_api
+
+    repo_root = Path(__file__).resolve().parents[2]
+    config_file = repo_root / "pyproject.toml"
+    durable_file = repo_root / "src" / "superbrain" / "adapters" / "os" / "durable.py"
+
+    for target_platform in ("linux", "darwin"):
+        stdout, stderr, exit_status = mypy_api.run(
+            [
+                "--config-file",
+                str(config_file),
+                "--platform",
+                target_platform,
+                "--follow-imports=silent",
+                "--no-incremental",
+                str(durable_file),
+            ]
+        )
+        assert exit_status == 0, (
+            f"mypy --platform {target_platform} failed on durable.py (rc={exit_status}):\n"
+            f"stdout:\n{stdout}\nstderr:\n{stderr}"
+        )
+
+    if sys.platform == "win32":
+        fs_info = durable._detect_windows(tmp_path)
+        assert fs_info.fs_type in {"NTFS", "ReFS"}
+        assert fs_info.remote is False
+
+        src_file = tmp_path / "move-src.bin"
+        dst_file = tmp_path / "move-dst.bin"
+        src_file.write_bytes(b"win32-move-bytes-payload")
+        dst_file.write_bytes(b"old-bytes")
+        durable._move_file_ex(str(src_file), str(dst_file), 0x1 | 0x8)
+        assert dst_file.read_bytes() == b"win32-move-bytes-payload"
+        assert not src_file.exists()
+
+        with pytest.raises(OSError) as move_err:
+            durable._move_file_ex(str(tmp_path / "nonexistent-source.bin"), str(tmp_path / "unused-dst.bin"), 0x1 | 0x8)
+        assert move_err.value.winerror == 2

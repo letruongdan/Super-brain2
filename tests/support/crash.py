@@ -21,6 +21,7 @@ CHILD = Path(__file__).resolve().with_name("crash_child.py")
 CRASH_EXIT = 86
 CHILD_TIMEOUT = 60.0
 PAUSE_DEADLINE = 30.0
+PUMP_JOIN_S = CHILD_TIMEOUT
 _FAULT_VARS = ("SUPERBRAIN_CRASHPOINT", "SUPERBRAIN_PAUSEPOINT")
 _RUNPY = "import runpy,sys; runpy.run_path(sys.argv[1], run_name='__main__')"
 
@@ -121,7 +122,7 @@ def _finish(proc: "subprocess.Popen[str]") -> None:
         proc.wait(timeout=CHILD_TIMEOUT)
     except subprocess.TimeoutExpired:
         proc.kill()
-        proc.wait()
+        proc.wait(timeout=CHILD_TIMEOUT)
         raise AssertionError(f"paused child did not exit within {CHILD_TIMEOUT}s after resume") from None
 
 
@@ -157,7 +158,7 @@ def paused_child(
         yield proc
     finally:
         _finish(proc)
-        for pump in pumps:
-            pump.join(timeout=CHILD_TIMEOUT)
-        proc.stdout.close()
-        proc.stderr.close()
+        for pump, stream in zip(pumps, (proc.stderr, proc.stdout), strict=True):
+            pump.join(timeout=PUMP_JOIN_S)
+            if not pump.is_alive():  # Closing a stream a thread is still reading would block on its lock.
+                stream.close()

@@ -1,6 +1,7 @@
 import os
 import subprocess
 import sys
+import threading
 
 import pytest
 
@@ -63,6 +64,21 @@ def test_registry_contents() -> None:
 
 
 PAUSE = "from superbrain.core.faults import pausepoint; pausepoint('writer.held'); print('resumed')"
+PAUSE_MARKER_TIMEOUT_S = 30.0
+
+
+def read_pause_marker(proc: subprocess.Popen[str]) -> str:
+    """Return the child's next stderr line, or "" after killing a child that never writes one."""
+    assert proc.stderr is not None
+    stream = proc.stderr
+    line: list[str] = []
+    reader = threading.Thread(target=lambda: line.append(stream.readline()), daemon=True)
+    reader.start()
+    reader.join(PAUSE_MARKER_TIMEOUT_S)
+    if reader.is_alive():
+        proc.kill()
+        reader.join(10.0)
+    return "".join(line)
 
 
 def test_pausepoint_blocks_until_a_line_arrives_on_stdin() -> None:
@@ -73,7 +89,7 @@ def test_pausepoint_blocks_until_a_line_arrives_on_stdin() -> None:
     )
     try:
         assert proc.stderr is not None and proc.stdin is not None and proc.stdout is not None
-        assert proc.stderr.readline().strip() == "PAUSED writer.held"
+        assert read_pause_marker(proc).strip() == "PAUSED writer.held"
         assert proc.poll() is None
         proc.stdin.write("go\n")
         proc.stdin.flush()
@@ -100,7 +116,7 @@ def test_every_crashpoint_is_also_a_pausepoint() -> None:
     )
     try:
         assert proc.stderr is not None and proc.stdin is not None and proc.stdout is not None
-        assert proc.stderr.readline().strip() == "PAUSED cas.after_rename"
+        assert read_pause_marker(proc).strip() == "PAUSED cas.after_rename"
         assert proc.poll() is None
         proc.stdin.write("go\n")
         proc.stdin.flush()

@@ -21,6 +21,7 @@ from superbrain.adapters.os.permissions import owned_by_current_user
 from superbrain.core.canonical import digest_bytes
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.kernel import TrustedLocator, WorkspaceRegistration
+from superbrain.ports.os import OsAdapters
 
 _MAX_LOCATOR = 2048
 _FORBIDDEN_IN_PATH = re.compile(r"[\x00-\x20\x7f%\"'<>`|^{}]")
@@ -194,3 +195,55 @@ def build_registration(
         locator=canonical_remote_locator(raw_remote) if raw_remote is not None else None,
         provider_egress_enabled=provider_egress_enabled,
     )
+
+
+def _validate_dir_spelling(path: Path, os_: OsAdapters) -> str:
+    if not isinstance(path, Path):
+        raise _invalid()
+    raw = os.fspath(path)
+    if not raw or "\x00" in raw or len(raw) > 4096:
+        raise _invalid()
+    os_.paths.reject_unsafe_path(raw)
+    _reject_unsafe_spelling(raw)
+    if ".." in path.parts:
+        raise BrainError(ErrorCode.UNSAFE_PATH, "unsafe path")
+    if not path.is_absolute() or not _is_absolute(raw):
+        raise _invalid()
+    return raw
+
+
+def _is_within_checkout(chk_real: Path, cwd_real: Path) -> bool:
+    return cwd_real == chk_real or chk_real in cwd_real.parents
+
+
+def verify_launch_checkout(checkout_path: Path, launch_cwd: Path, os_: OsAdapters) -> None:
+    """Verify that ``launch_cwd`` is an owner-only, link-free directory inside ``checkout_path``."""
+    raw_chk = _validate_dir_spelling(checkout_path, os_)
+    raw_cwd = _validate_dir_spelling(launch_cwd, os_)
+
+    os_.paths.reject_links(checkout_path)
+    if os_.permissions.check_ancestors(checkout_path):
+        raise BrainError(ErrorCode.INSECURE_PERMISSIONS, "insecure permissions")
+    phys_chk = physical_checkout(raw_chk)
+    if os_.permissions.object_problems(checkout_path):
+        raise BrainError(ErrorCode.INSECURE_PERMISSIONS, "insecure permissions")
+
+    os_.paths.reject_links(launch_cwd)
+    try:
+        cwd_st = launch_cwd.lstat()
+    except OSError as err:
+        raise BrainError(ErrorCode.IDENTITY_MISMATCH, "identity mismatch") from err
+    if stat.S_ISLNK(cwd_st.st_mode):
+        raise BrainError(ErrorCode.UNSAFE_PATH, "unsafe path")
+    if not stat.S_ISDIR(cwd_st.st_mode):
+        raise BrainError(ErrorCode.IDENTITY_MISMATCH, "identity mismatch")
+    if os_.permissions.check_ancestors(launch_cwd):
+        raise BrainError(ErrorCode.INSECURE_PERMISSIONS, "insecure permissions")
+    if os_.permissions.object_problems(launch_cwd):
+        raise BrainError(ErrorCode.INSECURE_PERMISSIONS, "insecure permissions")
+    phys_cwd = physical_checkout(raw_cwd)
+
+    chk_real = Path(phys_chk.checkout_path)
+    cwd_real = Path(phys_cwd.checkout_path)
+    if not _is_within_checkout(chk_real, cwd_real):
+        raise BrainError(ErrorCode.IDENTITY_MISMATCH, "identity mismatch")

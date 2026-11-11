@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import contextlib
+import logging
+import math
 import signal
 import threading
+import time
 from collections.abc import Callable, Iterator, Mapping
 from datetime import datetime
 from pathlib import Path
@@ -17,6 +20,7 @@ from superbrain.application.deadlines import Reservation
 from superbrain.application.dispatch import KernelToolDomain
 from superbrain.application.jobs import JobService
 from superbrain.application.owner_loop import AuthGate, OwnerLoop, OwnerSession
+from superbrain.cli_api._loopback_server import LoopbackServer
 from superbrain.composition._daemon_session import (
     DaemonTestHooks,
     _AdmittedOwnerSession,
@@ -65,6 +69,8 @@ __all__ = [
     "serve",
     "serve_config_path",
 ]
+
+_LOGGER = logging.getLogger(__name__)
 
 
 def _check_tls_utc_window(clock: Clock, not_before: datetime, not_after: datetime) -> None:
@@ -356,32 +362,89 @@ def serve(
     """Run the foreground kernel daemon lifecycle for ``config`` and return process exit status."""
     if not isinstance(config, DaemonConfig):
         raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+    if (
+        isinstance(shutdown_grace_s, bool)
+        or not isinstance(shutdown_grace_s, (int, float))
+        or not math.isfinite(shutdown_grace_s)
+        or shutdown_grace_s <= 0
+    ):
+        raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+
+    adapters = os_ if os_ is not None else os_adapters(clock=clock, monotonic=monotonic_clock)
+    resolved_clock = clock if clock is not None else adapters.clock
+    resolved_mono = monotonic_clock if monotonic_clock is not None else adapters.monotonic
+    bound_listeners: list[BoundLoopbackListener] = []
 
     loop = create_daemon_owner_loop(
-        os_=os_,
-        clock=clock,
-        monotonic_clock=monotonic_clock,
+        os_=adapters,
+        clock=resolved_clock,
+        monotonic_clock=resolved_mono,
         domain=domain,
         job_handlers=job_handlers,
         hooks=hooks,
+        on_listener_bound=bound_listeners.append,
     )
     effective_stop = stop_event if stop_event is not None else threading.Event()
-    ready = loop.start(config)
-    try:
-        if on_ready is not None:
-            on_ready(ready, loop)
-        with _signal_stop_guard(effective_stop):
+    with _signal_stop_guard(effective_stop):
+        ready = loop.start(config)
+        server: LoopbackServer | None = None
+        try:
+            if len(bound_listeners) != 1:
+                raise BrainError(ErrorCode.DAEMON_UNAVAILABLE, "daemon unavailable")
+            bound = bound_listeners[0]
+            server = LoopbackServer(
+                listener=bound.sock,
+                ssl_context=bound.ssl_context,
+                ready=ready,
+                owner=loop,
+                monotonic_ns=resolved_mono.monotonic_ns,
+                stop_event=effective_stop,
+            )
+            server.start()
+        except BaseException as err:  # noqa: BLE001
+            code = err.code if isinstance(err, BrainError) else ErrorCode.INTEGRITY_FAILURE
+            _LOGGER.error("loopback server startup failed (phase=loopback_startup, code=%s)", code.value)
+            stop_deadline = time.perf_counter() + float(shutdown_grace_s)
+            if server is not None:
+                with contextlib.suppress(Exception):
+                    server.quiesce(stop_deadline)
+            rep = None
+            with contextlib.suppress(BrainError):
+                rep = loop.stop(grace_s=max(0.0, stop_deadline - time.perf_counter()))
+            if server is not None:
+                with contextlib.suppress(Exception):
+                    server.finish(stop_deadline)
+            if rep is not None and rep.state is ShutdownState.OVERRUN:
+                with contextlib.suppress(BrainError):
+                    loop.wait_closed()
+            if isinstance(err, (KeyboardInterrupt, SystemExit)):
+                raise
+            return 1
+
+        try:
+            if on_ready is not None:
+                on_ready(ready, loop)
             try:
-                while not effective_stop.wait(timeout=0.25):
+                while not effective_stop.wait(timeout=0.02):
                     if loop.is_stopping or loop.wait_closed(timeout=0.0) is not None:
                         break
             except KeyboardInterrupt:
                 effective_stop.set()
-    finally:
-        report = loop.stop(grace_s=shutdown_grace_s)
-        if report.state is ShutdownState.OVERRUN:
-            loop.wait_closed()
-    return 0 if report.state is ShutdownState.STOPPED else 1
+        finally:
+            stop_deadline = time.perf_counter() + float(shutdown_grace_s)
+            quiesce_ok = True
+            try:
+                server.quiesce(stop_deadline)
+            except Exception:  # noqa: BLE001
+                quiesce_ok = False
+            report = loop.stop(grace_s=max(0.0, stop_deadline - time.perf_counter()))
+            try:
+                transport_ok = server.finish(stop_deadline) and quiesce_ok
+            except Exception:  # noqa: BLE001
+                transport_ok = False
+            if report.state is ShutdownState.OVERRUN:
+                loop.wait_closed()
+        return 0 if (report.state is ShutdownState.STOPPED and report.endpoint_removed and transport_ok) else 1
 
 
 def serve_config_path(

@@ -107,21 +107,6 @@ def _fsync_directory(path: Path, *, nt: bool = os.name == "nt") -> bool:
         os.close(descriptor)
 
 
-def _move_file_ex(src: str, dst: str, flags: int) -> None:
-    """Call kernel32 ``MoveFileExW``; raise ``OSError`` carrying ``winerror`` on failure."""
-    if sys.platform != "win32":
-        raise OSError(errno.ENOSYS, "MoveFileExW is only available on Windows")
-    import ctypes
-    from ctypes import wintypes
-
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    function = kernel32.MoveFileExW
-    function.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD]
-    function.restype = wintypes.BOOL
-    if not function(src, dst, flags):
-        raise ctypes.WinError(ctypes.get_last_error())
-
-
 # --------------------------------------------------------------------------------------------------
 # Filesystem detection
 
@@ -172,6 +157,62 @@ def _existing_ancestor(path: Path) -> Path:
     return candidate
 
 
+if sys.platform == "win32":
+    import ctypes as _win_ctypes
+    from ctypes import wintypes as _win_wintypes
+
+    _KERNEL32 = _win_ctypes.WinDLL("kernel32", use_last_error=True)
+    _MOVE_FILE_EX_W = _KERNEL32.MoveFileExW
+    _MOVE_FILE_EX_W.argtypes = [_win_wintypes.LPCWSTR, _win_wintypes.LPCWSTR, _win_wintypes.DWORD]
+    _MOVE_FILE_EX_W.restype = _win_wintypes.BOOL
+    _GET_VOLUME_PATH_NAME_W = _KERNEL32.GetVolumePathNameW
+    _GET_VOLUME_PATH_NAME_W.argtypes = [_win_wintypes.LPCWSTR, _win_wintypes.LPWSTR, _win_wintypes.DWORD]
+    _GET_VOLUME_PATH_NAME_W.restype = _win_wintypes.BOOL
+    _GET_VOLUME_INFORMATION_W = _KERNEL32.GetVolumeInformationW
+    _GET_VOLUME_INFORMATION_W.argtypes = [
+        _win_wintypes.LPCWSTR,
+        _win_wintypes.LPWSTR,
+        _win_wintypes.DWORD,
+        _win_wintypes.LPDWORD,
+        _win_wintypes.LPDWORD,
+        _win_wintypes.LPDWORD,
+        _win_wintypes.LPWSTR,
+        _win_wintypes.DWORD,
+    ]
+    _GET_VOLUME_INFORMATION_W.restype = _win_wintypes.BOOL
+    _GET_DRIVE_TYPE_W = _KERNEL32.GetDriveTypeW
+    _GET_DRIVE_TYPE_W.argtypes = [_win_wintypes.LPCWSTR]
+    _GET_DRIVE_TYPE_W.restype = _win_wintypes.UINT
+
+    def _move_file_ex(src: str, dst: str, flags: int) -> None:
+        """Call kernel32 ``MoveFileExW``; raise ``OSError`` carrying ``winerror`` on failure."""
+        if not _MOVE_FILE_EX_W(src, dst, flags):
+            raise _win_ctypes.WinError(_win_ctypes.get_last_error())
+
+    def _detect_windows(path: Path) -> FsInfo:
+        root = _win_ctypes.create_unicode_buffer(32768)
+        if not _GET_VOLUME_PATH_NAME_W(str(_existing_ancestor(path)), root, len(root)):
+            raise _win_ctypes.WinError(_win_ctypes.get_last_error())
+        name = _win_ctypes.create_unicode_buffer(261)
+        if not _GET_VOLUME_INFORMATION_W(root.value, None, 0, None, None, None, name, len(name)):
+            raise _win_ctypes.WinError(_win_ctypes.get_last_error())
+        kind = _GET_DRIVE_TYPE_W(root.value)
+        if kind == _DRIVE_REMOTE:
+            return FsInfo(name.value, True)
+        if kind != _DRIVE_FIXED:
+            # Removable, RAM disk or undetermined drives are never claimed power-loss durable.
+            return FsInfo(f"{name.value} (drive type {kind})", False)
+        return FsInfo(name.value, False)
+else:
+
+    def _move_file_ex(src: str, dst: str, flags: int) -> None:
+        """Call kernel32 ``MoveFileExW``; raise ``OSError`` carrying ``winerror`` on failure."""
+        raise OSError(errno.ENOSYS, "MoveFileExW is only available on Windows")
+
+    def _detect_windows(path: Path) -> FsInfo:
+        raise OSError(errno.ENOSYS, "Windows only")
+
+
 def _detect_linux(path: Path) -> FsInfo:
     with open("/proc/self/mountinfo", "rb") as handle:
         return _fs_from_mountinfo(handle.read(), os.fsencode(_existing_ancestor(path)))
@@ -215,47 +256,6 @@ def _detect_darwin(path: Path) -> FsInfo:
         raise OSError(ctypes.get_errno(), "statfs failed")
     fs_type = bytes(buffer.f_fstypename).decode(errors="replace").lower()
     return FsInfo(fs_type, not buffer.f_flags & mnt_local)
-
-
-def _detect_windows(path: Path) -> FsInfo:
-    if sys.platform != "win32":
-        raise OSError(errno.ENOSYS, "Windows only")
-    import ctypes
-    from ctypes import wintypes
-
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    volume_path = kernel32.GetVolumePathNameW
-    volume_path.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
-    volume_path.restype = wintypes.BOOL
-    volume_info = kernel32.GetVolumeInformationW
-    volume_info.argtypes = [
-        wintypes.LPCWSTR,
-        wintypes.LPWSTR,
-        wintypes.DWORD,
-        wintypes.LPDWORD,
-        wintypes.LPDWORD,
-        wintypes.LPDWORD,
-        wintypes.LPWSTR,
-        wintypes.DWORD,
-    ]
-    volume_info.restype = wintypes.BOOL
-    drive_type = kernel32.GetDriveTypeW
-    drive_type.argtypes = [wintypes.LPCWSTR]
-    drive_type.restype = wintypes.UINT
-
-    root = ctypes.create_unicode_buffer(32768)
-    if not volume_path(str(_existing_ancestor(path)), root, len(root)):
-        raise ctypes.WinError(ctypes.get_last_error())
-    name = ctypes.create_unicode_buffer(261)
-    if not volume_info(root.value, None, 0, None, None, None, name, len(name)):
-        raise ctypes.WinError(ctypes.get_last_error())
-    kind = drive_type(root.value)
-    if kind == _DRIVE_REMOTE:
-        return FsInfo(name.value, True)
-    if kind != _DRIVE_FIXED:
-        # Removable, RAM disk or undetermined drives are never claimed power-loss durable.
-        return FsInfo(f"{name.value} (drive type {kind})", False)
-    return FsInfo(name.value, False)
 
 
 def detect_fs(path: Path) -> FsInfo:
