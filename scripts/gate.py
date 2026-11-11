@@ -603,7 +603,7 @@ def run_gate(
         ev.write(artifact, report)
         try:
             ids, observed = _parse_junit(report, root=worktree)
-        except (ValueError, ET.ParseError) as err:
+        except (ValueError, LookupError, ET.ParseError) as err:
             extra.append(f"{label}: the report could not be parsed: {err}")
             ids, observed = [], {}
         xpassed, problems = parse_xpassed(output, observed)
@@ -620,26 +620,40 @@ def run_gate(
         started = time.monotonic()
         paths = [junit.with_name(f"{junit.stem}-shard-{index}.xml") for index in range(len(groups))]
         junit_paths.extend(paths)
+        results: list[tuple[int | None, str, float, str | None] | None] = [None] * len(groups)
 
-        def run_shard(index: int) -> tuple[int | None, str, float, str | None] | None:
+        def run_shard(index: int) -> None:
             timeout = min(PHASE_TIMEOUTS_S["pytest"], deadline - time.monotonic())
             if timeout <= 0:
-                return None
+                return
             cmd = _uv(worktree, python, "pytest", f"--junitxml={paths[index]}", "-q", "-rfEX", *groups[index])
-            return step(f"pytest-shard-{index}", cmd, worktree, timeout)
+            result = step(f"pytest-shard-{index}", cmd, worktree, timeout)
+            with record_lock:
+                results[index] = result
 
-        with ThreadPoolExecutor(max_workers=len(groups)) as pool:
-            results = list(pool.map(run_shard, range(len(groups))))
+        execution_failed = False
+        try:
+            with ThreadPoolExecutor(max_workers=len(groups)) as pool:
+                for _ in pool.map(run_shard, range(len(groups))):
+                    pass
+        except Exception as err:  # noqa: BLE001 - drained workers still have evidence to collect
+            execution_failed = True
+            extra.append(f"phase pytest shard launch or execution failed: {type(err).__name__}: {err}")
         ended = time.monotonic()
         codes: list[int | None] = []
-        runner_error = False
+        runner_error = execution_failed
         expected: dict[str, set[str]] = {file: set() for group in groups for file in group}
         for node in collected:
             expected[node.split("::", 1)[0]].add(node)
         for index, result in enumerate(results):
             name = f"pytest-shard-{index}"
             if result is None:
-                extra.append(f"phase {name} not started: the {TEST_JOB_BUDGET_S:.0f}s test-job budget was spent")
+                reason = (
+                    "shard execution failed"
+                    if execution_failed
+                    else f"the {TEST_JOB_BUDGET_S:.0f}s test-job budget was spent"
+                )
+                extra.append(f"phase {name} not started: {reason}")
                 codes.append(None)
                 continue
             code, output, _, error = result
