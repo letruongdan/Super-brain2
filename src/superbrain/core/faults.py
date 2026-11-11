@@ -29,6 +29,11 @@ KNOWN_CRASHPOINTS: frozenset[str] = frozenset({
     "kernel.migrate.after_policy_swap",
     "kernel.before_commit",
     "kernel.after_commit_before_response",
+    "jobs.after_lease",
+    "jobs.after_running",
+    "jobs.after_invocation_reserve",
+    "jobs.after_cancel_commit",
+    "jobs.after_usage_settle_commit",
 })
 
 KNOWN_PAUSEPOINTS: frozenset[str] = KNOWN_CRASHPOINTS | {"writer.held"}

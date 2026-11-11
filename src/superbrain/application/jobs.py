@@ -15,6 +15,7 @@ from datetime import datetime
 
 from superbrain.core.canonical import digest_bytes
 from superbrain.core.errors import BrainError, ErrorCode
+from superbrain.core.faults import crashpoint
 from superbrain.core.ids import new_id
 from superbrain.core.jsonvalue import JsonValue
 from superbrain.core.kernel import (
@@ -153,7 +154,10 @@ class JobService:
             tx.append_record(KernelRecord("job.leased", _lease_meta(claimed)))
             return claimed
 
-        return self._store.transact(lease)
+        claimed = self._store.transact(lease)
+        if claimed is not None:
+            crashpoint("jobs.after_lease")
+        return claimed
 
     def start(self, lease: JobLease) -> None:
         """``leased -> running`` under exactly ``lease``."""
@@ -164,6 +168,7 @@ class JobService:
             tx.append_record(KernelRecord("job.running", _lease_meta(lease)))
 
         self._store.transact(start)
+        crashpoint("jobs.after_running")
 
     def job_spec(self, lease: JobLease) -> JobSpec:
         """The immutable ``JobSpec`` (payload read from CAS) the owner hands to the worker for ``lease``."""
@@ -252,6 +257,7 @@ class JobService:
             tx.append_record(KernelRecord("provider.reserved", meta))
 
         self._store.transact(reserve)
+        crashpoint("jobs.after_invocation_reserve")
         return invocation_id
 
     def settle_usage(self, invocation_id: str, usage: UsageRecord) -> None:
@@ -260,18 +266,18 @@ class JobService:
         usage_digest = digest_bytes(descriptor)
         self._stager.stage_blob(descriptor)
 
-        def settle(tx: KernelTx) -> None:
+        def settle(tx: KernelTx) -> bool:
             invocation = tx.read_invocation(invocation_id)
             if invocation is None:
                 raise _not_found()
             if invocation.state is InvocationState.SETTLED:
                 if usage.complete and invocation.usage_digest == usage_digest:
-                    return
+                    return False
                 raise BrainError(ErrorCode.IDEMPOTENCY_CONFLICT, "idempotency conflict")
             if not usage.complete:
                 if invocation.state is InvocationState.OUTCOME_UNKNOWN and invocation.usage_complete is False:
                     if invocation.usage_digest == usage_digest:
-                        return
+                        return False
                     raise BrainError(ErrorCode.IDEMPOTENCY_CONFLICT, "idempotency conflict")
                 prior_usage_digest: str | None = None
             else:
@@ -285,8 +291,10 @@ class JobService:
                 "complete": usage.complete,
             }
             tx.append_record(KernelRecord("provider.settled", meta))
+            return True
 
-        self._store.transact(settle)
+        if self._store.transact(settle):
+            crashpoint("jobs.after_usage_settle_commit")
 
     # --- authorized reads and cancellation ----------------------------------------------------------------------
 
@@ -320,6 +328,7 @@ class JobService:
             return row.state
 
         prior = self._store.transact(cancel)
+        crashpoint("jobs.after_cancel_commit")
         if prior is not JobState.QUEUED and self._cancel_signal is not None:
             self._cancel_signal(job_id)
         return JobState.CANCELLED
