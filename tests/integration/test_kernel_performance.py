@@ -6,12 +6,16 @@ import copy
 import hashlib
 import json
 import math
+import os
 import re
 import runpy
+import subprocess
 import sys
 from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import asdict, replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 import jsonschema
@@ -582,6 +586,248 @@ def test_unclosed_tail_exercises_filter_with_full_size_valid_positive_twin() -> 
     with pytest.raises(BrainError) as caught:
         PrivacyFilter().apply(payload, FilterPolicy())
     assert caught.value.code is ErrorCode.INVALID_INPUT
+
+
+@pytest.mark.parametrize("wire_error", [True, False])
+def test_real_collector_checkpoints_the_attempted_wire_sample_when_transport_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, wire_error: bool
+) -> None:
+    from scripts import perf_probe
+    from tests.support import inc2_cli, inc2_fixture, inc2_t8_harness
+
+    monkeypatch.setattr(perf_gate, "source_identity", lambda repo: SOURCE)
+    monkeypatch.setattr(perf_gate, "WARMUP_CALLS", 1)
+    monkeypatch.setattr(perf_gate, "WARM_PREPARE_SAMPLES", 1)
+    monkeypatch.setattr(perf_gate, "COLD_CLIENT_SPAWNS", 0)
+    wheel = tmp_path / "fixture.whl"
+    wheel.write_bytes(b"synthetic wheel identity for the collector boundary")
+    env = SimpleNamespace(
+        wheel_path=wheel, venv_dir=tmp_path / "venv", venv_python=tmp_path / "venv" / "python",
+        source_schema_sha256=SCHEMA.removeprefix("sha256:"),
+    )
+    binding = SimpleNamespace(
+        alias="fixture-ws", checkout_path=tmp_path, repo_id="repo-perf", checkout_id="checkout-perf",
+    )
+    template = SimpleNamespace(
+        ws_a=binding, store_id="store-perf", cred=SimpleNamespace(token="fixture-token"),
+        tls=SimpleNamespace(
+            cert_path=tmp_path / "cert", key_path=tmp_path / "key", ca_cert_path=tmp_path / "ca",
+            leaf_cert_sha256="f" * 64,
+        ),
+    )
+    wire_args: dict[str, JsonValue] = {
+        "schema_version": "2.0", "task_id": "task-perf", "session_id": "session-perf",
+        "idempotency_key": "wire-failed-0001", "evidence": [],
+    }
+    attempted: list[dict[str, JsonValue]] = []
+    records: list[dict[str, JsonValue]] = []
+
+    class RecordQueue:
+        def get(self, *, timeout: float) -> dict[str, JsonValue]:
+            return records.pop(0)
+
+    class Shim:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self._proc = SimpleNamespace(pid=4242)
+
+        def __enter__(self) -> Shim:
+            return self
+
+        def __exit__(self, *args: Any) -> None:
+            pass
+
+        def send_frames_and_expect_response(
+            self, frames: list[dict[str, JsonValue]], **kwargs: Any
+        ) -> dict[str, JsonValue]:
+            frame = frames[0]
+            if frame.get("method") == "initialize":
+                return cast(dict[str, JsonValue], cold_sample(0)["first_frame"])
+            params = frame["params"]
+            assert isinstance(params, dict)
+            if params["name"] == "submit_episode":
+                attempted.append(frame)
+                if wire_error:
+                    raise OSError("fixture wire send/read failed")
+                records.append({
+                    "idempotency_key": wire_args["idempotency_key"], "status": "ok",
+                    "filter_start_ns": 1_000_000, "filter_end_ns": 2_000_000,
+                    "filter_ran": True, "filter_bytes": len(canonical_json(wire_args)),
+                    "redacted_count": 1, "stripped_keys_count": 1, "positive_control_preserved": True,
+                })
+                return {"result": {"structuredContent": {"ok": True, "data": {}}}}
+            arguments = params["arguments"]
+            assert isinstance(arguments, dict)
+            sample = warm_sample(len(records))
+            sample["idempotency_key"] = str(arguments["idempotency_key"])
+            records.append(sample)
+            return {"result": {"structuredContent": {"ok": True, "data": {"delivery_id": "fixture-delivery"}}}}
+
+    @contextmanager
+    def installed(scratch: Path) -> Iterator[Any]:
+        yield env
+
+    @contextmanager
+    def daemon(*args: Any) -> Iterator[Any]:
+        attempt = args[-1]
+        (attempt / "daemon.stderr").write_bytes(b"fixture daemon stderr")
+        (attempt / "daemon.jsonl").write_bytes(b'{"event":"fixture-ready"}\n')
+        yield SimpleNamespace(pid=4243), RecordQueue()
+
+    monkeypatch.setattr(inc2_cli, "InstalledMcpPipeSession", Shim)
+    monkeypatch.setattr(inc2_cli, "get_shared_t7_transport_template", lambda: template)
+    monkeypatch.setattr(inc2_cli, "verify_installed_wheel_isolation", lambda *args, **kwargs: {
+        "schema_sha256": env.source_schema_sha256, "module_file": str(env.venv_dir / "superbrain" / "__init__.py"),
+    })
+    monkeypatch.setattr(inc2_cli, "write_daemon_config_file", lambda path, **kwargs: path)
+    monkeypatch.setattr(inc2_cli, "write_credential_file", lambda path, *args: path)
+    monkeypatch.setattr(inc2_cli, "write_client_profile_file", lambda path, **kwargs: (path, "fixture-digest"))
+    monkeypatch.setattr(inc2_fixture, "open_inc2_installed_env", installed)
+    monkeypatch.setattr(inc2_t8_harness, "clone_template_root", lambda template, root: root)
+    monkeypatch.setattr(inc2_t8_harness, "store_rows", lambda *args: [("task-perf",)])
+    monkeypatch.setattr(perf_probe, "_daemon", daemon)
+    monkeypatch.setattr(perf_probe, "_local_privacy", lambda *args, **kwargs: None)
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: SimpleNamespace(stdout=json.dumps({
+        "version": "3.14.3", "implementation": "cpython", "executable": str(env.venv_python),
+    })))
+    monkeypatch.setattr(
+        perf_gate, "build_wire_privacy_sample", lambda: (dict(wire_args), len(canonical_json(wire_args)), 0),
+    )
+
+    receipt, path = perf_gate.run_benchmark(tmp_path, evidence_dir=tmp_path / "evidence")
+    observed = cast(Any, receipt)
+    assert_refused(observed)
+    assert len(observed["warm_prepare"]["warmup"]) == len(observed["warm_prepare"]["samples"]) == 1
+    wire_samples = observed["privacy_local"]["wire_samples"]
+    assert len(wire_samples) == 1, "the attempted wire request must retain exactly one terminal sample"
+    (failed,) = wire_samples
+    assert failed["idempotency_key"] == wire_args["idempotency_key"]
+    assert failed["wire_bytes"] == len(canonical_json(attempted[0]))
+    assert failed["status"] == ("transport_error" if wire_error else "ok")
+    assert observed["privacy_local"]["accepted"] is False
+    manifest = observed["evidence"]["manifest"]
+    for name in ("measurements-progress.json", "daemon.stderr", "daemon.jsonl"):
+        assert manifest[name] == digest_bytes((path.parent / name).read_bytes())
+    progress = json.loads((path.parent / "measurements-progress.json").read_bytes())
+    assert progress["privacy_local"]["wire_samples"] == [failed]
+
+
+def test_real_collector_progress_survives_transient_permission_error_and_cleans_temp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scripts import perf_probe
+    from tests.support import inc2_cli, inc2_fixture, inc2_t8_harness
+
+    monkeypatch.setattr(perf_gate, "source_identity", lambda repo: SOURCE)
+    monkeypatch.setattr(perf_gate, "WARMUP_CALLS", 1)
+    monkeypatch.setattr(perf_gate, "WARM_PREPARE_SAMPLES", 1)
+    monkeypatch.setattr(perf_gate, "COLD_CLIENT_SPAWNS", 0)
+    wheel = tmp_path / "fixture.whl"
+    wheel.write_bytes(b"synthetic wheel identity for the collector boundary")
+    env = SimpleNamespace(
+        wheel_path=wheel, venv_dir=tmp_path / "venv", venv_python=tmp_path / "venv" / "python",
+        source_schema_sha256=SCHEMA.removeprefix("sha256:"),
+    )
+    binding = SimpleNamespace(
+        alias="fixture-ws", checkout_path=tmp_path, repo_id="repo-perf", checkout_id="checkout-perf",
+    )
+    template = SimpleNamespace(
+        ws_a=binding, store_id="store-perf", cred=SimpleNamespace(token="fixture-token"),
+        tls=SimpleNamespace(
+            cert_path=tmp_path / "cert", key_path=tmp_path / "key", ca_cert_path=tmp_path / "ca",
+            leaf_cert_sha256="f" * 64,
+        ),
+    )
+    wire_args: dict[str, JsonValue] = {
+        "schema_version": "2.0", "task_id": "task-perf", "session_id": "session-perf",
+        "idempotency_key": "wire-transient-0001", "evidence": [],
+    }
+    records: list[dict[str, JsonValue]] = []
+
+    class RecordQueue:
+        def get(self, *, timeout: float) -> dict[str, JsonValue]:
+            return records.pop(0)
+
+    class Shim:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self._proc = SimpleNamespace(pid=4242)
+
+        def __enter__(self) -> Shim:
+            return self
+
+        def __exit__(self, *args: Any) -> None:
+            pass
+
+        def send_frames_and_expect_response(
+            self, frames: list[dict[str, JsonValue]], **kwargs: Any
+        ) -> dict[str, JsonValue]:
+            frame = frames[0]
+            if frame.get("method") == "initialize":
+                return cast(dict[str, JsonValue], cold_sample(0)["first_frame"])
+            params = frame["params"]
+            assert isinstance(params, dict)
+            if params["name"] == "submit_episode":
+                records.append({
+                    "idempotency_key": wire_args["idempotency_key"], "status": "ok",
+                    "filter_start_ns": 1_000_000, "filter_end_ns": 2_000_000,
+                    "filter_ran": True, "filter_bytes": len(canonical_json(wire_args)),
+                    "redacted_count": 1, "stripped_keys_count": 1, "positive_control_preserved": True,
+                })
+                return {"result": {"structuredContent": {"ok": True, "data": {}}}}
+            arguments = params["arguments"]
+            assert isinstance(arguments, dict)
+            sample = warm_sample(len(records))
+            sample["idempotency_key"] = str(arguments["idempotency_key"])
+            records.append(sample)
+            return {"result": {"structuredContent": {"ok": True, "data": {"delivery_id": "fixture-delivery"}}}}
+
+    @contextmanager
+    def installed(scratch: Path) -> Iterator[Any]:
+        yield env
+
+    @contextmanager
+    def daemon(*args: Any) -> Iterator[Any]:
+        attempt = args[-1]
+        (attempt / "daemon.stderr").write_bytes(b"fixture daemon stderr")
+        (attempt / "daemon.jsonl").write_bytes(b'{"event":"fixture-ready"}\n')
+        yield SimpleNamespace(pid=4243), RecordQueue()
+
+    fail_count = 2
+    real_replace = os.replace
+
+    def flaky_replace(src: Path | str, dst: Path | str) -> None:
+        nonlocal fail_count
+        if "measurements-progress" in str(dst) and fail_count > 0:
+            fail_count -= 1
+            raise PermissionError(13, "Access is denied (sharing violation)")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", flaky_replace)
+    monkeypatch.setattr(inc2_cli, "InstalledMcpPipeSession", Shim)
+    monkeypatch.setattr(inc2_cli, "get_shared_t7_transport_template", lambda: template)
+    monkeypatch.setattr(inc2_cli, "verify_installed_wheel_isolation", lambda *args, **kwargs: {
+        "schema_sha256": env.source_schema_sha256, "module_file": str(env.venv_dir / "superbrain" / "__init__.py"),
+    })
+    monkeypatch.setattr(inc2_cli, "write_daemon_config_file", lambda path, **kwargs: path)
+    monkeypatch.setattr(inc2_cli, "write_credential_file", lambda path, *args: path)
+    monkeypatch.setattr(inc2_cli, "write_client_profile_file", lambda path, **kwargs: (path, "fixture-digest"))
+    monkeypatch.setattr(inc2_fixture, "open_inc2_installed_env", installed)
+    monkeypatch.setattr(inc2_t8_harness, "clone_template_root", lambda template, root: root)
+    monkeypatch.setattr(inc2_t8_harness, "store_rows", lambda *args: [("task-perf",)])
+    monkeypatch.setattr(perf_probe, "_daemon", daemon)
+    monkeypatch.setattr(perf_probe, "_local_privacy", lambda *args, **kwargs: None)
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: SimpleNamespace(stdout=json.dumps({
+        "version": "3.14.3", "implementation": "cpython", "executable": str(env.venv_python),
+    })))
+    monkeypatch.setattr(
+        perf_gate, "build_wire_privacy_sample", lambda: (dict(wire_args), len(canonical_json(wire_args)), 0),
+    )
+
+    receipt, path = perf_gate.run_benchmark(tmp_path, evidence_dir=tmp_path / "evidence")
+    observed = cast(Any, receipt)
+    assert not any("PermissionError" in str(r) for r in observed.get("reasons", []))
+    assert fail_count == 0, "expected transient PermissionError to have been triggered and retried"
+    stray = list(path.parent.glob(".*tmp*"))
+    assert not stray, f"stray progress temp file was left behind: {stray}"
 
 
 if __name__ == "__main__":
