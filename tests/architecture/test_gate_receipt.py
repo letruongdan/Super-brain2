@@ -1700,3 +1700,85 @@ def test_cli_rejects_a_zero_shard_count_before_starting_the_gate(
     code, _, err = gate_cli(tmp_path, monkeypatch, capsys, runner, "--shards", "0")
     assert code == 2 and "shards" in err
     assert not runner.calls
+
+
+def test_shard_thread_start_failure_preserves_every_finished_shard_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = ShardRunner()
+    first_running = threading.Event()
+    finish = threading.Event()
+    start = threading.Thread.start
+    starts = 0
+
+    def report(argv: list[str], files: list[str], behavior: str) -> tuple[int | None, str]:
+        first_running.set()
+        assert finish.wait(timeout=5.0), "the second worker did not reach the fault boundary"
+        return ShardRunner.report(argv, files, behavior)
+
+    def fail_second_start(thread: threading.Thread) -> None:
+        nonlocal starts
+        starts += 1
+        if starts == 2:
+            assert first_running.wait(timeout=5.0), "no healthy shard started before the launch fault"
+            finish.set()
+            raise RuntimeError("synthetic thread start failure")
+        start(thread)
+
+    monkeypatch.setattr(runner, "report", report)
+    monkeypatch.setattr(threading.Thread, "start", fail_second_start)
+    try:
+        attempt, receipt = _run_shards(tmp_path, monkeypatch, runner)
+    finally:
+        finish.set()
+    assert starts >= 2
+    assert receipt["accepted"] is False
+    calls = _pytest_calls(runner)
+    assert calls, "the launch fault was never tested against a started shard"
+    expected: dict[str, str] = {}
+    # A callable queued before the failed Thread.start can run when the first worker drains its queue.
+    # Require evidence for each invocation observed at the process seam, independently of that scheduling choice.
+    for call in calls:
+        (file,) = _selected_pytest_files(call.argv, call.cwd)
+        (step,) = [step for step in receipt["steps"] if step["command"] == call.argv]
+        assert step["exit_code"] == 0
+        index = step["name"].removeprefix("pytest-shard-")
+        xml = attempt / f"junit-shard-{index}.xml"
+        assert xml.is_file(), f"completed {step['name']} lost its raw JUnit after another worker failed to start"
+        assert xml.read_bytes() == _junit_for_shard(SHARD_IDS[file])
+        expected.update(dict.fromkeys(SHARD_IDS[file], "passed"))
+    assert receipt["outcomes"] == expected
+    assert any(
+        "pytest" in reason.lower() and "shard" in reason.lower()
+        and any(word in reason.lower() for word in ("launch", "start", "thread"))
+        for reason in receipt["reasons"]
+    ), receipt["reasons"]
+
+
+def test_unknown_junit_encoding_keeps_its_raw_bytes_and_later_shard_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = ShardRunner()
+    bad_xml = b'<?xml version="1.0" encoding="x-no-such-encoding"?><testsuites/>'
+    (bad_file,), (healthy_file,) = gate.shard_files(ALL_SHARD_IDS, 2)
+
+    def report(argv: list[str], files: list[str], behavior: str) -> tuple[int | None, str]:
+        result = ShardRunner.report(argv, files, behavior)
+        if files == [bad_file]:
+            path = Path(next(arg.split("=", 1)[1] for arg in argv if arg.startswith("--junitxml=")))
+            path.write_bytes(bad_xml)
+        return result
+
+    monkeypatch.setattr(runner, "report", report)
+    attempt, receipt = _run_shards(tmp_path, monkeypatch, runner)
+    assert receipt["accepted"] is False
+    assert all(step["exit_code"] == 0 for step in _shard_steps(receipt))
+    assert (attempt / "junit-shard-0.xml").read_bytes() == bad_xml
+    healthy_xml = attempt / "junit-shard-1.xml"
+    assert healthy_xml.is_file(), "the encoding error discarded the healthy shard's raw JUnit"
+    assert healthy_xml.read_bytes() == _junit_for_shard(SHARD_IDS[healthy_file])
+    assert receipt["outcomes"] == dict.fromkeys(SHARD_IDS[healthy_file], "passed")
+    assert any(
+        "pytest-shard-0" in reason and any(word in reason.lower() for word in ("encoding", "parse"))
+        for reason in receipt["reasons"]
+    ), receipt["reasons"]
