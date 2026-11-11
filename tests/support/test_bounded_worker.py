@@ -338,7 +338,7 @@ for raw in sys.stdin.buffer:
     sys.stdout.write('{"jsonrpc":"2.0","id":1,"result":{"pid":%d}}\n' % os.getpid())
     sys.stdout.flush()
     if mode == "stop_after_first":
-        sys.stderr.write("diagnostic-note-7f3a\n")
+        sys.stderr.write("diagnostic-note-" + "7f3a\n")  # Split: the session label quotes this script's source.
         sys.stderr.flush()
         time.sleep(120)
 """
