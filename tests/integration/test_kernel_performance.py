@@ -314,6 +314,11 @@ def has_positive(value: JsonValue) -> bool:
     return isinstance(value, list) and any(has_positive(item) for item in value)
 
 
+def nesting_depth(value: JsonValue) -> int:
+    children = value.values() if isinstance(value, dict) else value if isinstance(value, list) else ()
+    return 1 + max((nesting_depth(item) for item in children), default=0)
+
+
 @pytest.mark.parametrize("kib", [256, 512, 768, 1024])
 def test_adversarial_corpus_reaches_the_actual_filter_at_the_requested_size(kib: int) -> None:
     payload, reported = perf_gate.build_privacy_corpus_sample(kib, 0)
@@ -321,13 +326,25 @@ def test_adversarial_corpus_reaches_the_actual_filter_at_the_requested_size(kib:
     assert reported == len(raw) == kib * 1024
     assert payload == perf_gate.build_privacy_corpus_sample(kib, 0)[0]
     text = list(string_leaves(payload))
-    assert max(len(item.encode("utf-8")) for item in text) <= 65536
+    assert max(len(item.encode("utf-8")) for item in text) == 65536
+    assert nesting_depth(payload) >= 3
     assert any("://" in item and "@" in item for item in text)
     assert any("<private>" in item for item in text)
     assert any(len(item) >= 24 for item in text)
     result = PrivacyFilter().apply(payload, FilterPolicy())
     assert result.redacted_count > 0 and result.stripped_keys_count > 0
     assert has_positive(result.value)
+
+
+def test_adversarial_work_grows_with_body_size_instead_of_benign_padding() -> None:
+    small, _ = perf_gate.build_privacy_corpus_sample(256, 0)
+    large, _ = perf_gate.build_privacy_corpus_sample(1024, 0)
+    small_text = "\n".join(string_leaves(small))
+    large_text = "\n".join(string_leaves(large))
+    for pattern in ("<private>", "://"):
+        count = small_text.count(pattern)
+        assert count > 0
+        assert 3 * count <= large_text.count(pattern) <= 5 * count
 
 
 def test_unclosed_private_tail_is_rejected_by_the_filter_after_a_bounded_valid_prefix() -> None:
