@@ -21,8 +21,15 @@ import math
 import re
 import time
 import unicodedata
-from collections import Counter
-from collections.abc import Callable
+
+try:
+    from _collections import _count_elements  # type: ignore[import-not-found]
+except ImportError:
+
+    def _count_elements(mapping: dict[str, int], iterable: str) -> None:
+        for elem in iterable:
+            mapping[elem] = mapping.get(elem, 0) + 1
+from collections.abc import Callable, Mapping
 from functools import lru_cache
 
 from superbrain.core.canonical import canonical_json
@@ -82,6 +89,8 @@ _FIXED_TOKEN_PREFIX = re.compile(r"github_pat_|gh[pousr]_|sk-|AKIA|ASIA|xox[bapr
 _DEFAULT_PATH_NEEDLE = re.compile(
     r"\.env|\.ssh|id_|\.aws|credentials|\.npmrc|\.pypirc|\.netrc|_netrc|\.pem|\.key|\.p12|\.pfx"
 )
+_AUTH_SCHEME_NEEDLE = re.compile(r"bearer|basic|token")
+_KEY_VALUE_NEEDLE = re.compile(r"pass|pwd|secret|api|access|refresh|client|auth|private")
 _PATH_SPLIT = re.compile(r"[\\/]+")
 _PATH_LEAD = "`*([{<\"'"
 _PATH_TRAIL = "`*)]}>\"'.,:;!?"
@@ -119,14 +128,16 @@ def _joined_key(key: str) -> str:
     return "".join(_key_words(key))
 
 
-def _shannon_from_counts(counts: Counter[str], total: int) -> float:
+def _shannon_from_counts(counts: Mapping[str, int], total: int) -> float:
     if total <= 256:
-        return -sum(map(_entropy_weights(total).__getitem__, counts.values()))
-    return -sum((count / total) * math.log2(count / total) for count in counts.values())
+        weights = _entropy_weights(total)
+        return -sum([weights[c] for c in counts.values()])
+    return -sum([(count / total) * math.log2(count / total) for count in counts.values()])
 
 
 def _shannon_bits(text: str) -> float:
-    counts = Counter(text)
+    counts: dict[str, int] = {}
+    _count_elements(counts, text)
     return _shannon_from_counts(counts, len(text))
 
 
@@ -137,11 +148,11 @@ def _entropy_weights(total: int) -> tuple[float, ...]:
 
 
 def _high_entropy(text: str, minimum: float) -> bool:
-    counts = Counter(text)
+    counts: dict[str, int] = {}
+    _count_elements(counts, text)
     total = len(text)
-    collision = sum(count * count for count in counts.values()) / (total * total)
-    # Renyi collision entropy is a lower bound on Shannon entropy. Keep boundary decisions on the exact formula.
-    if -math.log2(collision) > minimum + 1e-12:
+    thresh = 2 ** -(minimum + 1e-12)
+    if sum([c * c for c in counts.values()]) < thresh * (total * total):
         return True
     return _shannon_from_counts(counts, total) >= minimum
 
@@ -392,6 +403,8 @@ class _Run:
         A marker is ``<`` [ws] [``/``] [ws] ``private`` [ws] ``>`` (case-insensitive). Each ``private`` occurrence
         is inspected once, looking back over the whitespace run before it and forward over the one after it.
         """
+        if "<" not in text or "private" not in text.lower():
+            return text
         low = text.lower()
         if len(low) != len(text):  # a few characters lowercase to two; keep offsets aligned with ``text``
             low = "".join(ch.lower() if len(ch.lower()) == 1 else ch for ch in text)
@@ -456,6 +469,8 @@ class _Run:
         next whitespace, even when ``/ ? #`` appear inside it. Otherwise userinfo is redacted up to the last ``@`` of
         the authority. Linear: each whitespace-delimited segment's end and last ``@`` are computed once.
         """
+        if "://" not in text or "@" not in text:
+            return text
         out: list[str] = []
         cursor = 0
         seg_end = seg_last_at = -1
@@ -541,17 +556,14 @@ class _Run:
         if not ascii_text or "authorization" in lowered:
             text = self._sub(_AUTH_HEADER, rf"\1\2{REDACTED}", text)
         self.tick()
-        if not ascii_text or any(name in lowered for name in ("bearer", "basic", "token")):
+        if not ascii_text or _AUTH_SCHEME_NEEDLE.search(lowered):
             text = _AUTH_SCHEME.sub(self._auth_scheme, text)
         if _FIXED_TOKEN_PREFIX.search(text):
             for pattern in _FIXED_TOKENS:
                 text = self._sub(pattern, REDACTED, text)
                 self.tick()
         text = self._userinfo(text)
-        lowered = text.lower() if ascii_text else ""
-        if not ascii_text or any(name in lowered for name in (
-            "pass", "pwd", "secret", "api", "access", "refresh", "client", "auth", "private",
-        )):
+        if not ascii_text or _KEY_VALUE_NEEDLE.search(lowered):
             text = self._sub(_KEY_VALUE_SECRET, rf"\1\2{REDACTED}", text)
         self.tick()
         # The cheap candidate scan keeps the full component matcher as the authority.
