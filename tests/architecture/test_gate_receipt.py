@@ -11,9 +11,11 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -1357,3 +1359,344 @@ def test_outcome_key_swapped_for_an_unknown_id_with_equal_counts_is_not_accepted
     receipt = build_receipt(**ok(junit_outcomes={"a": "passed", "x": "passed"}))
     assert receipt["accepted"] is False
     assert receipt["reasons"], "a refusal carries a reason"
+
+
+@pytest.mark.parametrize(
+    ("key", "label", "skipped"),
+    [
+        ("preflight", "interpreter preflight", ("collect", *REQUIRED_PHASES)),
+        ("collect", "pytest --collect-only", REQUIRED_PHASES),
+        ("mypy", "phase mypy", ("lint-imports", "pytest")),
+    ],
+)
+@pytest.mark.parametrize(
+    "raised",
+    [subprocess.TimeoutExpired(["taskkill"], 60), RuntimeError("unexpected runner failure")],
+    ids=["kill-helper-timeout", "unexpected-exception"],
+)
+def test_started_runner_exception_keeps_its_step_and_reasons_for_every_later_step(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    key: str,
+    label: str,
+    skipped: tuple[str, ...],
+    raised: Exception,
+) -> None:
+    base = ClockRunner()
+    evidence = tmp_path / "ev"
+    evidence.mkdir()
+
+    def runner(cmd: Sequence[str], *, cwd: Path, timeout_s: float) -> tuple[int | None, str, float]:
+        if tool_key(list(cmd)) == key:
+            base.calls.append(Call(key, list(cmd), cwd, timeout_s, base.clock.now))
+            raise raised
+        return base(cmd, cwd=cwd, timeout_s=timeout_s)
+
+    code, _, err = cli_or_fail(tmp_path, monkeypatch, capsys, runner, evidence)
+    receipt = assert_refused_attempt(code, err, evidence)
+    (call,) = [call for call in base.calls if call.key == key]
+    records = [step for step in receipt["steps"] if step["name"] == key]
+    assert len(records) == 1, f"started {key} did not leave exactly one step: {records}"
+    (record,) = records
+    assert record["command"] == call.argv and record["cwd"] == str(call.cwd)
+    assert record["exit_code"] is None
+    assert record["error"].startswith(f"failed while running: {type(raised).__name__}")
+    assert record["output"] in receipt["evidence"]["manifest"]
+    assert any(reason.startswith(f"{label} failed while running") for reason in receipt["reasons"])
+    recorded_names = {step["name"] for step in receipt["steps"]}
+    assert not (set(skipped) & recorded_names)
+    for name in skipped:
+        step_label = "pytest --collect-only" if name == "collect" else f"phase {name}"
+        assert any(reason.startswith(f"{step_label} not started") for reason in receipt["reasons"]), name
+
+
+# --- T8.5s: split by file, run concurrently, bind the raw reports to the unchanged inventory --------------------
+
+SHARD_FILES = ("t/test_a.py", "t/test_b.py")
+SHARD_IDS = {
+    "t/test_a.py": ("t/test_a.py::test_a", "t/test_a.py::test_param[with::colon]"),
+    "t/test_b.py": ("t/test_b.py::test_b",),
+}
+ALL_SHARD_IDS = [node for nodes in SHARD_IDS.values() for node in nodes]
+
+
+@pytest.mark.parametrize("shards", [-1, 1, 2, 4, 20])
+def test_shard_file_partition_is_complete_disjoint_and_deterministic(shards: int) -> None:
+    inventory = [*ALL_SHARD_IDS, "t/nested/test_c.py::TestClass::test_case", "tests/test_d.py::test_d"]
+    files = {node.split("::", 1)[0] for node in inventory}
+    partition = getattr(gate, "shard_files", None)
+    assert callable(partition), "gate has no deterministic file partition"
+    groups = partition(inventory, shards)
+    assert groups == partition(inventory, shards)
+    assert 1 <= len(groups) <= min(max(shards, 1), len(files))
+    assert all(groups)
+    selected = [path for group in groups for path in group]
+    assert set(selected) == files and len(selected) == len(files)
+
+
+def test_gate_defaults_to_at_most_four_shards() -> None:
+    assert getattr(gate, "PYTEST_SHARDS", None) == min(4, os.cpu_count() or 1)
+
+
+def _junit_for_shard(ids: Sequence[str]) -> bytes:
+    cases = []
+    for node in ids:
+        path, name = node.split("::", 1)
+        module = path.removesuffix(".py").replace("/", ".")
+        cases.append(f'<testcase classname="{module}" name="{name}"/>')
+    return ("<testsuites><testsuite>" + "".join(cases) + "</testsuite></testsuites>").encode()
+
+
+def _selected_pytest_files(argv: Sequence[str], cwd: Path) -> list[str]:
+    files = [Path(arg) for arg in argv if arg.endswith(".py")]
+    return [(path.relative_to(cwd) if path.is_absolute() else path).as_posix() for path in files]
+
+
+class ShardRunner(ClockRunner):
+    """Synthetic subprocess results at the gate's command seam, with two files in the same collected inventory."""
+
+    def __init__(self, *, behavior: str = "ok", measure_overlap: bool = False, spent: bool = False) -> None:
+        steps = {"mypy": (0.0, 200.0), "lint-imports": (0.0, 100.0)} if spent else {}
+        if measure_overlap:
+            steps = {"preflight": (0.0, 2.0), "collect": (0.0, 3.0), "lint-imports": (0.0, 287.0)}
+        super().__init__(steps=steps)
+        self.behavior = behavior
+        self.overlap = threading.Barrier(2, timeout=3.0) if measure_overlap else None
+        self.lock = threading.Lock()
+        self.run_process: Callable[..., tuple[int | None, str, float]] | None = None
+
+    def _git(self, sub: list[str], seconds: float) -> tuple[int | None, str, float]:
+        result = super()._git(sub, seconds)
+        if sub[:2] == ["worktree", "add"]:
+            assert self.worktree is not None
+            (self.worktree / SHARD_FILES[1]).touch()
+        return result
+
+    def __call__(self, cmd: Sequence[str], *, cwd: Path, timeout_s: float) -> tuple[int | None, str, float]:
+        argv = list(cmd)
+        key = tool_key(argv)
+        if key == "collect":
+            code, _, seconds = super().__call__(cmd, cwd=cwd, timeout_s=timeout_s)
+            inventory = "\n".join(ALL_SHARD_IDS)
+            return code, f"{inventory}\n\n{len(ALL_SHARD_IDS)} tests collected in 0.01s\n", seconds
+        if key != "pytest":
+            return super().__call__(cmd, cwd=cwd, timeout_s=timeout_s)
+        with self.lock:
+            start = self.clock.now
+            self.calls.append(Call(key, argv, cwd, timeout_s, start))
+        files = _selected_pytest_files(argv, cwd)
+        if files and self.run_process is not None:
+            return self.run_process(cmd, cwd=cwd, timeout_s=timeout_s)
+        duration = 0.0
+        if files and self.overlap is not None:
+            self.overlap.wait()
+            duration = 7.0 if SHARD_FILES[1] in files else 2.0
+            with self.lock:
+                self.clock.now = max(self.clock.now, start + duration)
+        behavior = self.behavior if files == [SHARD_FILES[1]] else "ok"
+        exit_code, output = self.report(argv, files or list(SHARD_FILES), behavior)
+        return exit_code, output, duration
+
+    @staticmethod
+    def report(argv: list[str], files: list[str], behavior: str) -> tuple[int | None, str]:
+        ids = [node for path in files for node in SHARD_IDS[path]]
+        report = Path(next(arg.split("=", 1)[1] for arg in argv if arg.startswith("--junitxml=")))
+        if behavior == "omitted":
+            ids = []
+        elif behavior == "duplicate":
+            ids.extend(SHARD_IDS[SHARD_FILES[0]])
+        if behavior != "missing":
+            report.write_bytes(b"<testsuites" if behavior == "unparseable" else _junit_for_shard(ids))
+        label = ",".join(files)
+        if behavior in ("xpass", "foreign-xpass"):
+            node = SHARD_IDS[SHARD_FILES[1 if behavior == "xpass" else 0]][0]
+            return 0, f"OUT-{label}\nXPASS {node} - reason\n1 xpassed in 0.01s\n"
+        return {"failed": 1, "timed-out": None}.get(behavior, 0), f"OUT-{label}"
+
+
+def _run_shards(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, runner: ShardRunner
+) -> tuple[Path, dict[str, Any]]:
+    monkeypatch.setattr(gate, "run", runner)
+    monkeypatch.setattr(gate, "time", runner.clock)
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(gate, "collect_environment", clean_environment)
+    evidence = tmp_path / "ev"
+    kwargs: dict[str, Any] = {"evidence_dir": evidence}
+    # On the original gate, exercise its real serial behavior and judge the receipt rather than raising TypeError.
+    if "shards" in inspect.signature(gate.run_gate).parameters:
+        kwargs["shards"] = 2
+    receipt, _ = gate.run_gate(tmp_path / "repo", "3.14", **kwargs)
+    attempt, _, on_disk = load_attempt(evidence)
+    assert on_disk == receipt
+    return attempt, on_disk
+
+
+def _pytest_calls(runner: ShardRunner) -> list[Call]:
+    return [call for call in runner.calls if call.key == "pytest"]
+
+
+def _shard_steps(receipt: dict[str, Any]) -> list[dict[str, Any]]:
+    steps = [step for step in receipt["steps"] if step["name"].startswith("pytest-shard-")]
+    assert {step["name"] for step in steps} == {"pytest-shard-0", "pytest-shard-1"}, receipt["steps"]
+    assert len(steps) == 2
+    return steps
+
+
+def _pytest_phase(receipt: dict[str, Any]) -> dict[str, Any]:
+    phases: list[dict[str, Any]] = receipt["phases"]
+    (phase,) = [phase for phase in phases if phase["name"] == "pytest"]
+    return phase
+
+
+class StartedShard:
+    """Only returns after both worker PIDs exist, so a single global PID cannot identify both steps."""
+
+    returncode = 0
+
+    def __init__(self, pid: int, output: str, started: threading.Barrier) -> None:
+        self.pid = pid
+        self.output = output
+        self.started = started
+
+    def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+        self.started.wait()
+        return self.output, ""
+
+
+def test_gate_binds_each_overlapping_shard_command_pid_output_and_raw_junit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = ShardRunner()
+    runner.run_process = gate.run
+    started = threading.Barrier(2, timeout=3.0)
+    pid_by_file = dict(zip(SHARD_FILES, (4242, 5252), strict=True))
+    start_by_file: dict[str, datetime] = {}
+
+    def popen(argv: list[str], *, cwd: Path, **kwargs: Any) -> StartedShard:
+        files = _selected_pytest_files(argv, cwd)
+        (file,) = files
+        with runner.lock:
+            start_by_file[file] = datetime.now(UTC)
+        _, output = runner.report(argv, files, "ok")
+        return StartedShard(pid_by_file[file], output, started)
+
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    before = datetime.now(UTC)
+    attempt, receipt = _run_shards(tmp_path, monkeypatch, runner)
+    assert receipt["accepted"] is True, receipt["reasons"]
+    steps = _shard_steps(receipt)
+    calls = _pytest_calls(runner)
+    assert len(calls) == 2
+    assert len({step["output"] for step in steps}) == 2
+    manifest = receipt["evidence"]["manifest"]
+    observed_files = []
+    for call in calls:
+        (file,) = _selected_pytest_files(call.argv, call.cwd)
+        observed_files.append(file)
+        assert "--locked" in call.argv and call.argv[call.argv.index("--python") + 1] == "3.14"
+        (step,) = [step for step in steps if step["command"] == call.argv]
+        assert step["cwd"] == str(call.cwd) and step["exit_code"] == 0
+        assert step["pid"] == pid_by_file[file], f"incorrect process attribution for {file}: {step}"
+        assert before <= datetime.fromisoformat(step["started_at"]) <= start_by_file[file]
+        assert step["duration_s"] >= 0
+        assert step_bytes(attempt, manifest, step) == f"OUT-{file}".encode()
+        index = step["name"].removeprefix("pytest-shard-")
+        assert (attempt / f"junit-shard-{index}.xml").read_bytes() == _junit_for_shard(SHARD_IDS[file])
+        report_path = Path(next(arg.split("=", 1)[1] for arg in call.argv if arg.startswith("--junitxml=")))
+        assert not report_path.exists(), f"temporary JUnit still exists: {report_path}"
+    assert sorted(observed_files) == list(SHARD_FILES)
+    assert receipt["test_count"] == len(ALL_SHARD_IDS)
+    assert receipt["outcomes"] == dict.fromkeys(ALL_SHARD_IDS, "passed")
+    assert _pytest_phase(receipt)["exit_code"] == 0
+
+
+@pytest.mark.parametrize("behavior", ["failed", "timed-out", "missing", "unparseable", "omitted", "duplicate"])
+def test_one_bad_shard_refuses_the_attempt_and_preserves_the_other_reports(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, behavior: str
+) -> None:
+    attempt, receipt = _run_shards(tmp_path, monkeypatch, ShardRunner(behavior=behavior))
+    assert receipt["accepted"] is False, f"shard failure went undetected: {behavior}"
+    steps = _shard_steps(receipt)
+    (bad,) = [step for step in steps if SHARD_FILES[1] in _selected_pytest_files(step["command"], Path(step["cwd"]))]
+    (good,) = [step for step in steps if step is not bad]
+    assert any(bad["name"] in reason or "shard" in reason.lower() for reason in receipt["reasons"]), receipt["reasons"]
+    for node in SHARD_IDS[SHARD_FILES[0]]:
+        assert receipt["outcomes"][node] == "passed"
+    expected_exit = {"failed": 1, "timed-out": None}.get(behavior, 0)
+    assert bad["exit_code"] == expected_exit
+    assert _pytest_phase(receipt)["exit_code"] == expected_exit
+    good_index = good["name"].removeprefix("pytest-shard-")
+    assert (attempt / f"junit-shard-{good_index}.xml").read_bytes() == _junit_for_shard(SHARD_IDS[SHARD_FILES[0]])
+    bad_index = bad["name"].removeprefix("pytest-shard-")
+    bad_xml = attempt / f"junit-shard-{bad_index}.xml"
+    if behavior == "missing":
+        assert not bad_xml.exists()
+    elif behavior == "unparseable":
+        assert bad_xml.read_bytes() == b"<testsuites"
+
+
+@pytest.mark.parametrize("behavior", ["xpass", "foreign-xpass"])
+def test_xpass_is_validated_against_only_that_shards_junit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, behavior: str
+) -> None:
+    _, receipt = _run_shards(tmp_path, monkeypatch, ShardRunner(behavior=behavior))
+    assert receipt["accepted"] is False, "a zero-exit pytest shard with an XPASS was accepted"
+    _shard_steps(receipt)
+    expected = dict.fromkeys(ALL_SHARD_IDS, "passed")
+    if behavior == "xpass":
+        expected[SHARD_IDS[SHARD_FILES[1]][0]] = "xpassed"
+    else:
+        assert any("xpass" in reason.lower() for reason in receipt["reasons"])
+    assert receipt["outcomes"] == expected
+    assert receipt["counts"]["xpassed"] == (1 if behavior == "xpass" else 0)
+
+
+def test_shards_share_the_remaining_deadline_and_measure_wall_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = ShardRunner(measure_overlap=True)
+    _, receipt = _run_shards(tmp_path, monkeypatch, runner)
+    assert receipt["accepted"] is True, receipt["reasons"]
+    _shard_steps(receipt)
+    calls = _pytest_calls(runner)
+    assert len(calls) == 2 and all(call.timeout_s == 8.0 for call in calls)
+    assert _pytest_phase(receipt)["duration_s"] == 7.0
+    assert receipt["timing"]["test_job_s"] == 299.0
+
+
+def test_no_shard_starts_when_the_preceding_phases_spend_the_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = ShardRunner(spent=True)
+    _, receipt = _run_shards(tmp_path, monkeypatch, runner)
+    assert receipt["accepted"] is False
+    assert not _pytest_calls(runner)
+    assert budget_reason(receipt, "pytest")
+    assert receipt["timing"]["test_job_s"] == 300.0
+
+
+def test_cli_shards_one_retains_the_serial_attempt_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    evidence = tmp_path / "ev"
+    runner = ShardRunner()
+    code, _, err = gate_cli(tmp_path, monkeypatch, capsys, runner, "--shards", "1", "--evidence-dir", str(evidence))
+    assert code == 0, err
+    attempt, _, receipt = load_attempt(evidence)
+    assert receipt["accepted"] is True, receipt["reasons"]
+    (call,) = _pytest_calls(runner)
+    assert not _selected_pytest_files(call.argv, call.cwd)
+    assert [step["name"] for step in receipt["steps"] if step["name"].startswith("pytest")] == ["pytest"]
+    assert (attempt / "junit.xml").read_bytes() == _junit_for_shard(ALL_SHARD_IDS)
+    assert receipt["outcomes"] == dict.fromkeys(ALL_SHARD_IDS, "passed")
+
+
+def test_cli_rejects_a_zero_shard_count_before_starting_the_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    runner = ShardRunner()
+    code, _, err = gate_cli(tmp_path, monkeypatch, capsys, runner, "--shards", "0")
+    assert code == 2 and "shards" in err
+    assert not runner.calls
