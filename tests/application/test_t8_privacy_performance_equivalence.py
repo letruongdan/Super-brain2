@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import pytest
 
 from superbrain.application.privacy import PrivacyFilter
@@ -121,3 +123,57 @@ def test_long_key_fast_paths_preserve_suffix_word_rules(key: str, stripped: bool
     assert safe.value == ({"positive_control": "ordinary safe prose"} if stripped else payload)
     assert safe.stripped_keys_count == int(stripped)
     assert safe.redacted_count == 0
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("Baſic abcdefghijkl", f"Baſic {REDACTED}"),
+        ("TOKEN aB3dE5fG", f"TOKEN {REDACTED}"),
+        ("Authorızatıon: plaincred", f"Authorızatıon: {REDACTED}"),
+    ],
+)
+def test_ascii_fast_paths_keep_unicode_case_insensitive_authentication_rules(text: str, expected: str) -> None:
+    safe = PrivacyFilter().apply([text, text], FilterPolicy())
+    assert safe.value == [expected, expected]
+    assert safe.redacted_count == 2 and safe.stripped_keys_count == 0
+
+
+def test_default_path_candidate_fast_path_keeps_every_blocked_family() -> None:
+    paths = [
+        ".env", ".env.production", ".ssh/config", "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa",
+        ".aws/credentials", ".npmrc", ".pypirc", ".netrc", "_netrc",
+        "cert.pem", "cert.key", "cert.p12", "cert.pfx", r"C:\mixed/ID_RSA",
+    ]
+    benign = ["README", ".environment", "id_rsa_backup", "cert.pem.backup"]
+    safe = PrivacyFilter().apply([*paths, *benign], FilterPolicy())
+    assert safe.value == [*([REDACTED] * len(paths)), *benign]
+    assert safe.redacted_count == len(paths) and safe.stripped_keys_count == 0
+
+
+def test_literal_prefix_shortcuts_preserve_each_fixed_secret_pattern() -> None:
+    secrets: list[JsonValue] = [
+        "github_pat_" + "a" * 20,
+        *("gh" + kind + "_" + "a" * 16 for kind in "pousr"),
+        "sk-" + "a" * 16,
+        "AKIA" + "A" * 16,
+        "ASIA" + "A" * 16,
+        *("xox" + kind + "-" + "a" * 10 for kind in "baprs"),
+        "AIza" + "A" * 35,
+        "eyJaaaa.aaaa.aaaa",
+    ]
+    safe = PrivacyFilter().apply(secrets, FilterPolicy())
+    assert safe.value == [REDACTED] * len(secrets)
+    assert safe.redacted_count == len(secrets) and safe.stripped_keys_count == 0
+
+
+@pytest.mark.parametrize("threshold", [4.0, math.nextafter(4.0, math.inf)])
+def test_entropy_contribution_cache_preserves_exact_threshold_comparison(threshold: float) -> None:
+    # Sixteen symbols, each appearing twice, give exactly 4 bits per symbol.
+    uniform = "abcdefghijklmnop" * 2
+    below = "abcdefghijklmnop" + "abcdefghijklmnoa"
+    safe = PrivacyFilter().apply([uniform, below, uniform, below], FilterPolicy(entropy_min_bits=threshold))
+    expected_uniform = REDACTED if threshold == 4.0 else uniform
+    assert safe.value == [expected_uniform, below, expected_uniform, below]
+    assert safe.redacted_count == (2 if threshold == 4.0 else 0)
+    assert safe.stripped_keys_count == 0
