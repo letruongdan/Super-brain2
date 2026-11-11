@@ -3,6 +3,7 @@
 import inspect
 import json
 import math
+import os
 import platform
 import re
 import shutil
@@ -1111,3 +1112,248 @@ def test_ci_runs_the_locked_gate_with_evidence_and_uploads_it_always() -> None:
     bench = steps[bench_at]
     assert re.search(r"python -m tests\.integration\.test_kernel_performance --evidence-dir", bench), bench
     assert "--locked" in bench and not re.search(r"always\(\)|failure\(\)|cancelled\(\)", bench), bench
+
+
+# =========================================================================================================
+# T8.5 review round 1 (review-8.5.md, R85-01..R85-05)
+#
+# * R85-01: once an attempt dir exists, every way out of the gate ends with exactly one terminal receipt, refused
+#   with a reason, and exit 1 (exit 2 is only for input refused before anything ran). A step that started and then
+#   failed (its kill failed, its runner raised mid-step) is never reported as "could not start".
+# * R85-02: every receipt written (attempt or legacy ``.gate/``) carries a ``receipt_digest`` of its own payload.
+# * R85-03: only a measured number (int/float, not bool) can be the test-job time.
+# * R85-04: one artifact that cannot be written refuses the attempt with a reason naming it, while the attempt dir
+#   and the terminal receipt stay writable.
+# * R85-05: the outcome keys must be exactly the JUnit IDs, even when the counts agree.
+# =========================================================================================================
+
+NOT_STARTED_WORDS = ("could not start", "not started")
+NOTHING_RAN_WORDS = ("nothing ran", "could not be prepared")
+
+
+def cli_or_fail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], runner: Any, evidence: Path
+) -> tuple[int, str, str]:
+    """``gate_cli`` with an evidence dir; an exception escaping ``main`` is itself the failure under test."""
+    try:
+        return gate_cli(tmp_path, monkeypatch, capsys, runner, "--evidence-dir", str(evidence))
+    except Exception as err:  # noqa: BLE001 - the oracle: nothing may escape once the attempt dir exists
+        receipts = list(evidence.rglob("receipt.json"))
+        pytest.fail(f"{type(err).__name__} escaped the gate: {err}; terminal receipts: {receipts}")
+
+
+def assert_refused_attempt(code: int, err: str, evidence: Path) -> dict[str, Any]:
+    assert code == 1, f"exit {code}, expected 1 (attempted, refused); stderr:\n{err}"
+    assert not any(w in err for w in NOTHING_RAN_WORDS), f"stderr claims nothing ran:\n{err}"
+    _, _, receipt = load_attempt(evidence)  # exactly one terminal receipt, digest and manifest checked
+    assert receipt["accepted"] is False
+    reasons = receipt["reasons"]
+    assert isinstance(reasons, list) and reasons and all(isinstance(r, str) and r for r in reasons), reasons
+    return receipt
+
+
+class TimedOutProcess:
+    """A ``Popen`` stand-in that exceeds its timeout once, then returns its output after the kill attempt."""
+
+    pid = 4242
+    returncode = None
+
+    def __init__(self, output: str = "OUT-killed") -> None:
+        self.output = output
+        self.calls = 0
+
+    def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+        self.calls += 1
+        if self.calls == 1:
+            raise subprocess.TimeoutExpired("cmd", timeout or 0)
+        return self.output, ""
+
+    def kill(self) -> None:
+        pass
+
+
+def test_junit_read_error_after_pytest_still_ends_with_a_refused_terminal_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    evidence = tmp_path / "ev"
+    evidence.mkdir()
+    real = Path.read_bytes
+
+    def locked(self: Path) -> bytes:  # the temp JUnit report is locked (AV/indexer) after pytest wrote it
+        if self.name.endswith("-junit.xml"):
+            raise PermissionError(13, "locked by another process", str(self))
+        return real(self)
+
+    monkeypatch.setattr(Path, "read_bytes", locked)
+    runner = ClockRunner()
+    code, _, err = cli_or_fail(tmp_path, monkeypatch, capsys, runner, evidence)
+    monkeypatch.undo()
+    assert "pytest" in runner.keys(), "the run never reached pytest"
+    receipt = assert_refused_attempt(code, err, evidence)
+    assert any("junit" in r.lower() for r in receipt["reasons"]), receipt["reasons"]
+
+
+@pytest.mark.parametrize(
+    "raised",
+    [subprocess.TimeoutExpired(["taskkill"], 60), RuntimeError("unexpected runner failure")],
+    ids=["kill-helper-timeout", "unexpected-exception"],
+)
+def test_runner_exception_mid_step_still_ends_with_a_refused_terminal_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], raised: Exception
+) -> None:
+    evidence = tmp_path / "ev"
+    evidence.mkdir()
+    base = ClockRunner()
+
+    def runner(cmd: Sequence[str], *, cwd: Path, timeout_s: float) -> tuple[int | None, str, float]:
+        if tool_key(list(cmd)) == "mypy":
+            base.calls.append(Call("mypy", list(cmd), Path(cwd), timeout_s, base.clock.now))
+            raise raised
+        return base(cmd, cwd=cwd, timeout_s=timeout_s)
+
+    code, _, err = cli_or_fail(tmp_path, monkeypatch, capsys, runner, evidence)
+    receipt = assert_refused_attempt(code, err, evidence)
+    named = [r for r in receipt["reasons"] if "mypy" in r]
+    assert named, f"no reason names the failed step: {receipt['reasons']}"
+    if isinstance(raised, subprocess.TimeoutExpired):  # the step had started; only its kill hung
+        assert not any(w in r for r in named for w in NOT_STARTED_WORDS), named
+
+
+@pytest.mark.parametrize(
+    "kill_error",
+    [PermissionError(1, "Operation not permitted"), subprocess.TimeoutExpired(["taskkill"], 60)],
+    ids=["oserror", "kill-timeout"],
+)
+def test_run_reports_a_timeout_when_killing_the_timed_out_process_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kill_error: Exception
+) -> None:
+    def failing_kill(proc: Any) -> None:
+        raise kill_error
+
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: TimedOutProcess())
+    monkeypatch.setattr(gate, "_kill_tree", failing_kill)
+    monkeypatch.setattr(gate, "KILL_GRACE_S", 0.01)
+    try:
+        exit_code, output, _ = gate.run(["x"], cwd=tmp_path, timeout_s=0.01)
+    except Exception as err:  # noqa: BLE001 - the oracle: a failed kill must not escape run()
+        pytest.fail(f"{type(err).__name__} escaped run() after the timeout: {err}")
+    assert exit_code is None, "a process that exceeded its timeout is a timeout, whatever the kill did"
+    assert isinstance(output, str)
+
+
+def test_failed_kill_of_a_started_phase_is_not_reported_as_could_not_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def failing_kill(proc: Any) -> None:
+        raise PermissionError(1, "Operation not permitted")
+
+    real_run = gate.run
+    base = ClockRunner()
+
+    def runner(cmd: Sequence[str], *, cwd: Path, timeout_s: float) -> tuple[int | None, str, float]:
+        if tool_key(list(cmd)) == "pytest":  # the real run() on a process that times out and cannot be killed
+            base.calls.append(Call("pytest", list(cmd), Path(cwd), timeout_s, base.clock.now))
+            return real_run(cmd, cwd=cwd, timeout_s=timeout_s)
+        return base(cmd, cwd=cwd, timeout_s=timeout_s)
+
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: TimedOutProcess("OUT-pytest-killed"))
+    monkeypatch.setattr(gate, "_kill_tree", failing_kill)
+    monkeypatch.setattr(gate, "KILL_GRACE_S", 0.01)
+    evidence = tmp_path / "ev"
+    evidence.mkdir()
+    code, _, err = cli_or_fail(tmp_path, monkeypatch, capsys, runner, evidence)
+    receipt = assert_refused_attempt(code, err, evidence)
+    named = [r for r in receipt["reasons"] if "pytest" in r and "junit" not in r.lower()]
+    assert named, f"no reason names the timed-out pytest phase: {receipt['reasons']}"
+    assert not any(w in r for r in named for w in NOT_STARTED_WORDS), named
+    pytest_steps = [s for s in receipt["steps"] if isinstance(s, dict) and s.get("name") == "pytest"]
+    assert len(pytest_steps) == 1 and pytest_steps[0]["pid"] == TimedOutProcess.pid, pytest_steps  # it did start
+    assert pytest_steps[0]["exit_code"] is None, pytest_steps
+
+
+def test_legacy_receipt_digest_matches_its_payload_after_the_terminal_receipt_write_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    evidence = tmp_path / "ev"
+    evidence.mkdir()
+    real = os.replace
+
+    def failing(src: Any, dst: Any) -> None:
+        if Path(dst).name == "receipt.json":
+            raise PermissionError(13, "denied", str(dst))
+        real(src, dst)
+
+    monkeypatch.setattr(os, "replace", failing)  # gate.py calls os.replace
+    code, _, err = cli_or_fail(tmp_path, monkeypatch, capsys, ClockRunner(), evidence)
+    assert code == 1, err
+    (legacy,) = (tmp_path / "repo" / ".gate").glob("receipt-*.json")
+    data = json.loads(legacy.read_text(encoding="utf-8"))
+    payload = {k: v for k, v in data.items() if k != "receipt_digest"}
+    assert data["receipt_digest"] == digest_bytes(canonical_json(payload)), "legacy receipt digest is stale"
+    assert data["accepted"] is False
+    assert any("receipt" in str(r).lower() for r in data["reasons"]), data["reasons"]
+
+
+@pytest.mark.parametrize("value", [True, False], ids=["true", "false"])
+def test_gate_refuses_a_bool_test_job_time_with_a_reason(value: bool) -> None:
+    receipt = build_receipt(**ok(test_job_seconds=value))
+    assert receipt["accepted"] is False, "a bool is not a measured time"
+    reasons = receipt["reasons"]
+    assert isinstance(reasons, list) and reasons and all(isinstance(r, str) and r for r in reasons)
+
+
+def _step_log(name: str) -> Callable[[Path], bool]:
+    return lambda p: p.parent.name == "steps" and p.name.endswith(f"-{name}.log")
+
+
+def _named(name: str) -> Callable[[Path], bool]:
+    return lambda p: p.name == name
+
+
+@pytest.mark.parametrize(
+    ("artifact", "matches"),
+    [
+        (None, None),
+        ("ruff.log", _step_log("ruff")),
+        ("junit.xml", _named("junit.xml")),
+        ("source.json", _named("source.json")),
+    ],
+    ids=["control", "step-log", "junit-copy", "source"],
+)
+def test_one_artifact_write_failure_is_refused_with_a_reason_naming_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    artifact: str | None,
+    matches: Callable[[Path], bool] | None,
+) -> None:
+    """Only that artifact fails (no space); the attempt dir and the terminal receipt stay writable."""
+    evidence = tmp_path / "ev"
+    evidence.mkdir()
+    real = Path.write_bytes
+    hit: list[Path] = []
+
+    def no_space(self: Path, data: Any) -> int:
+        if matches is not None and self.is_relative_to(evidence) and matches(self):
+            hit.append(self)
+            raise OSError(28, "No space left on device", str(self))
+        return real(self, data)
+
+    monkeypatch.setattr(Path, "write_bytes", no_space)
+    code, _, err = cli_or_fail(tmp_path, monkeypatch, capsys, ClockRunner(), evidence)
+    monkeypatch.undo()
+    if artifact is None:  # positive twin: the same run with every write succeeding is accepted
+        assert code == 0, err
+        _, _, receipt = load_attempt(evidence)
+        assert receipt["accepted"] is True, receipt["reasons"]
+        return
+    assert hit, f"the run never tried to write {artifact}"
+    receipt = assert_refused_attempt(code, err, evidence)
+    assert any(artifact in r for r in receipt["reasons"]), receipt["reasons"]
+    assert artifact in err, err
+
+
+def test_outcome_key_swapped_for_an_unknown_id_with_equal_counts_is_not_accepted() -> None:
+    receipt = build_receipt(**ok(junit_outcomes={"a": "passed", "x": "passed"}))
+    assert receipt["accepted"] is False
+    assert receipt["reasons"], "a refusal carries a reason"
