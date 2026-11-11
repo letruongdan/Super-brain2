@@ -23,11 +23,19 @@ import time
 import unicodedata
 from collections import Counter
 from collections.abc import Callable
+from functools import lru_cache
 
 from superbrain.core.canonical import canonical_json
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.jsonvalue import JsonValue
-from superbrain.core.kernel import OPAQUE_ID_RE, SHA256_DIGEST_RE, FilterPolicy, RepoFlags, SafePayload
+from superbrain.core.kernel import (
+    DEFAULT_BLOCKED_PATH_PATTERNS,
+    OPAQUE_ID_RE,
+    SHA256_DIGEST_RE,
+    FilterPolicy,
+    RepoFlags,
+    SafePayload,
+)
 
 REDACTED = "[redacted]"
 REJECTED_MESSAGE = "privacy filter rejected payload"
@@ -67,6 +75,10 @@ _KEY_VALUE_SECRET = re.compile(
     r"(\"[^\"\r\n]{0,512}\"|'[^'\r\n]{0,512}'|[^\s;,&]+)"
 )
 _PATH_TOKEN = re.compile(r"[^\s\"'<>|()\[\]{},;]+")
+_DEFAULT_PATH_TOKEN = re.compile(
+    r"(?<![^\s\"'<>|()\[\]{},;])(?=[^\s\"'<>|()\[\]{},;]*[._])[^\s\"'<>|()\[\]{},;]+"
+)
+_FIXED_TOKEN_PREFIX = re.compile(r"github_pat_|gh[pousr]_|sk-|AKIA|ASIA|xox[baprs]-|AIza|eyJ")
 _PATH_SPLIT = re.compile(r"[\\/]+")
 _PATH_LEAD = "`*([{<\"'"
 _PATH_TRAIL = "`*)]}>\"'.,:;!?"
@@ -107,7 +119,25 @@ def _joined_key(key: str) -> str:
 def _shannon_bits(text: str) -> float:
     counts = Counter(text)
     total = len(text)
-    return -sum((n / total) * math.log2(n / total) for n in counts.values())
+    if total <= 256:
+        return -sum(map(_entropy_weights(total).__getitem__, counts.values()))
+    return -sum((count / total) * math.log2(count / total) for count in counts.values())
+
+
+@lru_cache(maxsize=128)
+def _entropy_weights(total: int) -> tuple[float, ...]:
+    """Cache bounded numeric probability tables, without retaining input text."""
+    return (0.0, *((count / total) * math.log2(count / total) for count in range(1, total + 1)))
+
+
+def _high_entropy(text: str, minimum: float) -> bool:
+    counts = Counter(text)
+    total = len(text)
+    collision = sum(count * count for count in counts.values()) / (total * total)
+    # Renyi collision entropy is a lower bound on Shannon entropy. Keep boundary decisions on the exact formula.
+    if -math.log2(collision) > minimum + 1e-12:
+        return True
+    return _shannon_bits(text) >= minimum
 
 
 def _structural_kind(key: str) -> str:
@@ -141,7 +171,10 @@ def _exempt_structural(key: str, value: object, min_segment: int) -> bool:
 
 
 def _is_structural_id(value: str) -> bool:
-    return _UUID_RE.fullmatch(value) is not None or SHA256_DIGEST_RE.fullmatch(value) is not None
+    return (
+        len(value) == 36 and _UUID_RE.fullmatch(value) is not None
+        or len(value) == 71 and SHA256_DIGEST_RE.fullmatch(value) is not None
+    )
 
 
 def _tokenish(token: str) -> bool:
@@ -165,8 +198,18 @@ class _PathMatcher:
             else:
                 names.append(fnmatch.translate(lowered))
         self._names = re.compile("|".join(f"(?:{n})" for n in names)) if names else None
+        self._results: dict[str, bool] = {}
 
     def blocked(self, token: str) -> bool:
+        cached = self._results.get(token)
+        if cached is not None:
+            return cached
+        result = self._matches(token)
+        if len(self._results) < 1024:
+            self._results[token] = result
+        return result
+
+    def _matches(self, token: str) -> bool:
         parts = [p.lower() for p in _PATH_SPLIT.split(token) if p and p != "."]
         for index, part in enumerate(parts):
             if part in self._dirs or (self._names is not None and self._names.fullmatch(part)):
@@ -449,17 +492,21 @@ class _Run:
         min_len = self.policy.entropy_min_length
         candidate = re.compile(rf"[\x21-\x7e]{{{min_len},}}")
         masked = text.replace(REDACTED, " " * len(REDACTED))
-        spans = []
+        parts: list[str] = []
+        cursor = 0
+        count = 0
         for match in candidate.finditer(masked):
             token = match.group(0)
             if _is_structural_id(token.strip(_ENTROPY_EDGE)):
                 continue
-            if _shannon_bits(token) >= self.policy.entropy_min_bits:
-                spans.append(match.span())
-        for start, end in reversed(spans):
-            text = text[:start] + REDACTED + text[end:]
-        self.redacted += len(spans)
-        return text
+            if _high_entropy(token, self.policy.entropy_min_bits):
+                start, end = match.span()
+                parts.extend((text[cursor:start], REDACTED))
+                cursor = end
+                count += 1
+        parts.append(text[cursor:])
+        self.redacted += count
+        return "".join(parts)
 
     def redact(self, text: str, *, entropy: bool = True) -> str:
         self.tick()
@@ -472,17 +519,31 @@ class _Run:
         before = self.redacted
         text = self._private(text)
         self.tick()
-        text = self._pem(text)
-        text = self._sub(_AUTH_HEADER, rf"\1\2{REDACTED}", text)
+        if "-----BEGIN " in text:
+            text = self._pem(text)
+        ascii_text = text.isascii()
+        lowered = text.lower() if ascii_text else ""
+        if not ascii_text or "authorization" in lowered:
+            text = self._sub(_AUTH_HEADER, rf"\1\2{REDACTED}", text)
         self.tick()
-        text = _AUTH_SCHEME.sub(self._auth_scheme, text)
-        for pattern in _FIXED_TOKENS:
-            text = self._sub(pattern, REDACTED, text)
-            self.tick()
+        if not ascii_text or any(name in lowered for name in ("bearer", "basic", "token")):
+            text = _AUTH_SCHEME.sub(self._auth_scheme, text)
+        if _FIXED_TOKEN_PREFIX.search(text):
+            for pattern in _FIXED_TOKENS:
+                text = self._sub(pattern, REDACTED, text)
+                self.tick()
         text = self._userinfo(text)
-        text = self._sub(_KEY_VALUE_SECRET, rf"\1\2{REDACTED}", text)
+        lowered = text.lower() if ascii_text else ""
+        if not ascii_text or any(name in lowered for name in (
+            "pass", "pwd", "secret", "api", "access", "refresh", "client", "auth", "private",
+        )):
+            text = self._sub(_KEY_VALUE_SECRET, rf"\1\2{REDACTED}", text)
         self.tick()
-        text = _PATH_TOKEN.sub(self._blocked_path, text)
+        # The cheap candidate scan keeps the full component matcher as the authority.
+        path_tokens = (
+            _DEFAULT_PATH_TOKEN if self.policy.blocked_path_patterns == DEFAULT_BLOCKED_PATH_PATTERNS else _PATH_TOKEN
+        )
+        text = path_tokens.sub(self._blocked_path, text)
         self.tick()
         if entropy:
             text = self._entropy(text)

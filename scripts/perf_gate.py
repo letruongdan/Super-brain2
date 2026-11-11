@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import json
 import math
 import os
@@ -57,12 +59,23 @@ def nearest_rank_percentile(values: Sequence[float], pct: int) -> float:
 def _corpus(size: int, sample_index: int) -> dict[str, JsonValue]:
     # Escaped quotes contribute to the JSON size. The filter also counts node overhead.
     # Retain this margin so a canonical 1 MiB input genuinely reaches all filter passes.
-    block = (
-        f'safe "quoted" prose {sample_index} '
-        "https://probe-user:probe-pass@example.invalid/path "
-        "<private>synthetic private text</private> "
-        "Ab9cD8eF7gH6iJ5kL4mN3oP2qR1sT0uV "
-    )
+    def text_block(width: int, chunk: int) -> str:
+        parts: list[str] = []
+        used = 0
+        while used < width:
+            index = f"{sample_index}-{chunk}-{len(parts)}"
+            token = base64.urlsafe_b64encode(hashlib.sha256(index.encode()).digest()[:24]).decode()
+            block = (
+                f'safe "quoted" prose {index} '
+                f"https://user-{index}:pass-{index}@example.invalid/path "
+                f"<private>synthetic private {index}</private> {token} "
+            )
+            if used + len(block) > width:
+                parts.append("x" * (width - used))
+                break
+            parts.append(block)
+            used += len(block)
+        return "".join(parts)
     chunks: list[JsonValue] = []
     body: dict[str, JsonValue] = {
         "nested": {
@@ -77,7 +90,7 @@ def _corpus(size: int, sample_index: int) -> dict[str, JsonValue]:
         low, high = 0, min(65536, left - 3)
         while low < high:
             mid = (low + high + 1) // 2
-            text = block * (mid // len(block)) + "x" * (mid % len(block))
+            text = text_block(mid, len(chunks))
             cost = len(canonical_json(text)) + (1 if chunks else 0)
             if cost <= left:
                 low = mid
@@ -85,7 +98,7 @@ def _corpus(size: int, sample_index: int) -> dict[str, JsonValue]:
                 high = mid - 1
         if low == 0:
             break
-        text = block * (low // len(block)) + "x" * (low % len(block))
+        text = text_block(low, len(chunks))
         chunks.append(text)
         base_size = len(canonical_json(body))
     body["padding"] = "x" * (size - len(canonical_json(body)))
@@ -102,8 +115,10 @@ def build_privacy_corpus_sample(
 
 
 def build_unclosed_private_tail_sample(size_kib: int) -> tuple[dict[str, JsonValue], int]:
-    payload, _ = build_privacy_corpus_sample(size_kib, 0)
-    payload["unclosed"] = "<private>synthetic unterminated tail"
+    marker = "<private>synthetic unterminated tail"
+    overhead = len(canonical_json({"unclosed": marker})) - 1
+    payload = _corpus(size_kib * 1024 - overhead, 0)
+    payload["unclosed"] = marker
     return payload, len(canonical_json(payload))
 
 
@@ -223,6 +238,8 @@ def evaluate_privacy_probe(
     assert isinstance(first, dict) and isinstance(last, dict)
     a, b = first["ms_per_kib"], last["ms_per_kib"]
     growth = b / a if isinstance(a, (int, float)) and a > 0 and isinstance(b, (int, float)) else None
+    if isinstance(growth, (int, float)) and growth > 2:
+        reasons.append("privacy normalized growth needs profiling before linear scaling can be accepted")
     return {
         "accepted": not reasons, "reasons": list(reasons), "sizes": buckets,
         "wire_samples": _preserved(wire_samples), "growth_ratio_1024_256": growth,
@@ -240,7 +257,10 @@ def _privacy_sample_valid(sample: Mapping[str, JsonValue]) -> bool:
 
 
 def valid_initialize_frame(frame: JsonValue) -> bool:
-    if not isinstance(frame, dict) or frame.get("jsonrpc") != "2.0" or frame.get("id") != 1:
+    if (
+        not isinstance(frame, dict) or frame.get("jsonrpc") != "2.0"
+        or type(frame.get("id")) is not int or frame["id"] != 1
+    ):
         return False
     if set(frame) != {"jsonrpc", "id", "result"} or not isinstance(frame["result"], dict):
         return False
@@ -353,6 +373,23 @@ def run_benchmark(repo: Path, *, evidence_dir: Path) -> tuple[dict[str, JsonValu
             reasons.append("source is dirty before measurement")
     except Exception as error:  # noqa: BLE001 - keep a refused benchmark receipt
         reasons.append(f"benchmark measurement failed: {type(error).__name__}")
+        try:
+            progress = json.loads((attempt / "measurements-progress.json").read_bytes())
+            if (
+                not isinstance(progress, dict)
+                or set(progress) != set(ProbeMeasurements.__dataclass_fields__)
+                or not all(isinstance(progress[name], dict) for name in (
+                    "warm_prepare", "privacy_local", "cold_client",
+                ))
+                or not all(progress[name] is None or isinstance(progress[name], str) for name in (
+                    "wheel_digest", "schema_sha256",
+                ))
+                or progress["interpreter"] is not None and not isinstance(progress["interpreter"], dict)
+            ):
+                raise ValueError("invalid partial measurement shape")
+            measured = ProbeMeasurements(**progress)
+        except (OSError, ValueError, TypeError) as progress_error:
+            reasons.append(f"partial measurement unavailable: {type(progress_error).__name__}")
     try:
         end = source_identity(repo)
     except (OSError, RuntimeError) as error:
@@ -371,7 +408,11 @@ def run_benchmark(repo: Path, *, evidence_dir: Path) -> tuple[dict[str, JsonValu
         extra_reasons=reasons,
     )
     del receipt["receipt_digest"]
-    receipt["evidence"] = {"attempt_dir": str(attempt), "manifest": {"measurements.json": digest_bytes(raw)}}
+    manifest: dict[str, JsonValue] = {}
+    for artifact in sorted(attempt.rglob("*")):
+        if artifact.is_file() and not artifact.is_symlink():
+            manifest[artifact.relative_to(attempt).as_posix()] = digest_bytes(artifact.read_bytes())
+    receipt["evidence"] = {"attempt_dir": str(attempt), "manifest": manifest}
     receipt["receipt_digest"] = digest_bytes(canonical_json(receipt))
     path = attempt / perf_receipt_name(receipt)
     tmp = attempt / ".receipt.tmp"
