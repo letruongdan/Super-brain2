@@ -73,12 +73,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             _write_stderr(ErrorCode.IO_ERROR.value)
             return 1
 
-    try:
-        proc = subprocess.Popen(cmd, shell=False)
-    except OSError:
-        _write_stderr(ErrorCode.IO_ERROR.value)
-        return 1
-
     saved_handlers: list[tuple[signal.Signals, Any]] = []
     for sig_name in ("SIGINT", "SIGBREAK"):
         sig = getattr(signal, sig_name, None)
@@ -89,6 +83,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             except (OSError, ValueError):
                 pass
     try:
+        try:
+            proc = subprocess.Popen(cmd, shell=False)
+        except OSError:
+            _write_stderr(ErrorCode.IO_ERROR.value)
+            return 1
         while True:
             try:
                 return int(proc.wait())

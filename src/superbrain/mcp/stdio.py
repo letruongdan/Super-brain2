@@ -210,6 +210,14 @@ def _dispatch_line(
     return state, encode_jsonrpc_error(req_id, JSONRPC_METHOD_NOT_FOUND)
 
 
+def _read_chunk(stdin: BinaryIO, size: int) -> bytes:
+    read1 = getattr(stdin, "read1", None)
+    if callable(read1):
+        chunk = read1(size)
+        return chunk if isinstance(chunk, bytes) else bytes(chunk)
+    return stdin.read(size)
+
+
 def run_stdio(stdin: BinaryIO, stdout: BinaryIO, call: ToolCaller) -> int:
     """Run a bounded MCP 2025-06-18 JSON-RPC session over ``stdin`` and ``stdout``."""
     state: _SessionState = "new"
@@ -235,15 +243,10 @@ def run_stdio(stdin: BinaryIO, stdout: BinaryIO, call: ToolCaller) -> int:
             ok = _write_frame(stdout, encode_jsonrpc_error(None, JSONRPC_PARSE_ERROR))
             return 0 if ok else 1
 
-        chunk = stdin.read(_READ_CHUNK_BYTES)
+        chunk = _read_chunk(stdin, _READ_CHUNK_BYTES)
         if not chunk:
             if not buf:
                 return 0
-            if len(buf) > MAX_WIRE_BODY_BYTES:
-                ok = _write_frame(stdout, encode_jsonrpc_error(None, JSONRPC_PARSE_ERROR))
-                return 0 if ok else 1
-            state, response = _dispatch_line(bytes(buf), state, call)
-            if response is not None and not _write_frame(stdout, response):
-                return 1
-            return 0
+            ok = _write_frame(stdout, encode_jsonrpc_error(None, JSONRPC_PARSE_ERROR))
+            return 0 if ok else 1
         buf.extend(chunk)
