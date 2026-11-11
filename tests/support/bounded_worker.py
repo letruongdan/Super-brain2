@@ -11,8 +11,8 @@ worker writes to its diagnostics stream.
   status and the tail of the worker's diagnostics. A failed worker is never reused, so a late reply cannot be
   matched to a later request.
 
-On Windows ``.venv\\Scripts\\python.exe`` is a launcher whose child interpreter is the real worker, so terminating
-the ``Popen`` handle alone would leak it. Termination walks the process tree and verifies each exit.
+On Windows ``.venv\\Scripts\\python.exe`` is a launcher whose child interpreter is the real worker. The launcher
+ties that interpreter to its own lifetime, so killing it ends both; the regression verifies the interpreter's PID.
 """
 
 from __future__ import annotations
@@ -22,14 +22,11 @@ import json
 import os
 import queue
 import subprocess
-import sys
 import threading
 import time
 from collections.abc import Sequence
 from pathlib import Path
 from typing import IO
-
-from tests.support.inc2_cli import _win32_descendant_pids, _win32_wait_or_terminate_pid
 
 # A real request finishes in seconds; the ceiling only has to stop a hang without flaking on a loaded Windows host.
 DEFAULT_RESPONSE_TIMEOUT_S = 120.0
@@ -63,21 +60,15 @@ class WorkerFailure(AssertionError):
         self.survivors = survivors
 
 
-def _terminate_tree(proc: subprocess.Popen[bytes], timeout_s: float) -> tuple[int, ...]:
-    """Terminate ``proc`` and its descendants, deepest first; return the PIDs that could not be confirmed gone."""
-    survivors: list[int] = []
-    if sys.platform == "win32":
-        # Popen keeps the launcher's process handle open, so its PID cannot have been reused for this walk.
-        for pid in reversed(_win32_descendant_pids(proc.pid)):
-            if not _win32_wait_or_terminate_pid(pid, terminate=True, timeout_s=timeout_s):
-                survivors.append(pid)
+def _terminate(proc: subprocess.Popen[bytes], timeout_s: float) -> tuple[int, ...]:
+    """Kill ``proc`` and wait for it; return its PID if it could not be confirmed gone."""
     with contextlib.suppress(OSError):
         proc.kill()
     try:
         proc.wait(timeout=timeout_s)
     except subprocess.TimeoutExpired:
-        survivors.append(proc.pid)
-    return tuple(survivors)
+        return (proc.pid,)
+    return ()
 
 
 class BoundedJsonWorker:
@@ -116,7 +107,7 @@ class BoundedJsonWorker:
         try:
             self._reader.start()
         except BaseException:
-            _terminate_tree(self._proc, _TERMINATE_TIMEOUT_S)
+            _terminate(self._proc, _TERMINATE_TIMEOUT_S)
             raise
 
     @property
@@ -232,8 +223,8 @@ class BoundedJsonWorker:
             self._stdin.flush()
 
     def _reap(self) -> tuple[int, ...]:
-        """Terminate the tree and release the pipes without closing a stream another thread may be blocked on."""
-        survivors = _terminate_tree(self._proc, _TERMINATE_TIMEOUT_S)
+        """End the worker and release the pipes without closing a stream another thread may be blocked on."""
+        survivors = _terminate(self._proc, _TERMINATE_TIMEOUT_S)
         self._reader.join(_TERMINATE_TIMEOUT_S)
         writer = self._writer
         if writer is not None:

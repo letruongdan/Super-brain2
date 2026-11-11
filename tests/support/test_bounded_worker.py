@@ -165,11 +165,13 @@ def spawn(tmp_path: Path) -> Iterator[_Spawn]:
         )
         workers.append(worker)
         deadline = time.monotonic() + _WATCHDOG_S
-        while not pid_path.exists():
-            assert worker.returncode is None, f"probe child exited at startup:\n{worker.diagnostics()}"
-            assert time.monotonic() < deadline, "probe child never started"
-            time.sleep(0.005)
-        return _Probe(worker, int(pid_path.read_text(encoding="ascii")))
+        while True:
+            try:
+                return _Probe(worker, int(pid_path.read_text(encoding="ascii")))
+            except OSError:  # Not written yet, or Windows denies the read during the child's rename.
+                assert worker.returncode is None, f"probe child exited at startup:\n{worker.diagnostics()}"
+                assert time.monotonic() < deadline, "probe child never started"
+                time.sleep(0.005)
 
     yield _spawn
     for worker in workers:
