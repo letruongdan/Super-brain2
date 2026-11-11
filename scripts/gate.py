@@ -665,14 +665,8 @@ def run_gate(
                     if code != 0:
                         log.append(f"--- {name} (exit {code}) ---\n{output[-4000:]}")
                 job_ended = time.monotonic()
-                raw: bytes | None = None
-                try:
-                    if junit.is_file():
-                        raw = junit.read_bytes()
-                except OSError as err:
-                    extra.append(f"junit: the report could not be read: {type(err).__name__}: {err}")
-                if raw is not None:
-                    ev.write("junit.xml", raw)  # raw bytes kept before parsing and before cleanup
+                if junit.is_file():  # a read error here is caught below as an aborted run, still with a receipt
+                    ev.write("junit.xml", junit.read_bytes())  # raw bytes kept before parsing and before cleanup
                     try:
                         junit_ids, outcomes = parse_junit(junit, root=worktree)
                     except (ValueError, OSError, ET.ParseError) as err:
@@ -684,7 +678,7 @@ def run_gate(
                             outcomes[node] = "xpassed"
                         else:
                             extra.append(f"xpass: {node} is XPASS in the terminal but {outcomes[node]} in JUnit")
-                elif not any(r.startswith("junit: the report could not be read") for r in extra):
+                else:
                     extra.append("junit: pytest wrote no JUnit report")
         if created:
             try:
