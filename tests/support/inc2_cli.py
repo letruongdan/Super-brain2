@@ -20,6 +20,7 @@ import ctypes.wintypes
 import datetime as dt
 import io
 import os
+import queue
 import shutil
 import signal
 import subprocess
@@ -604,6 +605,146 @@ def run_inprocess_stdio(
     stdout_buf = io.BytesIO()
     rc = run_stdio(stdin_buf, stdout_buf, caller)
     return rc, decode_stdio_frames(stdout_buf.getvalue())
+
+
+class InstalledMcpPipeSession:
+    """Interactive open-pipe MCP stdio controller for installed ``brain-mcp`` and ``brain mcp``."""
+
+    def __init__(
+        self,
+        env: InstalledEnv,
+        script_name: str,
+        args: Sequence[str],
+        *,
+        cwd: Path,
+        extra_env: Mapping[str, str] | None = None,
+    ) -> None:
+        script = installed_script_path(env, script_name)
+        assert script.is_file(), f"Installed console script not found: {script}"
+        self._label = f"{script_name} {' '.join(args)}".strip()
+        self._proc: subprocess.Popen[bytes] = subprocess.Popen(
+            [str(script), *args],
+            cwd=cwd,
+            env=clean_installed_subprocess_env(extra_env),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert self._proc.stdin is not None
+        assert self._proc.stdout is not None
+        assert self._proc.stderr is not None
+        self._stdin = self._proc.stdin
+        self._stdout = self._proc.stdout
+        self._stderr = self._proc.stderr
+        self._lines: queue.Queue[bytes] = queue.Queue()
+        self._reader = threading.Thread(target=self._read_stdout_lines, daemon=True)
+        self._reader.start()
+        self._descendants: list[int] = []
+        self._closed = False
+
+    def _read_stdout_lines(self) -> None:
+        try:
+            while True:
+                line = self._stdout.readline()
+                self._lines.put(line)
+                if not line:
+                    break
+        except (OSError, ValueError):
+            self._lines.put(b"")
+
+    def _snapshot_descendants(self) -> tuple[int, ...]:
+        if sys.platform == "win32":
+            for pid in _win32_descendant_pids(self._proc.pid):
+                if pid not in self._descendants:
+                    self._descendants.append(pid)
+        return tuple(self._descendants)
+
+    def write_chunks_and_expect_response(
+        self,
+        chunks: Sequence[bytes],
+        *,
+        timeout: float = 2.0,
+        require_alive_after: bool = True,
+    ) -> dict[str, JsonValue]:
+        """Write raw byte chunks to open ``stdin``, flush each, and wait for one response line."""
+        assert not self._stdin.closed, f"{self._label}: stdin must remain open before sending frame"
+        assert self._proc.poll() is None, f"{self._label}: process exited before frame was sent"
+        for chunk in chunks:
+            self._stdin.write(chunk)
+            self._stdin.flush()
+        self._snapshot_descendants()
+        try:
+            raw_line = self._lines.get(timeout=timeout)
+        except queue.Empty as err:
+            alive = self._proc.poll() is None
+            raise AssertionError(
+                f"{self._label}: timed out after {timeout:.1f}s waiting for MCP response while stdin open "
+                f"(process_alive={alive}, stdin_closed={self._stdin.closed})"
+            ) from err
+        assert raw_line, f"{self._label}: stdout reached EOF without emitting expected MCP response"
+        assert not self._stdin.closed, f"{self._label}: stdin was unexpectedly closed"
+        if require_alive_after:
+            assert self._proc.poll() is None, f"{self._label}: process exited while interactive pipe should stay open"
+        decoded = decode_stdio_frames(raw_line)
+        assert len(decoded) == 1, f"{self._label}: expected single response frame, got {decoded!r}"
+        return decoded[0]
+
+    def send_frames_and_expect_response(
+        self,
+        frames: Sequence[Mapping[str, JsonValue]],
+        *,
+        timeout: float = 2.0,
+    ) -> dict[str, JsonValue]:
+        """Encode ``frames`` with LF, send on open ``stdin``, and return the single decoded response frame."""
+        return self.write_chunks_and_expect_response([encode_stdio_frames(frames)], timeout=timeout)
+
+    def finish(self, *, timeout: float = 5.0) -> tuple[int, bytes]:
+        """Close ``stdin``, wait for clean process exit, and return ``(returncode, stderr_bytes)``."""
+        self._snapshot_descendants()
+        if not self._stdin.closed:
+            self._stdin.close()
+        rc = self._proc.wait(timeout=timeout)
+        self._reader.join(timeout=2.0)
+        stderr_bytes = self._stderr.read()
+        self.close()
+        return rc, stderr_bytes
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        tracked = self._snapshot_descendants()
+        with contextlib.suppress(OSError, ValueError):
+            if not self._stdin.closed:
+                self._stdin.close()
+        if self._proc.poll() is None:
+            with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+                self._proc.wait(timeout=2.0)
+        if self._proc.poll() is None:
+            with contextlib.suppress(OSError):
+                self._proc.kill()
+            with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+                self._proc.wait(timeout=2.0)
+        if sys.platform == "win32":
+            for pid in (*tracked, self._proc.pid):
+                with contextlib.suppress(Exception):
+                    _win32_wait_or_terminate_pid(pid, terminate=True, timeout_s=2.0)
+        self._reader.join(timeout=1.0)
+        with contextlib.suppress(OSError, ValueError):
+            self._stdout.close()
+        with contextlib.suppress(OSError, ValueError):
+            self._stderr.close()
+
+    def __enter__(self) -> InstalledMcpPipeSession:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        self.close()
 
 
 # ---------------------------------------------------------------------------

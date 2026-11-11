@@ -1,3 +1,4 @@
+import dataclasses
 import errno
 import json
 import os
@@ -10,8 +11,9 @@ import pytest
 
 from superbrain.adapters.os import locks, os_adapters
 from superbrain.core.errors import BrainError, ErrorCode
+from superbrain.ports.os import LockFactory, LockHandle
 from superbrain.storage.layout import DataRoot, prepare_data_root
-from superbrain.storage.writer import LockState, acquire_writer
+from superbrain.storage.writer import LockState, acquire_writer, acquire_writer_unbumped
 from tests.support.crash import paused_child, run_child, run_until_crash
 from tests.support.fs import corrupt_bytes
 
@@ -275,3 +277,135 @@ def test_release_with_open_handles_is_refused_and_keeps_the_lock(trusted_tmp: Pa
         assert lease.held and run_child("acquire_writer", root.root).error_code == "writer_held"
         lease.unregister_handle("store")
     assert not lease.held and run_child("acquire_writer", root.root).error_code is None
+
+
+class _PortOnlyLockHandle:
+    """Conforming ``LockHandle`` wrapper that exposes only the port protocol and hides ``_fd``."""
+
+    def __init__(self, inner: LockHandle) -> None:
+        self._inner = inner
+
+    def read_payload(self) -> bytes:
+        return self._inner.read_payload()
+
+    def write_payload(self, offset: int, data: bytes) -> None:
+        self._inner.write_payload(offset, data)
+
+    def release(self) -> None:
+        self._inner.release()
+
+
+class _PortOnlyLockFactory:
+    """``LockFactory`` returning ``_PortOnlyLockHandle`` wrappers without ``_fd``."""
+
+    def __init__(self, inner: LockFactory) -> None:
+        self._inner = inner
+
+    def acquire(self, path: Path) -> LockHandle:
+        wrapped = _PortOnlyLockHandle(self._inner.acquire(path))
+        assert not hasattr(wrapped, "_fd")
+        return wrapped
+
+
+def test_failed_slot_write_preserves_confirmed_epoch_and_trust_hwm_through_lock_port(
+    trusted_tmp: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R03: Failed slot write/flush/short-write preserves confirmed epoch, trust HWM, and valid recovery slot."""
+    base_adapters = os_adapters()
+    real_write = os.write
+
+    for wrapper_name, case_adapters in (
+        ("port_wrapper", dataclasses.replace(base_adapters, locks=_PortOnlyLockFactory(base_adapters.locks))),
+        ("native_os_lock", base_adapters),
+    ):
+        for fault_mode in (
+            "fault_before_first_write",
+            "flush_after_write_failure",
+            "compensating_write_failure",
+            "short_write_io_error",
+        ):
+            case_dir = trusted_tmp / f"{wrapper_name}-{fault_mode}"
+            root = prepare_data_root(case_dir, base_adapters)
+
+            # Seed confirmed epoch=1 and trust_generation_hwm=4 (seq 1 at slot 0, seq 2 at slot 1).
+            with acquire_writer(root, case_adapters) as seeded:
+                assert seeded.epoch == 1
+                seeded.raise_trust_hwm(4)
+                assert seeded.state() == LockState(writer_epoch=1, trust_generation_hwm=4)
+
+            def _install_fault(mode: str = fault_mode) -> None:
+                write_calls = 0
+
+                def _faulty_write(fd: int, data: bytes | memoryview) -> int:
+                    nonlocal write_calls
+                    write_calls += 1
+                    raw_bytes = bytes(data)
+                    if mode == "fault_before_first_write":
+                        raise OSError(errno.EIO, "injected fault before first write")
+                    if mode == "compensating_write_failure":
+                        if write_calls >= 2 or (len(raw_bytes) == 128 and not any(raw_bytes)):
+                            raise OSError(errno.EIO, "injected compensating write failure")
+                        return real_write(fd, data)
+                    if mode == "short_write_io_error":
+                        if write_calls == 1:
+                            return real_write(fd, raw_bytes[:64])
+                        raise OSError(errno.EIO, "injected short write EIO")
+                    return real_write(fd, data)
+
+                def _failing_fsync(_fd: int) -> bool:
+                    raise OSError(errno.EIO, "injected flush failure after write")
+
+                monkeypatch.setattr(os, "write", _faulty_write)
+                if mode in {"flush_after_write_failure", "compensating_write_failure"}:
+                    monkeypatch.setattr(locks, "full_fsync", _failing_fsync)
+
+            # 1. Failed acquire_writer (epoch bump 1 -> 2) reports io_error and leaves confirmed epoch 1 on disk.
+            _install_fault()
+            with pytest.raises(BrainError) as exc_acq:
+                acquire_writer(root, case_adapters)
+            monkeypatch.undo()
+            assert exc_acq.value.code == ErrorCode.IO_ERROR, f"{wrapper_name}/{fault_mode}: got {exc_acq.value.code}"
+
+            # Confirmed slot (slot 1, offset 257..513) must remain intact with valid CRC, and disk epoch stays 1.
+            raw_after_acq_fail = root.lock_path.read_bytes()
+            assert raw_after_acq_fail[257:513] == slot_bytes(2, 1, 4)
+            with acquire_writer_unbumped(root, case_adapters) as disk_lease:
+                assert disk_lease.state() == LockState(writer_epoch=1, trust_generation_hwm=4), (
+                    f"{wrapper_name}/{fault_mode}: failed acquire corrupted/advanced disk state to {disk_lease.state()}"
+                )
+
+                # 2. Failed raise_trust_hwm(9) reports io_error and does NOT advance trust_generation_hwm on disk.
+                _install_fault()
+                with pytest.raises(BrainError) as exc_hwm:
+                    disk_lease.raise_trust_hwm(9)
+                monkeypatch.undo()
+                assert exc_hwm.value.code == ErrorCode.IO_ERROR
+                assert disk_lease.state() == LockState(writer_epoch=1, trust_generation_hwm=4)
+
+            with acquire_writer_unbumped(root, case_adapters) as verify_lease:
+                assert verify_lease.state() == LockState(writer_epoch=1, trust_generation_hwm=4), (
+                    f"{wrapper_name}/{fault_mode}: failed raise_trust_hwm persisted unconfirmed HWM: "
+                    f"{verify_lease.state()}"
+                )
+
+            # 3. Subsequent clean acquire recovers from the valid slot and grants epoch 2 with HWM 4.
+            with acquire_writer(root, case_adapters) as next_lease:
+                assert next_lease.epoch == 2, (
+                    f"{wrapper_name}/{fault_mode}: expected next acquire epoch 2, got {next_lease.epoch}"
+                )
+                assert next_lease.state() == LockState(writer_epoch=2, trust_generation_hwm=4)
+
+        # Positive twin: with no fault injected, acquire increments epoch and raise_trust_hwm advances HWM durably.
+        pos_root = prepare_data_root(trusted_tmp / f"{wrapper_name}-positive", base_adapters)
+        with acquire_writer(pos_root, case_adapters) as pos1:
+            assert pos1.epoch == 1
+            pos1.raise_trust_hwm(4)
+        with acquire_writer(pos_root, case_adapters) as pos2:
+            assert pos2.epoch == 2
+            pos2.raise_trust_hwm(9)
+            assert pos2.state() == LockState(writer_epoch=2, trust_generation_hwm=9)
+        pos_bytes = pos_root.lock_path.read_bytes()
+        assert pos_bytes[257:513] == slot_bytes(4, 2, 9)
+        with acquire_writer(pos_root, case_adapters) as pos3:
+            assert pos3.state() == LockState(writer_epoch=3, trust_generation_hwm=9)

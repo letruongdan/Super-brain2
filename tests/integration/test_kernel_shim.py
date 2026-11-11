@@ -56,10 +56,11 @@ from superbrain.core.kernel import (
     Scope,
     WorkspaceBinding,
 )
-from superbrain.core.wire import WORKSPACE_SCOPED_TOOLS, load_catalog
+from superbrain.core.wire import MAX_WIRE_BODY_BYTES, WORKSPACE_SCOPED_TOOLS, load_catalog
 from superbrain.mcp.stdio import MCP_PROTOCOL_VERSION, run_stdio
 from tests.support.clock import FakeClock
 from tests.support.inc2_cli import (
+    InstalledMcpPipeSession,
     ShimTestDomain,
     decode_stdio_frames,
     encode_stdio_frames,
@@ -68,6 +69,7 @@ from tests.support.inc2_cli import (
     mcp_init_frames,
     run_inprocess_stdio,
     run_installed_command,
+    spawn_installed_brain_serve,
     spawn_installed_fixture_daemon,
     verify_installed_wheel_isolation,
     write_ca_file,
@@ -435,79 +437,110 @@ def test_installed_shim_exposes_packaged_catalog_and_calls_daemon(
     expected_catalog = load_catalog()
     assert expected_catalog.schema_sha256 == inc2_installed_env.source_schema_sha256
 
-    frames: list[dict[str, JsonValue]] = [
-        *mcp_init_frames(1),
-        {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
-        mcp_call_frame(3, "get_health", {"schema_version": "2.0"}),
-        mcp_call_frame(
-            4,
-            "prepare_task",
-            {
-                "schema_version": "2.0",
-                "idempotency_key": "idem-wheel-prod-0001",
-                "task_id": "task-wheel-prod-1",
-                "harness_id": "claude-code",
-                "description": "verify packaged catalog against production daemon",
-            },
-        ),
+    init_pair = mcp_init_frames(1)
+    init_req_frame = init_pair[0]
+    initialized_notif_frame = init_pair[1]
+    list_req_frame: dict[str, JsonValue] = {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}
+    health_req_bytes = canonical_json(mcp_call_frame(3, "get_health", {"schema_version": "2.0"}))
+    split_health_chunks = [
+        health_req_bytes[:24],
+        health_req_bytes[24:] + b"\r",
+        b"\n",
     ]
-    stdin_payload = encode_stdio_frames(frames)
+    prep_prod_frame = mcp_call_frame(
+        4,
+        "prepare_task",
+        {
+            "schema_version": "2.0",
+            "idempotency_key": "idem-wheel-prod-0001",
+            "task_id": "task-wheel-prod-1",
+            "harness_id": "claude-code",
+            "description": "verify packaged catalog against production daemon",
+        },
+    )
 
-    # Part A: Production daemon (domain=None) returns capability_unavailable for unimplemented domain tools.
-    with open_test_loopback_transport(shim_bundle.template, name="installed-prod", domain=None) as h_prod:
-        prod_profile_path, _ = _write_harness_profile(h_prod, "prod-ws-a", workspace=shim_bundle.ws_a)
+    # Part A (R01 & R07): Wheel-installed `brain serve` production daemon + open-pipe wheel-installed shims
+    # (`brain mcp` and `brain-mcp`), waiting for each response while stdin stays open before sending the next frame.
+    with spawn_installed_brain_serve(
+        inc2_installed_env,
+        config_path,
+        data_root=data_root,
+        cwd=chk_a_path,
+    ) as prod_daemon:
+        prod_daemon.wait_ready()
 
         for script_name, base_args in (
-            ("brain", ("mcp", "--profile", str(prod_profile_path))),
-            ("brain-mcp", ("--profile", str(prod_profile_path))),
+            ("brain", ("mcp", "--profile", str(profile_path))),
+            ("brain-mcp", ("--profile", str(profile_path))),
         ):
-            res_proc = run_installed_command(
+            with InstalledMcpPipeSession(
                 inc2_installed_env,
                 script_name,
                 base_args,
                 cwd=chk_a_path,
-                stdin_bytes=stdin_payload,
-            )
-            assert res_proc.returncode == 0, (
-                f"{script_name} failed (rc={res_proc.returncode}): "
-                f"stderr={res_proc.stderr.decode('utf-8', errors='replace')!r}"
-            )
-            assert res_proc.stderr == b""
-            responses = decode_stdio_frames(res_proc.stdout)
-            assert len(responses) == 4
+            ) as pipe_sess:
+                # 1. initialize answered on stdout while stdin remains open and process is alive
+                resp_init = pipe_sess.send_frames_and_expect_response([init_req_frame])
+                assert resp_init.get("id") == 1
+                init_res = _extract_tool_result(resp_init)
+                assert init_res.get("protocolVersion") == MCP_PROTOCOL_VERSION
 
-            # 1. initialize
-            init_res = _extract_tool_result(responses[0])
-            assert init_res.get("protocolVersion") == MCP_PROTOCOL_VERSION
+                # 2. notifications/initialized + tools/list answered while stdin remains open
+                resp_list = pipe_sess.send_frames_and_expect_response([initialized_notif_frame, list_req_frame])
+                assert resp_list.get("id") == 2
+                list_res = _extract_tool_result(resp_list)
+                assert list_res.get("tools") == expected_catalog.mcp_tools_list()
+                assert digest_bytes(canonical_json(list_res)) == digest_bytes(
+                    canonical_json({"tools": expected_catalog.mcp_tools_list()})
+                )
 
-            # 2. tools/list matches packaged catalog bytes/order exactly
-            list_res = _extract_tool_result(responses[1])
-            assert list_res.get("tools") == expected_catalog.mcp_tools_list()
-            assert digest_bytes(canonical_json(list_res)) == digest_bytes(
-                canonical_json({"tools": expected_catalog.mcp_tools_list()})
-            )
+                # 3. get_health split across multiple writes (with split CRLF) answered while stdin remains open
+                resp_health = pipe_sess.write_chunks_and_expect_response(split_health_chunks)
+                assert resp_health.get("id") == 3
+                health_res = _extract_tool_result(resp_health)
+                assert health_res.get("isError") is False
+                health_sc = health_res.get("structuredContent")
+                assert isinstance(health_sc, dict) and health_sc.get("ok") is True
+                health_data = health_sc.get("data")
+                assert isinstance(health_data, dict)
+                assert health_data.get("store_id") == shim_bundle.template.store_id
 
-            # 3. get_health succeeds
-            health_res = _extract_tool_result(responses[2])
-            assert health_res.get("isError") is False
-            health_sc = health_res.get("structuredContent")
-            assert isinstance(health_sc, dict) and health_sc.get("ok") is True
-            health_data = health_sc.get("data")
-            assert isinstance(health_data, dict)
-            assert health_data.get("store_id") == shim_bundle.template.store_id
+                # 4. prepare_task on production daemon returns capability_unavailable while stdin remains open
+                resp_prep = pipe_sess.send_frames_and_expect_response([prep_prod_frame])
+                assert resp_prep.get("id") == 4
+                prep_res = _extract_tool_result(resp_prep)
+                assert prep_res.get("isError") is True
+                assert "_meta" not in prep_res
+                prep_sc = prep_res.get("structuredContent")
+                assert prep_sc == {
+                    "ok": False,
+                    "error": {
+                        "code": "capability_unavailable",
+                        "message": "capability unavailable",
+                    },
+                }
 
-            # 4. prepare_task on production daemon returns capability_unavailable
-            prep_res = _extract_tool_result(responses[3])
-            assert prep_res.get("isError") is True
-            assert "_meta" not in prep_res
-            prep_sc = prep_res.get("structuredContent")
-            assert prep_sc == {
-                "ok": False,
-                "error": {
-                    "code": "capability_unavailable",
-                    "message": "capability unavailable",
-                },
-            }
+                # 5. For brain-mcp, also verify the 1 MiB per-frame cap is enforced over the open pipe.
+                if script_name == "brain-mcp":
+                    oversize_line = b'{"jsonrpc":"2.0","id":99,"pad":"' + (b"X" * MAX_WIRE_BODY_BYTES) + b'"}\n'
+                    resp_cap = pipe_sess.write_chunks_and_expect_response(
+                        [oversize_line],
+                        require_alive_after=False,
+                    )
+                    assert resp_cap == {
+                        "jsonrpc": "2.0",
+                        "id": None,
+                        "error": {"code": -32700, "message": "parse error"},
+                    }
+
+                rc_proc, stderr_proc = pipe_sess.finish()
+                assert rc_proc == 0, (
+                    f"{script_name} failed (rc={rc_proc}): stderr={stderr_proc.decode('utf-8', errors='replace')!r}"
+                )
+                assert stderr_proc == b""
+
+        rc_prod, _, _, _ = prod_daemon.signal_and_wait_exit()
+        assert rc_prod == 0
 
     # Part B: Fixture daemon running on the SAME installed wheel commits positive result & verifies schema sha256.
     with spawn_installed_fixture_daemon(
@@ -523,33 +556,32 @@ def test_installed_shim_exposes_packaged_catalog_and_calls_daemon(
             ("brain-mcp", ("--profile", str(profile_path))),
             ("brain", ("mcp", "--profile", str(profile_path))),
         ):
-            fix_frames = [
-                *mcp_init_frames(1),
-                mcp_call_frame(
-                    2,
-                    "prepare_task",
-                    {
-                        "schema_version": "2.0",
-                        "idempotency_key": "idem-wheel-fixture-0001",
-                        "task_id": "task-wheel-fixture-1",
-                        "harness_id": "claude-code",
-                        "description": "verify positive call and schema digest across wheel",
-                    },
-                ),
-            ]
-            res_fix = run_installed_command(
+            prep_fix_frame = mcp_call_frame(
+                2,
+                "prepare_task",
+                {
+                    "schema_version": "2.0",
+                    "idempotency_key": "idem-wheel-fixture-0001",
+                    "task_id": "task-wheel-fixture-1",
+                    "harness_id": "claude-code",
+                    "description": "verify positive call and schema digest across wheel",
+                },
+            )
+            with InstalledMcpPipeSession(
                 inc2_installed_env,
                 script_name,
                 base_args,
                 cwd=chk_a_path,
-                stdin_bytes=encode_stdio_frames(fix_frames),
-            )
-            assert res_fix.returncode == 0
-            assert res_fix.stderr == b""
-            fix_responses = decode_stdio_frames(res_fix.stdout)
-            assert len(fix_responses) == 2
+            ) as fix_sess:
+                fix_init = fix_sess.send_frames_and_expect_response([init_req_frame])
+                assert fix_init.get("id") == 1
+                fix_call = fix_sess.send_frames_and_expect_response([initialized_notif_frame, prep_fix_frame])
+                assert fix_call.get("id") == 2
+                rc_fix_proc, stderr_fix_proc = fix_sess.finish()
+                assert rc_fix_proc == 0
+                assert stderr_fix_proc == b""
 
-            call_res = _extract_tool_result(fix_responses[1])
+            call_res = _extract_tool_result(fix_call)
             assert call_res.get("isError") is False
             sc = call_res.get("structuredContent")
             assert isinstance(sc, dict) and sc.get("ok") is True

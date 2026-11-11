@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import collections
 import copy
 import io
-from typing import Any
+from collections.abc import Callable, Sequence
+from typing import Any, BinaryIO
 
 from superbrain.mcp.stdio import (
     MCP_PROTOCOL_VERSION,
@@ -1061,3 +1063,343 @@ def test_stdio_uncertainty_and_failed_stdout_have_no_second_call() -> None:
         rc_broken = run_stdio(io.BytesIO(two_calls_input), broken_out, _counting_caller)
         assert rc_broken == 1
         assert dispatched == ["get_health"]
+
+
+class _PartialPipeRaw(io.RawIOBase):
+    """Non-blocking/partial-read ``RawIOBase`` pipe double wrapped by ``io.BufferedReader``.
+
+    Each ``readinto`` call returns only the next queued chunk (modeling OS pipe partial reads
+    where ``read1`` returns currently available bytes whereas ``BufferedReader.read(65536)``
+    loops calling ``readinto`` again until 65,536 bytes or EOF).
+    """
+
+    def __init__(
+        self,
+        initial_chunks: Sequence[bytes] = (),
+        *,
+        close_after_initial: bool = False,
+    ) -> None:
+        super().__init__()
+        self._chunks: collections.deque[bytes] = collections.deque(c for c in initial_chunks if c)
+        self._eof = close_after_initial
+        self.stalled_while_waiting_for_reply: list[int] = []
+        self.completed_replies = 0
+
+    @property
+    def is_open_pipe(self) -> bool:
+        return not self.closed and not self._eof
+
+    def push_chunks(self, chunks: Sequence[bytes], *, eof_after: bool = False) -> None:
+        for chunk in chunks:
+            if chunk:
+                self._chunks.append(chunk)
+        if eof_after:
+            self._eof = True
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, b: Any) -> int:
+        view = memoryview(b).cast("B")
+        if not self._chunks:
+            if not self._eof:
+                self.stalled_while_waiting_for_reply.append(self.completed_replies)
+                self._eof = True
+            return 0
+        chunk = self._chunks.popleft()
+        n = min(len(view), len(chunk))
+        view[:n] = chunk[:n]
+        if n < len(chunk):
+            self._chunks.appendleft(chunk[n:])
+        return n
+
+
+class _InteractivePipeStdout(io.BytesIO):
+    """Stdout double that inspects each flushed frame while the input pipe is still open."""
+
+    def __init__(
+        self,
+        raw_in: _PartialPipeRaw,
+        on_response: Callable[[int, dict[str, Any], _PartialPipeRaw], None],
+    ) -> None:
+        super().__init__()
+        self._raw_in = raw_in
+        self._on_response = on_response
+        self._processed_offset = 0
+        self.responses: list[dict[str, Any]] = []
+        self.pipe_open_on_flush: list[bool] = []
+
+    def flush(self) -> None:
+        super().flush()
+        data = self.getvalue()
+        pending = data[self._processed_offset :]
+        while b"\n" in pending:
+            nl = pending.index(b"\n")
+            line = pending[:nl]
+            self._processed_offset += nl + 1
+            pending = pending[nl + 1 :]
+            frames = _decode_stdout_frames(line + b"\n")
+            assert len(frames) == 1
+            frame = frames[0]
+            was_open = self._raw_in.is_open_pipe
+            self.pipe_open_on_flush.append(was_open)
+            self.responses.append(frame)
+            self._raw_in.completed_replies = len(self.responses)
+            if was_open:
+                self._on_response(len(self.responses), frame, self._raw_in)
+
+
+def _buffered_pipe_reader(
+    chunks: Sequence[bytes], *, close_after_initial: bool = True
+) -> tuple[BinaryIO, _PartialPipeRaw]:
+    raw = _PartialPipeRaw(chunks, close_after_initial=close_after_initial)
+    return io.BufferedReader(raw, buffer_size=65_536), raw
+
+
+def test_stdio_answers_each_frame_while_pipe_stays_open() -> None:
+    """R01: ``run_stdio`` answers each complete frame while ``stdin`` stays open on a buffered pipe."""
+    from superbrain.core.canonical import canonical_json
+    from superbrain.core.jsonvalue import JsonValue
+    from superbrain.core.kernel import CallResult
+    from superbrain.core.wire import MAX_WIRE_BODY_BYTES, make_success_envelope
+
+    calls: list[tuple[str, dict[str, JsonValue]]] = []
+
+    def fake_caller(tool: str, arguments: dict[str, JsonValue]) -> CallResult:
+        calls.append((tool, copy.deepcopy(arguments)))
+        return make_success_envelope({"ready": True, "call_index": len(calls)})
+
+    init_frame = (
+        canonical_json(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": MCP_PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": {"name": "open-pipe-host", "version": "1.0.0"},
+                },
+            }
+        )
+        + b"\n"
+    )
+    initialized_notif = (
+        canonical_json({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}) + b"\r\n"
+    )
+    list_frame = canonical_json({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}) + b"\n"
+
+    health_json = canonical_json(
+        {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "get_health",
+                "arguments": {"schema_version": "2.0", "deep": False},
+            },
+        }
+    )
+    # Split frame across 4 partial pipe writes, including CRLF split across two chunks.
+    split_health_chunks = [
+        health_json[:19],
+        health_json[19:57],
+        health_json[57:] + b"\r",
+        b"\n",
+    ]
+
+    meta_pads: dict[str, JsonValue] = {f"pad_{idx:02d}": "P" * 60_000 for idx in range(17)}
+    meta_pads["tail"] = ""
+    cap_req: dict[str, JsonValue] = {
+        "jsonrpc": "2.0",
+        "id": "cap-ok",
+        "method": "tools/call",
+        "params": {
+            "name": "get_health",
+            "arguments": {"schema_version": "2.0", "deep": True},
+            "_meta": meta_pads,
+        },
+    }
+    remaining = MAX_WIRE_BODY_BYTES - len(canonical_json(cap_req))
+    meta_pads["tail"] = "T" * remaining
+    exact_cap_bytes = canonical_json(cap_req)
+    assert len(exact_cap_bytes) == MAX_WIRE_BODY_BYTES
+    exact_cap_chunks = [
+        exact_cap_bytes[:500_000],
+        exact_cap_bytes[500_000:] + b"\n",
+    ]
+
+    meta_pads["tail"] = "T" * (remaining + 1)
+    oversize_bytes = canonical_json(cap_req)
+    assert len(oversize_bytes) == MAX_WIRE_BODY_BYTES + 1
+    trailing_call = (
+        canonical_json(
+            {
+                "jsonrpc": "2.0",
+                "id": "after-oversize-open-pipe",
+                "method": "tools/call",
+                "params": {
+                    "name": "get_health",
+                    "arguments": {"schema_version": "2.0"},
+                },
+            }
+        )
+        + b"\n"
+    )
+
+    def _on_response(idx: int, frame: dict[str, Any], pipe_in: _PartialPipeRaw) -> None:
+        if idx == 1:
+            assert frame.get("id") == 1
+            pipe_in.push_chunks([initialized_notif, list_frame])
+        elif idx == 2:
+            assert frame.get("id") == 2
+            pipe_in.push_chunks(split_health_chunks)
+        elif idx == 3:
+            assert frame.get("id") == 3
+            pipe_in.push_chunks(exact_cap_chunks)
+        elif idx == 4:
+            assert frame.get("id") == "cap-ok"
+            pipe_in.push_chunks([oversize_bytes + b"\n", trailing_call], eof_after=True)
+
+    stdin_stream, raw_pipe = _buffered_pipe_reader([init_frame], close_after_initial=False)
+    stdout_stream = _InteractivePipeStdout(raw_pipe, _on_response)
+
+    rc = run_stdio(stdin_stream, stdout_stream, fake_caller)
+    assert rc == 0
+    assert raw_pipe.stalled_while_waiting_for_reply == [], (
+        "run_stdio blocked waiting for more stdin bytes before flushing response for completed frame "
+        f"(stalled after {raw_pipe.stalled_while_waiting_for_reply} replies)"
+    )
+    assert [r.get("id") for r in stdout_stream.responses] == [1, 2, 3, "cap-ok", None]
+    assert stdout_stream.pipe_open_on_flush[:4] == [True, True, True, True]
+    assert stdout_stream.responses[4] == {
+        "jsonrpc": "2.0",
+        "id": None,
+        "error": {"code": -32700, "message": "parse error"},
+    }
+    assert calls == [
+        ("get_health", {"schema_version": "2.0", "deep": False}),
+        ("get_health", {"schema_version": "2.0", "deep": True}),
+    ]
+
+
+def test_stdio_unterminated_eof_never_dispatches_tool() -> None:
+    """R02: A tool is dispatched only after a complete UTF-8 frame AND its stdio delimiter are received."""
+    from superbrain.core.canonical import canonical_json
+    from superbrain.core.jsonvalue import JsonValue
+    from superbrain.core.kernel import CallResult
+    from superbrain.core.wire import MAX_WIRE_BODY_BYTES, make_success_envelope
+
+    calls: list[tuple[str, dict[str, JsonValue]]] = []
+
+    def recording_caller(tool: str, arguments: dict[str, JsonValue]) -> CallResult:
+        calls.append((tool, copy.deepcopy(arguments)))
+        return make_success_envelope({"ready": True, "count": len(calls)})
+
+    init_chunks = _init_frames()
+    prepare_req: dict[str, JsonValue] = {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+            "name": "prepare_task",
+            "arguments": {
+                "schema_version": "2.0",
+                "idempotency_key": "idem-r02-eof-1",
+                "task_id": "task-r02-eof-1",
+                "harness_id": "claude-code",
+                "description": "must never dispatch without trailing LF",
+            },
+        },
+    }
+    valid_json_no_lf = canonical_json(prepare_req)
+    assert not valid_json_no_lf.endswith(b"\n")
+
+    # 1. Valid tools/call JSON without trailing LF followed by EOF -> zero tool invocations, no response for id=2.
+    for trailing in (b"", b"\r"):
+        calls.clear()
+        stdin_eof, _ = _buffered_pipe_reader([*init_chunks, valid_json_no_lf + trailing], close_after_initial=True)
+        out_eof = io.BytesIO()
+        rc_eof = run_stdio(stdin_eof, out_eof, recording_caller)
+        assert rc_eof == 0
+        frames_eof = _decode_stdout_frames(out_eof.getvalue())
+        response_ids = [f.get("id") for f in frames_eof]
+        assert calls == [], f"Expected zero tool invocations on EOF before LF (trailing={trailing!r}), got {calls}"
+        assert 2 not in response_ids, f"Expected no response for unterminated id=2, got {response_ids}"
+
+    # 2. Clean EOF right after valid initialize + notifications/initialized -> exits 0, zero tool invocations.
+    calls.clear()
+    stdin_clean, _ = _buffered_pipe_reader(init_chunks, close_after_initial=True)
+    out_clean = io.BytesIO()
+    assert run_stdio(stdin_clean, out_clean, recording_caller) == 0
+    assert calls == []
+    frames_clean = _decode_stdout_frames(out_clean.getvalue())
+    assert [f.get("id") for f in frames_clean] == ["init-1"]
+
+    # 3. Positive twin with trailing LF -> exactly one invocation and response for id=2.
+    calls.clear()
+    stdin_pos, _ = _buffered_pipe_reader([*init_chunks, valid_json_no_lf + b"\n"], close_after_initial=True)
+    out_pos = io.BytesIO()
+    assert run_stdio(stdin_pos, out_pos, recording_caller) == 0
+    assert len(calls) == 1 and calls[0][0] == "prepare_task"
+    frames_pos = _decode_stdout_frames(out_pos.getvalue())
+    assert [f.get("id") for f in frames_pos] == ["init-1", 2]
+
+    # 4. CRLF split across chunks -> exactly one invocation and response for id=2.
+    calls.clear()
+    stdin_crlf, _ = _buffered_pipe_reader(
+        [*init_chunks, valid_json_no_lf[:40], valid_json_no_lf[40:] + b"\r", b"\n"],
+        close_after_initial=True,
+    )
+    out_crlf = io.BytesIO()
+    assert run_stdio(stdin_crlf, out_crlf, recording_caller) == 0
+    assert len(calls) == 1 and calls[0][0] == "prepare_task"
+    frames_crlf = _decode_stdout_frames(out_crlf.getvalue())
+    assert [f.get("id") for f in frames_crlf] == ["init-1", 2]
+
+    # 5. Frame exactly at cap (MAX_WIRE_BODY_BYTES) with LF accepted; without LF at EOF refused; cap+1 with LF refused.
+    meta_pads: dict[str, JsonValue] = {f"pad_{idx:02d}": "P" * 60_000 for idx in range(17)}
+    meta_pads["tail"] = ""
+    cap_call: dict[str, JsonValue] = {
+        "jsonrpc": "2.0",
+        "id": "cap-r02",
+        "method": "tools/call",
+        "params": {
+            "name": "get_health",
+            "arguments": {"schema_version": "2.0", "deep": False},
+            "_meta": meta_pads,
+        },
+    }
+    rem = MAX_WIRE_BODY_BYTES - len(canonical_json(cap_call))
+    meta_pads["tail"] = "T" * rem
+    exact_cap_frame = canonical_json(cap_call)
+    assert len(exact_cap_frame) == MAX_WIRE_BODY_BYTES
+
+    calls.clear()
+    stdin_cap_ok, _ = _buffered_pipe_reader(
+        [*init_chunks, exact_cap_frame[:700_000], exact_cap_frame[700_000:] + b"\n"],
+        close_after_initial=True,
+    )
+    out_cap_ok = io.BytesIO()
+    assert run_stdio(stdin_cap_ok, out_cap_ok, recording_caller) == 0
+    assert calls == [("get_health", {"schema_version": "2.0", "deep": False})]
+    assert [f.get("id") for f in _decode_stdout_frames(out_cap_ok.getvalue())] == ["init-1", "cap-r02"]
+
+    calls.clear()
+    stdin_cap_no_lf, _ = _buffered_pipe_reader([*init_chunks, exact_cap_frame], close_after_initial=True)
+    out_cap_no_lf = io.BytesIO()
+    assert run_stdio(stdin_cap_no_lf, out_cap_no_lf, recording_caller) == 0
+    assert calls == []
+    assert "cap-r02" not in [f.get("id") for f in _decode_stdout_frames(out_cap_no_lf.getvalue())]
+
+    calls.clear()
+    meta_pads["tail"] = "T" * (rem + 1)
+    over_cap_frame = canonical_json(cap_call)
+    assert len(over_cap_frame) == MAX_WIRE_BODY_BYTES + 1
+    stdin_over_cap, _ = _buffered_pipe_reader([*init_chunks, over_cap_frame + b"\n"], close_after_initial=True)
+    out_over_cap = io.BytesIO()
+    assert run_stdio(stdin_over_cap, out_over_cap, recording_caller) == 0
+    assert calls == []
+    frames_over_cap = _decode_stdout_frames(out_over_cap.getvalue())
+    assert [f.get("id") for f in frames_over_cap] == ["init-1", None]
+    assert frames_over_cap[1]["error"] == {"code": -32700, "message": "parse error"}

@@ -18,15 +18,17 @@ from __future__ import annotations
 import contextlib
 import datetime as dt
 import io
+import os
 import shutil
+import socket
 import sqlite3
+import time
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 
 import pytest
 
 from superbrain.adapters.os import os_adapters
-from superbrain.adapters.os.locks import OsLockFactory
 from superbrain.composition.client_entry import (
     build_tool_caller,
     read_status,
@@ -57,12 +59,14 @@ from tests.support.inc2_cli import (
     write_credential_file,
     write_daemon_config_file,
 )
-from tests.support.inc2_fixture import InstalledEnv
+from tests.support.inc2_fixture import InstalledEnv, open_kernel_job_runtime
 from tests.support.inc2_transport import (
     TransportTemplate,
     clone_owner_only_tree,
     make_trusted_test_dir,
 )
+from tests.support.kernel_auth import seed_principal_and_credential
+from tests.support.platform import windows_only
 
 
 @pytest.fixture(scope="module")
@@ -491,9 +495,23 @@ def test_installed_migrate_respects_offline_lease(
     assert data2.get("writer_epoch") == epoch1 + 1
     assert is_writer_lock_held(legacy_root) is False
 
-    # 5. While writer.lock is held on legacy_root, installed `brain migrate --offline` is refused with writer_held.
-    lock_handle = OsLockFactory().acquire(layout.lock_path)
+    # 5. Seed an active credential on the migrated root, serve it via wheel-installed `brain serve`,
+    # and verify wheel-installed `brain migrate --offline` is refused with writer_held (R07).
+    rt_v2 = open_kernel_job_runtime(legacy_root, adapters)
     try:
+        seed_principal_and_credential(rt_v2.policy, owner_id="dan", harness_id="claude-code", machine_id="m-1")
+    finally:
+        rt_v2.close()
+
+    with spawn_installed_brain_serve(
+        inc2_installed_env,
+        legacy_cfg,
+        data_root=legacy_root,
+        cwd=outside_cwd,
+    ) as serve_proc:
+        ep = serve_proc.wait_ready()
+        assert ep.store_id == store_id
+
         res_held = run_installed_command(
             inc2_installed_env,
             "brain",
@@ -503,8 +521,9 @@ def test_installed_migrate_respects_offline_lease(
         assert res_held.returncode == 1
         assert res_held.stdout == b""
         assert _assert_static_stderr_line(res_held.stderr) == "writer_held"
-    finally:
-        lock_handle.release()
+
+        rc_serve, _, _, _ = serve_proc.signal_and_wait_exit()
+        assert rc_serve == 0
 
     # Verify original CAS blob is still intact after migration and lease refusal.
     hex_ = blob_digest.removeprefix("sha256:")
@@ -527,3 +546,131 @@ def test_installed_migrate_respects_offline_lease(
     assert out_mig_missing == b""
     _assert_static_stderr_line(err_mig_missing, forbidden_substrings=(str(missing_mig_root),))
     assert not missing_mig_root.exists()
+
+
+@windows_only
+def test_installed_serve_handles_ctrl_break_across_startup_on_ready_and_ready(
+    inc2_installed_env: InstalledEnv,
+    cli_transport_template: TransportTemplate,
+    cli_scratch_root: Path,
+) -> None:
+    """R06: Real installed ``brain serve`` handles ``CTRL_BREAK_EVENT`` during startup, ``on_ready``, and ready."""
+    from superbrain.composition.owner_entry import main as owner_main
+
+    ctrl_break_Codes = {0xC000013A, -1073741510}
+    case_dir = cli_scratch_root / "ctrl-break-lifecycle"
+    outside_cwd = case_dir / "outside-cwd"
+    outside_cwd.mkdir(parents=True, exist_ok=True)
+    os_adapters().permissions.secure_directory(outside_cwd)
+
+    data_root = case_dir / "data"
+    clone_owner_only_tree(cli_transport_template.root, data_root)
+    os_adapters().permissions.secure_directory(data_root)
+    config_path = write_daemon_config_file(
+        case_dir / "daemon-config.json",
+        data_root=data_root,
+        expected_store_id=cli_transport_template.store_id,
+        cert_path=cli_transport_template.tls.cert_path,
+        key_path=cli_transport_template.tls.key_path,
+    )
+    endpoint_path = data_root / "endpoint.json"
+
+    # (a) Deliver CTRL_BREAK_EVENT during startup before endpoint.json is published.
+    with spawn_installed_brain_serve(
+        inc2_installed_env,
+        config_path,
+        data_root=data_root,
+        cwd=outside_cwd,
+    ) as proc_a:
+        deadline_a = time.perf_counter() + 10.0
+        caught_startup = False
+        while time.perf_counter() < deadline_a:
+            if list(case_dir.glob(".data.admit-*")) and not endpoint_path.exists():
+                caught_startup = True
+                break
+            time.sleep(0.0005)
+        assert caught_startup, "Did not observe pre-publish startup window (.data.admit-*)"
+        rc_a, _out_a, _err_a, _children_a = proc_a.signal_and_wait_exit()
+    ep_remains_a = endpoint_path.exists()
+    lock_held_a = is_writer_lock_held(data_root)
+    scratch_remains_a = bool(list(case_dir.glob(".data.admit-*")))
+    for leftover in case_dir.glob(".data.admit-*"):
+        shutil.rmtree(leftover, ignore_errors=True)
+    endpoint_path.unlink(missing_ok=True)
+
+    # (b) Deliver CTRL_BREAK_EVENT while the `on_ready` callback is running after endpoint.json is published.
+    prebuilt_tree = case_dir / "prebuilt-on-ready-tree"
+    prebuilt_tree.mkdir(parents=True, exist_ok=True)
+    for idx in range(1500):
+        (prebuilt_tree / f"d{idx:04d}").mkdir(exist_ok=True)
+
+    with spawn_installed_brain_serve(
+        inc2_installed_env,
+        config_path,
+        data_root=data_root,
+        cwd=outside_cwd,
+    ) as proc_b:
+        deadline_b = time.perf_counter() + 15.0
+        scratch_b: Path | None = None
+        while time.perf_counter() < deadline_b:
+            matches = list(case_dir.glob(".data.admit-*"))
+            if matches:
+                scratch_b = matches[0]
+                os.replace(prebuilt_tree, scratch_b / "tree")
+                break
+            time.sleep(0.0005)
+        assert scratch_b is not None, "Did not observe .data.admit-* scratch creation for on_ready window"
+        first_marker = scratch_b / "tree" / "d0000"
+        last_marker = scratch_b / "tree" / "d1499"
+        caught_on_ready = False
+        while time.perf_counter() < deadline_b:
+            if endpoint_path.is_file() and not first_marker.exists() and last_marker.exists():
+                caught_on_ready = True
+                break
+            time.sleep(0.0005)
+        assert caught_on_ready, "Did not observe active on_ready callback after endpoint.json publish"
+        rc_b, _out_b, _err_b, _children_b = proc_b.signal_and_wait_exit()
+    ep_remains_b = endpoint_path.exists()
+    lock_held_b = is_writer_lock_held(data_root)
+    scratch_remains_b = bool(list(case_dir.glob(".data.admit-*")))
+    for leftover in case_dir.glob(".data.admit-*"):
+        shutil.rmtree(leftover, ignore_errors=True)
+    endpoint_path.unlink(missing_ok=True)
+
+    # (c) Deliver CTRL_BREAK_EVENT after ready; verify endpoint removed, socket closed, and lease re-acquirable.
+    with spawn_installed_brain_serve(
+        inc2_installed_env,
+        config_path,
+        data_root=data_root,
+        cwd=outside_cwd,
+    ) as proc_c:
+        ep_c = proc_c.wait_ready()
+        deadline_c = time.perf_counter() + 5.0
+        while list(case_dir.glob(".data.admit-*")) and time.perf_counter() < deadline_c:
+            time.sleep(0.005)
+        rc_c, _out_c, _err_c, _children_c = proc_c.signal_and_wait_exit()
+    ep_remains_c = endpoint_path.exists()
+    lock_held_c = is_writer_lock_held(data_root)
+    with pytest.raises(OSError):
+        with socket.create_connection((ep_c.host, ep_c.port), timeout=0.5):
+            pass
+
+    # Verify lease is re-acquirable by offline migrate after all three signal stops.
+    rc_mig, out_mig, err_mig = _run_inproc_entry(
+        owner_main,
+        ("migrate", "--offline", "--config", str(config_path)),
+    )
+    assert rc_mig == 0, f"Lease not re-acquirable after CTRL_BREAK_EVENT: stderr={err_mig!r}"
+    mig_env = parse_json(out_mig.strip())
+    assert isinstance(mig_env, dict) and mig_env.get("ok") is True
+
+    # Assert all three windows (b, a, c) exited cleanly through cleanup without 0xC000013A or leaked endpoint.json.
+    assert rc_b not in ctrl_break_Codes and not ep_remains_b and not lock_held_b and not scratch_remains_b, (
+        f"R06(b) on_ready CTRL_BREAK_EVENT bypassed cleanup: rc={rc_b:#x} ({rc_b}), "
+        f"endpoint_remains={ep_remains_b}, lock_held={lock_held_b}, scratch_remains={scratch_remains_b}"
+    )
+    assert rc_a not in ctrl_break_Codes and not ep_remains_a and not lock_held_a and not scratch_remains_a, (
+        f"R06(a) startup CTRL_BREAK_EVENT bypassed cleanup: rc={rc_a:#x} ({rc_a}), "
+        f"endpoint_remains={ep_remains_a}, lock_held={lock_held_a}, scratch_remains={scratch_remains_a}"
+    )
+    assert rc_c == 0 and not ep_remains_c and not lock_held_c
