@@ -36,6 +36,7 @@ from superbrain.composition._endpoint import (
 from superbrain.composition.kernel_bridge import KernelBridge
 from superbrain.composition.kernel_projections import kernel_store_extensions
 from superbrain.core.errors import BrainError, ErrorCode
+from superbrain.core.faults import crashpoint
 from superbrain.core.ids import new_id
 from superbrain.core.kernel import (
     DAEMON_QUEUE_DEPTH,
@@ -220,6 +221,7 @@ def _open_owner_session(
         listener = bind_loopback_listener(ssl_ctx)
         if on_listener_bound is not None:
             on_listener_bound(listener)
+        crashpoint("daemon.after_bind_before_endpoint")
 
         candidate_endpoint = Endpoint(
             version=ENDPOINT_VERSION,
@@ -234,6 +236,7 @@ def _open_owner_session(
         _check_tls_utc_window(resolved_clock, verified_tls.not_before, verified_tls.not_after)
         endpoint = candidate_endpoint
         publish_endpoint(rt.root, rt.lease, endpoint, adapters)
+        crashpoint("daemon.after_endpoint_publish")
 
         if hooks.after_endpoint_publish_before_final_tls_check is not None:
             hooks.after_endpoint_publish_before_final_tls_check(endpoint)

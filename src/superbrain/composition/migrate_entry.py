@@ -9,6 +9,7 @@ from typing import Literal
 
 from superbrain.adapters.os import os_adapters
 from superbrain.core.errors import BrainError, ErrorCode
+from superbrain.core.faults import crashpoint
 from superbrain.core.kernel import DaemonConfig
 from superbrain.ports.os import OsAdapters
 from superbrain.storage.kernel_schema import KERNEL_POLICY_MIGRATIONS, KERNEL_STORE_MIGRATIONS
@@ -86,6 +87,7 @@ def migrate_offline(
                 migrations=policy_migrations,
                 now=adapters.clock.now(),
             )
+            crashpoint("kernel.migrate.after_policy_swap")  # only when the policy really migrated
             policy_outcome = TargetMigrationOutcome(
                 target="policy",
                 status="migrated",

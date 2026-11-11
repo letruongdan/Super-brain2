@@ -23,6 +23,10 @@ KNOWN_CRASHPOINTS: frozenset[str] = frozenset({
     "migrating.store.between_renames",
     "migrating.policy.after_stage",
     "migrating.policy.between_renames",
+    # Task 8: kernel daemon startup and two-target offline migration
+    "daemon.after_bind_before_endpoint",
+    "daemon.after_endpoint_publish",
+    "kernel.migrate.after_policy_swap",
 })
 
 KNOWN_PAUSEPOINTS: frozenset[str] = KNOWN_CRASHPOINTS | {"writer.held"}
