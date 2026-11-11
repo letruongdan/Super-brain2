@@ -26,9 +26,11 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
+from collections.abc import Sequence
 from pathlib import Path
 
-_MODES = ("serve", "serve-fixture", "migrate")
+_MODES = ("serve", "serve-fixture", "migrate", "serve-jobs", "job-operation", "revoke-fixture")
 
 
 def _mark(tag: str, value: str) -> None:
@@ -59,7 +61,7 @@ def _process_start() -> str:
     return "_".join(out.stdout.split())
 
 
-def _serve(config_path: Path, *, fixture: bool = False) -> int:
+def _serve(config_path: Path, *, mode: str, args: Sequence[str]) -> int:
     import shutil
 
     from superbrain.application.owner_loop import OwnerLoop
@@ -67,31 +69,49 @@ def _serve(config_path: Path, *, fixture: bool = False) -> int:
     from superbrain.composition.owner_entry import _explicit_owner_adapters
     from superbrain.core.kernel import Ready
 
-    _cfg, adapters, scratch_base = _explicit_owner_adapters(config_path)
+    cfg, adapters, scratch_base = _explicit_owner_adapters(config_path)
+    stop = threading.Event()
 
-    def _on_ready(ready: Ready, _loop: OwnerLoop) -> None:
+    def _on_ready(ready: Ready, loop: OwnerLoop) -> None:
         shutil.rmtree(scratch_base, ignore_errors=True)
-        _mark("READY", ready.endpoint.encode_canonical().decode("utf-8"))
+        if mode == "revoke-fixture":
+            from tests.support.inc2_t8_job_child import revoke_on_owner
 
-    if not fixture:
-        try:
-            return serve_config_path(config_path, os_=adapters, on_ready=_on_ready)
-        finally:
-            shutil.rmtree(scratch_base, ignore_errors=True)
-    from tests.support.inc2_t8_domain import FixtureDomainProxy, fixture_hooks, use_fixture_store_extensions
+            revoke_on_owner(loop, cfg, args, _mark)
+            stop.set()
+        else:
+            _mark("READY", ready.endpoint.encode_canonical().decode("utf-8"))
 
-    use_fixture_store_extensions()
-    proxy = FixtureDomainProxy()
-    hooks = fixture_hooks(proxy, monotonic_ns=adapters.monotonic.monotonic_ns)
     try:
-        return serve_config_path(config_path, os_=adapters, on_ready=_on_ready, domain=proxy, hooks=hooks)
+        if mode == "serve-jobs":
+            from tests.support.inc2_t8_job_child import serve_claim
+
+            return serve_claim(config_path, adapters, _mark)
+        if mode == "job-operation":
+            from tests.support.inc2_t8_job_child import operate_job
+
+            return operate_job(cfg, adapters, args, _mark)
+        if mode == "serve":
+            return serve_config_path(config_path, os_=adapters, on_ready=_on_ready)
+
+        from tests.support.inc2_t8_domain import FixtureDomainProxy, fixture_hooks, use_fixture_store_extensions
+
+        use_fixture_store_extensions()
+        proxy = FixtureDomainProxy()
+        hooks = fixture_hooks(proxy, monotonic_ns=adapters.monotonic.monotonic_ns)
+        return serve_config_path(
+            config_path, os_=adapters, on_ready=_on_ready, stop_event=stop, domain=proxy, hooks=hooks
+        )
     finally:
         shutil.rmtree(scratch_base, ignore_errors=True)
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) != 3 or argv[1] not in _MODES or not Path(argv[2]).is_absolute():
+    if len(argv) < 3 or argv[1] not in _MODES or not Path(argv[2]).is_absolute():
         _mark("DRIVER_ERROR", "usage")
+        return 2
+    if len(argv) != 3 and argv[1] not in {"job-operation", "revoke-fixture"}:
+        _mark("DRIVER_ERROR", "unexpected operation arguments")
         return 2
     import superbrain
 
@@ -117,7 +137,7 @@ def main(argv: list[str]) -> int:
     if mode == "migrate":
         return owner_entry.main(["migrate", "--offline", "--config", str(config_path)])
     try:  # the same mapping as owner_entry.main
-        return _serve(config_path, fixture=mode == "serve-fixture")
+        return _serve(config_path, mode=mode, args=argv[3:])
     except BrainError as err:
         owner_entry._write_stderr(err.code.value)
         return 1

@@ -56,7 +56,17 @@ T8_1_CRASHPOINTS = frozenset(
 )
 """Task 8.1's three kernel boundaries."""
 T8_2_CRASHPOINTS = frozenset({"kernel.before_commit", "kernel.after_commit_before_response"})
-"""Task 8.2's two request-path boundaries. Part 8.3 brings the Task 8 names to all ten (exactly 29 in total)."""
+"""Task 8.2's two request-path boundaries."""
+T8_3_CRASHPOINTS = frozenset(
+    {
+        "jobs.after_lease",
+        "jobs.after_running",
+        "jobs.after_invocation_reserve",
+        "jobs.after_cancel_commit",
+        "jobs.after_usage_settle_commit",
+    }
+)
+T8_CRASHPOINTS = T8_1_CRASHPOINTS | T8_2_CRASHPOINTS | T8_3_CRASHPOINTS
 
 
 def test_every_known_crashpoint_has_a_case_and_a_doc_row() -> None:
@@ -69,18 +79,19 @@ def test_every_known_crashpoint_has_a_case_and_a_doc_row() -> None:
 
 
 def test_registry_is_exactly_the_increment_1_names_plus_the_task_8_names() -> None:
-    assert len(I1_CRASHPOINTS) == 19 and len(T8_1_CRASHPOINTS) == 3 and len(T8_2_CRASHPOINTS) == 2
+    assert len(I1_CRASHPOINTS) == 19 and len(T8_CRASHPOINTS) == 10
     assert {c.crashpoint for c in CRASH_CASES} == I1_CRASHPOINTS  # every I1 oracle stays, under its old node ID
-    assert {c.crashpoint for c in KERNEL_CRASH_CASES} == T8_1_CRASHPOINTS | T8_2_CRASHPOINTS
-    assert KNOWN_CRASHPOINTS == I1_CRASHPOINTS | T8_1_CRASHPOINTS | T8_2_CRASHPOINTS
-    assert len(KNOWN_CRASHPOINTS) == 24
+    assert {c.crashpoint for c in KERNEL_CRASH_CASES} == T8_CRASHPOINTS
+    assert KNOWN_CRASHPOINTS == I1_CRASHPOINTS | T8_CRASHPOINTS
+    assert len(KNOWN_CRASHPOINTS) == 29
 
 
 def test_kernel_cases_keep_operation_at_crashpoint_ids_and_all_run() -> None:
     """Node IDs stay ``operation@crashpoint``; every kernel operation is one the recovery module parametrizes over."""
     ids = [c.node_id for c in KERNEL_CRASH_CASES]
     assert ids == [f"{c.operation}@{c.crashpoint}" for c in KERNEL_CRASH_CASES] and len(set(ids)) == len(ids)
-    assert {c.operation for c in KERNEL_CRASH_CASES} == {"serve", "serve-fixture", "migrate"}
+    modes = {"serve", "serve-fixture", "migrate", "serve-jobs", "job-operation"}
+    assert {c.operation for c in KERNEL_CRASH_CASES} == modes
     for case in KERNEL_CRASH_CASES:  # a request-path crashpoint needs a request to reach it, a startup one must not
         assert (case.trigger is not None) == case.crashpoint.startswith(("kernel.before_", "kernel.after_commit"))
 

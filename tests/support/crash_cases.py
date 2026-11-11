@@ -83,6 +83,17 @@ from tests.support.inc2_cli import (
     write_owner_only_bytes,
 )
 from tests.support.inc2_fixture import InstalledEnv
+from tests.support.inc2_t8_job_cases import (
+    cancel_args,
+    expect_cancel,
+    expect_lease,
+    expect_reserve,
+    expect_running,
+    expect_settle,
+    seed_job,
+    seed_usage,
+    settle_args,
+)
 from tests.support.inc2_transport import TransportTemplate, clone_owner_only_tree
 from tests.support.kernel_auth import make_bootstrap_auth, seed_principal_and_credential
 
@@ -565,8 +576,8 @@ def run_marked(
     )
 
 
-def t8_child_command(env: InstalledEnv, mode: str, config: Path) -> list[str]:
-    return [str(env.venv_python), "-I", str(T8_CHILD), mode, str(config)]
+def t8_child_command(env: InstalledEnv, mode: str, config: Path, args: Sequence[str] = ()) -> list[str]:
+    return [str(env.venv_python), "-I", str(T8_CHILD), mode, str(config), *args]
 
 
 def run_t8_child(
@@ -577,8 +588,10 @@ def run_t8_child(
     cwd: Path,
     crashpoint: str | None = None,
     while_ready: Callable[[Endpoint], None] | None = None,
+    args: Sequence[str] = (),
 ) -> MarkedRun:
-    return run_marked(t8_child_command(env, mode, config), cwd=cwd, crashpoint=crashpoint, while_ready=while_ready)
+    cmd = t8_child_command(env, mode, config, args)
+    return run_marked(cmd, cwd=cwd, crashpoint=crashpoint, while_ready=while_ready)
 
 
 def assert_entered(run: MarkedRun) -> None:
@@ -628,13 +641,15 @@ class KernelSeed:
 
 @dataclass(frozen=True)
 class KernelCrashCase:
-    operation: Literal["serve", "serve-fixture", "migrate"]
+    operation: Literal["serve", "serve-fixture", "migrate", "serve-jobs", "job-operation"]
     """The ``inc2_t8_child.py`` mode."""
     crashpoint: str
     seed: Callable[[KernelCrashContext], KernelSeed]
     expect: Callable[[KernelCrashContext, KernelSeed, MarkedRun], None]
     trigger: Callable[[KernelCrashContext, KernelSeed, Endpoint], None] | None = None
     """For a crashpoint on a request path: runs once the daemon is READY (the crash must come from it)."""
+    args: Callable[[KernelSeed], tuple[str, ...]] | None = None
+    """Optional driver arguments derived from the seed's pinned job/principal/invocation IDs."""
 
     @property
     def node_id(self) -> str:
@@ -643,8 +658,9 @@ class KernelCrashCase:
 
 def run_kernel_case(case: KernelCrashCase, ctx: KernelCrashContext) -> None:
     seeded = case.seed(ctx)
+    args = case.args(seeded) if case.args is not None else ()
     if case.trigger is None:
-        run = run_t8_child(ctx.env, case.operation, seeded.config, cwd=ctx.cwd, crashpoint=case.crashpoint)
+        run = run_t8_child(ctx.env, case.operation, seeded.config, cwd=ctx.cwd, crashpoint=case.crashpoint, args=args)
         assert_t8_crashed(run, case.crashpoint)
     else:
         trigger = case.trigger
@@ -655,6 +671,7 @@ def run_kernel_case(case: KernelCrashCase, ctx: KernelCrashContext) -> None:
             cwd=ctx.cwd,
             crashpoint=case.crashpoint,
             while_ready=lambda ready: trigger(ctx, seeded, ready),
+            args=args,
         )
         assert_request_crashed(run, case.crashpoint)
     case.expect(ctx, seeded, run)
@@ -1416,4 +1433,11 @@ KERNEL_CRASH_CASES: tuple[KernelCrashCase, ...] = (
         expect_crash_after_commit,
         trigger=trigger_prepare_task,
     ),
+    KernelCrashCase("serve-jobs", "jobs.after_lease", seed_job, expect_lease),
+    KernelCrashCase("serve-jobs", "jobs.after_running", seed_job, expect_running),
+    KernelCrashCase(
+        "job-operation", "jobs.after_invocation_reserve", seed_job, expect_reserve, args=lambda _: ("reserve",)
+    ),
+    KernelCrashCase("job-operation", "jobs.after_cancel_commit", seed_job, expect_cancel, args=cancel_args),
+    KernelCrashCase("job-operation", "jobs.after_usage_settle_commit", seed_usage, expect_settle, args=settle_args),
 )

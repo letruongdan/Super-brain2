@@ -10,6 +10,7 @@ from __future__ import annotations
 import ast
 import dataclasses
 import datetime as dt
+import json
 import threading
 from collections.abc import Callable, Iterator
 from functools import partial
@@ -55,6 +56,7 @@ from tests.support.inc2_fixture import (
     fixture_job_registry,
     kernel_job_service,
     open_kernel_job_runtime,
+    reopen_kernel_job_runtime,
     validate_response_envelope,
 )
 from tests.support.kernel_auth import make_bootstrap_auth, seed_principal_and_credential, seed_repo_grant
@@ -144,6 +146,119 @@ def _item(
     return WorkItem(
         lease=lease, spec=service.job_spec(lease), invocation_ids=invocation_ids, deadline_ns=10**9 + timeout_ns
     )
+
+
+def test_late_worker_cannot_advance_recovered_job_but_can_settle_recorded_invocation(
+    trusted_tmp: Path, os_: OsAdapters, clock: FakeClock, executor_factory: Callable[..., JobExecutor]
+) -> None:
+    root = trusted_tmp / "late-worker"
+    first = open_kernel_job_runtime(root, os_)
+    reservation, final_usage = UsageReservation("7.5"), UsageRecord("1.25", True)
+    missing_id = "00000000-0000-4000-8000-000000000008"
+    try:
+        first_service, first_store = kernel_job_service(first, clock)
+        job = enqueue_job(first_service, first_store, owner_id="dan")
+        old = _running(first_service, first, clock)
+        invocation_id = first_service.reserve_invocation(old, reservation)
+        old_work = _item(first_service, old, (invocation_id,))
+        assert old.job_id == job.job_id and old.attempt == 1
+        original = first_store.transact(lambda tx: tx.read_invocation(invocation_id))
+        assert original is not None and original.state is InvocationState.RESERVED
+        assert (original.job_id, original.attempt, original.writer_epoch, original.lease_id) == (
+            job.job_id, old.attempt, old.writer_epoch, old.lease_id,
+        )
+        prefix = tuple(first.store.entries())
+        store_id = first.store.store_id
+    finally:
+        first.close()
+
+    denied: list[ErrorCode] = []
+
+    def old_handler(_spec: JobSpec, ctx: JobContext) -> tuple[ObjectRef, ...]:
+        try:
+            ctx.report_usage(missing_id, final_usage)
+        except BrainError as err:
+            denied.append(err.code)
+        ctx.report_usage(invocation_id, final_usage)
+        return ()
+
+    second = reopen_kernel_job_runtime(root, store_id, os_)
+    try:
+        service, store = kernel_job_service(second, clock)
+        service.recover(second.lease.epoch)
+        assert _row(store, job.job_id).state is JobState.QUEUED and _row(store, job.job_id).attempt == 2
+        unknown = store.transact(lambda tx: tx.read_invocation(invocation_id))
+        assert unknown == dataclasses.replace(original, state=InvocationState.OUTCOME_UNKNOWN)
+        entries = tuple(second.store.entries())
+        assert entries[:len(prefix)] == prefix
+        assert [e.kind for e in entries[len(prefix):]] == ["provider.unknown", "job.retry"]
+        fresh = _running(service, second, clock)
+        assert fresh.job_id == old.job_id and fresh.attempt == 2
+        assert fresh.writer_epoch > old.writer_epoch and fresh.lease_id != old.lease_id
+        running = _row(store, job.job_id)
+
+        worker = executor_factory({FIXTURE_JOB_KIND: old_handler})
+        worker.submit(old_work)
+        usage, completed = _command(worker), _command(worker)
+        assert denied == [ErrorCode.INVALID_INPUT]
+        assert usage == WorkerUsage(invocation_id, final_usage) and completed == WorkerCompleted(old)
+        before_stale = tuple(second.store.entries())
+        _expect(ErrorCode.REVISION_CONFLICT, lambda: service.apply_command(completed))
+        _expect(
+            ErrorCode.REVISION_CONFLICT,
+            lambda: service.apply_command(WorkerFailed(old, retryable=True, code=JobErrorCode.HANDLER_FAILED)),
+        )
+        _expect(ErrorCode.NOT_FOUND, lambda: service.apply_command(WorkerUsage(missing_id, final_usage)))
+        assert _row(store, job.job_id) == running and tuple(second.store.entries()) == before_stale
+
+        service.apply_command(WorkerUsage(invocation_id, UsageRecord(None, False)))
+        partial = store.transact(lambda tx: tx.read_invocation(invocation_id))
+        assert partial is not None
+        assert (partial.state, partial.usage_complete) == (InvocationState.OUTCOME_UNKNOWN, False)
+        service.apply_command(usage)
+        recorded = store.transact(lambda tx: tx.read_invocation(invocation_id))
+        assert recorded is not None and recorded.state is InvocationState.SETTLED
+        assert recorded == dataclasses.replace(
+            original, state=InvocationState.SETTLED, usage_digest=recorded.usage_digest, usage_complete=True,
+        )
+        final_digest = recorded.usage_digest
+        assert final_digest is not None
+        raw = store.transact(lambda tx: tx.read_held_blob(final_digest, holder_id=invocation_id))
+        max_raw = store.transact(lambda tx: tx.read_held_blob(original.reservation_digest, holder_id=invocation_id))
+        assert raw is not None and max_raw is not None
+        assert json.loads(raw) == {
+            "schema": "provider-usage-v1", "invocation_id": invocation_id, "amount": "1.25", "complete": True,
+        }
+        assert json.loads(max_raw) == {
+            "schema": "provider-reservation-v1", "invocation_id": invocation_id, "job_id": job.job_id,
+            "max_amount": "7.5",
+        }
+        after_usage = tuple(second.store.entries())
+        assert [e.meta["complete"] for e in after_usage[len(before_stale):] if e.kind == "provider.settled"] == [
+            False, True,
+        ]
+        service.apply_command(usage)  # the old invocation may be accounted for exactly once
+        assert tuple(second.store.entries()) == after_usage and _row(store, job.job_id) == running
+        service.apply_command(WorkerCompleted(fresh))
+        terminal = _row(store, job.job_id)
+        assert terminal.state is JobState.SUCCEEDED and terminal.attempt == 2
+        ledger = tuple(second.store.entries())
+    finally:
+        second.close()
+
+    third = reopen_kernel_job_runtime(root, store_id, os_)
+    try:
+        service, store = kernel_job_service(third, clock)
+        service.recover(third.lease.epoch)
+        assert tuple(third.store.entries()) == ledger
+        assert _row(store, job.job_id) == terminal
+        assert store.transact(lambda tx: tx.read_invocation(invocation_id)) == recorded
+        third.store.rebuild_projections()
+        assert tuple(third.store.entries()) == ledger
+        assert _row(store, job.job_id) == terminal
+        assert store.transact(lambda tx: tx.read_invocation(invocation_id)) == recorded
+    finally:
+        third.close()
 
 
 # --- get_job / cancel ACL ---------------------------------------------------------------------------------------------

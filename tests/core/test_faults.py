@@ -58,7 +58,7 @@ def test_unregistered_pausepoint_is_a_programming_error() -> None:
 
 
 def test_registry_contents() -> None:
-    assert len(KNOWN_CRASHPOINTS) == 19
+    assert len(KNOWN_CRASHPOINTS) == 29
     assert "writer.mid_slot_write" in KNOWN_CRASHPOINTS and "migrating.policy.between_renames" in KNOWN_CRASHPOINTS
     assert KNOWN_PAUSEPOINTS == KNOWN_CRASHPOINTS | {"writer.held"}
 
