@@ -79,6 +79,9 @@ _DEFAULT_PATH_TOKEN = re.compile(
     r"(?<![^\s\"'<>|()\[\]{},;])(?=[^\s\"'<>|()\[\]{},;]*[._])[^\s\"'<>|()\[\]{},;]+"
 )
 _FIXED_TOKEN_PREFIX = re.compile(r"github_pat_|gh[pousr]_|sk-|AKIA|ASIA|xox[baprs]-|AIza|eyJ")
+_DEFAULT_PATH_NEEDLE = re.compile(
+    r"\.env|\.ssh|id_|\.aws|credentials|\.npmrc|\.pypirc|\.netrc|_netrc|\.pem|\.key|\.p12|\.pfx"
+)
 _PATH_SPLIT = re.compile(r"[\\/]+")
 _PATH_LEAD = "`*([{<\"'"
 _PATH_TRAIL = "`*)]}>\"'.,:;!?"
@@ -116,12 +119,15 @@ def _joined_key(key: str) -> str:
     return "".join(_key_words(key))
 
 
-def _shannon_bits(text: str) -> float:
-    counts = Counter(text)
-    total = len(text)
+def _shannon_from_counts(counts: Counter[str], total: int) -> float:
     if total <= 256:
         return -sum(map(_entropy_weights(total).__getitem__, counts.values()))
     return -sum((count / total) * math.log2(count / total) for count in counts.values())
+
+
+def _shannon_bits(text: str) -> float:
+    counts = Counter(text)
+    return _shannon_from_counts(counts, len(text))
 
 
 @lru_cache(maxsize=128)
@@ -137,7 +143,7 @@ def _high_entropy(text: str, minimum: float) -> bool:
     # Renyi collision entropy is a lower bound on Shannon entropy. Keep boundary decisions on the exact formula.
     if -math.log2(collision) > minimum + 1e-12:
         return True
-    return _shannon_bits(text) >= minimum
+    return _shannon_from_counts(counts, total) >= minimum
 
 
 def _structural_kind(key: str) -> str:
@@ -199,6 +205,7 @@ class _PathMatcher:
                 names.append(fnmatch.translate(lowered))
         self._names = re.compile("|".join(f"(?:{n})" for n in names)) if names else None
         self._results: dict[str, bool] = {}
+        self._is_default = (patterns == DEFAULT_BLOCKED_PATH_PATTERNS)
 
     def blocked(self, token: str) -> bool:
         cached = self._results.get(token)
@@ -210,7 +217,15 @@ class _PathMatcher:
         return result
 
     def _matches(self, token: str) -> bool:
-        parts = [p.lower() for p in _PATH_SPLIT.split(token) if p and p != "."]
+        low = token.lower()
+        if self._is_default and "/" not in low and "\\" not in low:
+            if not (
+                low.startswith((".", "_", "id_"))
+                or low.endswith((".pem", ".key", ".p12", ".pfx"))
+                or low == "credentials"
+            ):
+                return False
+        parts = [p for p in _PATH_SPLIT.split(low) if p and p != "."]
         for index, part in enumerate(parts):
             if part in self._dirs or (self._names is not None and self._names.fullmatch(part)):
                 return True
@@ -238,6 +253,7 @@ class _Run:
         self._prefixes = frozenset(name[:i] for name in self._sensitive for i in range(1, len(name) + 1))
         self._contained = tuple(sorted(name for name in self._sensitive if len(name) >= _CONTAINMENT_MIN))
         self._redactions: dict[tuple[str, bool], tuple[str, int]] = {}
+        self._candidate = re.compile(rf"[\x21-\x7e]{{{self.policy.entropy_min_length},}}")
 
     def tick(self) -> None:
         if self._deadline_ns is not None and self._monotonic_ns() >= self._deadline_ns:
@@ -489,15 +505,14 @@ class _Run:
         Exempt: a run that is (inside surrounding punctuation) a canonical UUID or ``sha256:<64 hex>``. The
         ``[redacted]`` sentinel is a run boundary, never part of a candidate.
         """
-        min_len = self.policy.entropy_min_length
-        candidate = re.compile(rf"[\x21-\x7e]{{{min_len},}}")
-        masked = text.replace(REDACTED, " " * len(REDACTED))
+        masked = text.replace(REDACTED, " " * len(REDACTED)) if REDACTED in text else text
         parts: list[str] = []
         cursor = 0
         count = 0
-        for match in candidate.finditer(masked):
+        for match in self._candidate.finditer(masked):
             token = match.group(0)
-            if _is_structural_id(token.strip(_ENTROPY_EDGE)):
+            clean = token.strip(_ENTROPY_EDGE) if (token[0] in _ENTROPY_EDGE or token[-1] in _ENTROPY_EDGE) else token
+            if _is_structural_id(clean):
                 continue
             if _high_entropy(token, self.policy.entropy_min_bits):
                 start, end = match.span()
@@ -540,10 +555,11 @@ class _Run:
             text = self._sub(_KEY_VALUE_SECRET, rf"\1\2{REDACTED}", text)
         self.tick()
         # The cheap candidate scan keeps the full component matcher as the authority.
-        path_tokens = (
-            _DEFAULT_PATH_TOKEN if self.policy.blocked_path_patterns == DEFAULT_BLOCKED_PATH_PATTERNS else _PATH_TOKEN
-        )
-        text = path_tokens.sub(self._blocked_path, text)
+        if self.policy.blocked_path_patterns == DEFAULT_BLOCKED_PATH_PATTERNS:
+            if not ascii_text or _DEFAULT_PATH_NEEDLE.search(lowered):
+                text = _DEFAULT_PATH_TOKEN.sub(self._blocked_path, text)
+        else:
+            text = _PATH_TOKEN.sub(self._blocked_path, text)
         self.tick()
         if entropy:
             text = self._entropy(text)

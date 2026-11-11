@@ -334,9 +334,23 @@ def measure(repo: Path, attempt: Path) -> perf.ProbeMeasurements:
                     privacy,
                     perf.evaluate_cold_client_probe(cold),
                 )
-                tmp = attempt / ".progress.tmp"
-                tmp.write_bytes(canonical_json(asdict(observed)))
-                os.replace(tmp, attempt / "measurements-progress.json")
+                tmp = attempt / f".progress.{os.getpid()}.{time.monotonic_ns()}.tmp"
+                try:
+                    tmp.write_bytes(canonical_json(asdict(observed)))
+                    for attempt_idx in range(5):
+                        try:
+                            os.replace(tmp, attempt / "measurements-progress.json")
+                            break
+                        except PermissionError:
+                            if attempt_idx == 4:
+                                raise
+                            time.sleep(0.02)
+                finally:
+                    if tmp.exists():
+                        try:
+                            tmp.unlink()
+                        except OSError:
+                            pass
                 return observed
 
             checkpoint()
@@ -374,15 +388,26 @@ def measure(repo: Path, attempt: Path) -> perf.ProbeMeasurements:
                                   (deliveries[str(warm[-1]["idempotency_key"])],))
                 wire_args["task_id"] = str(rows[0][0])
                 frame = mcp_call_frame("perf-wire", "submit_episode", wire_args)
-                shim.send_frames_and_expect_response([frame], timeout=3)
-                observed = records.get(timeout=3)
-                if not isinstance(observed, dict):
-                    raise RuntimeError("wire filter did not produce a measurement")
-                observed.update(
-                    rejected_before_filter=False, elapsed_ns=int(str(observed["filter_end_ns"]))
-                    - int(str(observed["filter_start_ns"])), wire_bytes=len(canonical_json(frame)),
-                )
-                wire.append(observed)
+                try:
+                    shim.send_frames_and_expect_response([frame], timeout=3)
+                    observed = records.get(timeout=3)
+                    if not isinstance(observed, dict):
+                        raise RuntimeError("wire filter did not produce a measurement")
+                    observed.update(
+                        rejected_before_filter=False, elapsed_ns=int(str(observed["filter_end_ns"]))
+                        - int(str(observed["filter_start_ns"])), wire_bytes=len(canonical_json(frame)),
+                    )
+                    wire.append(observed)
+                except Exception:
+                    wire.append({
+                        "idempotency_key": wire_args["idempotency_key"],
+                        "status": "transport_error",
+                        "wire_bytes": len(canonical_json(frame)),
+                        "filter_ran": False,
+                        "rejected_before_filter": False,
+                    })
+                    checkpoint()
+                    raise
                 checkpoint()
             actual_ids = {
                 str(row[0]) for row in store_rows(data_root, "SELECT delivery_id FROM p_fixture_domain_deliveries")
