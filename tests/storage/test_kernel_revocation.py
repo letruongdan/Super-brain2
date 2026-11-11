@@ -20,6 +20,7 @@ from superbrain.storage.policy_store import PolicyStore
 from superbrain.storage.restore import restore_store
 from superbrain.storage.runtime import admit_existing_pair, open_runtime, open_runtime_under_lease
 from tests.storage.conftest import StaticPolicy, StoreFactory, maintenance_lease
+from tests.support.bounded_worker import BoundedJsonWorker
 from tests.support.clock import FakeClock
 from tests.support.fs import digest_tree
 from tests.support.kernel_auth import make_bootstrap_auth, seed_principal_and_credential
@@ -1521,7 +1522,6 @@ def test_cross_revision_v1_workspace_register_root_reopens_reconciles_and_blocks
 def test_historical_v2_writer_is_fenced_before_policy_mutation_across_migrate_and_restore(
     trusted_tmp: Path, os_: OsAdapters, clock: FakeClock
 ) -> None:
-    import json
     import os
     import shutil
     import subprocess
@@ -1790,45 +1790,14 @@ def test_historical_v2_writer_is_fenced_before_policy_mutation_across_migrate_an
         driver_path.write_text(driver_code, encoding="utf-8")
         os_.permissions.secure_file(driver_path)
 
-        hist_worker = subprocess.Popen(
+        hist_worker = BoundedJsonWorker(
             [sys.executable, str(driver_path), str(hist_src), str(repo_root)],
             cwd=repo_root,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            bufsize=1,
+            stderr_path=trusted_tmp / "hist_6a67b38_worker.stderr.log",
+            label="historical worker",
         )
-
-        def _close_hist_worker() -> None:
-            if hist_worker.stdin is not None and not hist_worker.stdin.closed:
-                hist_worker.stdin.close()
-            try:
-                rc = hist_worker.wait(timeout=5.0)
-            except subprocess.TimeoutExpired:
-                hist_worker.kill()
-                hist_worker.wait(timeout=5.0)
-                raise
-            err_txt = hist_worker.stderr.read() if hist_worker.stderr is not None else ""
-            if hist_worker.stdout is not None:
-                hist_worker.stdout.close()
-            if hist_worker.stderr is not None:
-                hist_worker.stderr.close()
-            assert rc == 0, f"historical worker exited with {rc}:\n{err_txt}"
-
-        def _run_hist_child(payload: dict[str, object]) -> dict[str, object]:
-            assert hist_worker.stdin is not None and hist_worker.stdout is not None
-            hist_worker.stdin.write(json.dumps(payload) + "\n")
-            hist_worker.stdin.flush()
-            resp_line = hist_worker.stdout.readline()
-            if not resp_line:
-                err_txt = hist_worker.stderr.read() if hist_worker.stderr is not None else ""
-                rc = hist_worker.wait(timeout=5.0)
-                raise AssertionError(f"historical child failed ({payload['mode']}, rc={rc}):\n{err_txt}")
-            parsed = json.loads(resp_line)
-            assert isinstance(parsed, dict)
-            return parsed
+        _close_hist_worker = hist_worker.close
+        _run_hist_child = hist_worker.request
 
         try:
             part_a_base = trusted_tmp / "part-a-6a67b38"
@@ -2502,7 +2471,6 @@ def test_historical_v2_writer_is_fenced_before_policy_mutation_across_migrate_an
 def test_historical_restore_policy_cannot_strip_main_store_fence_before_authority_mutation(
     trusted_tmp: Path, os_: OsAdapters, clock: FakeClock
 ) -> None:
-    import json
     import os
     import shutil
     import sqlite3
@@ -2893,45 +2861,14 @@ def test_historical_restore_policy_cannot_strip_main_store_fence_before_authorit
         driver_path.write_text(driver_code, encoding="utf-8")
         os_.permissions.secure_file(driver_path)
 
-        r4_worker = subprocess.Popen(
+        r4_worker = BoundedJsonWorker(
             [sys.executable, str(driver_path), str(hist_src), str(repo_root)],
             cwd=repo_root,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            bufsize=1,
+            stderr_path=trusted_tmp / "hist_r4_6a67b38_worker.stderr.log",
+            label="historical r4 worker",
         )
-
-        def _close_r4_worker() -> None:
-            if r4_worker.stdin is not None and not r4_worker.stdin.closed:
-                r4_worker.stdin.close()
-            try:
-                rc = r4_worker.wait(timeout=5.0)
-            except subprocess.TimeoutExpired:
-                r4_worker.kill()
-                r4_worker.wait(timeout=5.0)
-                raise
-            err_txt = r4_worker.stderr.read() if r4_worker.stderr is not None else ""
-            if r4_worker.stdout is not None:
-                r4_worker.stdout.close()
-            if r4_worker.stderr is not None:
-                r4_worker.stderr.close()
-            assert rc == 0, f"historical r4 worker exited with {rc}:\n{err_txt}"
-
-        def _run_r4_child(payload: dict[str, object]) -> dict[str, object]:
-            assert r4_worker.stdin is not None and r4_worker.stdout is not None
-            r4_worker.stdin.write(json.dumps(payload) + "\n")
-            r4_worker.stdin.flush()
-            resp_line = r4_worker.stdout.readline()
-            if not resp_line:
-                err_txt = r4_worker.stderr.read() if r4_worker.stderr is not None else ""
-                rc = r4_worker.wait(timeout=5.0)
-                raise AssertionError(f"historical r4 child failed ({payload['mode']}, rc={rc}):\n{err_txt}")
-            parsed = json.loads(resp_line)
-            assert isinstance(parsed, dict)
-            return parsed
+        _close_r4_worker = r4_worker.close
+        _run_r4_child = r4_worker.request
 
         try:
             part_a_base = trusted_tmp / "part-a-r4-6a67b38"
