@@ -1,5 +1,9 @@
 """The crash-point table (spec 5.4): every registered crashpoint fires in a real child process, and the reopened data
-root holds concrete, expected state. ``docs/design/sp1-crash-table.md`` has exactly one row per crashpoint."""
+root holds concrete, expected state. ``docs/design/sp1-crash-table.md`` has exactly one row per crashpoint.
+
+The increment 1 cases (``CRASH_CASES``) run here. The kernel cases of increment 2 Task 8 (``KERNEL_CRASH_CASES``) crash
+the installed wheel and run in ``tests/integration/test_kernel_crash_recovery.py``; this module pins the exact name
+set across the registry, both case groups and the table."""
 
 from pathlib import Path
 
@@ -11,13 +15,69 @@ from superbrain.core.faults import KNOWN_CRASHPOINTS
 from superbrain.storage.kinds import KindRegistry
 from superbrain.storage.runtime import open_runtime
 from tests.storage.conftest import DEMO_KINDS
-from tests.support.crash_cases import CRASH_CASES, CRASH_TABLE, CrashCase, crash, parse_crash_table
+from tests.support.crash_cases import (
+    CRASH_CASES,
+    CRASH_TABLE,
+    KERNEL_CRASH_CASES,
+    CrashCase,
+    crash,
+    parse_crash_table,
+)
+
+I1_CRASHPOINTS = frozenset(
+    {
+        "writer.mid_slot_write",
+        "ledger.before_commit",
+        "ledger.after_commit",
+        "cas.after_staging_write",
+        "cas.after_rename",
+        "policy.after_intent_commit",
+        "intents.after_store_apply",
+        "backup.after_db_snapshot",
+        "backup.after_blob_copy",
+        "restoring.store.after_stage",
+        "restoring.store.between_renames",
+        "restoring.policy.after_generation_persist",
+        "restoring.policy.after_stage",
+        "restoring.policy.between_renames",
+        "restoring.policy.before_hwm_update",
+        "migrating.store.after_stage",
+        "migrating.store.between_renames",
+        "migrating.policy.after_stage",
+        "migrating.policy.between_renames",
+    }
+)
+T8_1_CRASHPOINTS = frozenset(
+    {
+        "daemon.after_bind_before_endpoint",
+        "daemon.after_endpoint_publish",
+        "kernel.migrate.after_policy_swap",
+    }
+)
+"""Task 8.1's three kernel boundaries. Part 8.3 extends this set to all ten Task 8 names (exactly 29 in total)."""
 
 
 def test_every_known_crashpoint_has_a_case_and_a_doc_row() -> None:
-    assert sorted(c.crashpoint for c in CRASH_CASES) == sorted(KNOWN_CRASHPOINTS)  # exactly one case each
+    names = [c.crashpoint for c in CRASH_CASES] + [c.crashpoint for c in KERNEL_CRASH_CASES]
+    assert len(names) == len(set(names)), sorted(n for n in names if names.count(n) > 1)  # one case per name
+    assert set(names) == KNOWN_CRASHPOINTS
     rows = parse_crash_table(CRASH_TABLE)
-    assert set(rows) == KNOWN_CRASHPOINTS and len(rows) == len(KNOWN_CRASHPOINTS)  # exactly one row each
+    assert len(rows) == len(set(rows)), sorted(r for r in rows if rows.count(r) > 1)  # one row per name
+    assert set(rows) == KNOWN_CRASHPOINTS
+
+
+def test_registry_is_exactly_the_increment_1_names_plus_the_task_8_1_names() -> None:
+    assert len(I1_CRASHPOINTS) == 19 and len(T8_1_CRASHPOINTS) == 3
+    assert {c.crashpoint for c in CRASH_CASES} == I1_CRASHPOINTS  # every I1 oracle stays, under its old node ID
+    assert {c.crashpoint for c in KERNEL_CRASH_CASES} == T8_1_CRASHPOINTS
+    assert KNOWN_CRASHPOINTS == I1_CRASHPOINTS | T8_1_CRASHPOINTS
+
+
+def test_kernel_cases_keep_operation_at_crashpoint_ids_and_all_run() -> None:
+    """Node IDs stay ``operation@crashpoint``; every kernel operation is one the recovery module parametrizes over."""
+    ids = [c.node_id for c in KERNEL_CRASH_CASES]
+    assert ids == [f"{c.operation}@{c.crashpoint}" for c in KERNEL_CRASH_CASES] and len(set(ids)) == len(ids)
+    assert {c.operation for c in KERNEL_CRASH_CASES} == {"serve", "migrate"}
 
 
 @pytest.mark.parametrize("case", CRASH_CASES, ids=lambda c: f"{c.operation}@{c.crashpoint}")

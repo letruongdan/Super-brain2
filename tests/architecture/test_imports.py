@@ -213,3 +213,59 @@ def test_checker_reports_no_cycle_for_one_way_package_import(tmp_path: Path) -> 
         },
     )
     assert find_package_cycles(pkg / "superbrain") == []
+
+
+FAULT_FREE_ENTRIES = ("mcp", "cli", "composition/shim_entry.py", "composition/client_entry.py")
+"""Client-side code: no crash or pause hook may be reachable from these files, however it is spelled."""
+FAULT_MODULE = f"{ROOT}.core.faults"
+FAULT_STRINGS = (FAULT_MODULE, "SUPERBRAIN_CRASHPOINT", "SUPERBRAIN_PAUSEPOINT")
+
+
+def find_fault_hooks(root: Path, entries: tuple[str, ...] = FAULT_FREE_ENTRIES) -> list[tuple[str, str]]:
+    """``(file, evidence)`` for every import of ``superbrain.core.faults`` (any depth, relative or aliased) and every
+    string literal naming that module or a fault-injection variable, in the files under ``entries``."""
+    found: set[tuple[str, str]] = set()
+    for entry in entries:
+        target = root / entry
+        assert target.exists(), f"fault-free entry {entry} does not exist under {root}"
+        for path in sorted(target.rglob("*.py")) if target.is_dir() else [target]:
+            rel = path.relative_to(root).as_posix()
+            for imported in _imports(root, path):
+                if imported == FAULT_MODULE or imported.startswith(f"{FAULT_MODULE}."):
+                    found.add((rel, imported))
+            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"), filename=str(path))):
+                if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                    if any(marker in node.value for marker in FAULT_STRINGS):
+                        found.add((rel, node.value))
+    return sorted(found)
+
+
+def test_crash_hooks_stay_out_of_client_entrypoints() -> None:
+    assert find_fault_hooks(SRC / ROOT) == []
+    assert find_fault_hooks(SRC / ROOT, ("storage",)), "the scanner must see the hooks the storage layer does call"
+
+
+def test_fault_hook_scanner_catches_aliases_relative_and_dynamic_imports(tmp_path: Path) -> None:
+    pkg = make_package(
+        tmp_path,
+        {
+            "superbrain/mcp/a.py": "from superbrain.core import faults as hooks\n",
+            "superbrain/mcp/deep/b.py": "def f():\n    import os\n    return os.environ.get('SUPERBRAIN_PAUSEPOINT')\n",
+            "superbrain/cli/c.py": "from ..core.faults import crashpoint as cp\n",
+            "superbrain/composition/shim_entry.py": "import superbrain.core.faults as x\n",
+            "superbrain/composition/client_entry.py": (
+                "import importlib\nm = importlib.import_module('superbrain.core.faults')\n"
+            ),
+            "superbrain/composition/daemon_entry.py": "from superbrain.core.faults import crashpoint\n",
+            "superbrain/storage/x.py": "from superbrain.core.faults import crashpoint\n",
+            "superbrain/core/faults.py": "def crashpoint(name):\n    pass\n",
+        },
+    )
+    assert find_fault_hooks(pkg / ROOT) == [
+        ("cli/c.py", "superbrain.core.faults"),
+        ("cli/c.py", "superbrain.core.faults.crashpoint"),
+        ("composition/client_entry.py", "superbrain.core.faults"),
+        ("composition/shim_entry.py", "superbrain.core.faults"),
+        ("mcp/a.py", "superbrain.core.faults"),
+        ("mcp/deep/b.py", "SUPERBRAIN_PAUSEPOINT"),
+    ]

@@ -9,7 +9,18 @@ prose, one row per crashpoint; ``parse_crash_table`` reads its first column.
 The seeds and expectations are those of the focused crash tests in ``tests/storage``, reused through their helpers.
 """
 
+import contextlib
+import dataclasses
+import datetime as dt
+import os
+import queue
 import re
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,19 +29,28 @@ from typing import Literal
 import pytest
 
 from superbrain.adapters.os import os_adapters
+from superbrain.adapters.os.daemon_config import read_client_endpoint
+from superbrain.adapters.os.tls_material import create_store_tls
+from superbrain.composition.client_entry import read_status
 from superbrain.core.canonical import digest_bytes
 from superbrain.core.errors import BrainError, ErrorCode
+from superbrain.core.ids import new_id
+from superbrain.core.jsonvalue import JsonValue
+from superbrain.core.kernel import ENDPOINT_HOST, ENDPOINT_VERSION, Endpoint
+from superbrain.core.wire import parse_json
 from superbrain.ports.policy import IntentKind
 from superbrain.storage.backup import BackupKind, verify_backup
 from superbrain.storage.cas import RetentionClass
+from superbrain.storage.kernel_schema import KERNEL_POLICY_MIGRATIONS, KERNEL_STORE_MIGRATIONS
 from superbrain.storage.kinds import KindRegistry
-from superbrain.storage.layout import prepare_data_root, secure_subdirectories
+from superbrain.storage.layout import ENDPOINT_STAGE_PREFIX, DataRoot, prepare_data_root, secure_subdirectories
 from superbrain.storage.ledger import LedgerEntry
 from superbrain.storage.policy_store import PolicyStore
 from superbrain.storage.runtime import Runtime, open_runtime
 from superbrain.storage.schema import POLICY_MIGRATIONS, STORE_MIGRATIONS, Migration, read_schema_info
+from superbrain.storage.sqlite import open_readonly
 from superbrain.storage.store import Store
-from superbrain.storage.writer import acquire_writer
+from superbrain.storage.writer import acquire_writer, acquire_writer_unbumped
 from tests.storage.conftest import DEMO_KINDS, STORE_ID
 from tests.storage.test_backup import only_backup_dir, verify_store
 from tests.storage.test_migrate import POLICY_V2, STORE_V2
@@ -42,8 +62,29 @@ from tests.storage.test_restore import (
     seed_before_backup_after,
     seed_policy_backup,
 )
-from tests.support.crash import REPO, ChildResult, run_until_crash
+from tests.support.clock import FakeClock
+from tests.support.crash import CRASH_EXIT, REPO, ChildResult, _pump, _tagged, run_until_crash
 from tests.support.crash_child import EVENT_ID, EVENT_PAYLOAD
+from tests.support.inc2_cli import (
+    InstalledMcpPipeSession,
+    InstalledServeProcess,
+    _win32_descendant_pids,
+    _win32_wait_or_terminate_pid,
+    clean_installed_subprocess_env,
+    installed_script_path,
+    is_writer_lock_held,
+    mcp_call_frame,
+    mcp_init_frames,
+    run_installed_command,
+    spawn_installed_brain_serve,
+    write_client_profile_file,
+    write_credential_file,
+    write_daemon_config_file,
+    write_owner_only_bytes,
+)
+from tests.support.inc2_fixture import InstalledEnv
+from tests.support.inc2_transport import TransportTemplate, clone_owner_only_tree
+from tests.support.kernel_auth import make_bootstrap_auth, seed_principal_and_credential
 
 CRASH_TABLE = REPO / "docs" / "design" / "sp1-crash-table.md"
 EVENT_DIGEST = digest_bytes(EVENT_PAYLOAD)
@@ -376,4 +417,589 @@ CRASH_CASES: tuple[CrashCase, ...] = (
         expect_migration(target="policy", published=True),
         policy_migrations=POLICY_V2,
     ),
+)
+
+
+# --- kernel cases (SP1 increment 2, Task 8.1) ---------------------------------------------------------------------
+#
+# A ``KernelCrashCase`` crashes the installed wheel's owner composition (``inc2_t8_child.py serve|migrate``) instead
+# of a ``crash_child.py`` operation. Its seed builds a data root plus an absolute ``DaemonConfig``; its expectation
+# reads the state the dead process left (mixed schemas included) without opening a runtime, then drives the installed
+# ``brain serve`` / ``brain migrate --offline`` / ``brain-mcp`` for refuse, resume and restart. Node IDs keep the
+# ``operation@crashpoint`` form. ``tests/integration/test_kernel_crash_recovery.py`` runs every case.
+
+T8_CHILD = Path(__file__).resolve().with_name("inc2_t8_child.py")
+T8_CHILD_TIMEOUT = 60.0
+T8_STOP_TIMEOUT = 15.0
+_MARKERS = ("PPID", "ENTERED", "READY", "CRASHPOINT_HIT", "PAUSED", "DRIVER_ERROR")
+
+
+@dataclass(frozen=True)
+class MarkedRun:
+    """One owner process run: exit, output, and the driver's stderr control markers (absent for ``brain``)."""
+
+    result: ChildResult
+    launcher_pid: int
+    parent_pid: int | None
+    entered: tuple[int, str] | None
+    """``(pid, start)`` printed by the driver right before the owner operation."""
+    ready: Endpoint | None
+    """The endpoint the driver printed in ``READY``; the process was then stopped gracefully."""
+    timed_out: bool
+    owner_stderr: tuple[str, ...]
+    """Stderr lines that are not control markers: the owner's own static error code, if any."""
+
+    def describe(self) -> str:
+        r = self.result
+        return (
+            f"returncode={r.returncode}, hit={r.hit!r}, ready={self.ready is not None}, timed_out={self.timed_out}\n"
+            f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
+        )
+
+
+def _stop_tree(proc: "subprocess.Popen[str]") -> None:
+    """Graceful foreground stop (CTRL_BREAK / SIGTERM to the process group), then kill whatever is left."""
+    tracked = _win32_descendant_pids(proc.pid)
+    with contextlib.suppress(OSError, ValueError):
+        if sys.platform == "win32":
+            os.kill(proc.pid, int(signal.CTRL_BREAK_EVENT))
+        else:
+            proc.send_signal(signal.SIGTERM)
+    try:
+        proc.wait(timeout=T8_STOP_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=T8_STOP_TIMEOUT)
+    if sys.platform == "win32":
+        for pid in tracked:
+            with contextlib.suppress(Exception):
+                _win32_wait_or_terminate_pid(pid, terminate=True, timeout_s=T8_STOP_TIMEOUT)
+
+
+def run_marked(
+    cmd: Sequence[str],
+    *,
+    cwd: Path,
+    crashpoint: str | None = None,
+    while_ready: Callable[[Endpoint], None] | None = None,
+    timeout: float = T8_CHILD_TIMEOUT,
+) -> MarkedRun:
+    """Run ``cmd`` in a clean environment (``SUPERBRAIN_CRASHPOINT=crashpoint`` when given) until it exits.
+
+    On ``READY`` the process is alive and serving: ``while_ready(endpoint)`` runs, then the process is stopped
+    gracefully and its exit is recorded. A process that neither exits nor reports ``READY`` within ``timeout`` is
+    stopped and reported with ``timed_out=True``. No sleep orders anything: every step waits on the child's output.
+    """
+    extra = {"SUPERBRAIN_CRASHPOINT": crashpoint} if crashpoint is not None else None
+    proc = subprocess.Popen(
+        list(cmd),
+        cwd=cwd,
+        env=clean_installed_subprocess_env(extra),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if sys.platform == "win32" else 0,
+        start_new_session=sys.platform != "win32",
+    )
+    assert proc.stdout is not None and proc.stderr is not None
+    stderr_lines: queue.Queue[str | None] = queue.Queue()
+    stdout_box: list[str] = []
+    out = proc.stdout
+    pumps = [
+        threading.Thread(target=_pump, args=(proc.stderr, stderr_lines), daemon=True),
+        threading.Thread(target=lambda: stdout_box.append(out.read()), daemon=True),
+    ]
+    for pump in pumps:
+        pump.start()
+    seen: list[str] = []
+    ready: Endpoint | None = None
+    timed_out = False
+    end = time.monotonic() + timeout
+    try:
+        while True:
+            try:
+                line = stderr_lines.get(timeout=max(0.0, end - time.monotonic()))
+            except queue.Empty:
+                timed_out = True
+                break
+            if line is None:
+                break
+            seen.append(line)
+            if line.startswith("READY ") and ready is None:
+                ready = Endpoint.from_canonical(line[len("READY ") :].strip().encode("utf-8"))
+                if while_ready is not None:
+                    while_ready(ready)
+                _stop_tree(proc)
+    finally:
+        if proc.poll() is None:
+            _stop_tree(proc)
+        proc.wait(timeout=T8_STOP_TIMEOUT)
+        for pump in pumps:
+            pump.join(timeout=T8_STOP_TIMEOUT)
+    while not stderr_lines.empty():
+        rest = stderr_lines.get_nowait()
+        if rest is not None:
+            seen.append(rest)
+    stderr = "".join(seen)
+    entered = _tagged(stderr, "ENTERED")
+    parent = _tagged(stderr, "PPID")
+    owner = tuple(s for s in (ln.strip() for ln in seen) if s and s.split(" ")[0] not in _MARKERS)
+    pid_text, _, start_text = (entered or "").partition(" ")
+    return MarkedRun(
+        result=ChildResult(
+            returncode=proc.returncode,
+            stdout="".join(stdout_box),
+            stderr=stderr,
+            error_code=owner[-1] if owner else None,
+            hit=_tagged(stderr, "CRASHPOINT_HIT"),
+        ),
+        launcher_pid=proc.pid,
+        parent_pid=int(parent) if parent is not None else None,
+        entered=(int(pid_text), start_text) if entered is not None else None,
+        ready=ready,
+        timed_out=timed_out,
+        owner_stderr=owner,
+    )
+
+
+def t8_child_command(env: InstalledEnv, mode: str, config: Path) -> list[str]:
+    return [str(env.venv_python), "-I", str(T8_CHILD), mode, str(config)]
+
+
+def run_t8_child(
+    env: InstalledEnv,
+    mode: str,
+    config: Path,
+    *,
+    cwd: Path,
+    crashpoint: str | None = None,
+    while_ready: Callable[[Endpoint], None] | None = None,
+) -> MarkedRun:
+    return run_marked(t8_child_command(env, mode, config), cwd=cwd, crashpoint=crashpoint, while_ready=while_ready)
+
+
+def assert_entered(run: MarkedRun) -> None:
+    """The driver printed ``ENTERED`` with this launch's real PID (itself, or the venv redirector's child)."""
+    assert run.entered is not None, f"no ENTERED marker\n{run.describe()}"
+    pid, start = run.entered
+    assert pid == run.launcher_pid or run.parent_pid == run.launcher_pid, (
+        f"ENTERED pid {pid} (ppid {run.parent_pid}) is not launch {run.launcher_pid}\n{run.describe()}"
+    )
+    assert pid > 0 and start, run.describe()
+
+
+def assert_t8_crashed(run: MarkedRun, crashpoint: str) -> None:
+    """This invocation printed ``CRASHPOINT_HIT <crashpoint>`` and exited 86, after ``ENTERED``, before ``READY``."""
+    r = run.result
+    assert r.returncode == CRASH_EXIT and r.hit == crashpoint and run.ready is None and not run.timed_out, (
+        f"did not crash at {crashpoint!r}: {run.describe()}"
+    )
+    assert_entered(run)
+    assert r.stderr.index("ENTERED ") < r.stderr.index("CRASHPOINT_HIT "), run.describe()
+    assert r.stdout == "", run.describe()
+
+
+@dataclass(frozen=True)
+class KernelCrashContext:
+    env: InstalledEnv
+    template: TransportTemplate
+    case_dir: Path
+    """Trusted, owner-only directory of this case: data root, config, client files."""
+    cwd: Path
+    """Working directory of every child, outside the checkout."""
+
+
+@dataclass(frozen=True)
+class KernelSeed:
+    data_root: Path
+    config: Path
+    store_id: str
+    epoch: int
+    """The writer epoch in ``writer.lock`` once seeding finished."""
+    snapshot: dict[str, list[tuple[object, ...]]]
+    stale: Endpoint | None = None
+    """An ``endpoint.json`` of a previous epoch present before the crashing run."""
+
+
+@dataclass(frozen=True)
+class KernelCrashCase:
+    operation: Literal["serve", "migrate"]
+    """The ``inc2_t8_child.py`` mode."""
+    crashpoint: str
+    seed: Callable[[KernelCrashContext], KernelSeed]
+    expect: Callable[[KernelCrashContext, KernelSeed, MarkedRun], None]
+
+    @property
+    def node_id(self) -> str:
+        return f"{self.operation}@{self.crashpoint}"
+
+
+def run_kernel_case(case: KernelCrashCase, ctx: KernelCrashContext) -> None:
+    seeded = case.seed(ctx)
+    run = run_t8_child(ctx.env, case.operation, seeded.config, cwd=ctx.cwd, crashpoint=case.crashpoint)
+    assert_t8_crashed(run, case.crashpoint)
+    case.expect(ctx, seeded, run)
+
+
+# --- kernel reads without a runtime --------------------------------------------------------------------------------
+
+
+def lock_epoch(data_root: Path) -> int:
+    """The writer epoch recorded in ``writer.lock``, read under the lock without bumping it."""
+    lease = acquire_writer_unbumped(DataRoot.at(data_root), os_adapters())
+    try:
+        return lease.epoch
+    finally:
+        lease.release()
+
+
+def _rows(db_path: Path, scratch: Path, sql: str) -> list[tuple[object, ...]]:
+    scratch.mkdir(exist_ok=True)
+    with contextlib.closing(open_readonly(db_path, scratch_dir=scratch)) as db:
+        return [tuple(row) for row in db.execute(sql)]
+
+
+def store_rows(data_root: Path, scratch: Path) -> dict[str, list[tuple[object, ...]]]:
+    db = DataRoot.at(data_root).store_db
+    return {
+        "ledger": _rows(db, scratch, "SELECT sequence, entry_id, kind FROM ledger ORDER BY sequence"),
+        "applied_intents": _rows(db, scratch, "SELECT intent_id, applied_sequence FROM applied_intents ORDER BY 1"),
+    }
+
+
+def pair_rows(data_root: Path, scratch: Path) -> dict[str, list[tuple[object, ...]]]:
+    """IDs, intents and authority of both databases, in whatever schema each one is."""
+    db = DataRoot.at(data_root).policy_db
+    return {
+        **store_rows(data_root, scratch),
+        "intents": _rows(db, scratch, "SELECT intent_id, kind, payload FROM intents ORDER BY intent_id"),
+        "quarantine": _rows(db, scratch, "SELECT digest, intent_id FROM quarantine ORDER BY digest"),
+        "trust": _rows(db, scratch, "SELECT generation FROM trust"),
+        "principal": _rows(db, scratch, "SELECT id, owner_id, harness_id, machine_id FROM principal ORDER BY id"),
+        "credential": _rows(
+            db, scratch, "SELECT id, principal_id, secret_digest, revoked_intent_id FROM credential ORDER BY id"
+        ),
+        "request_digest_key": _rows(db, scratch, "SELECT id, active FROM request_digest_key ORDER BY id"),
+    }
+
+
+def schema_versions(data_root: Path) -> tuple[int, int]:
+    """``(policy, store)`` schema versions."""
+    root = DataRoot.at(data_root)
+    return schema_version(root.policy_db), schema_version(root.store_db)
+
+
+def endpoint_stages(data_root: Path) -> list[str]:
+    return sorted(p.name for p in data_root.iterdir() if p.name.startswith(ENDPOINT_STAGE_PREFIX))
+
+
+def _free_loopback_port() -> int:
+    with contextlib.closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as sock:
+        sock.bind((ENDPOINT_HOST, 0))
+        return int(sock.getsockname()[1])
+
+
+# --- kernel client probes ------------------------------------------------------------------------------------------
+
+
+def _client_profile(ctx: KernelCrashContext, seed: KernelSeed, name: str, endpoint_path: Path) -> Path:
+    tls = ctx.template.tls
+    client = ctx.case_dir / "client"
+    cred = client / "credential.txt"
+    if not cred.exists():
+        write_credential_file(cred, ctx.template.cred.token)
+    profile, _ = write_client_profile_file(
+        client / f"profile-{name}.json",
+        endpoint_path=endpoint_path,
+        expected_store_id=seed.store_id,
+        ca_file=tls.ca_cert_path,
+        leaf_cert_sha256=tls.leaf_cert_sha256,
+        credential_file=cred,
+    )
+    return profile
+
+
+def assert_old_tuple_refused(
+    ctx: KernelCrashContext, seed: KernelSeed, old: Endpoint, name: str, allowed: frozenset[str]
+) -> str:
+    """A shallow ``get_health`` aimed at ``old`` fails closed with one of ``allowed``; returns the code."""
+    tuple_file = write_owner_only_bytes(ctx.case_dir / "client" / f"tuple-{name}.json", old.encode_canonical())
+    envelope = read_status(_client_profile(ctx, seed, name, tuple_file), os_adapters())
+    error = envelope.get("error")
+    assert envelope.get("ok") is False and isinstance(error, dict), f"old tuple {name} was served: {envelope!r}"
+    assert error.get("code") in allowed, f"old tuple {name}: {envelope!r}"
+    return str(error["code"])
+
+
+def _tool_result(frame: dict[str, JsonValue]) -> dict[str, JsonValue]:
+    result = frame.get("result")
+    assert "error" not in frame and isinstance(result, dict), frame
+    content = result.get("structuredContent")
+    assert isinstance(content, dict), frame
+    return content
+
+
+def shim_health_and_job(
+    ctx: KernelCrashContext, seed: KernelSeed, job_id: str
+) -> tuple[dict[str, JsonValue], dict[str, JsonValue]]:
+    """Shallow ``get_health`` and global ``get_job`` through the installed ``brain-mcp`` on the live endpoint."""
+    profile = _client_profile(ctx, seed, "live", DataRoot.at(seed.data_root).endpoint_path)
+    init, initialized = mcp_init_frames(1)
+    with InstalledMcpPipeSession(ctx.env, "brain-mcp", ("--profile", str(profile)), cwd=ctx.cwd) as shim:
+        assert shim.send_frames_and_expect_response([init], timeout=10.0).get("id") == 1
+        health = shim.send_frames_and_expect_response(
+            [initialized, mcp_call_frame(2, "get_health", {"schema_version": "2.0"})], timeout=10.0
+        )
+        job = shim.send_frames_and_expect_response(
+            [mcp_call_frame(3, "get_job", {"schema_version": "2.0", "job_id": job_id})], timeout=10.0
+        )
+        rc, stderr = shim.finish()
+    assert rc == 0 and stderr == b"", (rc, stderr)
+    return _tool_result(health), _tool_result(job)
+
+
+# --- kernel seeds --------------------------------------------------------------------------------------------------
+
+
+def _seed_daemon_root(ctx: KernelCrashContext, *, stale_endpoint: bool) -> KernelSeed:
+    """A clone of the session's admitted (store 4, policy 3) template: credentials, workspaces, two ACKed jobs."""
+    tpl = ctx.template
+    data_root = ctx.case_dir / "data"
+    clone_owner_only_tree(tpl.root, data_root)
+    config = write_daemon_config_file(
+        ctx.case_dir / "daemon-config.json",
+        data_root=data_root,
+        expected_store_id=tpl.store_id,
+        cert_path=tpl.tls.cert_path,
+        key_path=tpl.tls.key_path,
+    )
+    epoch = lock_epoch(data_root)
+    stale = None
+    if stale_endpoint:
+        stale = Endpoint(
+            version=ENDPOINT_VERSION,
+            host=ENDPOINT_HOST,
+            port=_free_loopback_port(),
+            store_id=tpl.store_id,
+            writer_epoch=epoch,
+            instance_id=new_id(),
+        )
+        write_owner_only_bytes(DataRoot.at(data_root).endpoint_path, stale.encode_canonical())
+    snapshot = store_rows(data_root, ctx.case_dir / "ro-scratch")
+    assert snapshot["ledger"], "the seeded root must hold ACKed ledger entries"
+    return KernelSeed(data_root, config, tpl.store_id, epoch, snapshot, stale)
+
+
+def seed_daemon_root_with_stale_endpoint(ctx: KernelCrashContext) -> KernelSeed:
+    return _seed_daemon_root(ctx, stale_endpoint=True)
+
+
+def seed_daemon_root(ctx: KernelCrashContext) -> KernelSeed:
+    return _seed_daemon_root(ctx, stale_endpoint=False)
+
+
+def seed_legacy_pair(ctx: KernelCrashContext) -> KernelSeed:
+    """An increment 1 pair at (store 2, policy 2): two durable blobs, a quarantine intent applied to the store, an
+    active credential, and TLS material for its own store id."""
+    clock = FakeClock(dt.datetime.now(dt.UTC).replace(microsecond=0) - dt.timedelta(minutes=5))
+    adapters = os_adapters(clock=clock)
+    data_root = ctx.case_dir / "data"
+    rt = open_runtime(
+        data_root,
+        adapters,
+        store_migrations=KERNEL_STORE_MIGRATIONS[:2],
+        policy_migrations=KERNEL_POLICY_MIGRATIONS[:2],
+    )
+    try:
+        rt.store.store_content(b"t8-legacy-durable", "evidence", new_id(), RetentionClass.DURABLE, None)
+        blocked = rt.store.store_content(b"t8-legacy-quarantined", "evidence", new_id(), RetentionClass.DURABLE, None)
+        rt.policy.record_intent(IntentKind.QUARANTINE, {"digest": blocked})
+        assert rt.store.reconcile_policy() == 1
+        seed_principal_and_credential(rt.policy, owner_id="dan", harness_id="claude-code", machine_id="m-1")
+        store_id, generation = rt.store.store_id, rt.policy.trust_generation()
+    finally:
+        rt.close()
+    auth = make_bootstrap_auth(
+        store_id=store_id,
+        owner_id="dan",
+        action="provision_tls",
+        subject_id=store_id,
+        trust_generation=generation,
+        expires_at=clock.now() + dt.timedelta(hours=2),
+        destination=ctx.case_dir / "tls",
+    )
+    tls = create_store_tls(store_id, ctx.case_dir / "tls", auth, clock, adapters)
+    config = write_daemon_config_file(
+        ctx.case_dir / "daemon-config.json",
+        data_root=data_root,
+        expected_store_id=store_id,
+        cert_path=tls.cert_path,
+        key_path=tls.key_path,
+    )
+    assert schema_versions(data_root) == (2, 2)
+    snapshot = pair_rows(data_root, ctx.case_dir / "ro-scratch")
+    assert snapshot["intents"] and snapshot["quarantine"] and snapshot["credential"] and snapshot["ledger"]
+    return KernelSeed(data_root, config, store_id, lock_epoch(data_root), snapshot)
+
+
+# --- kernel expectations -------------------------------------------------------------------------------------------
+
+_DEAD_TUPLE_CODES = frozenset(
+    {ErrorCode.DAEMON_UNAVAILABLE.value, ErrorCode.IDENTITY_MISMATCH.value, ErrorCode.DEADLINE_EXCEEDED.value}
+)
+"""Nothing listens on the dead port: refused at once (POSIX) or after Windows' loopback SYN retries ran out the
+client's 2 s connect budget. Every one of them is a fail-closed refusal with no request sent."""
+_REUSED_PORT_CODES = frozenset({ErrorCode.IDENTITY_MISMATCH.value})
+
+
+def _wait_for_new_endpoint(serve: InstalledServeProcess, old: Sequence[Endpoint]) -> Endpoint:
+    """``wait_ready`` returns whatever ``endpoint.json`` holds; skip the old descriptors still on disk."""
+    old_ids = {o.identity for o in old}
+    deadline = time.monotonic() + T8_CHILD_TIMEOUT
+    while (current := serve.wait_ready()).identity in old_ids:
+        assert time.monotonic() < deadline, "the restarted daemon never replaced the old endpoint.json"
+        time.sleep(0.01)
+    return current
+
+
+def assert_acked_kept(seed: KernelSeed, after: dict[str, list[tuple[object, ...]]]) -> None:
+    """Every ACKed ledger entry is still there, in order and unchanged (recovery may append), and no applied intent
+    was lost."""
+    acked = seed.snapshot["ledger"]
+    assert after["ledger"][: len(acked)] == acked, "ACKed ledger entries changed or vanished"
+    assert set(seed.snapshot["applied_intents"]) <= set(after["applied_intents"]), "applied intents were lost"
+
+
+def expect_daemon_restart(ctx: KernelCrashContext, seed: KernelSeed, run: MarkedRun, dead: Endpoint | None) -> None:
+    """Shared by both daemon crashpoints, after the case-specific check of what the dead process left on disk.
+
+    The dead process took the next epoch and released the lock by dying. Its own published tuple fails closed while
+    nothing serves it. Every old tuple (the stale one of the epoch before, and the dead process's own) fails closed
+    again once a new daemon listens on its port. The installed ``brain serve`` then takes the lease (epoch + 2, new
+    instance), its endpoint matches that lease, and shallow ``get_health`` and the ACKed global job answer through
+    the installed ``brain-mcp``. While it is alive a second owner is fenced with ``writer_held`` (and, never reaching
+    the hook, prints no hit).
+    """
+    root = DataRoot.at(seed.data_root)
+    assert is_writer_lock_held(seed.data_root) is False
+    assert lock_epoch(seed.data_root) == seed.epoch + 1, "the crashed owner must have taken exactly one epoch"
+    old = [e for e in (seed.stale, dead) if e is not None]
+    if dead is not None:  # the retry of the dead process's own tuple
+        assert_old_tuple_refused(ctx, seed, dead, "dead", _DEAD_TUPLE_CODES)
+    assert ctx.template.global_job_id is not None
+
+    with spawn_installed_brain_serve(ctx.env, seed.config, data_root=seed.data_root, cwd=ctx.cwd) as serve:
+        current = _wait_for_new_endpoint(serve, old)
+        assert current.store_id == seed.store_id and current.writer_epoch == seed.epoch + 2
+        assert all(current.instance_id != o.instance_id for o in old)
+        assert root.endpoint_path.read_bytes() == current.encode_canonical()
+        for i, ep in enumerate(old):  # the old tuple aimed at the port a new daemon now listens on
+            reused = dataclasses.replace(ep, port=current.port)
+            assert_old_tuple_refused(ctx, seed, reused, f"reused-{i}", _REUSED_PORT_CODES)
+
+        health, job = shim_health_and_job(ctx, seed, ctx.template.global_job_id)
+        assert health.get("ok") is True, health
+        h = health["data"]
+        assert isinstance(h, dict) and h.get("ready") is True, health
+        assert (h.get("store_id"), h.get("writer_epoch")) == (seed.store_id, current.writer_epoch), health
+        assert job.get("ok") is True, job
+        j = job["data"]
+        assert isinstance(j, dict) and j.get("job_id") == ctx.template.global_job_id, job
+
+        fenced = run_t8_child(ctx.env, "serve", seed.config, cwd=ctx.cwd, crashpoint=run.result.hit)
+        assert (fenced.result.returncode, fenced.result.error_code) == (1, ErrorCode.WRITER_HELD.value), (
+            fenced.describe()
+        )
+        assert fenced.result.hit is None and fenced.ready is None, fenced.describe()
+        assert_entered(fenced)
+        assert root.endpoint_path.read_bytes() == current.encode_canonical()
+
+        rc, _, _, _ = serve.signal_and_wait_exit()
+        assert rc == 0
+    assert not root.endpoint_path.exists()
+    assert_acked_kept(seed, store_rows(seed.data_root, ctx.case_dir / "ro-scratch"))
+
+
+def expect_crash_after_bind(ctx: KernelCrashContext, seed: KernelSeed, run: MarkedRun) -> None:
+    """Bound but never published: ``endpoint.json`` still holds the previous epoch's bytes, no stage is left."""
+    assert seed.stale is not None
+    assert DataRoot.at(seed.data_root).endpoint_path.read_bytes() == seed.stale.encode_canonical()
+    assert endpoint_stages(seed.data_root) == []
+    assert_acked_kept(seed, store_rows(seed.data_root, ctx.case_dir / "ro-scratch"))
+    expect_daemon_restart(ctx, seed, run, dead=None)
+
+
+def expect_crash_after_publish(ctx: KernelCrashContext, seed: KernelSeed, run: MarkedRun) -> None:
+    """Published but never ready: the dead process's endpoint (its epoch, the seeded store) is what clients see."""
+    dead = read_client_endpoint(DataRoot.at(seed.data_root).endpoint_path, os_adapters())
+    assert (dead.store_id, dead.writer_epoch) == (seed.store_id, seed.epoch + 1)
+    assert endpoint_stages(seed.data_root) == []
+    assert_acked_kept(seed, store_rows(seed.data_root, ctx.case_dir / "ro-scratch"))
+    expect_daemon_restart(ctx, seed, run, dead=dead)
+
+
+def _owner_envelope(done: "subprocess.CompletedProcess[bytes]") -> dict[str, JsonValue]:
+    assert done.returncode == 0 and done.stderr == b"", (done.returncode, done.stdout, done.stderr)
+    envelope = parse_json(done.stdout.strip())
+    assert isinstance(envelope, dict) and envelope.get("ok") is True, envelope
+    data = envelope["data"]
+    assert isinstance(data, dict), envelope
+    return data
+
+
+def expect_crash_after_policy_swap(ctx: KernelCrashContext, seed: KernelSeed, run: MarkedRun) -> None:
+    """Policy published at v3, store still v2 and untouched; ``brain serve`` refuses, ``brain migrate --offline``
+    resumes only the store, a repeat is a no-op, and neither run fires the hook again although its env stays set."""
+    data_root, scratch = seed.data_root, ctx.case_dir / "ro-scratch"
+    root = DataRoot.at(data_root)
+    assert schema_versions(data_root) == (3, 2)
+    aside = sorted(p.name.split("-")[0] for p in data_root.iterdir() if p.name.startswith(("policy.", "store.")))
+    assert aside == ["policy.replaced"], aside  # the store migration never started
+    assert pair_rows(data_root, scratch) == seed.snapshot
+    assert is_writer_lock_held(data_root) is False
+
+    brain = installed_script_path(ctx.env, "brain")
+    refused = run_marked([str(brain), "serve", "--config", str(seed.config)], cwd=ctx.cwd)
+    assert (refused.result.returncode, refused.owner_stderr) == (1, (ErrorCode.MIGRATION_REQUIRED.value,)), (
+        refused.describe()
+    )
+    assert refused.result.stdout == "" and refused.ready is None
+    assert not root.endpoint_path.exists() and endpoint_stages(data_root) == []
+    assert schema_versions(data_root) == (3, 2) and pair_rows(data_root, scratch) == seed.snapshot
+
+    hook_env = {"SUPERBRAIN_CRASHPOINT": run.result.hit or ""}
+    migrate = ("migrate", "--offline", "--config", str(seed.config))
+    resumed = _owner_envelope(run_installed_command(ctx.env, "brain", migrate, cwd=ctx.cwd, extra_env=hook_env))
+    assert resumed["policy"] == {"status": "skipped", "from_version": 3, "to_version": 3}, resumed
+    assert resumed["store"] == {"status": "migrated", "from_version": 2, "to_version": 4}, resumed
+    assert (resumed["store_id"], resumed["noop"]) == (seed.store_id, False), resumed
+    assert schema_versions(data_root) == (3, 4) and pair_rows(data_root, scratch) == seed.snapshot
+
+    repeat = _owner_envelope(run_installed_command(ctx.env, "brain", migrate, cwd=ctx.cwd, extra_env=hook_env))
+    assert repeat["policy"] == {"status": "skipped", "from_version": 3, "to_version": 3}, repeat
+    assert repeat["store"] == {"status": "skipped", "from_version": 4, "to_version": 4}, repeat
+    assert repeat["noop"] is True and pair_rows(data_root, scratch) == seed.snapshot
+
+    with spawn_installed_brain_serve(ctx.env, seed.config, data_root=data_root, cwd=ctx.cwd) as serve:
+        current = serve.wait_ready()
+        assert current.store_id == seed.store_id
+        rc, _, _, _ = serve.signal_and_wait_exit()
+        assert rc == 0
+    assert not root.endpoint_path.exists()
+    after = pair_rows(data_root, scratch)
+    assert after["ledger"][: len(seed.snapshot["ledger"])] == seed.snapshot["ledger"]
+    assert {k: v for k, v in after.items() if k != "ledger"} == {
+        k: v for k, v in seed.snapshot.items() if k != "ledger"
+    }
+
+
+KERNEL_CRASH_CASES: tuple[KernelCrashCase, ...] = (
+    KernelCrashCase(
+        "serve", "daemon.after_bind_before_endpoint", seed_daemon_root_with_stale_endpoint, expect_crash_after_bind
+    ),
+    KernelCrashCase("serve", "daemon.after_endpoint_publish", seed_daemon_root, expect_crash_after_publish),
+    KernelCrashCase("migrate", "kernel.migrate.after_policy_swap", seed_legacy_pair, expect_crash_after_policy_swap),
 )

@@ -1,9 +1,10 @@
-# Bảng điểm crash của SP1 đợt 1
+# Bảng điểm crash của SP1 (đợt 1 và kernel đợt 2)
 
 Tài liệu này là deliverable "bảng điểm crash" mà spec mục 5.4 yêu cầu. Mỗi crashpoint đã đăng ký trong
 `superbrain.core.faults.KNOWN_CRASHPOINTS` có **đúng một dòng** ở các bảng dưới đây. Test
 `tests/storage/test_crash_matrix.py::test_every_known_crashpoint_has_a_case_and_a_doc_row` đọc cột đầu tiên của mọi
-bảng (tên crashpoint đặt trong backtick) và đòi tập tên đó bằng đúng `KNOWN_CRASHPOINTS`.
+bảng (tên crashpoint đặt trong backtick) và đòi tập tên đó bằng đúng `KNOWN_CRASHPOINTS`, không trùng, và bằng đúng
+tập tên của `CRASH_CASES` (đợt 1) cộng `KERNEL_CRASH_CASES` (đợt 2, Task 8).
 
 ## Cách đọc bảng
 
@@ -14,7 +15,7 @@ bảng (tên crashpoint đặt trong backtick) và đòi tập tên đó bằng 
 - **Phục hồi:** việc lần mở kế tiếp làm, theo thứ tự cố định của `open_runtime`: `prepare_data_root` →
   `acquire_writer` → `recover_interrupted_swaps` → mở policy store → mở kho (`Store.open` đối chiếu mọi intent).
 - **CrashCase:** ca trong `tests/support/crash_cases.py::CRASH_CASES`, có id `operation@crashpoint` trong
-  `test_crash_case`. Ca seed trạng thái đã ACK, cho tiến trình con chết với mã thoát 86 đúng ở điểm đó, mở lại
+  `test_crash_case`; các dòng kernel dùng `KERNEL_CRASH_CASES` (xem mục kernel bên dưới). Ca seed trạng thái đã ACK, cho tiến trình con chết với mã thoát 86 đúng ở điểm đó, mở lại
   data root rồi assert trạng thái **cụ thể**. `db_integrity() == "ok"` chỉ là kiểm tra bổ sung.
 - **Tiến trình chết:** có test. Ngoài ca trong ma trận, cột này nêu test chuyên biệt có sẵn.
 - **Mất điện:** **không** được chứng minh bằng test kill tiến trình. Lập luận dựa trên ngữ nghĩa OS đã chốt ở Task 5
@@ -95,10 +96,28 @@ bảng (tên crashpoint đặt trong backtick) và đòi tập tên đó bằng 
 | `migrating.policy.after_stage` | `migrate_policy_to_v2` | Policy store v1, payload event bị quarantine (intent đã áp) | Backup `policy-*` đầy đủ; `policy.migrating/` v2 có `READY`; `policy/` v1 nguyên vẹn | Chưa | Stage bị cất thành `policy.migrating.abandoned-*` | Như dòng kho; quarantine không bao giờ bị mất qua migrate | `migrate_policy_to_v2@migrating.policy.after_stage`, mở bằng bộ v1: policy v1, quarantine còn hiệu lực (đọc trả `quarantined`, đối chiếu áp 0), generation và HWM không đổi, backup `policy` verify được. Sau khi đóng, mở bằng bộ có v2 trả `migration_required` | Có test (ma trận) | Như dòng kho |
 | `migrating.policy.between_renames` | `migrate_policy_to_v2` | Như trên | `policy/` đã thành `policy.replaced-*` (v1); stage v2 `READY` chưa công bố | Chưa | Recovery công bố stage v2 | Như trên | `migrate_policy_to_v2@migrating.policy.between_renames`, mở bằng bộ có v2: policy v2, `policy.replaced` là v1, quarantine còn hiệu lực, generation không đổi | Có test (ma trận) | Như dòng kho |
 
+## Kernel daemon và offline migrate (SP1 đợt 2, Task 8.1)
+
+Ba dòng này là `KernelCrashCase` trong `tests/support/crash_cases.py::KERNEL_CRASH_CASES`, chạy bởi
+`tests/integration/test_kernel_crash_recovery.py` với node ID `operation@crashpoint`. Operation là mode của
+`tests/support/inc2_t8_child.py`, driver chạy bằng `python -I` trong venv của wheel đã cài và kiểm `superbrain.__file__`
+nằm trong venv đó. Driver in `ENTERED <pid> <start>` lên stderr trước khi gọi owner operation; test đòi
+`CRASHPOINT_HIT <tên>` và mã thoát 86 của chính lần gọi đó, `ENTERED` đứng trước hit, không có `READY`. Kiểm trạng thái
+sau crash đọc thẳng `writer.lock`, `endpoint.json` và hai DB (qua `open_readonly`, kể cả khi hai schema lệch nhau), không
+mở runtime. Restart, refuse và resume dùng `brain serve`, `brain migrate --offline` và `brain-mcp` đã cài.
+
+| Crashpoint | Operation | Trước | Sau crash | Đã ACK? | Phục hồi | Invariant | CrashCase | Tiến trình chết | Mất điện |
+|---|---|---|---|---|---|---|---|---|---|
+| `daemon.after_bind_before_endpoint` | `serve` | Root (store v4, policy v3) có credential, workspace và hai job đã ACK; writer epoch `e`; `endpoint.json` của epoch `e` (instance cũ, port cũ) còn trên đĩa | Tiến trình đã lấy lease (epoch `e + 1`), mở runtime, phục hồi job, publish auth view trong RAM và bind listener loopback; chưa ghi stage hay `endpoint.json` mới, chưa ready. Lock được OS nhả khi tiến trình chết | Chưa: chưa có endpoint nên không client nào gửi được request | Không cần bước riêng: `endpoint.json` cũ chỉ là descriptor, không phải authority. Writer kế tiếp lấy epoch `e + 2`, instance mới, rồi thay descriptor | Endpoint chỉ được publish dưới lease đang giữ, mang đúng epoch của lease; tuple cũ không bao giờ được xác thực, kể cả khi port của nó được tái sử dụng | `serve@daemon.after_bind_before_endpoint`: `endpoint.json` vẫn đúng bytes của epoch `e`, không còn `endpoint.json.stage-*`, ledger và `applied_intents` không đổi, lock epoch `e + 1` và không bị giữ. Tuple cũ hỏi `get_health` trả `daemon_unavailable` hoặc `identity_mismatch`. `brain serve` restart: endpoint epoch `e + 2`, instance khác, bytes khớp; tuple cũ trỏ vào port của daemon mới trả `identity_mismatch`; `brain-mcp` trả shallow `get_health` ready với cùng `store_id`/epoch và `get_job` của job đã ACK; owner thứ hai bị fence `writer_held` và không phát hit; sau khi dừng, endpoint bị gỡ và các entry đã ACK vẫn là tiền tố của ledger | Có test (process thật từ wheel); thêm `test_kernel_daemon.py::test_epoch_and_instance_change_after_kill` cho kill sau ready | Không có ghi bền nào giữa bind và publish. Epoch `e + 1` nằm trong slot lock đã `full_fsync` trước khi lease trả về, nên sau mất điện epoch kế tiếp vẫn lớn hơn mọi epoch đã dùng. `endpoint.json` cũ còn nguyên hoặc vẫn là bản trước đó; client luôn kiểm identity sống qua TLS trước khi gửi credential |
+| `daemon.after_endpoint_publish` | `serve` | Như trên, không có `endpoint.json` | `endpoint.json` mang epoch `e + 1`, instance và port của tiến trình chết đã được publish (stage, `secure_file`, `flush_file`, rename); chưa ready, worker chưa chạy | Chưa ACK request nào; descriptor đã bền | Writer kế tiếp lấy epoch `e + 2` và thay descriptor bằng bản của mình; descriptor của tiến trình chết không bao giờ được xác thực lại | Như dòng trên; descriptor còn lại sau crash chỉ là một tuple cũ | `serve@daemon.after_endpoint_publish`: descriptor đọc được, `store_id` của root, epoch `e + 1`, không còn stage, ledger không đổi. Tuple đó fail closed trước restart, và trả `identity_mismatch` khi trỏ vào port của daemon mới. Restart, shim, fence và kiểm ACK như dòng trên | Có test (process thật từ wheel) | Descriptor đi qua port `DurablePublisher` như mọi file bền khác, nên sau mất điện hoặc chưa có hoặc có đầy đủ. Cả hai trường hợp đều là tuple không có tiến trình sống; client kiểm identity trước khi gửi bearer |
+| `kernel.migrate.after_policy_swap` | `migrate` | Cặp đợt 1: store v2 (hai blob bền, một intent QUARANTINE đã áp), policy v2 (principal, credential đang hoạt động, request digest key, trust generation) | `migrate_database` đã publish policy v3 (backup `policy-*` và `policy.replaced-*` v2 còn lại); store vẫn v2, chưa có `store.migrating*` hay `store.replaced*`. Không in envelope | Chưa: lệnh migrate chưa trả kết quả | `brain serve` từ chối `migration_required`, không publish endpoint, không đổi schema hay dữ liệu. `brain migrate --offline --config …` chạy lại: policy `skipped` 3→3, store `migrated` 2→4. Lần lặp lại là no-op, cả hai `skipped` | Migration không tự chạy và không nửa vời được dùng: cặp lệch schema không bao giờ được serve; resume chỉ chạy phần còn thiếu; ID, intent và authority giữ nguyên qua crash và resume; hook chỉ phát sau khi policy thực sự được migrate trong lần chạy đó | `migrate@kernel.migrate.after_policy_swap`: schema (policy, store) = (3, 2), chỉ có `policy.replaced` bị cất, ledger/`applied_intents`/intents/quarantine/trust/principal/credential/request key bằng đúng lúc seed. `brain serve` thoát 1 với `migration_required` và stdout rỗng. Resume và lần lặp chạy **vẫn đặt** `SUPERBRAIN_CRASHPOINT=kernel.migrate.after_policy_swap`, thoát 0, stderr rỗng (không hit), schema (3, 4), dữ liệu bằng lúc seed. `brain serve` sau đó ready và dừng sạch | Có test (process thật từ wheel); thêm `test_kernel_cli.py::test_installed_migrate_respects_offline_lease` cho đường không crash | Swap policy đi qua stage `READY`, rename có sync thư mục và backup đã làm bền (như các dòng `migrating.policy.*`), nên sau mất điện policy là v2 hoặc v3 đầy đủ. Store v2 chưa bị chạm. Mọi tổ hợp (v2, v2) và (v3, v2) đều bị serve từ chối và được `migrate --offline` đưa về (v3, v4) |
+
 ## Bảo đảm của chính ma trận
 
-- `test_every_known_crashpoint_has_a_case_and_a_doc_row`: mỗi crashpoint đã đăng ký có đúng một `CrashCase` và đúng một
-  dòng trong tài liệu này.
+- `test_every_known_crashpoint_has_a_case_and_a_doc_row`: mỗi crashpoint đã đăng ký có đúng một ca (`CrashCase` hoặc
+  `KernelCrashCase`) và đúng một dòng trong tài liệu này, không tên nào trùng.
+- `test_registry_is_exactly_the_increment_1_names_plus_the_task_8_1_names`: registry bằng đúng 19 tên đợt 1 cộng 3 tên
+  của Task 8.1; 19 ca đợt 1 giữ nguyên node ID. Phần 8.3 nâng tập này lên đủ 10 tên Task 8 (tổng 29).
 - `test_crash_case`: mỗi ca phải chết với mã 86 **đúng** ở crashpoint của nó (`run_until_crash`).
 - `test_matrix_detects_a_removed_crashpoint`: với `SUPERBRAIN_DISABLE_CRASHPOINTS_FOR_TEST=cas.after_rename`, tiến
   trình con chạy hết operation như thể lời gọi crashpoint đã bị xóa khỏi code, và ma trận fail. Biến này chỉ dùng để
