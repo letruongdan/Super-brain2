@@ -60,33 +60,45 @@ def test_r4_optional_literal_shape_near_misses_are_kept(optional_literal_shape: 
         assert _filtered(text) == (text, 0)
 
 
-ESCAPE_ALTERNATIVE = r"tok\dkey"
+# ``tok\dkey`` is the owner's example; its ``key`` is also a needle of the existing ``api[_-]?key`` alternative, which
+# keeps the gate open by itself. ``tok\dzq`` shares no literal with any existing alternative, so only its own
+# post-escape literal ``zq`` can open the gate.
+ESCAPE_ALTERNATIVES: dict[str, tuple[str, tuple[str, ...]]] = {
+    "tok_d_key": (r"tok\dkey", ("tok7key", "TOK0KEY")),
+    "tok_d_zq": (r"tok\dzq", ("tok7zq", "TOK0ZQ")),
+}
 
 
-@pytest.fixture
-def escape_alternative(monkeypatch: pytest.MonkeyPatch) -> re.Pattern[str]:
+def _with_alternative(monkeypatch: pytest.MonkeyPatch, alternative: str) -> re.Pattern[str]:
     original = rules_mod._KEY_VALUE_SECRET
     assert r"\b(" in original.pattern
-    extended = re.compile(original.pattern.replace(r"\b(", rf"\b({ESCAPE_ALTERNATIVE}|", 1), original.flags)
+    extended = re.compile(original.pattern.replace(r"\b(", rf"\b({alternative}|", 1), original.flags)
     for module in _MODULES:
         monkeypatch.setattr(module, "_KEY_VALUE_SECRET", extended, raising=False)
     return extended
 
 
 @pytest.mark.parametrize("sep", ["=", ":", " = ", "\t:"])
-@pytest.mark.parametrize("key", ["tok7key", "TOK0KEY"])
 @pytest.mark.parametrize("suffix", _SUFFIXES, ids=["ascii", "non_ascii"])
+@pytest.mark.parametrize("name", sorted(ESCAPE_ALTERNATIVES))
 def test_r4_added_key_value_alternative_ending_in_escape_then_literal_is_redacted(
-    escape_alternative: re.Pattern[str], key: str, sep: str, suffix: str,
+    monkeypatch: pytest.MonkeyPatch, name: str, sep: str, suffix: str,
 ) -> None:
-    text = f"cfg {key}{sep}s3cr3tvalue end{suffix}"
-    assert escape_alternative.search(text)
-    assert _filtered(text) == (f"cfg {key}{sep}{REDACTED} end{suffix}", 1)
+    alternative, keys = ESCAPE_ALTERNATIVES[name]
+    rule = _with_alternative(monkeypatch, alternative)
+    for key in keys:
+        text = f"cfg {key}{sep}s3cr3tvalue end{suffix}"
+        assert rule.search(text)
+        assert _filtered(text) == (f"cfg {key}{sep}{REDACTED} end{suffix}", 1), text
 
 
 @pytest.mark.parametrize("suffix", _SUFFIXES, ids=["ascii", "non_ascii"])
-def test_r4_escape_alternative_near_misses_are_kept(escape_alternative: re.Pattern[str], suffix: str) -> None:
-    for key in ("tokxkey", "tok77key", "tok7keys"):
+@pytest.mark.parametrize("name", sorted(ESCAPE_ALTERNATIVES))
+def test_r4_escape_alternative_near_misses_are_kept(monkeypatch: pytest.MonkeyPatch, name: str, suffix: str) -> None:
+    alternative, keys = ESCAPE_ALTERNATIVES[name]
+    rule = _with_alternative(monkeypatch, alternative)
+    stem, tail = keys[0][:3], keys[0][4:]
+    for key in (f"{stem}x{tail}", f"{stem}77{tail}", f"{keys[0]}s"):
         text = f"cfg {key}=s3cr3tvalue end{suffix}"
-        assert not escape_alternative.search(text)
+        assert not rule.search(text)
         assert _filtered(text) == (text, 0)
