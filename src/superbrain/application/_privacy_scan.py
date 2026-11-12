@@ -224,16 +224,19 @@ class _TextScans:
             if self._path_scan:
                 if self._path_needle is None or self._path_needle.search(lowered):
                     text = self._path_token.sub(self._blocked_path, text)
-        else:
-            text = self._sub(_AUTH_HEADER, rf"\1\2{REDACTED}", text)
+        else:  # lowered=None: only case-sensitive gates are trusted on non-ASCII text
+            if _gate_open(_AUTH_HEADER, text, None):
+                text = self._sub(_AUTH_HEADER, rf"\1\2{REDACTED}", text)
             self.tick()
-            text = _AUTH_SCHEME.sub(self._auth_scheme, text)
+            if _gate_open(_AUTH_SCHEME, text, None):
+                text = _AUTH_SCHEME.sub(self._auth_scheme, text)
             for pattern in _FIXED_TOKENS:
                 if _gate_open(pattern, text, None):
                     text = self._sub(pattern, REDACTED, text)
                 self.tick()
             text = self._userinfo(text)
-            text = self._sub(_KEY_VALUE_SECRET, rf"\1\2{REDACTED}", text)
+            if _gate_open(_KEY_VALUE_SECRET, text, None):
+                text = self._sub(_KEY_VALUE_SECRET, rf"\1\2{REDACTED}", text)
             self.tick()
             # The cheap candidate scan keeps the full component matcher as the authority.
             if self._path_scan:
