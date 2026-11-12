@@ -263,9 +263,35 @@ def write_client_profile_file(
 # ---------------------------------------------------------------------------
 
 
+def _win32_process_creation_ticks(pid: int) -> int | None:
+    """Return 100ns FILETIME creation ticks for ``pid``, or ``None`` if unavailable."""
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [ctypes.wintypes.DWORD, ctypes.wintypes.BOOL, ctypes.wintypes.DWORD]
+    kernel32.OpenProcess.restype = ctypes.wintypes.HANDLE
+    kernel32.GetProcessTimes.argtypes = [ctypes.wintypes.HANDLE, *[ctypes.POINTER(ctypes.wintypes.FILETIME)] * 4]
+    kernel32.GetProcessTimes.restype = ctypes.wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [ctypes.wintypes.HANDLE]
+    kernel32.CloseHandle.restype = ctypes.wintypes.BOOL
+
+    handle = kernel32.OpenProcess(0x1000, False, int(pid))
+    if not handle:
+        return None
+    try:
+        times = [ctypes.wintypes.FILETIME() for _ in range(4)]
+        if not kernel32.GetProcessTimes(handle, *(ctypes.byref(t) for t in times)):
+            return None
+        return (int(times[0].dwHighDateTime) << 32) | int(times[0].dwLowDateTime)
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 def _win32_descendant_pids(root_pid: int) -> list[int]:
     """Enumerate all live descendant PIDs of ``root_pid`` on Windows via Toolhelp32 snapshot."""
     if sys.platform != "win32":
+        return []
+
+    root_ticks = _win32_process_creation_ticks(root_pid)
+    if root_ticks is None:
         return []
 
     th32cs_snapprocess = 0x00000002
@@ -305,15 +331,22 @@ def _win32_descendant_pids(root_pid: int) -> list[int]:
         kernel32.CloseHandle(snap)
 
     descendants: list[int] = []
+    start_ticks: dict[int, int] = {root_pid: root_ticks}
     frontier = [root_pid]
     seen = {root_pid}
     while frontier:
         curr = frontier.pop(0)
+        parent_ticks = start_ticks[curr]
         for child_pid in children_by_parent.get(curr, ()):
-            if child_pid not in seen:
-                seen.add(child_pid)
-                descendants.append(child_pid)
-                frontier.append(child_pid)
+            if child_pid in seen:
+                continue
+            child_ticks = _win32_process_creation_ticks(child_pid)
+            if child_ticks is None or child_ticks < parent_ticks:
+                continue
+            seen.add(child_pid)
+            start_ticks[child_pid] = child_ticks
+            descendants.append(child_pid)
+            frontier.append(child_pid)
     return descendants
 
 
