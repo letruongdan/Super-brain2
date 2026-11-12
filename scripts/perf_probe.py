@@ -46,7 +46,14 @@ def child(config: Path) -> int:
     from superbrain.composition import daemon_entry
     from superbrain.composition.daemon_entry import serve_config_path
     from superbrain.composition.owner_entry import _explicit_owner_adapters
-    from superbrain.core.kernel import Call, CallContext, SnapshotObservation, StoredResult, WorkspaceBinding
+    from superbrain.core.kernel import (
+        TOTAL_REQUEST_BUDGET_NS,
+        Call,
+        CallContext,
+        SnapshotObservation,
+        StoredResult,
+        WorkspaceBinding,
+    )
     from superbrain.storage.idempotency import KernelIdempotencyStore
     from tests.support.inc2_t8_domain import GatedObserver, fixture_hooks
     from tests.support.inc2_t8_privacy import PrivacyDomainProxy, privacy_store_extensions
@@ -60,9 +67,8 @@ def child(config: Path) -> int:
     threading.Thread(target=wait_for_stop, daemon=True).start()
     _, adapters, scratch = _explicit_owner_adapters(config)
     proxy = PrivacyDomainProxy()
-    samples: dict[str, dict[str, JsonValue]] = {}
     local = threading.local()
-    active: dict[str, JsonValue] = {}
+    owner_sample: dict[str, JsonValue] | None = None
     inflight: dict[int, dict[str, JsonValue]] = {}
     inflight_lock = threading.Lock()
     transport_api: Any = transport
@@ -79,81 +85,104 @@ def child(config: Path) -> int:
             assert isinstance(result.arguments, dict)
             key = str(result.arguments["idempotency_key"])
             sample: dict[str, JsonValue] = {
-                "idempotency_key": key, "t0_read_ns": kwargs["deadline_ns"] - 1_500_000_000,
+                "idempotency_key": key, "t0_read_ns": kwargs["deadline_ns"] - TOTAL_REQUEST_BUDGET_NS,
             }
-            samples[key] = sample
-            local.sample = sample
             with inflight_lock:
                 inflight[id(sample)] = sample
                 if len(inflight) > 1:
                     for other in inflight.values():
                         other["overlapped"] = True
+                local.sample = sample
         return result
 
     def prepare(call: Call, ctx: CallContext, *, now: Any) -> Any:
+        nonlocal owner_sample
         admitted_ns = time.perf_counter_ns()
         with inflight_lock:
-            active.clear()
-            active.update(samples[str(call.arguments["idempotency_key"])])
-            active["admission_done_ns"] = admitted_ns
+            owner_sample = None
+            if len(inflight) == 1:
+                (candidate,) = inflight.values()
+                if (
+                    candidate.get("overlapped") is not True
+                    and candidate["idempotency_key"] == call.arguments["idempotency_key"]
+                    and (
+                        ctx is None
+                        or ctx.deadline_ns == int(str(candidate["t0_read_ns"])) + TOTAL_REQUEST_BUDGET_NS
+                    )
+                ):
+                    candidate["admission_done_ns"] = admitted_ns
+                    owner_sample = candidate
         return original_prepare(call, ctx, now=now)
 
     def filtered(self: PrivacyFilter, value: Any, policy: Any, **kwargs: Any) -> Any:
-        active["filter_ran"] = True
-        active["filter_start_ns"] = time.perf_counter_ns()
+        sample = owner_sample
+        if sample is None:
+            return original_filter(self, value, policy, **kwargs)
+        sample["filter_ran"] = True
+        sample["filter_start_ns"] = time.perf_counter_ns()
         try:
             result = original_filter(self, value, policy, **kwargs)
-            active["filter_end_ns"] = time.perf_counter_ns()
-            active["filter_bytes"] = len(canonical_json(value))
-            active.update(
+            sample["filter_end_ns"] = time.perf_counter_ns()
+            sample["filter_bytes"] = len(canonical_json(value))
+            sample.update(
                 redacted_count=result.redacted_count, stripped_keys_count=result.stripped_keys_count,
                 positive_control_preserved=_positive(result.value),
             )
             return result
         finally:
-            active.setdefault("filter_end_ns", time.perf_counter_ns())
-            active.setdefault("filter_bytes", len(canonical_json(value)))
+            sample.setdefault("filter_end_ns", time.perf_counter_ns())
+            if "filter_bytes" not in sample:
+                sample["filter_bytes"] = len(canonical_json(value))
 
     def commit(self: KernelIdempotencyStore, **kwargs: Any) -> tuple[StoredResult, bool]:
-        active["commit_start_ns"] = time.perf_counter_ns()
+        sample = owner_sample
+        if sample is None:
+            return original_commit(self, **kwargs)
+        sample["commit_start_ns"] = time.perf_counter_ns()
         try:
             return original_commit(self, **kwargs)
         finally:
-            active["commit_end_ns"] = time.perf_counter_ns()
+            sample["commit_end_ns"] = time.perf_counter_ns()
 
     def write(*args: Any, **kwargs: Any) -> Any:
-        sample = getattr(local, "sample", None)
+        sample: dict[str, JsonValue] | None = getattr(local, "sample", None)
         if sample is None:
             return original_write(*args, **kwargs)
         write_start_ns = time.perf_counter_ns()
-        result = original_write(*args, **kwargs)
-        flushed_ns = time.perf_counter_ns()
-        with inflight_lock:
-            inflight.pop(id(sample), None)
-            overlapped = sample.get("overlapped") is True
-            captured = dict(active)
-        if overlapped or captured.get("idempotency_key") != sample["idempotency_key"]:
-            # Requests overlapped: owner-thread spans cannot be attributed, so never report an ok sample.
-            sample["status"] = "instrumentation_overlap"
-            print(json.dumps({"event": "sample", **sample}), flush=True)
+        try:
+            result = original_write(*args, **kwargs)
+            flushed_ns = time.perf_counter_ns()
+        finally:
+            with inflight_lock:
+                inflight.pop(id(sample), None)
+                captured = dict(sample)
             local.sample = None
-            return result
         captured["response_write_start_ns"] = write_start_ns
         captured["response_flushed_ns"] = flushed_ns
-        captured["elapsed_ns"] = flushed_ns - int(str(sample["t0_read_ns"]))
+        captured["elapsed_ns"] = flushed_ns - int(str(captured["t0_read_ns"]))
         envelope = json.loads(kwargs["body"])
-        captured["status"] = "ok" if envelope.get("ok") is True else str(envelope.get("error", {}).get("code"))
+        if captured.get("overlapped") is True:
+            captured["status"] = "instrumentation_overlap"
+        elif envelope.get("ok") is not True:
+            captured["status"] = str(envelope.get("error", {}).get("code"))
+        elif "admission_done_ns" not in captured:
+            # A cached replay can succeed without producing fresh owner spans.
+            captured["status"] = "instrumentation_missing_owner"
+        else:
+            captured["status"] = "ok"
         print(json.dumps({"event": "sample", **captured}), flush=True)
-        local.sample = None
         return result
 
     class Observer(GatedObserver):
         def observe(self, binding: WorkspaceBinding, deadline_ns: int) -> SnapshotObservation:
-            active["observer_start_ns"] = time.perf_counter_ns()
+            sample = owner_sample
+            if sample is None:
+                return super().observe(binding, deadline_ns)
+            sample["observer_start_ns"] = time.perf_counter_ns()
             try:
                 return super().observe(binding, deadline_ns)
             finally:
-                active["observer_end_ns"] = time.perf_counter_ns()
+                sample["observer_end_ns"] = time.perf_counter_ns()
 
     # Test-process taps wrap the real call, never the value being measured.
     transport_api.read_admitted_tool_command = read
