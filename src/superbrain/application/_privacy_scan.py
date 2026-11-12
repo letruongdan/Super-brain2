@@ -200,29 +200,36 @@ class _TextScans:
             text = self._pem(text)
         ascii_text = text.isascii()
         if ascii_text:
-            if _gate_open(_AUTH_HEADER, text, True):
+            lowered = text.lower()
+            if _gate_open(_AUTH_HEADER, text, lowered):
                 text = self._sub(_AUTH_HEADER, rf"\1\2{REDACTED}", text)
+                lowered = text.lower()
             self.tick()
-            if _gate_open(_AUTH_SCHEME, text, True):
+            if _gate_open(_AUTH_SCHEME, text, lowered):
                 text = _AUTH_SCHEME.sub(self._auth_scheme, text)
+                lowered = text.lower()
             for pattern in _FIXED_TOKENS:
-                if _gate_open(pattern, text, True):
+                if _gate_open(pattern, text, lowered):
                     text = self._sub(pattern, REDACTED, text)
+                    lowered = text.lower()
                 self.tick()
-            text = self._userinfo(text)
-            if _gate_open(_KEY_VALUE_SECRET, text, True):
+            new = self._userinfo(text)
+            if new != text:
+                text, lowered = new, new.lower()
+            if _gate_open(_KEY_VALUE_SECRET, text, lowered):
                 text = self._sub(_KEY_VALUE_SECRET, rf"\1\2{REDACTED}", text)
+                lowered = text.lower()
             self.tick()
             # The cheap candidate scan keeps the full component matcher as the authority.
             if self._path_scan:
-                if self._path_needle is None or self._path_needle.search(text.lower()):
+                if self._path_needle is None or self._path_needle.search(lowered):
                     text = self._path_token.sub(self._blocked_path, text)
         else:
             text = self._sub(_AUTH_HEADER, rf"\1\2{REDACTED}", text)
             self.tick()
             text = _AUTH_SCHEME.sub(self._auth_scheme, text)
             for pattern in _FIXED_TOKENS:
-                if _gate_open(pattern, text, False):
+                if _gate_open(pattern, text, None):
                     text = self._sub(pattern, REDACTED, text)
                 self.tick()
             text = self._userinfo(text)

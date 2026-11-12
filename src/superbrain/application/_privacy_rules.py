@@ -159,72 +159,98 @@ def _path_needles(patterns: tuple[str, ...]) -> tuple[str, ...] | None:
 
 
 _REGEX_META = frozenset(r".^$*+?{}[]\|()")
-# (leading literals, literal last chars of the leading group's alternatives, case-folded, separator chars)
-_RuleGate = tuple[tuple[str, ...], frozenset[str] | None, bool, str | None]
+_PLAIN_CLASS = re.compile(r"\[([A-Za-z0-9_]{1,8})\](?![?*+{])")
+# (needles one of which every match holds, "<last char><separator>" pairs or None, compare case-folded)
+_RuleGate = tuple[tuple[str, ...], tuple[str, ...] | None, bool]
 
 
-def _literal_run(text: str) -> str:
-    end = 0
-    while end < len(text) and text[end] not in _REGEX_META:
-        end += 1
-    return text[:end]
+def _leading_literals(source: str) -> tuple[str, ...]:
+    """Strings one of which starts every match of ``source``; a small plain ``[...]`` class is expanded."""
+    variants = [""]
+    i = 0
+    while i < len(source):
+        cls = _PLAIN_CLASS.match(source, i)
+        if cls is not None and len(variants) * len(cls.group(1)) <= 16:
+            variants = [v + ch for v in variants for ch in cls.group(1)]
+            i = cls.end()
+            continue
+        if source[i] in _REGEX_META or source[i + 1 : i + 2] in ("?", "*", "{"):
+            break  # a metacharacter, or a literal made optional by the quantifier after it
+        variants = [v + source[i] for v in variants]
+        i += 1
+        if source[i : i + 1] == "+":
+            break
+    return tuple(variants) if variants[0] else ()
+
+
+def _trailing_literal(alternative: str) -> str:
+    """Literal suffix every match of a quantifier-free-ending ``alternative`` ends with (``""`` when none)."""
+    start = len(alternative)
+    while start > 0 and alternative[start - 1] not in _REGEX_META:
+        start -= 1
+    if start > 0 and alternative[start - 1] == "\\":
+        start += 1  # ``\d``-style escape: its letter is not a literal
+    return alternative[start:]
 
 
 @lru_cache(maxsize=64)
 def _rule_gate(pattern: re.Pattern[str]) -> _RuleGate | None:
     r"""Cheap necessary condition for a ``\b``-anchored rule, read from the rule itself; ``None``: always run it.
 
-    Every match starts with one of the leading literals. When the leading group is followed by
-    ``([ \t]{0,16}[=:]``, a match also holds one of the alternatives' last characters (or a blank) right before
-    ``=`` or ``:``. Anything the reader does not recognise gives no gate, never a stale one.
+    A leading group's alternatives each give their literal suffix (the most specific part, next to the separator) or
+    else their leading literals; when the group is followed by ``([ \t]{0,16}[=:]``, a match also holds the
+    suffix's last character (or a blank) right before ``=`` or ``:``. Any shape the reader does not recognise gives
+    no gate, never a stale one.
     """
     fold = bool(pattern.flags & re.IGNORECASE)
     source = pattern.pattern.removeprefix("(?i)")
     if not source.startswith(r"\b"):
         return None
     source = source[2:]
-    ends: set[str] | None = None
-    seps: str | None = None
-    if source.startswith("("):
-        start = 3 if source.startswith("(?:") else 1
-        close = source.find(")")
-        if close < 0 or "(" in source[start:close]:
+    if not source.startswith("("):
+        needles = _leading_literals(source)
+        return (tuple(n.lower() for n in needles) if fold else needles, None, fold) if needles else None
+    start = 3 if source.startswith("(?:") else 1
+    close = source.find(")")
+    if close < 0 or "(" in source[start:close]:
+        return None
+    found: list[str] = []
+    ends: set[str] | None = set() if source[close + 1 :].startswith(r"([ \t]{0,16}[=:]") else None
+    for alternative in source[start:close].split("|"):
+        suffix = _trailing_literal(alternative)
+        options = (suffix,) if suffix else _leading_literals(alternative)
+        if not options:
             return None
-        alternatives = source[start:close].split("|")
-        if source[close + 1 :].startswith(r"([ \t]{0,16}[=:]"):
-            ends, seps = set(), "=:"
-    else:
-        alternatives = [source]
-    leads: list[str] = []
-    for alternative in alternatives:
-        lead = _literal_run(alternative)
-        if not lead:
-            return None
-        leads.append(lead.lower() if fold else lead)
+        found.extend(options)
         if ends is not None:
-            last = alternative[-1:]
-            if not last or last in _REGEX_META or alternative[-2:-1] == "\\":
-                ends, seps = None, None
+            if suffix:
+                ends.add(suffix[-1])
             else:
-                ends.add(last.lower() if fold else last)
-    return tuple(leads), (frozenset(ends) if ends is not None else None), fold, seps
+                ends = None
+    pairs = None if ends is None else tuple(f"{end}{sep}" for end in (*sorted(ends), " ", "\t") for sep in "=:")
+    if fold:
+        found = [n.lower() for n in found]
+        pairs = None if pairs is None else tuple(p.lower() for p in pairs)
+    return tuple(dict.fromkeys(found)), pairs, fold
 
 
-def _gate_open(pattern: re.Pattern[str], text: str, ascii_text: bool) -> bool:
-    """False only when ``pattern`` cannot match ``text``; case-folded gates are trusted on ASCII text only."""
+def _gate_open(pattern: re.Pattern[str], text: str, lowered: str | None) -> bool:
+    """False only when ``pattern`` cannot match ``text``.
+
+    ``lowered`` is ``text.lower()`` for ASCII text and ``None`` otherwise: ``re.IGNORECASE`` matches characters that
+    ``str.lower()`` does not map (``ſ`` matches ``s``), so a case-folded gate is trusted on ASCII text only.
+    """
     gate = _rule_gate(pattern)
     if gate is None:
         return True
-    leads, ends, fold, seps = gate
+    needles, pairs, fold = gate
     if fold:
-        if not ascii_text:
+        if lowered is None:
             return True
-        text = text.lower()
-    if not any(lead in text for lead in leads):
+        text = lowered
+    if not any(needle in text for needle in needles):
         return False
-    if ends is None or seps is None:
-        return True
-    return any(f"{end}{sep}" in text for end in (*ends, " ", "\t") for sep in seps)
+    return pairs is None or any(pair in text for pair in pairs)
 
 
 class _PathMatcher:
