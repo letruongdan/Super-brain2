@@ -187,9 +187,6 @@ class _TextScans:
                 if start < end and self._paths.blocked(token[start:end]):
                     self.redacted += 1
                     return token[:start] + REDACTED + token[end:]
-        if (lead or trail) and self._paths.blocked(token):  # the whole spelling, wrappers included
-            self.redacted += 1
-            return REDACTED
         return token
 
     def redact(self, text: str, *, entropy: bool = True) -> str:
