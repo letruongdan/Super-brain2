@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import json
 import os
 import queue
 import shutil
@@ -26,7 +25,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from superbrain.application.owner_loop import OwnerLoop
@@ -241,10 +240,11 @@ def _lookup_loopback_client_pid(client_port: int, listen_port: int) -> int | Non
 
 def _run_event_writer(evidence_dir: Path, event_queue: queue.SimpleQueue[dict[str, JsonValue] | None]) -> None:
     events_path = evidence_dir / "owner-events.jsonl"
+    sockets_path = evidence_dir / "socket-observations.jsonl"
     ready_path = evidence_dir / "owner-ready.json"
     from superbrain.core.canonical import canonical_json
 
-    with events_path.open("ab") as events_fh:
+    with events_path.open("ab") as events_fh, sockets_path.open("ab") as sockets_fh:
         while True:
             item = event_queue.get()
             if item is None:
@@ -254,6 +254,9 @@ def _run_event_writer(evidence_dir: Path, event_queue: queue.SimpleQueue[dict[st
                 tmp = evidence_dir / f".ready-{os.getpid()}.tmp"
                 tmp.write_bytes(canonical_json(item) + b"\n")
                 os.replace(tmp, ready_path)
+            elif kind == "socket_observation":
+                sockets_fh.write(canonical_json(item) + b"\n")
+                sockets_fh.flush()
             else:
                 events_fh.write(canonical_json(item) + b"\n")
                 events_fh.flush()
@@ -267,19 +270,39 @@ def _install_loopback_server_hooks(
     store_id: str | None = None,
     instance_id: str | None = None,
     initial_ready: bool = True,
+    collector_timeout_s: float = 1.5,
 ) -> dict[str, Any]:
+    from concurrent.futures import Future, ThreadPoolExecutor
+
     from superbrain.application._auth_gate import AuthGate
     from superbrain.cli_api import _loopback_server
     from superbrain.core.canonical import digest_bytes
     from superbrain.core.wire import encode_envelope
 
     hook_lock = threading.Lock()
+    conn_ctx_by_tid: dict[
+        int, tuple[str, str, str, int, str, int, Future[tuple[int | None, str | None]]]
+    ] = {}
     pending_cmds: dict[
-        int, tuple[str, dict[str, JsonValue] | None, str, str, str, int, str, int, int | None, str | None]
+        int,
+        tuple[
+            str,
+            dict[str, JsonValue] | None,
+            str,
+            str,
+            int,
+            str,
+            int,
+            str,
+            str,
+            Future[tuple[int | None, str | None]],
+        ],
     ] = {}
     flush_by_thread: dict[int, tuple[int | None, str | None]] = {}
     stamp_result_by_tid: dict[int, bool] = {}
+    active_finalizers: list[threading.Thread] = []
     ready_seen = initial_ready
+    lookup_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="inc2-obs-lookup")
 
     loopback_mod: Any = _loopback_server
     auth_gate_cls: Any = AuthGate
@@ -303,25 +326,27 @@ def _install_loopback_server_hooks(
     def _resolve_principal_and_cred(
         gate: Any,
         grant_stamp: Any,
-        raw_token: str,
-    ) -> tuple[str | None, str | None]:
+        auth_matched: bool,
+    ) -> tuple[str, str]:
+        if not auth_matched or grant_stamp is None:
+            return "<unknown>", "<unknown>"
+        cred_id = getattr(grant_stamp, "credential_id", None)
+        if not isinstance(cred_id, str) or not cred_id:
+            return "<unknown>", "<unknown>"
         view = gate.current()
-        credential_id: str | None = grant_stamp.credential_id if grant_stamp is not None else None
-        if credential_id is None and "." in raw_token:
-            credential_id = raw_token.split(".", 1)[0]
-        cred = (
-            view.auth.credentials.get(credential_id)
-            if (credential_id is not None and view is not None)
-            else None
-        )
-        principal_id = cred.principal.principal_id if cred is not None else None
-        return principal_id, credential_id
+        cred_rec = view.auth.credentials.get(cred_id) if view is not None else None
+        if cred_rec is None:
+            return "<unknown>", "<unknown>"
+        return str(cred_rec.principal.principal_id), str(cred_id)
 
-    def _emit_owner_call(
+    def _schedule_emit(
         *,
         gate: Any,
-        principal_id: str | None,
-        credential_id: str | None,
+        connection_id: str,
+        conn_started_at: str,
+        lookup_fut: Future[tuple[int | None, str | None]],
+        principal_id: str,
+        credential_id: str,
         tool_name: str,
         ready_val: bool,
         auth_matched: bool,
@@ -331,39 +356,102 @@ def _install_loopback_server_hooks(
         listen_port: int,
         peer_host: str,
         peer_port: int,
-        client_pid: int | None,
-        client_started_at: str | None,
         req_started_at: str,
         ended_at: str,
         selected_scope: dict[str, JsonValue] | None,
     ) -> None:
         ident = gate.identity
-        eq.put_nowait(
-            {
-                "event": "owner_call",
-                "daemon_pid": daemon_pid,
-                "daemon_started_at": daemon_started_at,
-                "store_id": ident.store_id if ident is not None else (store_id or ""),
-                "writer_epoch": ident.writer_epoch if ident is not None else 0,
-                "instance_id": ident.instance_id if ident is not None else (instance_id or ""),
-                "principal_id": principal_id or "<unknown>",
-                "credential_id": credential_id or "<unknown>",
-                "tool_name": tool_name,
-                "ready": ready_val,
-                "auth_stamp_matched": auth_matched,
-                "response_flushed_ok": response_flushed_ok,
-                "response_digest": resp_digest,
-                "listen_host": listen_host,
-                "listen_port": listen_port,
-                "client_host": peer_host,
-                "client_port": peer_port,
-                "client_pid": client_pid,
-                "client_started_at": client_started_at,
-                "started_at": req_started_at,
-                "ended_at": ended_at,
-                "selected_scope": selected_scope,
-            }
+        eff_store_id = ident.store_id if ident is not None else (store_id or "")
+        eff_writer_epoch = ident.writer_epoch if ident is not None else 0
+        eff_instance_id = ident.instance_id if ident is not None else (instance_id or "")
+
+        def _finalize(wait_s: float) -> None:
+            client_pid: int | None = None
+            client_started_at: str | None = None
+            try:
+                client_pid, client_started_at = lookup_fut.result(timeout=max(0.0, wait_s))
+            except Exception:  # noqa: BLE001 - observation collector failure stays off request path
+                client_pid, client_started_at = None, None
+            obs_status = (
+                "ok"
+                if (client_pid is not None and client_started_at is not None)
+                else "observation_incomplete"
+            )
+            eq.put_nowait(
+                {
+                    "event": "owner_call",
+                    "connection_id": connection_id,
+                    "observation_status": obs_status,
+                    "daemon_pid": daemon_pid,
+                    "daemon_started_at": daemon_started_at,
+                    "store_id": eff_store_id,
+                    "writer_epoch": eff_writer_epoch,
+                    "instance_id": eff_instance_id,
+                    "principal_id": principal_id,
+                    "credential_id": credential_id,
+                    "tool_name": tool_name,
+                    "ready": ready_val,
+                    "auth_stamp_matched": auth_matched,
+                    "response_flushed_ok": response_flushed_ok,
+                    "response_digest": resp_digest,
+                    "listen_host": listen_host,
+                    "listen_port": listen_port,
+                    "client_host": peer_host,
+                    "client_port": peer_port if peer_port > 0 else None,
+                    "client_pid": client_pid,
+                    "client_started_at": client_started_at,
+                    "started_at": req_started_at,
+                    "ended_at": ended_at,
+                    "call_id": None,
+                    "selected_scope": selected_scope,
+                }
+            )
+            if (
+                obs_status == "ok"
+                and eff_writer_epoch >= 1
+                and peer_port > 0
+                and listen_port > 0
+                and client_pid is not None
+                and client_started_at is not None
+            ):
+                so_ended_at = _utc_now_z()
+                if so_ended_at < ended_at:
+                    so_ended_at = ended_at
+                eq.put_nowait(
+                    {
+                        "event": "socket_observation",
+                        "connection_id": connection_id,
+                        "observation_status": "ok",
+                        "client_pid": client_pid,
+                        "client_started_at": client_started_at,
+                        "daemon_pid": daemon_pid,
+                        "daemon_started_at": daemon_started_at,
+                        "local_addr": peer_host,
+                        "local_port": peer_port,
+                        "remote_addr": listen_host,
+                        "remote_port": listen_port,
+                        "store_id": eff_store_id,
+                        "writer_epoch": eff_writer_epoch,
+                        "instance_id": eff_instance_id,
+                        "started_at": conn_started_at,
+                        "ended_at": so_ended_at,
+                    }
+                )
+
+        if lookup_fut.done():
+            _finalize(0.0)
+            return
+
+        th = threading.Thread(
+            target=_finalize,
+            args=(collector_timeout_s,),
+            name=f"inc2-obs-finalize-{connection_id}",
+            daemon=True,
         )
+        with hook_lock:
+            active_finalizers[:] = [t for t in active_finalizers if t.is_alive()]
+            active_finalizers.append(th)
+        th.start()
 
     def _tap_read_cmd(
         ssl_sock: Any,
@@ -377,31 +465,39 @@ def _install_loopback_server_hooks(
         with hook_lock:
             flush_by_thread.pop(tid, None)
             stamp_result_by_tid.pop(tid, None)
+            conn_ctx = conn_ctx_by_tid.get(tid)
         cmd = orig_read_cmd(ssl_sock, reader, ready, deadline_ns=deadline_ns, monotonic_ns=monotonic_ns)
         if cmd is not None:
             scope_dict = cmd.selected_scope.to_dict() if cmd.selected_scope is not None else None
-            listen_host = "127.0.0.1"
-            listen_port = 0
-            peer_host = "127.0.0.1"
-            peer_port = 0
-            with contextlib.suppress(OSError):
-                lhost, lport = ssl_sock.getsockname()[:2]
-                phost, pport = ssl_sock.getpeername()[:2]
-                listen_host, listen_port = str(lhost), int(lport)
-                peer_host, peer_port = str(phost), int(pport)
-            client_pid, client_started_at = _safe_client_identity(peer_port, listen_port)
+            listen_host = conn_ctx[2] if conn_ctx is not None else "127.0.0.1"
+            listen_port = conn_ctx[3] if conn_ctx is not None else 0
+            peer_host = conn_ctx[4] if conn_ctx is not None else "127.0.0.1"
+            peer_port = conn_ctx[5] if conn_ctx is not None else 0
+            if listen_port <= 0 or peer_port <= 0:
+                with contextlib.suppress(OSError):
+                    lhost, lport = ssl_sock.getsockname()[:2]
+                    phost, pport = ssl_sock.getpeername()[:2]
+                    listen_host, listen_port = str(lhost), int(lport)
+                    peer_host, peer_port = str(phost), int(pport)
+            connection_id = conn_ctx[0] if conn_ctx is not None else f"conn-tid-{tid}"
+            conn_started_at = conn_ctx[1] if conn_ctx is not None else _utc_now_z()
+            lookup_fut = (
+                conn_ctx[6]
+                if conn_ctx is not None
+                else lookup_pool.submit(_safe_client_identity, peer_port, listen_port)
+            )
             with hook_lock:
                 pending_cmds[tid] = (
                     str(cmd.tool),
                     scope_dict,
                     _utc_now_z(),
-                    str(cmd.token),
                     listen_host,
                     listen_port,
                     peer_host,
                     peer_port,
-                    client_pid,
-                    client_started_at,
+                    connection_id,
+                    conn_started_at,
+                    lookup_fut,
                 )
         return cmd
 
@@ -434,10 +530,33 @@ def _install_loopback_server_hooks(
 
     def _tap_conn_worker(self: Any, conn_id: Any, raw_sock: Any, accept_ns: int) -> None:
         tid = threading.get_ident()
+        connection_id = f"conn-{int(conn_id)}"
+        conn_started_at = _utc_now_z()
+        listen_host = "127.0.0.1"
+        listen_port = 0
+        peer_host = "127.0.0.1"
+        peer_port = 0
+        with contextlib.suppress(OSError):
+            lhost, lport = raw_sock.getsockname()[:2]
+            phost, pport = raw_sock.getpeername()[:2]
+            listen_host, listen_port = str(lhost), int(lport)
+            peer_host, peer_port = str(phost), int(pport)
+        lookup_fut = lookup_pool.submit(_safe_client_identity, peer_port, listen_port)
+        with hook_lock:
+            conn_ctx_by_tid[tid] = (
+                connection_id,
+                conn_started_at,
+                listen_host,
+                listen_port,
+                peer_host,
+                peer_port,
+                lookup_fut,
+            )
         try:
             orig_conn_worker(self, conn_id, raw_sock, accept_ns)
         finally:
             with hook_lock:
+                conn_ctx_by_tid.pop(tid, None)
                 cmd_info = pending_cmds.pop(tid, None)
                 flushed_status, flushed_digest = flush_by_thread.pop(tid, (None, None))
                 stamp_result_by_tid.pop(tid, None)
@@ -446,18 +565,21 @@ def _install_loopback_server_hooks(
                     tool_name,
                     selected_scope,
                     req_started_at,
-                    raw_token,
-                    listen_host,
-                    listen_port,
-                    peer_host,
-                    peer_port,
-                    client_pid,
-                    client_started_at,
+                    c_listen_host,
+                    c_listen_port,
+                    c_peer_host,
+                    c_peer_port,
+                    c_conn_id,
+                    c_started_at,
+                    c_lookup_fut,
                 ) = cmd_info
                 gate = self._owner.auth_gate
-                principal_id, credential_id = _resolve_principal_and_cred(gate, None, raw_token)
-                _emit_owner_call(
+                principal_id, credential_id = _resolve_principal_and_cred(gate, None, False)
+                _schedule_emit(
                     gate=gate,
+                    connection_id=c_conn_id,
+                    conn_started_at=c_started_at,
+                    lookup_fut=c_lookup_fut,
                     principal_id=principal_id,
                     credential_id=credential_id,
                     tool_name=tool_name,
@@ -465,12 +587,10 @@ def _install_loopback_server_hooks(
                     auth_matched=False,
                     response_flushed_ok=bool(flushed_status == 200 and flushed_digest is not None),
                     resp_digest=flushed_digest,
-                    listen_host=listen_host,
-                    listen_port=listen_port,
-                    peer_host=peer_host,
-                    peer_port=peer_port,
-                    client_pid=client_pid,
-                    client_started_at=client_started_at,
+                    listen_host=c_listen_host,
+                    listen_port=c_listen_port,
+                    peer_host=c_peer_host,
+                    peer_port=c_peer_port,
                     req_started_at=req_started_at,
                     ended_at=_utc_now_z(),
                     selected_scope=selected_scope,
@@ -480,33 +600,42 @@ def _install_loopback_server_hooks(
         tid = threading.get_ident()
         with hook_lock:
             cmd_info = pending_cmds.pop(tid, None)
+            conn_ctx = conn_ctx_by_tid.get(tid)
         tool_name = cmd_info[0] if cmd_info is not None else None
         selected_scope = cmd_info[1] if cmd_info is not None else None
         req_started_at = cmd_info[2] if cmd_info is not None else _utc_now_z()
-        raw_token = cmd_info[3] if cmd_info is not None else ""
 
-        listen_host = cmd_info[4] if cmd_info is not None else "127.0.0.1"
-        listen_port = cmd_info[5] if cmd_info is not None else 0
-        peer_host = cmd_info[6] if cmd_info is not None else "127.0.0.1"
-        peer_port = cmd_info[7] if cmd_info is not None else 0
-        client_pid = cmd_info[8] if cmd_info is not None else None
-        client_started_at = cmd_info[9] if cmd_info is not None else None
+        listen_host = cmd_info[3] if cmd_info is not None else (conn_ctx[2] if conn_ctx is not None else "127.0.0.1")
+        listen_port = cmd_info[4] if cmd_info is not None else (conn_ctx[3] if conn_ctx is not None else 0)
+        peer_host = cmd_info[5] if cmd_info is not None else (conn_ctx[4] if conn_ctx is not None else "127.0.0.1")
+        peer_port = cmd_info[6] if cmd_info is not None else (conn_ctx[5] if conn_ctx is not None else 0)
+        connection_id = (
+            cmd_info[7] if cmd_info is not None else (conn_ctx[0] if conn_ctx is not None else f"conn-tid-{tid}")
+        )
+        conn_started_at = (
+            cmd_info[8] if cmd_info is not None else (conn_ctx[1] if conn_ctx is not None else req_started_at)
+        )
+        lookup_fut = (
+            cmd_info[9]
+            if cmd_info is not None
+            else (
+                conn_ctx[6]
+                if conn_ctx is not None
+                else lookup_pool.submit(_safe_client_identity, peer_port, listen_port)
+            )
+        )
 
         gate = self._owner.auth_gate
         grant_stamp = getattr(reply, "grant_stamp", None)
-        principal_id: str | None = None
-        credential_id: str | None = None
         expected_env_digest: str | None = None
         release_completed = False
         try:
-            with contextlib.suppress(OSError):
-                lhost, lport = ssl_sock.getsockname()[:2]
-                phost, pport = ssl_sock.getpeername()[:2]
-                listen_host, listen_port = str(lhost), int(lport)
-                peer_host, peer_port = str(phost), int(pport)
-            if client_pid is None or client_started_at is None:
-                client_pid, client_started_at = _safe_client_identity(peer_port, listen_port)
-            principal_id, credential_id = _resolve_principal_and_cred(gate, grant_stamp, raw_token)
+            if listen_port <= 0 or peer_port <= 0:
+                with contextlib.suppress(OSError):
+                    lhost, lport = ssl_sock.getsockname()[:2]
+                    phost, pport = ssl_sock.getpeername()[:2]
+                    listen_host, listen_port = str(lhost), int(lport)
+                    peer_host, peer_port = str(phost), int(pport)
             expected_env_digest = digest_bytes(encode_envelope(reply.envelope))
             orig_release(self, ssl_sock, reply, tool_deadline_ns)
             release_completed = True
@@ -536,6 +665,7 @@ def _install_loopback_server_hooks(
                 auth_matched = False
                 response_flushed_ok = bool(flushed_status == 200 and flushed_digest == expected_env_digest)
 
+            principal_id, credential_id = _resolve_principal_and_cred(gate, grant_stamp, auth_matched)
             if not auth_matched:
                 ready_val = False
             elif tool_name == "get_health":
@@ -545,8 +675,11 @@ def _install_loopback_server_hooks(
                 ready_val = ready_seen
 
             if tool_name is not None:
-                _emit_owner_call(
+                _schedule_emit(
                     gate=gate,
+                    connection_id=connection_id,
+                    conn_started_at=conn_started_at,
+                    lookup_fut=lookup_fut,
                     principal_id=principal_id,
                     credential_id=credential_id,
                     tool_name=tool_name,
@@ -558,8 +691,6 @@ def _install_loopback_server_hooks(
                     listen_port=listen_port,
                     peer_host=peer_host,
                     peer_port=peer_port,
-                    client_pid=client_pid,
-                    client_started_at=client_started_at,
                     req_started_at=req_started_at,
                     ended_at=ended_at,
                     selected_scope=selected_scope,
@@ -573,6 +704,16 @@ def _install_loopback_server_hooks(
         with hook_lock:
             return len(pending_cmds)
 
+    def _flush(*, timeout: float = 2.0) -> None:
+        deadline = time.monotonic() + max(0.0, timeout)
+        with hook_lock:
+            threads = list(active_finalizers)
+        for th in threads:
+            rem = deadline - time.monotonic()
+            if rem <= 0.0:
+                break
+            th.join(timeout=rem)
+
     loopback_mod.read_admitted_tool_command = _tap_read_cmd
     loopback_mod.write_json_response = _tap_write_json
     loopback_mod.LoopbackServer._release_owner_reply = _tap_release
@@ -585,11 +726,14 @@ def _install_loopback_server_hooks(
         loopback_mod.LoopbackServer._release_owner_reply = orig_release
         loopback_mod.LoopbackServer._conn_worker = orig_conn_worker
         auth_gate_cls.authorize_stamp = orig_authorize_stamp
+        _flush(timeout=collector_timeout_s + 0.5)
+        lookup_pool.shutdown(wait=False, cancel_futures=True)
 
     return {
         "uninstall": _uninstall,
         "pending_count": _pending_count,
         "set_ready": _set_ready,
+        "flush": _flush,
     }
 
 
@@ -602,6 +746,7 @@ def run_observed_owner(config_path: Path, evidence_dir: Path, stop: threading.Ev
 
     import superbrain
     from superbrain.composition import daemon_entry, owner_entry
+    from superbrain.core.canonical import digest_bytes
     from superbrain.core.wire import load_catalog
 
     evidence_dir.mkdir(parents=True, exist_ok=True)
@@ -609,6 +754,7 @@ def run_observed_owner(config_path: Path, evidence_dir: Path, stop: threading.Ev
     daemon_started_at = process_started_at_for_pid(daemon_pid)
     module_file = str(Path(superbrain.__file__).resolve()) if superbrain.__file__ else ""
     schema_sha256 = load_catalog().schema_sha256
+    config_digest = digest_bytes(config_path.read_bytes())
 
     cfg, adapters, scratch_base = owner_entry._explicit_owner_adapters(config_path)
     event_queue: queue.SimpleQueue[dict[str, JsonValue] | None] = queue.SimpleQueue()
@@ -640,12 +786,14 @@ def run_observed_owner(config_path: Path, evidence_dir: Path, stop: threading.Ev
                 "instance_id": ready.identity.instance_id,
                 "module_file": module_file,
                 "schema_sha256": schema_sha256,
+                "config_digest": config_digest,
             }
         )
 
     try:
         return int(daemon_entry.serve(cfg, os_=adapters, stop_event=stop, on_ready=_on_ready))
     finally:
+        hook_state["flush"](timeout=2.5)
         hook_state["uninstall"]()
         shutil.rmtree(scratch_base, ignore_errors=True)
         event_queue.put_nowait(None)
@@ -655,73 +803,30 @@ def run_observed_owner(config_path: Path, evidence_dir: Path, stop: threading.Ev
 def load_owner_observations(
     evidence_dir: Path,
 ) -> tuple[dict[str, Any] | None, tuple[OwnerCallObservation, ...], tuple[SocketObservation, ...]]:
-    """Read ready metadata, owner call observations, and loopback socket observations from ``evidence_dir``."""
-    from tests.support.inc2_native import OwnerCallObservation, ProcessIdentity, SocketObservation
+    """Read ready metadata, owner call observations, and loopback socket observations strictly from ``evidence_dir``."""
+    from dataclasses import asdict
+
+    from tests.support.inc2_native import (
+        parse_owner_events_jsonl,
+        parse_owner_ready,
+        parse_socket_observations_jsonl,
+    )
 
     ready_path = evidence_dir / "owner-ready.json"
     ready_meta: dict[str, Any] | None = None
     if ready_path.is_file():
-        ready_meta = cast(dict[str, Any], json.loads(ready_path.read_bytes()))
+        ready_meta = asdict(parse_owner_ready(ready_path.read_bytes()))
 
     events_path = evidence_dir / "owner-events.jsonl"
-    owners: list[OwnerCallObservation] = []
-    sockets: list[SocketObservation] = []
+    owners: tuple[OwnerCallObservation, ...] = ()
     if events_path.is_file():
-        for line in events_path.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            row = cast(dict[str, Any], json.loads(line))
-            if row.get("event") != "owner_call":
-                continue
-            client_pid = row.get("client_pid")
-            client_started = row.get("client_started_at")
-            client_proc = (
-                ProcessIdentity(pid=client_pid, started_at=client_started)
-                if isinstance(client_pid, int) and isinstance(client_started, str)
-                else None
-            )
-            client_host_raw = row.get("client_host")
-            client_port_raw = row.get("client_port")
-            daemon_proc = ProcessIdentity(pid=int(row["daemon_pid"]), started_at=str(row["daemon_started_at"]))
-            owners.append(
-                OwnerCallObservation(
-                    daemon_process=daemon_proc,
-                    store_id=str(row["store_id"]),
-                    writer_epoch=int(row["writer_epoch"]),
-                    instance_id=str(row["instance_id"]),
-                    principal_id=str(row["principal_id"]),
-                    credential_id=str(row["credential_id"]),
-                    tool_name=str(row["tool_name"]),
-                    ready=bool(row["ready"]),
-                    auth_stamp_matched=bool(row["auth_stamp_matched"]),
-                    response_flushed_ok=bool(row["response_flushed_ok"]),
-                    response_digest=cast(str | None, row["response_digest"]),
-                    listen_host=str(row["listen_host"]),
-                    listen_port=int(row["listen_port"]),
-                    started_at=str(row["started_at"]),
-                    ended_at=str(row["ended_at"]),
-                    call_id=None,
-                    selected_scope=cast(dict[str, Any] | None, row["selected_scope"]),
-                    client_host=str(client_host_raw) if isinstance(client_host_raw, str) else None,
-                    client_port=int(client_port_raw) if isinstance(client_port_raw, int) else None,
-                    client_process=client_proc,
-                )
-            )
-            if isinstance(client_pid, int) and isinstance(client_started, str):
-                sockets.append(
-                    SocketObservation(
-                        client_process=ProcessIdentity(pid=client_pid, started_at=client_started),
-                        daemon_process=daemon_proc,
-                        local_addr=str(row["client_host"]),
-                        local_port=int(row["client_port"]),
-                        remote_addr=str(row["listen_host"]),
-                        remote_port=int(row["listen_port"]),
-                        store_id=str(row["store_id"]),
-                        writer_epoch=int(row["writer_epoch"]),
-                        instance_id=str(row["instance_id"]),
-                    )
-                )
-    return ready_meta, tuple(owners), tuple(sockets)
+        owners = parse_owner_events_jsonl(events_path.read_bytes())
+
+    sockets_path = evidence_dir / "socket-observations.jsonl"
+    sockets: tuple[SocketObservation, ...] = ()
+    if sockets_path.is_file():
+        sockets = parse_socket_observations_jsonl(sockets_path.read_bytes())
+    return ready_meta, owners, sockets
 
 
 @contextmanager
@@ -734,7 +839,7 @@ def spawn_observed_wheel_owner(
 ) -> Iterator[ObservedWheelOwner]:
     """Spawn ``inc2_native_owner.py`` under ``env.venv_python -I`` and wait until ready."""
     from tests.support.inc2_cli import clean_installed_subprocess_env
-    from tests.support.inc2_native import ProcessIdentity
+    from tests.support.inc2_native import OwnerReadyObservation, ProcessIdentity, parse_owner_ready
 
     evidence_dir.mkdir(parents=True, exist_ok=True)
     cmd = [
@@ -756,14 +861,14 @@ def spawn_observed_wheel_owner(
     )
     ready_file = evidence_dir / "owner-ready.json"
     deadline = time.monotonic() + 15.0
-    ready_data: dict[str, Any] | None = None
+    ready_obs: OwnerReadyObservation | None = None
     try:
         while time.monotonic() < deadline:
             if ready_file.is_file():
                 try:
                     raw = ready_file.read_bytes()
                     if raw:
-                        ready_data = cast(dict[str, Any], json.loads(raw))
+                        ready_obs = parse_owner_ready(raw)
                         break
                 except (OSError, ValueError):
                     pass
@@ -775,20 +880,20 @@ def spawn_observed_wheel_owner(
                     f"out={out_b.decode('utf-8', 'replace')!r} err={err_b.decode('utf-8', 'replace')!r}"
                 )
             time.sleep(0.02)
-        if ready_data is None:
+        if ready_obs is None:
             raise TimeoutError("observed wheel owner never wrote owner-ready.json")
 
         owner = ObservedWheelOwner(
             process_identity=ProcessIdentity(
-                pid=int(ready_data["daemon_pid"]),
-                started_at=str(ready_data["daemon_started_at"]),
+                pid=ready_obs.daemon_pid,
+                started_at=ready_obs.daemon_started_at,
             ),
-            endpoint_port=int(ready_data["port"]),
-            store_id=str(ready_data["store_id"]),
-            writer_epoch=int(ready_data["writer_epoch"]),
-            instance_id=str(ready_data["instance_id"]),
-            module_file=str(ready_data["module_file"]),
-            schema_sha256=str(ready_data["schema_sha256"]),
+            endpoint_port=ready_obs.port,
+            store_id=ready_obs.store_id,
+            writer_epoch=ready_obs.writer_epoch,
+            instance_id=ready_obs.instance_id,
+            module_file=ready_obs.module_file,
+            schema_sha256=ready_obs.schema_sha256,
             evidence_dir=evidence_dir,
         )
         yield owner

@@ -2268,8 +2268,22 @@ class TestTransportLifecycleAndRelease:
     def test_slow_request_bytes_consume_owner_budget(
         self,
         transport_template: TransportTemplate,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Slow body bytes arriving in (1,300 ms, 1,500 ms) receive deadline_exceeded with 0 durable writes."""
+        import threading
+
+        import superbrain.cli_api._loopback_server as loopback_server
+
+        entered_read_cmd = threading.Event()
+        orig_read_cmd = loopback_server.read_admitted_tool_command  # type: ignore[attr-defined]
+
+        def _hooked_read_cmd(*args: Any, **kwargs: Any) -> Any:
+            entered_read_cmd.set()
+            return orig_read_cmd(*args, **kwargs)
+
+        monkeypatch.setattr(loopback_server, "read_admitted_tool_command", _hooked_read_cmd)
+
         assert transport_template.ws_a is not None
         with open_test_loopback_transport(transport_template, name="slow-bytes") as h:
             port = h.ready.endpoint.port
@@ -2278,6 +2292,7 @@ class TestTransportLifecycleAndRelease:
 
             # 1. Writable client sends body slowly: last byte arrives between 1,300 ms and 1,500 ms
             with h.open_raw_tls_socket() as s_tls:
+                entered_read_cmd.clear()
                 h.send_raw_http(s_tls, f"GET /v2/identity HTTP/1.1\r\nHost: {host}\r\n\r\n".encode("ascii"))
 
                 cmd = ToolCommand(
@@ -2306,8 +2321,9 @@ class TestTransportLifecycleAndRelease:
                     f"Content-Length: {len(body)}\r\n\r\n"
                 ).encode("iso-8859-1")
 
-                # Send headers and body except the last byte
+                # Send headers and body except the last byte, then wait until t0_tool is stamped
                 s_tls.sendall(headers + body[:-1])
+                assert entered_read_cmd.wait(timeout=2.0), "server did not enter read_admitted_tool_command"
 
                 # Advance mono clock to t0 + 1,360 ms (after handler cutoff 1,300 ms, before deadline 1,500 ms)
                 h.mono_clock.advance_ms(1360)
@@ -2325,14 +2341,16 @@ class TestTransportLifecycleAndRelease:
 
             # 2. Unwritable / stalled client socket exceeding 1,500 ms total deadline
             with h.open_raw_tls_socket() as s_stall:
+                entered_read_cmd.clear()
                 h.send_raw_http(s_stall, f"GET /v2/identity HTTP/1.1\r\nHost: {host}\r\n\r\n".encode("ascii"))
                 s_stall.sendall(headers + body[:10])
+                assert entered_read_cmd.wait(timeout=2.0), "server did not enter read_admitted_tool_command"
 
                 # Advance clock past total deadline 1,500 ms
                 h.mono_clock.advance_ms(1600)
 
-                # Socket is closed by server
-                s_stall.settimeout(1.0)
+                # Socket is closed by server (FramedReader waits up to remaining 1.5s kernel recv timeout)
+                s_stall.settimeout(3.0)
                 try:
                     data = s_stall.recv(1024)
                     assert data == b""

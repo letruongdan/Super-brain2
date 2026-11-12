@@ -29,6 +29,82 @@ NATIVE_CONNECTION_SCHEMA_VERSION = "sp1-i2-native-connection-v1"
 
 _ALLOWED_KINDS = frozenset({"native", "fixture"})
 _ALLOWED_STATUSES = frozenset({"passed", "failed", "not_run"})
+_ALLOWED_HOSTS = frozenset({"claude-code", "codex-desktop", "codex-cli"})
+_ALLOWED_HOST_MODES = frozenset(
+    {
+        "claude_cli_mcp_isolated",
+        "codex_desktop_gui",
+        "codex_cli_exec",
+        "wheel_mcp_pipe",
+        "fixture_mcp_stdio",
+    }
+)
+_NATIVE_HOST_TO_MODE = {
+    "claude-code": "claude_cli_mcp_isolated",
+    "codex-desktop": "codex_desktop_gui",
+    "codex-cli": "codex_cli_exec",
+}
+_FIXTURE_HOST_MODES = frozenset({"wheel_mcp_pipe", "fixture_mcp_stdio"})
+_KNOWN_V2_TOOLS = frozenset(
+    {
+        "prepare_task",
+        "search_knowledge",
+        "get_artifact",
+        "submit_episode",
+        "record_outcome",
+        "request_improvement",
+        "get_job",
+        "get_health",
+    }
+)
+_WORKSPACE_REQUIRED_TOOLS = frozenset(
+    {
+        "prepare_task",
+        "search_knowledge",
+        "get_artifact",
+        "submit_episode",
+        "record_outcome",
+        "request_improvement",
+    }
+)
+_ALLOWED_TERMINAL_STATUSES = frozenset(
+    {
+        "ok",
+        "error",
+        "deadline_exceeded",
+        "in_progress",
+        "commit_outcome_unknown",
+        "policy_unavailable",
+        "daemon_unavailable",
+        "invalid_request",
+    }
+)
+_ALLOWED_OBSERVATION_STATUSES = frozenset({"ok", "observation_incomplete"})
+_REQUIRED_ARTIFACT_LABELS = frozenset(
+    {
+        "config",
+        "profile",
+        "schema",
+        "shim_build",
+        "evidence_index",
+        "owner_ready",
+        "owner_events",
+        "host_calls",
+        "socket_observations",
+    }
+)
+_INDEXED_ARTIFACT_LABELS = frozenset(
+    {
+        "config",
+        "profile",
+        "schema",
+        "shim_build",
+        "owner_ready",
+        "owner_events",
+        "host_calls",
+        "socket_observations",
+    }
+)
 _COMMIT_HEX_RE = re.compile(r"^[0-9a-f]{40}$")
 _REASON_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
 _SAFE_TOKEN_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
@@ -44,9 +120,12 @@ _PROBE_KEYS = frozenset(
         "status",
         "reason_code",
         "task_id",
+        "run_id",
+        "observer_id",
         "observed_call_id",
         "observation_channel",
         "host",
+        "host_mode",
         "host_version",
         "host_pid",
         "os",
@@ -71,12 +150,14 @@ _PROBE_KEYS = frozenset(
 __all__ = [
     "NATIVE_CONNECTION_SCHEMA_VERSION",
     "BindingSummary",
+    "EvidenceIndex",
     "HostCallObservation",
     "HostTokenContext",
     "NativeConnectionProbe",
     "ObservationSet",
     "ObserverRegistration",
     "OwnerCallObservation",
+    "OwnerReadyObservation",
     "PathCheckResult",
     "ProbeValidationError",
     "ProcessIdentity",
@@ -84,7 +165,12 @@ __all__ = [
     "TerminalToolFacts",
     "TimespanRecord",
     "encode_native_probe",
+    "parse_evidence_index",
+    "parse_host_calls_jsonl",
     "parse_native_probe",
+    "parse_owner_events_jsonl",
+    "parse_owner_ready",
+    "parse_socket_observations_jsonl",
     "verify_native_connection",
 ]
 
@@ -210,6 +296,9 @@ class NativeConnectionProbe:
     path_check: PathCheckResult | None
     binding: BindingSummary | None
     terminal_facts: TerminalToolFacts | None
+    run_id: str | None = None
+    observer_id: str | None = None
+    host_mode: str | None = None
 
     def to_dict(self) -> dict[str, JsonValue]:
         return {
@@ -218,9 +307,12 @@ class NativeConnectionProbe:
             "status": self.status,
             "reason_code": self.reason_code,
             "task_id": self.task_id,
+            "run_id": self.run_id,
+            "observer_id": self.observer_id,
             "observed_call_id": self.observed_call_id,
             "observation_channel": self.observation_channel,
             "host": self.host,
+            "host_mode": self.host_mode,
             "host_version": self.host_version,
             "host_pid": self.host_pid,
             "os": self.os,
@@ -280,6 +372,8 @@ class OwnerCallObservation:
     client_host: str | None = None
     client_port: int | None = None
     client_process: ProcessIdentity | None = None
+    connection_id: str | None = None
+    observation_status: str = "ok"
 
 
 @dataclass(frozen=True)
@@ -293,6 +387,50 @@ class SocketObservation:
     store_id: str
     writer_epoch: int
     instance_id: str
+    connection_id: str
+    started_at: str
+    ended_at: str
+    observation_status: str = "ok"
+
+
+@dataclass(frozen=True)
+class EvidenceIndex:
+    schema_version: str
+    task_id: str
+    run_id: str
+    observer_id: str
+    source_commit: str
+    host: str
+    host_mode: str
+    host_version: str
+    artifacts: Mapping[str, str]
+
+    def to_dict(self) -> dict[str, JsonValue]:
+        return {
+            "schema_version": self.schema_version,
+            "task_id": self.task_id,
+            "run_id": self.run_id,
+            "observer_id": self.observer_id,
+            "source_commit": self.source_commit,
+            "host": self.host,
+            "host_mode": self.host_mode,
+            "host_version": self.host_version,
+            "artifacts": {k: v for k, v in self.artifacts.items()},
+        }
+
+
+@dataclass(frozen=True)
+class OwnerReadyObservation:
+    event: Literal["ready"]
+    daemon_pid: int
+    daemon_started_at: str
+    port: int
+    store_id: str
+    writer_epoch: int
+    instance_id: str
+    module_file: str
+    schema_sha256: str
+    config_digest: str
 
 
 @dataclass(frozen=True)
@@ -315,6 +453,8 @@ class ObserverRegistration:
     expected_environment: str
     registered_host_versions: tuple[str, ...] = ()
     active: bool = True
+    run_id: str = ""
+    expected_host_mode: str = ""
 
 
 @dataclass(frozen=True)
@@ -382,10 +522,31 @@ def _opt_pos_int(val: object) -> int | None:
     return None if val is None else _req_pos_int(val)
 
 
+def _req_port(val: object) -> int:
+    port = _req_pos_int(val)
+    if port > 65535:
+        raise ProbeValidationError("probe_invalid_port")
+    return port
+
+
+def _opt_port(val: object) -> int | None:
+    return None if val is None else _req_port(val)
+
+
 def _req_bool(val: object) -> bool:
     if type(val) is not bool:
         raise ProbeValidationError("probe_invalid_bool")
     return val
+
+
+def _validate_host_mode_alignment(kind: str, host: str, host_mode: str) -> bool:
+    if host not in _ALLOWED_HOSTS or host_mode not in _ALLOWED_HOST_MODES:
+        return False
+    if kind == "native":
+        return _NATIVE_HOST_TO_MODE.get(host) == host_mode
+    if kind == "fixture":
+        return host_mode in _FIXTURE_HOST_MODES
+    return False
 
 
 def _req_utc_iso(val: object) -> datetime:
@@ -519,17 +680,44 @@ def _parse_terminal_facts(raw: object) -> TerminalToolFacts | None:
             }
         ),
     )
-    obs_scope = obj["observed_scope"]
-    if obs_scope is not None and not isinstance(obs_scope, dict):
-        raise ProbeValidationError("probe_invalid_scope")
+    tool_name = _req_opaque(obj["tool_name"])
+    if tool_name not in _KNOWN_V2_TOOLS:
+        raise ProbeValidationError("probe_unknown_tool")
+    ok_val = _req_bool(obj["ok"])
+    status_val = _req_str(obj["status"])
+    if status_val not in _ALLOWED_TERMINAL_STATUSES:
+        raise ProbeValidationError("probe_invalid_terminal_status")
+    ready_val = _req_bool(obj["ready"])
+    auth_granted_val = _req_bool(obj["auth_granted"])
+    flushed_val = _req_bool(obj["response_flushed"])
+    resp_digest = _req_digest_opt(obj["response_digest"])
+
+    if ok_val and status_val != "ok":
+        raise ProbeValidationError("probe_inconsistent_terminal_status")
+    if not ok_val and status_val == "ok":
+        raise ProbeValidationError("probe_inconsistent_terminal_status")
+    if ok_val and (not auth_granted_val or not flushed_val or resp_digest is None):
+        raise ProbeValidationError("probe_inconsistent_ok_facts")
+
+    obs_scope_raw = obj["observed_scope"]
+    obs_scope: dict[str, JsonValue] | None = None
+    if obs_scope_raw is not None:
+        scope_obj = _req_dict(obs_scope_raw, frozenset({"repo_id", "checkout_id"}))
+        obs_scope = {
+            "repo_id": _req_opaque(scope_obj["repo_id"]),
+            "checkout_id": _req_opaque(scope_obj["checkout_id"]),
+        }
+    elif tool_name in _WORKSPACE_REQUIRED_TOOLS:
+        raise ProbeValidationError("probe_missing_required_scope")
+
     return TerminalToolFacts(
-        ready=_req_bool(obj["ready"]),
-        tool_name=_req_opaque(obj["tool_name"]),
-        ok=_req_bool(obj["ok"]),
-        status=_req_str(obj["status"]),
-        auth_granted=_req_bool(obj["auth_granted"]),
-        response_flushed=_req_bool(obj["response_flushed"]),
-        response_digest=_req_digest_opt(obj["response_digest"]),
+        ready=ready_val,
+        tool_name=tool_name,
+        ok=ok_val,
+        status=status_val,
+        auth_granted=auth_granted_val,
+        response_flushed=flushed_val,
+        response_digest=resp_digest,
         observed_scope=obs_scope,
     )
 
@@ -547,12 +735,35 @@ def _validate_probe_invariants(probe: NativeConnectionProbe) -> None:
         if probe.reason_code is None or _REASON_CODE_RE.fullmatch(probe.reason_code) is None:
             raise ProbeValidationError("probe_invalid_reason_code")
     _req_opaque(probe.task_id)
+    if probe.run_id is not None:
+        _req_opaque(probe.run_id)
+    if probe.observer_id is not None:
+        _req_opaque(probe.observer_id)
     _req_str(probe.host)
+    if probe.host not in _ALLOWED_HOSTS:
+        raise ProbeValidationError("probe_invalid_host")
+    if probe.host_mode is not None and not _validate_host_mode_alignment(probe.kind, probe.host, probe.host_mode):
+        raise ProbeValidationError("probe_invalid_host_mode")
     _req_str(probe.os)
     if _COMMIT_HEX_RE.fullmatch(probe.source_commit) is None:
         raise ProbeValidationError("probe_invalid_commit")
     if probe.host_pid is not None and probe.host_process is not None and probe.host_pid != probe.host_process.pid:
         raise ProbeValidationError("probe_host_pid_mismatch")
+    if probe.terminal_facts is not None:
+        tf = probe.terminal_facts
+        if tf.tool_name not in _KNOWN_V2_TOOLS or tf.status not in _ALLOWED_TERMINAL_STATUSES:
+            raise ProbeValidationError("probe_invalid_terminal_status")
+        if tf.ok and (
+            tf.status != "ok"
+            or not tf.auth_granted
+            or not tf.response_flushed
+            or tf.response_digest is None
+        ):
+            raise ProbeValidationError("probe_inconsistent_terminal_status")
+        if not tf.ok and tf.status == "ok":
+            raise ProbeValidationError("probe_inconsistent_terminal_status")
+        if tf.tool_name in _WORKSPACE_REQUIRED_TOOLS and tf.observed_scope is None:
+            raise ProbeValidationError("probe_missing_required_scope")
 
 
 def encode_native_probe(probe: NativeConnectionProbe) -> bytes:
@@ -612,9 +823,344 @@ def parse_native_probe(raw: bytes) -> NativeConnectionProbe:
         path_check=_parse_path_check(parsed["path_check"]),
         binding=_parse_binding(parsed["binding"]),
         terminal_facts=_parse_terminal_facts(parsed["terminal_facts"]),
+        run_id=_req_opaque(parsed["run_id"]) if parsed["run_id"] is not None else None,
+        observer_id=_req_opaque(parsed["observer_id"]) if parsed["observer_id"] is not None else None,
+        host_mode=_opt_str(parsed["host_mode"]),
     )
     _validate_probe_invariants(probe)
     return probe
+
+
+_EVIDENCE_INDEX_KEYS = frozenset(
+    {
+        "schema_version",
+        "task_id",
+        "run_id",
+        "observer_id",
+        "source_commit",
+        "host",
+        "host_mode",
+        "host_version",
+        "artifacts",
+    }
+)
+_OWNER_READY_KEYS = frozenset(
+    {
+        "event",
+        "daemon_pid",
+        "daemon_started_at",
+        "port",
+        "store_id",
+        "writer_epoch",
+        "instance_id",
+        "module_file",
+        "schema_sha256",
+        "config_digest",
+    }
+)
+_HOST_CALL_KEYS = frozenset(
+    {
+        "call_id",
+        "channel",
+        "host_process",
+        "shim_launcher_process",
+        "shim_worker_process",
+        "tool_name",
+        "terminal_ok",
+        "response_digest",
+        "started_at",
+        "ended_at",
+    }
+)
+_OWNER_EVENT_KEYS = frozenset(
+    {
+        "event",
+        "connection_id",
+        "observation_status",
+        "daemon_pid",
+        "daemon_started_at",
+        "store_id",
+        "writer_epoch",
+        "instance_id",
+        "principal_id",
+        "credential_id",
+        "tool_name",
+        "ready",
+        "auth_stamp_matched",
+        "response_flushed_ok",
+        "response_digest",
+        "listen_host",
+        "listen_port",
+        "client_host",
+        "client_port",
+        "client_pid",
+        "client_started_at",
+        "started_at",
+        "ended_at",
+        "call_id",
+        "selected_scope",
+    }
+)
+_SOCKET_OBS_KEYS = frozenset(
+    {
+        "event",
+        "connection_id",
+        "observation_status",
+        "client_pid",
+        "client_started_at",
+        "daemon_pid",
+        "daemon_started_at",
+        "local_addr",
+        "local_port",
+        "remote_addr",
+        "remote_port",
+        "store_id",
+        "writer_epoch",
+        "instance_id",
+        "started_at",
+        "ended_at",
+    }
+)
+
+
+def _req_opaque_or_unknown(val: object) -> str:
+    text = _req_str(val)
+    if text == "<unknown>":
+        return text
+    return _req_opaque(text)
+
+
+def _parse_json_object_strict(raw: bytes, expected_keys: frozenset[str]) -> dict[str, JsonValue]:
+    if type(raw) is not bytes:
+        raise ProbeValidationError("probe_invalid_bytes")
+    try:
+        parsed = parse_json(raw)
+    except (BrainError, ValueError) as err:
+        raise ProbeValidationError("probe_malformed_json") from err
+    obj = _req_dict(parsed, expected_keys)
+    _scan_no_secrets(obj)
+    return obj
+
+
+def _split_nonempty_jsonl_lines(raw: bytes) -> list[bytes]:
+    if type(raw) is not bytes:
+        raise ProbeValidationError("probe_invalid_bytes")
+    if not raw:
+        return []
+    lines: list[bytes] = []
+    for raw_line in raw.splitlines():
+        if not raw_line.strip():
+            raise ProbeValidationError("probe_blank_jsonl_line")
+        lines.append(raw_line)
+    return lines
+
+
+def parse_evidence_index(raw: bytes) -> EvidenceIndex:
+    """Parse and strictly validate a coordinator ``evidence-index.json`` manifest."""
+    obj = _parse_json_object_strict(raw, _EVIDENCE_INDEX_KEYS)
+    if _req_str(obj["schema_version"]) != NATIVE_CONNECTION_SCHEMA_VERSION:
+        raise ProbeValidationError("probe_invalid_schema_version")
+    commit = _req_str(obj["source_commit"])
+    if _COMMIT_HEX_RE.fullmatch(commit) is None:
+        raise ProbeValidationError("probe_invalid_commit")
+    host = _req_str(obj["host"])
+    if host not in _ALLOWED_HOSTS:
+        raise ProbeValidationError("probe_invalid_host")
+    host_mode = _req_str(obj["host_mode"])
+    if host_mode not in _ALLOWED_HOST_MODES:
+        raise ProbeValidationError("probe_invalid_host_mode")
+    arts_obj = _req_dict(obj["artifacts"], _INDEXED_ARTIFACT_LABELS)
+    artifacts: dict[str, str] = {}
+    for label, digest_val in arts_obj.items():
+        digest_str = _req_digest_opt(digest_val)
+        if digest_str is None:
+            raise ProbeValidationError("probe_invalid_digest")
+        artifacts[label] = digest_str
+    return EvidenceIndex(
+        schema_version=NATIVE_CONNECTION_SCHEMA_VERSION,
+        task_id=_req_opaque(obj["task_id"]),
+        run_id=_req_opaque(obj["run_id"]),
+        observer_id=_req_opaque(obj["observer_id"]),
+        source_commit=commit,
+        host=host,
+        host_mode=host_mode,
+        host_version=_req_str(obj["host_version"]),
+        artifacts=artifacts,
+    )
+
+
+def parse_owner_ready(raw: bytes) -> OwnerReadyObservation:
+    """Parse and strictly validate ``owner-ready.json`` emitted by ``inc2_native_owner``."""
+    obj = _parse_json_object_strict(raw, _OWNER_READY_KEYS)
+    if _req_str(obj["event"]) != "ready":
+        raise ProbeValidationError("probe_invalid_event")
+    _req_utc_iso(obj["daemon_started_at"])
+    raw_schema_sha = _req_str(obj["schema_sha256"])
+    schema_norm = raw_schema_sha if raw_schema_sha.startswith("sha256:") else f"sha256:{raw_schema_sha}"
+    schema_sha = _req_digest_opt(schema_norm)
+    cfg_digest = _req_digest_opt(obj["config_digest"])
+    if schema_sha is None or cfg_digest is None:
+        raise ProbeValidationError("probe_invalid_digest")
+    return OwnerReadyObservation(
+        event="ready",
+        daemon_pid=_req_pos_int(obj["daemon_pid"]),
+        daemon_started_at=_req_str(obj["daemon_started_at"]),
+        port=_req_port(obj["port"]),
+        store_id=_req_opaque(obj["store_id"]),
+        writer_epoch=_req_pos_int(obj["writer_epoch"]),
+        instance_id=_req_opaque(obj["instance_id"]),
+        module_file=_req_str(obj["module_file"]),
+        schema_sha256=raw_schema_sha,
+        config_digest=cfg_digest,
+    )
+
+
+def parse_host_calls_jsonl(raw: bytes) -> tuple[HostCallObservation, ...]:
+    """Parse and strictly validate JSONL records from ``host-calls.jsonl``."""
+    out: list[HostCallObservation] = []
+    for line in _split_nonempty_jsonl_lines(raw):
+        obj = _parse_json_object_strict(line, _HOST_CALL_KEYS)
+        host_proc = _parse_process_identity(obj["host_process"])
+        launcher_proc = _parse_process_identity(obj["shim_launcher_process"])
+        worker_proc = _parse_process_identity(obj["shim_worker_process"])
+        if host_proc is None or launcher_proc is None or worker_proc is None:
+            raise ProbeValidationError("probe_missing_process")
+        start_dt = _req_utc_iso(obj["started_at"])
+        end_dt = _req_utc_iso(obj["ended_at"])
+        if end_dt < start_dt:
+            raise ProbeValidationError("probe_invalid_timespan")
+        tool_name = _req_opaque(obj["tool_name"])
+        if tool_name not in _KNOWN_V2_TOOLS:
+            raise ProbeValidationError("probe_unknown_tool")
+        out.append(
+            HostCallObservation(
+                call_id=_req_opaque(obj["call_id"]),
+                channel=_req_str(obj["channel"]),
+                host_process=host_proc,
+                shim_launcher_process=launcher_proc,
+                shim_worker_process=worker_proc,
+                tool_name=tool_name,
+                terminal_ok=_req_bool(obj["terminal_ok"]),
+                response_digest=_req_digest_opt(obj["response_digest"]),
+                started_at=_req_str(obj["started_at"]),
+                ended_at=_req_str(obj["ended_at"]),
+            )
+        )
+    return tuple(out)
+
+
+def parse_owner_events_jsonl(raw: bytes) -> tuple[OwnerCallObservation, ...]:
+    """Parse and strictly validate JSONL records from ``owner-events.jsonl``."""
+    out: list[OwnerCallObservation] = []
+    for line in _split_nonempty_jsonl_lines(raw):
+        obj = _parse_json_object_strict(line, _OWNER_EVENT_KEYS)
+        if _req_str(obj["event"]) != "owner_call":
+            raise ProbeValidationError("probe_invalid_event")
+        obs_status = _req_str(obj["observation_status"])
+        if obs_status not in _ALLOWED_OBSERVATION_STATUSES:
+            raise ProbeValidationError("probe_invalid_observation_status")
+        _req_utc_iso(obj["daemon_started_at"])
+        daemon_proc = ProcessIdentity(
+            pid=_req_pos_int(obj["daemon_pid"]),
+            started_at=_req_str(obj["daemon_started_at"]),
+        )
+        start_dt = _req_utc_iso(obj["started_at"])
+        end_dt = _req_utc_iso(obj["ended_at"])
+        if end_dt < start_dt:
+            raise ProbeValidationError("probe_invalid_timespan")
+
+        client_pid_raw = obj["client_pid"]
+        client_started_raw = obj["client_started_at"]
+        client_proc: ProcessIdentity | None = None
+        if client_pid_raw is not None or client_started_raw is not None:
+            if client_pid_raw is None or client_started_raw is None:
+                raise ProbeValidationError("probe_incomplete_client_identity")
+            _req_utc_iso(client_started_raw)
+            client_proc = ProcessIdentity(
+                pid=_req_pos_int(client_pid_raw),
+                started_at=_req_str(client_started_raw),
+            )
+
+        selected_scope_raw = obj["selected_scope"]
+        selected_scope: dict[str, JsonValue] | None = None
+        if selected_scope_raw is not None:
+            scope_obj = _req_dict(selected_scope_raw, frozenset({"repo_id", "checkout_id"}))
+            selected_scope = {
+                "repo_id": _req_opaque(scope_obj["repo_id"]),
+                "checkout_id": _req_opaque(scope_obj["checkout_id"]),
+            }
+
+        conn_id_raw = obj["connection_id"]
+        call_id_raw = obj["call_id"]
+        out.append(
+            OwnerCallObservation(
+                daemon_process=daemon_proc,
+                store_id=_req_opaque(obj["store_id"]),
+                writer_epoch=_req_pos_int(obj["writer_epoch"]),
+                instance_id=_req_opaque(obj["instance_id"]),
+                principal_id=_req_opaque_or_unknown(obj["principal_id"]),
+                credential_id=_req_opaque_or_unknown(obj["credential_id"]),
+                tool_name=_req_opaque(obj["tool_name"]),
+                ready=_req_bool(obj["ready"]),
+                auth_stamp_matched=_req_bool(obj["auth_stamp_matched"]),
+                response_flushed_ok=_req_bool(obj["response_flushed_ok"]),
+                response_digest=_req_digest_opt(obj["response_digest"]),
+                listen_host=_req_str(obj["listen_host"]),
+                listen_port=_req_port(obj["listen_port"]),
+                started_at=_req_str(obj["started_at"]),
+                ended_at=_req_str(obj["ended_at"]),
+                call_id=_req_opaque(call_id_raw) if call_id_raw is not None else None,
+                selected_scope=selected_scope,
+                client_host=_opt_str(obj["client_host"]),
+                client_port=_opt_port(obj["client_port"]),
+                client_process=client_proc,
+                connection_id=_req_opaque(conn_id_raw) if conn_id_raw is not None else None,
+                observation_status=obs_status,
+            )
+        )
+    return tuple(out)
+
+
+def parse_socket_observations_jsonl(raw: bytes) -> tuple[SocketObservation, ...]:
+    """Parse and strictly validate JSONL records from ``socket-observations.jsonl``."""
+    out: list[SocketObservation] = []
+    for line in _split_nonempty_jsonl_lines(raw):
+        obj = _parse_json_object_strict(line, _SOCKET_OBS_KEYS)
+        if _req_str(obj["event"]) != "socket_observation":
+            raise ProbeValidationError("probe_invalid_event")
+        obs_status = _req_str(obj["observation_status"])
+        if obs_status not in _ALLOWED_OBSERVATION_STATUSES:
+            raise ProbeValidationError("probe_invalid_observation_status")
+        _req_utc_iso(obj["client_started_at"])
+        _req_utc_iso(obj["daemon_started_at"])
+        start_dt = _req_utc_iso(obj["started_at"])
+        end_dt = _req_utc_iso(obj["ended_at"])
+        if end_dt < start_dt:
+            raise ProbeValidationError("probe_invalid_timespan")
+        out.append(
+            SocketObservation(
+                client_process=ProcessIdentity(
+                    pid=_req_pos_int(obj["client_pid"]),
+                    started_at=_req_str(obj["client_started_at"]),
+                ),
+                daemon_process=ProcessIdentity(
+                    pid=_req_pos_int(obj["daemon_pid"]),
+                    started_at=_req_str(obj["daemon_started_at"]),
+                ),
+                local_addr=_req_str(obj["local_addr"]),
+                local_port=_req_port(obj["local_port"]),
+                remote_addr=_req_str(obj["remote_addr"]),
+                remote_port=_req_port(obj["remote_port"]),
+                store_id=_req_opaque(obj["store_id"]),
+                writer_epoch=_req_pos_int(obj["writer_epoch"]),
+                instance_id=_req_opaque(obj["instance_id"]),
+                connection_id=_req_opaque(obj["connection_id"]),
+                started_at=_req_str(obj["started_at"]),
+                ended_at=_req_str(obj["ended_at"]),
+                observation_status=obs_status,
+            )
+        )
+    return tuple(out)
 
 
 def _is_link_or_reparse(info: os.stat_result) -> bool:
@@ -668,8 +1214,11 @@ def _digest_physical_file(path: Path, *, evidence_root: Path | None) -> str | No
 
 def _all_passed_fields_present(probe: NativeConnectionProbe) -> bool:
     required = (
+        probe.run_id,
+        probe.observer_id,
         probe.observed_call_id,
         probe.observation_channel,
+        probe.host_mode,
         probe.host_version,
         probe.host_pid,
         probe.shim_build_digest,
@@ -699,7 +1248,7 @@ def _all_passed_fields_present(probe: NativeConnectionProbe) -> bool:
     return True
 
 
-_CALL_OVERLAP_SLACK = timedelta(milliseconds=250)
+_CALL_OVERLAP_SLACK = timedelta(milliseconds=5)
 _PROCESS_START_SLACK = timedelta(seconds=2)
 
 
@@ -728,7 +1277,7 @@ def _verify_artifacts(
     ev_root = registration.evidence_root
     if not _check_physical_path(ev_root, root=None, expect_dir=True):
         return False
-    if "config" not in observations.artifact_paths or "profile" not in observations.artifact_paths:
+    if not _REQUIRED_ARTIFACT_LABELS.issubset(observations.artifact_paths.keys()):
         return False
 
     digests: dict[str, str] = {}
@@ -754,15 +1303,63 @@ def _verify_artifacts(
         return False
     if not hmac.compare_digest(digests["profile"], probe.profile_digest or ""):
         return False
-    if "schema" in digests and not hmac.compare_digest(digests["schema"], registration.expected_schema_digest):
+    if not hmac.compare_digest(digests["schema"], registration.expected_schema_digest):
         return False
     if not hmac.compare_digest(probe.schema_digest or "", registration.expected_schema_digest):
         return False
-    if "shim_build" in digests and not hmac.compare_digest(
-        digests["shim_build"], registration.expected_shim_build_digest
+    if not hmac.compare_digest(digests["shim_build"], registration.expected_shim_build_digest):
+        return False
+    if not hmac.compare_digest(probe.shim_build_digest or "", registration.expected_shim_build_digest):
+        return False
+
+    try:
+        idx = parse_evidence_index(observations.artifact_paths["evidence_index"].read_bytes())
+        owner_ready = parse_owner_ready(observations.artifact_paths["owner_ready"].read_bytes())
+        disk_host_calls = parse_host_calls_jsonl(observations.artifact_paths["host_calls"].read_bytes())
+        disk_owner_events = parse_owner_events_jsonl(observations.artifact_paths["owner_events"].read_bytes())
+        disk_socks = parse_socket_observations_jsonl(observations.artifact_paths["socket_observations"].read_bytes())
+    except (OSError, ProbeValidationError):
+        return False
+
+    if (
+        idx.task_id != registration.task_id
+        or idx.run_id != registration.run_id
+        or idx.observer_id != registration.registered_observer_id
+        or idx.source_commit != registration.expected_source_commit
+        or idx.host != registration.expected_host
+        or idx.host_mode != registration.expected_host_mode
+        or idx.host_version != probe.host_version
     ):
         return False
-    return hmac.compare_digest(probe.shim_build_digest or "", registration.expected_shim_build_digest)
+    for label in _INDEXED_ARTIFACT_LABELS:
+        idx_digest = idx.artifacts.get(label)
+        if idx_digest is None or not hmac.compare_digest(idx_digest, digests[label]):
+            return False
+
+    assert probe.daemon_process is not None and probe.binding is not None
+    if not hmac.compare_digest(owner_ready.config_digest, digests["config"]):
+        return False
+    owner_schema_norm = (
+        owner_ready.schema_sha256
+        if owner_ready.schema_sha256.startswith("sha256:")
+        else f"sha256:{owner_ready.schema_sha256}"
+    )
+    if not hmac.compare_digest(owner_schema_norm, digests["schema"]):
+        return False
+    if (
+        owner_ready.daemon_pid != probe.daemon_process.pid
+        or owner_ready.daemon_started_at != probe.daemon_process.started_at
+        or owner_ready.store_id != probe.binding.store_id
+        or owner_ready.writer_epoch != probe.binding.writer_epoch
+        or owner_ready.instance_id != probe.binding.instance_id
+    ):
+        return False
+
+    return (
+        disk_host_calls == observations.host_calls
+        and disk_owner_events == observations.owner_events
+        and disk_socks == observations.socket_observations
+    )
 
 
 def verify_native_connection(
@@ -775,6 +1372,16 @@ def verify_native_connection(
     """Verify ``probe`` against coordinator registration and independent multi-channel observations."""
     try:
         _validate_probe_invariants(probe)
+        _req_opaque(registration.registered_observer_id)
+        _req_opaque(registration.run_id)
+        if not registration.registered_host_versions:
+            return False
+        for ver in registration.registered_host_versions:
+            _req_str(ver)
+        if not _validate_host_mode_alignment(
+            registration.expected_kind, registration.expected_host, registration.expected_host_mode
+        ):
+            return False
     except ProbeValidationError:
         return False
 
@@ -787,6 +1394,9 @@ def verify_native_connection(
     if not _all_passed_fields_present(probe):
         return False
 
+    assert probe.run_id is not None
+    assert probe.observer_id is not None
+    assert probe.host_mode is not None
     assert probe.observed_call_id is not None
     assert probe.observation_channel is not None
     assert probe.host_process is not None
@@ -800,13 +1410,16 @@ def verify_native_connection(
 
     if (
         probe.task_id != registration.task_id
+        or probe.run_id != registration.run_id
+        or probe.observer_id != registration.registered_observer_id
         or probe.observation_channel != registration.registered_channel
         or probe.host != registration.expected_host
+        or probe.host_mode != registration.expected_host_mode
         or probe.os != registration.expected_os
         or probe.source_commit != registration.expected_source_commit
     ):
         return False
-    if registration.registered_host_versions and probe.host_version not in registration.registered_host_versions:
+    if probe.host_version not in registration.registered_host_versions:
         return False
     if probe.binding.store_id != registration.expected_store_id:
         return False
@@ -821,6 +1434,7 @@ def verify_native_connection(
     if not (
         probe.terminal_facts.ready
         and probe.terminal_facts.ok
+        and probe.terminal_facts.status == "ok"
         and probe.terminal_facts.auth_granted
         and probe.terminal_facts.response_flushed
         and probe.terminal_facts.response_digest is not None
@@ -897,23 +1511,39 @@ def verify_native_connection(
     ):
         return False
 
+    sock_by_conn: dict[str, SocketObservation] = {}
+    for so in observations.socket_observations:
+        if not so.connection_id or so.connection_id in sock_by_conn:
+            return False
+        if so.observation_status not in _ALLOWED_OBSERVATION_STATUSES:
+            return False
+        sock_by_conn[so.connection_id] = so
+
     worker_socks_all = [
         so for so in observations.socket_observations if so.client_process == probe.shim_worker_process
     ]
-    worker_socks = [
-        so
-        for so in worker_socks_all
-        if (
-            so.daemon_process == probe.daemon_process
+    worker_socks: list[SocketObservation] = []
+    for so in worker_socks_all:
+        so_start = _parse_utc_dt(so.started_at)
+        so_end = _parse_utc_dt(so.ended_at)
+        if so_start is None or so_end is None or so_start > so_end:
+            return False
+        if not (
+            so.observation_status == "ok"
+            and so.daemon_process == probe.daemon_process
             and so.local_addr == "127.0.0.1"
+            and 1 <= so.local_port <= 65535
             and so.remote_addr == "127.0.0.1"
+            and 1 <= so.remote_port <= 65535
             and so.store_id == probe.binding.store_id
             and so.writer_epoch == probe.binding.writer_epoch
             and so.instance_id == probe.binding.instance_id
-        )
-    ]
+        ):
+            return False
+        worker_socks.append(so)
     if not worker_socks or len(worker_socks) != len(worker_socks_all):
         return False
+
     worker_tuples = {(so.local_addr, so.local_port, so.remote_addr, so.remote_port) for so in worker_socks}
     for so in observations.socket_observations:
         if (so.local_addr, so.local_port, so.remote_addr, so.remote_port) in worker_tuples and (
@@ -924,14 +1554,25 @@ def verify_native_connection(
             or so.instance_id != probe.binding.instance_id
         ):
             return False
-    worker_ports = {so.local_port for so in worker_socks}
+    worker_sock_by_conn = {so.connection_id: so for so in worker_socks}
+
+    seen_owner_conns: set[str] = set()
+    for oc in observations.owner_events:
+        if oc.connection_id is not None:
+            if oc.connection_id in seen_owner_conns:
+                return False
+            seen_owner_conns.add(oc.connection_id)
 
     probe_scope = dict(probe.terminal_facts.observed_scope) if probe.terminal_facts.observed_scope is not None else None
 
-    def _oc_times_ok(oc: OwnerCallObservation) -> bool:
+    def _oc_times_ok(oc: OwnerCallObservation, so: SocketObservation) -> bool:
         oc_start = _parse_utc_dt(oc.started_at)
         oc_end = _parse_utc_dt(oc.ended_at)
-        if oc_start is None or oc_end is None or oc_start > oc_end:
+        so_start = _parse_utc_dt(so.started_at)
+        so_end = _parse_utc_dt(so.ended_at)
+        if oc_start is None or oc_end is None or oc_start > oc_end or so_start is None or so_end is None:
+            return False
+        if not (so_start <= oc_start <= oc_end <= so_end):
             return False
         if daemon_started > oc_start + _PROCESS_START_SLACK or daemon_started > oc_end:
             return False
@@ -951,37 +1592,47 @@ def verify_native_connection(
     def _oc_relates_to_call(oc: OwnerCallObservation) -> bool:
         if oc.call_id is not None:
             return oc.call_id == probe.observed_call_id
-        if oc.client_process is not None and oc.client_process != worker_proc:
-            return False
-        if oc.client_port is not None and oc.client_port not in worker_ports:
-            return False
-        if (
-            oc.daemon_process != daemon_proc
-            or oc.store_id != binding.store_id
-            or oc.principal_id != binding.principal_id
-            or oc.credential_id != token_ctx.credential_id
-            or oc.tool_name != term_facts.tool_name
-        ):
-            return False
         oc_start = _parse_utc_dt(oc.started_at)
         oc_end = _parse_utc_dt(oc.ended_at)
-        if oc_start is None or oc_end is None:
+        if oc_start is None or oc_end is None or oc_end < hc_start or oc_start > hc_end:
+            return False
+        if oc.connection_id is not None and oc.connection_id in sock_by_conn:
+            so = sock_by_conn[oc.connection_id]
+            so_start = _parse_utc_dt(so.started_at)
+            so_end = _parse_utc_dt(so.ended_at)
+            if so_start is None or so_end is None or so_end < hc_start or so_start > hc_end:
+                return False
+        if oc.client_process is not None and oc.client_process != worker_proc:
+            return False
+        if oc.connection_id is not None and oc.connection_id in worker_sock_by_conn:
             return True
-        if not (oc_start > hc_end or hc_start > oc_end):
+        if oc.client_process == worker_proc:
             return True
-        return oc.response_digest == term_facts.response_digest and not (
-            oc_start > hc_end + _CALL_OVERLAP_SLACK or hc_start > oc_end + _CALL_OVERLAP_SLACK
+        return (
+            oc.daemon_process == daemon_proc
+            and oc.store_id == binding.store_id
+            and oc.principal_id == binding.principal_id
+            and oc.credential_id == token_ctx.credential_id
+            and oc.tool_name == term_facts.tool_name
         )
 
     related_owner = [oc for oc in observations.owner_events if _oc_relates_to_call(oc)]
     matching_owner: list[OwnerCallObservation] = []
     for oc in related_owner:
-        sock_match = [
-            so
-            for so in worker_socks
-            if so.remote_port == oc.listen_port and (oc.client_port is None or so.local_port == oc.client_port)
-        ]
-        if not sock_match:
+        if (
+            oc.observation_status != "ok"
+            or oc.connection_id is None
+            or oc.client_host != "127.0.0.1"
+            or oc.client_port is None
+            or not (1 <= oc.client_port <= 65535)
+            or not (1 <= oc.listen_port <= 65535)
+            or oc.client_process != probe.shim_worker_process
+        ):
+            return False
+        worker_so = worker_sock_by_conn.get(oc.connection_id)
+        if worker_so is None:
+            return False
+        if worker_so.local_port != oc.client_port or worker_so.remote_port != oc.listen_port:
             return False
         if not (
             oc.daemon_process == probe.daemon_process
@@ -996,10 +1647,8 @@ def verify_native_connection(
             and oc.response_flushed_ok
             and oc.response_digest == probe.terminal_facts.response_digest
             and oc.listen_host == "127.0.0.1"
-            and (oc.client_host is None or oc.client_host == "127.0.0.1")
-            and (oc.client_process is None or oc.client_process == probe.shim_worker_process)
             and _oc_scope_matches(oc)
-            and _oc_times_ok(oc)
+            and _oc_times_ok(oc, worker_so)
         ):
             return False
         matching_owner.append(oc)

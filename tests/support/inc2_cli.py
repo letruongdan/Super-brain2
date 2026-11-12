@@ -263,13 +263,22 @@ def write_client_profile_file(
 # ---------------------------------------------------------------------------
 
 
+def _win32_handle_creation_ticks(handle: int) -> int | None:
+    """Return 100ns FILETIME creation ticks for an already-open Win32 process handle."""
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetProcessTimes.argtypes = [ctypes.wintypes.HANDLE, *[ctypes.POINTER(ctypes.wintypes.FILETIME)] * 4]
+    kernel32.GetProcessTimes.restype = ctypes.wintypes.BOOL
+    times = [ctypes.wintypes.FILETIME() for _ in range(4)]
+    if not kernel32.GetProcessTimes(ctypes.wintypes.HANDLE(int(handle)), *(ctypes.byref(t) for t in times)):
+        return None
+    return (int(times[0].dwHighDateTime) << 32) | int(times[0].dwLowDateTime)
+
+
 def _win32_process_creation_ticks(pid: int) -> int | None:
     """Return 100ns FILETIME creation ticks for ``pid``, or ``None`` if unavailable."""
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.OpenProcess.argtypes = [ctypes.wintypes.DWORD, ctypes.wintypes.BOOL, ctypes.wintypes.DWORD]
     kernel32.OpenProcess.restype = ctypes.wintypes.HANDLE
-    kernel32.GetProcessTimes.argtypes = [ctypes.wintypes.HANDLE, *[ctypes.POINTER(ctypes.wintypes.FILETIME)] * 4]
-    kernel32.GetProcessTimes.restype = ctypes.wintypes.BOOL
     kernel32.CloseHandle.argtypes = [ctypes.wintypes.HANDLE]
     kernel32.CloseHandle.restype = ctypes.wintypes.BOOL
 
@@ -277,21 +286,18 @@ def _win32_process_creation_ticks(pid: int) -> int | None:
     if not handle:
         return None
     try:
-        times = [ctypes.wintypes.FILETIME() for _ in range(4)]
-        if not kernel32.GetProcessTimes(handle, *(ctypes.byref(t) for t in times)):
-            return None
-        return (int(times[0].dwHighDateTime) << 32) | int(times[0].dwLowDateTime)
+        return _win32_handle_creation_ticks(int(handle))
     finally:
         kernel32.CloseHandle(handle)
 
 
-def _win32_descendant_pids(root_pid: int) -> list[int]:
-    """Enumerate all live descendant PIDs of ``root_pid`` on Windows via Toolhelp32 snapshot."""
+def _win32_descendant_identities(root_pid: int, *, root_ticks: int | None = None) -> list[tuple[int, int]]:
+    """Enumerate live ``(pid, creation_ticks)`` descendants of ``root_pid`` on Windows."""
     if sys.platform != "win32":
         return []
 
-    root_ticks = _win32_process_creation_ticks(root_pid)
-    if root_ticks is None:
+    eff_root_ticks = root_ticks if root_ticks is not None else _win32_process_creation_ticks(root_pid)
+    if eff_root_ticks is None:
         return []
 
     th32cs_snapprocess = 0x00000002
@@ -330,8 +336,8 @@ def _win32_descendant_pids(root_pid: int) -> list[int]:
     finally:
         kernel32.CloseHandle(snap)
 
-    descendants: list[int] = []
-    start_ticks: dict[int, int] = {root_pid: root_ticks}
+    descendants: list[tuple[int, int]] = []
+    start_ticks: dict[int, int] = {root_pid: eff_root_ticks}
     frontier = [root_pid]
     seen = {root_pid}
     while frontier:
@@ -345,13 +351,24 @@ def _win32_descendant_pids(root_pid: int) -> list[int]:
                 continue
             seen.add(child_pid)
             start_ticks[child_pid] = child_ticks
-            descendants.append(child_pid)
+            descendants.append((child_pid, child_ticks))
             frontier.append(child_pid)
     return descendants
 
 
-def _win32_wait_or_terminate_pid(pid: int, *, terminate: bool, timeout_s: float) -> bool:
-    """Wait for ``pid`` to exit on Windows (optionally terminating it first); return ``True`` once exited."""
+def _win32_descendant_pids(root_pid: int) -> list[int]:
+    """Enumerate all live descendant PIDs of ``root_pid`` on Windows via Toolhelp32 snapshot."""
+    return [pid for pid, _ in _win32_descendant_identities(root_pid)]
+
+
+def _win32_wait_or_terminate_pid(
+    pid: int,
+    *,
+    expected_ticks: int | None = None,
+    terminate: bool,
+    timeout_s: float,
+) -> bool:
+    """Wait for ``pid`` (optionally terminating it once handle creation ticks match ``expected_ticks``)."""
     assert sys.platform == "win32"
     import pywintypes
     import win32api
@@ -364,9 +381,18 @@ def _win32_wait_or_terminate_pid(pid: int, *, terminate: bool, timeout_s: float)
         access |= win32con.PROCESS_TERMINATE
     try:
         handle = win32api.OpenProcess(access, False, pid)
-    except pywintypes.error:
-        return True
+    except pywintypes.error as err:
+        error_invalid_parameter = getattr(win32con, "ERROR_INVALID_PARAMETER", 87)
+        if getattr(err, "winerror", None) == error_invalid_parameter:
+            return True
+        return False
     try:
+        actual_ticks = _win32_handle_creation_ticks(int(handle))
+        if actual_ticks is None:
+            return False
+        if expected_ticks is not None and actual_ticks != expected_ticks:
+            # Target process exited and OS recycled its PID; do not touch the new occupant.
+            return True
         if terminate:
             with contextlib.suppress(pywintypes.error):
                 win32process.TerminateProcess(handle, 9)
@@ -421,7 +447,10 @@ class InstalledServeProcess:
             creationflags=creationflags,
             start_new_session=start_new_session,
         )
-        self._descendant_pids: list[int] = []
+        self._proc_ticks: int | None = (
+            _win32_process_creation_ticks(self._proc.pid) if sys.platform == "win32" else None
+        )
+        self._descendant_identities: list[tuple[int, int]] = []
         self._closed = False
 
     @property
@@ -430,17 +459,22 @@ class InstalledServeProcess:
 
     @property
     def descendant_pids(self) -> tuple[int, ...]:
-        return tuple(self._descendant_pids)
+        return tuple(pid for pid, _ in self._descendant_identities)
 
     def poll(self) -> int | None:
         return self._proc.poll()
 
-    def snapshot_descendant_pids(self) -> tuple[int, ...]:
+    def snapshot_descendant_identities(self) -> tuple[tuple[int, int], ...]:
         if sys.platform == "win32":
-            for pid in _win32_descendant_pids(self._proc.pid):
-                if pid not in self._descendant_pids:
-                    self._descendant_pids.append(pid)
-        return tuple(self._descendant_pids)
+            seen = set(self._descendant_identities)
+            for ident in _win32_descendant_identities(self._proc.pid, root_ticks=self._proc_ticks):
+                if ident not in seen:
+                    seen.add(ident)
+                    self._descendant_identities.append(ident)
+        return tuple(self._descendant_identities)
+
+    def snapshot_descendant_pids(self) -> tuple[int, ...]:
+        return tuple(pid for pid, _ in self.snapshot_descendant_identities())
 
     def wait_ready(self, timeout: float = 15.0) -> Endpoint:
         """Poll ``endpoint.json`` until published and verified, ensuring the foreground process stays alive."""
@@ -468,7 +502,8 @@ class InstalledServeProcess:
 
     def signal_and_wait_exit(self, timeout: float = 15.0) -> tuple[int, str, str, tuple[int, ...]]:
         """Send graceful foreground stop signal and verify launcher + all worker descendants exit."""
-        tracked_pids = self.snapshot_descendant_pids()
+        tracked_identities = self.snapshot_descendant_identities()
+        tracked_pids = tuple(pid for pid, _ in tracked_identities)
         if sys.platform == "win32":
             ctrl_break = getattr(signal, "CTRL_BREAK_EVENT", None)
             assert ctrl_break is not None
@@ -481,8 +516,10 @@ class InstalledServeProcess:
         assert rc is not None
 
         if sys.platform == "win32":
-            for child_pid in tracked_pids:
-                exited = _win32_wait_or_terminate_pid(child_pid, terminate=False, timeout_s=timeout)
+            for child_pid, child_ticks in tracked_identities:
+                exited = _win32_wait_or_terminate_pid(
+                    child_pid, expected_ticks=child_ticks, terminate=False, timeout_s=timeout
+                )
                 assert exited, f"Descendant worker process pid={child_pid} still running after serve exit"
 
         self._closed = True
@@ -497,7 +534,7 @@ class InstalledServeProcess:
         if self._closed:
             return
         self._closed = True
-        tracked_pids = self.snapshot_descendant_pids()
+        tracked_identities = self.snapshot_descendant_identities()
         if self._proc.poll() is None:
             with contextlib.suppress(OSError, ValueError, subprocess.TimeoutExpired):
                 if sys.platform == "win32":
@@ -513,9 +550,9 @@ class InstalledServeProcess:
             with contextlib.suppress(OSError, subprocess.TimeoutExpired):
                 self._proc.communicate(timeout=2.0)
         if sys.platform == "win32":
-            for pid in (*tracked_pids, self._proc.pid):
+            for pid, ticks in (*tracked_identities, (self._proc.pid, self._proc_ticks)):
                 with contextlib.suppress(Exception):
-                    _win32_wait_or_terminate_pid(pid, terminate=True, timeout_s=2.0)
+                    _win32_wait_or_terminate_pid(pid, expected_ticks=ticks, terminate=True, timeout_s=2.0)
 
     def __enter__(self) -> InstalledServeProcess:
         return self
@@ -680,7 +717,10 @@ class InstalledMcpPipeSession:
         self._stderr_pump.start()
         self._writer: threading.Thread | None = None
         self._write_error: OSError | ValueError | None = None
-        self._descendants: list[int] = []
+        self._proc_ticks: int | None = (
+            _win32_process_creation_ticks(self._proc.pid) if sys.platform == "win32" else None
+        )
+        self._descendants: list[tuple[int, int]] = []
         self._closed = False
 
     def _read_stdout_lines(self) -> None:
@@ -714,12 +754,17 @@ class InstalledMcpPipeSession:
             with contextlib.suppress(OSError, ValueError):
                 self._stdin.close()
 
-    def _snapshot_descendants(self) -> tuple[int, ...]:
+    def _snapshot_descendant_identities(self) -> tuple[tuple[int, int], ...]:
         if sys.platform == "win32":
-            for pid in _win32_descendant_pids(self._proc.pid):
-                if pid not in self._descendants:
-                    self._descendants.append(pid)
+            seen = set(self._descendants)
+            for ident in _win32_descendant_identities(self._proc.pid, root_ticks=self._proc_ticks):
+                if ident not in seen:
+                    seen.add(ident)
+                    self._descendants.append(ident)
         return tuple(self._descendants)
+
+    def _snapshot_descendants(self) -> tuple[int, ...]:
+        return tuple(pid for pid, _ in self._snapshot_descendant_identities())
 
     def write_chunks_and_expect_response(
         self,
@@ -742,7 +787,7 @@ class InstalledMcpPipeSession:
             )
         if self._write_error is not None:
             raise self._write_error
-        self._snapshot_descendants()
+        self._snapshot_descendant_identities()
         try:
             raw_line = self._lines.get(timeout=timeout)
         except queue.Empty as err:
@@ -773,7 +818,7 @@ class InstalledMcpPipeSession:
 
     def finish(self, *, timeout: float = 5.0) -> tuple[int, bytes]:
         """Close ``stdin``, wait for clean process exit, and return ``(returncode, stderr_bytes)``."""
-        self._snapshot_descendants()
+        self._snapshot_descendant_identities()
         self._close_stdin()
         try:
             rc = self._proc.wait(timeout=timeout)
@@ -792,7 +837,7 @@ class InstalledMcpPipeSession:
         if self._closed:
             return
         self._closed = True
-        tracked = self._snapshot_descendants()
+        tracked = self._snapshot_descendant_identities()
         self._close_stdin()
         if self._proc.poll() is None and self._stdin.closed:
             with contextlib.suppress(subprocess.TimeoutExpired, OSError):
@@ -803,9 +848,9 @@ class InstalledMcpPipeSession:
             with contextlib.suppress(subprocess.TimeoutExpired, OSError):
                 self._proc.wait(timeout=2.0)
         if sys.platform == "win32":
-            for pid in (*tracked, self._proc.pid):
+            for pid, ticks in (*tracked, (self._proc.pid, self._proc_ticks)):
                 with contextlib.suppress(Exception):
-                    _win32_wait_or_terminate_pid(pid, terminate=True, timeout_s=2.0)
+                    _win32_wait_or_terminate_pid(pid, expected_ticks=ticks, terminate=True, timeout_s=2.0)
         if self._writer is not None:
             self._writer.join(timeout=1.0)
         self._close_stdin()

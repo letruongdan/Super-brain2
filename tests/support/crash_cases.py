@@ -68,7 +68,8 @@ from tests.support.crash_child import EVENT_ID, EVENT_PAYLOAD
 from tests.support.inc2_cli import (
     InstalledMcpPipeSession,
     InstalledServeProcess,
-    _win32_descendant_pids,
+    _win32_descendant_identities,
+    _win32_process_creation_ticks,
     _win32_wait_or_terminate_pid,
     clean_installed_subprocess_env,
     installed_script_path,
@@ -470,7 +471,8 @@ class MarkedRun:
 
 def _stop_tree(proc: "subprocess.Popen[str]") -> None:
     """Graceful foreground stop (CTRL_BREAK / SIGTERM to the process group), then kill whatever is left."""
-    tracked = _win32_descendant_pids(proc.pid)
+    root_ticks = _win32_process_creation_ticks(proc.pid) if sys.platform == "win32" else None
+    tracked = _win32_descendant_identities(proc.pid, root_ticks=root_ticks)
     with contextlib.suppress(OSError, ValueError):
         if sys.platform == "win32":
             os.kill(proc.pid, int(signal.CTRL_BREAK_EVENT))
@@ -482,9 +484,11 @@ def _stop_tree(proc: "subprocess.Popen[str]") -> None:
         proc.kill()
         proc.wait(timeout=T8_STOP_TIMEOUT)
     if sys.platform == "win32":
-        for pid in tracked:
+        for pid, ticks in tracked:
             with contextlib.suppress(Exception):
-                _win32_wait_or_terminate_pid(pid, terminate=True, timeout_s=T8_STOP_TIMEOUT)
+                _win32_wait_or_terminate_pid(
+                    pid, expected_ticks=ticks, terminate=True, timeout_s=T8_STOP_TIMEOUT
+                )
 
 
 def run_marked(

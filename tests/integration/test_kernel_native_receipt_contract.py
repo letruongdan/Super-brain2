@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from collections.abc import Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -101,6 +102,14 @@ def _sample_world(
     instance_id = "inst-t9-1"
     principal_id = "prin-t9-1"
     call_id = "call-t9-0001"
+    conn_id = "conn-t9-0001"
+    run_id = "run-t9-obs-1"
+    observer_id = "obs-claude-1"
+    host_mode = (
+        "fixture_mcp_stdio"
+        if kind == "fixture"
+        else ("codex_desktop_gui" if host == "codex-desktop" else "claude_cli_mcp_isolated")
+    )
     channel = "mcp_stdio_observed"
     response_digest = digest_bytes(canonical_json({"ok": True, "data": {"ready": True}}))
 
@@ -121,9 +130,12 @@ def _sample_world(
         status="passed",
         reason_code=None,
         task_id="task-t9-obs-1",
+        run_id=run_id,
+        observer_id=observer_id,
         observed_call_id=call_id,
         observation_channel=channel,
         host=host,
+        host_mode=host_mode,
         host_version="2.1.317",
         host_pid=host_proc.pid,
         os=sys.platform,
@@ -174,10 +186,12 @@ def _sample_world(
     registration = ObserverRegistration(
         evidence_root=evidence_root,
         task_id="task-t9-obs-1",
+        run_id=run_id,
         expected_kind=probe_kind,
-        registered_observer_id="obs-claude-1",
+        registered_observer_id=observer_id,
         registered_channel=channel,
         expected_host=host,
+        expected_host_mode=host_mode,
         expected_os=sys.platform,
         expected_source_commit=source_commit,
         expected_shim_build_digest=shim_digest,
@@ -192,61 +206,194 @@ def _sample_world(
         active=True,
     )
 
+    host_call_obs = HostCallObservation(
+        call_id=call_id,
+        channel=channel,
+        host_process=host_proc,
+        shim_launcher_process=launcher_proc,
+        shim_worker_process=worker_proc,
+        tool_name="get_health",
+        terminal_ok=True,
+        response_digest=response_digest,
+        started_at="2026-11-12T04:00:02.000000Z",
+        ended_at="2026-11-12T04:00:02.150000Z",
+    )
+    owner_call_obs = OwnerCallObservation(
+        daemon_process=daemon_proc,
+        store_id=store_id,
+        writer_epoch=writer_epoch,
+        instance_id=instance_id,
+        principal_id=principal_id,
+        credential_id=cred_id,
+        tool_name="get_health",
+        ready=True,
+        auth_stamp_matched=True,
+        response_flushed_ok=True,
+        response_digest=response_digest,
+        listen_host="127.0.0.1",
+        listen_port=45123,
+        started_at="2026-11-12T04:00:02.010000Z",
+        ended_at="2026-11-12T04:00:02.140000Z",
+        call_id=call_id,
+        selected_scope=scope_a.to_dict(),
+        client_host="127.0.0.1",
+        client_port=52001,
+        client_process=worker_proc,
+        connection_id=conn_id,
+        observation_status="ok",
+    )
+    sock_obs = SocketObservation(
+        client_process=worker_proc,
+        daemon_process=daemon_proc,
+        local_addr="127.0.0.1",
+        local_port=52001,
+        remote_addr="127.0.0.1",
+        remote_port=45123,
+        store_id=store_id,
+        writer_epoch=writer_epoch,
+        instance_id=instance_id,
+        connection_id=conn_id,
+        started_at="2026-11-12T04:00:02.005000Z",
+        ended_at="2026-11-12T04:00:02.145000Z",
+        observation_status="ok",
+    )
+
+    owner_ready_path = evidence_root / "owner-ready.json"
+    owner_events_path = evidence_root / "owner-events.jsonl"
+    host_calls_path = evidence_root / "host-calls.jsonl"
+    sock_obs_path = evidence_root / "socket-observations.jsonl"
+    evidence_index_path = evidence_root / "evidence-index.json"
+
+    owner_ready_path.write_bytes(
+        canonical_json(
+            {
+                "event": "ready",
+                "daemon_pid": daemon_proc.pid,
+                "daemon_started_at": daemon_proc.started_at,
+                "port": 45123,
+                "store_id": store_id,
+                "writer_epoch": writer_epoch,
+                "instance_id": instance_id,
+                "module_file": "C:/synthetic/owner.py",
+                "schema_sha256": schema_digest,
+                "config_digest": cfg_digest,
+            }
+        )
+        + b"\n"
+    )
+    host_calls_path.write_bytes(
+        canonical_json(
+            {
+                "call_id": call_id,
+                "channel": channel,
+                "host_process": host_proc.to_dict(),
+                "shim_launcher_process": launcher_proc.to_dict(),
+                "shim_worker_process": worker_proc.to_dict(),
+                "tool_name": "get_health",
+                "terminal_ok": True,
+                "response_digest": response_digest,
+                "started_at": host_call_obs.started_at,
+                "ended_at": host_call_obs.ended_at,
+            }
+        )
+        + b"\n"
+    )
+    owner_events_path.write_bytes(
+        canonical_json(
+            {
+                "event": "owner_call",
+                "connection_id": conn_id,
+                "observation_status": "ok",
+                "daemon_pid": daemon_proc.pid,
+                "daemon_started_at": daemon_proc.started_at,
+                "store_id": store_id,
+                "writer_epoch": writer_epoch,
+                "instance_id": instance_id,
+                "principal_id": principal_id,
+                "credential_id": cred_id,
+                "tool_name": "get_health",
+                "ready": True,
+                "auth_stamp_matched": True,
+                "response_flushed_ok": True,
+                "response_digest": response_digest,
+                "listen_host": "127.0.0.1",
+                "listen_port": 45123,
+                "client_host": "127.0.0.1",
+                "client_port": 52001,
+                "client_pid": worker_proc.pid,
+                "client_started_at": worker_proc.started_at,
+                "started_at": owner_call_obs.started_at,
+                "ended_at": owner_call_obs.ended_at,
+                "call_id": call_id,
+                "selected_scope": scope_a.to_dict(),
+            }
+        )
+        + b"\n"
+    )
+    sock_obs_path.write_bytes(
+        canonical_json(
+            {
+                "event": "socket_observation",
+                "connection_id": conn_id,
+                "observation_status": "ok",
+                "client_pid": worker_proc.pid,
+                "client_started_at": worker_proc.started_at,
+                "daemon_pid": daemon_proc.pid,
+                "daemon_started_at": daemon_proc.started_at,
+                "local_addr": "127.0.0.1",
+                "local_port": 52001,
+                "remote_addr": "127.0.0.1",
+                "remote_port": 45123,
+                "store_id": store_id,
+                "writer_epoch": writer_epoch,
+                "instance_id": instance_id,
+                "started_at": sock_obs.started_at,
+                "ended_at": sock_obs.ended_at,
+            }
+        )
+        + b"\n"
+    )
+    evidence_index_path.write_bytes(
+        canonical_json(
+            {
+                "schema_version": NATIVE_CONNECTION_SCHEMA_VERSION,
+                "task_id": "task-t9-obs-1",
+                "run_id": run_id,
+                "observer_id": observer_id,
+                "source_commit": source_commit,
+                "host": host,
+                "host_mode": host_mode,
+                "host_version": "2.1.317",
+                "artifacts": {
+                    "config": cfg_digest,
+                    "profile": prof_digest,
+                    "schema": schema_digest,
+                    "shim_build": shim_digest,
+                    "owner_ready": digest_bytes(owner_ready_path.read_bytes()),
+                    "owner_events": digest_bytes(owner_events_path.read_bytes()),
+                    "socket_observations": digest_bytes(sock_obs_path.read_bytes()),
+                    "host_calls": digest_bytes(host_calls_path.read_bytes()),
+                },
+            }
+        )
+        + b"\n"
+    )
+
     observations = ObservationSet(
         artifact_paths={
             "config": cfg_path,
             "profile": prof_path,
             "schema": schema_path,
             "shim_build": shim_path,
+            "evidence_index": evidence_index_path,
+            "owner_ready": owner_ready_path,
+            "owner_events": owner_events_path,
+            "socket_observations": sock_obs_path,
+            "host_calls": host_calls_path,
         },
-        host_calls=(
-            HostCallObservation(
-                call_id=call_id,
-                channel=channel,
-                host_process=host_proc,
-                shim_launcher_process=launcher_proc,
-                shim_worker_process=worker_proc,
-                tool_name="get_health",
-                terminal_ok=True,
-                response_digest=response_digest,
-                started_at="2026-11-12T04:00:02.000000Z",
-                ended_at="2026-11-12T04:00:02.150000Z",
-            ),
-        ),
-        owner_events=(
-            OwnerCallObservation(
-                daemon_process=daemon_proc,
-                store_id=store_id,
-                writer_epoch=writer_epoch,
-                instance_id=instance_id,
-                principal_id=principal_id,
-                credential_id=cred_id,
-                tool_name="get_health",
-                ready=True,
-                auth_stamp_matched=True,
-                response_flushed_ok=True,
-                response_digest=response_digest,
-                listen_host="127.0.0.1",
-                listen_port=45123,
-                started_at="2026-11-12T04:00:02.010000Z",
-                ended_at="2026-11-12T04:00:02.140000Z",
-                call_id=call_id,
-                selected_scope=scope_a.to_dict(),
-            ),
-        ),
-        socket_observations=(
-            SocketObservation(
-                client_process=worker_proc,
-                daemon_process=daemon_proc,
-                local_addr="127.0.0.1",
-                local_port=52001,
-                remote_addr="127.0.0.1",
-                remote_port=45123,
-                store_id=store_id,
-                writer_epoch=writer_epoch,
-                instance_id=instance_id,
-            ),
-        ),
+        host_calls=(host_call_obs,),
+        owner_events=(owner_call_obs,),
+        socket_observations=(sock_obs,),
     )
     return probe, registration, observations, evidence_root
 
@@ -465,8 +612,53 @@ def test_native_call_join_rejects_reused_identity_and_missing_terminal(trusted_t
         probe,
         terminal_facts=replace(probe.terminal_facts, observed_scope=scope_b.to_dict()),
     )
+    ev_root_lc = obs.artifact_paths["config"].parent
+    owner_events_lc_path = ev_root_lc / "owner-events-lc.jsonl"
+    oc0 = obs.owner_events[0]
+    assert oc0.client_process is not None
+    owner_events_lc_path.write_bytes(
+        canonical_json(
+            {
+                "event": "owner_call",
+                "connection_id": oc0.connection_id,
+                "observation_status": oc0.observation_status,
+                "daemon_pid": oc0.daemon_process.pid,
+                "daemon_started_at": oc0.daemon_process.started_at,
+                "store_id": oc0.store_id,
+                "writer_epoch": oc0.writer_epoch,
+                "instance_id": oc0.instance_id,
+                "principal_id": oc0.principal_id,
+                "credential_id": oc0.credential_id,
+                "tool_name": oc0.tool_name,
+                "ready": oc0.ready,
+                "auth_stamp_matched": oc0.auth_stamp_matched,
+                "response_flushed_ok": oc0.response_flushed_ok,
+                "response_digest": oc0.response_digest,
+                "listen_host": oc0.listen_host,
+                "listen_port": oc0.listen_port,
+                "client_host": oc0.client_host,
+                "client_port": oc0.client_port,
+                "client_pid": oc0.client_process.pid,
+                "client_started_at": oc0.client_process.started_at,
+                "started_at": oc0.started_at,
+                "ended_at": oc0.ended_at,
+                "call_id": oc0.call_id,
+                "selected_scope": scope_b.to_dict(),
+            }
+        )
+        + b"\n"
+    )
+    ev_idx_lc_obj = json.loads(obs.artifact_paths["evidence_index"].read_text(encoding="utf-8"))
+    ev_idx_lc_obj["artifacts"]["owner_events"] = digest_bytes(owner_events_lc_path.read_bytes())
+    ev_idx_lc_path = ev_root_lc / "evidence-index-lc.json"
+    ev_idx_lc_path.write_bytes(canonical_json(ev_idx_lc_obj) + b"\n")
     obs_b_lc = replace(
         obs,
+        artifact_paths={
+            **obs.artifact_paths,
+            "owner_events": owner_events_lc_path,
+            "evidence_index": ev_idx_lc_path,
+        },
         owner_events=(replace(obs.owner_events[0], selected_scope=scope_b.to_dict()),),
         prior_lifecycle=obs_before,
         current_lifecycle=obs_after_good,
@@ -527,9 +719,12 @@ def test_native_probe_reason_and_secret_redaction(trusted_tmp: Path) -> None:
         status="not_run",
         reason_code="owner_approval_required_d8",
         task_id="task-t9-not-run",
+        run_id=None,
+        observer_id=None,
         observed_call_id=None,
         observation_channel=None,
         host="codex-desktop",
+        host_mode=None,
         host_version=None,
         host_pid=None,
         os=sys.platform,
@@ -671,25 +866,119 @@ def _build_wheel_probe_and_obs(
     expected_alias: str | None = None,
 ) -> tuple[NativeConnectionProbe, ObserverRegistration, ObservationSet]:
     source_commit = _git_head_sha()
-    shim_build_digest = digest_bytes(env.wheel_path.read_bytes())
+    shim_bytes = env.wheel_path.read_bytes()
+    shim_build_digest = digest_bytes(shim_bytes)
     cfg_digest = digest_bytes(config_path.read_bytes())
     prof_digest = digest_bytes(profile_path.read_bytes())
     schema_digest = digest_bytes(schema_copy_path.read_bytes())
     resp_digest = digest_bytes(canonical_json(response_envelope))
     channel = "wheel_mcp_pipe"
     environment = "installed_wheel"
+    host_mode = "wheel_mcp_pipe"
+    run_id = f"run-{task_id}-{call_id}"
+    observer_id = f"obs-{host}"
     host_proc = ProcessIdentity(pid=os.getpid(), started_at=process_started_at_for_pid(os.getpid()))
 
-    _, owner_events, sock_events = load_owner_observations(owner_evidence_dir)
-    matching_owner = [
-        ev for ev in owner_events if ev.tool_name == tool_name and ev.response_digest == resp_digest
-    ]
+    deadline = time.monotonic() + 2.0
+    owner_events: tuple[OwnerCallObservation, ...] = ()
+    sock_events: tuple[SocketObservation, ...] = ()
+    matching_owner: list[OwnerCallObservation] = []
+    matching_sock: list[SocketObservation] = []
+    while True:
+        _, owner_events, sock_events = load_owner_observations(owner_evidence_dir)
+        matching_owner = [
+            ev for ev in owner_events if ev.tool_name == tool_name and ev.response_digest == resp_digest
+        ]
+        matched_conns = {ev.connection_id for ev in matching_owner if ev.connection_id is not None}
+        matched_ports = {ev.listen_port for ev in matching_owner}
+        matching_sock = [
+            so
+            for so in sock_events
+            if so.client_process == worker_proc
+            and so.remote_port in matched_ports
+            and so.connection_id in matched_conns
+        ]
+        if matching_owner and matching_sock:
+            break
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.02)
+
     assert matching_owner, f"Owner tap missing {tool_name} response digest {resp_digest}"
-    matched_ports = {ev.listen_port for ev in matching_owner}
-    matching_sock = [
-        so for so in sock_events if so.client_process == worker_proc and so.remote_port in matched_ports
-    ]
     assert matching_sock, f"Kernel socket table tap did not bind {worker_proc} to owner listen port"
+
+    art_dir = evidence_root / f"artifacts-{call_id}"
+    art_dir.mkdir(parents=True, exist_ok=True)
+    shim_copy_path = art_dir / "shim-build.whl"
+    shim_copy_path.write_bytes(shim_bytes)
+    owner_ready_copy = art_dir / "owner-ready.json"
+    owner_events_copy = art_dir / "owner-events.jsonl"
+    sock_obs_copy = art_dir / "socket-observations.jsonl"
+    host_calls_path = art_dir / "host-calls.jsonl"
+    evidence_index_path = art_dir / "evidence-index.json"
+
+    owner_ready_bytes = (owner_evidence_dir / "owner-ready.json").read_bytes()
+    owner_events_bytes = (owner_evidence_dir / "owner-events.jsonl").read_bytes()
+    sock_obs_bytes = (owner_evidence_dir / "socket-observations.jsonl").read_bytes()
+    owner_ready_copy.write_bytes(owner_ready_bytes)
+    owner_events_copy.write_bytes(owner_events_bytes)
+    sock_obs_copy.write_bytes(sock_obs_bytes)
+
+    host_call_obs = HostCallObservation(
+        call_id=call_id,
+        channel=channel,
+        host_process=host_proc,
+        shim_launcher_process=launcher_proc,
+        shim_worker_process=worker_proc,
+        tool_name=tool_name,
+        terminal_ok=True,
+        response_digest=resp_digest,
+        started_at=started_at,
+        ended_at=ended_at,
+    )
+    host_calls_bytes = (
+        canonical_json(
+            {
+                "call_id": call_id,
+                "channel": channel,
+                "host_process": host_proc.to_dict(),
+                "shim_launcher_process": launcher_proc.to_dict(),
+                "shim_worker_process": worker_proc.to_dict(),
+                "tool_name": tool_name,
+                "terminal_ok": True,
+                "response_digest": resp_digest,
+                "started_at": started_at,
+                "ended_at": ended_at,
+            }
+        )
+        + b"\n"
+    )
+    host_calls_path.write_bytes(host_calls_bytes)
+    evidence_index_path.write_bytes(
+        canonical_json(
+            {
+                "schema_version": NATIVE_CONNECTION_SCHEMA_VERSION,
+                "task_id": task_id,
+                "run_id": run_id,
+                "observer_id": observer_id,
+                "source_commit": source_commit,
+                "host": host,
+                "host_mode": host_mode,
+                "host_version": "0.1.0",
+                "artifacts": {
+                    "config": cfg_digest,
+                    "profile": prof_digest,
+                    "schema": schema_digest,
+                    "shim_build": shim_build_digest,
+                    "owner_ready": digest_bytes(owner_ready_bytes),
+                    "owner_events": digest_bytes(owner_events_bytes),
+                    "socket_observations": digest_bytes(sock_obs_bytes),
+                    "host_calls": digest_bytes(host_calls_bytes),
+                },
+            }
+        )
+        + b"\n"
+    )
 
     probe = NativeConnectionProbe(
         schema_version=NATIVE_CONNECTION_SCHEMA_VERSION,
@@ -697,9 +986,12 @@ def _build_wheel_probe_and_obs(
         status="passed",
         reason_code=None,
         task_id=task_id,
+        run_id=run_id,
+        observer_id=observer_id,
         observed_call_id=call_id,
         observation_channel=channel,
         host=host,
+        host_mode=host_mode,
         host_version="0.1.0",
         host_pid=host_proc.pid,
         os=sys.platform,
@@ -746,10 +1038,12 @@ def _build_wheel_probe_and_obs(
     registration = ObserverRegistration(
         evidence_root=evidence_root,
         task_id=task_id,
+        run_id=run_id,
         expected_kind="fixture",
-        registered_observer_id=f"obs-{host}",
+        registered_observer_id=observer_id,
         registered_channel=channel,
         expected_host=host,
+        expected_host_mode=host_mode,
         expected_os=sys.platform,
         expected_source_commit=source_commit,
         expected_shim_build_digest=shim_build_digest,
@@ -769,21 +1063,14 @@ def _build_wheel_probe_and_obs(
             "config": config_path,
             "profile": profile_path,
             "schema": schema_copy_path,
+            "shim_build": shim_copy_path,
+            "evidence_index": evidence_index_path,
+            "owner_ready": owner_ready_copy,
+            "owner_events": owner_events_copy,
+            "socket_observations": sock_obs_copy,
+            "host_calls": host_calls_path,
         },
-        host_calls=(
-            HostCallObservation(
-                call_id=call_id,
-                channel=channel,
-                host_process=host_proc,
-                shim_launcher_process=launcher_proc,
-                shim_worker_process=worker_proc,
-                tool_name=tool_name,
-                terminal_ok=True,
-                response_digest=resp_digest,
-                started_at=started_at,
-                ended_at=ended_at,
-            ),
-        ),
+        host_calls=(host_call_obs,),
         owner_events=owner_events,
         socket_observations=sock_events,
         prior_lifecycle=prior_lifecycle,
@@ -1655,6 +1942,7 @@ def test_native_same_daemon_rejects_same_principal_and_mismatched_runtime(truste
         probe_a,
         observed_call_id="call-t9-prin2",
         host="codex-desktop",
+        host_mode="codex_desktop_gui",
         host_version="0.166.0-alpha.6",
         binding=replace(probe_a.binding, principal_id="prin-t9-2"),
         token_context=HostTokenContext(
@@ -2377,8 +2665,21 @@ def test_native_verifier_rejects_null_response_digest(trusted_tmp: Path) -> None
     assert verify_native_connection(probe_malformed, registration=reg, observations=obs_malformed) is False
     assert verify_same_daemon(probe_malformed, probe_second) is False
 
-    roundtripped_null = parse_native_probe(encode_native_probe(probe_null))
-    roundtripped_second_null = parse_native_probe(encode_native_probe(probe_second_null))
+    with pytest.raises(ProbeValidationError):
+        encode_native_probe(probe_null)
+    with pytest.raises(ProbeValidationError):
+        encode_native_probe(probe_second_null)
+
+    probe_failed_null = replace(
+        probe_null,
+        terminal_facts=replace(tf_null, ok=False, status="error"),
+    )
+    probe_second_failed_null = replace(
+        probe_second_null,
+        terminal_facts=replace(tf_null, ok=False, status="error"),
+    )
+    roundtripped_null = parse_native_probe(encode_native_probe(probe_failed_null))
+    roundtripped_second_null = parse_native_probe(encode_native_probe(probe_second_failed_null))
     assert verify_native_connection(roundtripped_null, registration=reg, observations=obs_null) is False
     assert verify_same_daemon(roundtripped_null, roundtripped_second_null) is False
 
@@ -2406,6 +2707,9 @@ def test_owner_driver_non_release_error_quiesced_and_timeout_logging(
         for th in threading.enumerate():
             if th.name.startswith("superbrain-loopback-conn-") and th.is_alive():
                 th.join(timeout=2.0)
+        flush_fn = hook_state.get("flush")
+        if callable(flush_fn):
+            flush_fn(timeout=2.0)
         items: list[dict[str, object]] = []
         while not eq.empty():
             item = eq.get_nowait()
@@ -2648,3 +2952,673 @@ def test_win32_descendant_pids_exited_root_open_handle_and_recycled_ppid_rejecti
     finally:
         for pid in (child_keep_pid, child_older_pid, parent_proc.pid):
             subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True, check=False)
+
+
+def test_t9_r01_rejects_unpinned_host_mode_versions_and_unbacked_artifacts(trusted_tmp: Path) -> None:
+    """T9-R01: Require non-empty host_versions, host_mode/observer_id/run_id pinning, and disk-backed index."""
+    case_dir = trusted_tmp / "r01-pinning"
+    case_dir.mkdir(parents=True, exist_ok=True)
+    probe, reg, obs, ev_root = _sample_world(case_dir)
+
+    assert verify_native_connection(probe, registration=reg, observations=obs) is True
+
+    # Empty registered_host_versions must reject rather than skip host_version checks.
+    assert (
+        verify_native_connection(
+            probe,
+            registration=replace(reg, registered_host_versions=()),
+            observations=obs,
+        )
+        is False
+    )
+
+    # host_mode must align strictly with host (e.g. codex-desktop cannot use codex_cli_exec).
+    bad_codex = replace(probe, host="codex-desktop", host_mode="codex_cli_exec")
+    with pytest.raises(ProbeValidationError):
+        parse_native_probe(canonical_json(bad_codex.to_dict()))
+    assert (
+        verify_native_connection(
+            bad_codex,
+            registration=replace(reg, expected_host="codex-desktop"),
+            observations=obs,
+        )
+        is False
+    )
+
+    # host_mode, observer_id, and run_id must be present on the schema and strictly verified.
+    assert getattr(probe, "host_mode", None) == getattr(reg, "expected_host_mode", None)
+    assert getattr(probe, "observer_id", None) == reg.registered_observer_id
+    assert getattr(probe, "run_id", None) == getattr(reg, "run_id", None)
+    assert (
+        verify_native_connection(
+            probe,
+            registration=replace(reg, registered_observer_id="obs-other"),
+            observations=obs,
+        )
+        is False
+    )
+    assert verify_native_connection(probe, registration=replace(reg, run_id="run-other"), observations=obs) is False
+
+    # Unbacked memory-only mutation (differs from disk JSONL) must reject.
+    assert (
+        verify_native_connection(
+            probe,
+            registration=reg,
+            observations=replace(
+                obs,
+                host_calls=(replace(obs.host_calls[0], ended_at="2026-11-12T04:00:02.160000Z"),),
+            ),
+        )
+        is False
+    )
+
+    # Missing channel artifacts in artifact_paths must reject even if in-memory observations look consistent.
+    for missing_label in ("evidence_index", "owner_ready", "owner_events", "host_calls", "socket_observations"):
+        pruned_paths = {k: v for k, v in obs.artifact_paths.items() if k != missing_label}
+        assert verify_native_connection(
+            probe,
+            registration=reg,
+            observations=replace(obs, artifact_paths=pruned_paths),
+        ) is False
+
+    # Tampered evidence-index.json digest must reject.
+    idx_file = ev_root / "evidence-index.json"
+    orig_idx = idx_file.read_bytes()
+    idx_obj = json.loads(orig_idx.decode("utf-8"))
+    idx_obj["artifacts"]["host_calls"] = "sha256:" + "1" * 64
+    idx_file.write_bytes(canonical_json(idx_obj) + b"\n")
+    assert verify_native_connection(probe, registration=reg, observations=obs) is False
+    idx_file.write_bytes(orig_idx)
+    assert verify_native_connection(probe, registration=reg, observations=obs) is True
+
+    # Tampered on-disk owner-ready config_digest must reject.
+    ready_file = ev_root / "owner-ready.json"
+    ready_obj = json.loads(ready_file.read_text(encoding="utf-8"))
+    ready_obj["config_digest"] = "sha256:" + "0" * 64
+    ready_file.write_bytes(canonical_json(ready_obj) + b"\n")
+    assert verify_native_connection(probe, registration=reg, observations=obs) is False
+
+
+def test_t9_r02_rejects_null_owner_endpoints_and_requires_socket_connection_join(trusted_tmp: Path) -> None:
+    """T9-R02: Forbid None client_* fallbacks and enforce 1-to-1 connection_id + socket lifetime join."""
+    case_dir = trusted_tmp / "r02-conn-join"
+    case_dir.mkdir(parents=True, exist_ok=True)
+    probe, reg, obs, ev_root = _sample_world(case_dir)
+    oc = obs.owner_events[0]
+    so = obs.socket_observations[0]
+    hc = obs.host_calls[0]
+    assert oc.client_process is not None
+
+    assert getattr(oc, "connection_id", None) is not None
+    assert getattr(so, "connection_id", None) == getattr(oc, "connection_id", None)
+    assert isinstance(getattr(so, "started_at", None), str)
+    assert isinstance(getattr(so, "ended_at", None), str)
+
+    # Positive twin: two identical get_health calls distinguish cleanly via 1-to-1 connection_id + lifetime.
+    hc2 = replace(
+        hc,
+        call_id="call-t9-0002",
+        started_at="2026-11-12T04:00:03.000000Z",
+        ended_at="2026-11-12T04:00:03.150000Z",
+    )
+    oc2 = replace(
+        oc,
+        call_id="call-t9-0002",
+        connection_id="conn-t9-0002",
+        client_port=52002,
+        started_at="2026-11-12T04:00:03.010000Z",
+        ended_at="2026-11-12T04:00:03.140000Z",
+    )
+    so2 = replace(
+        so,
+        connection_id="conn-t9-0002",
+        local_port=52002,
+        started_at="2026-11-12T04:00:03.005000Z",
+        ended_at="2026-11-12T04:00:03.145000Z",
+    )
+
+    def _write_two_call_artifacts(
+        sub_name: str,
+        owner_pair: tuple[OwnerCallObservation, OwnerCallObservation],
+        sock_pair: tuple[SocketObservation, SocketObservation],
+    ) -> ObservationSet:
+        sub_dir = ev_root / sub_name
+        sub_dir.mkdir(parents=True, exist_ok=True)
+        hc_p = sub_dir / "host-calls.jsonl"
+        oc_p = sub_dir / "owner-events.jsonl"
+        so_p = sub_dir / "socket-observations.jsonl"
+        idx_p = sub_dir / "evidence-index.json"
+        hc_p.write_bytes(
+            b"".join(
+                canonical_json(
+                    {
+                        "call_id": item.call_id,
+                        "channel": item.channel,
+                        "host_process": item.host_process.to_dict(),
+                        "shim_launcher_process": item.shim_launcher_process.to_dict(),
+                        "shim_worker_process": item.shim_worker_process.to_dict(),
+                        "tool_name": item.tool_name,
+                        "terminal_ok": item.terminal_ok,
+                        "response_digest": item.response_digest,
+                        "started_at": item.started_at,
+                        "ended_at": item.ended_at,
+                    }
+                )
+                + b"\n"
+                for item in (hc, hc2)
+            )
+        )
+        oc_p.write_bytes(
+            b"".join(
+                canonical_json(
+                    {
+                        "event": "owner_call",
+                        "connection_id": item.connection_id,
+                        "observation_status": item.observation_status,
+                        "daemon_pid": item.daemon_process.pid,
+                        "daemon_started_at": item.daemon_process.started_at,
+                        "store_id": item.store_id,
+                        "writer_epoch": item.writer_epoch,
+                        "instance_id": item.instance_id,
+                        "principal_id": item.principal_id,
+                        "credential_id": item.credential_id,
+                        "tool_name": item.tool_name,
+                        "ready": item.ready,
+                        "auth_stamp_matched": item.auth_stamp_matched,
+                        "response_flushed_ok": item.response_flushed_ok,
+                        "response_digest": item.response_digest,
+                        "listen_host": item.listen_host,
+                        "listen_port": item.listen_port,
+                        "client_host": item.client_host,
+                        "client_port": item.client_port,
+                        "client_pid": item.client_process.pid if item.client_process else None,
+                        "client_started_at": item.client_process.started_at if item.client_process else None,
+                        "started_at": item.started_at,
+                        "ended_at": item.ended_at,
+                        "call_id": item.call_id,
+                        "selected_scope": item.selected_scope,
+                    }
+                )
+                + b"\n"
+                for item in owner_pair
+            )
+        )
+        so_p.write_bytes(
+            b"".join(
+                canonical_json(
+                    {
+                        "event": "socket_observation",
+                        "connection_id": item.connection_id,
+                        "observation_status": item.observation_status,
+                        "client_pid": item.client_process.pid if item.client_process else None,
+                        "client_started_at": item.client_process.started_at if item.client_process else None,
+                        "daemon_pid": item.daemon_process.pid,
+                        "daemon_started_at": item.daemon_process.started_at,
+                        "local_addr": item.local_addr,
+                        "local_port": item.local_port,
+                        "remote_addr": item.remote_addr,
+                        "remote_port": item.remote_port,
+                        "store_id": item.store_id,
+                        "writer_epoch": item.writer_epoch,
+                        "instance_id": item.instance_id,
+                        "started_at": item.started_at,
+                        "ended_at": item.ended_at,
+                    }
+                )
+                + b"\n"
+                for item in sock_pair
+            )
+        )
+        idx_obj = json.loads(obs.artifact_paths["evidence_index"].read_text(encoding="utf-8"))
+        idx_obj["artifacts"]["host_calls"] = digest_bytes(hc_p.read_bytes())
+        idx_obj["artifacts"]["owner_events"] = digest_bytes(oc_p.read_bytes())
+        idx_obj["artifacts"]["socket_observations"] = digest_bytes(so_p.read_bytes())
+        idx_p.write_bytes(canonical_json(idx_obj) + b"\n")
+        return replace(
+            obs,
+            artifact_paths={
+                **obs.artifact_paths,
+                "host_calls": hc_p,
+                "owner_events": oc_p,
+                "socket_observations": so_p,
+                "evidence_index": idx_p,
+            },
+            host_calls=(hc, hc2),
+            owner_events=owner_pair,
+            socket_observations=sock_pair,
+        )
+
+    obs_two = _write_two_call_artifacts("two-calls-ok", (oc, oc2), (so, so2))
+    probe2 = replace(
+        probe,
+        observed_call_id="call-t9-0002",
+        timespan=TimespanRecord(
+            started_at="2026-11-12T04:00:03.000000Z",
+            ended_at="2026-11-12T04:00:03.150000Z",
+            duration_ms=150.0,
+        ),
+    )
+    assert verify_native_connection(probe, registration=reg, observations=obs_two) is True
+    assert verify_native_connection(probe2, registration=reg, observations=obs_two) is True
+
+    # Swapped connection_ids across two calls (cross-swap socket/owner port mismatch) must reject.
+    obs_swapped = _write_two_call_artifacts(
+        "two-calls-swapped",
+        (replace(oc, connection_id="conn-t9-0002"), replace(oc2, connection_id="conn-t9-0001")),
+        (so, so2),
+    )
+    assert verify_native_connection(probe, registration=reg, observations=obs_swapped) is False
+
+    # Out-of-lifetime socket (socket closed before owner call ended) must reject.
+    obs_early_close = _write_two_call_artifacts(
+        "two-calls-early-close",
+        (oc, oc2),
+        (replace(so, ended_at="2026-11-12T04:00:02.120000Z"), so2),
+    )
+    assert verify_native_connection(probe, registration=reg, observations=obs_early_close) is False
+
+    # Any None client_* bypass or invalid port on OwnerCallObservation must reject.
+    for bad_oc in (
+        replace(oc, client_host=None),
+        replace(oc, client_port=None),
+        replace(oc, client_port=0),
+        replace(oc, client_port=65536),
+        replace(oc, client_process=None),
+    ):
+        assert (
+            verify_native_connection(
+                probe,
+                registration=reg,
+                observations=replace(obs, owner_events=(bad_oc,)),
+            )
+            is False
+        )
+
+
+def test_t9_r03_strict_owner_parsers_and_terminal_facts_consistency(trusted_tmp: Path) -> None:
+    """T9-R03: Reject inconsistent terminal_facts (ok=True + deadline_exceeded) and duplicate/loose JSON."""
+    from tests.support.inc2_native import (
+        parse_evidence_index,
+        parse_host_calls_jsonl,
+        parse_owner_ready,
+        parse_socket_observations_jsonl,
+    )
+    from tests.support.inc2_native_owner import load_owner_observations
+
+    case_dir = trusted_tmp / "r03-strict-parse"
+    case_dir.mkdir(parents=True, exist_ok=True)
+    probe, reg, obs, ev_root = _sample_world(case_dir)
+    assert probe.terminal_facts is not None
+
+    # Positive twin: get_health permits observed_scope=None alongside matching selected_scope=None.
+    oc = obs.owner_events[0]
+    assert oc.client_process is not None
+    oc_global_path = ev_root / "owner-events-global.jsonl"
+    oc_global_path.write_bytes(
+        canonical_json(
+            {
+                "event": "owner_call",
+                "connection_id": oc.connection_id,
+                "observation_status": oc.observation_status,
+                "daemon_pid": oc.daemon_process.pid,
+                "daemon_started_at": oc.daemon_process.started_at,
+                "store_id": oc.store_id,
+                "writer_epoch": oc.writer_epoch,
+                "instance_id": oc.instance_id,
+                "principal_id": oc.principal_id,
+                "credential_id": oc.credential_id,
+                "tool_name": "get_health",
+                "ready": True,
+                "auth_stamp_matched": True,
+                "response_flushed_ok": True,
+                "response_digest": oc.response_digest,
+                "listen_host": oc.listen_host,
+                "listen_port": oc.listen_port,
+                "client_host": oc.client_host,
+                "client_port": oc.client_port,
+                "client_pid": oc.client_process.pid,
+                "client_started_at": oc.client_process.started_at,
+                "started_at": oc.started_at,
+                "ended_at": oc.ended_at,
+                "call_id": oc.call_id,
+                "selected_scope": None,
+            }
+        )
+        + b"\n"
+    )
+    idx_global = json.loads(obs.artifact_paths["evidence_index"].read_text(encoding="utf-8"))
+    idx_global["artifacts"]["owner_events"] = digest_bytes(oc_global_path.read_bytes())
+    idx_global_path = ev_root / "evidence-index-global.json"
+    idx_global_path.write_bytes(canonical_json(idx_global) + b"\n")
+    probe_global = replace(probe, terminal_facts=replace(probe.terminal_facts, observed_scope=None))
+    obs_global = replace(
+        obs,
+        artifact_paths={**obs.artifact_paths, "owner_events": oc_global_path, "evidence_index": idx_global_path},
+        owner_events=(replace(oc, selected_scope=None),),
+    )
+    assert verify_native_connection(probe_global, registration=reg, observations=obs_global) is True
+
+    # Workspace-scoped tool submit_episode with observed_scope=None must reject.
+    bad_scope_ep = replace(
+        probe,
+        terminal_facts=replace(probe.terminal_facts, tool_name="submit_episode", observed_scope=None),
+    )
+    with pytest.raises(ProbeValidationError):
+        parse_native_probe(canonical_json(bad_scope_ep.to_dict()))
+
+    bad_term = replace(probe, terminal_facts=replace(probe.terminal_facts, ok=True, status="deadline_exceeded"))
+    assert verify_native_connection(bad_term, registration=reg, observations=obs) is False
+    with pytest.raises(ProbeValidationError):
+        parse_native_probe(canonical_json(bad_term.to_dict()))
+
+    # Duplicate keys, bool-as-int, and string-as-int must be rejected across ALL artifact parsers.
+    dup_ev_dir = case_dir / "dup-ev"
+    dup_ev_dir.mkdir(parents=True, exist_ok=True)
+    (dup_ev_dir / "owner-events.jsonl").write_text(
+        '{"event":"owner_call","event":"owner_call","daemon_pid":1}\n',
+        encoding="utf-8",
+    )
+    with pytest.raises((ProbeValidationError, ValueError)):
+        load_owner_observations(dup_ev_dir)
+
+    for path_key, parser_fn in (
+        ("owner_ready", parse_owner_ready),
+        ("evidence_index", parse_evidence_index),
+        ("host_calls", parse_host_calls_jsonl),
+        ("socket_observations", parse_socket_observations_jsonl),
+    ):
+        raw_line = obs.artifact_paths[path_key].read_bytes().splitlines()[0]
+        obj = json.loads(raw_line.decode("utf-8"))
+        int_key = (
+            next((k for k in ("daemon_pid", "port", "writer_epoch") if k in obj), None)
+            if path_key != "evidence_index"
+            else None
+        )
+        if int_key is not None:
+            bad_bool = dict(obj)
+            bad_bool[int_key] = True
+            with pytest.raises(ProbeValidationError):
+                parser_fn(canonical_json(bad_bool))
+            bad_str = dict(obj)
+            bad_str[int_key] = "123"
+            with pytest.raises(ProbeValidationError):
+                parser_fn(canonical_json(bad_str))
+        elif "terminal_ok" in obj:
+            bad_term_ok = dict(obj)
+            bad_term_ok["terminal_ok"] = "true"
+            with pytest.raises(ProbeValidationError):
+                parser_fn(canonical_json(bad_term_ok))
+        else:
+            bad_extra = dict(obj)
+            bad_extra["extra"] = 1
+            with pytest.raises(ProbeValidationError):
+                parser_fn(canonical_json(bad_extra))
+
+
+def test_t9_r04_unverified_token_never_leaks_prefix_into_owner_events(trusted_tmp: Path) -> None:
+    """T9-R04: Unverified dotted bearer tokens never leak prefixes; valid calls record exact principal/cred."""
+    import queue
+    import threading
+
+    from superbrain.core.kernel import ToolCommand
+    from tests.support import inc2_native_owner as native_owner
+    from tests.support.inc2_transport import open_test_loopback_transport
+
+    del trusted_tmp
+    tpl = get_shared_t7_transport_template()
+    eq: queue.Queue[dict[str, object] | None] = queue.Queue()
+    hook_state = native_owner._install_loopback_server_hooks(
+        eq=eq,
+        store_id=tpl.store_id,
+        instance_id="inst-r04",
+        daemon_pid=os.getpid(),
+        daemon_started_at=process_started_at_for_pid(os.getpid()),
+    )
+    try:
+        with open_test_loopback_transport(tpl, name="r04-no-token-leak") as h:
+            client = h.open_client()
+            target = h.make_target()
+            res_bad = client.call(
+                target,
+                ToolCommand(
+                    tool="get_health",
+                    arguments={"schema_version": "2.0"},
+                    token="t9-synthetic-private-canary.invalid-secret-part",
+                    selected_scope=None,
+                    correlation_id="corr-r04-forged",
+                ),
+            )
+            assert res_bad.get("ok") is False
+
+            res_ok = client.call(
+                target,
+                ToolCommand(
+                    tool="get_health",
+                    arguments={"schema_version": "2.0"},
+                    token=tpl.cred.token,
+                    selected_scope=None,
+                    correlation_id="corr-r04-valid",
+                ),
+            )
+            assert res_ok.get("ok") is True
+
+            for th in threading.enumerate():
+                if th.name.startswith("superbrain-loopback-conn-") and th.is_alive():
+                    th.join(timeout=2.0)
+            if "flush" in hook_state:
+                hook_state["flush"](timeout=2.0)
+    finally:
+        hook_state["uninstall"]()
+
+    events: list[dict[str, object]] = []
+    while not eq.empty():
+        item = eq.get_nowait()
+        if item is not None:
+            events.append(item)
+    calls = [r for r in events if r.get("event") == "owner_call"]
+    assert len(calls) == 2
+    bad_calls = [r for r in calls if r.get("auth_stamp_matched") is False]
+    ok_calls = [r for r in calls if r.get("auth_stamp_matched") is True]
+    assert len(bad_calls) == 1 and len(ok_calls) == 1
+    assert bad_calls[0]["credential_id"] == "<unknown>"
+    assert bad_calls[0]["principal_id"] == "<unknown>"
+    assert "t9-synthetic-private-canary" not in json.dumps(calls)
+    assert ok_calls[0]["credential_id"] == tpl.cred.credential_id
+    assert ok_calls[0]["principal_id"] == tpl.cred.principal.principal_id
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows-only PID handle guard")
+def test_t9_r05_win32_wait_or_terminate_checks_ticks_and_access_denied(
+    trusted_tmp: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T9-R05: _win32_wait_or_terminate_pid verifies handle creation ticks and never masks ERROR_ACCESS_DENIED."""
+    import pywintypes
+    import win32api
+
+    from tests.support import inc2_cli as cli
+
+    del trusted_tmp
+
+    def _deny_open(*_args: object, **_kwargs: object) -> object:
+        raise pywintypes.error(5, "OpenProcess", "Access is denied.")
+
+    with monkeypatch.context() as mp:
+        mp.setattr(win32api, "OpenProcess", _deny_open)
+        assert cli._win32_wait_or_terminate_pid(999999, terminate=False, timeout_s=0.1) is False
+
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"])
+    try:
+        real_ticks = cli._win32_process_creation_ticks(child.pid)
+        assert real_ticks is not None
+        # Mismatched expected_ticks MUST NOT terminate the live child process.
+        res = cli._win32_wait_or_terminate_pid(
+            child.pid,
+            expected_ticks=real_ticks - 1,
+            terminate=True,
+            timeout_s=0.2,
+        )
+        assert res is True
+        assert child.poll() is None, "Reused-PID guard failed: live process with wrong ticks was terminated!"
+
+        # Matching expected_ticks terminates the process cleanly.
+        assert cli._win32_wait_or_terminate_pid(
+            child.pid,
+            expected_ticks=real_ticks,
+            terminate=True,
+            timeout_s=2.0,
+        ) is True
+        assert child.wait(timeout=2.0) is not None
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=5.0)
+
+
+def test_t9_r07_slow_collector_off_deadline_and_concurrent_calls(
+    trusted_tmp: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T9-R07: Slow/failing OS socket lookup runs off request thread, preserves concurrent calls, marks incomplete."""
+    import concurrent.futures
+    import queue
+    import threading
+
+    from superbrain.core.kernel import ToolCommand
+    from tests.support import inc2_native_owner as native_owner
+    from tests.support.inc2_transport import FakeMonotonicClock, open_test_loopback_transport
+
+    case_dir = trusted_tmp / "r07-collector"
+    case_dir.mkdir(parents=True, exist_ok=True)
+    probe, reg, obs, _ = _sample_world(case_dir)
+
+    tpl = get_shared_t7_transport_template()
+    eq: queue.Queue[dict[str, object] | None] = queue.Queue()
+
+    slow_entered = threading.Event()
+    slow_release = threading.Event()
+    lookup_lock = threading.Lock()
+    call_idx = {"n": 0}
+    mode_state = {"error": False}
+
+    def _mock_lookup(peer_port: int, _listen_port: int) -> int | None:
+        if mode_state["error"]:
+            raise OSError("collector_boom")
+        with lookup_lock:
+            call_idx["n"] += 1
+            idx = call_idx["n"]
+        if idx == 1:
+            slow_entered.set()
+            slow_release.wait(timeout=3.0)
+            return None
+        return os.getpid()
+
+    hook_state = native_owner._install_loopback_server_hooks(
+        eq=eq,
+        store_id=tpl.store_id,
+        instance_id="inst-r07",
+        daemon_pid=os.getpid(),
+        daemon_started_at=process_started_at_for_pid(os.getpid()),
+        collector_timeout_s=0.1,
+    )
+    try:
+        with open_test_loopback_transport(tpl, name="r07-slow-collector") as h:
+            client_clock = FakeMonotonicClock(h.mono_clock.now)
+            target = h.make_target()
+            with monkeypatch.context() as mp:
+                mp.setattr(native_owner, "_lookup_loopback_client_pid", _mock_lookup)
+
+                def _call(corr: str) -> dict[str, Any]:
+                    return h.open_client(monotonic_ns=client_clock.monotonic_ns).call(
+                        target,
+                        ToolCommand(
+                            tool="get_health",
+                            arguments={"schema_version": "2.0"},
+                            token=tpl.cred.token,
+                            selected_scope=None,
+                            correlation_id=corr,
+                        ),
+                    )
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                    fut_slow = pool.submit(_call, "corr-r07-slow")
+                    assert slow_entered.wait(timeout=2.0)
+                    fut_fast = pool.submit(_call, "corr-r07-fast")
+                    res_slow = fut_slow.result(timeout=2.0)
+                    res_fast = fut_fast.result(timeout=2.0)
+
+                assert res_slow.get("ok") is True, f"Slow collector broke tool call: {res_slow!r}"
+                assert res_fast.get("ok") is True, f"Fast concurrent call affected: {res_fast!r}"
+
+                # Collector raising OSError must also leave request path ok=True and mark observation_incomplete.
+                mode_state["error"] = True
+                res_err = _call("corr-r07-oserror")
+                assert res_err.get("ok") is True
+
+            if "flush" in hook_state:
+                hook_state["flush"](timeout=1.0)
+    finally:
+        slow_release.set()
+        hook_state["uninstall"]()
+
+    events: list[dict[str, object]] = []
+    while not eq.empty():
+        item = eq.get_nowait()
+        if item is not None:
+            events.append(item)
+    calls = [r for r in events if r.get("event") == "owner_call"]
+    assert len(calls) == 3
+    incomplete_calls = [r for r in calls if r.get("observation_status") == "observation_incomplete"]
+    complete_calls = [r for r in calls if r.get("observation_status") == "ok"]
+    assert len(incomplete_calls) == 2
+    assert all(r["client_pid"] is None for r in incomplete_calls)
+    assert len(complete_calls) == 1
+    assert complete_calls[0]["client_pid"] == os.getpid()
+
+    # An observation_incomplete owner event must be rejected by verify_native_connection.
+    oc = obs.owner_events[0]
+    assert oc.client_process is not None
+    oc_inc_path = obs.artifact_paths["evidence_index"].parent / "owner-events-incomplete.jsonl"
+    oc_inc_path.write_bytes(
+        canonical_json(
+            {
+                "event": "owner_call",
+                "connection_id": oc.connection_id,
+                "observation_status": "observation_incomplete",
+                "daemon_pid": oc.daemon_process.pid,
+                "daemon_started_at": oc.daemon_process.started_at,
+                "store_id": oc.store_id,
+                "writer_epoch": oc.writer_epoch,
+                "instance_id": oc.instance_id,
+                "principal_id": oc.principal_id,
+                "credential_id": oc.credential_id,
+                "tool_name": oc.tool_name,
+                "ready": oc.ready,
+                "auth_stamp_matched": oc.auth_stamp_matched,
+                "response_flushed_ok": oc.response_flushed_ok,
+                "response_digest": oc.response_digest,
+                "listen_host": oc.listen_host,
+                "listen_port": oc.listen_port,
+                "client_host": oc.client_host,
+                "client_port": oc.client_port,
+                "client_pid": oc.client_process.pid,
+                "client_started_at": oc.client_process.started_at,
+                "started_at": oc.started_at,
+                "ended_at": oc.ended_at,
+                "call_id": oc.call_id,
+                "selected_scope": oc.selected_scope,
+            }
+        )
+        + b"\n"
+    )
+    idx_inc = json.loads(obs.artifact_paths["evidence_index"].read_text(encoding="utf-8"))
+    idx_inc["artifacts"]["owner_events"] = digest_bytes(oc_inc_path.read_bytes())
+    idx_inc_path = obs.artifact_paths["evidence_index"].parent / "evidence-index-incomplete.json"
+    idx_inc_path.write_bytes(canonical_json(idx_inc) + b"\n")
+    obs_inc = replace(
+        obs,
+        artifact_paths={**obs.artifact_paths, "owner_events": oc_inc_path, "evidence_index": idx_inc_path},
+        owner_events=(replace(oc, observation_status="observation_incomplete"),),
+    )
+    assert verify_native_connection(probe, registration=reg, observations=obs_inc) is False
+

@@ -22,7 +22,11 @@ import pytest
 from superbrain.core.jsonvalue import JsonValue
 from tests.support import crash, inc2_child, inc2_cli
 from tests.support.bounded_worker import DIAGNOSTIC_TAIL_BYTES, MAX_RESPONSE_BYTES, BoundedJsonWorker, WorkerFailure
-from tests.support.inc2_cli import InstalledMcpPipeSession, _win32_wait_or_terminate_pid
+from tests.support.inc2_cli import (
+    InstalledMcpPipeSession,
+    _win32_process_creation_ticks,
+    _win32_wait_or_terminate_pid,
+)
 from tests.support.inc2_fixture import InstalledEnv
 from tests.support.platform import windows_only
 
@@ -131,9 +135,9 @@ def _bounded_failure(call: Callable[[], object]) -> WorkerFailure:
     return exc.value
 
 
-def _process_gone(pid: int) -> bool:
+def _process_gone(pid: int, *, expected_ticks: int | None = None) -> bool:
     if sys.platform == "win32":
-        return _win32_wait_or_terminate_pid(pid, terminate=False, timeout_s=5.0)
+        return _win32_wait_or_terminate_pid(pid, expected_ticks=expected_ticks, terminate=False, timeout_s=5.0)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -145,10 +149,13 @@ def _process_gone(pid: int) -> bool:
 class _Probe:
     worker: BoundedJsonWorker
     inner_pid: int
+    inner_ticks: int | None = None
 
     def assert_gone(self) -> None:
         assert self.worker.returncode is not None, "worker process still running"
-        assert _process_gone(self.inner_pid), f"worker interpreter pid={self.inner_pid} still running"
+        assert _process_gone(self.inner_pid, expected_ticks=self.inner_ticks), (
+            f"worker interpreter pid={self.inner_pid} still running"
+        )
 
 
 _Spawn = Callable[..., _Probe]
@@ -171,7 +178,9 @@ def spawn(tmp_path: Path) -> Iterator[_Spawn]:
         deadline = time.monotonic() + _WATCHDOG_S
         while True:
             try:
-                return _Probe(worker, int(pid_path.read_text(encoding="ascii")))
+                inner_pid = int(pid_path.read_text(encoding="ascii"))
+                inner_ticks = _win32_process_creation_ticks(inner_pid) if sys.platform == "win32" else None
+                return _Probe(worker, inner_pid, inner_ticks)
             except OSError:  # Not written yet, or Windows denies the read during the child's rename.
                 assert worker.returncode is None, f"probe child exited at startup:\n{worker.diagnostics()}"
                 assert time.monotonic() < deadline, "probe child never started"
@@ -404,8 +413,12 @@ def _wait_for_pid(pid_path: Path) -> int:
 
 def _assert_alive_then_end(pid: int) -> None:
     """The stream was really held: the grandchild outlived the call under test. End it."""
-    assert not _win32_wait_or_terminate_pid(pid, terminate=False, timeout_s=0.001), "grandchild did not hold the stream"
-    assert _win32_wait_or_terminate_pid(pid, terminate=True, timeout_s=5.0)
+    ticks = _win32_process_creation_ticks(pid)
+    assert ticks is not None, "grandchild exited before identity could be pinned"
+    assert not _win32_wait_or_terminate_pid(
+        pid, expected_ticks=ticks, terminate=False, timeout_s=0.001
+    ), "grandchild did not hold the stream"
+    assert _win32_wait_or_terminate_pid(pid, expected_ticks=ticks, terminate=True, timeout_s=5.0)
 
 
 def test_mcp_session_large_frame_after_large_diagnostics_gets_response(open_session: _OpenSession) -> None:
