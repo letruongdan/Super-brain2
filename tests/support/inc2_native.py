@@ -687,7 +687,16 @@ def _all_passed_fields_present(probe: NativeConnectionProbe) -> bool:
         probe.binding,
         probe.terminal_facts,
     )
-    return all(item is not None for item in required)
+    if not all(item is not None for item in required):
+        return False
+    assert probe.terminal_facts is not None
+    if probe.terminal_facts.response_digest is None:
+        return False
+    try:
+        require_sha256_digest(probe.terminal_facts.response_digest)
+    except BrainError:
+        return False
+    return True
 
 
 _CALL_OVERLAP_SLACK = timedelta(milliseconds=250)
@@ -814,6 +823,7 @@ def verify_native_connection(
         and probe.terminal_facts.ok
         and probe.terminal_facts.auth_granted
         and probe.terminal_facts.response_flushed
+        and probe.terminal_facts.response_digest is not None
     ):
         return False
     if not _verify_artifacts(probe, registration, observations):

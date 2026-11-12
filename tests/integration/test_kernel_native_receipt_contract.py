@@ -1852,6 +1852,7 @@ def test_owner_driver_revoked_stamp_error_logging_and_cutoff_cleanup(
 
     revoked_calls = [r for r in recorded if r.get("event") == "owner_call" and r.get("tool_name") == "get_health"]
     assert len(revoked_calls) == 1
+    assert revoked_calls[0]["ready"] is False
     assert revoked_calls[0]["auth_stamp_matched"] is False
     assert revoked_calls[0]["response_flushed_ok"] is False
     assert hook_state["pending_count"]() == 0
@@ -2295,8 +2296,185 @@ def test_two_concurrent_live_shims_same_repo_checkouts_replaced_root_and_reused_
         shutil.rmtree(base, ignore_errors=True)
 
 
-def test_win32_descendant_pids_catches_exited_parent_and_rejects_recycled(trusted_tmp: Path) -> None:
-    """Win32 descendant PID collector catches orphan children while handle open and skips pre-existing processes."""
+def test_native_verifier_rejects_null_response_digest(trusted_tmp: Path) -> None:
+    """Passed probes require non-null response_digest across verify_native_connection and verify_same_daemon."""
+    case_dir = trusted_tmp / "null-response-digest"
+    case_dir.mkdir(parents=True, exist_ok=True)
+    probe, reg, obs, _ = _sample_world(case_dir)
+    assert probe.binding is not None and probe.token_context is not None and probe.terminal_facts is not None
+    cred2, _, _, _ = generate_bearer_token()
+    probe_second = replace(
+        probe,
+        observed_call_id="call-t9-0002",
+        binding=replace(probe.binding, principal_id="prin-t9-2"),
+        token_context=replace(probe.token_context, credential_id=cred2),
+    )
+
+    assert verify_native_connection(probe, registration=reg, observations=obs) is True
+    assert verify_same_daemon(probe, probe_second) is True
+
+    tf_null = replace(probe.terminal_facts, response_digest=None)
+    probe_null = replace(probe, terminal_facts=tf_null)
+    probe_second_null = replace(probe_second, terminal_facts=tf_null)
+    hc_null = replace(obs.host_calls[0], response_digest=None)
+    oc_null = replace(obs.owner_events[0], response_digest=None)
+    obs_null = replace(obs, host_calls=(hc_null,), owner_events=(oc_null,))
+
+    assert verify_native_connection(probe_null, registration=reg, observations=obs_null) is False
+    assert verify_same_daemon(probe_null, probe_second_null) is False
+    assert verify_same_daemon(probe, probe_second_null) is False
+
+    roundtripped_null = parse_native_probe(encode_native_probe(probe_null))
+    roundtripped_second_null = parse_native_probe(encode_native_probe(probe_second_null))
+    assert verify_native_connection(roundtripped_null, registration=reg, observations=obs_null) is False
+    assert verify_same_daemon(roundtripped_null, roundtripped_second_null) is False
+
+
+def test_owner_driver_non_release_error_quiesced_and_timeout_logging(
+    trusted_tmp: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_tap_conn_worker emits failed owner_call events on non-release exits without leaking State 0 flushes."""
+    import queue
+    import threading
+    from concurrent.futures import Future
+
+    from superbrain.cli_api.loopback import LoopbackTransportError
+    from superbrain.core.errors import BrainError, ErrorCode
+    from superbrain.core.kernel import TOTAL_REQUEST_BUDGET_NS, OwnerReply, ToolCommand
+    from tests.support import inc2_native_owner as native_owner
+    from tests.support.inc2_transport import FakeMonotonicClock, open_test_loopback_transport
+
+    del trusted_tmp
+    tpl = get_shared_t7_transport_template()
+    eq: queue.Queue[dict[str, object] | None] = queue.Queue()
+
+    def _drain_and_join_workers() -> list[dict[str, object]]:
+        for th in threading.enumerate():
+            if th.name.startswith("superbrain-loopback-conn-") and th.is_alive():
+                th.join(timeout=2.0)
+        items: list[dict[str, object]] = []
+        while not eq.empty():
+            item = eq.get_nowait()
+            if item is not None:
+                items.append(item)
+        return items
+
+    hook_state = native_owner._install_loopback_server_hooks(
+        eq=eq,
+        store_id=tpl.store_id,
+        instance_id="inst-non-release",
+        daemon_pid=os.getpid(),
+        daemon_started_at=process_started_at_for_pid(os.getpid()),
+    )
+    try:
+        with open_test_loopback_transport(tpl, name="non-release-exits") as h:
+            client_clock = FakeMonotonicClock(h.mono_clock.now)
+            target = h.make_target()
+
+            # 1. submit_reply raises BrainError -> _write_200_best_effort flushes error, skipping _release_owner_reply.
+            orig_submit = h.loop.submit_reply
+
+            def _submit_boom(command: ToolCommand, deadline_ns: int) -> Future[OwnerReply]:
+                del command, deadline_ns
+                raise BrainError(ErrorCode.DAEMON_UNAVAILABLE, "daemon unavailable")
+
+            with monkeypatch.context() as mp:
+                mp.setattr(h.loop, "submit_reply", _submit_boom)
+                res_err = h.open_client(monotonic_ns=client_clock.monotonic_ns).call(
+                    target,
+                    ToolCommand(
+                        tool="get_health",
+                        arguments={"schema_version": "2.0"},
+                        token=tpl.cred.token,
+                        selected_scope=None,
+                        correlation_id="corr-submit-boom",
+                    ),
+                )
+
+            assert res_err.get("ok") is False
+            ev1 = [r for r in _drain_and_join_workers() if r.get("event") == "owner_call"]
+            assert len(ev1) == 1
+            assert ev1[0]["tool_name"] == "get_health"
+            assert ev1[0]["ready"] is False
+            assert ev1[0]["auth_stamp_matched"] is False
+            assert ev1[0]["response_flushed_ok"] is True
+            assert ev1[0]["response_digest"] == digest_bytes(canonical_json(res_err))
+            assert hook_state["pending_count"]() == 0
+
+            # 2. _is_quiesced() becomes True right after read_admitted_tool_command -> flushes DAEMON_UNAVAILABLE.
+            orig_is_quiesced = h.server._is_quiesced
+            quiesce_calls_by_tid: dict[int, int] = {}
+
+            def _quiesced_post_admission() -> bool:
+                if threading.current_thread().name.startswith("superbrain-loopback-conn-"):
+                    tid = threading.get_ident()
+                    n = quiesce_calls_by_tid.get(tid, 0) + 1
+                    quiesce_calls_by_tid[tid] = n
+                    if n == 3:
+                        return True
+                return orig_is_quiesced()
+
+            with monkeypatch.context() as mp:
+                mp.setattr(h.server, "_is_quiesced", _quiesced_post_admission)
+                res_q = h.open_client(monotonic_ns=client_clock.monotonic_ns).call(
+                    target,
+                    ToolCommand(
+                        tool="get_health",
+                        arguments={"schema_version": "2.0"},
+                        token=tpl.cred.token,
+                        selected_scope=None,
+                        correlation_id="corr-quiesced",
+                    ),
+                )
+
+            assert res_q.get("ok") is False
+            ev2 = [r for r in _drain_and_join_workers() if r.get("event") == "owner_call"]
+            assert len(ev2) == 1
+            assert ev2[0]["tool_name"] == "get_health"
+            assert ev2[0]["ready"] is False
+            assert ev2[0]["auth_stamp_matched"] is False
+            assert ev2[0]["response_flushed_ok"] is True
+            assert ev2[0]["response_digest"] == digest_bytes(canonical_json(res_q))
+            assert hook_state["pending_count"]() == 0
+
+            # 3. _await_owner_reply times out (reply is None) -> exits with NO tool flush (State 0 200 must not bleed).
+            def _submit_and_expire(command: ToolCommand, deadline_ns: int) -> Future[OwnerReply]:
+                fut = orig_submit(command, deadline_ns)
+                h.mono_clock.advance_ns(TOTAL_REQUEST_BUDGET_NS + 1)
+                return fut
+
+            with monkeypatch.context() as mp:
+                mp.setattr(h.loop, "submit_reply", _submit_and_expire)
+                with pytest.raises(LoopbackTransportError):
+                    h.open_client(monotonic_ns=client_clock.monotonic_ns).call(
+                        target,
+                        ToolCommand(
+                            tool="get_health",
+                            arguments={"schema_version": "2.0"},
+                            token=tpl.cred.token,
+                            selected_scope=None,
+                            correlation_id="corr-timeout-none",
+                        ),
+                    )
+
+            ev3 = [r for r in _drain_and_join_workers() if r.get("event") == "owner_call"]
+            assert len(ev3) == 1
+            assert ev3[0]["tool_name"] == "get_health"
+            assert ev3[0]["ready"] is False
+            assert ev3[0]["auth_stamp_matched"] is False
+            assert ev3[0]["response_flushed_ok"] is False
+            assert ev3[0]["response_digest"] is None
+            assert hook_state["pending_count"]() == 0
+    finally:
+        hook_state["uninstall"]()
+
+
+def test_win32_descendant_pids_exited_root_open_handle_and_recycled_ppid_rejection(
+    trusted_tmp: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Win32 collector captures orphan child while root handle is open and enforces creation-tick guards."""
     if sys.platform != "win32":
         pytest.skip("Win32-only process creation tick test")
     from tests.support import inc2_cli as cli
@@ -2315,6 +2493,7 @@ def test_win32_descendant_pids_catches_exited_parent_and_rejects_recycled(truste
     )
     assert proc.stdout is not None
     child_pid = int(proc.stdout.readline().strip())
+    # Wait for process exit while Popen still holds proc._handle open so OpenProcess(proc.pid) succeeds.
     proc.wait(timeout=5.0)
     try:
         desc = cli._win32_descendant_pids(proc.pid)
@@ -2323,3 +2502,60 @@ def test_win32_descendant_pids_catches_exited_parent_and_rejects_recycled(truste
         assert os.getpid() not in desc
     finally:
         subprocess.run(["taskkill", "/F", "/PID", str(child_pid)], capture_output=True, check=False)
+
+    # Exercise child_ticks < parent_ticks, child_ticks is None, and recycled root_ticks > child_ticks on live processes.
+    tree_code = (
+        "import subprocess, sys, time; "
+        "c1 = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(15)']); "
+        "c2 = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(15)']); "
+        "print(f'{c1.pid} {c2.pid}', flush=True); time.sleep(15)"
+    )
+    parent_proc = subprocess.Popen(
+        [base_py, "-c", tree_code],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    assert parent_proc.stdout is not None
+    child_keep_pid, child_older_pid = (int(x) for x in parent_proc.stdout.readline().strip().split())
+    try:
+        real_ticks_fn = cli._win32_process_creation_ticks
+        real_parent_ticks = real_ticks_fn(parent_proc.pid)
+        real_keep_ticks = real_ticks_fn(child_keep_pid)
+        real_older_ticks = real_ticks_fn(child_older_pid)
+        assert real_parent_ticks is not None
+        assert real_keep_ticks is not None
+        assert real_older_ticks is not None
+
+        def _fake_ticks_older_child(pid: int) -> int | None:
+            if pid == child_older_pid:
+                return real_parent_ticks - 10_000_000
+            return real_ticks_fn(pid)
+
+        with monkeypatch.context() as mp:
+            mp.setattr(cli, "_win32_process_creation_ticks", _fake_ticks_older_child)
+            desc_filtered = cli._win32_descendant_pids(parent_proc.pid)
+            assert child_keep_pid in desc_filtered
+            assert child_older_pid not in desc_filtered
+
+        def _fake_ticks_missing_child(pid: int) -> int | None:
+            if pid == child_older_pid:
+                return None
+            return real_ticks_fn(pid)
+
+        with monkeypatch.context() as mp:
+            mp.setattr(cli, "_win32_process_creation_ticks", _fake_ticks_missing_child)
+            desc_missing = cli._win32_descendant_pids(parent_proc.pid)
+            assert child_keep_pid in desc_missing
+            assert child_older_pid not in desc_missing
+
+        def _fake_ticks_recycled_root(pid: int) -> int | None:
+            if pid == parent_proc.pid:
+                return max(real_keep_ticks, real_older_ticks) + 10_000_000
+            return real_ticks_fn(pid)
+
+        with monkeypatch.context() as mp:
+            mp.setattr(cli, "_win32_process_creation_ticks", _fake_ticks_recycled_root)
+            assert cli._win32_descendant_pids(parent_proc.pid) == []
+    finally:
+        for pid in (child_keep_pid, child_older_pid, parent_proc.pid):
+            subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True, check=False)

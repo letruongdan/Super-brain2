@@ -274,8 +274,7 @@ def _install_loopback_server_hooks(
     from superbrain.core.wire import encode_envelope
 
     hook_lock = threading.Lock()
-    pending_cmds: dict[int, tuple[str, dict[str, JsonValue] | None, str, str]] = {}
-    active_sock_by_tid: dict[int, int] = {}
+    pending_cmds: dict[int, tuple[str, dict[str, JsonValue] | None, str, str, str, int, str, int]] = {}
     flush_by_thread: dict[int, tuple[int | None, str | None]] = {}
     stamp_result_by_tid: dict[int, bool] = {}
     ready_seen = initial_ready
@@ -288,6 +287,71 @@ def _install_loopback_server_hooks(
     orig_conn_worker = _loopback_server.LoopbackServer._conn_worker
     orig_authorize_stamp = AuthGate.authorize_stamp
 
+    def _resolve_principal_and_cred(
+        gate: Any,
+        grant_stamp: Any,
+        raw_token: str,
+    ) -> tuple[str | None, str | None]:
+        view = gate.current()
+        credential_id: str | None = grant_stamp.credential_id if grant_stamp is not None else None
+        if credential_id is None and "." in raw_token:
+            credential_id = raw_token.split(".", 1)[0]
+        cred = (
+            view.auth.credentials.get(credential_id)
+            if (credential_id is not None and view is not None)
+            else None
+        )
+        principal_id = cred.principal.principal_id if cred is not None else None
+        return principal_id, credential_id
+
+    def _emit_owner_call(
+        *,
+        gate: Any,
+        principal_id: str | None,
+        credential_id: str | None,
+        tool_name: str,
+        ready_val: bool,
+        auth_matched: bool,
+        response_flushed_ok: bool,
+        resp_digest: str | None,
+        listen_host: str,
+        listen_port: int,
+        peer_host: str,
+        peer_port: int,
+        client_pid: int | None,
+        client_started_at: str | None,
+        req_started_at: str,
+        ended_at: str,
+        selected_scope: dict[str, JsonValue] | None,
+    ) -> None:
+        ident = gate.identity
+        eq.put_nowait(
+            {
+                "event": "owner_call",
+                "daemon_pid": daemon_pid,
+                "daemon_started_at": daemon_started_at,
+                "store_id": ident.store_id if ident is not None else (store_id or ""),
+                "writer_epoch": ident.writer_epoch if ident is not None else 0,
+                "instance_id": ident.instance_id if ident is not None else (instance_id or ""),
+                "principal_id": principal_id or "<unknown>",
+                "credential_id": credential_id or "<unknown>",
+                "tool_name": tool_name,
+                "ready": ready_val,
+                "auth_stamp_matched": auth_matched,
+                "response_flushed_ok": response_flushed_ok,
+                "response_digest": resp_digest,
+                "listen_host": listen_host,
+                "listen_port": listen_port,
+                "client_host": peer_host,
+                "client_port": peer_port,
+                "client_pid": client_pid,
+                "client_started_at": client_started_at,
+                "started_at": req_started_at,
+                "ended_at": ended_at,
+                "selected_scope": selected_scope,
+            }
+        )
+
     def _tap_read_cmd(
         ssl_sock: Any,
         reader: Any,
@@ -298,12 +362,31 @@ def _install_loopback_server_hooks(
     ) -> Any:
         tid = threading.get_ident()
         with hook_lock:
-            active_sock_by_tid[tid] = id(ssl_sock)
+            flush_by_thread.pop(tid, None)
+            stamp_result_by_tid.pop(tid, None)
         cmd = orig_read_cmd(ssl_sock, reader, ready, deadline_ns=deadline_ns, monotonic_ns=monotonic_ns)
         if cmd is not None:
             scope_dict = cmd.selected_scope.to_dict() if cmd.selected_scope is not None else None
+            listen_host = "127.0.0.1"
+            listen_port = 0
+            peer_host = "127.0.0.1"
+            peer_port = 0
+            with contextlib.suppress(OSError):
+                lhost, lport = ssl_sock.getsockname()[:2]
+                phost, pport = ssl_sock.getpeername()[:2]
+                listen_host, listen_port = str(lhost), int(lport)
+                peer_host, peer_port = str(phost), int(pport)
             with hook_lock:
-                pending_cmds[id(ssl_sock)] = (str(cmd.tool), scope_dict, _utc_now_z(), str(cmd.token))
+                pending_cmds[tid] = (
+                    str(cmd.tool),
+                    scope_dict,
+                    _utc_now_z(),
+                    str(cmd.token),
+                    listen_host,
+                    listen_port,
+                    peer_host,
+                    peer_port,
+                )
         return cmd
 
     def _tap_write_json(
@@ -339,28 +422,55 @@ def _install_loopback_server_hooks(
             orig_conn_worker(self, conn_id, raw_sock, accept_ns)
         finally:
             with hook_lock:
-                sock_id = active_sock_by_tid.pop(tid, None)
-                if sock_id is not None:
-                    pending_cmds.pop(sock_id, None)
-                flush_by_thread.pop(tid, None)
+                cmd_info = pending_cmds.pop(tid, None)
+                flushed_status, flushed_digest = flush_by_thread.pop(tid, (None, None))
                 stamp_result_by_tid.pop(tid, None)
+            if cmd_info is not None:
+                (
+                    tool_name,
+                    selected_scope,
+                    req_started_at,
+                    raw_token,
+                    listen_host,
+                    listen_port,
+                    peer_host,
+                    peer_port,
+                ) = cmd_info
+                gate = self._owner.auth_gate
+                principal_id, credential_id = _resolve_principal_and_cred(gate, None, raw_token)
+                _emit_owner_call(
+                    gate=gate,
+                    principal_id=principal_id,
+                    credential_id=credential_id,
+                    tool_name=tool_name,
+                    ready_val=False,
+                    auth_matched=False,
+                    response_flushed_ok=bool(flushed_status == 200 and flushed_digest is not None),
+                    resp_digest=flushed_digest,
+                    listen_host=listen_host,
+                    listen_port=listen_port,
+                    peer_host=peer_host,
+                    peer_port=peer_port,
+                    client_pid=None,
+                    client_started_at=None,
+                    req_started_at=req_started_at,
+                    ended_at=_utc_now_z(),
+                    selected_scope=selected_scope,
+                )
 
     def _tap_release(self: Any, ssl_sock: Any, reply: Any, tool_deadline_ns: int) -> None:
         tid = threading.get_ident()
         with hook_lock:
-            cmd_info = pending_cmds.pop(id(ssl_sock), None)
-            active_sock_by_tid.pop(tid, None)
-            flush_by_thread.pop(tid, None)
-            stamp_result_by_tid.pop(tid, None)
+            cmd_info = pending_cmds.pop(tid, None)
         tool_name = cmd_info[0] if cmd_info is not None else None
         selected_scope = cmd_info[1] if cmd_info is not None else None
         req_started_at = cmd_info[2] if cmd_info is not None else _utc_now_z()
         raw_token = cmd_info[3] if cmd_info is not None else ""
 
-        listen_host = "127.0.0.1"
-        listen_port = 0
-        peer_host = "127.0.0.1"
-        peer_port = 0
+        listen_host = cmd_info[4] if cmd_info is not None else "127.0.0.1"
+        listen_port = cmd_info[5] if cmd_info is not None else 0
+        peer_host = cmd_info[6] if cmd_info is not None else "127.0.0.1"
+        peer_port = cmd_info[7] if cmd_info is not None else 0
         with contextlib.suppress(OSError):
             lhost, lport = ssl_sock.getsockname()[:2]
             phost, pport = ssl_sock.getpeername()[:2]
@@ -376,17 +486,8 @@ def _install_loopback_server_hooks(
                     client_started_at = process_started_at_for_pid(client_pid)
 
         gate = self._owner.auth_gate
-        view = gate.current()
         grant_stamp = reply.grant_stamp
-        credential_id: str | None = grant_stamp.credential_id if grant_stamp is not None else None
-        if credential_id is None and "." in raw_token:
-            credential_id = raw_token.split(".", 1)[0]
-        cred = (
-            view.auth.credentials.get(credential_id)
-            if (credential_id is not None and view is not None)
-            else None
-        )
-        principal_id = cred.principal.principal_id if cred is not None else None
+        principal_id, credential_id = _resolve_principal_and_cred(gate, grant_stamp, raw_token)
 
         expected_env_digest = digest_bytes(encode_envelope(reply.envelope))
         try:
@@ -394,57 +495,53 @@ def _install_loopback_server_hooks(
         finally:
             with hook_lock:
                 flushed_status, flushed_digest = flush_by_thread.pop(tid, (None, None))
-                stamp_decision = stamp_result_by_tid.pop(tid, None)
+                stamp_result = stamp_result_by_tid.pop(tid, None)
 
-        ended_at = _utc_now_z()
-        env_ok = reply.envelope.get("ok") is True
-        if env_ok:
-            if stamp_decision is not None:
-                auth_matched = bool(stamp_decision and flushed_digest == expected_env_digest)
-            else:
-                auth_matched = bool(
-                    grant_stamp is not None and flushed_status == 200 and flushed_digest == expected_env_digest
+            ended_at = _utc_now_z()
+            env_ok = reply.envelope.get("ok") is True
+            if env_ok:
+                if stamp_result is not None:
+                    auth_matched = bool(
+                        stamp_result and flushed_status == 200 and flushed_digest == expected_env_digest
+                    )
+                else:
+                    auth_matched = bool(
+                        grant_stamp is not None and flushed_status == 200 and flushed_digest == expected_env_digest
+                    )
+                response_flushed_ok = bool(
+                    auth_matched and flushed_status == 200 and flushed_digest == expected_env_digest
                 )
-            response_flushed_ok = bool(
-                auth_matched and flushed_status == 200 and flushed_digest == expected_env_digest
-            )
-        else:
-            auth_matched = False
-            response_flushed_ok = bool(flushed_status is not None and flushed_digest == expected_env_digest)
+            else:
+                auth_matched = False
+                response_flushed_ok = bool(flushed_status is not None and flushed_digest == expected_env_digest)
 
-        resp_digest = flushed_digest if flushed_digest is not None else expected_env_digest
-        ready_val = ready_seen
-        if tool_name == "get_health" and isinstance(reply.envelope.get("data"), dict):
-            ready_val = bool(reply.envelope["data"].get("ready") is True)
+            if env_ok and not auth_matched:
+                ready_val = False
+            elif tool_name == "get_health" and auth_matched and isinstance(reply.envelope.get("data"), dict):
+                ready_val = bool(reply.envelope["data"].get("ready") is True)
+            else:
+                ready_val = ready_seen
 
-        if tool_name is not None:
-            ident = gate.identity
-            eq.put_nowait(
-                {
-                    "event": "owner_call",
-                    "daemon_pid": daemon_pid,
-                    "daemon_started_at": daemon_started_at,
-                    "store_id": ident.store_id if ident is not None else (store_id or ""),
-                    "writer_epoch": ident.writer_epoch if ident is not None else 0,
-                    "instance_id": ident.instance_id if ident is not None else (instance_id or ""),
-                    "principal_id": principal_id or "<unknown>",
-                    "credential_id": credential_id or "<unknown>",
-                    "tool_name": tool_name,
-                    "ready": ready_val,
-                    "auth_stamp_matched": auth_matched,
-                    "response_flushed_ok": response_flushed_ok,
-                    "response_digest": resp_digest,
-                    "listen_host": listen_host,
-                    "listen_port": listen_port,
-                    "client_host": peer_host,
-                    "client_port": peer_port,
-                    "client_pid": client_pid,
-                    "client_started_at": client_started_at,
-                    "started_at": req_started_at,
-                    "ended_at": ended_at,
-                    "selected_scope": selected_scope,
-                }
-            )
+            if tool_name is not None:
+                _emit_owner_call(
+                    gate=gate,
+                    principal_id=principal_id,
+                    credential_id=credential_id,
+                    tool_name=tool_name,
+                    ready_val=ready_val,
+                    auth_matched=auth_matched,
+                    response_flushed_ok=response_flushed_ok,
+                    resp_digest=flushed_digest,
+                    listen_host=listen_host,
+                    listen_port=listen_port,
+                    peer_host=peer_host,
+                    peer_port=peer_port,
+                    client_pid=client_pid,
+                    client_started_at=client_started_at,
+                    req_started_at=req_started_at,
+                    ended_at=ended_at,
+                    selected_scope=selected_scope,
+                )
 
     def _set_ready(value: bool) -> None:
         nonlocal ready_seen
@@ -707,6 +804,7 @@ def verify_same_daemon(first: NativeConnectionProbe, second: NativeConnectionPro
             and item.terminal_facts.ok
             and item.terminal_facts.auth_granted
             and item.terminal_facts.response_flushed
+            and item.terminal_facts.response_digest is not None
         ):
             return False
         if not (
