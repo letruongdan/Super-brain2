@@ -54,7 +54,6 @@ _PATH_TOKEN = re.compile(r"[^\s\"'<>|()\[\]{},;]+")
 _DOTTED_PATH_TOKEN = re.compile(
     r"(?<![^\s\"'<>|()\[\]{},;])(?=[^\s\"'<>|()\[\]{},;]*[._])[^\s\"'<>|()\[\]{},;]+"
 )
-_FIXED_TOKEN_PREFIX = re.compile(r"github_pat_|gh[pousr]_|sk-|AKIA|ASIA|xox[baprs]-|AIza|eyJ")
 _PATH_SPLIT = re.compile(r"[\\/]+")
 _PATH_LEAD = "`*([{<\"'"
 _PATH_TRAIL = "`*)]}>\"'.,:;!?"
@@ -159,17 +158,85 @@ def _path_needles(patterns: tuple[str, ...]) -> tuple[str, ...] | None:
     return tuple(sorted(needles))
 
 
+_REGEX_META = frozenset(r".^$*+?{}[]\|()")
+# (leading literals, literal last chars of the leading group's alternatives, case-folded, separator chars)
+_RuleGate = tuple[tuple[str, ...], frozenset[str] | None, bool, str | None]
+
+
+def _literal_run(text: str) -> str:
+    end = 0
+    while end < len(text) and text[end] not in _REGEX_META:
+        end += 1
+    return text[:end]
+
+
+@lru_cache(maxsize=64)
+def _rule_gate(pattern: re.Pattern[str]) -> _RuleGate | None:
+    r"""Cheap necessary condition for a ``\b``-anchored rule, read from the rule itself; ``None``: always run it.
+
+    Every match starts with one of the leading literals. When the leading group is followed by
+    ``([ \t]{0,16}[=:]``, a match also holds one of the alternatives' last characters (or a blank) right before
+    ``=`` or ``:``. Anything the reader does not recognise gives no gate, never a stale one.
+    """
+    fold = bool(pattern.flags & re.IGNORECASE)
+    source = pattern.pattern.removeprefix("(?i)")
+    if not source.startswith(r"\b"):
+        return None
+    source = source[2:]
+    ends: set[str] | None = None
+    seps: str | None = None
+    if source.startswith("("):
+        start = 3 if source.startswith("(?:") else 1
+        close = source.find(")")
+        if close < 0 or "(" in source[start:close]:
+            return None
+        alternatives = source[start:close].split("|")
+        if source[close + 1 :].startswith(r"([ \t]{0,16}[=:]"):
+            ends, seps = set(), "=:"
+    else:
+        alternatives = [source]
+    leads: list[str] = []
+    for alternative in alternatives:
+        lead = _literal_run(alternative)
+        if not lead:
+            return None
+        leads.append(lead.lower() if fold else lead)
+        if ends is not None:
+            last = alternative[-1:]
+            if not last or last in _REGEX_META or alternative[-2:-1] == "\\":
+                ends, seps = None, None
+            else:
+                ends.add(last.lower() if fold else last)
+    return tuple(leads), (frozenset(ends) if ends is not None else None), fold, seps
+
+
+def _gate_open(pattern: re.Pattern[str], text: str, ascii_text: bool) -> bool:
+    """False only when ``pattern`` cannot match ``text``; case-folded gates are trusted on ASCII text only."""
+    gate = _rule_gate(pattern)
+    if gate is None:
+        return True
+    leads, ends, fold, seps = gate
+    if fold:
+        if not ascii_text:
+            return True
+        text = text.lower()
+    if not any(lead in text for lead in leads):
+        return False
+    if ends is None or seps is None:
+        return True
+    return any(f"{end}{sep}" in text for end in (*ends, " ", "\t") for sep in seps)
+
+
 class _PathMatcher:
     """Component-boundary matcher for blocked path patterns (``name``, ``dir/`` and ``a/b`` chains)."""
 
     def __init__(self, patterns: tuple[str, ...]) -> None:
-        self._dirs: set[str] = set()
         self._chains: list[list[re.Pattern[str]]] = []
         names: list[str] = []
         for pattern in patterns:
             lowered = pattern.lower()
-            if lowered.endswith("/"):
-                self._dirs.add(lowered.rstrip("/"))
+            if lowered.endswith("/"):  # ``dir/``: any component matching the glob, like a name pattern
+                names.append(fnmatch.translate(lowered.rstrip("/")))
             elif "/" in lowered:
                 self._chains.append([re.compile(fnmatch.translate(part)) for part in lowered.split("/") if part])
             else:
@@ -193,7 +260,7 @@ class _PathMatcher:
             return False
         parts = [p for p in _PATH_SPLIT.split(low) if p and p != "."]
         for index, part in enumerate(parts):
-            if part in self._dirs or (self._names is not None and self._names.fullmatch(part)):
+            if self._names is not None and self._names.fullmatch(part):
                 return True
             for chain in self._chains:
                 window = parts[index : index + len(chain)]

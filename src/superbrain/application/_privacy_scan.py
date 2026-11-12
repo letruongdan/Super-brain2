@@ -10,7 +10,6 @@ from superbrain.application._privacy_rules import (
     _AUTH_SCHEME,
     _AUTHORITY,
     _CREDENTIAL_USER,
-    _FIXED_TOKEN_PREFIX,
     _FIXED_TOKENS,
     _KEY_VALUE_SECRET,
     _PATH_LEAD,
@@ -19,6 +18,7 @@ from superbrain.application._privacy_rules import (
     _PEM_END,
     _SEGMENT,
     REDACTED,
+    _gate_open,
     _PathMatcher,
     _Reject,
     _tokenish,
@@ -200,119 +200,31 @@ class _TextScans:
             text = self._pem(text)
         ascii_text = text.isascii()
         if ascii_text:
-            lowered = text.lower()
-            if "authorization" in lowered:
-                new = self._sub(_AUTH_HEADER, rf"\1\2{REDACTED}", text)
-                if new != text:
-                    text = new
-                    lowered = ""
+            if _gate_open(_AUTH_HEADER, text, True):
+                text = self._sub(_AUTH_HEADER, rf"\1\2{REDACTED}", text)
             self.tick()
-            if not lowered:
-                lowered = text.lower()
-            if "bearer" in lowered or "basic" in lowered or "token" in lowered:
-                new = _AUTH_SCHEME.sub(self._auth_scheme, text)
-                if new != text:
-                    text = new
-                    lowered = ""
-            fixed_changed = False
-            if "github_pat_" in text:
-                new = self._sub(_FIXED_TOKENS[0], REDACTED, text)
-                if new != text:
-                    text, fixed_changed = new, True
-            self.tick()
-            if "gh" in text and "_" in text and (
-                "ghp_" in text or "gho_" in text or "ghu_" in text or "ghs_" in text or "ghr_" in text
-            ):
-                new = self._sub(_FIXED_TOKENS[1], REDACTED, text)
-                if new != text:
-                    text, fixed_changed = new, True
-            self.tick()
-            if "sk-" in text:
-                new = self._sub(_FIXED_TOKENS[2], REDACTED, text)
-                if new != text:
-                    text, fixed_changed = new, True
-            self.tick()
-            if "AKIA" in text or "ASIA" in text:
-                new = self._sub(_FIXED_TOKENS[3], REDACTED, text)
-                if new != text:
-                    text, fixed_changed = new, True
-            self.tick()
-            if "xox" in text and "-" in text:
-                new = self._sub(_FIXED_TOKENS[4], REDACTED, text)
-                if new != text:
-                    text, fixed_changed = new, True
-            self.tick()
-            if "AIza" in text:
-                new = self._sub(_FIXED_TOKENS[5], REDACTED, text)
-                if new != text:
-                    text, fixed_changed = new, True
-            self.tick()
-            if "eyJ" in text and "." in text:
-                new = self._sub(_FIXED_TOKENS[6], REDACTED, text)
-                if new != text:
-                    text, fixed_changed = new, True
-            self.tick()
-            if fixed_changed:
-                lowered = ""
-            new = self._userinfo(text)
-            if new != text:
-                text = new
-                lowered = ""
-            has_eq = "=" in text
-            if has_eq or ":" in text:
-                if not lowered:
-                    lowered = text.lower()
-                if (
-                    "pass" in lowered
-                    or "pwd" in lowered
-                    or "secret" in lowered
-                    or "key" in lowered
-                    or "token" in lowered
-                ) and (
-                    (
-                        ":" in text
-                        and (
-                            "d:" in lowered
-                            or "t:" in lowered
-                            or "y:" in lowered
-                            or "n:" in lowered
-                            or "e:" in lowered
-                            or " :" in lowered
-                            or "\t:" in lowered
-                        )
-                    )
-                    or (
-                        has_eq
-                        and (
-                            "d=" in lowered
-                            or "t=" in lowered
-                            or "y=" in lowered
-                            or "n=" in lowered
-                            or "e=" in lowered
-                            or " =" in lowered
-                            or "\t=" in lowered
-                        )
-                    )
-                ):
-                    new = self._sub(_KEY_VALUE_SECRET, rf"\1\2{REDACTED}", text)
-                    if new != text:
-                        text = new
-                        lowered = ""
+            if _gate_open(_AUTH_SCHEME, text, True):
+                text = _AUTH_SCHEME.sub(self._auth_scheme, text)
+            for pattern in _FIXED_TOKENS:
+                if _gate_open(pattern, text, True):
+                    text = self._sub(pattern, REDACTED, text)
+                self.tick()
+            text = self._userinfo(text)
+            if _gate_open(_KEY_VALUE_SECRET, text, True):
+                text = self._sub(_KEY_VALUE_SECRET, rf"\1\2{REDACTED}", text)
             self.tick()
             # The cheap candidate scan keeps the full component matcher as the authority.
             if self._path_scan:
-                if self._path_needle is not None and not lowered:
-                    lowered = text.lower()
-                if self._path_needle is None or self._path_needle.search(lowered):
+                if self._path_needle is None or self._path_needle.search(text.lower()):
                     text = self._path_token.sub(self._blocked_path, text)
         else:
             text = self._sub(_AUTH_HEADER, rf"\1\2{REDACTED}", text)
             self.tick()
             text = _AUTH_SCHEME.sub(self._auth_scheme, text)
-            if _FIXED_TOKEN_PREFIX.search(text):
-                for pattern in _FIXED_TOKENS:
+            for pattern in _FIXED_TOKENS:
+                if _gate_open(pattern, text, False):
                     text = self._sub(pattern, REDACTED, text)
-                    self.tick()
+                self.tick()
             text = self._userinfo(text)
             text = self._sub(_KEY_VALUE_SECRET, rf"\1\2{REDACTED}", text)
             self.tick()
