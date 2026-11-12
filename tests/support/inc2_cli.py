@@ -31,7 +31,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import TracebackType
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from superbrain.adapters.os import os_adapters
 from superbrain.adapters.os.daemon_config import read_client_endpoint
@@ -291,14 +291,33 @@ def _win32_process_creation_ticks(pid: int) -> int | None:
         kernel32.CloseHandle(handle)
 
 
+def _win32_popen_creation_ticks(proc: subprocess.Popen[Any]) -> int | None:
+    """Pin creation ticks from ``proc``'s direct OS handle first (no PID reopen race)."""
+    if sys.platform != "win32":
+        return None
+    proc_handle = getattr(proc, "_handle", None)
+    if proc_handle is not None:
+        with contextlib.suppress(TypeError, ValueError, OSError):
+            ticks = _win32_handle_creation_ticks(int(proc_handle))
+            if ticks is not None:
+                return ticks
+    return _win32_process_creation_ticks(proc.pid)
+
+
 def _win32_descendant_identities(root_pid: int, *, root_ticks: int | None = None) -> list[tuple[int, int]]:
     """Enumerate live ``(pid, creation_ticks)`` descendants of ``root_pid`` on Windows."""
     if sys.platform != "win32":
         return []
 
-    eff_root_ticks = root_ticks if root_ticks is not None else _win32_process_creation_ticks(root_pid)
-    if eff_root_ticks is None:
-        return []
+    live_root_ticks = _win32_process_creation_ticks(root_pid)
+    if root_ticks is not None:
+        if live_root_ticks is None or live_root_ticks != root_ticks:
+            return []
+        eff_root_ticks = root_ticks
+    else:
+        if live_root_ticks is None:
+            return []
+        eff_root_ticks = live_root_ticks
 
     th32cs_snapprocess = 0x00000002
     invalid_handle_value = ctypes.c_void_p(-1).value
@@ -343,6 +362,9 @@ def _win32_descendant_identities(root_pid: int, *, root_ticks: int | None = None
     while frontier:
         curr = frontier.pop(0)
         parent_ticks = start_ticks[curr]
+        curr_live = _win32_process_creation_ticks(curr)
+        if curr_live is None or curr_live != parent_ticks:
+            continue
         for child_pid in children_by_parent.get(curr, ()):
             if child_pid in seen:
                 continue
@@ -368,8 +390,10 @@ def _win32_wait_or_terminate_pid(
     terminate: bool,
     timeout_s: float,
 ) -> bool:
-    """Wait for ``pid`` (optionally terminating it once handle creation ticks match ``expected_ticks``)."""
+    """Wait for ``pid`` (optionally terminating it); requires pinned ``expected_ticks`` and fails closed if ``None``."""
     assert sys.platform == "win32"
+    if expected_ticks is None or isinstance(expected_ticks, bool) or not isinstance(expected_ticks, int):
+        return False
     import pywintypes
     import win32api
     import win32con
@@ -390,7 +414,7 @@ def _win32_wait_or_terminate_pid(
         actual_ticks = _win32_handle_creation_ticks(int(handle))
         if actual_ticks is None:
             return False
-        if expected_ticks is not None and actual_ticks != expected_ticks:
+        if actual_ticks != expected_ticks:
             # Target process exited and OS recycled its PID; do not touch the new occupant.
             return True
         if terminate:
@@ -448,10 +472,11 @@ class InstalledServeProcess:
             start_new_session=start_new_session,
         )
         self._proc_ticks: int | None = (
-            _win32_process_creation_ticks(self._proc.pid) if sys.platform == "win32" else None
+            _win32_popen_creation_ticks(self._proc) if sys.platform == "win32" else None
         )
         self._descendant_identities: list[tuple[int, int]] = []
         self._closed = False
+        self.cleanup_unverified = False
 
     @property
     def pid(self) -> int:
@@ -466,6 +491,9 @@ class InstalledServeProcess:
 
     def snapshot_descendant_identities(self) -> tuple[tuple[int, int], ...]:
         if sys.platform == "win32":
+            if self._proc_ticks is None:
+                self.cleanup_unverified = True
+                return tuple(self._descendant_identities)
             seen = set(self._descendant_identities)
             for ident in _win32_descendant_identities(self._proc.pid, root_ticks=self._proc_ticks):
                 if ident not in seen:
@@ -550,9 +578,18 @@ class InstalledServeProcess:
             with contextlib.suppress(OSError, subprocess.TimeoutExpired):
                 self._proc.communicate(timeout=2.0)
         if sys.platform == "win32":
-            for pid, ticks in (*tracked_identities, (self._proc.pid, self._proc_ticks)):
+            for pid, ticks in tracked_identities:
                 with contextlib.suppress(Exception):
-                    _win32_wait_or_terminate_pid(pid, expected_ticks=ticks, terminate=True, timeout_s=2.0)
+                    if not _win32_wait_or_terminate_pid(pid, expected_ticks=ticks, terminate=True, timeout_s=2.0):
+                        self.cleanup_unverified = True
+            if self._proc_ticks is None:
+                self.cleanup_unverified = True
+            else:
+                with contextlib.suppress(Exception):
+                    if not _win32_wait_or_terminate_pid(
+                        self._proc.pid, expected_ticks=self._proc_ticks, terminate=True, timeout_s=2.0
+                    ):
+                        self.cleanup_unverified = True
 
     def __enter__(self) -> InstalledServeProcess:
         return self
@@ -718,10 +755,11 @@ class InstalledMcpPipeSession:
         self._writer: threading.Thread | None = None
         self._write_error: OSError | ValueError | None = None
         self._proc_ticks: int | None = (
-            _win32_process_creation_ticks(self._proc.pid) if sys.platform == "win32" else None
+            _win32_popen_creation_ticks(self._proc) if sys.platform == "win32" else None
         )
         self._descendants: list[tuple[int, int]] = []
         self._closed = False
+        self.cleanup_unverified = False
 
     def _read_stdout_lines(self) -> None:
         try:
@@ -756,6 +794,9 @@ class InstalledMcpPipeSession:
 
     def _snapshot_descendant_identities(self) -> tuple[tuple[int, int], ...]:
         if sys.platform == "win32":
+            if self._proc_ticks is None:
+                self.cleanup_unverified = True
+                return tuple(self._descendants)
             seen = set(self._descendants)
             for ident in _win32_descendant_identities(self._proc.pid, root_ticks=self._proc_ticks):
                 if ident not in seen:
@@ -848,9 +889,18 @@ class InstalledMcpPipeSession:
             with contextlib.suppress(subprocess.TimeoutExpired, OSError):
                 self._proc.wait(timeout=2.0)
         if sys.platform == "win32":
-            for pid, ticks in (*tracked, (self._proc.pid, self._proc_ticks)):
+            for pid, ticks in tracked:
                 with contextlib.suppress(Exception):
-                    _win32_wait_or_terminate_pid(pid, expected_ticks=ticks, terminate=True, timeout_s=2.0)
+                    if not _win32_wait_or_terminate_pid(pid, expected_ticks=ticks, terminate=True, timeout_s=2.0):
+                        self.cleanup_unverified = True
+            if self._proc_ticks is None:
+                self.cleanup_unverified = True
+            else:
+                with contextlib.suppress(Exception):
+                    if not _win32_wait_or_terminate_pid(
+                        self._proc.pid, expected_ticks=self._proc_ticks, terminate=True, timeout_s=2.0
+                    ):
+                        self.cleanup_unverified = True
         if self._writer is not None:
             self._writer.join(timeout=1.0)
         self._close_stdin()

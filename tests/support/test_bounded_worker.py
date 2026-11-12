@@ -448,13 +448,16 @@ def test_mcp_session_write_to_child_not_reading_is_bounded_and_close_ends_it(
     with monkeypatch.context() as mp:
         mp.setattr(inc2_cli, "_STDIN_WRITE_TIMEOUT_S", _WATCHDOG_S, raising=False)
         inner = _pid_of(_bounded(lambda: session.write_chunks_and_expect_response([_FRAME], timeout=_WATCHDOG_S)))
+        inner_ticks = _win32_process_creation_ticks(inner) if sys.platform == "win32" else None
+        if sys.platform == "win32":
+            assert inner_ticks is not None
     _wait_for_diagnostic(session)
     with pytest.raises(AssertionError) as exc:
         _bounded(lambda: session.write_chunks_and_expect_response([_LARGE_FRAME]))
     assert "stdin write did not finish" in str(exc.value) and _NOTE in str(exc.value)
     _bounded(session.close)
     assert session._proc.poll() is not None
-    assert _process_gone(inner)
+    assert _process_gone(inner, expected_ticks=inner_ticks)
 
 
 def _wait_for_diagnostic(session: InstalledMcpPipeSession) -> None:

@@ -67,6 +67,8 @@ _WORKSPACE_REQUIRED_TOOLS = frozenset(
         "request_improvement",
     }
 )
+_GLOBAL_SCOPELESS_TOOLS = frozenset({"get_health"})
+_D8_NATIVE_ACTIVE_TOOLS = frozenset({"get_health", "get_job"})
 _ALLOWED_TERMINAL_STATUSES = frozenset(
     {
         "ok",
@@ -378,7 +380,7 @@ class OwnerCallObservation:
 
 @dataclass(frozen=True)
 class SocketObservation:
-    client_process: ProcessIdentity
+    client_process: ProcessIdentity | None
     daemon_process: ProcessIdentity
     local_addr: str
     local_port: int
@@ -390,6 +392,7 @@ class SocketObservation:
     connection_id: str
     started_at: str
     ended_at: str
+    observed_at: str | None = None
     observation_status: str = "ok"
 
 
@@ -662,6 +665,13 @@ def _parse_binding(raw: object) -> BindingSummary | None:
     )
 
 
+def _validate_terminal_tool_scope(tool_name: str, *, ok: bool, scope: Mapping[str, JsonValue] | None) -> None:
+    if tool_name in _WORKSPACE_REQUIRED_TOOLS and scope is None:
+        raise ProbeValidationError("probe_missing_required_scope")
+    if tool_name in _GLOBAL_SCOPELESS_TOOLS and ok and scope is not None:
+        raise ProbeValidationError("probe_unexpected_scope_for_global_tool")
+
+
 def _parse_terminal_facts(raw: object) -> TerminalToolFacts | None:
     if raw is None:
         return None
@@ -707,8 +717,7 @@ def _parse_terminal_facts(raw: object) -> TerminalToolFacts | None:
             "repo_id": _req_opaque(scope_obj["repo_id"]),
             "checkout_id": _req_opaque(scope_obj["checkout_id"]),
         }
-    elif tool_name in _WORKSPACE_REQUIRED_TOOLS:
-        raise ProbeValidationError("probe_missing_required_scope")
+    _validate_terminal_tool_scope(tool_name, ok=ok_val, scope=obs_scope)
 
     return TerminalToolFacts(
         ready=ready_val,
@@ -762,8 +771,9 @@ def _validate_probe_invariants(probe: NativeConnectionProbe) -> None:
             raise ProbeValidationError("probe_inconsistent_terminal_status")
         if not tf.ok and tf.status == "ok":
             raise ProbeValidationError("probe_inconsistent_terminal_status")
-        if tf.tool_name in _WORKSPACE_REQUIRED_TOOLS and tf.observed_scope is None:
-            raise ProbeValidationError("probe_missing_required_scope")
+        _validate_terminal_tool_scope(tf.tool_name, ok=tf.ok, scope=tf.observed_scope)
+        if probe.kind == "native" and tf.ok and tf.tool_name not in _D8_NATIVE_ACTIVE_TOOLS:
+            raise ProbeValidationError("probe_tool_outside_d8_scope")
 
 
 def encode_native_probe(probe: NativeConnectionProbe) -> bytes:
@@ -918,6 +928,7 @@ _SOCKET_OBS_KEYS = frozenset(
         "writer_epoch",
         "instance_id",
         "started_at",
+        "observed_at",
         "ended_at",
     }
 )
@@ -1032,6 +1043,10 @@ def parse_host_calls_jsonl(raw: bytes) -> tuple[HostCallObservation, ...]:
         tool_name = _req_opaque(obj["tool_name"])
         if tool_name not in _KNOWN_V2_TOOLS:
             raise ProbeValidationError("probe_unknown_tool")
+        term_ok = _req_bool(obj["terminal_ok"])
+        resp_digest = _req_digest_opt(obj["response_digest"])
+        if term_ok and resp_digest is None:
+            raise ProbeValidationError("probe_inconsistent_ok_facts")
         out.append(
             HostCallObservation(
                 call_id=_req_opaque(obj["call_id"]),
@@ -1040,8 +1055,8 @@ def parse_host_calls_jsonl(raw: bytes) -> tuple[HostCallObservation, ...]:
                 shim_launcher_process=launcher_proc,
                 shim_worker_process=worker_proc,
                 tool_name=tool_name,
-                terminal_ok=_req_bool(obj["terminal_ok"]),
-                response_digest=_req_digest_opt(obj["response_digest"]),
+                terminal_ok=term_ok,
+                response_digest=resp_digest,
                 started_at=_req_str(obj["started_at"]),
                 ended_at=_req_str(obj["ended_at"]),
             )
@@ -1090,6 +1105,19 @@ def parse_owner_events_jsonl(raw: bytes) -> tuple[OwnerCallObservation, ...]:
                 "checkout_id": _req_opaque(scope_obj["checkout_id"]),
             }
 
+        tool_name = _req_opaque(obj["tool_name"])
+        if tool_name not in _KNOWN_V2_TOOLS:
+            raise ProbeValidationError("probe_unknown_tool")
+        ready_val = _req_bool(obj["ready"])
+        auth_matched = _req_bool(obj["auth_stamp_matched"])
+        response_flushed_ok = _req_bool(obj["response_flushed_ok"])
+        resp_digest = _req_digest_opt(obj["response_digest"])
+        if auth_matched and (not response_flushed_ok or resp_digest is None):
+            raise ProbeValidationError("probe_inconsistent_ok_facts")
+        if ready_val and not auth_matched:
+            raise ProbeValidationError("probe_inconsistent_terminal_status")
+        _validate_terminal_tool_scope(tool_name, ok=(auth_matched and response_flushed_ok), scope=selected_scope)
+
         conn_id_raw = obj["connection_id"]
         call_id_raw = obj["call_id"]
         out.append(
@@ -1100,11 +1128,11 @@ def parse_owner_events_jsonl(raw: bytes) -> tuple[OwnerCallObservation, ...]:
                 instance_id=_req_opaque(obj["instance_id"]),
                 principal_id=_req_opaque_or_unknown(obj["principal_id"]),
                 credential_id=_req_opaque_or_unknown(obj["credential_id"]),
-                tool_name=_req_opaque(obj["tool_name"]),
-                ready=_req_bool(obj["ready"]),
-                auth_stamp_matched=_req_bool(obj["auth_stamp_matched"]),
-                response_flushed_ok=_req_bool(obj["response_flushed_ok"]),
-                response_digest=_req_digest_opt(obj["response_digest"]),
+                tool_name=tool_name,
+                ready=ready_val,
+                auth_stamp_matched=auth_matched,
+                response_flushed_ok=response_flushed_ok,
+                response_digest=resp_digest,
                 listen_host=_req_str(obj["listen_host"]),
                 listen_port=_req_port(obj["listen_port"]),
                 started_at=_req_str(obj["started_at"]),
@@ -1131,18 +1159,41 @@ def parse_socket_observations_jsonl(raw: bytes) -> tuple[SocketObservation, ...]
         obs_status = _req_str(obj["observation_status"])
         if obs_status not in _ALLOWED_OBSERVATION_STATUSES:
             raise ProbeValidationError("probe_invalid_observation_status")
-        _req_utc_iso(obj["client_started_at"])
         _req_utc_iso(obj["daemon_started_at"])
         start_dt = _req_utc_iso(obj["started_at"])
         end_dt = _req_utc_iso(obj["ended_at"])
         if end_dt < start_dt:
             raise ProbeValidationError("probe_invalid_timespan")
+
+        client_pid_raw = obj["client_pid"]
+        client_started_raw = obj["client_started_at"]
+        observed_raw = obj["observed_at"]
+        client_proc: ProcessIdentity | None = None
+        client_start_dt: datetime | None = None
+        if client_pid_raw is not None or client_started_raw is not None:
+            if client_pid_raw is None or client_started_raw is None:
+                raise ProbeValidationError("probe_incomplete_client_identity")
+            client_start_dt = _req_utc_iso(client_started_raw)
+            client_proc = ProcessIdentity(
+                pid=_req_pos_int(client_pid_raw),
+                started_at=_req_str(client_started_raw),
+            )
+        observed_dt: datetime | None = None
+        observed_str: str | None = None
+        if observed_raw is not None:
+            observed_dt = _req_utc_iso(observed_raw)
+            observed_str = _req_str(observed_raw)
+            if observed_dt < start_dt or observed_dt > end_dt:
+                raise ProbeValidationError("probe_invalid_timespan")
+            if client_start_dt is not None and client_start_dt > observed_dt:
+                raise ProbeValidationError("probe_invalid_timespan")
+
+        if obs_status == "ok" and (client_proc is None or observed_dt is None):
+            raise ProbeValidationError("probe_incomplete_client_identity")
+
         out.append(
             SocketObservation(
-                client_process=ProcessIdentity(
-                    pid=_req_pos_int(obj["client_pid"]),
-                    started_at=_req_str(obj["client_started_at"]),
-                ),
+                client_process=client_proc,
                 daemon_process=ProcessIdentity(
                     pid=_req_pos_int(obj["daemon_pid"]),
                     started_at=_req_str(obj["daemon_started_at"]),
@@ -1156,6 +1207,7 @@ def parse_socket_observations_jsonl(raw: bytes) -> tuple[SocketObservation, ...]
                 instance_id=_req_opaque(obj["instance_id"]),
                 connection_id=_req_opaque(obj["connection_id"]),
                 started_at=_req_str(obj["started_at"]),
+                observed_at=observed_str,
                 ended_at=_req_str(obj["ended_at"]),
                 observation_status=obs_status,
             )
@@ -1203,13 +1255,14 @@ def _check_physical_path(path: Path, *, root: Path | None, expect_dir: bool = Fa
     return True
 
 
-def _digest_physical_file(path: Path, *, evidence_root: Path | None) -> str | None:
+def _read_physical_artifact(path: Path, *, evidence_root: Path | None) -> tuple[bytes, str] | None:
     if not _check_physical_path(path, root=evidence_root, expect_dir=False):
         return None
     try:
-        return digest_bytes(path.read_bytes())
+        raw = path.read_bytes()
     except OSError:
         return None
+    return raw, digest_bytes(raw)
 
 
 def _all_passed_fields_present(probe: NativeConnectionProbe) -> bool:
@@ -1279,22 +1332,25 @@ def _verify_artifacts(
         return False
     if not _REQUIRED_ARTIFACT_LABELS.issubset(observations.artifact_paths.keys()):
         return False
-
-    digests: dict[str, str] = {}
-    for label, path in observations.artifact_paths.items():
-        actual_digest = _digest_physical_file(path, evidence_root=ev_root)
-        if actual_digest is None:
-            return False
-        digests[label] = actual_digest
-
-    cfg_disk = _digest_physical_file(registration.expected_config_path, evidence_root=None)
-    prof_disk = _digest_physical_file(registration.expected_profile_path, evidence_root=None)
-    if cfg_disk is None or prof_disk is None:
+    if not _check_physical_path(registration.expected_config_path, root=None, expect_dir=False):
+        return False
+    if not _check_physical_path(registration.expected_profile_path, root=None, expect_dir=False):
         return False
     if not _same_physical_file(observations.artifact_paths["config"], registration.expected_config_path):
         return False
     if not _same_physical_file(observations.artifact_paths["profile"], registration.expected_profile_path):
         return False
+
+    artifact_bytes: dict[str, bytes] = {}
+    digests: dict[str, str] = {}
+    for label, path in observations.artifact_paths.items():
+        loaded = _read_physical_artifact(path, evidence_root=ev_root)
+        if loaded is None:
+            return False
+        raw, actual_digest = loaded
+        artifact_bytes[label] = raw
+        digests[label] = actual_digest
+
     if not hmac.compare_digest(digests["config"], registration.expected_config_digest):
         return False
     if not hmac.compare_digest(digests["config"], probe.config_digest or ""):
@@ -1313,12 +1369,12 @@ def _verify_artifacts(
         return False
 
     try:
-        idx = parse_evidence_index(observations.artifact_paths["evidence_index"].read_bytes())
-        owner_ready = parse_owner_ready(observations.artifact_paths["owner_ready"].read_bytes())
-        disk_host_calls = parse_host_calls_jsonl(observations.artifact_paths["host_calls"].read_bytes())
-        disk_owner_events = parse_owner_events_jsonl(observations.artifact_paths["owner_events"].read_bytes())
-        disk_socks = parse_socket_observations_jsonl(observations.artifact_paths["socket_observations"].read_bytes())
-    except (OSError, ProbeValidationError):
+        idx = parse_evidence_index(artifact_bytes["evidence_index"])
+        owner_ready = parse_owner_ready(artifact_bytes["owner_ready"])
+        disk_host_calls = parse_host_calls_jsonl(artifact_bytes["host_calls"])
+        disk_owner_events = parse_owner_events_jsonl(artifact_bytes["owner_events"])
+        disk_socks = parse_socket_observations_jsonl(artifact_bytes["socket_observations"])
+    except ProbeValidationError:
         return False
 
     if (
@@ -1512,11 +1568,21 @@ def verify_native_connection(
         return False
 
     sock_by_conn: dict[str, SocketObservation] = {}
+    sock_intervals_by_tuple: dict[tuple[str, int, str, int], list[tuple[str, datetime, datetime]]] = {}
     for so in observations.socket_observations:
         if not so.connection_id or so.connection_id in sock_by_conn:
             return False
         if so.observation_status not in _ALLOWED_OBSERVATION_STATUSES:
             return False
+        so_s = _parse_utc_dt(so.started_at)
+        so_e = _parse_utc_dt(so.ended_at)
+        if so_s is None or so_e is None or so_s > so_e:
+            return False
+        sock_tuple = (so.local_addr, so.local_port, so.remote_addr, so.remote_port)
+        for prev_conn, prev_s, prev_e in sock_intervals_by_tuple.get(sock_tuple, ()):
+            if prev_conn != so.connection_id and prev_s <= so_e and so_s <= prev_e:
+                return False
+        sock_intervals_by_tuple.setdefault(sock_tuple, []).append((so.connection_id, so_s, so_e))
         sock_by_conn[so.connection_id] = so
 
     worker_socks_all = [
@@ -1526,7 +1592,10 @@ def verify_native_connection(
     for so in worker_socks_all:
         so_start = _parse_utc_dt(so.started_at)
         so_end = _parse_utc_dt(so.ended_at)
-        if so_start is None or so_end is None or so_start > so_end:
+        so_obs = _parse_utc_dt(so.observed_at) if so.observed_at is not None else None
+        if so_start is None or so_end is None or so_obs is None or not (so_start <= so_obs <= so_end):
+            return False
+        if worker_started > so_obs or daemon_started > so_start + _PROCESS_START_SLACK or daemon_started > so_obs:
             return False
         if not (
             so.observation_status == "ok"
@@ -1681,12 +1750,16 @@ def verify_native_connection(
             or observations.expected_profile_digest != registration.expected_profile_digest
         ):
             return False
-        if probe_scope is not None:
-            repo_id = probe_scope.get("repo_id")
-            checkout_id = probe_scope.get("checkout_id")
-            if not isinstance(repo_id, str) or not isinstance(checkout_id, str):
-                return False
-            if curr_lc.observed_scope != Scope(repo_id, checkout_id):
-                return False
+        if probe_scope is None:
+            return False
+        repo_id = probe_scope.get("repo_id")
+        checkout_id = probe_scope.get("checkout_id")
+        if not isinstance(repo_id, str) or not isinstance(checkout_id, str):
+            return False
+        if curr_lc.observed_scope != Scope(repo_id, checkout_id):
+            return False
+
+    if probe.kind == "native" and term_facts.tool_name not in _D8_NATIVE_ACTIVE_TOOLS:
+        return False
 
     return True

@@ -74,9 +74,40 @@ def inc2_child_command(operation: str, config_path: Path, extra_args: Sequence[s
     return [sys.executable, "-I", "-c", _RUNPY, str(INC2_CHILD_PATH), operation, str(config_path), *extra_args]
 
 
-def _win32_terminate_and_wait_pid(pid: int, timeout_s: float) -> None:
-    """Terminate ``pid`` via Win32 kernel handle and wait until the OS confirms termination."""
+def _win32_handle_creation_ticks(handle: int) -> int | None:
+    """Return 100ns FILETIME creation ticks for an already-open Win32 process handle."""
+    if sys.platform != "win32":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetProcessTimes.argtypes = [wintypes.HANDLE, *[ctypes.POINTER(wintypes.FILETIME)] * 4]
+    kernel32.GetProcessTimes.restype = wintypes.BOOL
+    times = [wintypes.FILETIME() for _ in range(4)]
+    if not kernel32.GetProcessTimes(wintypes.HANDLE(int(handle)), *(ctypes.byref(t) for t in times)):
+        return None
+    return (int(times[0].dwHighDateTime) << 32) | int(times[0].dwLowDateTime)
+
+
+def _current_win32_creation_ticks() -> int | None:
+    """Return 100ns creation ticks of the current Win32 process via ``GetCurrentProcess()``."""
+    if sys.platform != "win32":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetCurrentProcess.argtypes = []
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    return _win32_handle_creation_ticks(int(kernel32.GetCurrentProcess()))
+
+
+def _win32_terminate_and_wait_pid(pid: int, timeout_s: float, *, expected_ticks: int | None = None) -> bool:
+    """Terminate ``pid`` via Win32 kernel handle only when ``expected_ticks`` matches handle creation ticks."""
     assert sys.platform == "win32"
+    if expected_ticks is None or isinstance(expected_ticks, bool) or not isinstance(expected_ticks, int):
+        return False
     import pywintypes
     import win32api
     import win32con
@@ -86,9 +117,17 @@ def _win32_terminate_and_wait_pid(pid: int, timeout_s: float) -> None:
     access = win32con.PROCESS_TERMINATE | win32con.SYNCHRONIZE | win32con.PROCESS_QUERY_LIMITED_INFORMATION
     try:
         handle = win32api.OpenProcess(access, False, pid)
-    except pywintypes.error:
-        return  # Process already exited and OS handle entry was reclaimed.
+    except pywintypes.error as err:
+        error_invalid_parameter = getattr(win32con, "ERROR_INVALID_PARAMETER", 87)
+        if getattr(err, "winerror", None) == error_invalid_parameter:
+            return True
+        return False
     try:
+        actual_ticks = _win32_handle_creation_ticks(int(handle))
+        if actual_ticks is None:
+            return False
+        if actual_ticks != expected_ticks:
+            return True  # Target exited and PID was recycled; do not touch new occupant.
         with contextlib.suppress(pywintypes.error):
             win32process.TerminateProcess(handle, 9)
         timeout_ms = max(1, int(timeout_s * 1000))
@@ -98,6 +137,7 @@ def _win32_terminate_and_wait_pid(pid: int, timeout_s: float) -> None:
         code = win32process.GetExitCodeProcess(handle)
         if code == win32con.STILL_ACTIVE:
             raise AssertionError(f"Windows child process pid={pid} still reports STILL_ACTIVE after wait")
+        return True
     finally:
         win32api.CloseHandle(handle)
 
@@ -129,6 +169,14 @@ class Inc2ChildProcess:
         self._lock = threading.Lock()
         self._hello_event = threading.Event()
         self._inner_pid: int | None = None
+        self._inner_ticks: int | None = None
+        proc_handle = getattr(self._proc, "_handle", None)
+        self._proc_ticks: int | None = (
+            _win32_handle_creation_ticks(int(proc_handle))
+            if (sys.platform == "win32" and proc_handle is not None)
+            else None
+        )
+        self.cleanup_unverified = False
         self._events: queue.Queue[dict[str, JsonValue] | None] = queue.Queue()
         self._buffered_events: list[dict[str, JsonValue]] = []
         self._terminal_result_event: dict[str, JsonValue] | None = None
@@ -174,8 +222,10 @@ class Inc2ChildProcess:
                     if not isinstance(parsed, dict):
                         continue
                     if parsed.get("event") == "hello" and type(parsed.get("pid")) is int:
+                        raw_ticks = parsed.get("creation_ticks")
                         with self._lock:
                             self._inner_pid = int(parsed["pid"])
+                            self._inner_ticks = int(raw_ticks) if type(raw_ticks) is int else None
                         self._hello_event.set()
                         continue
                     self._events.put(parsed)
@@ -328,14 +378,22 @@ class Inc2ChildProcess:
 
         inner = self.inner_pid
         launcher = self.launcher_pid
+        with self._lock:
+            inner_ticks = self._inner_ticks
 
         if sys.platform == "win32":
             if inner is not None and inner != launcher:
-                _win32_terminate_and_wait_pid(inner, timeout)
-            _win32_terminate_and_wait_pid(launcher, timeout)
+                if inner_ticks is None or not _win32_terminate_and_wait_pid(
+                    inner, timeout, expected_ticks=inner_ticks
+                ):
+                    self.cleanup_unverified = True
             with contextlib.suppress(OSError):
                 self._proc.kill()
             self._proc.wait(timeout=timeout)
+            if self._proc_ticks is None:
+                self.cleanup_unverified = True
+            else:
+                _win32_terminate_and_wait_pid(launcher, timeout, expected_ticks=self._proc_ticks)
         else:
             if inner is not None and inner != launcher:
                 _posix_kill_pid(inner)
@@ -515,7 +573,14 @@ def _child_main(argv: Sequence[str]) -> int:
     sys.stdout = sys.stderr
     ctrl_out = os.fdopen(ctrl_fd, "w", encoding="utf-8", buffering=1)
     try:
-        _emit(ctrl_out, {"event": "hello", "pid": os.getpid()})
+        _emit(
+            ctrl_out,
+            {
+                "event": "hello",
+                "pid": os.getpid(),
+                "creation_ticks": _current_win32_creation_ticks(),
+            },
+        )
         if len(argv) < 3:
             raise ValueError(f"Expected <operation> <config_path>, got {list(argv)!r}")
         operation = argv[1]

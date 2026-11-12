@@ -69,7 +69,7 @@ from tests.support.inc2_cli import (
     InstalledMcpPipeSession,
     InstalledServeProcess,
     _win32_descendant_identities,
-    _win32_process_creation_ticks,
+    _win32_popen_creation_ticks,
     _win32_wait_or_terminate_pid,
     clean_installed_subprocess_env,
     installed_script_path,
@@ -471,8 +471,8 @@ class MarkedRun:
 
 def _stop_tree(proc: "subprocess.Popen[str]") -> None:
     """Graceful foreground stop (CTRL_BREAK / SIGTERM to the process group), then kill whatever is left."""
-    root_ticks = _win32_process_creation_ticks(proc.pid) if sys.platform == "win32" else None
-    tracked = _win32_descendant_identities(proc.pid, root_ticks=root_ticks)
+    root_ticks = _win32_popen_creation_ticks(proc) if sys.platform == "win32" else None
+    tracked = _win32_descendant_identities(proc.pid, root_ticks=root_ticks) if root_ticks is not None else []
     with contextlib.suppress(OSError, ValueError):
         if sys.platform == "win32":
             os.kill(proc.pid, int(signal.CTRL_BREAK_EVENT))

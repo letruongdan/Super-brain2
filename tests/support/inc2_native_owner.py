@@ -309,7 +309,17 @@ def _install_loopback_server_hooks(
 
     hook_lock = threading.Lock()
     conn_ctx_by_tid: dict[
-        int, tuple[str, str, str, int, str, int, Future[tuple[int | None, str | None]]]
+        int,
+        tuple[
+            str,
+            str,
+            str,
+            int,
+            str,
+            int,
+            Future[tuple[int | None, str | None, str | None, int | None]],
+            dict[str, Any],
+        ],
     ] = {}
     pending_cmds: dict[
         int,
@@ -323,7 +333,8 @@ def _install_loopback_server_hooks(
             int,
             str,
             str,
-            Future[tuple[int | None, str | None]],
+            Future[tuple[int | None, str | None, str | None, int | None]],
+            dict[str, Any] | None,
         ],
     ] = {}
     flush_by_thread: dict[int, tuple[int | None, str | None]] = {}
@@ -331,6 +342,9 @@ def _install_loopback_server_hooks(
     active_finalizers: list[threading.Thread] = []
     ready_seen = initial_ready
     lookup_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="inc2-obs-lookup")
+    with contextlib.suppress(Exception):
+        for pre_fut in [lookup_pool.submit(lambda: None) for _ in range(4)]:
+            pre_fut.result(timeout=1.0)
 
     loopback_mod: Any = _loopback_server
     auth_gate_cls: Any = AuthGate
@@ -340,16 +354,48 @@ def _install_loopback_server_hooks(
     orig_conn_worker = _loopback_server.LoopbackServer._conn_worker
     orig_authorize_stamp = AuthGate.authorize_stamp
 
-    def _safe_client_identity(peer_port: int, listen_port: int) -> tuple[int | None, str | None]:
+    def _safe_client_identity(
+        peer_port: int,
+        listen_port: int,
+        conn_state: dict[str, Any] | None = None,
+    ) -> tuple[int | None, str | None, str | None, int | None]:
         if peer_port <= 0 or listen_port <= 0:
-            return None, None
+            return None, None, None, None
+        if conn_state is not None and conn_state["closed_event"].is_set():
+            return None, None, None, None
         client_pid: int | None = None
         client_started_at: str | None = None
+        observed_at: str | None = None
+        observed_ns: int | None = None
         with contextlib.suppress(OSError, subprocess.SubprocessError):
             client_pid = _lookup_loopback_client_pid(peer_port, listen_port)
             if client_pid is not None:
+                observed_ns = time.monotonic_ns()
+                observed_at = _utc_now_z()
+                if conn_state is not None and conn_state["closed_event"].is_set():
+                    return None, None, None, None
                 client_started_at = process_started_at_for_pid(client_pid)
-        return client_pid, client_started_at
+        if (
+            client_pid is None
+            or client_started_at is None
+            or observed_at is None
+            or observed_ns is None
+            or (conn_state is not None and conn_state["closed_event"].is_set())
+        ):
+            return None, None, None, None
+        return client_pid, client_started_at, observed_at, observed_ns
+
+    def _submit_lookup(
+        peer_port: int,
+        listen_port: int,
+        conn_state: dict[str, Any] | None,
+    ) -> Future[tuple[int | None, str | None, str | None, int | None]]:
+        try:
+            return lookup_pool.submit(_safe_client_identity, peer_port, listen_port, conn_state)
+        except Exception:  # noqa: BLE001 - degraded collector never breaks daemon worker
+            fallback: Future[tuple[int | None, str | None, str | None, int | None]] = Future()
+            fallback.set_result((None, None, None, None))
+            return fallback
 
     def _resolve_principal_and_cred(
         gate: Any,
@@ -372,7 +418,8 @@ def _install_loopback_server_hooks(
         gate: Any,
         connection_id: str,
         conn_started_at: str,
-        lookup_fut: Future[tuple[int | None, str | None]],
+        lookup_fut: Future[tuple[int | None, str | None, str | None, int | None]],
+        conn_state: dict[str, Any] | None,
         principal_id: str,
         credential_id: str,
         tool_name: str,
@@ -393,93 +440,135 @@ def _install_loopback_server_hooks(
         eff_writer_epoch = ident.writer_epoch if ident is not None else 0
         eff_instance_id = ident.instance_id if ident is not None else (instance_id or "")
 
-        def _finalize(wait_s: float) -> None:
-            client_pid: int | None = None
-            client_started_at: str | None = None
-            try:
-                client_pid, client_started_at = lookup_fut.result(timeout=max(0.0, wait_s))
-            except Exception:  # noqa: BLE001 - observation collector failure stays off request path
-                client_pid, client_started_at = None, None
-            obs_status = (
-                "ok"
-                if (client_pid is not None and client_started_at is not None)
-                else "observation_incomplete"
-            )
-            eq.put_nowait(
-                {
-                    "event": "owner_call",
-                    "connection_id": connection_id,
-                    "observation_status": obs_status,
-                    "daemon_pid": daemon_pid,
-                    "daemon_started_at": daemon_started_at,
-                    "store_id": eff_store_id,
-                    "writer_epoch": eff_writer_epoch,
-                    "instance_id": eff_instance_id,
-                    "principal_id": principal_id,
-                    "credential_id": credential_id,
-                    "tool_name": tool_name,
-                    "ready": ready_val,
-                    "auth_stamp_matched": auth_matched,
-                    "response_flushed_ok": response_flushed_ok,
-                    "response_digest": resp_digest,
-                    "listen_host": listen_host,
-                    "listen_port": listen_port,
-                    "client_host": peer_host,
-                    "client_port": peer_port if peer_port > 0 else None,
-                    "client_pid": client_pid,
-                    "client_started_at": client_started_at,
-                    "started_at": req_started_at,
-                    "ended_at": ended_at,
-                    "call_id": None,
-                    "selected_scope": selected_scope,
-                }
-            )
-            if (
-                obs_status == "ok"
-                and eff_writer_epoch >= 1
-                and peer_port > 0
-                and listen_port > 0
-                and client_pid is not None
-                and client_started_at is not None
-            ):
-                so_ended_at = _utc_now_z()
-                if so_ended_at < ended_at:
-                    so_ended_at = ended_at
+        def _emit_events(
+            *,
+            obs_status: str,
+            client_pid: int | None,
+            client_started_at: str | None,
+            observed_at: str | None,
+            so_ended_at: str | None,
+        ) -> None:
+            with contextlib.suppress(Exception):
                 eq.put_nowait(
                     {
-                        "event": "socket_observation",
+                        "event": "owner_call",
                         "connection_id": connection_id,
-                        "observation_status": "ok",
-                        "client_pid": client_pid,
-                        "client_started_at": client_started_at,
+                        "observation_status": obs_status,
                         "daemon_pid": daemon_pid,
                         "daemon_started_at": daemon_started_at,
-                        "local_addr": peer_host,
-                        "local_port": peer_port,
-                        "remote_addr": listen_host,
-                        "remote_port": listen_port,
                         "store_id": eff_store_id,
                         "writer_epoch": eff_writer_epoch,
                         "instance_id": eff_instance_id,
-                        "started_at": conn_started_at,
-                        "ended_at": so_ended_at,
+                        "principal_id": principal_id,
+                        "credential_id": credential_id,
+                        "tool_name": tool_name,
+                        "ready": ready_val,
+                        "auth_stamp_matched": auth_matched,
+                        "response_flushed_ok": response_flushed_ok,
+                        "response_digest": resp_digest,
+                        "listen_host": listen_host,
+                        "listen_port": listen_port,
+                        "client_host": peer_host,
+                        "client_port": peer_port if peer_port > 0 else None,
+                        "client_pid": client_pid,
+                        "client_started_at": client_started_at,
+                        "started_at": req_started_at,
+                        "ended_at": ended_at,
+                        "call_id": None,
+                        "selected_scope": selected_scope,
                     }
                 )
+            if eff_writer_epoch >= 1 and peer_port > 0 and listen_port > 0 and so_ended_at is not None:
+                if so_ended_at < conn_started_at:
+                    so_ended_at = conn_started_at
+                with contextlib.suppress(Exception):
+                    eq.put_nowait(
+                        {
+                            "event": "socket_observation",
+                            "connection_id": connection_id,
+                            "observation_status": obs_status,
+                            "client_pid": client_pid if obs_status == "ok" else None,
+                            "client_started_at": client_started_at if obs_status == "ok" else None,
+                            "daemon_pid": daemon_pid,
+                            "daemon_started_at": daemon_started_at,
+                            "local_addr": peer_host,
+                            "local_port": peer_port,
+                            "remote_addr": listen_host,
+                            "remote_port": listen_port,
+                            "store_id": eff_store_id,
+                            "writer_epoch": eff_writer_epoch,
+                            "instance_id": eff_instance_id,
+                            "started_at": conn_started_at,
+                            "observed_at": observed_at if obs_status == "ok" else None,
+                            "ended_at": so_ended_at,
+                        }
+                    )
 
-        if lookup_fut.done():
+        def _finalize(wait_s: float) -> None:
+            client_pid: int | None = None
+            client_started_at: str | None = None
+            observed_at: str | None = None
+            observed_ns: int | None = None
+            try:
+                client_pid, client_started_at, observed_at, observed_ns = lookup_fut.result(timeout=max(0.0, wait_s))
+            except Exception:  # noqa: BLE001 - observation collector failure stays off request path
+                client_pid, client_started_at, observed_at, observed_ns = None, None, None, None
+
+            closed_at: str | None = None
+            closed_ns: int | None = None
+            conn_started_ns: int | None = None
+            if conn_state is not None:
+                with contextlib.suppress(Exception):
+                    conn_state["closed_event"].wait(timeout=max(0.0, wait_s))
+                closed_at = conn_state["closed_at"]
+                closed_ns = conn_state["closed_ns"]
+                conn_started_ns = conn_state["conn_started_ns"]
+
+            obs_ok = (
+                client_pid is not None
+                and client_started_at is not None
+                and observed_at is not None
+                and observed_ns is not None
+                and closed_at is not None
+                and closed_ns is not None
+                and conn_started_ns is not None
+                and conn_started_ns <= observed_ns <= closed_ns
+                and conn_started_at <= observed_at <= closed_at
+            )
+            obs_status = "ok" if obs_ok else "observation_incomplete"
+            _emit_events(
+                obs_status=obs_status,
+                client_pid=client_pid if obs_ok else None,
+                client_started_at=client_started_at if obs_ok else None,
+                observed_at=observed_at if obs_ok else None,
+                so_ended_at=closed_at,
+            )
+
+        if lookup_fut.done() and (conn_state is None or conn_state["closed_event"].is_set()):
             _finalize(0.0)
             return
 
-        th = threading.Thread(
-            target=_finalize,
-            args=(collector_timeout_s,),
-            name=f"inc2-obs-finalize-{connection_id}",
-            daemon=True,
-        )
+        try:
+            th = threading.Thread(
+                target=_finalize,
+                args=(collector_timeout_s,),
+                name=f"inc2-obs-finalize-{connection_id}",
+                daemon=True,
+            )
+            th.start()
+        except Exception:  # noqa: BLE001 - finalizer start failure degrades evidence without breaking worker
+            fallback_closed = conn_state["closed_at"] if conn_state is not None else None
+            _emit_events(
+                obs_status="observation_incomplete",
+                client_pid=None,
+                client_started_at=None,
+                observed_at=None,
+                so_ended_at=fallback_closed,
+            )
+            return
         with hook_lock:
             active_finalizers[:] = [t for t in active_finalizers if t.is_alive()]
             active_finalizers.append(th)
-        th.start()
 
     def _tap_read_cmd(
         ssl_sock: Any,
@@ -496,37 +585,40 @@ def _install_loopback_server_hooks(
             conn_ctx = conn_ctx_by_tid.get(tid)
         cmd = orig_read_cmd(ssl_sock, reader, ready, deadline_ns=deadline_ns, monotonic_ns=monotonic_ns)
         if cmd is not None:
-            scope_dict = cmd.selected_scope.to_dict() if cmd.selected_scope is not None else None
-            listen_host = conn_ctx[2] if conn_ctx is not None else "127.0.0.1"
-            listen_port = conn_ctx[3] if conn_ctx is not None else 0
-            peer_host = conn_ctx[4] if conn_ctx is not None else "127.0.0.1"
-            peer_port = conn_ctx[5] if conn_ctx is not None else 0
-            if listen_port <= 0 or peer_port <= 0:
-                with contextlib.suppress(OSError):
-                    lhost, lport = ssl_sock.getsockname()[:2]
-                    phost, pport = ssl_sock.getpeername()[:2]
-                    listen_host, listen_port = str(lhost), int(lport)
-                    peer_host, peer_port = str(phost), int(pport)
-            connection_id = conn_ctx[0] if conn_ctx is not None else f"conn-tid-{tid}"
-            conn_started_at = conn_ctx[1] if conn_ctx is not None else _utc_now_z()
-            lookup_fut = (
-                conn_ctx[6]
-                if conn_ctx is not None
-                else lookup_pool.submit(_safe_client_identity, peer_port, listen_port)
-            )
-            with hook_lock:
-                pending_cmds[tid] = (
-                    str(cmd.tool),
-                    scope_dict,
-                    _utc_now_z(),
-                    listen_host,
-                    listen_port,
-                    peer_host,
-                    peer_port,
-                    connection_id,
-                    conn_started_at,
-                    lookup_fut,
+            with contextlib.suppress(Exception):
+                scope_dict = cmd.selected_scope.to_dict() if cmd.selected_scope is not None else None
+                listen_host = conn_ctx[2] if conn_ctx is not None else "127.0.0.1"
+                listen_port = conn_ctx[3] if conn_ctx is not None else 0
+                peer_host = conn_ctx[4] if conn_ctx is not None else "127.0.0.1"
+                peer_port = conn_ctx[5] if conn_ctx is not None else 0
+                if listen_port <= 0 or peer_port <= 0:
+                    with contextlib.suppress(OSError):
+                        lhost, lport = ssl_sock.getsockname()[:2]
+                        phost, pport = ssl_sock.getpeername()[:2]
+                        listen_host, listen_port = str(lhost), int(lport)
+                        peer_host, peer_port = str(phost), int(pport)
+                connection_id = conn_ctx[0] if conn_ctx is not None else f"conn-tid-{tid}"
+                conn_started_at = conn_ctx[1] if conn_ctx is not None else _utc_now_z()
+                c_state = conn_ctx[7] if conn_ctx is not None else None
+                lookup_fut = (
+                    conn_ctx[6]
+                    if conn_ctx is not None
+                    else _submit_lookup(peer_port, listen_port, c_state)
                 )
+                with hook_lock:
+                    pending_cmds[tid] = (
+                        str(cmd.tool),
+                        scope_dict,
+                        _utc_now_z(),
+                        listen_host,
+                        listen_port,
+                        peer_host,
+                        peer_port,
+                        connection_id,
+                        conn_started_at,
+                        lookup_fut,
+                        c_state,
+                    )
         return cmd
 
     def _tap_write_json(
@@ -547,7 +639,7 @@ def _install_loopback_server_hooks(
             monotonic_ns=monotonic_ns,
         )
         tid = threading.get_ident()
-        with hook_lock:
+        with contextlib.suppress(Exception), hook_lock:
             flush_by_thread[tid] = (int(status), digest_bytes(body))
 
     def _tap_authorize_stamp(gate_self: Any, stamp: Any) -> bool:
@@ -560,6 +652,12 @@ def _install_loopback_server_hooks(
         tid = threading.get_ident()
         connection_id = f"conn-{int(conn_id)}"
         conn_started_at = _utc_now_z()
+        conn_state: dict[str, Any] = {
+            "conn_started_ns": time.monotonic_ns(),
+            "closed_event": threading.Event(),
+            "closed_at": None,
+            "closed_ns": None,
+        }
         listen_host = "127.0.0.1"
         listen_port = 0
         peer_host = "127.0.0.1"
@@ -569,7 +667,7 @@ def _install_loopback_server_hooks(
             phost, pport = raw_sock.getpeername()[:2]
             listen_host, listen_port = str(lhost), int(lport)
             peer_host, peer_port = str(phost), int(pport)
-        lookup_fut = lookup_pool.submit(_safe_client_identity, peer_port, listen_port)
+        lookup_fut = _submit_lookup(peer_port, listen_port, conn_state)
         with hook_lock:
             conn_ctx_by_tid[tid] = (
                 connection_id,
@@ -579,10 +677,14 @@ def _install_loopback_server_hooks(
                 peer_host,
                 peer_port,
                 lookup_fut,
+                conn_state,
             )
         try:
             orig_conn_worker(self, conn_id, raw_sock, accept_ns)
         finally:
+            conn_state["closed_ns"] = time.monotonic_ns()
+            conn_state["closed_at"] = _utc_now_z()
+            conn_state["closed_event"].set()
             with hook_lock:
                 conn_ctx_by_tid.pop(tid, None)
                 cmd_info = pending_cmds.pop(tid, None)
@@ -600,29 +702,32 @@ def _install_loopback_server_hooks(
                     c_conn_id,
                     c_started_at,
                     c_lookup_fut,
+                    c_state,
                 ) = cmd_info
-                gate = self._owner.auth_gate
-                principal_id, credential_id = _resolve_principal_and_cred(gate, None, False)
-                _schedule_emit(
-                    gate=gate,
-                    connection_id=c_conn_id,
-                    conn_started_at=c_started_at,
-                    lookup_fut=c_lookup_fut,
-                    principal_id=principal_id,
-                    credential_id=credential_id,
-                    tool_name=tool_name,
-                    ready_val=False,
-                    auth_matched=False,
-                    response_flushed_ok=bool(flushed_status == 200 and flushed_digest is not None),
-                    resp_digest=flushed_digest,
-                    listen_host=c_listen_host,
-                    listen_port=c_listen_port,
-                    peer_host=c_peer_host,
-                    peer_port=c_peer_port,
-                    req_started_at=req_started_at,
-                    ended_at=_utc_now_z(),
-                    selected_scope=selected_scope,
-                )
+                with contextlib.suppress(Exception):
+                    gate = self._owner.auth_gate
+                    principal_id, credential_id = _resolve_principal_and_cred(gate, None, False)
+                    _schedule_emit(
+                        gate=gate,
+                        connection_id=c_conn_id,
+                        conn_started_at=c_started_at,
+                        lookup_fut=c_lookup_fut,
+                        conn_state=c_state,
+                        principal_id=principal_id,
+                        credential_id=credential_id,
+                        tool_name=tool_name,
+                        ready_val=False,
+                        auth_matched=False,
+                        response_flushed_ok=bool(flushed_status == 200 and flushed_digest is not None),
+                        resp_digest=flushed_digest,
+                        listen_host=c_listen_host,
+                        listen_port=c_listen_port,
+                        peer_host=c_peer_host,
+                        peer_port=c_peer_port,
+                        req_started_at=req_started_at,
+                        ended_at=_utc_now_z(),
+                        selected_scope=selected_scope,
+                    )
 
     def _tap_release(self: Any, ssl_sock: Any, reply: Any, tool_deadline_ns: int) -> None:
         tid = threading.get_ident()
@@ -643,13 +748,14 @@ def _install_loopback_server_hooks(
         conn_started_at = (
             cmd_info[8] if cmd_info is not None else (conn_ctx[1] if conn_ctx is not None else req_started_at)
         )
+        conn_state = cmd_info[10] if cmd_info is not None else (conn_ctx[7] if conn_ctx is not None else None)
         lookup_fut = (
             cmd_info[9]
             if cmd_info is not None
             else (
                 conn_ctx[6]
                 if conn_ctx is not None
-                else lookup_pool.submit(_safe_client_identity, peer_port, listen_port)
+                else _submit_lookup(peer_port, listen_port, conn_state)
             )
         )
 
@@ -668,61 +774,63 @@ def _install_loopback_server_hooks(
             orig_release(self, ssl_sock, reply, tool_deadline_ns)
             release_completed = True
         finally:
-            with hook_lock:
-                flushed_status, flushed_digest = flush_by_thread.pop(tid, (None, None))
-                stamp_result = stamp_result_by_tid.pop(tid, None)
+            with contextlib.suppress(Exception):
+                with hook_lock:
+                    flushed_status, flushed_digest = flush_by_thread.pop(tid, (None, None))
+                    stamp_result = stamp_result_by_tid.pop(tid, None)
 
-            ended_at = _utc_now_z()
-            env_ok = isinstance(reply.envelope, dict) and reply.envelope.get("ok") is True
-            if not release_completed or expected_env_digest is None:
-                auth_matched = False
-                response_flushed_ok = bool(flushed_status == 200 and flushed_digest is not None)
-            elif env_ok:
-                if stamp_result is not None:
-                    auth_matched = bool(
-                        stamp_result and flushed_status == 200 and flushed_digest == expected_env_digest
+                ended_at = _utc_now_z()
+                env_ok = isinstance(reply.envelope, dict) and reply.envelope.get("ok") is True
+                if not release_completed or expected_env_digest is None:
+                    auth_matched = False
+                    response_flushed_ok = bool(flushed_status == 200 and flushed_digest is not None)
+                elif env_ok:
+                    if stamp_result is not None:
+                        auth_matched = bool(
+                            stamp_result and flushed_status == 200 and flushed_digest == expected_env_digest
+                        )
+                    else:
+                        auth_matched = bool(
+                            grant_stamp is not None and flushed_status == 200 and flushed_digest == expected_env_digest
+                        )
+                    response_flushed_ok = bool(
+                        auth_matched and flushed_status == 200 and flushed_digest == expected_env_digest
                     )
                 else:
-                    auth_matched = bool(
-                        grant_stamp is not None and flushed_status == 200 and flushed_digest == expected_env_digest
+                    auth_matched = False
+                    response_flushed_ok = bool(flushed_status == 200 and flushed_digest == expected_env_digest)
+
+                principal_id, credential_id = _resolve_principal_and_cred(gate, grant_stamp, auth_matched)
+                if not auth_matched:
+                    ready_val = False
+                elif tool_name == "get_health":
+                    data = reply.envelope.get("data") if isinstance(reply.envelope, dict) else None
+                    ready_val = bool(isinstance(data, dict) and data.get("ready") is True)
+                else:
+                    ready_val = ready_seen
+
+                if tool_name is not None:
+                    _schedule_emit(
+                        gate=gate,
+                        connection_id=connection_id,
+                        conn_started_at=conn_started_at,
+                        lookup_fut=lookup_fut,
+                        conn_state=conn_state,
+                        principal_id=principal_id,
+                        credential_id=credential_id,
+                        tool_name=tool_name,
+                        ready_val=ready_val,
+                        auth_matched=auth_matched,
+                        response_flushed_ok=response_flushed_ok,
+                        resp_digest=flushed_digest,
+                        listen_host=listen_host,
+                        listen_port=listen_port,
+                        peer_host=peer_host,
+                        peer_port=peer_port,
+                        req_started_at=req_started_at,
+                        ended_at=ended_at,
+                        selected_scope=selected_scope,
                     )
-                response_flushed_ok = bool(
-                    auth_matched and flushed_status == 200 and flushed_digest == expected_env_digest
-                )
-            else:
-                auth_matched = False
-                response_flushed_ok = bool(flushed_status == 200 and flushed_digest == expected_env_digest)
-
-            principal_id, credential_id = _resolve_principal_and_cred(gate, grant_stamp, auth_matched)
-            if not auth_matched:
-                ready_val = False
-            elif tool_name == "get_health":
-                data = reply.envelope.get("data") if isinstance(reply.envelope, dict) else None
-                ready_val = bool(isinstance(data, dict) and data.get("ready") is True)
-            else:
-                ready_val = ready_seen
-
-            if tool_name is not None:
-                _schedule_emit(
-                    gate=gate,
-                    connection_id=connection_id,
-                    conn_started_at=conn_started_at,
-                    lookup_fut=lookup_fut,
-                    principal_id=principal_id,
-                    credential_id=credential_id,
-                    tool_name=tool_name,
-                    ready_val=ready_val,
-                    auth_matched=auth_matched,
-                    response_flushed_ok=response_flushed_ok,
-                    resp_digest=flushed_digest,
-                    listen_host=listen_host,
-                    listen_port=listen_port,
-                    peer_host=peer_host,
-                    peer_port=peer_port,
-                    req_started_at=req_started_at,
-                    ended_at=ended_at,
-                    selected_scope=selected_scope,
-                )
 
     def _set_ready(value: bool) -> None:
         nonlocal ready_seen
@@ -773,6 +881,7 @@ def run_observed_owner(config_path: Path, evidence_dir: Path, stop: threading.Ev
         raise ValueError("absolute evidence_dir required")
 
     import superbrain
+    from superbrain.adapters.os import daemon_config as daemon_config_mod
     from superbrain.composition import daemon_entry, owner_entry
     from superbrain.core.canonical import digest_bytes
     from superbrain.core.wire import load_catalog
@@ -782,9 +891,25 @@ def run_observed_owner(config_path: Path, evidence_dir: Path, stop: threading.Ev
     daemon_started_at = process_started_at_for_pid(daemon_pid)
     module_file = str(Path(superbrain.__file__).resolve()) if superbrain.__file__ else ""
     schema_sha256 = load_catalog().schema_sha256
-    config_digest = digest_bytes(config_path.read_bytes())
 
-    cfg, adapters, scratch_base = owner_entry._explicit_owner_adapters(config_path)
+    captured_digests: list[str] = []
+    orig_checked_read = daemon_config_mod._read_checked_file_bytes
+    target_cfg_norm = os.path.normcase(os.path.abspath(config_path))
+
+    def _single_read_config(path: Path, os_: Any, *, max_bytes: int, **kwargs: Any) -> bytes:
+        raw = orig_checked_read(path, os_, max_bytes=max_bytes, **kwargs)
+        if os.path.normcase(os.path.abspath(path)) == target_cfg_norm:
+            captured_digests.append(digest_bytes(raw))
+        return raw
+
+    daemon_config_mod._read_checked_file_bytes = _single_read_config
+    try:
+        cfg, adapters, scratch_base = owner_entry._explicit_owner_adapters(config_path)
+    finally:
+        daemon_config_mod._read_checked_file_bytes = orig_checked_read
+    if len(captured_digests) != 1:
+        raise RuntimeError(f"Expected single checked config read for {config_path}, got {len(captured_digests)}")
+    config_digest = captured_digests[0]
     event_queue: queue.SimpleQueue[dict[str, JsonValue] | None] = queue.SimpleQueue()
     writer_thread = threading.Thread(
         target=_run_event_writer,

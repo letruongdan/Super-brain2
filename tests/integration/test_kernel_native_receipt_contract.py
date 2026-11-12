@@ -76,6 +76,7 @@ def _sample_world(
     host: str = "claude-code",
     environment: str = "native_host",
     launcher_same_as_worker: bool = False,
+    tool_name: str = "get_health",
 ) -> tuple[NativeConnectionProbe, ObserverRegistration, ObservationSet, Path]:
     evidence_root = root / "evidence"
     evidence_root.mkdir(parents=True, exist_ok=True)
@@ -127,6 +128,7 @@ def _sample_world(
     daemon_proc = ProcessIdentity(pid=4104, started_at="2026-11-12T03:59:59.000000Z")
 
     scope_a = Scope(repo_id="repo-t9-a", checkout_id="chk-t9-a")
+    eff_scope: dict[str, JsonValue] | None = None if tool_name == "get_health" else scope_a.to_dict()
     probe_kind: Any = kind
     probe = NativeConnectionProbe(
         schema_version=NATIVE_CONNECTION_SCHEMA_VERSION,
@@ -177,13 +179,13 @@ def _sample_world(
         ),
         terminal_facts=TerminalToolFacts(
             ready=True,
-            tool_name="get_health",
+            tool_name=tool_name,
             ok=True,
             status="ok",
             auth_granted=True,
             response_flushed=True,
             response_digest=response_digest,
-            observed_scope=scope_a.to_dict(),
+            observed_scope=eff_scope,
         ),
     )
 
@@ -216,7 +218,7 @@ def _sample_world(
         host_process=host_proc,
         shim_launcher_process=launcher_proc,
         shim_worker_process=worker_proc,
-        tool_name="get_health",
+        tool_name=tool_name,
         terminal_ok=True,
         response_digest=response_digest,
         started_at="2026-11-12T04:00:02.000000Z",
@@ -229,7 +231,7 @@ def _sample_world(
         instance_id=instance_id,
         principal_id=principal_id,
         credential_id=cred_id,
-        tool_name="get_health",
+        tool_name=tool_name,
         ready=True,
         auth_stamp_matched=True,
         response_flushed_ok=True,
@@ -239,7 +241,7 @@ def _sample_world(
         started_at="2026-11-12T04:00:02.010000Z",
         ended_at="2026-11-12T04:00:02.140000Z",
         call_id=call_id,
-        selected_scope=scope_a.to_dict(),
+        selected_scope=eff_scope,
         client_host="127.0.0.1",
         client_port=52001,
         client_process=worker_proc,
@@ -258,6 +260,7 @@ def _sample_world(
         instance_id=instance_id,
         connection_id=conn_id,
         started_at="2026-11-12T04:00:02.005000Z",
+        observed_at="2026-11-12T04:00:02.020000Z",
         ended_at="2026-11-12T04:00:02.145000Z",
         observation_status="ok",
     )
@@ -293,7 +296,7 @@ def _sample_world(
                 "host_process": host_proc.to_dict(),
                 "shim_launcher_process": launcher_proc.to_dict(),
                 "shim_worker_process": worker_proc.to_dict(),
-                "tool_name": "get_health",
+                "tool_name": tool_name,
                 "terminal_ok": True,
                 "response_digest": response_digest,
                 "started_at": host_call_obs.started_at,
@@ -315,7 +318,7 @@ def _sample_world(
                 "instance_id": instance_id,
                 "principal_id": principal_id,
                 "credential_id": cred_id,
-                "tool_name": "get_health",
+                "tool_name": tool_name,
                 "ready": True,
                 "auth_stamp_matched": True,
                 "response_flushed_ok": True,
@@ -329,7 +332,7 @@ def _sample_world(
                 "started_at": owner_call_obs.started_at,
                 "ended_at": owner_call_obs.ended_at,
                 "call_id": call_id,
-                "selected_scope": scope_a.to_dict(),
+                "selected_scope": eff_scope,
             }
         )
         + b"\n"
@@ -352,6 +355,7 @@ def _sample_world(
                 "writer_epoch": writer_epoch,
                 "instance_id": instance_id,
                 "started_at": sock_obs.started_at,
+                "observed_at": sock_obs.observed_at,
                 "ended_at": sock_obs.ended_at,
             }
         )
@@ -597,6 +601,9 @@ def test_native_call_join_rejects_reused_identity_and_missing_terminal(trusted_t
     )
 
     # Lifecycle workspace transition enforcement inside verifier: reused shim or stale profile rejects!
+    probe_d3, reg_d3, obs_d3, _ = _sample_world(case_dir / "d3-lifecycle", tool_name="get_job")
+    assert probe_d3.shim_worker_process is not None
+    assert probe_d3.profile_digest is not None
     scope_a = Scope(repo_id="repo-t9-a", checkout_id="chk-t9-a")
     scope_b = Scope(repo_id="repo-t9-b", checkout_id="chk-t9-b")
     obs_before = ShimLaunchObservation(
@@ -606,19 +613,19 @@ def test_native_call_join_rejects_reused_identity_and_missing_terminal(trusted_t
         observed_scope=scope_a,
     )
     obs_after_good = ShimLaunchObservation(
-        pid=probe.shim_worker_process.pid,
-        started_at=probe.shim_worker_process.started_at,
-        profile_digest=probe.profile_digest or "",
+        pid=probe_d3.shim_worker_process.pid,
+        started_at=probe_d3.shim_worker_process.started_at,
+        profile_digest=probe_d3.profile_digest,
         observed_scope=scope_b,
     )
-    assert probe.terminal_facts is not None
+    assert probe_d3.terminal_facts is not None
     probe_b_lc = replace(
-        probe,
-        terminal_facts=replace(probe.terminal_facts, observed_scope=scope_b.to_dict()),
+        probe_d3,
+        terminal_facts=replace(probe_d3.terminal_facts, observed_scope=scope_b.to_dict()),
     )
-    ev_root_lc = obs.artifact_paths["config"].parent
+    ev_root_lc = obs_d3.artifact_paths["config"].parent
     owner_events_lc_path = ev_root_lc / "owner-events-lc.jsonl"
-    oc0 = obs.owner_events[0]
+    oc0 = obs_d3.owner_events[0]
     assert oc0.client_process is not None
     owner_events_lc_path.write_bytes(
         canonical_json(
@@ -652,36 +659,36 @@ def test_native_call_join_rejects_reused_identity_and_missing_terminal(trusted_t
         )
         + b"\n"
     )
-    ev_idx_lc_obj = json.loads(obs.artifact_paths["evidence_index"].read_text(encoding="utf-8"))
+    ev_idx_lc_obj = json.loads(obs_d3.artifact_paths["evidence_index"].read_text(encoding="utf-8"))
     ev_idx_lc_obj["artifacts"]["owner_events"] = digest_bytes(owner_events_lc_path.read_bytes())
     ev_idx_lc_path = ev_root_lc / "evidence-index-lc.json"
     ev_idx_lc_path.write_bytes(canonical_json(ev_idx_lc_obj) + b"\n")
     obs_b_lc = replace(
-        obs,
+        obs_d3,
         artifact_paths={
-            **obs.artifact_paths,
+            **obs_d3.artifact_paths,
             "owner_events": owner_events_lc_path,
             "evidence_index": ev_idx_lc_path,
         },
-        owner_events=(replace(obs.owner_events[0], selected_scope=scope_b.to_dict()),),
+        owner_events=(replace(obs_d3.owner_events[0], selected_scope=scope_b.to_dict()),),
         prior_lifecycle=obs_before,
         current_lifecycle=obs_after_good,
         expected_scope=scope_b,
-        expected_profile_digest=probe.profile_digest,
+        expected_profile_digest=probe_d3.profile_digest,
         expected_first_scope=scope_a,
     )
-    assert verify_native_connection(probe_b_lc, registration=reg, observations=obs_b_lc) is True
+    assert verify_native_connection(probe_b_lc, registration=reg_d3, observations=obs_b_lc) is True
     # Contradictory probe observed_scope (scope_a) vs current_lifecycle (scope_b) MUST fail.
     assert (
         verify_native_connection(
-            probe,
-            registration=reg,
+            probe_d3,
+            registration=reg_d3,
             observations=replace(
-                obs,
+                obs_d3,
                 prior_lifecycle=obs_before,
                 current_lifecycle=obs_after_good,
                 expected_scope=scope_b,
-                expected_profile_digest=probe.profile_digest,
+                expected_profile_digest=probe_d3.profile_digest,
                 expected_first_scope=scope_a,
             ),
         )
@@ -695,14 +702,14 @@ def test_native_call_join_rejects_reused_identity_and_missing_terminal(trusted_t
     )
     assert (
         verify_native_connection(
-            probe,
-            registration=reg,
+            probe_d3,
+            registration=reg_d3,
             observations=replace(
-                obs,
+                obs_d3,
                 prior_lifecycle=obs_before,
                 current_lifecycle=obs_after_stale,
                 expected_scope=scope_b,
-                expected_profile_digest=probe.profile_digest,
+                expected_profile_digest=probe_d3.profile_digest,
                 expected_first_scope=scope_a,
             ),
         )
@@ -1887,42 +1894,48 @@ def test_native_verifier_enforces_monotonic_timestamps_unique_joins_scope_and_li
     )
 
     # 7. Probe omitting observed_scope while owner selected a workspace scope must reject.
-    probe_no_scope = replace(probe, terminal_facts=replace(probe.terminal_facts, observed_scope=None))
-    oc_scoped = replace(oc, selected_scope={"repo_id": "repo-t9-a", "checkout_id": "chk-t9-a"})
+    probe_d3, reg_d3, obs_d3, _ = _sample_world(case_dir / "d3-scope", tool_name="get_job")
+    assert probe_d3.shim_worker_process is not None
+    assert probe_d3.profile_digest is not None
+    assert probe_d3.terminal_facts is not None
+    assert verify_native_connection(probe_d3, registration=reg_d3, observations=obs_d3) is True
+    probe_no_scope = replace(probe_d3, terminal_facts=replace(probe_d3.terminal_facts, observed_scope=None))
+    oc_d3 = obs_d3.owner_events[0]
+    oc_scoped = replace(oc_d3, selected_scope={"repo_id": "repo-t9-a", "checkout_id": "chk-t9-a"})
     assert (
         verify_native_connection(
             probe_no_scope,
-            registration=reg,
-            observations=replace(obs, owner_events=(oc_scoped,)),
+            registration=reg_d3,
+            observations=replace(obs_d3, owner_events=(oc_scoped,)),
         )
         is False
     )
 
     # 8. Disconnected current_lifecycle (valid transition between unrelated PIDs/profiles) must reject.
     prior_lc = ShimLaunchObservation(
-        pid=probe.shim_worker_process.pid - 10,
+        pid=probe_d3.shim_worker_process.pid - 10,
         started_at="2026-11-12T04:00:00.000000Z",
         profile_digest="sha256:" + "1" * 64,
         observed_scope=Scope("repo-t9-other", "chk-t9-other"),
         launch_cwd=case_dir / "chk-other",
     )
     bogus_curr_lc = ShimLaunchObservation(
-        pid=probe.shim_worker_process.pid + 50,
+        pid=probe_d3.shim_worker_process.pid + 50,
         started_at="2026-11-12T04:00:01.900000Z",
-        profile_digest=probe.profile_digest,
+        profile_digest=probe_d3.profile_digest,
         observed_scope=Scope("repo-t9-a", "chk-t9-a"),
         launch_cwd=case_dir / "chk-a",
     )
     assert (
         verify_native_connection(
-            probe,
-            registration=reg,
+            probe_d3,
+            registration=reg_d3,
             observations=replace(
-                obs,
+                obs_d3,
                 prior_lifecycle=prior_lc,
                 current_lifecycle=bogus_curr_lc,
                 expected_scope=Scope("repo-t9-a", "chk-t9-a"),
-                expected_profile_digest=probe.profile_digest,
+                expected_profile_digest=probe_d3.profile_digest,
                 expected_first_scope=Scope("repo-t9-other", "chk-t9-other"),
             ),
         )
@@ -3097,6 +3110,7 @@ def test_t9_r02_rejects_null_owner_endpoints_and_requires_socket_connection_join
         connection_id="conn-t9-0002",
         local_port=52002,
         started_at="2026-11-12T04:00:03.005000Z",
+        observed_at="2026-11-12T04:00:03.020000Z",
         ended_at="2026-11-12T04:00:03.145000Z",
     )
 
@@ -3185,6 +3199,7 @@ def test_t9_r02_rejects_null_owner_endpoints_and_requires_socket_connection_join
                         "writer_epoch": item.writer_epoch,
                         "instance_id": item.instance_id,
                         "started_at": item.started_at,
+                        "observed_at": item.observed_at,
                         "ended_at": item.ended_at,
                     }
                 )
@@ -3273,53 +3288,11 @@ def test_t9_r03_strict_owner_parsers_and_terminal_facts_consistency(trusted_tmp:
     probe, reg, obs, ev_root = _sample_world(case_dir)
     assert probe.terminal_facts is not None
 
-    # Positive twin: get_health permits observed_scope=None alongside matching selected_scope=None.
-    oc = obs.owner_events[0]
-    assert oc.client_process is not None
-    oc_global_path = ev_root / "owner-events-global.jsonl"
-    oc_global_path.write_bytes(
-        canonical_json(
-            {
-                "event": "owner_call",
-                "connection_id": oc.connection_id,
-                "observation_status": oc.observation_status,
-                "daemon_pid": oc.daemon_process.pid,
-                "daemon_started_at": oc.daemon_process.started_at,
-                "store_id": oc.store_id,
-                "writer_epoch": oc.writer_epoch,
-                "instance_id": oc.instance_id,
-                "principal_id": oc.principal_id,
-                "credential_id": oc.credential_id,
-                "tool_name": "get_health",
-                "ready": True,
-                "auth_stamp_matched": True,
-                "response_flushed_ok": True,
-                "response_digest": oc.response_digest,
-                "listen_host": oc.listen_host,
-                "listen_port": oc.listen_port,
-                "client_host": oc.client_host,
-                "client_port": oc.client_port,
-                "client_pid": oc.client_process.pid,
-                "client_started_at": oc.client_process.started_at,
-                "started_at": oc.started_at,
-                "ended_at": oc.ended_at,
-                "call_id": oc.call_id,
-                "selected_scope": None,
-            }
-        )
-        + b"\n"
-    )
-    idx_global = json.loads(obs.artifact_paths["evidence_index"].read_text(encoding="utf-8"))
-    idx_global["artifacts"]["owner_events"] = digest_bytes(oc_global_path.read_bytes())
-    idx_global_path = ev_root / "evidence-index-global.json"
-    idx_global_path.write_bytes(canonical_json(idx_global) + b"\n")
-    probe_global = replace(probe, terminal_facts=replace(probe.terminal_facts, observed_scope=None))
-    obs_global = replace(
-        obs,
-        artifact_paths={**obs.artifact_paths, "owner_events": oc_global_path, "evidence_index": idx_global_path},
-        owner_events=(replace(oc, selected_scope=None),),
-    )
-    assert verify_native_connection(probe_global, registration=reg, observations=obs_global) is True
+    # Positive twin: get_health permits observed_scope=None alongside matching selected_scope=None,
+    # and get_job permits matching workspace scope on both sides.
+    assert verify_native_connection(probe, registration=reg, observations=obs) is True
+    probe_job, reg_job, obs_job, _ = _sample_world(case_dir / "job-ok", tool_name="get_job")
+    assert verify_native_connection(probe_job, registration=reg_job, observations=obs_job) is True
 
     # Workspace-scoped tool submit_episode with observed_scope=None must reject.
     bad_scope_ep = replace(
@@ -3468,7 +3441,7 @@ def test_t9_r05_win32_wait_or_terminate_checks_ticks_and_access_denied(
 
     with monkeypatch.context() as mp:
         mp.setattr(win32api, "OpenProcess", _deny_open)
-        assert cli._win32_wait_or_terminate_pid(999999, terminate=False, timeout_s=0.1) is False
+        assert cli._win32_wait_or_terminate_pid(999999, expected_ticks=1, terminate=False, timeout_s=0.1) is False
 
     child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"])
     try:
@@ -3805,3 +3778,618 @@ def test_wheel_probe_builder_avoids_toctou_when_owner_jsonl_grows_mid_build(
         shutil.rmtree(case_dir, ignore_errors=True)
 
 
+def test_t9_r01_verifier_single_read_and_run_observed_owner_config_digest(
+    trusted_tmp: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T9-R01: _verify_artifacts reads once (hash+parse same buffer) and run_observed_owner hashes launched bytes."""
+    import threading
+    from types import SimpleNamespace
+
+    from superbrain.adapters.os import daemon_config as dc_mod
+    from superbrain.adapters.os import os_adapters
+    from superbrain.composition import daemon_entry as de_mod
+    from superbrain.composition import owner_entry as oe_mod
+    from tests.support import inc2_native_owner as native_owner
+
+    case_dir = trusted_tmp / "r5-t9-r01"
+    case_dir.mkdir(parents=True, exist_ok=True)
+    probe, reg, obs, _ = _sample_world(case_dir)
+    hc_path = obs.artifact_paths["host_calls"]
+    hc_tampered = replace(obs.host_calls[0], ended_at="2026-11-12T04:00:02.999000Z")
+    obs_tampered = replace(obs, host_calls=(hc_tampered,))
+    hc_tampered_bytes = (
+        canonical_json(
+            {
+                "call_id": hc_tampered.call_id,
+                "channel": hc_tampered.channel,
+                "host_process": hc_tampered.host_process.to_dict(),
+                "shim_launcher_process": hc_tampered.shim_launcher_process.to_dict(),
+                "shim_worker_process": hc_tampered.shim_worker_process.to_dict(),
+                "tool_name": hc_tampered.tool_name,
+                "terminal_ok": hc_tampered.terminal_ok,
+                "response_digest": hc_tampered.response_digest,
+                "started_at": hc_tampered.started_at,
+                "ended_at": hc_tampered.ended_at,
+            }
+        )
+        + b"\n"
+    )
+
+    read_counts: dict[Path, int] = {}
+    orig_read_bytes = Path.read_bytes
+
+    def _split_read_bytes(self: Path) -> bytes:
+        resolved = self.resolve()
+        read_counts[resolved] = read_counts.get(resolved, 0) + 1
+        if resolved == hc_path.resolve() and read_counts[resolved] >= 2:
+            return hc_tampered_bytes
+        return orig_read_bytes(self)
+
+    with monkeypatch.context() as mp:
+        mp.setattr(Path, "read_bytes", _split_read_bytes)
+        # Digest check used hc_orig_bytes; parser MUST use that exact buffer and reject obs_tampered.
+        assert verify_native_connection(probe, registration=reg, observations=obs_tampered) is False
+        assert read_counts.get(hc_path.resolve(), 0) == 1
+        for label, art_path in obs.artifact_paths.items():
+            cnt = read_counts.get(art_path.resolve(), 0)
+            assert cnt == 1, f"{label} was read {cnt} times"
+
+    # Sibling: reg.expected_config_path replaced by symlink/wrong physical path must reject without double-read.
+    sym_cfg = case_dir / "sym-cfg.json"
+    try:
+        sym_cfg.symlink_to(reg.expected_config_path)
+    except OSError:
+        sym_cfg = case_dir / "missing-cfg.json"
+    bad_reg = replace(reg, expected_config_path=sym_cfg)
+    assert verify_native_connection(probe, registration=bad_reg, observations=obs) is False
+
+    # Sibling: run_observed_owner computes config_digest from the single _read_checked_file_bytes launch buffer.
+    cfg_read_calls: list[Path] = []
+    orig_checked_read = dc_mod._read_checked_file_bytes
+
+    def _counting_checked_read(path: Path, os_: Any, *, max_bytes: int, **kwargs: Any) -> bytes:
+        cfg_read_calls.append(path)
+        return orig_checked_read(path, os_, max_bytes=max_bytes, **kwargs)
+
+    raw_cfg_reads: list[Path] = []
+
+    def _spy_raw_read(self: Path) -> bytes:
+        if self.name == "owner-cfg.json":
+            raw_cfg_reads.append(self)
+        return orig_read_bytes(self)
+
+    fake_cfg = case_dir / "owner-cfg.json"
+    fake_cfg.write_bytes(b"{}\n")
+    ev_dir = case_dir / "owner-ev"
+    with monkeypatch.context() as mp:
+        mp.setattr(dc_mod, "_read_checked_file_bytes", _counting_checked_read)
+        mp.setattr(Path, "read_bytes", _spy_raw_read)
+        mp.setattr(
+            dc_mod,
+            "read_daemon_config",
+            lambda p, os_: (
+                dc_mod._read_checked_file_bytes(p, os_, max_bytes=dc_mod.MAX_DAEMON_CONFIG_BYTES),
+                SimpleNamespace(
+                    data_root=case_dir / "dr",
+                    expected_store_id="store-1",
+                    cert_path=fake_cfg,
+                    key_path=fake_cfg,
+                ),
+            )[1],
+        )
+
+        mp.setattr(
+            oe_mod,
+            "_explicit_owner_adapters",
+            lambda cp: (
+                dc_mod.read_daemon_config(cp, os_adapters()),
+                os_adapters(),
+                case_dir / "scratch",
+            ),
+        )
+        mp.setattr(de_mod, "serve", lambda cfg, os_, stop_event, on_ready: 0)
+        rc = native_owner.run_observed_owner(fake_cfg, ev_dir, threading.Event())
+        assert rc == 0
+    assert raw_cfg_reads == [], f"run_observed_owner read config via unpinned raw read_bytes: {raw_cfg_reads}"
+    assert len(cfg_read_calls) == 1
+
+
+def test_t9_r02_socket_observation_lifetime_and_post_close_lookup_rejection(
+    trusted_tmp: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T9-R02: Post-close OS lookups degrade cleanly; live lookups record observed_at within lifetime."""
+    import queue
+    import threading
+
+    from superbrain.core.kernel import ToolCommand
+    from tests.support import inc2_native_owner as native_owner
+    from tests.support.inc2_transport import FakeMonotonicClock, open_test_loopback_transport
+
+    tpl = get_shared_t7_transport_template()
+    eq: queue.Queue[dict[str, object] | None] = queue.Queue()
+
+    post_close_gate = threading.Event()
+    lookup_mode = {"kind": "post_close"}
+
+    def _mock_lookup(c_port: int, l_port: int) -> int | None:
+        if lookup_mode["kind"] == "post_close":
+            assert post_close_gate.wait(timeout=3.0)
+            return 47001
+        return os.getpid()
+
+    def _mock_start(pid: int) -> str:
+        if pid == 47001:
+            return "2026-11-12T03:00:00.000000Z"
+        return native_owner.utc_now_z()
+
+    hook_state = native_owner._install_loopback_server_hooks(
+        eq=eq,
+        store_id=tpl.store_id,
+        instance_id="inst-r02-life",
+        daemon_pid=os.getpid(),
+        daemon_started_at=process_started_at_for_pid(os.getpid()),
+        collector_timeout_s=1.0,
+    )
+    try:
+        with open_test_loopback_transport(tpl, name="r02-post-close") as h:
+            from superbrain.cli_api import _loopback_server
+
+            orig_wrapped_worker = _loopback_server.LoopbackServer._conn_worker
+
+            def _worker_then_signal_close(self: Any, conn_id: Any, raw_sock: Any, accept_ns: int) -> None:
+                try:
+                    orig_wrapped_worker(self, conn_id, raw_sock, accept_ns)
+                finally:
+                    post_close_gate.set()
+
+            client_clock = FakeMonotonicClock(h.mono_clock.now)
+            target = h.make_target()
+            with monkeypatch.context() as mp:
+                mp.setattr(native_owner, "_lookup_loopback_client_pid", _mock_lookup)
+                mp.setattr(native_owner, "process_started_at_for_pid", _mock_start)
+                mp.setattr(_loopback_server.LoopbackServer, "_conn_worker", _worker_then_signal_close)
+
+                res_post = h.open_client(monotonic_ns=client_clock.monotonic_ns).call(
+                    target,
+                    ToolCommand(
+                        tool="get_health",
+                        arguments={"schema_version": "2.0"},
+                        token=tpl.cred.token,
+                        selected_scope=None,
+                        correlation_id="corr-r02-post-close",
+                    ),
+                )
+                assert res_post.get("ok") is True
+                hook_state["flush"](timeout=2.0)
+
+                lookup_mode["kind"] = "fast_live"
+                mp.setattr(_loopback_server.LoopbackServer, "_conn_worker", orig_wrapped_worker)
+                res_live = h.open_client(monotonic_ns=client_clock.monotonic_ns).call(
+                    target,
+                    ToolCommand(
+                        tool="get_health",
+                        arguments={"schema_version": "2.0"},
+                        token=tpl.cred.token,
+                        selected_scope=None,
+                        correlation_id="corr-r02-live",
+                    ),
+                )
+                assert res_live.get("ok") is True
+                hook_state["flush"](timeout=2.0)
+    finally:
+        post_close_gate.set()
+        hook_state["uninstall"]()
+
+    events: list[dict[str, Any]] = []
+    while not eq.empty():
+        item = eq.get_nowait()
+        if item is not None:
+            events.append(item)
+    owner_calls = [e for e in events if e.get("event") == "owner_call"]
+    sock_obs = [e for e in events if e.get("event") == "socket_observation"]
+    assert len(owner_calls) == 2
+
+    # First call (post-close synthetic 47001) MUST NOT be recorded as 'ok' with client_pid=47001!
+    oc_post = owner_calls[0]
+    assert oc_post["observation_status"] == "observation_incomplete"
+    assert oc_post["client_pid"] is None
+    for so_post in sock_obs:
+        if so_post.get("connection_id") == oc_post.get("connection_id"):
+            assert so_post["observation_status"] == "observation_incomplete"
+            assert so_post["client_pid"] is None
+
+    # Second call (live socket) succeeds with 'ok', observed_at inside [started_at, ended_at].
+    oc_live = owner_calls[1]
+    assert oc_live["observation_status"] == "ok"
+    assert oc_live["client_pid"] == os.getpid()
+    live_socks = [s for s in sock_obs if s.get("connection_id") == oc_live.get("connection_id")]
+    assert len(live_socks) == 1
+    so_live = live_socks[0]
+    assert so_live["observation_status"] == "ok"
+    assert isinstance(so_live.get("observed_at"), str)
+    assert so_live["started_at"] <= so_live["observed_at"] <= so_live["ended_at"]
+    assert so_live["ended_at"] >= oc_live["ended_at"]
+
+    # Verifier rejects missing/out-of-bounds observed_at, PID reuse, and overlapping 4-tuple reuse.
+    case_dir = trusted_tmp / "r5-t9-r02-synth"
+    case_dir.mkdir(parents=True, exist_ok=True)
+    probe, reg, obs, _ = _sample_world(case_dir)
+    so0 = obs.socket_observations[0]
+    assert verify_native_connection(probe, registration=reg, observations=obs) is True
+    for bad_so in (
+        replace(so0, observed_at=None),
+        replace(so0, observed_at="2026-11-12T04:00:02.001000Z"),  # Before socket started_at.
+        replace(so0, observed_at="2026-11-12T04:00:02.149000Z"),  # After socket ended_at.
+    ):
+        bad_obs = replace(obs, socket_observations=(bad_so,))
+        assert verify_native_connection(probe, registration=reg, observations=bad_obs) is False
+
+    # PID reuse: worker started AFTER observed_at must reject even if inside probe ended_at.
+    assert probe.shim_worker_process is not None
+    reused_worker = ProcessIdentity(pid=probe.shim_worker_process.pid, started_at="2026-11-12T04:00:02.030000Z")
+    reused_so = replace(so0, client_process=reused_worker, observed_at="2026-11-12T04:00:02.020000Z")
+    assert (
+        verify_native_connection(
+            replace(probe, shim_worker_process=reused_worker),
+            registration=reg,
+            observations=replace(
+                obs,
+                host_calls=(replace(obs.host_calls[0], shim_worker_process=reused_worker),),
+                owner_events=(replace(obs.owner_events[0], client_process=reused_worker),),
+                socket_observations=(reused_so,),
+            ),
+        )
+        is False
+    )
+
+    # Concurrent 4-tuple reuse (overlapping lifetime on exact same 4-tuple even for same worker) must reject.
+    so_overlap = replace(
+        so0,
+        connection_id="conn-t9-overlap",
+        started_at="2026-11-12T04:00:02.010000Z",
+        observed_at="2026-11-12T04:00:02.030000Z",
+        ended_at="2026-11-12T04:00:02.150000Z",
+    )
+    assert (
+        verify_native_connection(
+            probe,
+            registration=reg,
+            observations=replace(obs, socket_observations=(so0, so_overlap)),
+        )
+        is False
+    )
+
+
+def test_t9_r03_tool_scope_symmetry_and_d8_terminal_shape(trusted_tmp: Path) -> None:
+    """T9-R03: Reject scoped shallow get_health, non-D8 ok tools, and malformed host/owner terminals."""
+    from tests.support.inc2_native import parse_host_calls_jsonl, parse_owner_events_jsonl
+
+    case_dir = trusted_tmp / "r5-t9-r03"
+    case_dir.mkdir(parents=True, exist_ok=True)
+    probe, reg, obs, ev_root = _sample_world(case_dir)
+    assert probe.terminal_facts is not None
+    scope_a = {"repo_id": "repo-t9-a", "checkout_id": "chk-t9-a"}
+
+    # Positive twin 1: global scope-free get_health succeeds.
+    assert probe.terminal_facts.tool_name == "get_health"
+    assert probe.terminal_facts.observed_scope is None
+    assert obs.owner_events[0].selected_scope is None
+    assert verify_native_connection(probe, registration=reg, observations=obs) is True
+
+    # Negative: get_health with ok=True and checkout scope MUST fail parser AND verifier.
+    scoped_health_probe = replace(
+        probe,
+        terminal_facts=replace(probe.terminal_facts, tool_name="get_health", observed_scope=scope_a),
+    )
+    with pytest.raises(ProbeValidationError):
+        parse_native_probe(canonical_json(scoped_health_probe.to_dict()))
+    oc = obs.owner_events[0]
+    assert oc.client_process is not None
+    oc_scoped_path = ev_root / "oc-bad-health-scope.jsonl"
+    oc_scoped_path.write_bytes(
+        canonical_json(
+            {
+                "event": "owner_call",
+                "connection_id": oc.connection_id,
+                "observation_status": oc.observation_status,
+                "daemon_pid": oc.daemon_process.pid,
+                "daemon_started_at": oc.daemon_process.started_at,
+                "store_id": oc.store_id,
+                "writer_epoch": oc.writer_epoch,
+                "instance_id": oc.instance_id,
+                "principal_id": oc.principal_id,
+                "credential_id": oc.credential_id,
+                "tool_name": "get_health",
+                "ready": True,
+                "auth_stamp_matched": True,
+                "response_flushed_ok": True,
+                "response_digest": oc.response_digest,
+                "listen_host": oc.listen_host,
+                "listen_port": oc.listen_port,
+                "client_host": oc.client_host,
+                "client_port": oc.client_port,
+                "client_pid": oc.client_process.pid,
+                "client_started_at": oc.client_process.started_at,
+                "started_at": oc.started_at,
+                "ended_at": oc.ended_at,
+                "call_id": oc.call_id,
+                "selected_scope": scope_a,
+            }
+        )
+        + b"\n"
+    )
+    idx_bad = json.loads(obs.artifact_paths["evidence_index"].read_text(encoding="utf-8"))
+    idx_bad["artifacts"]["owner_events"] = digest_bytes(oc_scoped_path.read_bytes())
+    idx_bad_path = ev_root / "idx-bad-health.json"
+    idx_bad_path.write_bytes(canonical_json(idx_bad) + b"\n")
+    obs_scoped_health = replace(
+        obs,
+        artifact_paths={**obs.artifact_paths, "owner_events": oc_scoped_path, "evidence_index": idx_bad_path},
+        owner_events=(replace(oc, selected_scope=scope_a),),
+    )
+    assert verify_native_connection(scoped_health_probe, registration=reg, observations=obs_scoped_health) is False
+
+    # Positive twin 2: D3 workspace-scoped get_job succeeds (both global None and scoped checkout valid).
+    job_dir = case_dir / "job-positive"
+    job_dir.mkdir(parents=True, exist_ok=True)
+    probe_job, reg_job, obs_job, _ = _sample_world(job_dir, tool_name="get_job")
+    assert probe_job.terminal_facts is not None and probe_job.terminal_facts.observed_scope == scope_a
+    assert verify_native_connection(probe_job, registration=reg_job, observations=obs_job) is True
+
+    # Native passed probe with unimplemented D8 mutation tool (submit_episode) MUST reject even with scope present.
+    native_mut_probe = replace(
+        probe_job,
+        kind="native",
+        terminal_facts=replace(probe_job.terminal_facts, tool_name="submit_episode", observed_scope=scope_a),
+    )
+    assert verify_native_connection(native_mut_probe, registration=reg_job, observations=obs_job) is False
+
+    # Host terminal_ok=True without response_digest must fail; owner auth_stamp_matched=True without digest must fail.
+    hc = obs.host_calls[0]
+    with pytest.raises(ProbeValidationError):
+        parse_host_calls_jsonl(
+            canonical_json(
+                {
+                    "call_id": hc.call_id,
+                    "channel": hc.channel,
+                    "host_process": hc.host_process.to_dict(),
+                    "shim_launcher_process": hc.shim_launcher_process.to_dict(),
+                    "shim_worker_process": hc.shim_worker_process.to_dict(),
+                    "tool_name": "get_health",
+                    "terminal_ok": True,
+                    "response_digest": None,
+                    "started_at": hc.started_at,
+                    "ended_at": hc.ended_at,
+                }
+            )
+            + b"\n"
+        )
+    with pytest.raises(ProbeValidationError):
+        parse_owner_events_jsonl(
+            canonical_json(
+                {
+                    "event": "owner_call",
+                    "connection_id": oc.connection_id,
+                    "observation_status": "ok",
+                    "daemon_pid": oc.daemon_process.pid,
+                    "daemon_started_at": oc.daemon_process.started_at,
+                    "store_id": oc.store_id,
+                    "writer_epoch": oc.writer_epoch,
+                    "instance_id": oc.instance_id,
+                    "principal_id": oc.principal_id,
+                    "credential_id": oc.credential_id,
+                    "tool_name": "get_health",
+                    "ready": True,
+                    "auth_stamp_matched": True,
+                    "response_flushed_ok": True,
+                    "response_digest": None,
+                    "listen_host": oc.listen_host,
+                    "listen_port": oc.listen_port,
+                    "client_host": oc.client_host,
+                    "client_port": oc.client_port,
+                    "client_pid": oc.client_process.pid,
+                    "client_started_at": oc.client_process.started_at,
+                    "started_at": oc.started_at,
+                    "ended_at": oc.ended_at,
+                    "call_id": oc.call_id,
+                    "selected_scope": None,
+                }
+            )
+            + b"\n"
+        )
+
+
+def test_t9_r05_win32_unpinned_ticks_never_terminates_or_waits_reopened_pid(
+    trusted_tmp: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T9-R05: expected_ticks=None never calls TerminateProcess, Wait, or unpinned OpenProcess."""
+    if sys.platform != "win32":
+        pytest.skip("Win32-only process creation tick pin test")
+    import win32api
+    import win32process
+
+    from tests.support import inc2_cli as cli
+
+    terminated_handles: list[int] = []
+    opened_pids: list[int] = []
+
+    def _stub_open(access: int, inherit: bool, pid: int) -> int:
+        opened_pids.append(pid)
+        return 777
+
+    with monkeypatch.context() as mp:
+        mp.setattr(win32api, "OpenProcess", _stub_open)
+        mp.setattr(win32api, "CloseHandle", lambda _h: None)
+        mp.setattr(cli, "_win32_handle_creation_ticks", lambda _h: 909)
+        mp.setattr(
+            win32process,
+            "TerminateProcess",
+            lambda handle, code: terminated_handles.append(int(handle)),
+        )
+
+        # Mismatch pin (808 != 909) returns True (PID recycled) without terminating.
+        assert cli._win32_wait_or_terminate_pid(12345, expected_ticks=808, terminate=True, timeout_s=0.1) is True
+        assert terminated_handles == []
+
+        # Missing pin (expected_ticks=None) MUST fail closed (False) and NEVER open/terminate/wait!
+        opened_pids.clear()
+        assert cli._win32_wait_or_terminate_pid(12345, expected_ticks=None, terminate=True, timeout_s=0.1) is False
+        assert cli._win32_wait_or_terminate_pid(12345, expected_ticks=None, terminate=False, timeout_s=0.1) is False
+        assert terminated_handles == []
+        assert opened_pids == []
+
+    # Recycled ancestor PID in _win32_descendant_identities: if root_pid exited and OS recycled PID to newer occupant,
+    # children spawned by the new occupant (ticks > pinned_root_ticks) MUST NOT be claimed as descendants.
+    base_py = str(getattr(sys, "_base_executable", sys.executable))
+    child_cmd = (
+        "import subprocess, sys, time; "
+        "c = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(10)']); "
+        "print(c.pid, flush=True); time.sleep(10)"
+    )
+    tree_proc = subprocess.Popen(
+        [base_py, "-c", child_cmd],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    assert tree_proc.stdout is not None
+    child_pid = int(tree_proc.stdout.readline().strip())
+    try:
+        actual_root_ticks = cli._win32_process_creation_ticks(tree_proc.pid)
+        assert actual_root_ticks is not None
+        stale_pinned_ticks = actual_root_ticks - 10_000_000
+        assert cli._win32_descendant_identities(tree_proc.pid, root_ticks=stale_pinned_ticks) == []
+    finally:
+        for p in (child_pid, tree_proc.pid):
+            subprocess.run(["taskkill", "/F", "/PID", str(p)], capture_output=True, check=False)
+
+    # Controller with missing _proc_ticks uses only Popen handle kill/wait and skips PID reopen.
+    reopened_calls: list[tuple[int, int | None]] = []
+
+    def _record_reopened(
+        pid: int,
+        *,
+        expected_ticks: int | None = None,
+        terminate: bool,
+        timeout_s: float,
+    ) -> bool:
+        del terminate, timeout_s
+        reopened_calls.append((pid, expected_ticks))
+        return False
+
+    with monkeypatch.context() as mp:
+        mp.setattr(cli, "_win32_popen_creation_ticks", lambda _p: None, raising=False)
+        mp.setattr(cli, "_win32_process_creation_ticks", lambda _pid: None)
+        mp.setattr(cli, "_win32_wait_or_terminate_pid", _record_reopened)
+        ctrl = cli.InstalledServeProcess(
+            [base_py, "-c", "import time; time.sleep(10)"],
+            data_root=trusted_tmp / "r5-serve-unpinned",
+            cwd=trusted_tmp,
+        )
+        assert ctrl.snapshot_descendant_identities() == ()
+        ctrl.close()
+        assert reopened_calls == []
+        assert getattr(ctrl, "cleanup_unverified", False) is True
+
+
+def test_t9_r07_collector_submit_and_finalizer_start_failures_preserve_worker_and_cleanup(
+    trusted_tmp: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T9-R07: Failures in submit or Thread.start keep daemon call + socket/slot cleanup intact."""
+    import concurrent.futures
+    import queue
+    import threading
+
+    from superbrain.core.kernel import ToolCommand
+    from tests.support import inc2_native_owner as native_owner
+    from tests.support.inc2_transport import FakeMonotonicClock, open_test_loopback_transport
+
+    del trusted_tmp
+    tpl = get_shared_t7_transport_template()
+    eq: queue.Queue[dict[str, object] | None] = queue.Queue()
+
+    hook_state = native_owner._install_loopback_server_hooks(
+        eq=eq,
+        store_id=tpl.store_id,
+        instance_id="inst-r07-submit-fail",
+        daemon_pid=os.getpid(),
+        daemon_started_at=process_started_at_for_pid(os.getpid()),
+        collector_timeout_s=0.5,
+    )
+    try:
+        with open_test_loopback_transport(tpl, name="r07-submit-fail") as h:
+            client_clock = FakeMonotonicClock(h.mono_clock.now)
+            target = h.make_target()
+
+            # 1. Collector ThreadPoolExecutor.submit raises RuntimeError -> request & cleanup succeed.
+            with monkeypatch.context() as mp:
+                mp.setattr(
+                    concurrent.futures.ThreadPoolExecutor,
+                    "submit",
+                    lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("submit_boom")),
+                )
+                res_submit = h.open_client(monotonic_ns=client_clock.monotonic_ns).call(
+                    target,
+                    ToolCommand(
+                        tool="get_health",
+                        arguments={"schema_version": "2.0"},
+                        token=tpl.cred.token,
+                        selected_scope=None,
+                        correlation_id="corr-r07-submit-fail",
+                    ),
+                )
+                assert res_submit.get("ok") is True
+
+            # 2. Finalizer Thread.start raises RuntimeError -> request & cleanup succeed, event degraded.
+            orig_start = threading.Thread.start
+
+            def _fail_finalizer_start(self: threading.Thread) -> None:
+                if self.name.startswith("inc2-obs-finalize-"):
+                    raise RuntimeError("thread_start_boom")
+                orig_start(self)
+
+            with monkeypatch.context() as mp:
+                mp.setattr(native_owner, "_lookup_loopback_client_pid", lambda _c, _l: None)
+                mp.setattr(threading.Thread, "start", _fail_finalizer_start)
+                # Force lookup_fut not yet done when _schedule_emit runs by gating lookup briefly.
+                gate = threading.Event()
+                mp.setattr(
+                    native_owner,
+                    "_lookup_loopback_client_pid",
+                    lambda _c, _l: (gate.wait(timeout=0.3), None)[1],
+                )
+                try:
+                    res_th = h.open_client(monotonic_ns=client_clock.monotonic_ns).call(
+                        target,
+                        ToolCommand(
+                            tool="get_health",
+                            arguments={"schema_version": "2.0"},
+                            token=tpl.cred.token,
+                            selected_scope=None,
+                            correlation_id="corr-r07-th-start-fail",
+                        ),
+                    )
+                    assert res_th.get("ok") is True
+                finally:
+                    gate.set()
+
+            hook_state["flush"](timeout=2.0)
+            srv = h.server
+            with srv._lock:
+                assert srv._active_slots == 0
+                assert srv._sockets == {}
+                assert srv._workers == {}
+    finally:
+        hook_state["uninstall"]()
+
+    events: list[dict[str, object]] = []
+    while not eq.empty():
+        item = eq.get_nowait()
+        if item is not None:
+            events.append(item)
+    calls = [e for e in events if e.get("event") == "owner_call"]
+    assert len(calls) == 2
+    assert all(c["observation_status"] == "observation_incomplete" and c["client_pid"] is None for c in calls)
