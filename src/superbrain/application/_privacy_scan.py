@@ -179,6 +179,7 @@ class _TextScans:
         if not self._paths.may_block(token):
             return token
         found = self._paths.find(token)
+        self.tick()  # one deadline check per decided token: the search itself is linear
         if found is None:
             return token
         start, cut = found

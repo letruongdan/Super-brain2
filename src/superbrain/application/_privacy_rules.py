@@ -6,7 +6,6 @@ import fnmatch
 import hashlib
 import re
 import unicodedata
-from collections.abc import Callable
 from functools import lru_cache
 
 from superbrain.core.kernel import (
@@ -228,12 +227,20 @@ def _glob_units(glob: str) -> list[str]:
     return units
 
 
+def _unit_regex(unit: str) -> str:
+    """One fnmatch unit as an unanchored regex (``fnmatch.translate`` ends with a two-character end anchor)."""
+    translated = fnmatch.translate(unit)
+    assert translated.endswith(("\\Z", "\\z"))
+    return translated[:-2]
+
+
 class _Glob:
     """One component glob, with the fixed-width head/tail used to pick the few trimmed spellings worth testing.
 
     Each non-``*`` unit matches exactly one character. Without ``*`` a match has a fixed width. With ``*``, a match
     is head + anything + tail with stars at both inner ends, so keeping more characters next to a matching head or
-    tail never breaks a match: the smallest trim whose head (tail) fits is the only one to test.
+    tail never breaks a match: the smallest trim whose head (tail) fits is the only one to test. Fits are found by
+    one regex search (the tail on the reversed text), so the cost is linear in the wrapper run, not per position.
     """
 
     def __init__(self, glob: str) -> None:
@@ -244,52 +251,67 @@ class _Glob:
             first = units.index("*")
             last = len(units) - 1 - units[::-1].index("*")
             head, tail = units[:first], units[last + 1 :]
+            # Only stars between head and tail: a fitting head and tail with room between them is a full match.
+            self.simple = all(unit == "*" for unit in units[first : last + 1])
         else:
             head, tail = units, []
-        self.head = [re.compile(fnmatch.translate(unit)) for unit in head]
-        self.tail = [re.compile(fnmatch.translate(unit)) for unit in tail]
+            self.simple = True
+        self.h, self.t = len(head), len(tail)
+        self.head_rx = re.compile("".join(map(_unit_regex, head)))
+        self.tail_rx = re.compile("".join(map(_unit_regex, tail)))
+        self.tail_rev_rx = re.compile("".join(map(_unit_regex, reversed(tail))))
 
     def _kept(self, piece: str) -> bool:
-        return piece not in ("", ".") and self.full.fullmatch(piece) is not None
+        return piece not in ("", ".") and (self.simple or self.full.fullmatch(piece) is not None)
 
-    @staticmethod
-    def _fits(units: list[re.Pattern[str]], text: str, at: int) -> bool:
-        return all(unit.fullmatch(text[at + k]) for k, unit in enumerate(units))
+    def _head_at(self, seg: str, low: int, high: int) -> int | None:
+        """Smallest ``p`` in ``[low, high]`` where the head fits at ``seg[p:]``."""
+        if high < low:
+            return None
+        found = self.head_rx.search(seg, low, high + self.h)
+        return found.start() if found else None
 
-    def _smallest(self, units: list[re.Pattern[str]], text: str, limit: int, at: Callable[[int], int]) -> int | None:
-        return next((k for k in range(limit + 1) if self._fits(units, text, at(k))), None)
+    def _tail_at(self, rev: str, high: int) -> int | None:
+        """Smallest ``s <= high`` where the tail fits right before the last ``s`` characters (``rev`` = reversed)."""
+        if high < 0:
+            return None
+        found = self.tail_rev_rx.search(rev, 0, high + self.t)
+        return found.start() if found else None
 
     def first_edge(self, seg: str, lead: int) -> int | None:
         """Smallest ``p <= lead`` with ``seg[p:]`` a kept, matching component (``None`` when there is none)."""
-        n, h, t = len(seg), len(self.head), len(self.tail)
+        n, h, t = len(seg), self.h, self.t
         if not self.star:
-            p: int | None = n - h if 0 <= n - h <= lead else None
+            p = n - h if 0 <= n - h <= lead and self.head_rx.fullmatch(seg, n - h) else None
         else:
-            p = self._smallest(self.head, seg, min(lead, n - h - t), lambda k: k)
+            tail_fits = n - t >= 0 and self.tail_rx.fullmatch(seg, n - t) is not None
+            p = self._head_at(seg, 0, min(lead, n - h - t)) if tail_fits else None
         return p if p is not None and self._kept(seg[p:]) else None
 
-    def last_edge(self, seg: str, trail: int) -> int | None:
+    def last_edge(self, seg: str, rev: str, trail: int) -> int | None:
         """Smallest ``s <= trail`` with ``seg[:len - s]`` a kept, matching component."""
-        n, h, t = len(seg), len(self.head), len(self.tail)
+        n, h, t = len(seg), self.h, self.t
         if not self.star:
-            s: int | None = n - h if 0 <= n - h <= trail else None
+            s = n - h if 0 <= n - h <= trail and self.head_rx.fullmatch(seg, 0, h) else None
         else:
-            s = self._smallest(self.tail, seg, min(trail, n - h - t), lambda k: n - k - t)
+            head_fits = self.head_rx.fullmatch(seg, 0, h) is not None
+            s = self._tail_at(rev, min(trail, n - h - t)) if head_fits else None
         return s if s is not None and self._kept(seg[: n - s]) else None
 
-    def single(self, seg: str, lead: int, trail: int) -> tuple[int, int] | None:
+    def single(self, seg: str, rev: str, lead: int, trail: int) -> tuple[int, int] | None:
         """``(p, s)`` with ``seg[p:len - s]`` a kept match, both trims inside their runs (``None`` when none)."""
-        n, h, t = len(seg), len(self.head), len(self.tail)
+        n, h, t = len(seg), self.h, self.t
         if not self.star:
-            for start in range(min(lead, n - h) + 1):
-                cut = n - h - start
-                if cut <= trail and self._kept(seg[start : n - cut]):
-                    return start, cut
+            low, high = max(0, n - h - trail), min(lead, n - h)
+            while (p := self._head_at(seg, low, high)) is not None:
+                if self._kept(seg[p : p + h]):
+                    return p, n - h - p
+                low = p + 1  # only a lone "." piece is dropped; the next fit is a different character
             return None
-        p = self._smallest(self.head, seg, min(lead, n - h - t), lambda k: k)
+        p = self._head_at(seg, 0, min(lead, n - h - t))
         if p is None:
             return None
-        s = self._smallest(self.tail, seg, min(trail, n - h - t - p), lambda k: n - k - t)
+        s = self._tail_at(rev, min(trail, n - h - t - p))
         return (p, s) if s is not None and self._kept(seg[p : n - s]) else None
 
 
@@ -346,13 +368,15 @@ class _PathMatcher:
             return None
         segs = _PATH_SPLIT.split(low)
         if len(segs) == 1:
-            return next((hit for g in self._name_globs if (hit := g.single(low, lead, trail)) is not None), None)
+            rev = low[::-1]
+            return next((hit for g in self._name_globs if (hit := g.single(low, rev, lead, trail)) is not None), None)
         first, last = segs[0], segs[-1]
+        last_rev = last[::-1]
         mid = [part for part in segs[1:-1] if part and part != "."]
         for g in self._name_globs:
             if (p := g.first_edge(first, lead)) is not None:
                 return p, trail
-            if (s := g.last_edge(last, trail)) is not None:
+            if (s := g.last_edge(last, last_rev, trail)) is not None:
                 return lead, s
         for chain in self._chain_globs:
             inner = len(chain) - 1
@@ -362,12 +386,12 @@ class _PathMatcher:
             if len(mid) >= inner and all(
                 g.full.fullmatch(part) for g, part in zip(chain[:-1], mid[len(mid) - inner :], strict=True)
             ):
-                if (s := chain[-1].last_edge(last, trail)) is not None:
+                if (s := chain[-1].last_edge(last, last_rev, trail)) is not None:
                     return lead, s
             if len(mid) == len(chain) - 2 and all(
                 g.full.fullmatch(part) for g, part in zip(chain[1:-1], mid, strict=True)
             ):
-                p, s = chain[0].first_edge(first, lead), chain[-1].last_edge(last, trail)
+                p, s = chain[0].first_edge(first, lead), chain[-1].last_edge(last, last_rev, trail)
                 if p is not None and s is not None:
                     return p, s
         return None
