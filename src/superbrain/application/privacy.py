@@ -201,6 +201,7 @@ class _Run(_TextScans):
         Windows are bounded by the longest name and pruned by name prefixes, so the check is linear in the key.
         """
         words = _key_words(key)
+        word_count = len(words)
         for start, word in enumerate(words):
             if (
                 len(word) >= _CONTAINMENT_MIN
@@ -209,6 +210,10 @@ class _Run(_TextScans):
             ):
                 return True
             if word not in self._prefixes:
+                continue
+            if word not in self._sensitive and (
+                start + 1 == word_count or word + words[start + 1] not in self._prefixes
+            ):
                 continue
             joined = ""
             for size in range(1, min(self._max_words, len(words) - start) + 1):

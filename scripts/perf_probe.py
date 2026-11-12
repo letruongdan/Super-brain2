@@ -63,7 +63,7 @@ def child(config: Path) -> int:
     samples: dict[str, dict[str, JsonValue]] = {}
     local = threading.local()
     active: dict[str, JsonValue] = {}
-    inflight: set[str] = set()  # read but not yet written; spans are only attributable while this holds one key
+    inflight: dict[int, dict[str, JsonValue]] = {}
     inflight_lock = threading.Lock()
     transport_api: Any = transport
     composition_api: Any = daemon_entry
@@ -84,16 +84,18 @@ def child(config: Path) -> int:
             samples[key] = sample
             local.sample = sample
             with inflight_lock:
-                inflight.add(key)
+                inflight[id(sample)] = sample
                 if len(inflight) > 1:
-                    for other in inflight:
-                        samples[other]["overlapped"] = True
+                    for other in inflight.values():
+                        other["overlapped"] = True
         return result
 
     def prepare(call: Call, ctx: CallContext, *, now: Any) -> Any:
-        active.clear()
-        active.update(samples[str(call.arguments["idempotency_key"])])
-        active["admission_done_ns"] = time.perf_counter_ns()
+        admitted_ns = time.perf_counter_ns()
+        with inflight_lock:
+            active.clear()
+            active.update(samples[str(call.arguments["idempotency_key"])])
+            active["admission_done_ns"] = admitted_ns
         return original_prepare(call, ctx, now=now)
 
     def filtered(self: PrivacyFilter, value: Any, policy: Any, **kwargs: Any) -> Any:
@@ -125,22 +127,23 @@ def child(config: Path) -> int:
             return original_write(*args, **kwargs)
         write_start_ns = time.perf_counter_ns()
         result = original_write(*args, **kwargs)
+        flushed_ns = time.perf_counter_ns()
         with inflight_lock:
-            inflight.discard(str(sample["idempotency_key"]))
+            inflight.pop(id(sample), None)
             overlapped = sample.get("overlapped") is True
-        if overlapped or active.get("idempotency_key") != sample["idempotency_key"]:
+            captured = dict(active)
+        if overlapped or captured.get("idempotency_key") != sample["idempotency_key"]:
             # Requests overlapped: owner-thread spans cannot be attributed, so never report an ok sample.
             sample["status"] = "instrumentation_overlap"
             print(json.dumps({"event": "sample", **sample}), flush=True)
             local.sample = None
             return result
-        active["response_write_start_ns"] = write_start_ns
-        active["response_flushed_ns"] = time.perf_counter_ns()
-        active["elapsed_ns"] = int(str(active["response_flushed_ns"])) - int(str(active["t0_read_ns"]))
+        captured["response_write_start_ns"] = write_start_ns
+        captured["response_flushed_ns"] = flushed_ns
+        captured["elapsed_ns"] = flushed_ns - int(str(sample["t0_read_ns"]))
         envelope = json.loads(kwargs["body"])
-        active["status"] = "ok" if envelope.get("ok") is True else str(envelope.get("error", {}).get("code"))
-        samples[str(active["idempotency_key"])].update(active)
-        print(json.dumps({"event": "sample", **active}), flush=True)
+        captured["status"] = "ok" if envelope.get("ok") is True else str(envelope.get("error", {}).get("code"))
+        print(json.dumps({"event": "sample", **captured}), flush=True)
         local.sample = None
         return result
 

@@ -1360,6 +1360,10 @@ Filter xử lý:
 - nội dung trong `<private>…</private>`;
 - danh sách đường dẫn cấm.
 
+**Mẫu đường dẫn trong SP1.** Mẫu được so với từng thành phần đường dẫn bằng glob `*`, `?` và lớp ký tự dạng `[ab]`, `[0-9]`, `[!x]`, sau khi chuyển chữ thường. Hai dấu `/` và `\` đều phân tách thành phần. Bỏ thành phần rỗng và `.`, giữ `..`. Mẫu một thành phần khớp ở bất kỳ vị trí nào. Mẫu nhiều thành phần khớp một chuỗi thành phần liên tiếp, và dấu phân tách cuối mẫu áp dụng cùng quy tắc.
+
+Khi dựng policy, mẫu không còn thành phần hoặc chứa ký tự mà bộ quét tách thành ranh giới phải bị từ chối với `invalid_input`. Các ký tự ranh giới gồm khoảng trắng, dấu nháy, `< > | ( ) { } , ;` và dấu ngoặc vuông dùng như ký tự literal. Lớp glob hợp lệ phải đóng, không rỗng và không chứa lớp lồng hoặc ký tự ranh giới. Khi xử lý dấu câu bao quanh token, vẫn phải kiểm cách viết gốc nếu phần đã cắt dấu câu không khớp, để các mẫu như `..`, `vault.` hoặc `vault?` được thực thi.
+
 Filter duyệt cả object và list lồng nhau. **Filter lỗi thì không lưu payload gốc**, kể cả trong log lỗi, trace hay dead-letter.
 
 **Lưu trữ.** Log, trace và dead-letter không chứa payload thô; chỉ ID, loại và digest.

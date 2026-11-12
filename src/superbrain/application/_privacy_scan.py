@@ -181,6 +181,9 @@ class _TextScans:
         lead = len(token) - len(core)
         core = core.rstrip(_PATH_TRAIL)
         if not core or not self._paths.blocked(core):
+            if self._paths.blocked(token):
+                self.redacted += 1
+                return REDACTED
             return token
         self.redacted += 1
         return token[:lead] + REDACTED + token[lead + len(core) :]

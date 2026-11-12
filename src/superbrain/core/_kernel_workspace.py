@@ -76,6 +76,7 @@ DEFAULT_SENSITIVE_KEYS: frozenset[str] = frozenset(
     }
 )
 _PATH_SEPARATORS = re.compile(r"[\\/]+")
+_BLOCKED_PATH_COMPONENT = re.compile(r"""(?:[^\s"'<>|()\[\]{},;]|\[(?!!\])[^\s"'<>|()\[\]{},;]+\])+""")
 
 
 def blocked_path_components(pattern: str) -> tuple[str, ...]:
@@ -233,9 +234,9 @@ class FilterPolicy:
             if not isinstance(values, expected) or not all(isinstance(v, str) and v for v in values):
                 raise _invalid()
         for pattern in self.blocked_path_patterns:
-            # A token never holds whitespace and always has a component: such a pattern could never be enforced.
+            # Patterns must describe scanner tokens. Literal brackets and token delimiters are unenforceable.
             parts = blocked_path_components(pattern)
-            if not parts or any(ch.isspace() for part in parts for ch in part):
+            if not parts or any(_BLOCKED_PATH_COMPONENT.fullmatch(part) is None for part in parts):
                 raise _invalid()
         if not is_strict_int(self.entropy_min_length) or not (8 <= self.entropy_min_length <= 4096):
             raise _invalid()
