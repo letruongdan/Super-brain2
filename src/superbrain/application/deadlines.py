@@ -305,6 +305,7 @@ class KernelDeadlineCoordinator:
                 deadline_ns=queued.deadlines.total_deadline_ns,
                 selected_scope=queued.selected_scope,
                 local_deadline_ns=owner_local_deadline_ns,
+                canonical_payload=queued.canonical_payload,  # verified equal by reconstruct_queued_call
             )
             response = self._owner_runner(call, ctx, queued.auth, reservation)
         except BrainError as err:

@@ -59,17 +59,24 @@ def compute_canonical_payload_hmac(key_bytes: bytes, canonical_payload: bytes) -
     return f"sha256:{mac.hexdigest()}"
 
 
-def compute_request_hmac(key_bytes: bytes, call: Call) -> str:
-    """Compute ``HMAC-SHA256(key_bytes, b"request-v1\\0" + canonical_request_payload(call))``."""
+def compute_request_hmac(key_bytes: bytes, call: Call, canonical_payload: bytes | None = None) -> str:
+    """Compute ``HMAC-SHA256(key_bytes, b"request-v1\\0" + canonical_request_payload(call))``.
+
+    ``canonical_payload`` is that same encoding when the caller already holds it verified (the owner path checks
+    it against the reconstructed call); it is never re-derived then, so the 1 MiB body is not serialized again.
+    """
     if not isinstance(call, Call):
         raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
-    return compute_canonical_payload_hmac(key_bytes, canonical_request_payload(call))
+    payload = canonical_payload if canonical_payload is not None else canonical_request_payload(call)
+    return compute_canonical_payload_hmac(key_bytes, payload)
 
 
-def verify_request_hmac(key_bytes: bytes, call: Call, expected_digest: str) -> bool:
+def verify_request_hmac(
+    key_bytes: bytes, call: Call, expected_digest: str, canonical_payload: bytes | None = None
+) -> bool:
     """Constant-time verification of ``call`` against stored ``expected_digest`` under ``key_bytes``."""
     require_sha256_digest(expected_digest)
-    actual = compute_request_hmac(key_bytes, call)
+    actual = compute_request_hmac(key_bytes, call, canonical_payload)
     return hmac.compare_digest(actual.encode("ascii"), expected_digest.encode("ascii"))
 
 

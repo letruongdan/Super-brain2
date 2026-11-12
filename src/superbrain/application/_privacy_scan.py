@@ -23,13 +23,13 @@ from superbrain.application._privacy_rules import (
 )
 
 # ``\s`` and ``str.isspace`` agree (one Unicode whitespace table). Only ASCII letters lowercase to the letters of
-# "private" (checked over every code point), so these classes equal a match on the lowercased text. Possessive
-# whitespace runs (``\s*+``) keep long blank runs linear: the next character must be ``/``, a letter or ``>``.
+# "private" (checked over every code point), so these classes equal a match on the lowercased text. Two blank
+# runs are never adjacent (a ``/`` sits between them), which keeps long blank runs linear.
 _PRIVATE_WORD = "[pP][rR][iI][vV][aA][tT][eE]"
-_PRIVATE_START = rf"<\s*+(?:/\s*+)?{_PRIVATE_WORD}"
+_PRIVATE_START = rf"<\s*(?:/\s*)?{_PRIVATE_WORD}"
 _PRIVATE_MARK = re.compile(_PRIVATE_START)
 _PRIVATE_BLOCK = re.compile(
-    rf"<\s*+{_PRIVATE_WORD}\s*+>(?:(?!{_PRIVATE_START}).)*?<\s*+/\s*+{_PRIVATE_WORD}\s*+>", re.DOTALL
+    rf"<\s*{_PRIVATE_WORD}\s*>(?:(?!{_PRIVATE_START}).)*?<\s*/\s*{_PRIVATE_WORD}\s*>", re.DOTALL
 )
 
 

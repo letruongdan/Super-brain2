@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import copy
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from superbrain.core._json_parse import parse_json
 from superbrain.core._kernel_auth import (
@@ -195,8 +195,14 @@ class CallContext:
     deadline_ns: int
     selected_scope: Scope | None
     local_deadline_ns: int | None = None
+    # Owner path only: the queued request's canonical bytes, already verified against the reconstructed call.
+    canonical_payload: bytes | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        if self.canonical_payload is not None and (
+            type(self.canonical_payload) is not bytes or not self.canonical_payload
+        ):
+            raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
         if not isinstance(self.principal, Principal) or not isinstance(self.identity, Identity):
             raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
         if isinstance(self.deadline_ns, bool) or type(self.deadline_ns) is not int:

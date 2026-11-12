@@ -250,13 +250,15 @@ class KernelDispatcher:
             if now_ns >= ctx.deadline_ns - HANDLER_RESERVE_NS:
                 raise BrainError(ErrorCode.DEADLINE_EXCEEDED, "deadline exceeded")
 
-    def _verify_retained_row(self, row: IdempotencyRow, call: Call, *, now: datetime) -> bool:
+    def _verify_retained_row(
+        self, row: IdempotencyRow, call: Call, *, now: datetime, canonical_payload: bytes | None = None
+    ) -> bool:
         """Validate ``row.request_digest_key_id`` (even when expired); return True iff ``row`` is live and matches."""
         stored_key = self._policy.request_digest_key_by_id(row.request_digest_key_id)
         if stored_key is None:
             raise BrainError(ErrorCode.POLICY_UNAVAILABLE, "policy unavailable")
         if not is_idempotency_expired(row.committed_at, now):
-            if not verify_request_hmac(stored_key, call, row.request_digest):
+            if not verify_request_hmac(stored_key, call, row.request_digest, canonical_payload):
                 raise BrainError(ErrorCode.IDEMPOTENCY_CONFLICT, "idempotency conflict")
             return True
         return False
@@ -308,7 +310,9 @@ class KernelDispatcher:
             key_hash=key_hash,
             now=now,
         )
-        if existing is not None and self._verify_retained_row(existing, call, now=now):
+        if existing is not None and self._verify_retained_row(
+            existing, call, now=now, canonical_payload=ctx.canonical_payload
+        ):
             replay_result = StoredResult(
                 result_id=existing.result_id,
                 assignment_id=existing.assignment_id,
@@ -326,7 +330,7 @@ class KernelDispatcher:
             )
 
         active_key_id, active_key_bytes = self._policy.request_digest_key()
-        request_digest = compute_request_hmac(active_key_bytes, call)
+        request_digest = compute_request_hmac(active_key_bytes, call, ctx.canonical_payload)
         prepared = self._domain.prepare_mutation(call, ctx, now=now)
 
         if reservation is not None and reservation.cancelled:
