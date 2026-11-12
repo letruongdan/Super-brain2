@@ -16,11 +16,9 @@ compatibility forms (fullwidth letters, ligatures) are caught, but cross-script 
 from __future__ import annotations
 
 import dataclasses
-import fnmatch
 import math
 import re
 import time
-import unicodedata
 
 try:
     from _collections import _count_elements  # type: ignore[import-not-found]
@@ -32,95 +30,45 @@ except ImportError:
 from collections.abc import Callable, Mapping
 from functools import lru_cache
 
+from superbrain.application._privacy_rules import (
+    _BENIGN_CONTAINING_WORDS,
+    _BENIGN_NEXT_WORDS,
+    _CONTAINMENT_MIN,
+    _DOTTED_PATH_TOKEN,
+    _ENTROPY_EDGE,
+    _ID_SEGMENTS,
+    _MAX_INT,
+    _NODE_OVERHEAD,
+    _PATH_TOKEN,
+    _STATUS_VALUE_RE,
+    MAX_ARRAY_ITEMS,
+    MAX_DEPTH,
+    MAX_OBJECT_KEYS,
+    MAX_TEXT_BYTES,
+    MAX_TOTAL_BYTES,
+    REDACTED,
+    REJECTED_MESSAGE,
+    STATUS_FIELDS,
+    _Deadline,
+    _exempt_structural,
+    _is_structural_id,
+    _joined_key,
+    _key_words,
+    _path_needles,
+    _PathMatcher,
+    _Reject,
+    _structural_kind,
+)
+from superbrain.application._privacy_scan import _TextScans
 from superbrain.core.canonical import canonical_json
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.jsonvalue import JsonValue
 from superbrain.core.kernel import (
     OPAQUE_ID_RE,
-    SHA256_DIGEST_RE,
     FilterPolicy,
     RepoFlags,
     SafePayload,
 )
-
-REDACTED = "[redacted]"
-REJECTED_MESSAGE = "privacy filter rejected payload"
-MAX_DEPTH = 32
-MAX_TEXT_BYTES = 64 * 1024
-MAX_ARRAY_ITEMS = 1024
-MAX_OBJECT_KEYS = 1024
-MAX_TOTAL_BYTES = 1024 * 1024
-_NODE_OVERHEAD = 2
-_MAX_INT = 2**63
-STATUS_FIELDS: frozenset[str] = frozenset({"schema_version", "status", "outcome", "state"})
-
-_UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
-_STATUS_VALUE_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
-_PEM_BEGIN = re.compile(r"-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY-----")
-_PEM_END = re.compile(r"-----END [A-Z0-9 ]{0,40}PRIVATE KEY-----")
-_AUTH_HEADER = re.compile(r"(?i)\b(authorization|proxy-authorization)([ \t]{0,16}[:=][ \t]{0,16})[^\r\n,;]+")
-_AUTH_SCHEME = re.compile(r"(?i)\b(bearer|basic|token)[ \t]{1,16}([A-Za-z0-9._~+/=-]{8,})")
-_FIXED_TOKENS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"),
-    re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{16,}"),
-    re.compile(r"\bsk-[A-Za-z0-9_-]{16,}"),
-    re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
-    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}"),
-    re.compile(r"\bAIza[0-9A-Za-z_-]{35}"),
-    re.compile(r"\beyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}"),
-)
-_AUTHORITY = re.compile(r"[^/?#\s]*")
-_SEGMENT = re.compile(r"\S*")
-# Credential-like userinfo prefix ``user:`` right after ``scheme://``: the username may be empty and may contain
-# a raw ``@`` (I2-T3-R06); it stops at whitespace, ``:``, ``/``, ``?`` or ``#``. Runs after successive ``://``
-# are disjoint (each ``://`` holds a ``:`` and a ``/``), so matching stays linear.
-_CREDENTIAL_USER = re.compile(r"[^\s:/?#]*:")
-_KEY_VALUE_SECRET = re.compile(
-    r"(?i)\b(password|passwd|pwd|passphrase|secret|api[_-]?key|access[_-]?token|refresh[_-]?token"
-    r"|client[_-]?secret|auth[_-]?token|private[_-]?key)([ \t]{0,16}[=:][ \t]{0,16})"
-    r"(\"[^\"\r\n]{0,512}\"|'[^'\r\n]{0,512}'|[^\s;,&]+)"
-)
-_PATH_TOKEN = re.compile(r"[^\s\"'<>|()\[\]{},;]+")
-# A token holding ``.`` or ``_``: enough when every blocked-pattern needle holds one (lower() never makes them).
-_DOTTED_PATH_TOKEN = re.compile(
-    r"(?<![^\s\"'<>|()\[\]{},;])(?=[^\s\"'<>|()\[\]{},;]*[._])[^\s\"'<>|()\[\]{},;]+"
-)
-_FIXED_TOKEN_PREFIX = re.compile(r"github_pat_|gh[pousr]_|sk-|AKIA|ASIA|xox[baprs]-|AIza|eyJ")
-_PATH_SPLIT = re.compile(r"[\\/]+")
-_PATH_LEAD = "`*([{<\"'"
-_PATH_TRAIL = "`*)]}>\"'.,:;!?"
-_ENTROPY_EDGE = "\"'()[]{}<>,;.!?:`*"
-# Zero-width word boundaries (O(1) per position, so linear on any key): camelCase, acronym->Camel, letter<->digit.
-_WORD_BOUNDARY = re.compile(
-    r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])|(?<=[A-Za-z])(?=[0-9])|(?<=[0-9])(?=[A-Za-z])"
-)
-_KEY_WORD_SPLIT = re.compile(r"[^0-9a-z]+")
-_ID_SEGMENTS = re.compile(r"[._-]")
-_BENIGN_NEXT_WORDS: dict[str, frozenset[str]] = {
-    "token": frozenset({"estimator", "estimate", "budget", "count", "counts", "limit", "usage", "total"}),
-}
-"""Word n-grams that are measurements, not credentials (``token_estimator``), when followed by these words."""
-_CONTAINMENT_MIN = 6
-"""A single word containing a sensitive name at least this long is sensitive (``mypassword``); ``token`` is not."""
-_BENIGN_CONTAINING_WORDS: frozenset[str] = frozenset({"secretary", "secretaries", "secretariat", "secretarial"})
-
-
-class _Reject(Exception):
-    """Internal refusal; deliberately carries no text."""
-
-
-class _Deadline(Exception):
-    """Internal deadline signal; deliberately carries no text."""
-
-
-def _key_words(key: str) -> list[str]:
-    """NFKC + casefold words of a key, split at separators, camelCase, acronym->Camel and letter<->digit."""
-    normalized = unicodedata.normalize("NFKC", key)
-    return [word for word in _KEY_WORD_SPLIT.split(_WORD_BOUNDARY.sub(" ", normalized).casefold()) if word]
-
-
-def _joined_key(key: str) -> str:
-    return "".join(_key_words(key))
 
 
 def _shannon_from_counts(counts: Mapping[str, int], total: int) -> float:
@@ -173,117 +121,7 @@ def _high_entropy(text: str, minimum: float) -> bool:
     return _shannon_from_counts(counts, total) >= minimum
 
 
-def _structural_kind(key: str) -> str:
-    """Field type of a structural field (mcp-tools-v2 catalog): ``digest``, ``revision`` or an ID field."""
-    if key == "digest" or key.endswith("_digest"):
-        return "digest"
-    if key == "revision":
-        return "revision"
-    return "id"
-
-
-def _exempt_structural(key: str, value: object, min_segment: int) -> bool:
-    """Whether ``value`` is a valid typed structural value for field ``key`` (never free text).
-
-    ``digest``: only ``sha256:<64 lower hex>``. ``revision``: only a positive int. ID fields: a canonical UUID, or a
-    catalog ``OpaqueId`` whose ``.``/``_``/``-`` separated segments are all shorter than the entropy candidate length
-    (a separator-free credential-shaped run is never an ID).
-    """
-    kind = _structural_kind(key)
-    if kind == "revision":
-        return type(value) is int and value >= 1
-    if not isinstance(value, str):
-        return False
-    if kind == "digest":
-        return SHA256_DIGEST_RE.fullmatch(value) is not None
-    if _UUID_RE.fullmatch(value):
-        return True
-    return OPAQUE_ID_RE.fullmatch(value) is not None and all(
-        len(segment) < min_segment for segment in _ID_SEGMENTS.split(value)
-    )
-
-
-def _is_structural_id(value: str) -> bool:
-    return (
-        len(value) == 36 and _UUID_RE.fullmatch(value) is not None
-        or len(value) == 71 and SHA256_DIGEST_RE.fullmatch(value) is not None
-    )
-
-
-def _tokenish(token: str) -> bool:
-    """Credential-shaped: more than a lowercase prose word (a digit, a symbol or an inner capital)."""
-    return any(ch.isdigit() or ch in "+/=_-.~" for ch in token) or any(ch.isupper() for ch in token[1:])
-
-
-def _component_needle(part: str) -> str:
-    """Longest literal run every fnmatch fullmatch of ``part`` must contain; ``""`` when none is guaranteed."""
-    if "[" in part:  # a bracket class matches one of several characters: keep only the literal text before it
-        part = part[: part.index("[")]
-    return max(re.split(r"[*?]", part), key=len)
-
-
-@lru_cache(maxsize=32)
-def _path_needles(patterns: tuple[str, ...]) -> tuple[str, ...] | None:
-    """Lowercase ASCII substrings one of which every blocked token's lowercase form contains; ``None``: no prefilter.
-
-    Derived from the policy's own patterns, so a pattern added to any list (the shipped default included) is never
-    skipped by a stale hand-written prefilter.
-    """
-    needles: set[str] = set()
-    for pattern in patterns:
-        lowered = pattern.lower()
-        parts = [lowered.rstrip("/")] if lowered.endswith("/") else [part for part in lowered.split("/") if part]
-        best = max((_component_needle(part) for part in parts), key=len, default="")
-        if not best or not best.isascii():
-            return None
-        needles.add(best)
-    return tuple(sorted(needles))
-
-
-class _PathMatcher:
-    """Component-boundary matcher for blocked path patterns (``name``, ``dir/`` and ``a/b`` chains)."""
-
-    def __init__(self, patterns: tuple[str, ...]) -> None:
-        self._dirs: set[str] = set()
-        self._chains: list[list[re.Pattern[str]]] = []
-        names: list[str] = []
-        for pattern in patterns:
-            lowered = pattern.lower()
-            if lowered.endswith("/"):
-                self._dirs.add(lowered.rstrip("/"))
-            elif "/" in lowered:
-                self._chains.append([re.compile(fnmatch.translate(part)) for part in lowered.split("/") if part])
-            else:
-                names.append(fnmatch.translate(lowered))
-        self._names = re.compile("|".join(f"(?:{n})" for n in names)) if names else None
-        self._results: dict[str, bool] = {}
-        self._needles = _path_needles(patterns)
-
-    def blocked(self, token: str) -> bool:
-        cached = self._results.get(token)
-        if cached is not None:
-            return cached
-        result = self._matches(token)
-        if len(self._results) < 1024:
-            self._results[token] = result
-        return result
-
-    def _matches(self, token: str) -> bool:
-        low = token.lower()
-        if self._needles is not None and not any(needle in low for needle in self._needles):
-            return False
-        parts = [p for p in _PATH_SPLIT.split(low) if p and p != "."]
-        for index, part in enumerate(parts):
-            if part in self._dirs or (self._names is not None and self._names.fullmatch(part)):
-                return True
-            for chain in self._chains:
-                window = parts[index : index + len(chain)]
-                if len(window) == len(chain) and all(rx.fullmatch(p) for rx, p in zip(chain, window, strict=True)):
-                    return True
-        return False
-
-
-class _Run:
+class _Run(_TextScans):
     def __init__(self, policy: FilterPolicy, monotonic_ns: Callable[[], int], deadline_ns: int | None) -> None:
         self.policy = policy
         self.redacted = 0
@@ -436,150 +274,6 @@ class _Run:
             raise _Reject
         self._count(size)
 
-    def _sub(self, pattern: re.Pattern[str], repl: str | Callable[[re.Match[str]], str], text: str) -> str:
-        new, count = pattern.subn(repl, text)
-        self.redacted += count
-        return new
-
-    def _private(self, text: str) -> str:
-        """``<private>…</private>`` -> ``[redacted]``; any malformed, orphan or nested marker refuses.
-
-        A marker is ``<`` [ws] [``/``] [ws] ``private`` [ws] ``>`` (case-insensitive). Each ``private`` occurrence
-        is inspected once, looking back over the whitespace run before it and forward over the one after it.
-        """
-        if "<" not in text:
-            return text
-        low = text.lower()
-        if "private" not in low:
-            return text
-        if len(low) != len(text):  # a few characters lowercase to two; keep offsets aligned with ``text``
-            low = "".join(ch.lower() if len(ch.lower()) == 1 else ch for ch in text)
-        n = len(low)
-        out: list[str] = []
-        cursor = 0
-        open_at = -1
-        find = low.find
-        index = find("private")
-        while index != -1:
-            end = index + 7
-            if index >= 1 and end < n:
-                prev_ch = low[index - 1]
-                next_ch = low[end]
-                if prev_ch == "<" and next_ch == ">":
-                    if open_at >= 0:
-                        raise _Reject
-                    out.append(text[cursor : index - 1])
-                    open_at = index - 1
-                    index = find("private", end)
-                    continue
-                if prev_ch == "/" and index >= 2 and low[index - 2] == "<" and next_ch == ">":
-                    if open_at < 0:
-                        raise _Reject
-                    out.append(REDACTED)
-                    self.redacted += 1
-                    cursor = end + 1
-                    open_at = -1
-                    index = find("private", end)
-                    continue
-            j = index - 1
-            while j >= 0 and low[j].isspace():
-                j -= 1
-            closing = j >= 0 and low[j] == "/"
-            if closing:
-                j -= 1
-                while j >= 0 and low[j].isspace():
-                    j -= 1
-            if j >= 0 and low[j] == "<":
-                k = end
-                while k < n and low[k].isspace():
-                    k += 1
-                if k >= n or low[k] != ">":
-                    raise _Reject
-                if not closing:
-                    if open_at >= 0:
-                        raise _Reject
-                    out.append(text[cursor:j])
-                    open_at = j
-                else:
-                    if open_at < 0:
-                        raise _Reject
-                    out.append(REDACTED)
-                    self.redacted += 1
-                    cursor, open_at = k + 1, -1
-            index = find("private", end)
-        if open_at >= 0:
-            raise _Reject
-        out.append(text[cursor:])
-        return "".join(out)
-
-    def _pem(self, text: str) -> str:
-        out: list[str] = []
-        cursor = 0
-        begin = _PEM_BEGIN.search(text)
-        while begin is not None:
-            out.append(text[cursor : begin.start()])
-            out.append(REDACTED)
-            self.redacted += 1
-            end = _PEM_END.search(text, begin.end())
-            if end is None:  # unterminated key: redact to the end of the string
-                return "".join(out)
-            cursor = end.end()
-            begin = _PEM_BEGIN.search(text, cursor)
-        out.append(text[cursor:])
-        return "".join(out)
-
-    def _userinfo(self, text: str) -> str:
-        """``scheme://user:pass@host`` -> ``scheme://[redacted]@host``.
-
-        Privacy-first: a credential-like ``user:`` right after ``://`` is redacted through the last ``@`` before the
-        next whitespace, even when ``/ ? #`` appear inside it. Otherwise userinfo is redacted up to the last ``@`` of
-        the authority. Linear: each whitespace-delimited segment's end and last ``@`` are computed once.
-        """
-        if "://" not in text or "@" not in text:
-            return text
-        out: list[str] = []
-        cursor = 0
-        seg_end = seg_last_at = -1
-        index = text.find("://")
-        while index != -1:
-            start = index + 3
-            if start > seg_end:
-                segment = _SEGMENT.match(text, start)
-                seg_end = segment.end() if segment is not None else start
-                seg_last_at = text.rfind("@", start, seg_end)
-            if seg_last_at > start and _CREDENTIAL_USER.match(text, start, seg_end):
-                at = seg_last_at
-            else:
-                authority = _AUTHORITY.match(text, start)
-                stop = authority.end() if authority is not None else start
-                at = text.rfind("@", start, stop)
-            if at > start:
-                out.append(text[cursor:start])
-                out.append(REDACTED)
-                self.redacted += 1
-                cursor = at
-            index = text.find("://", max(at, start))
-        out.append(text[cursor:])
-        return "".join(out)
-
-    def _auth_scheme(self, match: re.Match[str]) -> str:
-        # Once ``Bearer``/``Basic`` is recognised its credential is a secret whatever its charset (I2-T3-R05); only
-        # the plain word ``token`` keeps the prose heuristic ("the token validation step").
-        if match.group(1).lower() == "token" and not _tokenish(match.group(2)):
-            return match.group(0)
-        self.redacted += 1
-        return f"{match.group(1)} {REDACTED}"
-
-    def _blocked_path(self, match: re.Match[str]) -> str:
-        token = match.group(0)
-        core = token.lstrip(_PATH_LEAD)
-        lead = len(token) - len(core)
-        core = core.rstrip(_PATH_TRAIL)
-        if not core or not self._paths.blocked(core):
-            return token
-        self.redacted += 1
-        return token[:lead] + REDACTED + token[lead + len(core) :]
-
     def _entropy(self, text: str) -> str:
         """D6: a maximal run of >= N printable non-whitespace ASCII chars with Shannon >= bits is redacted.
 
@@ -677,148 +371,6 @@ class _Run:
         parts_fb.append(text[cursor:])
         self.redacted += count
         return "".join(parts_fb)
-
-    def redact(self, text: str, *, entropy: bool = True) -> str:
-        self.tick()
-        key = (text, entropy)
-        cached = self._redactions.get(key)
-        if cached is not None:
-            value, redacted = cached
-            self.redacted += redacted
-            return value
-        before = self.redacted
-        text = self._private(text)
-        self.tick()
-        if "-----BEGIN " in text:
-            text = self._pem(text)
-        ascii_text = text.isascii()
-        if ascii_text:
-            lowered = text.lower()
-            if "authorization" in lowered:
-                new = self._sub(_AUTH_HEADER, rf"\1\2{REDACTED}", text)
-                if new != text:
-                    text = new
-                    lowered = ""
-            self.tick()
-            if not lowered:
-                lowered = text.lower()
-            if "bearer" in lowered or "basic" in lowered or "token" in lowered:
-                new = _AUTH_SCHEME.sub(self._auth_scheme, text)
-                if new != text:
-                    text = new
-                    lowered = ""
-            fixed_changed = False
-            if "github_pat_" in text:
-                new = self._sub(_FIXED_TOKENS[0], REDACTED, text)
-                if new != text:
-                    text, fixed_changed = new, True
-            self.tick()
-            if "gh" in text and "_" in text and (
-                "ghp_" in text or "gho_" in text or "ghu_" in text or "ghs_" in text or "ghr_" in text
-            ):
-                new = self._sub(_FIXED_TOKENS[1], REDACTED, text)
-                if new != text:
-                    text, fixed_changed = new, True
-            self.tick()
-            if "sk-" in text:
-                new = self._sub(_FIXED_TOKENS[2], REDACTED, text)
-                if new != text:
-                    text, fixed_changed = new, True
-            self.tick()
-            if "AKIA" in text or "ASIA" in text:
-                new = self._sub(_FIXED_TOKENS[3], REDACTED, text)
-                if new != text:
-                    text, fixed_changed = new, True
-            self.tick()
-            if "xox" in text and "-" in text:
-                new = self._sub(_FIXED_TOKENS[4], REDACTED, text)
-                if new != text:
-                    text, fixed_changed = new, True
-            self.tick()
-            if "AIza" in text:
-                new = self._sub(_FIXED_TOKENS[5], REDACTED, text)
-                if new != text:
-                    text, fixed_changed = new, True
-            self.tick()
-            if "eyJ" in text and "." in text:
-                new = self._sub(_FIXED_TOKENS[6], REDACTED, text)
-                if new != text:
-                    text, fixed_changed = new, True
-            self.tick()
-            if fixed_changed:
-                lowered = ""
-            new = self._userinfo(text)
-            if new != text:
-                text = new
-                lowered = ""
-            has_eq = "=" in text
-            if has_eq or ":" in text:
-                if not lowered:
-                    lowered = text.lower()
-                if (
-                    "pass" in lowered
-                    or "pwd" in lowered
-                    or "secret" in lowered
-                    or "key" in lowered
-                    or "token" in lowered
-                ) and (
-                    (
-                        ":" in text
-                        and (
-                            "d:" in lowered
-                            or "t:" in lowered
-                            or "y:" in lowered
-                            or "n:" in lowered
-                            or "e:" in lowered
-                            or " :" in lowered
-                            or "\t:" in lowered
-                        )
-                    )
-                    or (
-                        has_eq
-                        and (
-                            "d=" in lowered
-                            or "t=" in lowered
-                            or "y=" in lowered
-                            or "n=" in lowered
-                            or "e=" in lowered
-                            or " =" in lowered
-                            or "\t=" in lowered
-                        )
-                    )
-                ):
-                    new = self._sub(_KEY_VALUE_SECRET, rf"\1\2{REDACTED}", text)
-                    if new != text:
-                        text = new
-                        lowered = ""
-            self.tick()
-            # The cheap candidate scan keeps the full component matcher as the authority.
-            if self._path_scan:
-                if self._path_needle is not None and not lowered:
-                    lowered = text.lower()
-                if self._path_needle is None or self._path_needle.search(lowered):
-                    text = self._path_token.sub(self._blocked_path, text)
-        else:
-            text = self._sub(_AUTH_HEADER, rf"\1\2{REDACTED}", text)
-            self.tick()
-            text = _AUTH_SCHEME.sub(self._auth_scheme, text)
-            if _FIXED_TOKEN_PREFIX.search(text):
-                for pattern in _FIXED_TOKENS:
-                    text = self._sub(pattern, REDACTED, text)
-                    self.tick()
-            text = self._userinfo(text)
-            text = self._sub(_KEY_VALUE_SECRET, rf"\1\2{REDACTED}", text)
-            self.tick()
-            # The cheap candidate scan keeps the full component matcher as the authority.
-            if self._path_scan:
-                text = self._path_token.sub(self._blocked_path, text)
-        self.tick()
-        if entropy:
-            text = self._entropy(text)
-        self.tick()  # after the last phase too: a late expiry is never hidden by returning
-        if len(self._redactions) < 1024:
-            self._redactions[key] = (text, self.redacted - before)
-        return text
 
 
 def _low_entropy_opaque_id(key: str, item: object, policy: FilterPolicy) -> bool:
