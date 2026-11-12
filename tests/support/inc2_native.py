@@ -1324,49 +1324,49 @@ def _same_physical_file(a: Path, b: Path) -> bool:
         return False
 
 
-def _verify_artifacts(
+def _load_verified_artifacts(
     probe: NativeConnectionProbe, registration: ObserverRegistration, observations: ObservationSet
-) -> bool:
+) -> OwnerReadyObservation | None:
     ev_root = registration.evidence_root
     if not _check_physical_path(ev_root, root=None, expect_dir=True):
-        return False
+        return None
     if not _REQUIRED_ARTIFACT_LABELS.issubset(observations.artifact_paths.keys()):
-        return False
+        return None
     if not _check_physical_path(registration.expected_config_path, root=None, expect_dir=False):
-        return False
+        return None
     if not _check_physical_path(registration.expected_profile_path, root=None, expect_dir=False):
-        return False
+        return None
     if not _same_physical_file(observations.artifact_paths["config"], registration.expected_config_path):
-        return False
+        return None
     if not _same_physical_file(observations.artifact_paths["profile"], registration.expected_profile_path):
-        return False
+        return None
 
     artifact_bytes: dict[str, bytes] = {}
     digests: dict[str, str] = {}
     for label, path in observations.artifact_paths.items():
         loaded = _read_physical_artifact(path, evidence_root=ev_root)
         if loaded is None:
-            return False
+            return None
         raw, actual_digest = loaded
         artifact_bytes[label] = raw
         digests[label] = actual_digest
 
     if not hmac.compare_digest(digests["config"], registration.expected_config_digest):
-        return False
+        return None
     if not hmac.compare_digest(digests["config"], probe.config_digest or ""):
-        return False
+        return None
     if not hmac.compare_digest(digests["profile"], registration.expected_profile_digest):
-        return False
+        return None
     if not hmac.compare_digest(digests["profile"], probe.profile_digest or ""):
-        return False
+        return None
     if not hmac.compare_digest(digests["schema"], registration.expected_schema_digest):
-        return False
+        return None
     if not hmac.compare_digest(probe.schema_digest or "", registration.expected_schema_digest):
-        return False
+        return None
     if not hmac.compare_digest(digests["shim_build"], registration.expected_shim_build_digest):
-        return False
+        return None
     if not hmac.compare_digest(probe.shim_build_digest or "", registration.expected_shim_build_digest):
-        return False
+        return None
 
     try:
         idx = parse_evidence_index(artifact_bytes["evidence_index"])
@@ -1375,7 +1375,7 @@ def _verify_artifacts(
         disk_owner_events = parse_owner_events_jsonl(artifact_bytes["owner_events"])
         disk_socks = parse_socket_observations_jsonl(artifact_bytes["socket_observations"])
     except ProbeValidationError:
-        return False
+        return None
 
     if (
         idx.task_id != registration.task_id
@@ -1386,22 +1386,22 @@ def _verify_artifacts(
         or idx.host_mode != registration.expected_host_mode
         or idx.host_version != probe.host_version
     ):
-        return False
+        return None
     for label in _INDEXED_ARTIFACT_LABELS:
         idx_digest = idx.artifacts.get(label)
         if idx_digest is None or not hmac.compare_digest(idx_digest, digests[label]):
-            return False
+            return None
 
     assert probe.daemon_process is not None and probe.binding is not None
     if not hmac.compare_digest(owner_ready.config_digest, digests["config"]):
-        return False
+        return None
     owner_schema_norm = (
         owner_ready.schema_sha256
         if owner_ready.schema_sha256.startswith("sha256:")
         else f"sha256:{owner_ready.schema_sha256}"
     )
     if not hmac.compare_digest(owner_schema_norm, digests["schema"]):
-        return False
+        return None
     if (
         owner_ready.daemon_pid != probe.daemon_process.pid
         or owner_ready.daemon_started_at != probe.daemon_process.started_at
@@ -1409,13 +1409,21 @@ def _verify_artifacts(
         or owner_ready.writer_epoch != probe.binding.writer_epoch
         or owner_ready.instance_id != probe.binding.instance_id
     ):
-        return False
+        return None
 
-    return (
-        disk_host_calls == observations.host_calls
-        and disk_owner_events == observations.owner_events
-        and disk_socks == observations.socket_observations
-    )
+    if (
+        disk_host_calls != observations.host_calls
+        or disk_owner_events != observations.owner_events
+        or disk_socks != observations.socket_observations
+    ):
+        return None
+    return owner_ready
+
+
+def _verify_artifacts(
+    probe: NativeConnectionProbe, registration: ObserverRegistration, observations: ObservationSet
+) -> bool:
+    return _load_verified_artifacts(probe, registration, observations) is not None
 
 
 def verify_native_connection(
@@ -1496,7 +1504,8 @@ def verify_native_connection(
         and probe.terminal_facts.response_digest is not None
     ):
         return False
-    if not _verify_artifacts(probe, registration, observations):
+    owner_ready = _load_verified_artifacts(probe, registration, observations)
+    if owner_ready is None:
         return False
 
     if probe.binding.writer_epoch < 1:
@@ -1603,7 +1612,7 @@ def verify_native_connection(
             and so.local_addr == "127.0.0.1"
             and 1 <= so.local_port <= 65535
             and so.remote_addr == "127.0.0.1"
-            and 1 <= so.remote_port <= 65535
+            and so.remote_port == owner_ready.port
             and so.store_id == probe.binding.store_id
             and so.writer_epoch == probe.binding.writer_epoch
             and so.instance_id == probe.binding.instance_id
@@ -1701,7 +1710,13 @@ def verify_native_connection(
         worker_so = worker_sock_by_conn.get(oc.connection_id)
         if worker_so is None:
             return False
-        if worker_so.local_port != oc.client_port or worker_so.remote_port != oc.listen_port:
+        if (
+            worker_so.local_port != oc.client_port
+            or worker_so.remote_port != oc.listen_port
+            or worker_so.remote_port != owner_ready.port
+            or worker_so.local_addr != oc.client_host
+            or worker_so.remote_addr != oc.listen_host
+        ):
             return False
         if not (
             oc.daemon_process == probe.daemon_process

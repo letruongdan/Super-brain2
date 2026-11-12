@@ -68,9 +68,10 @@ from tests.support.crash_child import EVENT_ID, EVENT_PAYLOAD
 from tests.support.inc2_cli import (
     InstalledMcpPipeSession,
     InstalledServeProcess,
-    _win32_descendant_identities,
+    _win32_descendant_identities_checked,
     _win32_popen_creation_ticks,
     _win32_wait_or_terminate_pid,
+    _Win32ProcessJob,
     clean_installed_subprocess_env,
     installed_script_path,
     is_writer_lock_held,
@@ -469,10 +470,19 @@ class MarkedRun:
         )
 
 
-def _stop_tree(proc: "subprocess.Popen[str]") -> None:
+def _stop_tree(
+    proc: "subprocess.Popen[str]",
+    *,
+    job: _Win32ProcessJob | None = None,
+) -> None:
     """Graceful foreground stop (CTRL_BREAK / SIGTERM to the process group), then kill whatever is left."""
     root_ticks = _win32_popen_creation_ticks(proc) if sys.platform == "win32" else None
-    tracked = _win32_descendant_identities(proc.pid, root_ticks=root_ticks) if root_ticks is not None else []
+    job_handle = job.handle if (job is not None and job.assigned) else None
+    tracked: list[tuple[int, int]] = []
+    if sys.platform == "win32" and root_ticks is not None:
+        tracked, _ = _win32_descendant_identities_checked(
+            proc.pid, root_ticks=root_ticks, job_handle=job_handle
+        )
     with contextlib.suppress(OSError, ValueError):
         if sys.platform == "win32":
             os.kill(proc.pid, int(signal.CTRL_BREAK_EVENT))
@@ -484,10 +494,25 @@ def _stop_tree(proc: "subprocess.Popen[str]") -> None:
         proc.kill()
         proc.wait(timeout=T8_STOP_TIMEOUT)
     if sys.platform == "win32":
+        if job is not None and job.assigned:
+            job.terminate_and_wait(timeout_s=T8_STOP_TIMEOUT)
         for pid, ticks in tracked:
             with contextlib.suppress(Exception):
                 _win32_wait_or_terminate_pid(
-                    pid, expected_ticks=ticks, terminate=True, timeout_s=T8_STOP_TIMEOUT
+                    pid,
+                    expected_ticks=ticks,
+                    job_handle=job_handle,
+                    terminate=True,
+                    timeout_s=T8_STOP_TIMEOUT,
+                )
+        if root_ticks is not None:
+            with contextlib.suppress(Exception):
+                _win32_wait_or_terminate_pid(
+                    proc.pid,
+                    expected_ticks=root_ticks,
+                    job_handle=job_handle,
+                    terminate=True,
+                    timeout_s=T8_STOP_TIMEOUT,
                 )
 
 
@@ -519,6 +544,9 @@ def run_marked(
         creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if sys.platform == "win32" else 0,
         start_new_session=sys.platform != "win32",
     )
+    job: _Win32ProcessJob | None = _Win32ProcessJob(kill_on_close=True) if sys.platform == "win32" else None
+    if job is not None:
+        job.assign_process(getattr(proc, "_handle", None))
     assert proc.stdout is not None and proc.stderr is not None
     stderr_lines: queue.Queue[str | None] = queue.Queue()
     stdout_box: list[str] = []
@@ -547,13 +575,19 @@ def run_marked(
                 ready = Endpoint.from_canonical(line[len("READY ") :].strip().encode("utf-8"))
                 if while_ready is not None:
                     while_ready(ready)
-                _stop_tree(proc)
+                _stop_tree(proc, job=job)
     finally:
-        if proc.poll() is None:
-            _stop_tree(proc)
-        proc.wait(timeout=T8_STOP_TIMEOUT)
-        for pump in pumps:
-            pump.join(timeout=T8_STOP_TIMEOUT)
+        try:
+            if proc.poll() is None:
+                _stop_tree(proc, job=job)
+            elif sys.platform == "win32" and job is not None and job.assigned:
+                job.terminate_and_wait(timeout_s=T8_STOP_TIMEOUT)
+            proc.wait(timeout=T8_STOP_TIMEOUT)
+            for pump in pumps:
+                pump.join(timeout=T8_STOP_TIMEOUT)
+        finally:
+            if job is not None:
+                job.close()
     while not stderr_lines.empty():
         rest = stderr_lines.get_nowait()
         if rest is not None:

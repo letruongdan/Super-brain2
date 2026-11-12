@@ -2922,6 +2922,7 @@ def test_win32_descendant_pids_exited_root_open_handle_and_recycled_ppid_rejecti
     )
     assert proc.stdout is not None
     child_pid = int(proc.stdout.readline().strip())
+    child_ticks = cli._win32_process_creation_ticks(child_pid)
     # Wait for process exit while Popen still holds proc._handle open so OpenProcess(proc.pid) succeeds.
     proc.wait(timeout=5.0)
     try:
@@ -2930,7 +2931,8 @@ def test_win32_descendant_pids_exited_root_open_handle_and_recycled_ppid_rejecti
         # Must never claim current pytest process as a descendant.
         assert os.getpid() not in desc
     finally:
-        subprocess.run(["taskkill", "/F", "/PID", str(child_pid)], capture_output=True, check=False)
+        if child_ticks is not None:
+            cli._win32_wait_or_terminate_pid(child_pid, expected_ticks=child_ticks, terminate=True, timeout_s=2.0)
 
     # Exercise child_ticks < parent_ticks, child_ticks is None, and recycled root_ticks > child_ticks on live processes.
     tree_code = (
@@ -2946,6 +2948,11 @@ def test_win32_descendant_pids_exited_root_open_handle_and_recycled_ppid_rejecti
     )
     assert parent_proc.stdout is not None
     child_keep_pid, child_older_pid = (int(x) for x in parent_proc.stdout.readline().strip().split())
+    cleanup_pins: list[tuple[int, int | None]] = [
+        (child_keep_pid, cli._win32_process_creation_ticks(child_keep_pid)),
+        (child_older_pid, cli._win32_process_creation_ticks(child_older_pid)),
+        (parent_proc.pid, cli._win32_popen_creation_ticks(parent_proc)),
+    ]
     try:
         real_ticks_fn = cli._win32_process_creation_ticks
         real_parent_ticks = real_ticks_fn(parent_proc.pid)
@@ -2986,8 +2993,9 @@ def test_win32_descendant_pids_exited_root_open_handle_and_recycled_ppid_rejecti
             mp.setattr(cli, "_win32_process_creation_ticks", _fake_ticks_recycled_root)
             assert cli._win32_descendant_pids(parent_proc.pid) == []
     finally:
-        for pid in (child_keep_pid, child_older_pid, parent_proc.pid):
-            subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True, check=False)
+        for pid, ticks in cleanup_pins:
+            if ticks is not None:
+                cli._win32_wait_or_terminate_pid(pid, expected_ticks=ticks, terminate=True, timeout_s=2.0)
 
 
 def test_t9_r01_rejects_unpinned_host_mode_versions_and_unbacked_artifacts(trusted_tmp: Path) -> None:
@@ -4256,14 +4264,19 @@ def test_t9_r05_win32_unpinned_ticks_never_terminates_or_waits_reopened_pid(
     )
     assert tree_proc.stdout is not None
     child_pid = int(tree_proc.stdout.readline().strip())
+    tree_pins = [
+        (child_pid, cli._win32_process_creation_ticks(child_pid)),
+        (tree_proc.pid, cli._win32_popen_creation_ticks(tree_proc)),
+    ]
     try:
         actual_root_ticks = cli._win32_process_creation_ticks(tree_proc.pid)
         assert actual_root_ticks is not None
         stale_pinned_ticks = actual_root_ticks - 10_000_000
         assert cli._win32_descendant_identities(tree_proc.pid, root_ticks=stale_pinned_ticks) == []
     finally:
-        for p in (child_pid, tree_proc.pid):
-            subprocess.run(["taskkill", "/F", "/PID", str(p)], capture_output=True, check=False)
+        for p, ticks in tree_pins:
+            if ticks is not None:
+                cli._win32_wait_or_terminate_pid(p, expected_ticks=ticks, terminate=True, timeout_s=2.0)
 
     # Controller with missing _proc_ticks uses only Popen handle kill/wait and skips PID reopen.
     reopened_calls: list[tuple[int, int | None]] = []
@@ -4393,3 +4406,374 @@ def test_t9_r07_collector_submit_and_finalizer_start_failures_preserve_worker_an
     calls = [e for e in events if e.get("event") == "owner_call"]
     assert len(calls) == 2
     assert all(c["observation_status"] == "observation_incomplete" and c["client_pid"] is None for c in calls)
+
+
+def test_t9_r02_tls_close_before_worker_return_and_ready_port_mismatch(
+    trusted_tmp: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T9-R02 R6: Reject OS lookups after socket close/abort before worker return, and pin 3-channel port."""
+    import queue
+    import threading
+
+    from superbrain.cli_api import _loopback_server
+    from superbrain.cli_api._loopback_wire import (
+        HEADER_INSTANCE_ID,
+        HEADER_STORE_ID,
+        HEADER_WRITER_EPOCH,
+        IDENTITY_PATH,
+        TOOL_CALL_PATH,
+        encode_call,
+    )
+    from superbrain.core.kernel import ToolCommand
+    from tests.support import inc2_native_owner as native_owner
+    from tests.support.inc2_transport import FakeMonotonicClock, open_test_loopback_transport
+
+    # Part A: Verifier MUST reject owner-ready.port != owner.listen_port / socket.remote_port even with valid digests.
+    case_dir = trusted_tmp / "r6-r02-port"
+    probe, reg, obs, ev_root = _sample_world(case_dir)
+    assert verify_native_connection(probe, registration=reg, observations=obs) is True
+
+    ready_path = ev_root / "owner-ready.json"
+    ready_obj = json.loads(ready_path.read_text(encoding="utf-8"))
+    ready_obj["port"] = int(ready_obj["port"]) + 1
+    new_ready_bytes = canonical_json(ready_obj) + b"\n"
+    ready_path.write_bytes(new_ready_bytes)
+
+    idx_path = ev_root / "evidence-index.json"
+    idx_obj = json.loads(idx_path.read_text(encoding="utf-8"))
+    idx_obj["artifacts"]["owner_ready"] = digest_bytes(new_ready_bytes)
+    idx_path.write_bytes(canonical_json(idx_obj) + b"\n")
+    assert verify_native_connection(probe, registration=reg, observations=obs) is False
+
+    # Part B: Live TLS client held open across server close (_graceful_close_conn) / abort BEFORE _conn_worker returns.
+    tpl = get_shared_t7_transport_template()
+    eq: queue.SimpleQueue[dict[str, JsonValue] | None] = queue.SimpleQueue()
+    hook_state = native_owner._install_loopback_server_hooks(
+        eq=eq,
+        daemon_pid=os.getpid(),
+        daemon_started_at=process_started_at_for_pid(os.getpid()),
+        store_id=tpl.store_id,
+        instance_id="inst-r6-r02-tls",
+        collector_timeout_s=2.0,
+    )
+    real_lookup_fn = native_owner._lookup_loopback_client_pid
+    after_close_gate = threading.Event()
+    lookup_finished = threading.Event()
+    mode = {"kind": "after_tls_close"}
+
+    def _gated_real_lookup(client_port: int, listen_port: int) -> int | None:
+        if mode["kind"] in {"after_tls_close", "after_abort"}:
+            after_close_gate.wait(timeout=2.0)
+            try:
+                return real_lookup_fn(client_port, listen_port)
+            finally:
+                lookup_finished.set()
+        return real_lookup_fn(client_port, listen_port)
+
+    try:
+        with open_test_loopback_transport(tpl, name="r6-r02-tls") as h:
+            orig_release_conn = _loopback_server.LoopbackServer._release_conn
+            orig_release_reply = _loopback_server.LoopbackServer._release_owner_reply
+
+            def _wait_after_close_before_worker_return(
+                self: Any,
+                conn_id: Any,
+                raw_sock: Any,
+                ssl_sock: Any,
+                *,
+                drain: bool,
+            ) -> None:
+                orig_release_conn(self, conn_id, raw_sock, ssl_sock, drain=drain)
+                if mode["kind"] == "after_tls_close":
+                    assert (ssl_sock is None or ssl_sock.fileno() == -1) and raw_sock.fileno() == -1
+                    after_close_gate.set()
+                    lookup_finished.wait(timeout=2.0)
+
+            def _abort_during_reply_and_wait(
+                self: Any,
+                ssl_sock: Any,
+                reply: Any,
+                tool_deadline_ns: int,
+            ) -> None:
+                if mode["kind"] == "after_abort":
+                    self._abort_all_active_sockets()
+                    assert ssl_sock.fileno() == -1
+                    after_close_gate.set()
+                    lookup_finished.wait(timeout=2.0)
+                orig_release_reply(self, ssl_sock, reply, tool_deadline_ns)
+
+            client_clock = FakeMonotonicClock(h.mono_clock.now)
+            target = h.make_target()
+
+            with monkeypatch.context() as mp:
+                mp.setattr(native_owner, "_lookup_loopback_client_pid", _gated_real_lookup)
+                mp.setattr(
+                    _loopback_server.LoopbackServer,
+                    "_release_conn",
+                    _wait_after_close_before_worker_return,
+                )
+
+                # 1. Keep client TLS socket open past _graceful_close_conn before _conn_worker returns.
+                tls_sock = h.open_raw_tls_socket(timeout=2.0)
+                try:
+                    host_hdr = f"127.0.0.1:{target.endpoint.port}"
+                    ident_req = (
+                        f"GET {IDENTITY_PATH} HTTP/1.1\r\nHost: {host_hdr}\r\nConnection: keep-alive\r\n\r\n"
+                    ).encode("ascii")
+                    ident_resp = h.send_raw_http(tls_sock, ident_req)
+                    assert b"200 OK" in ident_resp
+
+                    call_body = encode_call(
+                        ToolCommand(
+                            tool="get_health",
+                            arguments={"schema_version": "2.0"},
+                            token=tpl.cred.token,
+                            selected_scope=None,
+                            correlation_id="corr-r6-r02-after-close",
+                        )
+                    )
+                    tool_req = (
+                        f"POST {TOOL_CALL_PATH} HTTP/1.1\r\n"
+                        f"Host: {host_hdr}\r\n"
+                        f"Authorization: Bearer {tpl.cred.token}\r\n"
+                        f"{HEADER_STORE_ID}: {target.expected_store_id}\r\n"
+                        f"{HEADER_WRITER_EPOCH}: {h.ready.identity.writer_epoch}\r\n"
+                        f"{HEADER_INSTANCE_ID}: {h.ready.identity.instance_id}\r\n"
+                        f"Content-Length: {len(call_body)}\r\n"
+                        f"Connection: close\r\n\r\n"
+                    ).encode("ascii") + call_body
+                    tool_resp = h.send_raw_http(tls_sock, tool_req)
+                    assert b'"ok":true' in tool_resp
+                    assert lookup_finished.wait(timeout=3.0)
+                finally:
+                    tls_sock.close()
+                hook_state["flush"](timeout=2.0)
+
+                # 2. Positive twin: TLS call with live lookup before close -> 'ok' with os.getpid().
+                mode["kind"] = "live"
+                res_live = h.open_client(monotonic_ns=client_clock.monotonic_ns).call(
+                    target,
+                    ToolCommand(
+                        tool="get_health",
+                        arguments={"schema_version": "2.0"},
+                        token=tpl.cred.token,
+                        selected_scope=None,
+                        correlation_id="corr-r6-r02-live",
+                    ),
+                )
+                assert res_live.get("ok") is True
+                hook_state["flush"](timeout=2.0)
+
+                # 3. Abort boundary: socket aborted during shutdown before _release_owner_reply / _conn_worker returns.
+                after_close_gate.clear()
+                lookup_finished.clear()
+                mode["kind"] = "after_abort"
+                mp.setattr(_loopback_server.LoopbackServer, "_release_owner_reply", _abort_during_reply_and_wait)
+                abort_sock = h.open_raw_tls_socket(timeout=2.0)
+                try:
+                    host_hdr = f"127.0.0.1:{target.endpoint.port}"
+                    ident_req = (
+                        f"GET {IDENTITY_PATH} HTTP/1.1\r\nHost: {host_hdr}\r\nConnection: keep-alive\r\n\r\n"
+                    ).encode("ascii")
+                    assert b"200 OK" in h.send_raw_http(abort_sock, ident_req)
+                    call_body = encode_call(
+                        ToolCommand(
+                            tool="get_health",
+                            arguments={"schema_version": "2.0"},
+                            token=tpl.cred.token,
+                            selected_scope=None,
+                            correlation_id="corr-r6-r02-after-abort",
+                        )
+                    )
+                    tool_req = (
+                        f"POST {TOOL_CALL_PATH} HTTP/1.1\r\n"
+                        f"Host: {host_hdr}\r\n"
+                        f"Authorization: Bearer {tpl.cred.token}\r\n"
+                        f"{HEADER_STORE_ID}: {target.expected_store_id}\r\n"
+                        f"{HEADER_WRITER_EPOCH}: {h.ready.identity.writer_epoch}\r\n"
+                        f"{HEADER_INSTANCE_ID}: {h.ready.identity.instance_id}\r\n"
+                        f"Content-Length: {len(call_body)}\r\n"
+                        f"Connection: close\r\n\r\n"
+                    ).encode("ascii") + call_body
+                    abort_sock.sendall(tool_req)
+                    assert lookup_finished.wait(timeout=3.0)
+                finally:
+                    abort_sock.close()
+                hook_state["flush"](timeout=2.0)
+    finally:
+        after_close_gate.set()
+        hook_state["uninstall"]()
+
+    events: list[dict[str, Any]] = []
+    while not eq.empty():
+        item = eq.get_nowait()
+        if item is not None:
+            events.append(item)
+    owner_calls = [e for e in events if e.get("event") == "owner_call"]
+    sock_obs = [e for e in events if e.get("event") == "socket_observation"]
+    assert len(owner_calls) == 3
+
+    oc_after_close, oc_live, oc_abort = owner_calls[0], owner_calls[1], owner_calls[2]
+    for bad_oc in (oc_after_close, oc_abort):
+        assert bad_oc["observation_status"] == "observation_incomplete"
+        assert bad_oc["client_pid"] is None
+        for bad_so in sock_obs:
+            if bad_so.get("connection_id") == bad_oc.get("connection_id"):
+                assert bad_so["observation_status"] == "observation_incomplete"
+                assert bad_so["client_pid"] is None
+
+    assert oc_live["observation_status"] == "ok"
+    assert oc_live["client_pid"] == os.getpid()
+
+
+def test_t9_r05_win32_descendant_snapshot_pin_rejects_recycled_child_occupant(
+    trusted_tmp: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T9-R05 R6: Child PID recycled to unrelated occupant between snapshot and pin is rejected + unverified."""
+    if sys.platform != "win32":
+        pytest.skip("Win32-only process identity & Job Object test")
+    import ctypes
+    from ctypes import wintypes
+
+    import win32process
+
+    from tests.support import inc2_cli as cli
+
+    base_py = str(getattr(sys, "_base_executable", sys.executable))
+
+    # 1. Recycled child occupant between snapshot and handle pinning while root stays alive.
+    terminated_handles: list[int] = []
+    root_proc = subprocess.Popen(
+        [base_py, "-c", "import time; time.sleep(10)"],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    unrelated_proc = subprocess.Popen(
+        [base_py, "-c", "import time; time.sleep(10)"],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        root_pid = root_proc.pid
+        root_ticks = cli._win32_popen_creation_ticks(root_proc)
+        assert root_ticks is not None
+        unrelated_pid = unrelated_proc.pid
+        unrelated_ticks = cli._win32_popen_creation_ticks(unrelated_proc)
+        assert unrelated_ticks is not None
+        stale_child_ticks = root_ticks + 5_000
+        assert unrelated_ticks != stale_child_ticks
+
+        class _ProcessEntry32(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.c_size_t),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", wintypes.LONG),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", ctypes.c_char * 260),
+            ]
+
+        kernel32 = ctypes.windll.kernel32
+        snap_sentinel = 987654321
+        orig_snap = kernel32.CreateToolhelp32Snapshot
+        orig_p32_first = kernel32.Process32First
+        orig_p32_next = kernel32.Process32Next
+        orig_close = kernel32.CloseHandle
+
+        def _fake_snap(flags: int, pid: int) -> int:
+            del flags, pid
+            return snap_sentinel
+
+        def _fake_first(snap: int, entry_ref: Any) -> int:
+            if snap != snap_sentinel:
+                return int(orig_p32_first(snap, entry_ref))
+            ent = ctypes.cast(entry_ref, ctypes.POINTER(_ProcessEntry32)).contents
+            ent.th32ProcessID = unrelated_pid
+            ent.th32ParentProcessID = root_pid
+            return 1
+
+        def _fake_next(snap: int, entry_ref: Any) -> int:
+            if snap != snap_sentinel:
+                return int(orig_p32_next(snap, entry_ref))
+            return 0
+
+        def _fake_close(handle: int) -> int:
+            if handle == snap_sentinel:
+                return 1
+            return int(orig_close(handle))
+
+        with monkeypatch.context() as mp:
+            # Snapshot reports edge root_pid -> stale old occupant at PID `unrelated_pid`,
+            # while live handle queries see real `unrelated_proc` (unrelated ppid + new ticks).
+            mp.setattr(kernel32, "CreateToolhelp32Snapshot", _fake_snap)
+            mp.setattr(kernel32, "Process32First", _fake_first)
+            mp.setattr(kernel32, "Process32Next", _fake_next)
+            mp.setattr(kernel32, "CloseHandle", _fake_close)
+            mp.setattr(
+                cli,
+                "_win32_process_snapshot",
+                lambda: [
+                    (root_pid, os.getpid(), root_ticks),
+                    (unrelated_pid, root_pid, stale_child_ticks),
+                ],
+                raising=False,
+            )
+            mp.setattr(
+                win32process,
+                "TerminateProcess",
+                lambda handle, code: terminated_handles.append(int(handle)),
+            )
+
+            identities = cli._win32_descendant_identities(root_pid, root_ticks=root_ticks)
+            assert identities == []
+            _ = orig_snap
+
+            checked_idents, unverified = cli._win32_descendant_identities_checked(
+                root_pid, root_ticks=root_ticks
+            )
+            assert checked_idents == []
+            assert unverified is True
+            for dpid, dticks in checked_idents:
+                cli._win32_wait_or_terminate_pid(
+                    dpid, expected_ticks=dticks, terminate=True, timeout_s=0.1
+                )
+            assert terminated_handles == []
+    finally:
+        for p in (unrelated_proc, root_proc):
+            ticks = cli._win32_popen_creation_ticks(p)
+            p.terminate()
+            p.wait(timeout=5.0)
+            if ticks is not None:
+                cli._win32_wait_or_terminate_pid(p.pid, expected_ticks=ticks, terminate=True, timeout_s=2.0)
+
+    # 2. Positive twin: live root with real live child under InstalledServeProcess Job Object.
+    ctrl = cli.InstalledServeProcess(
+        [
+            base_py,
+            "-c",
+            (
+                "import subprocess, sys, time; "
+                "c = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(10)']); "
+                "print(c.pid, flush=True); time.sleep(10)"
+            ),
+        ],
+        data_root=trusted_tmp / "r6-r05-live",
+        cwd=trusted_tmp,
+    )
+    try:
+        assert ctrl._proc.stdout is not None
+        live_child_pid = int(ctrl._proc.stdout.readline().strip())
+        live_idents, live_unverified = cli._win32_descendant_identities_checked(
+            ctrl.pid, root_ticks=ctrl._proc_ticks, job_handle=getattr(ctrl, "_job_handle", None)
+        )
+        assert live_unverified is False
+        assert any(pid == live_child_pid for pid, _ in live_idents)
+    finally:
+        ctrl.close()
+        assert ctrl.cleanup_unverified is False

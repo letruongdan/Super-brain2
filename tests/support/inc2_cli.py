@@ -265,6 +265,8 @@ def write_client_profile_file(
 
 def _win32_handle_creation_ticks(handle: int) -> int | None:
     """Return 100ns FILETIME creation ticks for an already-open Win32 process handle."""
+    if sys.platform != "win32":
+        return None
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.GetProcessTimes.argtypes = [ctypes.wintypes.HANDLE, *[ctypes.POINTER(ctypes.wintypes.FILETIME)] * 4]
     kernel32.GetProcessTimes.restype = ctypes.wintypes.BOOL
@@ -272,6 +274,292 @@ def _win32_handle_creation_ticks(handle: int) -> int | None:
     if not kernel32.GetProcessTimes(ctypes.wintypes.HANDLE(int(handle)), *(ctypes.byref(t) for t in times)):
         return None
     return (int(times[0].dwHighDateTime) << 32) | int(times[0].dwLowDateTime)
+
+
+def _win32_handle_identity(handle: int) -> tuple[int, int, int] | None:
+    """Return ``(pid, ppid, creation_ticks)`` from one open Win32 process handle."""
+    if sys.platform != "win32":
+        return None
+    ticks = _win32_handle_creation_ticks(handle)
+    if ticks is None:
+        return None
+
+    class _ProcessBasicInformation(ctypes.Structure):
+        _fields_ = [
+            ("Reserved1", ctypes.c_void_p),
+            ("PebBaseAddress", ctypes.c_void_p),
+            ("Reserved2", ctypes.c_void_p * 2),
+            ("UniqueProcessId", ctypes.c_size_t),
+            ("InheritedFromUniqueProcessId", ctypes.c_size_t),
+        ]
+
+    ntdll = ctypes.WinDLL("ntdll")
+    pbi = _ProcessBasicInformation()
+    ret_len = ctypes.wintypes.ULONG()
+    status = ntdll.NtQueryInformationProcess(
+        ctypes.wintypes.HANDLE(int(handle)),
+        0,
+        ctypes.byref(pbi),
+        ctypes.sizeof(pbi),
+        ctypes.byref(ret_len),
+    )
+    if int(status) != 0:
+        return None
+    return int(pbi.UniqueProcessId), int(pbi.InheritedFromUniqueProcessId), ticks
+
+
+def _win32_is_handle_in_job(proc_handle: int, job_handle: int) -> bool | None:
+    """Return whether ``proc_handle`` belongs to OS Job Object ``job_handle`` (``None`` on API error)."""
+    if sys.platform != "win32":
+        return None
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.IsProcessInJob.argtypes = [
+        ctypes.wintypes.HANDLE,
+        ctypes.wintypes.HANDLE,
+        ctypes.POINTER(ctypes.wintypes.BOOL),
+    ]
+    kernel32.IsProcessInJob.restype = ctypes.wintypes.BOOL
+    in_job = ctypes.wintypes.BOOL()
+    if not kernel32.IsProcessInJob(
+        ctypes.wintypes.HANDLE(int(proc_handle)),
+        ctypes.wintypes.HANDLE(int(job_handle)),
+        ctypes.byref(in_job),
+    ):
+        return None
+    return bool(in_job.value)
+
+
+def _win32_job_pids(job_handle: int) -> tuple[int, ...] | None:
+    """Return live OS-managed member PIDs inside ``job_handle``, or ``None`` if unavailable."""
+    if sys.platform != "win32":
+        return ()
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.QueryInformationJobObject.argtypes = [
+        ctypes.wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.wintypes.DWORD,
+        ctypes.POINTER(ctypes.wintypes.DWORD),
+    ]
+    kernel32.QueryInformationJobObject.restype = ctypes.wintypes.BOOL
+    error_more_data = 234
+    cap = 64
+    while cap <= 4096:
+
+        class _JobObjectBasicProcessIdList(ctypes.Structure):
+            _fields_ = [
+                ("NumberOfAssignedProcesses", ctypes.wintypes.DWORD),
+                ("NumberOfProcessIdsInList", ctypes.wintypes.DWORD),
+                ("ProcessIdList", ctypes.c_size_t * cap),
+            ]
+
+        buf = _JobObjectBasicProcessIdList()
+        ret_len = ctypes.wintypes.DWORD()
+        ctypes.set_last_error(0)
+        ok = kernel32.QueryInformationJobObject(
+            ctypes.wintypes.HANDLE(int(job_handle)),
+            3,
+            ctypes.byref(buf),
+            ctypes.sizeof(buf),
+            ctypes.byref(ret_len),
+        )
+        if ok:
+            count = min(cap, int(buf.NumberOfProcessIdsInList))
+            return tuple(int(buf.ProcessIdList[i]) for i in range(count) if int(buf.ProcessIdList[i]) > 0)
+        err = ctypes.get_last_error()
+        if err == error_more_data and int(buf.NumberOfAssignedProcesses) > cap:
+            cap = min(4096, max(cap * 2, int(buf.NumberOfAssignedProcesses)))
+            continue
+        return None
+    return None
+
+
+class _Win32ProcessJob:
+    """OS-managed Win32 Job Object pinning descendant membership across subprocess spawns."""
+
+    def __init__(self, *, kill_on_close: bool = False) -> None:
+        self._handle: int | None = None
+        self.assigned: bool = False
+        if sys.platform != "win32":
+            return
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, ctypes.wintypes.LPCWSTR]
+        kernel32.CreateJobObjectW.restype = ctypes.wintypes.HANDLE
+        handle = kernel32.CreateJobObjectW(None, None)
+        if not handle:
+            return
+        self._handle = int(handle)
+        if kill_on_close:
+            _set_win32_job_kill_on_close(self._handle)
+
+    @property
+    def handle(self) -> int | None:
+        return self._handle
+
+    def assign_process(self, proc_handle: int | None) -> bool:
+        if sys.platform != "win32" or self._handle is None or proc_handle is None:
+            return False
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.AssignProcessToJobObject.argtypes = [ctypes.wintypes.HANDLE, ctypes.wintypes.HANDLE]
+        kernel32.AssignProcessToJobObject.restype = ctypes.wintypes.BOOL
+        ok = bool(
+            kernel32.AssignProcessToJobObject(
+                ctypes.wintypes.HANDLE(self._handle),
+                ctypes.wintypes.HANDLE(int(proc_handle)),
+            )
+        )
+        if ok:
+            self.assigned = True
+        return ok
+
+    def query_pids(self) -> tuple[int, ...] | None:
+        if self._handle is None:
+            return None
+        return _win32_job_pids(self._handle)
+
+    def terminate_and_wait(self, *, timeout_s: float = 2.0) -> bool:
+        if sys.platform != "win32":
+            return True
+        if self._handle is None or not self.assigned:
+            return False
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.TerminateJobObject.argtypes = [ctypes.wintypes.HANDLE, ctypes.wintypes.UINT]
+        kernel32.TerminateJobObject.restype = ctypes.wintypes.BOOL
+        if not kernel32.TerminateJobObject(ctypes.wintypes.HANDLE(self._handle), 9):
+            return False
+        deadline = time.monotonic() + max(0.0, timeout_s)
+        while True:
+            pids = self.query_pids()
+            if pids == ():
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.01)
+
+    def close(self) -> None:
+        if sys.platform != "win32" or self._handle is None:
+            return
+        handle = self._handle
+        self._handle = None
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CloseHandle.argtypes = [ctypes.wintypes.HANDLE]
+        kernel32.CloseHandle.restype = ctypes.wintypes.BOOL
+        with contextlib.suppress(OSError):
+            kernel32.CloseHandle(ctypes.wintypes.HANDLE(handle))
+
+
+def _set_win32_job_kill_on_close(job_handle: int) -> None:
+    if sys.platform != "win32":
+        return
+
+    class _IoCounters(ctypes.Structure):
+        _fields_ = [
+            ("ReadOperationCount", ctypes.c_uint64),
+            ("WriteOperationCount", ctypes.c_uint64),
+            ("OtherOperationCount", ctypes.c_uint64),
+            ("ReadTransferCount", ctypes.c_uint64),
+            ("WriteTransferCount", ctypes.c_uint64),
+            ("OtherTransferCount", ctypes.c_uint64),
+        ]
+
+    class _BasicLimitInfo(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_int64),
+            ("PerJobUserTimeLimit", ctypes.c_int64),
+            ("LimitFlags", ctypes.wintypes.DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", ctypes.wintypes.DWORD),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", ctypes.wintypes.DWORD),
+            ("SchedulingClass", ctypes.wintypes.DWORD),
+        ]
+
+    class _ExtendedLimitInfo(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", _BasicLimitInfo),
+            ("IoInfo", _IoCounters),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+    info = _ExtendedLimitInfo()
+    info.BasicLimitInformation.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.SetInformationJobObject.argtypes = [
+        ctypes.wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.wintypes.DWORD,
+    ]
+    kernel32.SetInformationJobObject.restype = ctypes.wintypes.BOOL
+    kernel32.SetInformationJobObject(
+        ctypes.wintypes.HANDLE(job_handle),
+        9,  # JobObjectExtendedLimitInformation
+        ctypes.byref(info),
+        ctypes.sizeof(info),
+    )
+
+
+def _win32_process_snapshot() -> list[tuple[int, int, int]] | None:
+    """Capture one atomic ``(pid, ppid, creation_ticks)`` process snapshot on Windows."""
+    if sys.platform != "win32":
+        return []
+
+    class _UnicodeString(ctypes.Structure):
+        _fields_ = [
+            ("Length", ctypes.wintypes.USHORT),
+            ("MaximumLength", ctypes.wintypes.USHORT),
+            ("Buffer", ctypes.c_void_p),
+        ]
+
+    class _SystemProcessInfo(ctypes.Structure):
+        _fields_ = [
+            ("NextEntryOffset", ctypes.wintypes.ULONG),
+            ("NumberOfThreads", ctypes.wintypes.ULONG),
+            ("WorkingSetPrivateSize", ctypes.c_int64),
+            ("HardFaultCount", ctypes.wintypes.ULONG),
+            ("NumberOfThreadsHighWatermark", ctypes.wintypes.ULONG),
+            ("CycleTime", ctypes.c_uint64),
+            ("CreateTime", ctypes.c_int64),
+            ("UserTime", ctypes.c_int64),
+            ("KernelTime", ctypes.c_int64),
+            ("ImageName", _UnicodeString),
+            ("BasePriority", ctypes.wintypes.LONG),
+            ("UniqueProcessId", ctypes.c_size_t),
+            ("InheritedFromUniqueProcessId", ctypes.c_size_t),
+        ]
+
+    ntdll = ctypes.WinDLL("ntdll")
+    status_info_length_mismatch = 0xC0000004
+    buf_size = 512 * 1024
+    while buf_size <= 64 * 1024 * 1024:
+        buf = (ctypes.c_ubyte * buf_size)()
+        needed = ctypes.wintypes.ULONG()
+        status = int(ntdll.NtQuerySystemInformation(5, buf, buf_size, ctypes.byref(needed))) & 0xFFFFFFFF
+        if status == status_info_length_mismatch:
+            buf_size = max(buf_size * 2, int(needed.value) + 65536)
+            continue
+        if status != 0:
+            return None
+        rows: list[tuple[int, int, int]] = []
+        offset = 0
+        while True:
+            entry = _SystemProcessInfo.from_buffer(buf, offset)
+            rows.append(
+                (
+                    int(entry.UniqueProcessId),
+                    int(entry.InheritedFromUniqueProcessId),
+                    int(entry.CreateTime),
+                )
+            )
+            if entry.NextEntryOffset == 0:
+                break
+            offset += int(entry.NextEntryOffset)
+        return rows
+    return None
 
 
 def _win32_process_creation_ticks(pid: int) -> int | None:
@@ -304,82 +592,166 @@ def _win32_popen_creation_ticks(proc: subprocess.Popen[Any]) -> int | None:
     return _win32_process_creation_ticks(proc.pid)
 
 
-def _win32_descendant_identities(root_pid: int, *, root_ticks: int | None = None) -> list[tuple[int, int]]:
-    """Enumerate live ``(pid, creation_ticks)`` descendants of ``root_pid`` on Windows."""
-    if sys.platform != "win32":
-        return []
+def _win32_open_and_verify_handle(
+    pid: int,
+    *,
+    expected_ppid: int | None,
+    expected_snap_ticks: int | None,
+    min_parent_ticks: int | None,
+    job_handle: int | None,
+) -> tuple[int | None, bool]:
+    """Open ``pid`` once and verify on that kernel handle that parentage, snapshot ticks, and job membership match.
 
+    Returns ``(verified_ticks_or_None, verification_failed)``.
+    """
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [ctypes.wintypes.DWORD, ctypes.wintypes.BOOL, ctypes.wintypes.DWORD]
+    kernel32.OpenProcess.restype = ctypes.wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [ctypes.wintypes.HANDLE]
+    kernel32.CloseHandle.restype = ctypes.wintypes.BOOL
+
+    handle = kernel32.OpenProcess(0x1000, False, int(pid))
+    if not handle:
+        return None, True
+    try:
+        ident = _win32_handle_identity(int(handle))
+        if ident is None:
+            return None, True
+        actual_pid, actual_ppid, actual_ticks = ident
+        if actual_pid != int(pid):
+            return None, True
+        if expected_ppid is not None and actual_ppid != expected_ppid:
+            return None, True
+        if expected_snap_ticks is not None and actual_ticks != expected_snap_ticks:
+            return None, True
+        if min_parent_ticks is not None and actual_ticks < min_parent_ticks:
+            return None, True
+        if job_handle is not None and _win32_is_handle_in_job(int(handle), job_handle) is not True:
+            return None, True
+        hooked_ticks = _win32_process_creation_ticks(pid)
+        if hooked_ticks is None or hooked_ticks != actual_ticks:
+            return None, True
+        if min_parent_ticks is not None and hooked_ticks < min_parent_ticks:
+            return None, True
+        return actual_ticks, False
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _win32_descendant_identities_checked(
+    root_pid: int,
+    *,
+    root_ticks: int | None = None,
+    job_handle: int | None = None,
+) -> tuple[list[tuple[int, int]], bool]:
+    """Enumerate verified ``(pid, creation_ticks)`` descendants and flag unverified candidates."""
+    if sys.platform != "win32":
+        return [], False
+
+    unverified = False
     live_root_ticks = _win32_process_creation_ticks(root_pid)
+    root_alive_or_open = True
     if root_ticks is not None:
-        if live_root_ticks is None or live_root_ticks != root_ticks:
-            return []
         eff_root_ticks = root_ticks
+        if live_root_ticks is None or live_root_ticks != root_ticks:
+            root_alive_or_open = False
     else:
         if live_root_ticks is None:
-            return []
+            return [], True
         eff_root_ticks = live_root_ticks
 
-    th32cs_snapprocess = 0x00000002
-    invalid_handle_value = ctypes.c_void_p(-1).value
+    snap_rows = _win32_process_snapshot()
+    if snap_rows is None:
+        unverified = True
+        snap_rows = []
 
-    class PROCESSENTRY32(ctypes.Structure):
-        _fields_ = [
-            ("dwSize", ctypes.wintypes.DWORD),
-            ("cntUsage", ctypes.wintypes.DWORD),
-            ("th32ProcessID", ctypes.wintypes.DWORD),
-            ("th32DefaultHeapID", ctypes.c_size_t),
-            ("th32ModuleID", ctypes.wintypes.DWORD),
-            ("cntThreads", ctypes.wintypes.DWORD),
-            ("th32ParentProcessID", ctypes.wintypes.DWORD),
-            ("pcPriClassBase", ctypes.wintypes.LONG),
-            ("dwFlags", ctypes.wintypes.DWORD),
-            ("szExeFile", ctypes.c_char * 260),
-        ]
+    children_by_parent: dict[int, list[tuple[int, int]]] = {}
+    snap_ticks_by_pid: dict[int, int] = {}
+    for pid, ppid, snap_ticks in snap_rows:
+        if pid > 0:
+            snap_ticks_by_pid[pid] = snap_ticks
+            if pid != ppid:
+                children_by_parent.setdefault(ppid, []).append((pid, snap_ticks))
 
-    kernel32 = ctypes.windll.kernel32
-    snap = kernel32.CreateToolhelp32Snapshot(th32cs_snapprocess, 0)
-    if snap == invalid_handle_value:
-        return []
-    children_by_parent: dict[int, list[int]] = {}
-    try:
-        entry = PROCESSENTRY32()
-        entry.dwSize = ctypes.sizeof(PROCESSENTRY32)
-        if kernel32.Process32First(snap, ctypes.byref(entry)):
-            while True:
-                pid = int(entry.th32ProcessID)
-                ppid = int(entry.th32ParentProcessID)
-                if pid > 0 and pid != ppid:
-                    children_by_parent.setdefault(ppid, []).append(pid)
-                if not kernel32.Process32Next(snap, ctypes.byref(entry)):
-                    break
-    finally:
-        kernel32.CloseHandle(snap)
+    snap_root_ticks = snap_ticks_by_pid.get(root_pid)
+    if snap_root_ticks is not None and snap_root_ticks != eff_root_ticks:
+        root_alive_or_open = False
 
     descendants: list[tuple[int, int]] = []
     start_ticks: dict[int, int] = {root_pid: eff_root_ticks}
-    frontier = [root_pid]
     seen = {root_pid}
+    frontier = [root_pid] if root_alive_or_open else []
+
     while frontier:
         curr = frontier.pop(0)
         parent_ticks = start_ticks[curr]
         curr_live = _win32_process_creation_ticks(curr)
         if curr_live is None or curr_live != parent_ticks:
+            if curr != root_pid:
+                unverified = True
             continue
-        for child_pid in children_by_parent.get(curr, ()):
+        for child_pid, snap_child_ticks in children_by_parent.get(curr, ()):
             if child_pid in seen:
                 continue
-            child_ticks = _win32_process_creation_ticks(child_pid)
-            if child_ticks is None or child_ticks < parent_ticks:
+            if snap_child_ticks < parent_ticks:
+                continue
+            verified_ticks, failed = _win32_open_and_verify_handle(
+                child_pid,
+                expected_ppid=curr,
+                expected_snap_ticks=snap_child_ticks,
+                min_parent_ticks=parent_ticks,
+                job_handle=job_handle,
+            )
+            if failed or verified_ticks is None:
+                unverified = True
+                continue
+            if _win32_process_creation_ticks(curr) != parent_ticks:
+                unverified = True
                 continue
             seen.add(child_pid)
-            start_ticks[child_pid] = child_ticks
-            descendants.append((child_pid, child_ticks))
+            start_ticks[child_pid] = verified_ticks
+            descendants.append((child_pid, verified_ticks))
             frontier.append(child_pid)
-    return descendants
+
+    if job_handle is not None:
+        job_pids = _win32_job_pids(job_handle)
+        if job_pids is None:
+            unverified = True
+        else:
+            for jpid in job_pids:
+                if jpid == root_pid or jpid in seen:
+                    continue
+                verified_ticks, failed = _win32_open_and_verify_handle(
+                    jpid,
+                    expected_ppid=None,
+                    expected_snap_ticks=None,
+                    min_parent_ticks=eff_root_ticks,
+                    job_handle=job_handle,
+                )
+                if failed or verified_ticks is None:
+                    unverified = True
+                    continue
+                seen.add(jpid)
+                descendants.append((jpid, verified_ticks))
+
+    return descendants, unverified
+
+
+def _win32_descendant_identities(
+    root_pid: int,
+    *,
+    root_ticks: int | None = None,
+    job_handle: int | None = None,
+) -> list[tuple[int, int]]:
+    """Enumerate verified live ``(pid, creation_ticks)`` descendants of ``root_pid`` on Windows."""
+    identities, _ = _win32_descendant_identities_checked(
+        root_pid, root_ticks=root_ticks, job_handle=job_handle
+    )
+    return identities
 
 
 def _win32_descendant_pids(root_pid: int) -> list[int]:
-    """Enumerate all live descendant PIDs of ``root_pid`` on Windows via Toolhelp32 snapshot."""
+    """Enumerate all live descendant PIDs of ``root_pid`` on Windows via verified kernel snapshot + handle checks."""
     return [pid for pid, _ in _win32_descendant_identities(root_pid)]
 
 
@@ -387,10 +759,11 @@ def _win32_wait_or_terminate_pid(
     pid: int,
     *,
     expected_ticks: int | None = None,
+    job_handle: int | None = None,
     terminate: bool,
     timeout_s: float,
 ) -> bool:
-    """Wait for ``pid`` (optionally terminating it); requires pinned ``expected_ticks`` and fails closed if ``None``."""
+    """Wait for ``pid`` (optionally terminating); require pinned ticks/job on the open handle."""
     assert sys.platform == "win32"
     if expected_ticks is None or isinstance(expected_ticks, bool) or not isinstance(expected_ticks, int):
         return False
@@ -417,6 +790,8 @@ def _win32_wait_or_terminate_pid(
         if actual_ticks != expected_ticks:
             # Target process exited and OS recycled its PID; do not touch the new occupant.
             return True
+        if job_handle is not None and _win32_is_handle_in_job(int(handle), job_handle) is not True:
+            return False
         if terminate:
             with contextlib.suppress(pywintypes.error):
                 win32process.TerminateProcess(handle, 9)
@@ -471,12 +846,23 @@ class InstalledServeProcess:
             creationflags=creationflags,
             start_new_session=start_new_session,
         )
+        self._job: _Win32ProcessJob | None = (
+            _Win32ProcessJob(kill_on_close=True) if sys.platform == "win32" else None
+        )
+        self._job_assigned = (
+            self._job.assign_process(getattr(self._proc, "_handle", None))
+            if self._job is not None
+            else False
+        )
+        self._job_handle: int | None = (
+            self._job.handle if (self._job is not None and self._job_assigned) else None
+        )
         self._proc_ticks: int | None = (
             _win32_popen_creation_ticks(self._proc) if sys.platform == "win32" else None
         )
         self._descendant_identities: list[tuple[int, int]] = []
         self._closed = False
-        self.cleanup_unverified = False
+        self.cleanup_unverified = bool(self._job is not None and not self._job_assigned)
 
     @property
     def pid(self) -> int:
@@ -494,8 +880,15 @@ class InstalledServeProcess:
             if self._proc_ticks is None:
                 self.cleanup_unverified = True
                 return tuple(self._descendant_identities)
+            identities, unverified = _win32_descendant_identities_checked(
+                self._proc.pid,
+                root_ticks=self._proc_ticks,
+                job_handle=self._job_handle,
+            )
+            if unverified:
+                self.cleanup_unverified = True
             seen = set(self._descendant_identities)
-            for ident in _win32_descendant_identities(self._proc.pid, root_ticks=self._proc_ticks):
+            for ident in identities:
                 if ident not in seen:
                     seen.add(ident)
                     self._descendant_identities.append(ident)
@@ -546,9 +939,23 @@ class InstalledServeProcess:
         if sys.platform == "win32":
             for child_pid, child_ticks in tracked_identities:
                 exited = _win32_wait_or_terminate_pid(
-                    child_pid, expected_ticks=child_ticks, terminate=False, timeout_s=timeout
+                    child_pid,
+                    expected_ticks=child_ticks,
+                    job_handle=self._job_handle,
+                    terminate=False,
+                    timeout_s=timeout,
                 )
                 assert exited, f"Descendant worker process pid={child_pid} still running after serve exit"
+            if self._job is not None and self._job_assigned:
+                job_deadline = time.monotonic() + min(1.0, max(0.0, timeout))
+                job_pids = self._job.query_pids()
+                while job_pids:
+                    if time.monotonic() >= job_deadline:
+                        break
+                    time.sleep(0.01)
+                    job_pids = self._job.query_pids()
+                assert job_pids == (), f"Descendant worker processes still active in job after serve exit: {job_pids}"
+                self._job.close()
 
         self._closed = True
         return (
@@ -578,18 +985,35 @@ class InstalledServeProcess:
             with contextlib.suppress(OSError, subprocess.TimeoutExpired):
                 self._proc.communicate(timeout=2.0)
         if sys.platform == "win32":
-            for pid, ticks in tracked_identities:
-                with contextlib.suppress(Exception):
-                    if not _win32_wait_or_terminate_pid(pid, expected_ticks=ticks, terminate=True, timeout_s=2.0):
+            try:
+                if self._job is not None and self._job_assigned:
+                    if not self._job.terminate_and_wait(timeout_s=2.0):
                         self.cleanup_unverified = True
-            if self._proc_ticks is None:
-                self.cleanup_unverified = True
-            else:
-                with contextlib.suppress(Exception):
-                    if not _win32_wait_or_terminate_pid(
-                        self._proc.pid, expected_ticks=self._proc_ticks, terminate=True, timeout_s=2.0
-                    ):
-                        self.cleanup_unverified = True
+                for pid, ticks in tracked_identities:
+                    with contextlib.suppress(Exception):
+                        if not _win32_wait_or_terminate_pid(
+                            pid,
+                            expected_ticks=ticks,
+                            job_handle=self._job_handle,
+                            terminate=True,
+                            timeout_s=2.0,
+                        ):
+                            self.cleanup_unverified = True
+                if self._proc_ticks is None:
+                    self.cleanup_unverified = True
+                else:
+                    with contextlib.suppress(Exception):
+                        if not _win32_wait_or_terminate_pid(
+                            self._proc.pid,
+                            expected_ticks=self._proc_ticks,
+                            job_handle=self._job_handle,
+                            terminate=True,
+                            timeout_s=2.0,
+                        ):
+                            self.cleanup_unverified = True
+            finally:
+                if self._job is not None:
+                    self._job.close()
 
     def __enter__(self) -> InstalledServeProcess:
         return self
@@ -754,12 +1178,23 @@ class InstalledMcpPipeSession:
         self._stderr_pump.start()
         self._writer: threading.Thread | None = None
         self._write_error: OSError | ValueError | None = None
+        self._job: _Win32ProcessJob | None = (
+            _Win32ProcessJob(kill_on_close=False) if sys.platform == "win32" else None
+        )
+        self._job_assigned = (
+            self._job.assign_process(getattr(self._proc, "_handle", None))
+            if self._job is not None
+            else False
+        )
+        self._job_handle: int | None = (
+            self._job.handle if (self._job is not None and self._job_assigned) else None
+        )
         self._proc_ticks: int | None = (
             _win32_popen_creation_ticks(self._proc) if sys.platform == "win32" else None
         )
         self._descendants: list[tuple[int, int]] = []
         self._closed = False
-        self.cleanup_unverified = False
+        self.cleanup_unverified = bool(self._job is not None and not self._job_assigned)
 
     def _read_stdout_lines(self) -> None:
         try:
@@ -797,8 +1232,15 @@ class InstalledMcpPipeSession:
             if self._proc_ticks is None:
                 self.cleanup_unverified = True
                 return tuple(self._descendants)
+            identities, unverified = _win32_descendant_identities_checked(
+                self._proc.pid,
+                root_ticks=self._proc_ticks,
+                job_handle=self._job_handle,
+            )
+            if unverified:
+                self.cleanup_unverified = True
             seen = set(self._descendants)
-            for ident in _win32_descendant_identities(self._proc.pid, root_ticks=self._proc_ticks):
+            for ident in identities:
                 if ident not in seen:
                     seen.add(ident)
                     self._descendants.append(ident)
@@ -878,7 +1320,11 @@ class InstalledMcpPipeSession:
         if self._closed:
             return
         self._closed = True
-        tracked = self._snapshot_descendant_identities()
+        tracked = (
+            self._snapshot_descendant_identities()
+            if self._proc.poll() is None
+            else tuple(self._descendants)
+        )
         self._close_stdin()
         if self._proc.poll() is None and self._stdin.closed:
             with contextlib.suppress(subprocess.TimeoutExpired, OSError):
@@ -889,18 +1335,32 @@ class InstalledMcpPipeSession:
             with contextlib.suppress(subprocess.TimeoutExpired, OSError):
                 self._proc.wait(timeout=2.0)
         if sys.platform == "win32":
-            for pid, ticks in tracked:
-                with contextlib.suppress(Exception):
-                    if not _win32_wait_or_terminate_pid(pid, expected_ticks=ticks, terminate=True, timeout_s=2.0):
-                        self.cleanup_unverified = True
-            if self._proc_ticks is None:
-                self.cleanup_unverified = True
-            else:
-                with contextlib.suppress(Exception):
-                    if not _win32_wait_or_terminate_pid(
-                        self._proc.pid, expected_ticks=self._proc_ticks, terminate=True, timeout_s=2.0
-                    ):
-                        self.cleanup_unverified = True
+            try:
+                for pid, ticks in tracked:
+                    with contextlib.suppress(Exception):
+                        if not _win32_wait_or_terminate_pid(
+                            pid,
+                            expected_ticks=ticks,
+                            job_handle=self._job_handle,
+                            terminate=True,
+                            timeout_s=2.0,
+                        ):
+                            self.cleanup_unverified = True
+                if self._proc_ticks is None:
+                    self.cleanup_unverified = True
+                else:
+                    with contextlib.suppress(Exception):
+                        if not _win32_wait_or_terminate_pid(
+                            self._proc.pid,
+                            expected_ticks=self._proc_ticks,
+                            job_handle=self._job_handle,
+                            terminate=True,
+                            timeout_s=2.0,
+                        ):
+                            self.cleanup_unverified = True
+            finally:
+                if self._job is not None:
+                    self._job.close()
         if self._writer is not None:
             self._writer.join(timeout=1.0)
         self._close_stdin()

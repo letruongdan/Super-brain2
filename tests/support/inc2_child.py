@@ -22,7 +22,10 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
-from typing import IO
+from typing import IO, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from tests.support.inc2_cli import _Win32ProcessJob
 
 from superbrain.adapters.os import os_adapters
 from superbrain.adapters.os.daemon_config import read_daemon_config
@@ -103,8 +106,14 @@ def _current_win32_creation_ticks() -> int | None:
     return _win32_handle_creation_ticks(int(kernel32.GetCurrentProcess()))
 
 
-def _win32_terminate_and_wait_pid(pid: int, timeout_s: float, *, expected_ticks: int | None = None) -> bool:
-    """Terminate ``pid`` via Win32 kernel handle only when ``expected_ticks`` matches handle creation ticks."""
+def _win32_terminate_and_wait_pid(
+    pid: int,
+    timeout_s: float,
+    *,
+    expected_ticks: int | None = None,
+    job_handle: int | None = None,
+) -> bool:
+    """Terminate ``pid`` via Win32 kernel handle only when ``expected_ticks`` (and optional ``job_handle``) matches."""
     assert sys.platform == "win32"
     if expected_ticks is None or isinstance(expected_ticks, bool) or not isinstance(expected_ticks, int):
         return False
@@ -128,6 +137,11 @@ def _win32_terminate_and_wait_pid(pid: int, timeout_s: float, *, expected_ticks:
             return False
         if actual_ticks != expected_ticks:
             return True  # Target exited and PID was recycled; do not touch new occupant.
+        if job_handle is not None:
+            from tests.support.inc2_cli import _win32_is_handle_in_job
+
+            if _win32_is_handle_in_job(int(handle), job_handle) is not True:
+                return False
         with contextlib.suppress(pywintypes.error):
             win32process.TerminateProcess(handle, 9)
         timeout_ms = max(1, int(timeout_s * 1000))
@@ -171,12 +185,21 @@ class Inc2ChildProcess:
         self._inner_pid: int | None = None
         self._inner_ticks: int | None = None
         proc_handle = getattr(self._proc, "_handle", None)
+        self._job: _Win32ProcessJob | None = None
+        self._job_assigned = False
+        self._job_handle: int | None = None
+        if sys.platform == "win32":
+            from tests.support.inc2_cli import _Win32ProcessJob
+
+            self._job = _Win32ProcessJob(kill_on_close=False)
+            self._job_assigned = self._job.assign_process(proc_handle)
+            self._job_handle = self._job.handle if self._job_assigned else None
         self._proc_ticks: int | None = (
             _win32_handle_creation_ticks(int(proc_handle))
             if (sys.platform == "win32" and proc_handle is not None)
             else None
         )
-        self.cleanup_unverified = False
+        self.cleanup_unverified = bool(self._job is not None and not self._job_assigned)
         self._events: queue.Queue[dict[str, JsonValue] | None] = queue.Queue()
         self._buffered_events: list[dict[str, JsonValue]] = []
         self._terminal_result_event: dict[str, JsonValue] | None = None
@@ -382,18 +405,31 @@ class Inc2ChildProcess:
             inner_ticks = self._inner_ticks
 
         if sys.platform == "win32":
-            if inner is not None and inner != launcher:
-                if inner_ticks is None or not _win32_terminate_and_wait_pid(
-                    inner, timeout, expected_ticks=inner_ticks
+            try:
+                if inner is not None and inner != launcher:
+                    if inner_ticks is None or not _win32_terminate_and_wait_pid(
+                        inner,
+                        timeout,
+                        expected_ticks=inner_ticks,
+                        job_handle=self._job_handle,
+                    ):
+                        self.cleanup_unverified = True
+                with contextlib.suppress(OSError):
+                    self._proc.kill()
+                if self._job is not None and self._job_assigned:
+                    if not self._job.terminate_and_wait(timeout_s=timeout):
+                        self.cleanup_unverified = True
+                self._proc.wait(timeout=timeout)
+                if self._proc_ticks is None or not _win32_terminate_and_wait_pid(
+                    launcher,
+                    timeout,
+                    expected_ticks=self._proc_ticks,
+                    job_handle=self._job_handle,
                 ):
                     self.cleanup_unverified = True
-            with contextlib.suppress(OSError):
-                self._proc.kill()
-            self._proc.wait(timeout=timeout)
-            if self._proc_ticks is None:
-                self.cleanup_unverified = True
-            else:
-                _win32_terminate_and_wait_pid(launcher, timeout, expected_ticks=self._proc_ticks)
+            finally:
+                if self._job is not None:
+                    self._job.close()
         else:
             if inner is not None and inner != launcher:
                 _posix_kill_pid(inner)
@@ -419,10 +455,14 @@ class Inc2ChildProcess:
         if self._closed:
             return
         self._closed = True
-        if self._proc.poll() is None:
-            self.kill_and_verify(timeout=timeout)
-        else:
-            self._close_pipes_and_join_pumps()
+        try:
+            if self._proc.poll() is None:
+                self.kill_and_verify(timeout=timeout)
+            else:
+                self._close_pipes_and_join_pumps()
+        finally:
+            if self._job is not None:
+                self._job.close()
 
     def __enter__(self) -> Inc2ChildProcess:
         return self

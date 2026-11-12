@@ -303,7 +303,7 @@ def _install_loopback_server_hooks(
     from concurrent.futures import Future, ThreadPoolExecutor
 
     from superbrain.application._auth_gate import AuthGate
-    from superbrain.cli_api import _loopback_server
+    from superbrain.cli_api import _loopback_server, _server_http
     from superbrain.core.canonical import digest_bytes
     from superbrain.core.wire import encode_envelope
 
@@ -321,6 +321,9 @@ def _install_loopback_server_hooks(
             dict[str, Any],
         ],
     ] = {}
+    conn_state_by_conn_key: dict[tuple[int, int], dict[str, Any]] = {}
+    conn_states_by_server: dict[int, set[tuple[int, int]]] = {}
+    conn_state_by_sock_id: dict[int, dict[str, Any]] = {}
     pending_cmds: dict[
         int,
         tuple[
@@ -347,12 +350,48 @@ def _install_loopback_server_hooks(
             pre_fut.result(timeout=1.0)
 
     loopback_mod: Any = _loopback_server
+    server_http_mod: Any = _server_http
     auth_gate_cls: Any = AuthGate
     orig_read_cmd = loopback_mod.read_admitted_tool_command
     orig_write_json = loopback_mod.write_json_response
+    orig_handle_ident = loopback_mod.handle_identity_request
     orig_release = _loopback_server.LoopbackServer._release_owner_reply
     orig_conn_worker = _loopback_server.LoopbackServer._conn_worker
+    orig_release_conn = _loopback_server.LoopbackServer._release_conn
+    orig_abort_all = _loopback_server.LoopbackServer._abort_all_active_sockets
+    orig_graceful_close = loopback_mod._graceful_close_conn
+    orig_abort_sock = loopback_mod._abort_socket
+    orig_graceful_reject = loopback_mod._graceful_reject_socket
+    orig_srv_graceful_close = server_http_mod._graceful_close_conn
+    orig_srv_abort_sock = server_http_mod._abort_socket
+    orig_srv_graceful_reject = server_http_mod._graceful_reject_socket
     orig_authorize_stamp = AuthGate.authorize_stamp
+
+    def _register_conn_sock(c_state: dict[str, Any] | None, sock: Any) -> None:
+        if c_state is None or sock is None:
+            return
+        with hook_lock:
+            if c_state.get("ssl_sock") is None and sock is not c_state.get("raw_sock"):
+                c_state["ssl_sock"] = sock
+            conn_state_by_sock_id[id(sock)] = c_state
+
+    def _mark_conn_closing(c_state: dict[str, Any] | None) -> None:
+        if c_state is None:
+            return
+        with c_state["lock"]:
+            if not c_state["closing"]:
+                c_state["closing"] = True
+                c_state["closing_ns"] = time.monotonic_ns()
+                c_state["closing_at"] = _utc_now_z()
+
+    def _lookup_state_for_socks(*socks: Any) -> dict[str, Any] | None:
+        with hook_lock:
+            for sock in socks:
+                if sock is not None:
+                    found = conn_state_by_sock_id.get(id(sock))
+                    if found is not None:
+                        return found
+        return None
 
     def _safe_client_identity(
         peer_port: int,
@@ -361,7 +400,7 @@ def _install_loopback_server_hooks(
     ) -> tuple[int | None, str | None, str | None, int | None]:
         if peer_port <= 0 or listen_port <= 0:
             return None, None, None, None
-        if conn_state is not None and conn_state["closed_event"].is_set():
+        if conn_state is not None and (conn_state["closed_event"].is_set() or conn_state["closing"]):
             return None, None, None, None
         client_pid: int | None = None
         client_started_at: str | None = None
@@ -370,19 +409,26 @@ def _install_loopback_server_hooks(
         with contextlib.suppress(OSError, subprocess.SubprocessError):
             client_pid = _lookup_loopback_client_pid(peer_port, listen_port)
             if client_pid is not None:
-                observed_ns = time.monotonic_ns()
-                observed_at = _utc_now_z()
-                if conn_state is not None and conn_state["closed_event"].is_set():
+                if conn_state is not None and (conn_state["closed_event"].is_set() or conn_state["closing"]):
                     return None, None, None, None
                 client_started_at = process_started_at_for_pid(client_pid)
+                observed_ns = time.monotonic_ns()
+                observed_at = _utc_now_z()
         if (
             client_pid is None
             or client_started_at is None
             or observed_at is None
             or observed_ns is None
-            or (conn_state is not None and conn_state["closed_event"].is_set())
         ):
             return None, None, None, None
+        if conn_state is not None:
+            with conn_state["lock"]:
+                if (
+                    conn_state["closing"]
+                    or conn_state["closed_event"].is_set()
+                    or observed_ns < conn_state["conn_started_ns"]
+                ):
+                    return None, None, None, None
         return client_pid, client_started_at, observed_at, observed_ns
 
     def _submit_lookup(
@@ -516,23 +562,27 @@ def _install_loopback_server_hooks(
 
             closed_at: str | None = None
             closed_ns: int | None = None
+            closing_ns: int | None = None
             conn_started_ns: int | None = None
             if conn_state is not None:
                 with contextlib.suppress(Exception):
                     conn_state["closed_event"].wait(timeout=max(0.0, wait_s))
-                closed_at = conn_state["closed_at"]
-                closed_ns = conn_state["closed_ns"]
-                conn_started_ns = conn_state["conn_started_ns"]
+                with conn_state["lock"]:
+                    closing_ns = conn_state["closing_ns"]
+                    closed_at = conn_state["closed_at"]
+                    closed_ns = conn_state["closed_ns"]
+                    conn_started_ns = conn_state["conn_started_ns"]
 
             obs_ok = (
                 client_pid is not None
                 and client_started_at is not None
                 and observed_at is not None
                 and observed_ns is not None
+                and closing_ns is not None
                 and closed_at is not None
                 and closed_ns is not None
                 and conn_started_ns is not None
-                and conn_started_ns <= observed_ns <= closed_ns
+                and conn_started_ns <= observed_ns <= closing_ns <= closed_ns
                 and conn_started_at <= observed_at <= closed_at
             )
             obs_status = "ok" if obs_ok else "observation_incomplete"
@@ -570,6 +620,29 @@ def _install_loopback_server_hooks(
             active_finalizers[:] = [t for t in active_finalizers if t.is_alive()]
             active_finalizers.append(th)
 
+    def _tap_handle_ident(
+        ssl_sock: Any,
+        reader: Any,
+        ready: Any,
+        *,
+        deadline_ns: int,
+        monotonic_ns: Any,
+    ) -> bool:
+        tid = threading.get_ident()
+        with hook_lock:
+            conn_ctx = conn_ctx_by_tid.get(tid)
+        if conn_ctx is not None:
+            _register_conn_sock(conn_ctx[7], ssl_sock)
+        return bool(
+            orig_handle_ident(
+                ssl_sock,
+                reader,
+                ready,
+                deadline_ns=deadline_ns,
+                monotonic_ns=monotonic_ns,
+            )
+        )
+
     def _tap_read_cmd(
         ssl_sock: Any,
         reader: Any,
@@ -583,6 +656,8 @@ def _install_loopback_server_hooks(
             flush_by_thread.pop(tid, None)
             stamp_result_by_tid.pop(tid, None)
             conn_ctx = conn_ctx_by_tid.get(tid)
+        if conn_ctx is not None:
+            _register_conn_sock(conn_ctx[7], ssl_sock)
         cmd = orig_read_cmd(ssl_sock, reader, ready, deadline_ns=deadline_ns, monotonic_ns=monotonic_ns)
         if cmd is not None:
             with contextlib.suppress(Exception):
@@ -630,6 +705,11 @@ def _install_loopback_server_hooks(
         deadline_ns: int,
         monotonic_ns: Any,
     ) -> None:
+        tid = threading.get_ident()
+        with hook_lock:
+            conn_ctx = conn_ctx_by_tid.get(tid)
+        if conn_ctx is not None:
+            _register_conn_sock(conn_ctx[7], ssl_sock)
         orig_write_json(
             ssl_sock,
             status=status,
@@ -638,7 +718,6 @@ def _install_loopback_server_hooks(
             deadline_ns=deadline_ns,
             monotonic_ns=monotonic_ns,
         )
-        tid = threading.get_ident()
         with contextlib.suppress(Exception), hook_lock:
             flush_by_thread[tid] = (int(status), digest_bytes(body))
 
@@ -650,13 +729,21 @@ def _install_loopback_server_hooks(
 
     def _tap_conn_worker(self: Any, conn_id: Any, raw_sock: Any, accept_ns: int) -> None:
         tid = threading.get_ident()
-        connection_id = f"conn-{int(conn_id)}"
+        conn_id_int = int(conn_id)
+        conn_key = (id(self), conn_id_int)
+        connection_id = f"conn-{conn_id_int}"
         conn_started_at = _utc_now_z()
         conn_state: dict[str, Any] = {
+            "lock": threading.Lock(),
             "conn_started_ns": time.monotonic_ns(),
             "closed_event": threading.Event(),
+            "closing": False,
+            "closing_ns": None,
+            "closing_at": None,
             "closed_at": None,
             "closed_ns": None,
+            "raw_sock": raw_sock,
+            "ssl_sock": None,
         }
         listen_host = "127.0.0.1"
         listen_port = 0
@@ -667,7 +754,16 @@ def _install_loopback_server_hooks(
             phost, pport = raw_sock.getpeername()[:2]
             listen_host, listen_port = str(lhost), int(lport)
             peer_host, peer_port = str(phost), int(pport)
+        with hook_lock:
+            conn_state_by_conn_key[conn_key] = conn_state
+            conn_states_by_server.setdefault(id(self), set()).add(conn_key)
+            if raw_sock is not None:
+                conn_state_by_sock_id[id(raw_sock)] = conn_state
         lookup_fut = _submit_lookup(peer_port, listen_port, conn_state)
+        prewait_s = min(0.01, max(0.0, collector_timeout_s * 0.05))
+        if prewait_s > 0.0:
+            with contextlib.suppress(Exception):
+                lookup_fut.result(timeout=prewait_s)
         with hook_lock:
             conn_ctx_by_tid[tid] = (
                 connection_id,
@@ -682,10 +778,25 @@ def _install_loopback_server_hooks(
         try:
             orig_conn_worker(self, conn_id, raw_sock, accept_ns)
         finally:
-            conn_state["closed_ns"] = time.monotonic_ns()
-            conn_state["closed_at"] = _utc_now_z()
-            conn_state["closed_event"].set()
+            _mark_conn_closing(conn_state)
+            with conn_state["lock"]:
+                conn_state["closed_ns"] = time.monotonic_ns()
+                conn_state["closed_at"] = _utc_now_z()
+                ssl_sock_ref = conn_state.get("ssl_sock")
+                conn_state["raw_sock"] = None
+                conn_state["ssl_sock"] = None
+                conn_state["closed_event"].set()
             with hook_lock:
+                conn_state_by_conn_key.pop(conn_key, None)
+                srv_set = conn_states_by_server.get(id(self))
+                if srv_set is not None:
+                    srv_set.discard(conn_key)
+                    if not srv_set:
+                        conn_states_by_server.pop(id(self), None)
+                if raw_sock is not None:
+                    conn_state_by_sock_id.pop(id(raw_sock), None)
+                if ssl_sock_ref is not None:
+                    conn_state_by_sock_id.pop(id(ssl_sock_ref), None)
                 conn_ctx_by_tid.pop(tid, None)
                 cmd_info = pending_cmds.pop(tid, None)
                 flushed_status, flushed_digest = flush_by_thread.pop(tid, (None, None))
@@ -704,6 +815,7 @@ def _install_loopback_server_hooks(
                     c_lookup_fut,
                     c_state,
                 ) = cmd_info
+                fallback_ended_at = conn_state["closed_at"] or _utc_now_z()
                 with contextlib.suppress(Exception):
                     gate = self._owner.auth_gate
                     principal_id, credential_id = _resolve_principal_and_cred(gate, None, False)
@@ -725,9 +837,60 @@ def _install_loopback_server_hooks(
                         peer_host=c_peer_host,
                         peer_port=c_peer_port,
                         req_started_at=req_started_at,
-                        ended_at=_utc_now_z(),
+                        ended_at=fallback_ended_at,
                         selected_scope=selected_scope,
                     )
+
+    def _tap_release_conn(
+        self: Any,
+        conn_id: Any,
+        raw_sock: Any,
+        ssl_sock: Any,
+        *,
+        drain: bool,
+    ) -> None:
+        conn_key = (id(self), int(conn_id))
+        with hook_lock:
+            c_state = conn_state_by_conn_key.get(conn_key)
+        if c_state is None:
+            c_state = _lookup_state_for_socks(ssl_sock, raw_sock)
+        _mark_conn_closing(c_state)
+        orig_release_conn(self, conn_id, raw_sock, ssl_sock, drain=drain)
+
+    def _tap_abort_all(self: Any) -> None:
+        with hook_lock:
+            keys = list(conn_states_by_server.get(id(self), ()))
+            states = [conn_state_by_conn_key[k] for k in keys if k in conn_state_by_conn_key]
+        for st in states:
+            _mark_conn_closing(st)
+        orig_abort_all(self)
+
+    def _make_graceful_close_tap(orig_fn: Any) -> Any:
+        def _tap_graceful_close(
+            ssl_sock: Any,
+            raw_sock: Any,
+            *,
+            drain: bool,
+            stop_deadline: float | None = None,
+        ) -> None:
+            _mark_conn_closing(_lookup_state_for_socks(ssl_sock, raw_sock))
+            orig_fn(ssl_sock, raw_sock, drain=drain, stop_deadline=stop_deadline)
+
+        return _tap_graceful_close
+
+    def _make_sock_close_tap(orig_fn: Any) -> Any:
+        def _tap_sock_close(sock: Any) -> None:
+            _mark_conn_closing(_lookup_state_for_socks(sock))
+            orig_fn(sock)
+
+        return _tap_sock_close
+
+    _tap_graceful_close = _make_graceful_close_tap(orig_graceful_close)
+    _tap_srv_graceful_close = _make_graceful_close_tap(orig_srv_graceful_close)
+    _tap_abort_sock = _make_sock_close_tap(orig_abort_sock)
+    _tap_srv_abort_sock = _make_sock_close_tap(orig_srv_abort_sock)
+    _tap_graceful_reject = _make_sock_close_tap(orig_graceful_reject)
+    _tap_srv_graceful_reject = _make_sock_close_tap(orig_srv_graceful_reject)
 
     def _tap_release(self: Any, ssl_sock: Any, reply: Any, tool_deadline_ns: int) -> None:
         tid = threading.get_ident()
@@ -852,15 +1015,33 @@ def _install_loopback_server_hooks(
 
     loopback_mod.read_admitted_tool_command = _tap_read_cmd
     loopback_mod.write_json_response = _tap_write_json
+    loopback_mod.handle_identity_request = _tap_handle_ident
+    loopback_mod._graceful_close_conn = _tap_graceful_close
+    loopback_mod._abort_socket = _tap_abort_sock
+    loopback_mod._graceful_reject_socket = _tap_graceful_reject
+    server_http_mod._graceful_close_conn = _tap_srv_graceful_close
+    server_http_mod._abort_socket = _tap_srv_abort_sock
+    server_http_mod._graceful_reject_socket = _tap_srv_graceful_reject
     loopback_mod.LoopbackServer._release_owner_reply = _tap_release
     loopback_mod.LoopbackServer._conn_worker = _tap_conn_worker
+    loopback_mod.LoopbackServer._release_conn = _tap_release_conn
+    loopback_mod.LoopbackServer._abort_all_active_sockets = _tap_abort_all
     auth_gate_cls.authorize_stamp = _tap_authorize_stamp
 
     def _uninstall() -> None:
         loopback_mod.read_admitted_tool_command = orig_read_cmd
         loopback_mod.write_json_response = orig_write_json
+        loopback_mod.handle_identity_request = orig_handle_ident
+        loopback_mod._graceful_close_conn = orig_graceful_close
+        loopback_mod._abort_socket = orig_abort_sock
+        loopback_mod._graceful_reject_socket = orig_graceful_reject
+        server_http_mod._graceful_close_conn = orig_srv_graceful_close
+        server_http_mod._abort_socket = orig_srv_abort_sock
+        server_http_mod._graceful_reject_socket = orig_srv_graceful_reject
         loopback_mod.LoopbackServer._release_owner_reply = orig_release
         loopback_mod.LoopbackServer._conn_worker = orig_conn_worker
+        loopback_mod.LoopbackServer._release_conn = orig_release_conn
+        loopback_mod.LoopbackServer._abort_all_active_sockets = orig_abort_all
         auth_gate_cls.authorize_stamp = orig_authorize_stamp
         _flush(timeout=collector_timeout_s + 0.5)
         lookup_pool.shutdown(wait=False, cancel_futures=True)
@@ -881,8 +1062,9 @@ def run_observed_owner(config_path: Path, evidence_dir: Path, stop: threading.Ev
         raise ValueError("absolute evidence_dir required")
 
     import superbrain
+    import superbrain.composition.daemon_entry as daemon_entry
+    import superbrain.composition.owner_entry as owner_entry
     from superbrain.adapters.os import daemon_config as daemon_config_mod
-    from superbrain.composition import daemon_entry, owner_entry
     from superbrain.core.canonical import digest_bytes
     from superbrain.core.wire import load_catalog
 
