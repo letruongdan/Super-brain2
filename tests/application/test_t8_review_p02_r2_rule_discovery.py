@@ -25,6 +25,8 @@ _HELPERS = frozenset(
         "_STATUS_VALUE_RE",
         "_PEM_BEGIN",
         "_PEM_END",
+        "_PRIVATE_MARK",  # T8-W01: <private> marker scanners, ungated like the PEM markers
+        "_PRIVATE_BLOCK",
         "_AUTHORITY",
         "_SEGMENT",
         "_CREDENTIAL_USER",
