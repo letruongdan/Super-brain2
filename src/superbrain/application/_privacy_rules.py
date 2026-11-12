@@ -6,6 +6,7 @@ import fnmatch
 import hashlib
 import re
 import unicodedata
+from collections.abc import Callable
 from functools import lru_cache
 
 from superbrain.core.kernel import (
@@ -59,8 +60,6 @@ _DOTTED_PATH_TOKEN = re.compile(
 _PATH_SPLIT = re.compile(r"[\\/]+")
 _PATH_LEAD = "`*([{<\"'"
 _PATH_TRAIL = "`*)]}>\"'.,:;!?"
-# Spellings of one wrapped token checked before the payload is refused: (leading run + 1) x (trailing run + 1).
-MAX_PATH_SPELLINGS = 4096
 _ENTROPY_EDGE = "\"'()[]{}<>,;.!?:`*"
 # Zero-width word boundaries (O(1) per position, so linear on any key): camelCase, acronym->Camel, letter<->digit.
 _WORD_BOUNDARY = re.compile(
@@ -208,19 +207,109 @@ def _gate_open(pattern: re.Pattern[str], text: str, lowered: str | None) -> bool
     return pairs is None or any(pair in text for pair in pairs)
 
 
+def _glob_units(glob: str) -> list[str]:
+    """fnmatch units of one component: ``*``, ``?``, a closed ``[...]`` class, or one literal character."""
+    units: list[str] = []
+    i = 0
+    while i < len(glob):
+        if glob[i] == "[":
+            j = i + 1
+            if j < len(glob) and glob[j] == "!":
+                j += 1
+            if j < len(glob) and glob[j] == "]":
+                j += 1
+            close = glob.find("]", j)
+            if close >= 0:
+                units.append(glob[i : close + 1])
+                i = close + 1
+                continue
+        units.append(glob[i])
+        i += 1
+    return units
+
+
+class _Glob:
+    """One component glob, with the fixed-width head/tail used to pick the few trimmed spellings worth testing.
+
+    Each non-``*`` unit matches exactly one character. Without ``*`` a match has a fixed width. With ``*``, a match
+    is head + anything + tail with stars at both inner ends, so keeping more characters next to a matching head or
+    tail never breaks a match: the smallest trim whose head (tail) fits is the only one to test.
+    """
+
+    def __init__(self, glob: str) -> None:
+        self.full = re.compile(fnmatch.translate(glob))
+        units = _glob_units(glob)
+        self.star = "*" in units
+        if self.star:
+            first = units.index("*")
+            last = len(units) - 1 - units[::-1].index("*")
+            head, tail = units[:first], units[last + 1 :]
+        else:
+            head, tail = units, []
+        self.head = [re.compile(fnmatch.translate(unit)) for unit in head]
+        self.tail = [re.compile(fnmatch.translate(unit)) for unit in tail]
+
+    def _kept(self, piece: str) -> bool:
+        return piece not in ("", ".") and self.full.fullmatch(piece) is not None
+
+    @staticmethod
+    def _fits(units: list[re.Pattern[str]], text: str, at: int) -> bool:
+        return all(unit.fullmatch(text[at + k]) for k, unit in enumerate(units))
+
+    def _smallest(self, units: list[re.Pattern[str]], text: str, limit: int, at: Callable[[int], int]) -> int | None:
+        return next((k for k in range(limit + 1) if self._fits(units, text, at(k))), None)
+
+    def first_edge(self, seg: str, lead: int) -> int | None:
+        """Smallest ``p <= lead`` with ``seg[p:]`` a kept, matching component (``None`` when there is none)."""
+        n, h, t = len(seg), len(self.head), len(self.tail)
+        if not self.star:
+            p: int | None = n - h if 0 <= n - h <= lead else None
+        else:
+            p = self._smallest(self.head, seg, min(lead, n - h - t), lambda k: k)
+        return p if p is not None and self._kept(seg[p:]) else None
+
+    def last_edge(self, seg: str, trail: int) -> int | None:
+        """Smallest ``s <= trail`` with ``seg[:len - s]`` a kept, matching component."""
+        n, h, t = len(seg), len(self.head), len(self.tail)
+        if not self.star:
+            s: int | None = n - h if 0 <= n - h <= trail else None
+        else:
+            s = self._smallest(self.tail, seg, min(trail, n - h - t), lambda k: n - k - t)
+        return s if s is not None and self._kept(seg[: n - s]) else None
+
+    def single(self, seg: str, lead: int, trail: int) -> tuple[int, int] | None:
+        """``(p, s)`` with ``seg[p:len - s]`` a kept match, both trims inside their runs (``None`` when none)."""
+        n, h, t = len(seg), len(self.head), len(self.tail)
+        if not self.star:
+            for start in range(min(lead, n - h) + 1):
+                cut = n - h - start
+                if cut <= trail and self._kept(seg[start : n - cut]):
+                    return start, cut
+            return None
+        p = self._smallest(self.head, seg, min(lead, n - h - t), lambda k: k)
+        if p is None:
+            return None
+        s = self._smallest(self.tail, seg, min(trail, n - h - t - p), lambda k: n - k - t)
+        return (p, s) if s is not None and self._kept(seg[p : n - s]) else None
+
+
 class _PathMatcher:
     """Component-boundary matcher for blocked path patterns (``name``, ``dir/`` and ``a/b`` chains)."""
 
     def __init__(self, patterns: tuple[str, ...]) -> None:
         self._chains: list[list[re.Pattern[str]]] = []
+        self._name_globs: list[_Glob] = []
+        self._chain_globs: list[list[_Glob]] = []
         names: list[str] = []
         for pattern in patterns:
             # ``name``, ``dir/`` and ``a/b`` (either separator): globs over a window of consecutive token components.
             parts = blocked_path_components(pattern)
             if len(parts) == 1:
                 names.append(fnmatch.translate(parts[0]))
+                self._name_globs.append(_Glob(parts[0]))
             elif parts:
                 self._chains.append([re.compile(fnmatch.translate(part)) for part in parts])
+                self._chain_globs.append([_Glob(part) for part in parts])
         self._names = re.compile("|".join(f"(?:{n})" for n in names)) if names else None
         self._results: dict[str, bool] = {}
         self._needles = _path_needles(patterns)
@@ -237,15 +326,61 @@ class _PathMatcher:
         if cached is not None:
             return cached
         result = self._matches(token)
-        if len(self._results) < 1024:
+        if len(token) <= 256 and len(self._results) < 1024:  # bounded memory: long tokens are not cached
             self._results[token] = result
         return result
+
+    def find(self, token: str) -> tuple[int, int] | None:
+        """§14.2 for a wrapped token: ``(p, s)`` such that ``token[p:len - s]`` is a blocked spelling, where ``p``
+        and ``s`` trim inside the leading and trailing wrapper runs (measured on the whole token), else ``None``.
+
+        Trimming only changes the first and the last component, so the token is split once and each glob is tested
+        on a handful of edge spellings (see ``_Glob``): linear in the token, with no cap on the wrapper runs.
+        """
+        low = token.lower()  # wrapper runs are ASCII, so their lengths match between ``token`` and ``low``
+        lead = len(low) - len(low.lstrip(_PATH_LEAD))
+        trail = len(low) - len(low.rstrip(_PATH_TRAIL))
+        if lead + trail < len(low) and self.blocked(token[lead : len(token) - trail]):
+            return lead, trail  # the fully trimmed spelling first: every wrapper outside it is kept
+        if not lead and not trail:
+            return None
+        segs = _PATH_SPLIT.split(low)
+        if len(segs) == 1:
+            return next((hit for g in self._name_globs if (hit := g.single(low, lead, trail)) is not None), None)
+        first, last = segs[0], segs[-1]
+        mid = [part for part in segs[1:-1] if part and part != "."]
+        if self._matches_parts(mid):
+            return lead, trail
+        for g in self._name_globs:
+            if (p := g.first_edge(first, lead)) is not None:
+                return p, trail
+            if (s := g.last_edge(last, trail)) is not None:
+                return lead, s
+        for chain in self._chain_globs:
+            inner = len(chain) - 1
+            if len(mid) >= inner and all(g.full.fullmatch(part) for g, part in zip(chain[1:], mid, strict=False)):
+                if (p := chain[0].first_edge(first, lead)) is not None:
+                    return p, trail
+            if len(mid) >= inner and all(
+                g.full.fullmatch(part) for g, part in zip(chain[:-1], mid[len(mid) - inner :], strict=True)
+            ):
+                if (s := chain[-1].last_edge(last, trail)) is not None:
+                    return lead, s
+            if len(mid) == len(chain) - 2 and all(
+                g.full.fullmatch(part) for g, part in zip(chain[1:-1], mid, strict=True)
+            ):
+                p, s = chain[0].first_edge(first, lead), chain[-1].last_edge(last, trail)
+                if p is not None and s is not None:
+                    return p, s
+        return None
 
     def _matches(self, token: str) -> bool:
         low = token.lower()
         if self._needles is not None and not any(needle in low for needle in self._needles):
             return False
-        parts = [p for p in _PATH_SPLIT.split(low) if p and p != "."]
+        return self._matches_parts([p for p in _PATH_SPLIT.split(low) if p and p != "."])
+
+    def _matches_parts(self, parts: list[str]) -> bool:
         for index, part in enumerate(parts):
             if self._names is not None and self._names.fullmatch(part):
                 return True

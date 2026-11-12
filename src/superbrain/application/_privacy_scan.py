@@ -12,12 +12,9 @@ from superbrain.application._privacy_rules import (
     _CREDENTIAL_USER,
     _FIXED_TOKENS,
     _KEY_VALUE_SECRET,
-    _PATH_LEAD,
-    _PATH_TRAIL,
     _PEM_BEGIN,
     _PEM_END,
     _SEGMENT,
-    MAX_PATH_SPELLINGS,
     REDACTED,
     _gate_open,
     _PathMatcher,
@@ -177,25 +174,16 @@ class _TextScans:
         return f"{match.group(1)} {REDACTED}"
 
     def _blocked_path(self, match: re.Match[str]) -> str:
-        """§14.2: a token is blocked when any spelling left after removing part of its leading wrapper run and part
-        of its trailing wrapper run (or nothing) matches; that spelling is replaced and the removed wrappers stay."""
+        """§14.2: replace a blocked spelling of the token (any trim of its wrapper runs); wrappers outside it stay."""
         token = match.group(0)
-        # Both runs are measured on the whole token; in an all-wrapper token they overlap.
-        lead = len(token) - len(token.lstrip(_PATH_LEAD))
-        trail = len(token) - len(token.rstrip(_PATH_TRAIL))
         if not self._paths.may_block(token):
             return token
-        if (lead + 1) * (trail + 1) > MAX_PATH_SPELLINGS:
-            raise _Reject  # fail closed rather than check fewer spellings than the rule names
-        # Most wrapper characters removed first, so wrappers outside the blocked spelling are kept.
-        for keep_lead in range(lead + 1):
-            for keep_trail in range(trail + 1):
-                start, end = lead - keep_lead, len(token) - trail + keep_trail
-                if start < end and self._paths.blocked(token[start:end]):
-                    self.redacted += 1
-                    return token[:start] + REDACTED + token[end:]
-                self.tick()
-        return token
+        found = self._paths.find(token)
+        if found is None:
+            return token
+        start, cut = found
+        self.redacted += 1
+        return token[:start] + REDACTED + token[len(token) - cut :]
 
     def redact(self, text: str, *, entropy: bool = True) -> str:
         self.tick()
