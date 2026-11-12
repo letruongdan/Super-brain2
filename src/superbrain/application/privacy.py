@@ -36,7 +36,6 @@ from superbrain.core.canonical import canonical_json
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.jsonvalue import JsonValue
 from superbrain.core.kernel import (
-    DEFAULT_BLOCKED_PATH_PATTERNS,
     OPAQUE_ID_RE,
     SHA256_DIGEST_RE,
     FilterPolicy,
@@ -82,13 +81,11 @@ _KEY_VALUE_SECRET = re.compile(
     r"(\"[^\"\r\n]{0,512}\"|'[^'\r\n]{0,512}'|[^\s;,&]+)"
 )
 _PATH_TOKEN = re.compile(r"[^\s\"'<>|()\[\]{},;]+")
-_DEFAULT_PATH_TOKEN = re.compile(
+# A token holding ``.`` or ``_``: enough when every blocked-pattern needle holds one (lower() never makes them).
+_DOTTED_PATH_TOKEN = re.compile(
     r"(?<![^\s\"'<>|()\[\]{},;])(?=[^\s\"'<>|()\[\]{},;]*[._])[^\s\"'<>|()\[\]{},;]+"
 )
 _FIXED_TOKEN_PREFIX = re.compile(r"github_pat_|gh[pousr]_|sk-|AKIA|ASIA|xox[baprs]-|AIza|eyJ")
-_DEFAULT_PATH_NEEDLE = re.compile(
-    r"\.(?:env|ssh|aws|npmrc|pypirc|netrc|pem|key|p12|pfx)|id_|credentials|_netrc"
-)
 _PATH_SPLIT = re.compile(r"[\\/]+")
 _PATH_LEAD = "`*([{<\"'"
 _PATH_TRAIL = "`*)]}>\"'.,:;!?"
@@ -218,6 +215,31 @@ def _tokenish(token: str) -> bool:
     return any(ch.isdigit() or ch in "+/=_-.~" for ch in token) or any(ch.isupper() for ch in token[1:])
 
 
+def _component_needle(part: str) -> str:
+    """Longest literal run every fnmatch fullmatch of ``part`` must contain; ``""`` when none is guaranteed."""
+    if "[" in part:  # a bracket class matches one of several characters: keep only the literal text before it
+        part = part[: part.index("[")]
+    return max(re.split(r"[*?]", part), key=len)
+
+
+@lru_cache(maxsize=32)
+def _path_needles(patterns: tuple[str, ...]) -> tuple[str, ...] | None:
+    """Lowercase ASCII substrings one of which every blocked token's lowercase form contains; ``None``: no prefilter.
+
+    Derived from the policy's own patterns, so a pattern added to any list (the shipped default included) is never
+    skipped by a stale hand-written prefilter.
+    """
+    needles: set[str] = set()
+    for pattern in patterns:
+        lowered = pattern.lower()
+        parts = [lowered.rstrip("/")] if lowered.endswith("/") else [part for part in lowered.split("/") if part]
+        best = max((_component_needle(part) for part in parts), key=len, default="")
+        if not best or not best.isascii():
+            return None
+        needles.add(best)
+    return tuple(sorted(needles))
+
+
 class _PathMatcher:
     """Component-boundary matcher for blocked path patterns (``name``, ``dir/`` and ``a/b`` chains)."""
 
@@ -235,7 +257,7 @@ class _PathMatcher:
                 names.append(fnmatch.translate(lowered))
         self._names = re.compile("|".join(f"(?:{n})" for n in names)) if names else None
         self._results: dict[str, bool] = {}
-        self._is_default = (patterns == DEFAULT_BLOCKED_PATH_PATTERNS)
+        self._needles = _path_needles(patterns)
 
     def blocked(self, token: str) -> bool:
         cached = self._results.get(token)
@@ -248,13 +270,8 @@ class _PathMatcher:
 
     def _matches(self, token: str) -> bool:
         low = token.lower()
-        if self._is_default and "/" not in low and "\\" not in low:
-            if not (
-                low.startswith((".", "_", "id_"))
-                or low.endswith((".pem", ".key", ".p12", ".pfx"))
-                or low == "credentials"
-            ):
-                return False
+        if self._needles is not None and not any(needle in low for needle in self._needles):
+            return False
         parts = [p for p in _PATH_SPLIT.split(low) if p and p != "."]
         for index, part in enumerate(parts):
             if part in self._dirs or (self._names is not None and self._names.fullmatch(part)):
@@ -287,6 +304,11 @@ class _Run:
         self._entropy_thresh = 2 ** -(policy.entropy_min_bits + 1e-12)
         self._entropy_min_distinct = 2 ** (policy.entropy_min_bits - 1e-12)
         self._min_u = _min_u_table(float(policy.entropy_min_bits))
+        needles = _path_needles(policy.blocked_path_patterns)
+        self._path_scan = bool(policy.blocked_path_patterns)
+        self._path_needle = re.compile("|".join(map(re.escape, needles))) if needles else None
+        dotted = needles is not None and all("." in needle or "_" in needle for needle in needles)
+        self._path_token = _DOTTED_PATH_TOKEN if dotted else _PATH_TOKEN
 
     def tick(self) -> None:
         if self._deadline_ns is not None and self._monotonic_ns() >= self._deadline_ns:
@@ -771,13 +793,11 @@ class _Run:
                         lowered = ""
             self.tick()
             # The cheap candidate scan keeps the full component matcher as the authority.
-            if self.policy.blocked_path_patterns == DEFAULT_BLOCKED_PATH_PATTERNS:
-                if not lowered:
+            if self._path_scan:
+                if self._path_needle is not None and not lowered:
                     lowered = text.lower()
-                if _DEFAULT_PATH_NEEDLE.search(lowered):
-                    text = _DEFAULT_PATH_TOKEN.sub(self._blocked_path, text)
-            else:
-                text = _PATH_TOKEN.sub(self._blocked_path, text)
+                if self._path_needle is None or self._path_needle.search(lowered):
+                    text = self._path_token.sub(self._blocked_path, text)
         else:
             text = self._sub(_AUTH_HEADER, rf"\1\2{REDACTED}", text)
             self.tick()
@@ -790,10 +810,8 @@ class _Run:
             text = self._sub(_KEY_VALUE_SECRET, rf"\1\2{REDACTED}", text)
             self.tick()
             # The cheap candidate scan keeps the full component matcher as the authority.
-            if self.policy.blocked_path_patterns == DEFAULT_BLOCKED_PATH_PATTERNS:
-                text = _DEFAULT_PATH_TOKEN.sub(self._blocked_path, text)
-            else:
-                text = _PATH_TOKEN.sub(self._blocked_path, text)
+            if self._path_scan:
+                text = self._path_token.sub(self._blocked_path, text)
         self.tick()
         if entropy:
             text = self._entropy(text)

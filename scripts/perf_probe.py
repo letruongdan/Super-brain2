@@ -116,6 +116,13 @@ def child(config: Path) -> int:
         sample = getattr(local, "sample", None)
         if sample is None:
             return original_write(*args, **kwargs)
+        if active.get("idempotency_key") != sample["idempotency_key"]:
+            # Spans recorded since belong to another request: never pair them with this response.
+            result = original_write(*args, **kwargs)
+            sample["status"] = "instrumentation_mismatch"
+            print(json.dumps({"event": "sample", **sample}), flush=True)
+            local.sample = None
+            return result
         active["response_write_start_ns"] = time.perf_counter_ns()
         result = original_write(*args, **kwargs)
         active["response_flushed_ns"] = time.perf_counter_ns()
