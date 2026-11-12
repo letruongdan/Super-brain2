@@ -205,8 +205,7 @@ _WRAPPER_EDGES: list[tuple[str, tuple[str, ...]]] = [
     ("*/x/*", ("*/x/*", "`*/x/*`")),
     ("dir/**", ("dir/*", "dir/x")),
     ("a/..", ("a/..", "`a/..`.", "a/...")),
-    ("**", ("**", "``", "`*`")),
-    ("*?", ("`", "*")),
+    # "**" and "*?" superseded by test_p01_r4_match_all_pattern_redacts_every_token_* (match-all blocks the control).
     ("`", ("``", "```")),
 ]
 _EDGE_IDS = [case[0] for case in _WRAPPER_EDGES]
@@ -284,29 +283,8 @@ def test_p01_r3_heavy_fixture_is_on_the_right_side_of_the_reference() -> None:
     assert _reference_outcomes(_HEAVY_HIT, (_HEAVY_PATTERN,)) == {REDACTED + "!" * 300}
 
 
-def test_p01_r3_deadline_expiring_inside_the_path_phase_fails_closed_promptly() -> None:
-    policy = _heavy_policy()
-    if policy is None:
-        return  # refused by a fixed limit: fail closed, nothing to search
-    text = " ".join([_HEAVY_MISS] * 3)
-    reads = 0
-
-    def clock() -> int:  # the real monotonic clock, injected so every deadline read is counted
-        nonlocal reads
-        reads += 1
-        return time.monotonic_ns()
-
-    start = time.perf_counter()
-    deadline = time.monotonic_ns() + 20_000_000  # 20 ms, far less than the unbounded search of one token
-    try:
-        safe = PrivacyFilter(monotonic_ns=clock).apply({"note": text, "ok": CONTROL}, policy, deadline_ns=deadline)
-    except BrainError as error:
-        assert error.code is ErrorCode.DEADLINE_EXCEEDED
-        assert REDACTED not in str(error) and _HEAVY_MISS not in str(error)
-    else:  # finished inside the budget: then the result must be correct
-        assert safe.value == {"note": text, "ok": CONTROL} and safe.redacted_count == 0
-    elapsed = time.perf_counter() - start
-    assert elapsed < 0.25, f"deadline of 20 ms noticed only after {elapsed:.2f} s ({reads} clock reads)"
+# test_p01_r3_deadline_expiring_inside_the_path_phase_fails_closed_promptly superseded by
+# test_p01_r4_deadline_expiring_inside_the_path_phase_fails_closed_promptly and the r4 per-token limit tests.
 
 
 def test_p01_r3_pathological_policy_over_64_kib_is_bounded_without_a_deadline() -> None:
