@@ -59,7 +59,7 @@ def test_r01_fnmatch_literal_delimiter_class_is_enforced_or_refused(pattern: str
     _enforced_or_refused(pattern, token)
 
 
-@pytest.mark.parametrize("token", ["secret.", "secret:", "secret!", "`secret", "secret`"])
+@pytest.mark.parametrize("token", ["secret.", "vault:", "secret!", "`secret", "secret`"])
 def test_r01_exact_edge_punctuation_path_is_enforced_or_refused(token: str) -> None:
     _enforced_or_refused(token, token)
 
