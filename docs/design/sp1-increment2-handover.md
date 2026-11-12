@@ -26,7 +26,7 @@ Tính đến thời điểm commit tài liệu này:
 - **Vận hành daemon owner và CLI/MCP shim (D1, D3):** `brain serve --config <ABS>`, `brain migrate --offline --config <ABS>`, `brain-mcp` và `brain mcp --profile <ABS>` (stdio MCP `2025-06-18`) thực thi `single-checkout-owner-profile-v1`, xác minh raw path, physical identity và launch CWD, tiêm `workspace_hint` và `selected_scope={repo_id, checkout_id}` trước HMAC digest.
 - **Policy v3 & Store v4:** principal `(owner_id, harness_id, machine_id)`, bearer `<credential_uuidv7>.<secret>` lưu hash SHA-256 + constant-time verify, `AuthGate` nguyên tử (generation + trust generation + grant stamp), registry workspace trên policy và reconcile theo intent ID vào kho, HMAC-SHA256 `idempotency` với replay/conflict/lost-response recovery, mô hình `Delivery`/`ServedReceipt`/`ReadAck`, `LineageRef`/`LineageSet`/`LineagedField`, tương thích S1=A (`snapshot_status`), và `Job`/`JobService`/`ProviderInvocation` với lease/attempt/cancel/settlement.
 - **Privacy filter & ma trận crash:** 10 nhóm lọc secret/PII/entropy/`<private>`/path cấm trước canonical safe payload; 29 dòng crashpoint trong [sp1-crash-table.md](sp1-crash-table.md) (19 I1 + 10 kernel Task 8) được kiểm parity tên/doc/case bằng AST/matrix tests.
-- **Contract nhận diện kết nối & quan sát owner Task 9:** `tests/support/inc2_native.py` (`sp1-i2-native-connection-v1`), `tests/support/inc2_native_owner.py` (chạy wheel dưới `python -I`, nối `LoopbackServer._release_owner_reply`, `write_json_response`, `AuthGrantStamp` == `AuthGate.current()` và lookup PID socket loopback OS), 6 contract/wheel tests trong `tests/integration/test_kernel_native_receipt_contract.py`, và [sp1-increment2-native-checklist.md](sp1-increment2-native-checklist.md).
+- **Contract nhận diện kết nối & quan sát owner Task 9:** `tests/support/inc2_native.py` (`sp1-i2-native-connection-v1`), `tests/support/inc2_native_owner.py` (chạy wheel dưới `python -I`, nối `read_admitted_tool_command`, `LoopbackServer._conn_worker`, `LoopbackServer._release_owner_reply`, `write_json_response`, `AuthGate.authorize_stamp` / `AuthGrantStamp` == `AuthGate.current()` và lookup PID socket loopback OS qua `GetExtendedTcpTable` trên Win32 hoặc `/proc` / `lsof` trên Linux/macOS), 12 contract/wheel tests trong `tests/integration/test_kernel_native_receipt_contract.py`, và [sp1-increment2-native-checklist.md](sp1-increment2-native-checklist.md).
 
 ### Không thuộc SP1 đợt 2 (hoãn đúng theo D1–D8 và spec §20)
 
@@ -81,7 +81,7 @@ Môi trường Windows sử dụng `LOCALAPPDATA=C:\Users\letru\sb2-trusted-loca
 
 ## 4. Verdict Q4 · Kết nối native theo từng host
 
-Quy ước theo §17.3 / §17.5: 6 bài kiểm trong `tests/integration/test_kernel_native_receipt_contract.py` là bằng chứng **contract và fixture qua wheel cài đặt thật** (`kind="fixture"`), hoàn toàn không thay thế `NativeHostReceipt` từ tiến trình host thật.
+Quy ước theo §17.3 / §17.5: 12 bài kiểm trong `tests/integration/test_kernel_native_receipt_contract.py` là bằng chứng **contract và fixture qua wheel cài đặt thật** (`kind="fixture"`), hoàn toàn không thay thế `NativeHostReceipt` từ tiến trình host thật.
 
 | Host (Q4) | Trạng thái T0 lịch sử | Verdict native T9 hiện tại | Ghi chú & điều kiện |
 |---|---|---|---|

@@ -90,12 +90,14 @@ def workspace_transition_matches(
             return False
         if after.profile_digest == before.profile_digest:
             return False
-        if (
-            scope_changed
-            and before.launch_cwd is not None
-            and after.launch_cwd is not None
-            and after.launch_cwd == before.launch_cwd
-        ):
-            return False
+        if scope_changed and before.launch_cwd is not None:
+            import os
+
+            if after.launch_cwd is None:
+                return False
+            if os.path.normcase(os.path.abspath(str(after.launch_cwd))) == os.path.normcase(
+                os.path.abspath(str(before.launch_cwd))
+            ):
+                return False
 
     return True

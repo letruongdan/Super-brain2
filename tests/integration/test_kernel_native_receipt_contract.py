@@ -460,6 +460,22 @@ def test_native_call_join_rejects_reused_identity_and_missing_terminal(trusted_t
         profile_digest=probe.profile_digest or "",
         observed_scope=scope_b,
     )
+    assert probe.terminal_facts is not None
+    probe_b_lc = replace(
+        probe,
+        terminal_facts=replace(probe.terminal_facts, observed_scope=scope_b.to_dict()),
+    )
+    obs_b_lc = replace(
+        obs,
+        owner_events=(replace(obs.owner_events[0], selected_scope=scope_b.to_dict()),),
+        prior_lifecycle=obs_before,
+        current_lifecycle=obs_after_good,
+        expected_scope=scope_b,
+        expected_profile_digest=probe.profile_digest,
+        expected_first_scope=scope_a,
+    )
+    assert verify_native_connection(probe_b_lc, registration=reg, observations=obs_b_lc) is True
+    # Contradictory probe observed_scope (scope_a) vs current_lifecycle (scope_b) MUST fail.
     assert (
         verify_native_connection(
             probe,
@@ -473,7 +489,7 @@ def test_native_call_join_rejects_reused_identity_and_missing_terminal(trusted_t
                 expected_first_scope=scope_a,
             ),
         )
-        is True
+        is False
     )
     obs_after_stale = ShimLaunchObservation(
         pid=obs_before.pid,
@@ -980,9 +996,12 @@ def test_two_principals_one_store_id(inc2_installed_env: InstalledEnv) -> None:
                 verify_native_connection(probe_dup, registration=reg_dup, observations=obs_dup, require_native=False)
                 is True
             )
-            assert verify_same_daemon(probe_a, probe_dup) is True
+            # Same principal with two credentials cannot satisfy two-principal verify_same_daemon.
+            assert verify_same_daemon(probe_a, probe_dup) is False
             assert probe_dup.binding is not None
             assert probe_dup.binding.principal_id == probe_a.binding.principal_id
+            assert probe_dup.token_context is not None and probe_a.token_context is not None
+            assert probe_dup.token_context.credential_id != probe_a.token_context.credential_id
 
         assert is_writer_lock_held(data_root) is False
     finally:
@@ -1068,6 +1087,31 @@ def test_two_hosts_reject_different_daemon_epochs(inc2_installed_env: InstalledE
             assert (
                 verify_native_connection(probe_1, registration=reg_1, observations=obs_1, require_native=False) is True
             )
+            sc1b, la1b, wk1b, st1b, en1b = _invoke_wheel_shim_health(inc2_installed_env, prof_2, cwd=outside_cwd)
+            probe_1b, reg_1b, obs_1b = _build_wheel_probe_and_obs(
+                env=inc2_installed_env,
+                owner=owner1,
+                evidence_root=case_dir,
+                owner_evidence_dir=ev1,
+                config_path=cfg_path,
+                profile_path=prof_2,
+                schema_copy_path=schema_copy,
+                task_id="task-t9-epoch-1b",
+                call_id="call-t9-epoch-1b",
+                host="codex-desktop",
+                credential_id=cred_2.credential_id,
+                principal_id=cred_2.principal.principal_id,
+                tool_name="get_health",
+                response_envelope=sc1b,
+                launcher_proc=la1b,
+                worker_proc=wk1b,
+                started_at=st1b,
+                ended_at=en1b,
+            )
+            assert (
+                verify_native_connection(probe_1b, registration=reg_1b, observations=obs_1b, require_native=False)
+                is True
+            )
 
         assert is_writer_lock_held(data_root) is False
 
@@ -1098,30 +1142,35 @@ def test_two_hosts_reject_different_daemon_epochs(inc2_installed_env: InstalledE
                 verify_native_connection(probe_2, registration=reg_2, observations=obs_2, require_native=False) is True
             )
 
-        assert verify_same_daemon(probe_1, probe_1) is True
+        assert verify_same_daemon(probe_1, probe_1b) is True
+        assert verify_same_daemon(probe_1, probe_1) is False
         assert probe_1.binding is not None and probe_2.binding is not None
         assert probe_2.binding.writer_epoch > probe_1.binding.writer_epoch
         assert probe_2.binding.instance_id != probe_1.binding.instance_id
         assert verify_same_daemon(probe_1, probe_2) is False
 
         # Even if writer_epoch differs alone, instance_id differs alone, or daemon started_at differs, reject.
-        assert probe_1.daemon_process is not None and probe_1.terminal_facts is not None
         assert (
-            verify_same_daemon(probe_1, replace(probe_1, binding=replace(probe_1.binding, writer_epoch=999))) is False
+            probe_1b.binding is not None
+            and probe_1b.daemon_process is not None
+            and probe_1b.terminal_facts is not None
         )
         assert (
-            verify_same_daemon(probe_1, replace(probe_1, binding=replace(probe_1.binding, instance_id="inst-other")))
+            verify_same_daemon(probe_1, replace(probe_1b, binding=replace(probe_1b.binding, writer_epoch=999))) is False
+        )
+        assert (
+            verify_same_daemon(probe_1, replace(probe_1b, binding=replace(probe_1b.binding, instance_id="inst-other")))
             is False
         )
         assert (
             verify_same_daemon(
                 probe_1,
-                replace(probe_1, daemon_process=replace(probe_1.daemon_process, started_at="2026-11-12T05:00:00Z")),
+                replace(probe_1b, daemon_process=replace(probe_1b.daemon_process, started_at="2026-11-12T05:00:00Z")),
             )
             is False
         )
         assert (
-            verify_same_daemon(probe_1, replace(probe_1, terminal_facts=replace(probe_1.terminal_facts, ready=False)))
+            verify_same_daemon(probe_1, replace(probe_1b, terminal_facts=replace(probe_1b.terminal_facts, ready=False)))
             is False
         )
     finally:
@@ -1228,7 +1277,6 @@ def test_native_workspace_transition_rejects_stale_shim_and_scope(inc2_installed
                 inc2_installed_env, "brain", ("mcp", "--profile", str(prof_a)), cwd=chk_a
             ) as sess_a:
                 sess_a.send_frames_and_expect_response(mcp_init_frames(1))
-                st_a = _utc_now_z()
                 resp_ha = sess_a.send_frames_and_expect_response(
                     [
                         {"jsonrpc": "2.0", "method": "notifications/initialized"},
@@ -1238,9 +1286,11 @@ def test_native_workspace_transition_rejects_stale_shim_and_scope(inc2_installed
                 is_err_h, sc_ha = _extract_mcp_structured(resp_ha)
                 assert is_err_h is False and cast(dict[str, Any], sc_ha["data"])["ready"] is True
 
+                st_a = _utc_now_z()
                 resp_ja = sess_a.send_frames_and_expect_response(
                     [mcp_call_frame(3, "get_job", {"schema_version": "2.0", "job_id": job_a.job_id})]
                 )
+                en_a = _utc_now_z()
                 is_err_ja, sc_ja = _extract_mcp_structured(resp_ja)
                 assert is_err_ja is False and sc_ja["ok"] is True
                 assert cast(dict[str, Any], sc_ja["data"])["job_id"] == job_a.job_id
@@ -1268,7 +1318,6 @@ def test_native_workspace_transition_rejects_stale_shim_and_scope(inc2_installed
                     "ok": False,
                     "error": {"code": "identity_mismatch", "message": "identity mismatch"},
                 }
-                en_a = _utc_now_z()
                 la_a_pid = sess_a._proc.pid
                 desc_a = sess_a._snapshot_descendants()
                 wk_a_pid = desc_a[-1] if desc_a else la_a_pid
@@ -1339,7 +1388,6 @@ def test_native_workspace_transition_rejects_stale_shim_and_scope(inc2_installed
                 inc2_installed_env, "brain", ("mcp", "--profile", str(prof_b)), cwd=chk_b
             ) as sess_b:
                 sess_b.send_frames_and_expect_response(mcp_init_frames(1))
-                st_b = _utc_now_z()
                 resp_hb = sess_b.send_frames_and_expect_response(
                     [
                         {"jsonrpc": "2.0", "method": "notifications/initialized"},
@@ -1349,9 +1397,11 @@ def test_native_workspace_transition_rejects_stale_shim_and_scope(inc2_installed
                 is_err_hb2, sc_hb2 = _extract_mcp_structured(resp_hb)
                 assert is_err_hb2 is False and cast(dict[str, Any], sc_hb2["data"])["ready"] is True
 
+                st_b = _utc_now_z()
                 resp_jb = sess_b.send_frames_and_expect_response(
                     [mcp_call_frame(3, "get_job", {"schema_version": "2.0", "job_id": job_b.job_id})]
                 )
+                en_b = _utc_now_z()
                 is_err_jb, sc_jb = _extract_mcp_structured(resp_jb)
                 assert is_err_jb is False and sc_jb["ok"] is True
                 assert cast(dict[str, Any], sc_jb["data"])["job_id"] == job_b.job_id
@@ -1365,7 +1415,6 @@ def test_native_workspace_transition_rejects_stale_shim_and_scope(inc2_installed
                     "error": {"code": "not_found", "message": "not found"},
                 }
 
-                en_b = _utc_now_z()
                 la_b_pid = sess_b._proc.pid
                 desc_b = sess_b._snapshot_descendants()
                 wk_b_pid = desc_b[-1] if desc_b else la_b_pid
@@ -1417,6 +1466,860 @@ def test_native_workspace_transition_rejects_stale_shim_and_scope(inc2_installed
             assert (
                 verify_native_connection(probe_b, registration=reg_b, observations=obs_b, require_native=False) is True
             )
-            assert verify_same_daemon(probe_a, probe_b) is True
+            assert probe_a.binding is not None and probe_b.binding is not None
+            assert probe_a.daemon_process == probe_b.daemon_process
+            assert probe_a.binding.store_id == probe_b.binding.store_id
+            assert probe_a.binding.writer_epoch == probe_b.binding.writer_epoch
+            assert probe_a.binding.instance_id == probe_b.binding.instance_id
+            # Same principal switching workspaces must not pass the two-principal verify_same_daemon gate.
+            assert verify_same_daemon(probe_a, probe_b) is False
     finally:
         shutil.rmtree(case_dir, ignore_errors=True)
+
+
+
+def test_native_verifier_enforces_monotonic_timestamps_unique_joins_scope_and_lifecycle(trusted_tmp: Path) -> None:
+    """Verifier rejects non-monotonic times, ambiguous/conflicting joins, asymmetric scopes, and stale lifecycles."""
+    case_dir = trusted_tmp / "audit-contract-v2"
+    case_dir.mkdir(parents=True, exist_ok=True)
+    probe, reg, obs, _ = _sample_world(case_dir)
+    assert verify_native_connection(probe, registration=reg, observations=obs) is True
+    assert (
+        probe.daemon_process is not None
+        and probe.shim_worker_process is not None
+        and probe.terminal_facts is not None
+        and probe.profile_digest is not None
+    )
+
+    hc = obs.host_calls[0]
+    oc = obs.owner_events[0]
+    so = obs.socket_observations[0]
+
+    # 1. Daemon started_at AFTER call ended_at must reject.
+    future_daemon = ProcessIdentity(pid=probe.daemon_process.pid, started_at="2099-01-01T00:00:00.000000Z")
+    assert (
+        verify_native_connection(
+            replace(probe, daemon_process=future_daemon),
+            registration=reg,
+            observations=replace(
+                obs,
+                owner_events=(replace(oc, daemon_process=future_daemon),),
+                socket_observations=(replace(so, daemon_process=future_daemon),),
+            ),
+        )
+        is False
+    )
+
+    # 2. Worker process spawned BEFORE its launcher/host parent must reject.
+    impossible_worker = ProcessIdentity(pid=probe.shim_worker_process.pid, started_at="2020-01-01T00:00:00.000000Z")
+    assert (
+        verify_native_connection(
+            replace(probe, shim_worker_process=impossible_worker),
+            registration=reg,
+            observations=replace(
+                obs,
+                host_calls=(replace(hc, shim_worker_process=impossible_worker),),
+                socket_observations=(replace(so, client_process=impossible_worker),),
+            ),
+        )
+        is False
+    )
+
+    # 3. Disjoint host vs owner call timestamps (2020 vs 2099) must reject.
+    assert (
+        verify_native_connection(
+            probe,
+            registration=reg,
+            observations=replace(
+                obs,
+                host_calls=(
+                    replace(hc, started_at="2020-01-01T00:00:00.000000Z", ended_at="2020-01-01T00:00:01.000000Z"),
+                ),
+                owner_events=(
+                    replace(oc, started_at="2099-01-01T00:00:00.000000Z", ended_at="2099-01-01T00:00:01.000000Z"),
+                ),
+            ),
+        )
+        is False
+    )
+
+    # 4. Conflicting failed owner event alongside healthy one (even with call_id=None) must reject.
+    oc_anon = replace(oc, call_id=None)
+    oc_failed = replace(oc_anon, ready=False, auth_stamp_matched=False, response_flushed_ok=False)
+    assert (
+        verify_native_connection(
+            probe,
+            registration=reg,
+            observations=replace(obs, owner_events=(oc_anon, oc_failed)),
+        )
+        is False
+    )
+
+    # 5. Ambiguous duplicate matching owner events when call_id=None must reject.
+    assert (
+        verify_native_connection(
+            probe,
+            registration=reg,
+            observations=replace(obs, owner_events=(oc_anon, oc_anon)),
+        )
+        is False
+    )
+
+    # 6. Conflicting SocketObservation on the same local/remote 4-tuple must reject.
+    so_spoofed = replace(so, client_process=ProcessIdentity(pid=99999, started_at=probe.shim_worker_process.started_at))
+    assert (
+        verify_native_connection(
+            probe,
+            registration=reg,
+            observations=replace(obs, socket_observations=(so, so_spoofed)),
+        )
+        is False
+    )
+
+    # 7. Probe omitting observed_scope while owner selected a workspace scope must reject.
+    probe_no_scope = replace(probe, terminal_facts=replace(probe.terminal_facts, observed_scope=None))
+    oc_scoped = replace(oc, selected_scope={"repo_id": "repo-t9-a", "checkout_id": "chk-t9-a"})
+    assert (
+        verify_native_connection(
+            probe_no_scope,
+            registration=reg,
+            observations=replace(obs, owner_events=(oc_scoped,)),
+        )
+        is False
+    )
+
+    # 8. Disconnected current_lifecycle (valid transition between unrelated PIDs/profiles) must reject.
+    prior_lc = ShimLaunchObservation(
+        pid=probe.shim_worker_process.pid - 10,
+        started_at="2026-11-12T04:00:00.000000Z",
+        profile_digest="sha256:" + "1" * 64,
+        observed_scope=Scope("repo-t9-other", "chk-t9-other"),
+        launch_cwd=case_dir / "chk-other",
+    )
+    bogus_curr_lc = ShimLaunchObservation(
+        pid=probe.shim_worker_process.pid + 50,
+        started_at="2026-11-12T04:00:01.900000Z",
+        profile_digest=probe.profile_digest,
+        observed_scope=Scope("repo-t9-a", "chk-t9-a"),
+        launch_cwd=case_dir / "chk-a",
+    )
+    assert (
+        verify_native_connection(
+            probe,
+            registration=reg,
+            observations=replace(
+                obs,
+                prior_lifecycle=prior_lc,
+                current_lifecycle=bogus_curr_lc,
+                expected_scope=Scope("repo-t9-a", "chk-t9-a"),
+                expected_profile_digest=probe.profile_digest,
+                expected_first_scope=Scope("repo-t9-other", "chk-t9-other"),
+            ),
+        )
+        is False
+    )
+
+    # 9. Case-insensitive Windows path pointing to the same physical file succeeds.
+    if sys.platform == "win32":
+        cfg_lower = Path(str(reg.expected_config_path).lower())
+        assert (
+            verify_native_connection(
+                probe,
+                registration=reg,
+                observations=replace(obs, artifact_paths={**obs.artifact_paths, "config": cfg_lower}),
+            )
+            is True
+        )
+
+
+def test_native_same_daemon_rejects_same_principal_and_mismatched_runtime(trusted_tmp: Path) -> None:
+    """verify_same_daemon requires two distinct principals on the exact same live daemon, store, epoch, and runtime."""
+    case_dir = trusted_tmp / "audit-same-daemon"
+    case_dir.mkdir(parents=True, exist_ok=True)
+    probe_a, _, _, _ = _sample_world(case_dir)
+    assert probe_a.token_context is not None and probe_a.binding is not None
+
+    probe_same_prin_diff_cred = replace(
+        probe_a,
+        observed_call_id="call-t9-cred2",
+        token_context=HostTokenContext(
+            credential_id="01a1cde6-cd6e-7158-8702-5ff8cb44b099",
+            uid_or_sid=probe_a.token_context.uid_or_sid,
+            sandbox_state=probe_a.token_context.sandbox_state,
+        ),
+    )
+    assert verify_same_daemon(probe_a, probe_same_prin_diff_cred) is False
+    assert verify_same_daemon(probe_a, probe_a) is False
+
+    probe_b = replace(
+        probe_a,
+        observed_call_id="call-t9-prin2",
+        host="codex-desktop",
+        host_version="0.166.0-alpha.6",
+        binding=replace(probe_a.binding, principal_id="prin-t9-2"),
+        token_context=HostTokenContext(
+            credential_id="01a1cde6-cd6e-7158-8702-5ff8cb44b077",
+            uid_or_sid="uid-owner-1000",
+            sandbox_state="unsandboxed",
+        ),
+    )
+    assert verify_same_daemon(probe_a, probe_b) is True
+    assert probe_b.binding is not None
+    assert verify_same_daemon(probe_a, replace(probe_b, kind="fixture")) is False
+    assert (
+        verify_same_daemon(
+            probe_a,
+            replace(probe_b, binding=replace(probe_b.binding, environment="fixture_test")),
+        )
+        is False
+    )
+    assert verify_same_daemon(probe_a, replace(probe_b, os="linux")) is False
+    assert verify_same_daemon(probe_a, replace(probe_b, source_commit="b" * 40)) is False
+
+
+def test_posix_socket_pid_lookup_and_concurrent_owner_call_client_binding(
+    trusted_tmp: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """POSIX loopback PID lookup parses /proc and lsof cleanly; OwnerCallObservation retains socket client identity."""
+    from tests.support import inc2_native_owner as native_owner
+
+    # 1. Synthetic Linux /proc/net/tcp + /proc/<pid>/fd socket inode lookup.
+    proc_root = trusted_tmp / "fake_proc"
+    (proc_root / "net").mkdir(parents=True)
+    # 127.0.0.1 in little-endian hex is 0100007F; 55158 -> D776, 55157 -> D775.
+    (proc_root / "net" / "tcp").write_text(
+        "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
+        "   0: 0100007F:D776 0100007F:D775 01 00000000:00000000 00:00000000 00000000  1000        0 998877 1 0 0 0 0\n"
+        "   1: 0100007F:D775 0100007F:D776 01 00000000:00000000 00:00000000 00000000  1000        0 112233 1 0 0 0 0\n",
+        encoding="utf-8",
+    )
+    # Verify non-None dispatch on mocked Linux/Darwin even when testing parser paths via monkeypatch.
+    monkeypatch.setattr(sys, "platform", "linux")
+    fake_fd_dir = proc_root / "4242" / "fd"
+    fake_fd_dir.mkdir(parents=True)
+    monkeypatch.setattr(native_owner, "_LINUX_PROC_ROOT", proc_root, raising=False)
+    monkeypatch.setattr(
+        os,
+        "readlink",
+        lambda path: "socket:[998877]" if str(path).endswith("fd\\3") or str(path).endswith("fd/3") else "",
+    )
+    (fake_fd_dir / "3").write_text("", encoding="utf-8")
+    assert native_owner._lookup_loopback_client_pid(55158, 55157) == 4242
+
+    # 2. Synthetic macOS lsof output parsing.
+    monkeypatch.setattr(sys, "platform", "darwin")
+    lsof_out = "p1111\nn127.0.0.1:55157->127.0.0.1:55158\np2222\nn127.0.0.1:55158->127.0.0.1:55157\n"
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, stdout=lsof_out, stderr=""),
+    )
+    assert native_owner._lookup_loopback_client_pid(55158, 55157) == 2222
+
+    # 3. Client endpoint disambiguation across two concurrent workers with identical get_health replies.
+    case_dir = trusted_tmp / "client-bind"
+    case_dir.mkdir(parents=True, exist_ok=True)
+    probe, reg, obs, _ = _sample_world(case_dir)
+    assert probe.shim_worker_process is not None
+    worker_other = ProcessIdentity(
+        pid=probe.shim_worker_process.pid + 1,
+        started_at=probe.shim_worker_process.started_at,
+    )
+    oc_wrong_client = replace(
+        obs.owner_events[0],
+        call_id=None,
+        client_host="127.0.0.1",
+        client_port=52009,
+        client_process=worker_other,
+    )
+    assert (
+        verify_native_connection(
+            probe,
+            registration=reg,
+            observations=replace(obs, owner_events=(oc_wrong_client,)),
+        )
+        is False
+    )
+
+
+def test_owner_driver_revoked_stamp_error_logging_and_cutoff_cleanup(
+    inc2_installed_env: InstalledEnv,
+    trusted_tmp: Path,
+) -> None:
+    """Owner driver records failed calls, refuses response_flushed_ok on revoked stamp, and never leaks pending_cmds."""
+    from superbrain.cli_api._loopback_server import LoopbackServer
+    from superbrain.core.kernel import ToolCommand
+    from tests.support import inc2_cli as cli
+    from tests.support import inc2_native_owner as native_owner
+    from tests.support.inc2_transport import open_test_loopback_transport
+
+    tpl = get_shared_t7_transport_template()
+    case_dir = trusted_tmp / "owner-hooks"
+    data_dir = case_dir / "data"
+    clone_owner_only_tree(tpl.root, data_dir)
+    os_adapters().permissions.secure_directory(data_dir)
+
+    cfg_path = write_daemon_config_file(
+        case_dir / "daemon.json",
+        data_root=data_dir,
+        expected_store_id=tpl.store_id,
+        cert_path=tpl.tls.cert_path,
+        key_path=tpl.tls.key_path,
+    )
+    cred_path = write_credential_file(case_dir / "cred.txt", tpl.cred.token)
+    profile_path, _ = write_client_profile_file(
+        case_dir / "profile.json",
+        endpoint_path=data_dir / "endpoint.json",
+        expected_store_id=tpl.store_id,
+        ca_file=tpl.tls.ca_cert_path,
+        leaf_cert_sha256=tpl.tls.leaf_cert_sha256,
+        credential_file=cred_path,
+    )
+    ev_dir = case_dir / "evidence"
+    ev_dir.mkdir(parents=True, exist_ok=True)
+    with spawn_observed_wheel_owner(inc2_installed_env, cfg_path, ev_dir, cwd=case_dir):
+        with InstalledMcpPipeSession(
+            inc2_installed_env, "brain-mcp", ["--profile", str(profile_path)], cwd=case_dir
+        ) as session:
+            session.send_frames_and_expect_response(mcp_init_frames(1))
+            err_resp = session.send_frames_and_expect_response(
+                [mcp_call_frame(2, "get_job", {"schema_version": "2.0", "job_id": "missing-audit-job"})]
+            )
+            err_is_err, err_env = _extract_mcp_structured(err_resp)
+            assert err_is_err is True
+            assert err_env["ok"] is False
+
+    _, calls, _ = load_owner_observations(ev_dir)
+    assert any(c.tool_name == "get_job" and not c.auth_stamp_matched for c in calls), (
+        f"Expected failed get_job owner_call observation, got {calls!r}"
+    )
+
+    # In-process LoopbackServer hook check for concurrent authorize_stamp revocation & pending_cmds cleanup.
+    import queue
+    import ssl
+
+    hook_ev = case_dir / "hook-ev"
+    hook_ev.mkdir(parents=True, exist_ok=True)
+    eq: queue.Queue[dict[str, object] | None] = queue.Queue()
+    recorded: list[dict[str, object]] = []
+    install_fn = native_owner._install_loopback_server_hooks
+    hook_state = install_fn(
+        eq=eq,
+        store_id=tpl.store_id,
+        instance_id="inst-hook",
+        daemon_pid=os.getpid(),
+        daemon_started_at=process_started_at_for_pid(os.getpid()),
+    )
+    try:
+        with open_test_loopback_transport(tpl, name="stamp-revoke") as h:
+            client = h.open_client()
+            target = h.make_target()
+            auth_gate: Any = h.server._owner.auth_gate
+            orig_auth = auth_gate.authorize_stamp
+            auth_gate.authorize_stamp = lambda _stamp: False
+            try:
+                res = client.call(
+                    target,
+                    ToolCommand(
+                        tool="get_health",
+                        arguments={"schema_version": "2.0"},
+                        token=tpl.cred.token,
+                        selected_scope=None,
+                        correlation_id="corr-revoke",
+                    ),
+                )
+            finally:
+                auth_gate.authorize_stamp = orig_auth
+            assert res.get("ok") is False
+
+            # Abrupt TLS close mid-body must not leak pending_cmds entries.
+            ctx = ssl.create_default_context(cafile=str(tpl.tls.ca_cert_path))
+            import socket
+
+            raw = socket.create_connection(("127.0.0.1", h.bound.port), timeout=2.0)
+            with ctx.wrap_socket(raw, server_hostname="127.0.0.1") as ss:
+                ss.sendall(b"POST /v1/tool HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 4096\r\n\r\n{")
+            import time
+
+            time.sleep(0.1)
+    finally:
+        hook_state["uninstall"]()
+    while not eq.empty():
+        item = eq.get_nowait()
+        if item is not None:
+            recorded.append(item)
+
+    revoked_calls = [r for r in recorded if r.get("event") == "owner_call" and r.get("tool_name") == "get_health"]
+    assert len(revoked_calls) == 1
+    assert revoked_calls[0]["auth_stamp_matched"] is False
+    assert revoked_calls[0]["response_flushed_ok"] is False
+    assert hook_state["pending_count"]() == 0
+    _ = LoopbackServer
+    _ = cli
+
+
+def test_two_concurrent_live_shims_same_repo_checkouts_replaced_root_and_reused_pid(
+    inc2_installed_env: InstalledEnv,
+    trusted_tmp: Path,
+) -> None:
+    """Covers concurrent live shims, same-repo checkouts, CWD refusal, stale profile, and replaced data_root."""
+    from tests.support.inc2_fixture import kernel_job_service
+    from tests.support.inc2_lifecycle import workspace_transition_matches
+    from tests.support.inc2_transport import make_trusted_test_dir
+
+    tpl = get_shared_t7_transport_template()
+    base = make_trusted_test_dir("t9-audit-step92")
+    try:
+        data_root = base / "data"
+        clone_owner_only_tree(tpl.root, data_root)
+        os_adapters().permissions.secure_directory(data_root)
+
+        chk_a = base / "chk-a"
+        chk_a2 = base / "chk-a2"
+        outside_cwd = base / "outside-cwd"
+        outside_cwd.mkdir(parents=True, exist_ok=True)
+        os_adapters().permissions.secure_directory(outside_cwd)
+
+        adapters = os_adapters(clock=FakeClock(tpl.base_time))
+        rt = open_kernel_job_runtime(data_root, adapters)
+        try:
+            assert tpl.dan is not None and tpl.cred_b is not None and tpl.cred_bob is not None
+            ws_a = register_workspace_direct(
+                rt,
+                FakeClock(tpl.base_time),
+                tpl.dan,
+                alias="same-repo-a",
+                checkout_dir=chk_a,
+                remote="https://github.example/dan/shared-repo.git",
+            )
+            ws_a2 = register_workspace_direct(
+                rt,
+                FakeClock(tpl.base_time),
+                tpl.dan,
+                alias="same-repo-a2",
+                checkout_dir=chk_a2,
+                remote="https://github.example/dan/shared-repo.git",
+            )
+            assert ws_a.repo_id == ws_a2.repo_id
+            assert ws_a.checkout_id != ws_a2.checkout_id
+            service, staged_store = kernel_job_service(rt, FakeClock(tpl.base_time))
+            job_a = enqueue_job(
+                service,
+                staged_store,
+                owner_id="dan",
+                payload=b"checkout-a",
+                repo_id=ws_a.repo_id,
+                checkout_id=ws_a.checkout_id,
+            )
+            job_a2 = enqueue_job(
+                service,
+                staged_store,
+                owner_id="dan",
+                payload=b"checkout-a2",
+                repo_id=ws_a2.repo_id,
+                checkout_id=ws_a2.checkout_id,
+            )
+        finally:
+            rt.close()
+
+        cfg_path = write_daemon_config_file(
+            base / "evidence" / "daemon-config.json",
+            data_root=data_root,
+            expected_store_id=tpl.store_id,
+            cert_path=tpl.tls.cert_path,
+            key_path=tpl.tls.key_path,
+        )
+        schema_copy = base / "evidence" / "mcp-tools-v2.json"
+        schema_copy.write_bytes(inc2_installed_env.source_schema_path.read_bytes())
+
+        cred1_p = write_credential_file(base / "cred1.txt", tpl.cred.token)
+        cred2_p = write_credential_file(base / "cred2.txt", tpl.cred_b.token)
+        bob_p = write_credential_file(base / "bob.txt", tpl.cred_bob.token)
+
+        prof_a, digest_a = write_client_profile_file(
+            base / "evidence" / "prof-a.json",
+            endpoint_path=data_root / "endpoint.json",
+            expected_store_id=tpl.store_id,
+            ca_file=tpl.tls.ca_cert_path,
+            leaf_cert_sha256=tpl.tls.leaf_cert_sha256,
+            credential_file=cred1_p,
+            workspace={
+                "alias": ws_a.alias,
+                "checkout_path": str(chk_a),
+                "expected_workspace_id": ws_a.repo_id,
+                "expected_checkout_id": ws_a.checkout_id,
+            },
+        )
+        prof_a2, digest_a2 = write_client_profile_file(
+            base / "evidence" / "prof-a2.json",
+            endpoint_path=data_root / "endpoint.json",
+            expected_store_id=tpl.store_id,
+            ca_file=tpl.tls.ca_cert_path,
+            leaf_cert_sha256=tpl.tls.leaf_cert_sha256,
+            credential_file=cred2_p,
+            workspace={
+                "alias": ws_a2.alias,
+                "checkout_path": str(chk_a2),
+                "expected_workspace_id": ws_a2.repo_id,
+                "expected_checkout_id": ws_a2.checkout_id,
+            },
+        )
+        prof_bob, _ = write_client_profile_file(
+            base / "evidence" / "prof-bob.json",
+            endpoint_path=data_root / "endpoint.json",
+            expected_store_id=tpl.store_id,
+            ca_file=tpl.tls.ca_cert_path,
+            leaf_cert_sha256=tpl.tls.leaf_cert_sha256,
+            credential_file=bob_p,
+        )
+
+        ev_dir = base / "owner-ev"
+        ev_dir.mkdir(parents=True, exist_ok=True)
+        with spawn_observed_wheel_owner(inc2_installed_env, cfg_path, ev_dir, cwd=base) as owner:
+            # Open TWO shims CONCURRENTLY (same repo, two checkouts; plus third principal bob).
+            with (
+                InstalledMcpPipeSession(
+                    inc2_installed_env, "brain-mcp", ["--profile", str(prof_a)], cwd=chk_a
+                ) as sess_a,
+                InstalledMcpPipeSession(
+                    inc2_installed_env, "brain-mcp", ["--profile", str(prof_a2)], cwd=chk_a2
+                ) as sess_a2,
+                InstalledMcpPipeSession(
+                    inc2_installed_env, "brain-mcp", ["--profile", str(prof_bob)], cwd=outside_cwd
+                ) as sess_bob,
+            ):
+                sess_a.send_frames_and_expect_response(mcp_init_frames(1))
+                sess_a2.send_frames_and_expect_response(mcp_init_frames(1))
+                sess_bob.send_frames_and_expect_response(mcp_init_frames(1))
+
+                # Concurrent identical tool names (`get_health`) and `prepare_task` while all 3 shims stay live!
+                t_a0 = _utc_now_z()
+                r_ha = sess_a.send_frames_and_expect_response(
+                    [mcp_call_frame(2, "get_health", {"schema_version": "2.0"})]
+                )
+                t_a1 = _utc_now_z()
+                err_ha, env_ha = _extract_mcp_structured(r_ha)
+                assert err_ha is False and env_ha["ok"] is True
+
+                t_a20 = _utc_now_z()
+                r_ha2 = sess_a2.send_frames_and_expect_response(
+                    [mcp_call_frame(2, "get_health", {"schema_version": "2.0"})]
+                )
+                t_a21 = _utc_now_z()
+                err_ha2, env_ha2 = _extract_mcp_structured(r_ha2)
+                assert err_ha2 is False and env_ha2["ok"] is True
+
+                t_b0 = _utc_now_z()
+                r_hb = sess_bob.send_frames_and_expect_response(
+                    [mcp_call_frame(2, "get_health", {"schema_version": "2.0"})]
+                )
+                t_b1 = _utc_now_z()
+                err_hb, env_hb = _extract_mcp_structured(r_hb)
+                assert err_hb is False and env_hb["ok"] is True
+
+                t_pa0 = _utc_now_z()
+                r_pa = sess_a.send_frames_and_expect_response(
+                    [mcp_call_frame(3, "get_job", {"schema_version": "2.0", "job_id": job_a.job_id})]
+                )
+                t_pa1 = _utc_now_z()
+                err_pa, env_pa = _extract_mcp_structured(r_pa)
+                assert err_pa is False and env_pa["ok"] is True
+
+                t_pa20 = _utc_now_z()
+                r_pa2 = sess_a2.send_frames_and_expect_response(
+                    [mcp_call_frame(3, "get_job", {"schema_version": "2.0", "job_id": job_a2.job_id})]
+                )
+                t_pa21 = _utc_now_z()
+                err_pa2, env_pa2 = _extract_mcp_structured(r_pa2)
+                assert err_pa2 is False and env_pa2["ok"] is True
+
+                # Negative: sess_a (chk_a) calling same-repo other-checkout job_a2 MUST fail!
+                r_cross = sess_a.send_frames_and_expect_response(
+                    [mcp_call_frame(4, "get_job", {"schema_version": "2.0", "job_id": job_a2.job_id})]
+                )
+                err_cross, env_cross = _extract_mcp_structured(r_cross)
+                assert err_cross is True and env_cross["ok"] is False
+
+                # Negative: stale profile A launched in checkout A2 must refuse locally before transport.
+                from tests.support.inc2_cli import run_installed_command
+
+                res_stale = run_installed_command(
+                    inc2_installed_env, "brain-mcp", ["--profile", str(prof_a)], cwd=chk_a2
+                )
+                assert res_stale.returncode != 0
+                assert b"identity_mismatch" in res_stale.stderr
+
+                # Negative: outside/missing CWD with workspace-bound profile must refuse locally.
+                res_bad_cwd = run_installed_command(
+                    inc2_installed_env, "brain-mcp", ["--profile", str(prof_a)], cwd=outside_cwd
+                )
+                assert res_bad_cwd.returncode != 0
+                assert b"identity_mismatch" in res_bad_cwd.stderr
+
+                launcher_a = ProcessIdentity(sess_a._proc.pid, process_started_at_for_pid(sess_a._proc.pid))
+                launcher_a2 = ProcessIdentity(sess_a2._proc.pid, process_started_at_for_pid(sess_a2._proc.pid))
+                launcher_bob = ProcessIdentity(sess_bob._proc.pid, process_started_at_for_pid(sess_bob._proc.pid))
+
+        _, calls, socks = load_owner_observations(ev_dir)
+        by_cred_tool = {(c.credential_id, c.tool_name): c for c in calls}
+        c_a_health = by_cred_tool[(tpl.cred.credential_id, "get_health")]
+        c_a2_health = by_cred_tool[(tpl.cred_b.credential_id, "get_health")]
+        c_bob_health = by_cred_tool[(tpl.cred_bob.credential_id, "get_health")]
+        assert c_a_health.client_process is not None
+        assert c_a2_health.client_process is not None
+        assert c_bob_health.client_process is not None
+        assert c_a_health.client_port != c_a2_health.client_port
+        assert any(
+            s.client_process == c_a_health.client_process and s.local_port == c_a_health.client_port for s in socks
+        )
+        assert any(
+            s.client_process == c_a2_health.client_process and s.local_port == c_a2_health.client_port for s in socks
+        )
+
+        probe_a, reg_a, obs_a = _build_wheel_probe_and_obs(
+            env=inc2_installed_env,
+            owner=owner,
+            evidence_root=base / "evidence",
+            owner_evidence_dir=ev_dir,
+            config_path=cfg_path,
+            profile_path=prof_a,
+            schema_copy_path=schema_copy,
+            task_id="task-audit-concurrent",
+            call_id="call-audit-a",
+            host="claude-code",
+            credential_id=tpl.cred.credential_id,
+            principal_id=tpl.cred.principal.principal_id,
+            tool_name="get_health",
+            response_envelope=env_ha,
+            launcher_proc=launcher_a,
+            worker_proc=c_a_health.client_process,
+            started_at=t_a0,
+            ended_at=t_a1,
+        )
+        probe_a2, reg_a2, obs_a2 = _build_wheel_probe_and_obs(
+            env=inc2_installed_env,
+            owner=owner,
+            evidence_root=base / "evidence",
+            owner_evidence_dir=ev_dir,
+            config_path=cfg_path,
+            profile_path=prof_a2,
+            schema_copy_path=schema_copy,
+            task_id="task-audit-concurrent",
+            call_id="call-audit-a2",
+            host="claude-code",
+            credential_id=tpl.cred_b.credential_id,
+            principal_id=tpl.cred_b.principal.principal_id,
+            tool_name="get_health",
+            response_envelope=env_ha2,
+            launcher_proc=launcher_a2,
+            worker_proc=c_a2_health.client_process,
+            started_at=t_a20,
+            ended_at=t_a21,
+        )
+        probe_bob, reg_bob, obs_bob = _build_wheel_probe_and_obs(
+            env=inc2_installed_env,
+            owner=owner,
+            evidence_root=base / "evidence",
+            owner_evidence_dir=ev_dir,
+            config_path=cfg_path,
+            profile_path=prof_bob,
+            schema_copy_path=schema_copy,
+            task_id="task-audit-concurrent",
+            call_id="call-audit-bob",
+            host="codex-desktop",
+            credential_id=tpl.cred_bob.credential_id,
+            principal_id=tpl.cred_bob.principal.principal_id,
+            tool_name="get_health",
+            response_envelope=env_hb,
+            launcher_proc=launcher_bob,
+            worker_proc=c_bob_health.client_process,
+            started_at=t_b0,
+            ended_at=t_b1,
+        )
+        assert (
+            verify_native_connection(probe_a, registration=reg_a, observations=obs_a, require_native=False) is True
+        )
+        assert (
+            verify_native_connection(probe_a2, registration=reg_a2, observations=obs_a2, require_native=False) is True
+        )
+        assert (
+            verify_native_connection(probe_bob, registration=reg_bob, observations=obs_bob, require_native=False)
+            is True
+        )
+
+        # Cross-shim session attribution mismatch (same principal/repo, wrong worker/port) must fail.
+        assert (
+            verify_native_connection(
+                replace(probe_a, shim_worker_process=c_a2_health.client_process),
+                registration=reg_a,
+                observations=obs_a,
+                require_native=False,
+            )
+            is False
+        )
+        # Reused PID with altered started_at must fail.
+        assert probe_a.daemon_process is not None
+        reused_daemon = ProcessIdentity(pid=probe_a.daemon_process.pid, started_at="2099-01-01T00:00:00.000000Z")
+        assert (
+            verify_native_connection(
+                replace(probe_a, daemon_process=reused_daemon),
+                registration=reg_a,
+                observations=obs_a,
+                require_native=False,
+            )
+            is False
+        )
+
+        # Same principal two credentials -> False; two different principals same daemon -> True.
+        assert verify_same_daemon(probe_a, probe_a2) is False
+        assert verify_same_daemon(probe_a, probe_bob) is True
+
+        # Verify workspace-scoped prepare_task transition across the SAME repo's two checkouts.
+        obs_ws_a = ShimLaunchObservation(
+            pid=c_a_health.client_process.pid,
+            started_at=c_a_health.client_process.started_at,
+            profile_digest=digest_a,
+            observed_scope=Scope(ws_a.repo_id, ws_a.checkout_id),
+            launch_cwd=chk_a,
+        )
+        obs_ws_a2 = ShimLaunchObservation(
+            pid=c_a2_health.client_process.pid,
+            started_at=c_a2_health.client_process.started_at,
+            profile_digest=digest_a2,
+            observed_scope=Scope(ws_a2.repo_id, ws_a2.checkout_id),
+            launch_cwd=chk_a2,
+            reported_alias=ws_a2.alias,
+        )
+        probe_pa2, reg_pa2, obs_pa2 = _build_wheel_probe_and_obs(
+            env=inc2_installed_env,
+            owner=owner,
+            evidence_root=base / "evidence",
+            owner_evidence_dir=ev_dir,
+            config_path=cfg_path,
+            profile_path=prof_a2,
+            schema_copy_path=schema_copy,
+            task_id="task-audit-concurrent",
+            call_id="call-audit-pa2",
+            host="claude-code",
+            credential_id=tpl.cred_b.credential_id,
+            principal_id=tpl.cred_b.principal.principal_id,
+            tool_name="get_job",
+            response_envelope=env_pa2,
+            launcher_proc=launcher_a2,
+            worker_proc=c_a2_health.client_process,
+            started_at=t_pa20,
+            ended_at=t_pa21,
+            observed_scope={"repo_id": ws_a2.repo_id, "checkout_id": ws_a2.checkout_id},
+            prior_lifecycle=obs_ws_a,
+            current_lifecycle=obs_ws_a2,
+            expected_scope=Scope(ws_a2.repo_id, ws_a2.checkout_id),
+            expected_first_scope=Scope(ws_a.repo_id, ws_a.checkout_id),
+            expected_alias=ws_a2.alias,
+        )
+        assert (
+            verify_native_connection(probe_pa2, registration=reg_pa2, observations=obs_pa2, require_native=False)
+            is True
+        )
+        _ = (t_pa0, t_pa1, env_pa)
+
+        # Missing launch_cwd on after when before had launch_cwd must reject in workspace_transition_matches.
+        obs_no_cwd = replace(obs_ws_a2, launch_cwd=None)
+        assert (
+            workspace_transition_matches(
+                obs_ws_a,
+                obs_no_cwd,
+                expected_scope=Scope(ws_a2.repo_id, ws_a2.checkout_id),
+                expected_profile_digest=digest_a2,
+            )
+            is False
+        )
+
+        # Replaced root at the EXACT SAME data_root path must be rejected by verify_same_daemon.
+        from tests.support.inc2_transport import create_transport_template
+
+        tpl_replaced = create_transport_template("t9-replaced-root")
+        try:
+            assert tpl_replaced.store_id != tpl.store_id
+            shutil.rmtree(data_root)
+            clone_owner_only_tree(tpl_replaced.root, data_root)
+            os_adapters().permissions.secure_directory(data_root)
+            cfg_replaced = write_daemon_config_file(
+                base / "evidence" / "daemon-config-replaced.json",
+                data_root=data_root,
+                expected_store_id=tpl_replaced.store_id,
+                cert_path=tpl_replaced.tls.cert_path,
+                key_path=tpl_replaced.tls.key_path,
+            )
+            cred_rep_p = write_credential_file(base / "cred-rep.txt", tpl_replaced.cred.token)
+            prof_rep, _ = write_client_profile_file(
+                base / "evidence" / "prof-rep.json",
+                endpoint_path=data_root / "endpoint.json",
+                expected_store_id=tpl_replaced.store_id,
+                ca_file=tpl_replaced.tls.ca_cert_path,
+                leaf_cert_sha256=tpl_replaced.tls.leaf_cert_sha256,
+                credential_file=cred_rep_p,
+            )
+            ev_rep_dir = base / "owner-ev-rep"
+            ev_rep_dir.mkdir(parents=True, exist_ok=True)
+            with spawn_observed_wheel_owner(inc2_installed_env, cfg_replaced, ev_rep_dir, cwd=base) as owner_rep:
+                r_rep, l_rep, w_rep, tr0, tr1 = _invoke_wheel_shim_health(inc2_installed_env, prof_rep, cwd=base)
+            probe_rep, reg_rep, obs_rep = _build_wheel_probe_and_obs(
+                env=inc2_installed_env,
+                owner=owner_rep,
+                evidence_root=base / "evidence",
+                owner_evidence_dir=ev_rep_dir,
+                config_path=cfg_replaced,
+                profile_path=prof_rep,
+                schema_copy_path=schema_copy,
+                task_id="task-audit-replaced",
+                call_id="call-audit-replaced",
+                host="claude-code",
+                credential_id=tpl_replaced.cred.credential_id,
+                principal_id=tpl_replaced.cred.principal.principal_id,
+                tool_name="get_health",
+                response_envelope=r_rep,
+                launcher_proc=l_rep,
+                worker_proc=w_rep,
+                started_at=tr0,
+                ended_at=tr1,
+            )
+            assert (
+                verify_native_connection(probe_rep, registration=reg_rep, observations=obs_rep, require_native=False)
+                is True
+            )
+            assert verify_same_daemon(probe_bob, probe_rep) is False
+        finally:
+            shutil.rmtree(tpl_replaced.base_dir, ignore_errors=True)
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def test_win32_descendant_pids_catches_exited_parent_and_rejects_recycled(trusted_tmp: Path) -> None:
+    """Win32 descendant PID collector catches orphan children while handle open and skips pre-existing processes."""
+    if sys.platform != "win32":
+        pytest.skip("Win32-only process creation tick test")
+    from tests.support import inc2_cli as cli
+
+    _ = trusted_tmp
+    base_py = str(getattr(sys, "_base_executable", sys.executable))
+    child_code = (
+        "import subprocess, sys, time; "
+        "c = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(10)']); "
+        "print(c.pid, flush=True); time.sleep(0.05)"
+    )
+    proc = subprocess.Popen(
+        [base_py, "-c", child_code],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    assert proc.stdout is not None
+    child_pid = int(proc.stdout.readline().strip())
+    proc.wait(timeout=5.0)
+    try:
+        desc = cli._win32_descendant_pids(proc.pid)
+        assert child_pid in desc
+        # Must never claim current pytest process as a descendant.
+        assert os.getpid() not in desc
+    finally:
+        subprocess.run(["taskkill", "/F", "/PID", str(child_pid)], capture_output=True, check=False)

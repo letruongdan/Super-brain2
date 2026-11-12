@@ -277,6 +277,9 @@ class OwnerCallObservation:
     ended_at: str
     call_id: str | None = None
     selected_scope: Mapping[str, JsonValue] | None = None
+    client_host: str | None = None
+    client_port: int | None = None
+    client_process: ProcessIdentity | None = None
 
 
 @dataclass(frozen=True)
@@ -687,6 +690,29 @@ def _all_passed_fields_present(probe: NativeConnectionProbe) -> bool:
     return all(item is not None for item in required)
 
 
+_CALL_OVERLAP_SLACK = timedelta(milliseconds=250)
+_PROCESS_START_SLACK = timedelta(seconds=2)
+
+
+def _parse_utc_dt(raw: str) -> datetime | None:
+    if not isinstance(raw, str) or not raw.endswith("Z"):
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
+        return None
+    return parsed
+
+
+def _same_physical_file(a: Path, b: Path) -> bool:
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
 def _verify_artifacts(
     probe: NativeConnectionProbe, registration: ObserverRegistration, observations: ObservationSet
 ) -> bool:
@@ -707,9 +733,9 @@ def _verify_artifacts(
     prof_disk = _digest_physical_file(registration.expected_profile_path, evidence_root=None)
     if cfg_disk is None or prof_disk is None:
         return False
-    if os.path.abspath(observations.artifact_paths["config"]) != os.path.abspath(registration.expected_config_path):
+    if not _same_physical_file(observations.artifact_paths["config"], registration.expected_config_path):
         return False
-    if os.path.abspath(observations.artifact_paths["profile"]) != os.path.abspath(registration.expected_profile_path):
+    if not _same_physical_file(observations.artifact_paths["profile"], registration.expected_profile_path):
         return False
     if not hmac.compare_digest(digests["config"], registration.expected_config_digest):
         return False
@@ -793,10 +819,63 @@ def verify_native_connection(
     if not _verify_artifacts(probe, registration, observations):
         return False
 
+    if probe.binding.writer_epoch < 1:
+        return False
+
+    assert (
+        probe.host_process is not None
+        and probe.shim_launcher_process is not None
+        and probe.shim_worker_process is not None
+        and probe.daemon_process is not None
+        and probe.timespan is not None
+        and probe.terminal_facts is not None
+        and probe.binding is not None
+        and probe.token_context is not None
+    )
+    binding = probe.binding
+    token_ctx = probe.token_context
+    term_facts = probe.terminal_facts
+    worker_proc = probe.shim_worker_process
+    daemon_proc = probe.daemon_process
+    host_started = _parse_utc_dt(probe.host_process.started_at)
+    launcher_started = _parse_utc_dt(probe.shim_launcher_process.started_at)
+    worker_started = _parse_utc_dt(probe.shim_worker_process.started_at)
+    daemon_started = _parse_utc_dt(probe.daemon_process.started_at)
+    call_start = _parse_utc_dt(probe.timespan.started_at)
+    call_end = _parse_utc_dt(probe.timespan.ended_at)
+    if (
+        host_started is None
+        or launcher_started is None
+        or worker_started is None
+        or daemon_started is None
+        or call_start is None
+        or call_end is None
+        or call_start > call_end
+        or probe.timespan.duration_ms < 0.0
+    ):
+        return False
+    if not (host_started <= launcher_started <= worker_started):
+        return False
+    if host_started > call_start + _PROCESS_START_SLACK or worker_started > call_end:
+        return False
+    if daemon_started > call_end:
+        return False
+
     matching_host_calls = [hc for hc in observations.host_calls if hc.call_id == probe.observed_call_id]
     if len(matching_host_calls) != 1:
         return False
     hc = matching_host_calls[0]
+    hc_start = _parse_utc_dt(hc.started_at)
+    hc_end = _parse_utc_dt(hc.ended_at)
+    if hc_start is None or hc_end is None or hc_start > hc_end:
+        return False
+    if (
+        abs((call_start - hc_start).total_seconds()) > 5.0
+        or abs((call_end - hc_end).total_seconds()) > 5.0
+        or worker_started > hc_end
+        or host_started > hc_start + _PROCESS_START_SLACK
+    ):
+        return False
     if (
         hc.channel != probe.observation_channel
         or hc.host_process != probe.host_process
@@ -808,11 +887,93 @@ def verify_native_connection(
     ):
         return False
 
-    probe_scope = dict(probe.terminal_facts.observed_scope) if probe.terminal_facts.observed_scope is not None else None
-    matching_owner = [
-        oc
-        for oc in observations.owner_events
+    worker_socks_all = [
+        so for so in observations.socket_observations if so.client_process == probe.shim_worker_process
+    ]
+    worker_socks = [
+        so
+        for so in worker_socks_all
         if (
+            so.daemon_process == probe.daemon_process
+            and so.local_addr == "127.0.0.1"
+            and so.remote_addr == "127.0.0.1"
+            and so.store_id == probe.binding.store_id
+            and so.writer_epoch == probe.binding.writer_epoch
+            and so.instance_id == probe.binding.instance_id
+        )
+    ]
+    if not worker_socks or len(worker_socks) != len(worker_socks_all):
+        return False
+    worker_tuples = {(so.local_addr, so.local_port, so.remote_addr, so.remote_port) for so in worker_socks}
+    for so in observations.socket_observations:
+        if (so.local_addr, so.local_port, so.remote_addr, so.remote_port) in worker_tuples and (
+            so.client_process != probe.shim_worker_process
+            or so.daemon_process != probe.daemon_process
+            or so.store_id != probe.binding.store_id
+            or so.writer_epoch != probe.binding.writer_epoch
+            or so.instance_id != probe.binding.instance_id
+        ):
+            return False
+    worker_ports = {so.local_port for so in worker_socks}
+
+    probe_scope = dict(probe.terminal_facts.observed_scope) if probe.terminal_facts.observed_scope is not None else None
+
+    def _oc_times_ok(oc: OwnerCallObservation) -> bool:
+        oc_start = _parse_utc_dt(oc.started_at)
+        oc_end = _parse_utc_dt(oc.ended_at)
+        if oc_start is None or oc_end is None or oc_start > oc_end:
+            return False
+        if daemon_started > oc_start + _PROCESS_START_SLACK or daemon_started > oc_end:
+            return False
+        if worker_started > oc_end:
+            return False
+        if oc_start > hc_end + _CALL_OVERLAP_SLACK or hc_start > oc_end + _CALL_OVERLAP_SLACK:
+            return False
+        if oc_start > call_end + _CALL_OVERLAP_SLACK or call_start > oc_end + _CALL_OVERLAP_SLACK:
+            return False
+        return True
+
+    def _oc_scope_matches(oc: OwnerCallObservation) -> bool:
+        if probe_scope is None:
+            return oc.selected_scope is None
+        return oc.selected_scope is not None and dict(oc.selected_scope) == probe_scope
+
+    def _oc_relates_to_call(oc: OwnerCallObservation) -> bool:
+        if oc.call_id is not None:
+            return oc.call_id == probe.observed_call_id
+        if oc.client_process is not None and oc.client_process != worker_proc:
+            return False
+        if oc.client_port is not None and oc.client_port not in worker_ports:
+            return False
+        if (
+            oc.daemon_process != daemon_proc
+            or oc.store_id != binding.store_id
+            or oc.principal_id != binding.principal_id
+            or oc.credential_id != token_ctx.credential_id
+            or oc.tool_name != term_facts.tool_name
+        ):
+            return False
+        oc_start = _parse_utc_dt(oc.started_at)
+        oc_end = _parse_utc_dt(oc.ended_at)
+        if oc_start is None or oc_end is None:
+            return True
+        if not (oc_start > hc_end or hc_start > oc_end):
+            return True
+        return oc.response_digest == term_facts.response_digest and not (
+            oc_start > hc_end + _CALL_OVERLAP_SLACK or hc_start > oc_end + _CALL_OVERLAP_SLACK
+        )
+
+    related_owner = [oc for oc in observations.owner_events if _oc_relates_to_call(oc)]
+    matching_owner: list[OwnerCallObservation] = []
+    for oc in related_owner:
+        sock_match = [
+            so
+            for so in worker_socks
+            if so.remote_port == oc.listen_port and (oc.client_port is None or so.local_port == oc.client_port)
+        ]
+        if not sock_match:
+            return False
+        if not (
             oc.daemon_process == probe.daemon_process
             and oc.store_id == probe.binding.store_id
             and oc.writer_epoch == probe.binding.writer_epoch
@@ -824,33 +985,16 @@ def verify_native_connection(
             and oc.auth_stamp_matched
             and oc.response_flushed_ok
             and oc.response_digest == probe.terminal_facts.response_digest
-            and (oc.call_id is None or oc.call_id == probe.observed_call_id)
             and oc.listen_host == "127.0.0.1"
-            and (
-                probe_scope is None
-                or (oc.selected_scope is not None and dict(oc.selected_scope) == probe_scope)
-            )
-        )
-    ]
-    if not matching_owner:
-        return False
+            and (oc.client_host is None or oc.client_host == "127.0.0.1")
+            and (oc.client_process is None or oc.client_process == probe.shim_worker_process)
+            and _oc_scope_matches(oc)
+            and _oc_times_ok(oc)
+        ):
+            return False
+        matching_owner.append(oc)
 
-    matched_ports = {oc.listen_port for oc in matching_owner}
-    matching_sock = [
-        so
-        for so in observations.socket_observations
-        if (
-            so.client_process == probe.shim_worker_process
-            and so.daemon_process == probe.daemon_process
-            and so.local_addr == "127.0.0.1"
-            and so.remote_addr == "127.0.0.1"
-            and so.remote_port in matched_ports
-            and so.store_id == probe.binding.store_id
-            and so.writer_epoch == probe.binding.writer_epoch
-            and so.instance_id == probe.binding.instance_id
-        )
-    ]
-    if not matching_sock:
+    if len(matching_owner) != 1:
         return False
 
     if observations.prior_lifecycle is not None or observations.current_lifecycle is not None:
@@ -870,5 +1014,20 @@ def verify_native_connection(
             expected_alias=observations.expected_alias,
         ):
             return False
+        curr_lc = observations.current_lifecycle
+        if (
+            curr_lc.pid != probe.shim_worker_process.pid
+            or curr_lc.started_at != probe.shim_worker_process.started_at
+            or curr_lc.profile_digest != probe.profile_digest
+            or observations.expected_profile_digest != registration.expected_profile_digest
+        ):
+            return False
+        if probe_scope is not None:
+            repo_id = probe_scope.get("repo_id")
+            checkout_id = probe_scope.get("checkout_id")
+            if not isinstance(repo_id, str) or not isinstance(checkout_id, str):
+                return False
+            if curr_lc.observed_scope != Scope(repo_id, checkout_id):
+                return False
 
     return True

@@ -119,6 +119,69 @@ def process_started_at_for_pid(pid: int) -> str:
     return parsed.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
+_LINUX_PROC_ROOT = Path("/proc")
+
+
+def _parse_proc_net_tcp_inode(text: str, *, client_port: int, listen_port: int, ipv6: bool = False) -> int | None:
+    """Return socket inode for loopback ``127.0.0.1:client_port -> 127.0.0.1:listen_port`` from ``/proc/net/tcp*``."""
+    addr_hex = "0000000000000000FFFF00000100007F" if ipv6 else "0100007F"
+    local_target = f"{addr_hex}:{client_port:04X}"
+    remote_target = f"{addr_hex}:{listen_port:04X}"
+    for line in text.splitlines()[1:]:
+        parts = line.split()
+        if len(parts) < 10:
+            continue
+        if parts[1].upper() == local_target and parts[2].upper() == remote_target and parts[3].upper() != "0A":
+            try:
+                inode = int(parts[9])
+            except ValueError:
+                continue
+            if inode > 0:
+                return inode
+    return None
+
+
+def _find_pid_by_socket_inode(inode: int, *, proc_root: Path | None = None) -> int | None:
+    """Locate the owning PID whose ``/proc/<pid>/fd/*`` references ``socket:[inode]``."""
+    root = _LINUX_PROC_ROOT if proc_root is None else proc_root
+    target = f"socket:[{inode}]"
+    try:
+        entries = list(root.iterdir())
+    except OSError:
+        return None
+    for pid_dir in entries:
+        if not pid_dir.name.isdigit():
+            continue
+        fd_dir = pid_dir / "fd"
+        try:
+            fd_entries = list(fd_dir.iterdir())
+        except OSError:
+            continue
+        for fd_path in fd_entries:
+            try:
+                if os.readlink(fd_path) == target:
+                    return int(pid_dir.name)
+            except OSError:
+                continue
+    return None
+
+
+def _parse_lsof_client_pid(output: str, *, client_port: int, listen_port: int) -> int | None:
+    """Parse ``lsof -nP -F pn`` output and return the PID owning ``127.0.0.1:client_port->127.0.0.1:listen_port``."""
+    target_name = f"127.0.0.1:{client_port}->127.0.0.1:{listen_port}"
+    current_pid: int | None = None
+    for raw_line in output.splitlines():
+        if raw_line.startswith("p"):
+            try:
+                current_pid = int(raw_line[1:])
+            except ValueError:
+                current_pid = None
+        elif raw_line.startswith("n") and current_pid is not None:
+            if raw_line[1:].strip() == target_name:
+                return current_pid
+    return None
+
+
 def _lookup_loopback_client_pid(client_port: int, listen_port: int) -> int | None:
     if client_port <= 0 or listen_port <= 0:
         return None
@@ -147,6 +210,32 @@ def _lookup_loopback_client_pid(client_port: int, listen_port: int) -> int | Non
                 if pid > 0:
                     return int(pid)
         return None
+    if sys.platform.startswith("linux"):
+        for name, is_v6 in (("tcp", False), ("tcp6", True)):
+            try:
+                text = (_LINUX_PROC_ROOT / "net" / name).read_text(encoding="ascii", errors="replace")
+            except OSError:
+                continue
+            inode = _parse_proc_net_tcp_inode(text, client_port=client_port, listen_port=listen_port, ipv6=is_v6)
+            if inode is not None:
+                pid = _find_pid_by_socket_inode(inode)
+                if pid is not None:
+                    return pid
+        return None
+    if sys.platform == "darwin":
+        try:
+            proc = subprocess.run(
+                ["lsof", "-nP", "-F", "pn", f"-iTCP@127.0.0.1:{client_port}"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=2.0,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if proc.returncode != 0 and not proc.stdout:
+            return None
+        return _parse_lsof_client_pid(proc.stdout, client_port=client_port, listen_port=listen_port)
     return None
 
 
@@ -170,57 +259,51 @@ def _run_event_writer(evidence_dir: Path, event_queue: queue.SimpleQueue[dict[st
                 events_fh.flush()
 
 
-def run_observed_owner(config_path: Path, evidence_dir: Path, stop: threading.Event) -> int:
-    """Run the production owner loop via ``_explicit_owner_adapters`` and record sanitized call observations."""
-    if not isinstance(config_path, Path) or not config_path.is_absolute():
-        raise ValueError("absolute config_path required")
-    if not isinstance(evidence_dir, Path) or not evidence_dir.is_absolute():
-        raise ValueError("absolute evidence_dir required")
-
-    import superbrain
+def _install_loopback_server_hooks(
+    *,
+    eq: Any,
+    daemon_pid: int,
+    daemon_started_at: str,
+    store_id: str | None = None,
+    instance_id: str | None = None,
+    initial_ready: bool = True,
+) -> dict[str, Any]:
+    from superbrain.application._auth_gate import AuthGate
     from superbrain.cli_api import _loopback_server
-    from superbrain.composition import daemon_entry, owner_entry
-    from superbrain.core.canonical import canonical_json, digest_bytes
-    from superbrain.core.wire import load_catalog
-
-    evidence_dir.mkdir(parents=True, exist_ok=True)
-    daemon_pid = os.getpid()
-    daemon_started_at = process_started_at_for_pid(daemon_pid)
-    module_file = str(Path(superbrain.__file__).resolve()) if superbrain.__file__ else ""
-    schema_sha256 = load_catalog().schema_sha256
-
-    cfg, adapters, scratch_base = owner_entry._explicit_owner_adapters(config_path)
-    event_queue: queue.SimpleQueue[dict[str, JsonValue] | None] = queue.SimpleQueue()
-    writer_thread = threading.Thread(
-        target=_run_event_writer,
-        args=(evidence_dir, event_queue),
-        daemon=True,
-    )
-    writer_thread.start()
+    from superbrain.core.canonical import digest_bytes
+    from superbrain.core.wire import encode_envelope
 
     hook_lock = threading.Lock()
-    pending_cmds: dict[int, tuple[str, dict[str, JsonValue] | None, str]] = {}
-    flush_by_thread: dict[int, tuple[bool, str | None]] = {}
-    ready_seen = False
+    pending_cmds: dict[int, tuple[str, dict[str, JsonValue] | None, str, str]] = {}
+    active_sock_by_tid: dict[int, int] = {}
+    flush_by_thread: dict[int, tuple[int | None, str | None]] = {}
+    stamp_result_by_tid: dict[int, bool] = {}
+    ready_seen = initial_ready
 
     loopback_mod: Any = _loopback_server
+    auth_gate_cls: Any = AuthGate
     orig_read_cmd = loopback_mod.read_admitted_tool_command
     orig_write_json = loopback_mod.write_json_response
     orig_release = _loopback_server.LoopbackServer._release_owner_reply
+    orig_conn_worker = _loopback_server.LoopbackServer._conn_worker
+    orig_authorize_stamp = AuthGate.authorize_stamp
 
     def _tap_read_cmd(
         ssl_sock: Any,
         reader: Any,
-        ready: Ready,
+        ready: Any,
         *,
         deadline_ns: int,
         monotonic_ns: Any,
     ) -> Any:
+        tid = threading.get_ident()
+        with hook_lock:
+            active_sock_by_tid[tid] = id(ssl_sock)
         cmd = orig_read_cmd(ssl_sock, reader, ready, deadline_ns=deadline_ns, monotonic_ns=monotonic_ns)
         if cmd is not None:
             scope_dict = cmd.selected_scope.to_dict() if cmd.selected_scope is not None else None
             with hook_lock:
-                pending_cmds[id(ssl_sock)] = (str(cmd.tool), scope_dict, _utc_now_z())
+                pending_cmds[id(ssl_sock)] = (str(cmd.tool), scope_dict, _utc_now_z(), str(cmd.token))
         return cmd
 
     def _tap_write_json(
@@ -242,14 +325,37 @@ def run_observed_owner(config_path: Path, evidence_dir: Path, stop: threading.Ev
         )
         tid = threading.get_ident()
         with hook_lock:
-            flush_by_thread[tid] = (status == 200, digest_bytes(body))
+            flush_by_thread[tid] = (int(status), digest_bytes(body))
+
+    def _tap_authorize_stamp(gate_self: Any, stamp: Any) -> bool:
+        res = bool(orig_authorize_stamp(gate_self, stamp))
+        with hook_lock:
+            stamp_result_by_tid[threading.get_ident()] = res
+        return res
+
+    def _tap_conn_worker(self: Any, conn_id: Any, raw_sock: Any, accept_ns: int) -> None:
+        tid = threading.get_ident()
+        try:
+            orig_conn_worker(self, conn_id, raw_sock, accept_ns)
+        finally:
+            with hook_lock:
+                sock_id = active_sock_by_tid.pop(tid, None)
+                if sock_id is not None:
+                    pending_cmds.pop(sock_id, None)
+                flush_by_thread.pop(tid, None)
+                stamp_result_by_tid.pop(tid, None)
 
     def _tap_release(self: Any, ssl_sock: Any, reply: Any, tool_deadline_ns: int) -> None:
+        tid = threading.get_ident()
         with hook_lock:
             cmd_info = pending_cmds.pop(id(ssl_sock), None)
+            active_sock_by_tid.pop(tid, None)
+            flush_by_thread.pop(tid, None)
+            stamp_result_by_tid.pop(tid, None)
         tool_name = cmd_info[0] if cmd_info is not None else None
         selected_scope = cmd_info[1] if cmd_info is not None else None
         req_started_at = cmd_info[2] if cmd_info is not None else _utc_now_z()
+        raw_token = cmd_info[3] if cmd_info is not None else ""
 
         listen_host = "127.0.0.1"
         listen_port = 0
@@ -272,53 +378,61 @@ def run_observed_owner(config_path: Path, evidence_dir: Path, stop: threading.Ev
         gate = self._owner.auth_gate
         view = gate.current()
         grant_stamp = reply.grant_stamp
-        stamp_ok = (
-            grant_stamp is not None
-            and view is not None
-            and grant_stamp.identity == gate.identity
-            and grant_stamp.generation == view.version
-            and grant_stamp.trust_generation == view.auth.trust_generation
-        )
+        credential_id: str | None = grant_stamp.credential_id if grant_stamp is not None else None
+        if credential_id is None and "." in raw_token:
+            credential_id = raw_token.split(".", 1)[0]
         cred = (
-            view.auth.credentials.get(grant_stamp.credential_id)
-            if (grant_stamp is not None and view is not None)
+            view.auth.credentials.get(credential_id)
+            if (credential_id is not None and view is not None)
             else None
         )
-        cred_active = cred is not None and not cred.revoked
         principal_id = cred.principal.principal_id if cred is not None else None
-        credential_id = grant_stamp.credential_id if grant_stamp is not None else None
-        auth_matched = bool(stamp_ok and cred_active)
 
-        tid = threading.get_ident()
+        expected_env_digest = digest_bytes(encode_envelope(reply.envelope))
         try:
             orig_release(self, ssl_sock, reply, tool_deadline_ns)
         finally:
             with hook_lock:
-                flushed_status_ok, flushed_digest = flush_by_thread.pop(tid, (False, None))
+                flushed_status, flushed_digest = flush_by_thread.pop(tid, (None, None))
+                stamp_decision = stamp_result_by_tid.pop(tid, None)
 
         ended_at = _utc_now_z()
         env_ok = reply.envelope.get("ok") is True
-        resp_digest = flushed_digest if flushed_digest is not None else digest_bytes(canonical_json(reply.envelope))
+        if env_ok:
+            if stamp_decision is not None:
+                auth_matched = bool(stamp_decision and flushed_digest == expected_env_digest)
+            else:
+                auth_matched = bool(
+                    grant_stamp is not None and flushed_status == 200 and flushed_digest == expected_env_digest
+                )
+            response_flushed_ok = bool(
+                auth_matched and flushed_status == 200 and flushed_digest == expected_env_digest
+            )
+        else:
+            auth_matched = False
+            response_flushed_ok = bool(flushed_status is not None and flushed_digest == expected_env_digest)
+
+        resp_digest = flushed_digest if flushed_digest is not None else expected_env_digest
         ready_val = ready_seen
         if tool_name == "get_health" and isinstance(reply.envelope.get("data"), dict):
             ready_val = bool(reply.envelope["data"].get("ready") is True)
 
-        if principal_id is not None and credential_id is not None and tool_name is not None:
+        if tool_name is not None:
             ident = gate.identity
-            event_queue.put_nowait(
+            eq.put_nowait(
                 {
                     "event": "owner_call",
                     "daemon_pid": daemon_pid,
                     "daemon_started_at": daemon_started_at,
-                    "store_id": ident.store_id,
-                    "writer_epoch": ident.writer_epoch,
-                    "instance_id": ident.instance_id,
-                    "principal_id": principal_id,
-                    "credential_id": credential_id,
+                    "store_id": ident.store_id if ident is not None else (store_id or ""),
+                    "writer_epoch": ident.writer_epoch if ident is not None else 0,
+                    "instance_id": ident.instance_id if ident is not None else (instance_id or ""),
+                    "principal_id": principal_id or "<unknown>",
+                    "credential_id": credential_id or "<unknown>",
                     "tool_name": tool_name,
                     "ready": ready_val,
                     "auth_stamp_matched": auth_matched,
-                    "response_flushed_ok": bool(flushed_status_ok and env_ok),
+                    "response_flushed_ok": response_flushed_ok,
                     "response_digest": resp_digest,
                     "listen_host": listen_host,
                     "listen_port": listen_port,
@@ -332,9 +446,69 @@ def run_observed_owner(config_path: Path, evidence_dir: Path, stop: threading.Ev
                 }
             )
 
-    def _on_ready(ready: Ready, _loop: OwnerLoop) -> None:
+    def _set_ready(value: bool) -> None:
         nonlocal ready_seen
-        ready_seen = True
+        ready_seen = value
+
+    def _pending_count() -> int:
+        with hook_lock:
+            return len(pending_cmds)
+
+    loopback_mod.read_admitted_tool_command = _tap_read_cmd
+    loopback_mod.write_json_response = _tap_write_json
+    loopback_mod.LoopbackServer._release_owner_reply = _tap_release
+    loopback_mod.LoopbackServer._conn_worker = _tap_conn_worker
+    auth_gate_cls.authorize_stamp = _tap_authorize_stamp
+
+    def _uninstall() -> None:
+        loopback_mod.read_admitted_tool_command = orig_read_cmd
+        loopback_mod.write_json_response = orig_write_json
+        loopback_mod.LoopbackServer._release_owner_reply = orig_release
+        loopback_mod.LoopbackServer._conn_worker = orig_conn_worker
+        auth_gate_cls.authorize_stamp = orig_authorize_stamp
+
+    return {
+        "uninstall": _uninstall,
+        "pending_count": _pending_count,
+        "set_ready": _set_ready,
+    }
+
+
+def run_observed_owner(config_path: Path, evidence_dir: Path, stop: threading.Event) -> int:
+    """Run the production owner loop via ``_explicit_owner_adapters`` and record sanitized call observations."""
+    if not isinstance(config_path, Path) or not config_path.is_absolute():
+        raise ValueError("absolute config_path required")
+    if not isinstance(evidence_dir, Path) or not evidence_dir.is_absolute():
+        raise ValueError("absolute evidence_dir required")
+
+    import superbrain
+    from superbrain.composition import daemon_entry, owner_entry
+    from superbrain.core.wire import load_catalog
+
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    daemon_pid = os.getpid()
+    daemon_started_at = process_started_at_for_pid(daemon_pid)
+    module_file = str(Path(superbrain.__file__).resolve()) if superbrain.__file__ else ""
+    schema_sha256 = load_catalog().schema_sha256
+
+    cfg, adapters, scratch_base = owner_entry._explicit_owner_adapters(config_path)
+    event_queue: queue.SimpleQueue[dict[str, JsonValue] | None] = queue.SimpleQueue()
+    writer_thread = threading.Thread(
+        target=_run_event_writer,
+        args=(evidence_dir, event_queue),
+        daemon=True,
+    )
+    writer_thread.start()
+
+    hook_state = _install_loopback_server_hooks(
+        eq=event_queue,
+        daemon_pid=daemon_pid,
+        daemon_started_at=daemon_started_at,
+        initial_ready=False,
+    )
+
+    def _on_ready(ready: Ready, _loop: OwnerLoop) -> None:
+        hook_state["set_ready"](True)
         shutil.rmtree(scratch_base, ignore_errors=True)
         event_queue.put_nowait(
             {
@@ -350,15 +524,10 @@ def run_observed_owner(config_path: Path, evidence_dir: Path, stop: threading.Ev
             }
         )
 
-    loopback_mod.read_admitted_tool_command = _tap_read_cmd
-    loopback_mod.write_json_response = _tap_write_json
-    loopback_mod.LoopbackServer._release_owner_reply = _tap_release
     try:
         return int(daemon_entry.serve(cfg, os_=adapters, stop_event=stop, on_ready=_on_ready))
     finally:
-        loopback_mod.read_admitted_tool_command = orig_read_cmd
-        loopback_mod.write_json_response = orig_write_json
-        loopback_mod.LoopbackServer._release_owner_reply = orig_release
+        hook_state["uninstall"]()
         shutil.rmtree(scratch_base, ignore_errors=True)
         event_queue.put_nowait(None)
         writer_thread.join(timeout=5.0)
@@ -385,6 +554,15 @@ def load_owner_observations(
             row = cast(dict[str, Any], json.loads(line))
             if row.get("event") != "owner_call":
                 continue
+            client_pid = row.get("client_pid")
+            client_started = row.get("client_started_at")
+            client_proc = (
+                ProcessIdentity(pid=client_pid, started_at=client_started)
+                if isinstance(client_pid, int) and isinstance(client_started, str)
+                else None
+            )
+            client_host_raw = row.get("client_host")
+            client_port_raw = row.get("client_port")
             daemon_proc = ProcessIdentity(pid=int(row["daemon_pid"]), started_at=str(row["daemon_started_at"]))
             owners.append(
                 OwnerCallObservation(
@@ -405,10 +583,11 @@ def load_owner_observations(
                     ended_at=str(row["ended_at"]),
                     call_id=None,
                     selected_scope=cast(dict[str, Any] | None, row["selected_scope"]),
+                    client_host=str(client_host_raw) if isinstance(client_host_raw, str) else None,
+                    client_port=int(client_port_raw) if isinstance(client_port_raw, int) else None,
+                    client_process=client_proc,
                 )
             )
-            client_pid = row.get("client_pid")
-            client_started = row.get("client_started_at")
             if isinstance(client_pid, int) and isinstance(client_started, str):
                 sockets.append(
                     SocketObservation(
@@ -512,7 +691,7 @@ def spawn_observed_wheel_owner(
 
 
 def verify_same_daemon(first: NativeConnectionProbe, second: NativeConnectionProbe) -> bool:
-    """True iff both passed probes belong to the same live daemon instance, epoch, and process identity."""
+    """True iff both passed probes link distinct principals on one live daemon, store, epoch, and runtime."""
     from tests.support.inc2_native import ProbeValidationError, _all_passed_fields_present, _validate_probe_invariants
 
     for item in (first, second):
@@ -522,7 +701,7 @@ def verify_same_daemon(first: NativeConnectionProbe, second: NativeConnectionPro
             return False
         if item.status != "passed" or item.reason_code is not None or not _all_passed_fields_present(item):
             return False
-        assert item.terminal_facts is not None
+        assert item.terminal_facts is not None and item.path_check is not None
         if not (
             item.terminal_facts.ready
             and item.terminal_facts.ok
@@ -530,9 +709,29 @@ def verify_same_daemon(first: NativeConnectionProbe, second: NativeConnectionPro
             and item.terminal_facts.response_flushed
         ):
             return False
+        if not (
+            item.path_check.physical_root_ok
+            and item.path_check.ancestors_ok
+            and item.path_check.symlink_or_reparse_rejected
+        ):
+            return False
 
     assert first.daemon_process is not None and second.daemon_process is not None
     assert first.binding is not None and second.binding is not None
+    assert first.token_context is not None and second.token_context is not None
+    if (
+        first.kind != second.kind
+        or first.os != second.os
+        or first.source_commit != second.source_commit
+        or first.config_digest != second.config_digest
+        or first.binding.environment != second.binding.environment
+    ):
+        return False
+    if first.binding.principal_id == second.binding.principal_id:
+        return False
+    if first.token_context.credential_id == second.token_context.credential_id:
+        return False
+
     return (
         first.daemon_process == second.daemon_process
         and first.binding.store_id == second.binding.store_id
