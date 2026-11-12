@@ -63,6 +63,8 @@ def child(config: Path) -> int:
     samples: dict[str, dict[str, JsonValue]] = {}
     local = threading.local()
     active: dict[str, JsonValue] = {}
+    inflight: set[str] = set()  # read but not yet written; spans are only attributable while this holds one key
+    inflight_lock = threading.Lock()
     transport_api: Any = transport
     composition_api: Any = daemon_entry
     original_read = transport_api.read_admitted_tool_command
@@ -81,6 +83,11 @@ def child(config: Path) -> int:
             }
             samples[key] = sample
             local.sample = sample
+            with inflight_lock:
+                inflight.add(key)
+                if len(inflight) > 1:
+                    for other in inflight:
+                        samples[other]["overlapped"] = True
         return result
 
     def prepare(call: Call, ctx: CallContext, *, now: Any) -> Any:
@@ -116,15 +123,18 @@ def child(config: Path) -> int:
         sample = getattr(local, "sample", None)
         if sample is None:
             return original_write(*args, **kwargs)
-        if active.get("idempotency_key") != sample["idempotency_key"]:
-            # Spans recorded since belong to another request: never pair them with this response.
-            result = original_write(*args, **kwargs)
-            sample["status"] = "instrumentation_mismatch"
+        write_start_ns = time.perf_counter_ns()
+        result = original_write(*args, **kwargs)
+        with inflight_lock:
+            inflight.discard(str(sample["idempotency_key"]))
+            overlapped = sample.get("overlapped") is True
+        if overlapped or active.get("idempotency_key") != sample["idempotency_key"]:
+            # Requests overlapped: owner-thread spans cannot be attributed, so never report an ok sample.
+            sample["status"] = "instrumentation_overlap"
             print(json.dumps({"event": "sample", **sample}), flush=True)
             local.sample = None
             return result
-        active["response_write_start_ns"] = time.perf_counter_ns()
-        result = original_write(*args, **kwargs)
+        active["response_write_start_ns"] = write_start_ns
         active["response_flushed_ns"] = time.perf_counter_ns()
         active["elapsed_ns"] = int(str(active["response_flushed_ns"])) - int(str(active["t0_read_ns"]))
         envelope = json.loads(kwargs["body"])

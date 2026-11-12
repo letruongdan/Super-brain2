@@ -75,6 +75,14 @@ DEFAULT_SENSITIVE_KEYS: frozenset[str] = frozenset(
         "githubtoken",
     }
 )
+_PATH_SEPARATORS = re.compile(r"[\\/]+")
+
+
+def blocked_path_components(pattern: str) -> tuple[str, ...]:
+    """Lowercase components of a blocked path pattern: ``/`` and ``\\`` are one separator, ``.`` is skipped."""
+    return tuple(part for part in _PATH_SEPARATORS.split(pattern.lower()) if part and part != ".")
+
+
 DEFAULT_BLOCKED_PATH_PATTERNS: tuple[str, ...] = (
     ".env",
     ".env.*",
@@ -223,6 +231,11 @@ class FilterPolicy:
             values = getattr(self, name)
             expected = tuple if name == "blocked_path_patterns" else frozenset
             if not isinstance(values, expected) or not all(isinstance(v, str) and v for v in values):
+                raise _invalid()
+        for pattern in self.blocked_path_patterns:
+            # A token never holds whitespace and always has a component: such a pattern could never be enforced.
+            parts = blocked_path_components(pattern)
+            if not parts or any(ch.isspace() for part in parts for ch in part):
                 raise _invalid()
         if not is_strict_int(self.entropy_min_length) or not (8 <= self.entropy_min_length <= 4096):
             raise _invalid()

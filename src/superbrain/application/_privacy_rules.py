@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import re
 import unicodedata
 from functools import lru_cache
@@ -10,6 +11,7 @@ from functools import lru_cache
 from superbrain.core.kernel import (
     OPAQUE_ID_RE,
     SHA256_DIGEST_RE,
+    blocked_path_components,
 )
 
 REDACTED = "[redacted]"
@@ -149,89 +151,40 @@ def _path_needles(patterns: tuple[str, ...]) -> tuple[str, ...] | None:
     """
     needles: set[str] = set()
     for pattern in patterns:
-        lowered = pattern.lower()
-        parts = [lowered.rstrip("/")] if lowered.endswith("/") else [part for part in lowered.split("/") if part]
-        best = max((_component_needle(part) for part in parts), key=len, default="")
+        best = max((_component_needle(part) for part in blocked_path_components(pattern)), key=len, default="")
         if not best:
             return None
         needles.add(best)
     return tuple(sorted(needles))
 
 
-_REGEX_META = frozenset(r".^$*+?{}[]\|()")
-_PLAIN_CLASS = re.compile(r"\[([A-Za-z0-9_]{1,8})\](?![?*+{])")
+# Gates for the shipped rules, each pinned to the exact rule text (flags + pattern) it was checked against. An edited
+# or added rule has no entry and always runs, so a gate can never be stale; no regex is parsed to build one.
 # (needles one of which every match holds, "<last char><separator>" pairs or None, compare case-folded)
 _RuleGate = tuple[tuple[str, ...], tuple[str, ...] | None, bool]
+_KV_PAIRS = ("d=", "d:", "e=", "e:", "n=", "n:", "t=", "t:", "y=", "y:", " =", " :", "\t=", "\t:")
+_RULE_GATES: dict[str, _RuleGate] = {
+    "a640d3fcd03f3622": (("authorization", "proxy-authorization"), None, True),  # _AUTH_HEADER
+    "2b74d6348b7f85b8": (("bearer", "basic", "token"), None, True),  # _AUTH_SCHEME
+    "800fedecfd83067a": (("password", "passwd", "pwd", "passphrase", "secret", "key", "token"), _KV_PAIRS, True),
+    "b28cd107992a4ba1": (("github_pat_",), None, False),  # _FIXED_TOKENS[0]
+    "092ac9a36b30cd8f": (("ghp_", "gho_", "ghu_", "ghs_", "ghr_"), None, False),  # _FIXED_TOKENS[1]
+    "86297f39e32a8e45": (("sk-",), None, False),  # _FIXED_TOKENS[2]
+    "4aed425b63d1fcb7": (("AKIA", "ASIA"), None, False),  # _FIXED_TOKENS[3]
+    "4f2fc09f0b773dcb": (("xoxb-", "xoxa-", "xoxp-", "xoxr-", "xoxs-"), None, False),  # _FIXED_TOKENS[4]
+    "fb1e448c567540e2": (("AIza",), None, False),  # _FIXED_TOKENS[5]
+    "a05f078b9a278638": (("eyJ",), None, False),  # _FIXED_TOKENS[6]
+}  # the third entry is _KEY_VALUE_SECRET
 
 
-def _leading_literals(source: str) -> tuple[str, ...]:
-    """Strings one of which starts every match of ``source``; a small plain ``[...]`` class is expanded."""
-    variants = [""]
-    i = 0
-    while i < len(source):
-        cls = _PLAIN_CLASS.match(source, i)
-        if cls is not None and len(variants) * len(cls.group(1)) <= 16:
-            variants = [v + ch for v in variants for ch in cls.group(1)]
-            i = cls.end()
-            continue
-        if source[i] in _REGEX_META or source[i + 1 : i + 2] in ("?", "*", "{"):
-            break  # a metacharacter, or a literal made optional by the quantifier after it
-        variants = [v + source[i] for v in variants]
-        i += 1
-        if source[i : i + 1] == "+":
-            break
-    return tuple(variants) if variants[0] else ()
-
-
-def _trailing_literal(alternative: str) -> str:
-    """Literal suffix every match of a quantifier-free-ending ``alternative`` ends with (``""`` when none)."""
-    start = len(alternative)
-    while start > 0 and alternative[start - 1] not in _REGEX_META:
-        start -= 1
-    if start > 0 and alternative[start - 1] == "\\":
-        start += 1  # ``\d``-style escape: its letter is not a literal
-    return alternative[start:]
+def _rule_text_digest(pattern: re.Pattern[str]) -> str:
+    return hashlib.sha256(f"{pattern.flags}\0{pattern.pattern}".encode()).hexdigest()[:16]
 
 
 @lru_cache(maxsize=64)
 def _rule_gate(pattern: re.Pattern[str]) -> _RuleGate | None:
-    r"""Cheap necessary condition for a ``\b``-anchored rule, read from the rule itself; ``None``: always run it.
-
-    A leading group's alternatives each give their literal suffix (the most specific part, next to the separator) or
-    else their leading literals; when the group is followed by ``([ \t]{0,16}[=:]``, a match also holds the
-    suffix's last character (or a blank) right before ``=`` or ``:``. Any shape the reader does not recognise gives
-    no gate, never a stale one.
-    """
-    fold = bool(pattern.flags & re.IGNORECASE)
-    source = pattern.pattern.removeprefix("(?i)")
-    if not source.startswith(r"\b"):
-        return None
-    source = source[2:]
-    if not source.startswith("("):
-        needles = _leading_literals(source)
-        return (tuple(n.lower() for n in needles) if fold else needles, None, fold) if needles else None
-    start = 3 if source.startswith("(?:") else 1
-    close = source.find(")")
-    if close < 0 or "(" in source[start:close]:
-        return None
-    found: list[str] = []
-    ends: set[str] | None = set() if source[close + 1 :].startswith(r"([ \t]{0,16}[=:]") else None
-    for alternative in source[start:close].split("|"):
-        suffix = _trailing_literal(alternative)
-        options = (suffix,) if suffix else _leading_literals(alternative)
-        if not options:
-            return None
-        found.extend(options)
-        if ends is not None:
-            if suffix:
-                ends.add(suffix[-1])
-            else:
-                ends = None
-    pairs = None if ends is None else tuple(f"{end}{sep}" for end in (*sorted(ends), " ", "\t") for sep in "=:")
-    if fold:
-        found = [n.lower() for n in found]
-        pairs = None if pairs is None else tuple(p.lower() for p in pairs)
-    return tuple(dict.fromkeys(found)), pairs, fold
+    """The gate checked for exactly this rule text, or ``None``: the rule always runs."""
+    return _RULE_GATES.get(_rule_text_digest(pattern))
 
 
 def _gate_open(pattern: re.Pattern[str], text: str, lowered: str | None) -> bool:
@@ -260,13 +213,12 @@ class _PathMatcher:
         self._chains: list[list[re.Pattern[str]]] = []
         names: list[str] = []
         for pattern in patterns:
-            lowered = pattern.lower()
-            if lowered.endswith("/"):  # ``dir/``: any component matching the glob, like a name pattern
-                names.append(fnmatch.translate(lowered.rstrip("/")))
-            elif "/" in lowered:
-                self._chains.append([re.compile(fnmatch.translate(part)) for part in lowered.split("/") if part])
-            else:
-                names.append(fnmatch.translate(lowered))
+            # ``name``, ``dir/`` and ``a/b`` (either separator): globs over a window of consecutive token components.
+            parts = blocked_path_components(pattern)
+            if len(parts) == 1:
+                names.append(fnmatch.translate(parts[0]))
+            elif parts:
+                self._chains.append([re.compile(fnmatch.translate(part)) for part in parts])
         self._names = re.compile("|".join(f"(?:{n})" for n in names)) if names else None
         self._results: dict[str, bool] = {}
         self._needles = _path_needles(patterns)
