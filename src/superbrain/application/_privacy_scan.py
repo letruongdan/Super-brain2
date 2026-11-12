@@ -17,6 +17,7 @@ from superbrain.application._privacy_rules import (
     _PEM_BEGIN,
     _PEM_END,
     _SEGMENT,
+    MAX_PATH_SPELLINGS,
     REDACTED,
     _gate_open,
     _PathMatcher,
@@ -176,17 +177,24 @@ class _TextScans:
         return f"{match.group(1)} {REDACTED}"
 
     def _blocked_path(self, match: re.Match[str]) -> str:
+        """§14.2: a token is blocked when any spelling left after removing part of its leading wrapper run and part
+        of its trailing wrapper run (or nothing) matches; that spelling is replaced and the removed wrappers stay."""
         token = match.group(0)
-        core = token.lstrip(_PATH_LEAD)
-        lead = len(token) - len(core)
-        trail = len(core) - len(core.rstrip(_PATH_TRAIL))
-        # Shortest piece first, so wrapper punctuation that is not part of the blocked spelling stays.
-        for keep_lead in range(min(lead, self._paths.keep_lead) + 1):
-            for keep_trail in range(min(trail, self._paths.keep_trail) + 1):
+        # Both runs are measured on the whole token; in an all-wrapper token they overlap.
+        lead = len(token) - len(token.lstrip(_PATH_LEAD))
+        trail = len(token) - len(token.rstrip(_PATH_TRAIL))
+        if not self._paths.may_block(token):
+            return token
+        if (lead + 1) * (trail + 1) > MAX_PATH_SPELLINGS:
+            raise _Reject  # fail closed rather than check fewer spellings than the rule names
+        # Most wrapper characters removed first, so wrappers outside the blocked spelling are kept.
+        for keep_lead in range(lead + 1):
+            for keep_trail in range(trail + 1):
                 start, end = lead - keep_lead, len(token) - trail + keep_trail
                 if start < end and self._paths.blocked(token[start:end]):
                     self.redacted += 1
                     return token[:start] + REDACTED + token[end:]
+                self.tick()
         return token
 
     def redact(self, text: str, *, entropy: bool = True) -> str:

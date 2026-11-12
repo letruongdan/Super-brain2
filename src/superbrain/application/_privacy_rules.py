@@ -59,6 +59,8 @@ _DOTTED_PATH_TOKEN = re.compile(
 _PATH_SPLIT = re.compile(r"[\\/]+")
 _PATH_LEAD = "`*([{<\"'"
 _PATH_TRAIL = "`*)]}>\"'.,:;!?"
+# Spellings of one wrapped token checked before the payload is refused: (leading run + 1) x (trailing run + 1).
+MAX_PATH_SPELLINGS = 4096
 _ENTROPY_EDGE = "\"'()[]{}<>,;.!?:`*"
 # Zero-width word boundaries (O(1) per position, so linear on any key): camelCase, acronym->Camel, letter<->digit.
 _WORD_BOUNDARY = re.compile(
@@ -206,31 +208,6 @@ def _gate_open(pattern: re.Pattern[str], text: str, lowered: str | None) -> bool
     return pairs is None or any(pair in text for pair in pairs)
 
 
-def _edge_units(component: str, edge: str, reverse: bool) -> int:
-    """Upper bound of ``edge`` characters a match of ``component`` needs at that end: literals in ``edge``, ``?`` and
-    ``[...]`` classes count one each; ``*`` counts none (it can match nothing) and the count goes on past it."""
-    units = 0
-    i = len(component) - 1 if reverse else 0
-    step = -1 if reverse else 1
-    while 0 <= i < len(component):
-        ch = component[i]
-        if ch == "*":
-            i += step
-            continue
-        if ch == "]" if reverse else ch == "[":
-            close = component.rfind("[", 0, i) if reverse else component.find("]", i + 2)
-            if close < 0:
-                break
-            units += 1
-            i = close + step
-            continue
-        if ch != "?" and ch not in edge:
-            break
-        units += 1
-        i += step
-    return units
-
-
 class _PathMatcher:
     """Component-boundary matcher for blocked path patterns (``name``, ``dir/`` and ``a/b`` chains)."""
 
@@ -247,10 +224,13 @@ class _PathMatcher:
         self._names = re.compile("|".join(f"(?:{n})" for n in names)) if names else None
         self._results: dict[str, bool] = {}
         self._needles = _path_needles(patterns)
-        components = [part for pattern in patterns for part in blocked_path_components(pattern)]
-        # Wrapper characters a token may need to keep at each end for some pattern to match (bounded, usually 0).
-        self.keep_lead = max((_edge_units(part, _PATH_LEAD, False) for part in components), default=0)
-        self.keep_trail = max((_edge_units(part, _PATH_TRAIL, True) for part in components), default=0)
+
+    def may_block(self, token: str) -> bool:
+        """False only when no spelling inside ``token`` can match: every match holds one of the needles."""
+        if self._needles is None:
+            return True
+        low = token.lower()
+        return any(needle in low for needle in self._needles)
 
     def blocked(self, token: str) -> bool:
         cached = self._results.get(token)
