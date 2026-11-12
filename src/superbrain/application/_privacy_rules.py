@@ -143,7 +143,7 @@ def _component_needle(part: str) -> str:
 
 @lru_cache(maxsize=32)
 def _path_needles(patterns: tuple[str, ...]) -> tuple[str, ...] | None:
-    """Lowercase ASCII substrings one of which every blocked token's lowercase form contains; ``None``: no prefilter.
+    """Lowercase substrings one of which every blocked token's lowercase form contains; ``None``: no prefilter.
 
     Derived from the policy's own patterns, so a pattern added to any list (the shipped default included) is never
     skipped by a stale hand-written prefilter.
@@ -153,7 +153,7 @@ def _path_needles(patterns: tuple[str, ...]) -> tuple[str, ...] | None:
         lowered = pattern.lower()
         parts = [lowered.rstrip("/")] if lowered.endswith("/") else [part for part in lowered.split("/") if part]
         best = max((_component_needle(part) for part in parts), key=len, default="")
-        if not best or not best.isascii():
+        if not best:
             return None
         needles.add(best)
     return tuple(sorted(needles))
