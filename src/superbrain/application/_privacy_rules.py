@@ -306,10 +306,10 @@ class _Glob:
             # A lone "." can only sit at the end of the leading run, so no later start is left to try.
             p = self._head_at(seg, low, high)
             return (p, n - h - p) if p is not None and self._kept(seg[p : p + h]) else None
-        p = self._head_at(seg, 0, min(lead, n - h - t))
+        p = self._head_at(seg, 0, lead)
         if p is None:
             return None
-        s = self._tail_at(rev, min(trail, n - h - t - p))
+        s = self._tail_at(rev, min(trail, n - h - t - p))  # negative when head and tail would overlap: no match
         return (p, s) if s is not None and self._kept(seg[p : n - s]) else None
 
 
