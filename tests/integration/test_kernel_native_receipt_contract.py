@@ -1856,6 +1856,47 @@ def test_owner_driver_revoked_stamp_error_logging_and_cutoff_cleanup(
     assert revoked_calls[0]["auth_stamp_matched"] is False
     assert revoked_calls[0]["response_flushed_ok"] is False
     assert hook_state["pending_count"]() == 0
+
+    # Even when ready_seen=True, a get_health error envelope (ok=False) MUST emit ready=False.
+    eq_err: queue.Queue[dict[str, object] | None] = queue.Queue()
+    hook_err = install_fn(
+        eq=eq_err,
+        store_id=tpl.store_id,
+        instance_id="inst-hook-err",
+        daemon_pid=os.getpid(),
+        daemon_started_at=process_started_at_for_pid(os.getpid()),
+        initial_ready=True,
+    )
+    try:
+        with open_test_loopback_transport(tpl, name="health-err-envelope") as h:
+            client = h.open_client()
+            target = h.make_target()
+            err_health_res = client.call(
+                target,
+                ToolCommand(
+                    tool="get_health",
+                    arguments={"schema_version": "2.0", "unexpected": 1},
+                    token=tpl.cred.token,
+                    selected_scope=None,
+                    correlation_id="corr-health-err",
+                ),
+            )
+            assert err_health_res.get("ok") is False
+    finally:
+        hook_err["uninstall"]()
+    err_recorded: list[dict[str, object]] = []
+    while not eq_err.empty():
+        item = eq_err.get_nowait()
+        if item is not None:
+            err_recorded.append(item)
+    health_err_calls = [
+        r for r in err_recorded if r.get("event") == "owner_call" and r.get("tool_name") == "get_health"
+    ]
+    assert len(health_err_calls) == 1
+    assert health_err_calls[0]["ready"] is False
+    assert health_err_calls[0]["auth_stamp_matched"] is False
+    assert health_err_calls[0]["response_flushed_ok"] is True
+    assert hook_err["pending_count"]() == 0
     _ = LoopbackServer
     _ = cli
 
@@ -2321,8 +2362,20 @@ def test_native_verifier_rejects_null_response_digest(trusted_tmp: Path) -> None
     obs_null = replace(obs, host_calls=(hc_null,), owner_events=(oc_null,))
 
     assert verify_native_connection(probe_null, registration=reg, observations=obs_null) is False
+    assert verify_native_connection(probe, registration=reg, observations=obs_null) is False
     assert verify_same_daemon(probe_null, probe_second_null) is False
+    assert verify_same_daemon(probe_null, probe_second) is False
     assert verify_same_daemon(probe, probe_second_null) is False
+
+    tf_malformed = replace(probe.terminal_facts, response_digest="not-a-sha256")
+    probe_malformed = replace(probe, terminal_facts=tf_malformed)
+    obs_malformed = replace(
+        obs,
+        host_calls=(replace(obs.host_calls[0], response_digest="not-a-sha256"),),
+        owner_events=(replace(obs.owner_events[0], response_digest="not-a-sha256"),),
+    )
+    assert verify_native_connection(probe_malformed, registration=reg, observations=obs_malformed) is False
+    assert verify_same_daemon(probe_malformed, probe_second) is False
 
     roundtripped_null = parse_native_probe(encode_native_probe(probe_null))
     roundtripped_second_null = parse_native_probe(encode_native_probe(probe_second_null))
@@ -2360,12 +2413,13 @@ def test_owner_driver_non_release_error_quiesced_and_timeout_logging(
                 items.append(item)
         return items
 
+    daemon_started_at = process_started_at_for_pid(os.getpid())
     hook_state = native_owner._install_loopback_server_hooks(
         eq=eq,
         store_id=tpl.store_id,
         instance_id="inst-non-release",
         daemon_pid=os.getpid(),
-        daemon_started_at=process_started_at_for_pid(os.getpid()),
+        daemon_started_at=daemon_started_at,
     )
     try:
         with open_test_loopback_transport(tpl, name="non-release-exits") as h:
@@ -2400,6 +2454,9 @@ def test_owner_driver_non_release_error_quiesced_and_timeout_logging(
             assert ev1[0]["auth_stamp_matched"] is False
             assert ev1[0]["response_flushed_ok"] is True
             assert ev1[0]["response_digest"] == digest_bytes(canonical_json(res_err))
+            if sys.platform == "win32":
+                assert ev1[0]["client_pid"] == os.getpid()
+                assert ev1[0]["client_started_at"] == daemon_started_at
             assert hook_state["pending_count"]() == 0
 
             # 2. _is_quiesced() becomes True right after read_admitted_tool_command -> flushes DAEMON_UNAVAILABLE.
@@ -2436,6 +2493,9 @@ def test_owner_driver_non_release_error_quiesced_and_timeout_logging(
             assert ev2[0]["auth_stamp_matched"] is False
             assert ev2[0]["response_flushed_ok"] is True
             assert ev2[0]["response_digest"] == digest_bytes(canonical_json(res_q))
+            if sys.platform == "win32":
+                assert ev2[0]["client_pid"] == os.getpid()
+                assert ev2[0]["client_started_at"] == daemon_started_at
             assert hook_state["pending_count"]() == 0
 
             # 3. _await_owner_reply times out (reply is None) -> exits with NO tool flush (State 0 200 must not bleed).
@@ -2465,6 +2525,35 @@ def test_owner_driver_non_release_error_quiesced_and_timeout_logging(
             assert ev3[0]["auth_stamp_matched"] is False
             assert ev3[0]["response_flushed_ok"] is False
             assert ev3[0]["response_digest"] is None
+            if sys.platform == "win32":
+                assert ev3[0]["client_pid"] == os.getpid()
+                assert ev3[0]["client_started_at"] == daemon_started_at
+            assert hook_state["pending_count"]() == 0
+
+            # 4. Transient OS socket-lookup failure must not break daemon reply or drop owner_call telemetry.
+            def _boom_pid(_peer_port: int, _listen_port: int) -> int | None:
+                raise OSError("simulated tcp table failure")
+
+            with monkeypatch.context() as mp:
+                mp.setattr(native_owner, "_lookup_loopback_client_pid", _boom_pid)
+                res_pid_err = h.open_client(monotonic_ns=client_clock.monotonic_ns).call(
+                    target,
+                    ToolCommand(
+                        tool="get_health",
+                        arguments={"schema_version": "2.0"},
+                        token=tpl.cred.token,
+                        selected_scope=None,
+                        correlation_id="corr-lookup-boom",
+                    ),
+                )
+
+            assert res_pid_err.get("ok") is True
+            ev4 = [r for r in _drain_and_join_workers() if r.get("event") == "owner_call"]
+            assert len(ev4) == 1
+            assert ev4[0]["tool_name"] == "get_health"
+            assert ev4[0]["response_flushed_ok"] is True
+            assert ev4[0]["client_pid"] is None
+            assert ev4[0]["client_started_at"] is None
             assert hook_state["pending_count"]() == 0
     finally:
         hook_state["uninstall"]()

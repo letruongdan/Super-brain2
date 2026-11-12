@@ -85,8 +85,8 @@ Quy ước theo §17.3 / §17.5: 14 bài kiểm trong `tests/integration/test_ke
 
 | Host (Q4) | Trạng thái T0 lịch sử | Verdict native T9 hiện tại | Ghi chú & điều kiện |
 |---|---|---|---|
-| **Codex desktop app** (`26.1029.7803.0` / `codex.exe 0.166.0-alpha.6`) | `passed` (`t0r1`/`t0r2`) | `not_run` | Đã có checklist cô lập & verifier; chờ phê duyệt D8 của owner và chạy trên pin cuối sau khi F4/perf Windows pass |
-| **Claude Code** (`2.1.317`) | `passed` (`t0r3`) | `not_run` | Đã có checklist cô lập & verifier; chờ phê duyệt D8 + quota và chạy trên pin cuối sau khi F4/perf Windows pass |
+| **Codex desktop app / CLI** (`26.1106.6628.0` / `codex-cli 0.167.0-alpha.4.1`; T0 `26.1029.7803.0` / `0.166.0-alpha.6`) | `passed` (`t0r1`/`t0r2`) | `not_run` | Đã có checklist cô lập, hồ sơ xin phép D8 & verifier; chờ phê duyệt D8 của owner (bao gồm chọn mode GUI/CLI) sau kiểm tra pin cuối |
+| **Claude Code** (`2.1.322 (Claude Code)`; T0 `2.1.317`) | `passed` (`t0r3`) | `not_run` | Đã có checklist cô lập, hồ sơ xin phép D8 & verifier; chờ phê duyệt D8 + quota của owner sau kiểm tra pin cuối |
 | **Antigravity Desktop** (`1.23.2` / `agy 1.5.1`) | `failed_r1_unsupported_in_i2` | `not_run` *(ngoài tập I2)* | Đã loại khỏi tập hỗ trợ I2 theo Owner Ruling `2026-11-05T19:05:18+07:00`; giữ nguyên lịch sử failure `t0r2` cho SP7 |
 | **OpenCode** (`2.2.0`) | `not_run` | `not_run` | Chưa được chọn cho I2; cần quyết định phạm vi và D8 |
 | **Cursor** | `not_run` | `not_run` | Chưa cài đặt / chưa được chọn cho I2; cần quyết định phạm vi và D8 |

@@ -274,7 +274,9 @@ def _install_loopback_server_hooks(
     from superbrain.core.wire import encode_envelope
 
     hook_lock = threading.Lock()
-    pending_cmds: dict[int, tuple[str, dict[str, JsonValue] | None, str, str, str, int, str, int]] = {}
+    pending_cmds: dict[
+        int, tuple[str, dict[str, JsonValue] | None, str, str, str, int, str, int, int | None, str | None]
+    ] = {}
     flush_by_thread: dict[int, tuple[int | None, str | None]] = {}
     stamp_result_by_tid: dict[int, bool] = {}
     ready_seen = initial_ready
@@ -286,6 +288,17 @@ def _install_loopback_server_hooks(
     orig_release = _loopback_server.LoopbackServer._release_owner_reply
     orig_conn_worker = _loopback_server.LoopbackServer._conn_worker
     orig_authorize_stamp = AuthGate.authorize_stamp
+
+    def _safe_client_identity(peer_port: int, listen_port: int) -> tuple[int | None, str | None]:
+        if peer_port <= 0 or listen_port <= 0:
+            return None, None
+        client_pid: int | None = None
+        client_started_at: str | None = None
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            client_pid = _lookup_loopback_client_pid(peer_port, listen_port)
+            if client_pid is not None:
+                client_started_at = process_started_at_for_pid(client_pid)
+        return client_pid, client_started_at
 
     def _resolve_principal_and_cred(
         gate: Any,
@@ -376,6 +389,7 @@ def _install_loopback_server_hooks(
                 phost, pport = ssl_sock.getpeername()[:2]
                 listen_host, listen_port = str(lhost), int(lport)
                 peer_host, peer_port = str(phost), int(pport)
+            client_pid, client_started_at = _safe_client_identity(peer_port, listen_port)
             with hook_lock:
                 pending_cmds[tid] = (
                     str(cmd.tool),
@@ -386,6 +400,8 @@ def _install_loopback_server_hooks(
                     listen_port,
                     peer_host,
                     peer_port,
+                    client_pid,
+                    client_started_at,
                 )
         return cmd
 
@@ -435,6 +451,8 @@ def _install_loopback_server_hooks(
                     listen_port,
                     peer_host,
                     peer_port,
+                    client_pid,
+                    client_started_at,
                 ) = cmd_info
                 gate = self._owner.auth_gate
                 principal_id, credential_id = _resolve_principal_and_cred(gate, None, raw_token)
@@ -451,8 +469,8 @@ def _install_loopback_server_hooks(
                     listen_port=listen_port,
                     peer_host=peer_host,
                     peer_port=peer_port,
-                    client_pid=None,
-                    client_started_at=None,
+                    client_pid=client_pid,
+                    client_started_at=client_started_at,
                     req_started_at=req_started_at,
                     ended_at=_utc_now_z(),
                     selected_scope=selected_scope,
@@ -471,35 +489,38 @@ def _install_loopback_server_hooks(
         listen_port = cmd_info[5] if cmd_info is not None else 0
         peer_host = cmd_info[6] if cmd_info is not None else "127.0.0.1"
         peer_port = cmd_info[7] if cmd_info is not None else 0
-        with contextlib.suppress(OSError):
-            lhost, lport = ssl_sock.getsockname()[:2]
-            phost, pport = ssl_sock.getpeername()[:2]
-            listen_host, listen_port = str(lhost), int(lport)
-            peer_host, peer_port = str(phost), int(pport)
-
-        client_pid: int | None = None
-        client_started_at: str | None = None
-        if peer_port > 0 and listen_port > 0:
-            client_pid = _lookup_loopback_client_pid(peer_port, listen_port)
-            if client_pid is not None:
-                with contextlib.suppress(OSError):
-                    client_started_at = process_started_at_for_pid(client_pid)
+        client_pid = cmd_info[8] if cmd_info is not None else None
+        client_started_at = cmd_info[9] if cmd_info is not None else None
 
         gate = self._owner.auth_gate
-        grant_stamp = reply.grant_stamp
-        principal_id, credential_id = _resolve_principal_and_cred(gate, grant_stamp, raw_token)
-
-        expected_env_digest = digest_bytes(encode_envelope(reply.envelope))
+        grant_stamp = getattr(reply, "grant_stamp", None)
+        principal_id: str | None = None
+        credential_id: str | None = None
+        expected_env_digest: str | None = None
+        release_completed = False
         try:
+            with contextlib.suppress(OSError):
+                lhost, lport = ssl_sock.getsockname()[:2]
+                phost, pport = ssl_sock.getpeername()[:2]
+                listen_host, listen_port = str(lhost), int(lport)
+                peer_host, peer_port = str(phost), int(pport)
+            if client_pid is None or client_started_at is None:
+                client_pid, client_started_at = _safe_client_identity(peer_port, listen_port)
+            principal_id, credential_id = _resolve_principal_and_cred(gate, grant_stamp, raw_token)
+            expected_env_digest = digest_bytes(encode_envelope(reply.envelope))
             orig_release(self, ssl_sock, reply, tool_deadline_ns)
+            release_completed = True
         finally:
             with hook_lock:
                 flushed_status, flushed_digest = flush_by_thread.pop(tid, (None, None))
                 stamp_result = stamp_result_by_tid.pop(tid, None)
 
             ended_at = _utc_now_z()
-            env_ok = reply.envelope.get("ok") is True
-            if env_ok:
+            env_ok = isinstance(reply.envelope, dict) and reply.envelope.get("ok") is True
+            if not release_completed or expected_env_digest is None:
+                auth_matched = False
+                response_flushed_ok = bool(flushed_status == 200 and flushed_digest is not None)
+            elif env_ok:
                 if stamp_result is not None:
                     auth_matched = bool(
                         stamp_result and flushed_status == 200 and flushed_digest == expected_env_digest
@@ -513,12 +534,13 @@ def _install_loopback_server_hooks(
                 )
             else:
                 auth_matched = False
-                response_flushed_ok = bool(flushed_status is not None and flushed_digest == expected_env_digest)
+                response_flushed_ok = bool(flushed_status == 200 and flushed_digest == expected_env_digest)
 
-            if env_ok and not auth_matched:
+            if not auth_matched:
                 ready_val = False
-            elif tool_name == "get_health" and auth_matched and isinstance(reply.envelope.get("data"), dict):
-                ready_val = bool(reply.envelope["data"].get("ready") is True)
+            elif tool_name == "get_health":
+                data = reply.envelope.get("data") if isinstance(reply.envelope, dict) else None
+                ready_val = bool(isinstance(data, dict) and data.get("ready") is True)
             else:
                 ready_val = ready_seen
 
