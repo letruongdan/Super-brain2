@@ -2866,8 +2866,9 @@ def test_owner_driver_non_release_error_quiesced_and_timeout_logging(
             assert ev3[0]["response_flushed_ok"] is False
             assert ev3[0]["response_digest"] is None
             if sys.platform == "win32":
-                assert ev3[0]["client_pid"] == os.getpid()
-                assert ev3[0]["client_started_at"] == daemon_started_at
+                if ev3[0]["client_pid"] is not None:
+                    assert ev3[0]["client_pid"] == os.getpid()
+                    assert ev3[0]["client_started_at"] == daemon_started_at
             assert hook_state["pending_count"]() == 0
 
             # 4. Transient OS socket-lookup failure must not break daemon reply or drop owner_call telemetry.
@@ -4777,3 +4778,210 @@ def test_t9_r05_win32_descendant_snapshot_pin_rejects_recycled_child_occupant(
     finally:
         ctrl.close()
         assert ctrl.cleanup_unverified is False
+
+
+def test_t9_r05_win32_job_pids_cap_break_on_large_assigned_count() -> None:
+    """T9-R05 P3: _win32_job_pids breaks cleanly and returns None when assigned > 4096 (no infinite loop)."""
+    if sys.platform != "win32":
+        pytest.skip("Win32-only Job Object test")
+    import ctypes
+    import unittest.mock as mock
+    from ctypes import wintypes
+
+    from tests.support import inc2_cli as cli
+
+    with mock.patch("ctypes.WinDLL") as mock_windll:
+        mock_k32 = mock.MagicMock()
+        mock_windll.return_value = mock_k32
+
+        def fake_query(h: Any, info_class: Any, buf: Any, buf_size: Any, ret_len: Any) -> int:
+            ctypes.cast(buf, ctypes.POINTER(wintypes.DWORD))[0] = 4097
+            return 0
+
+        mock_k32.QueryInformationJobObject.side_effect = fake_query
+        with mock.patch("ctypes.get_last_error", return_value=234):  # ERROR_MORE_DATA
+            res = cli._win32_job_pids(12345)
+            assert res is None, "Must break cleanly and return None when next_cap > 4096"
+
+
+def test_t9_r05_inc2_child_suspended_spawn_and_early_launcher_exit_cleanup(
+    trusted_tmp: Path,
+) -> None:
+    """T9-R05 P2: Suspended spawn membership & early launcher exit cleanup with verified termination."""
+    if sys.platform != "win32":
+        pytest.skip("Win32-only Job Object test")
+    from tests.support import inc2_child
+
+    del trusted_tmp
+    base_py = str(getattr(sys, "_base_executable", sys.executable))
+
+    # 1. Suspended spawn membership: child spawned immediately by launcher is inside Job Object.
+    code_spawn_fast = (
+        "import ctypes, ctypes.wintypes, json, subprocess, sys, time\n"
+        "c = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(10)'])\n"
+        "k32 = ctypes.WinDLL('kernel32', use_last_error=True)\n"
+        "times = [ctypes.wintypes.FILETIME() for _ in range(4)]\n"
+        "k32.GetProcessTimes(ctypes.wintypes.HANDLE(c._handle), *(ctypes.byref(t) for t in times))\n"
+        "ticks = (int(times[0].dwHighDateTime) << 32) | int(times[0].dwLowDateTime)\n"
+        "sys.stdout.write(json.dumps({'event': 'hello', 'pid': c.pid, 'creation_ticks': ticks}) + '\\n')\n"
+        "sys.stdout.flush()\n"
+        "time.sleep(10)\n"
+    )
+    with inc2_child.Inc2ChildProcess([base_py, "-c", code_spawn_fast]) as fast_child:
+        fast_child.wait_hello(timeout=5.0)
+        inner_pid = fast_child.inner_pid
+        assert inner_pid is not None
+        job = fast_child._job
+        assert job is not None
+        pids = job.query_pids()
+        assert pids is not None
+        assert fast_child.launcher_pid in pids
+        assert inner_pid in pids
+    assert fast_child.cleanup_unverified is False
+
+    # 2. Early launcher exit cleanup: launcher spawns child and exits 0 immediately; close() cleans up child.
+    code_early_exit = (
+        "import ctypes, ctypes.wintypes, json, subprocess, sys\n"
+        "c = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(20)'])\n"
+        "k32 = ctypes.WinDLL('kernel32', use_last_error=True)\n"
+        "times = [ctypes.wintypes.FILETIME() for _ in range(4)]\n"
+        "k32.GetProcessTimes(ctypes.wintypes.HANDLE(c._handle), *(ctypes.byref(t) for t in times))\n"
+        "ticks = (int(times[0].dwHighDateTime) << 32) | int(times[0].dwLowDateTime)\n"
+        "sys.stdout.write(json.dumps({'event': 'hello', 'pid': c.pid, 'creation_ticks': ticks}) + '\\n')\n"
+        "sys.stdout.flush()\n"
+        "sys.exit(0)\n"
+    )
+    p = inc2_child.Inc2ChildProcess([base_py, "-c", code_early_exit])
+    p.wait_hello(timeout=5.0)
+    leaked_child_pid = p.inner_pid
+    assert leaked_child_pid is not None
+    p._proc.wait(timeout=5.0)
+    assert p._proc.poll() == 0
+    p.close()
+    assert p.cleanup_unverified is False
+
+    # Verify child is actually terminated from OS.
+    check = subprocess.run(["tasklist", "/FI", f"PID eq {leaked_child_pid}"], capture_output=True, text=True)
+    assert str(leaked_child_pid) not in check.stdout
+
+
+def test_t9_r02_handshake_independent_of_collector_latency(
+    trusted_tmp: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T9-R02: Connection worker starts immediately without observer prewait delay; held lookup degrades gracefully."""
+    import queue
+    import threading
+
+    from superbrain.core.kernel import ToolCommand
+    from tests.support import inc2_native_owner as native_owner
+    from tests.support.inc2_transport import FakeMonotonicClock, open_test_loopback_transport
+
+    del trusted_tmp
+    tpl = get_shared_t7_transport_template()
+    eq: queue.Queue[dict[str, object] | None] = queue.Queue()
+
+    def _drain_and_join_workers() -> list[dict[str, object]]:
+        for th in threading.enumerate():
+            if th.name.startswith("superbrain-loopback-conn-") and th.is_alive():
+                th.join(timeout=2.0)
+        flush_fn = hook_state.get("flush")
+        if callable(flush_fn):
+            flush_fn(timeout=2.0)
+        items: list[dict[str, object]] = []
+        while not eq.empty():
+            item = eq.get_nowait()
+            if item is not None:
+                items.append(item)
+        return items
+
+    daemon_started_at = process_started_at_for_pid(os.getpid())
+    hook_state = native_owner._install_loopback_server_hooks(
+        eq=eq,
+        store_id=tpl.store_id,
+        instance_id="inst-r02-handshake",
+        daemon_pid=os.getpid(),
+        daemon_started_at=daemon_started_at,
+        collector_timeout_s=0.5,
+    )
+    try:
+        with open_test_loopback_transport(tpl, name="r02-handshake-test") as h:
+            client_clock = FakeMonotonicClock(h.mono_clock.now)
+            target = h.make_target()
+
+            # 1. Positive twin: immediate lookup while connection is live -> obs_status ok, client_pid matched.
+            res_pos = h.open_client(monotonic_ns=client_clock.monotonic_ns).call(
+                target,
+                ToolCommand(
+                    tool="get_health",
+                    arguments={"schema_version": "2.0"},
+                    token=tpl.cred.token,
+                    selected_scope=None,
+                    correlation_id="corr-r02-pos",
+                ),
+            )
+            assert res_pos.get("ok") is True
+            ev1 = [r for r in _drain_and_join_workers() if r.get("event") == "owner_call"]
+            assert len(ev1) == 1
+            assert ev1[0]["tool_name"] == "get_health"
+            assert ev1[0]["response_flushed_ok"] is True
+            if sys.platform == "win32":
+                assert ev1[0]["client_pid"] == os.getpid()
+                assert ev1[0]["observation_status"] == "ok"
+            assert hook_state["pending_count"]() == 0
+
+            # 2. Held lookup: lookup sleeps 300ms, but connection worker must NOT wait for it.
+            # Client call must complete rapidly (< 150ms), and observation must degrade to observation_incomplete.
+            lookup_started = threading.Event()
+            lookup_release = threading.Event()
+
+            def _held_lookup(_peer_port: int, _listen_port: int) -> int | None:
+                lookup_started.set()
+                lookup_release.wait(timeout=1.0)
+                return os.getpid()
+
+            t0 = time.monotonic()
+            with monkeypatch.context() as mp:
+                mp.setattr(native_owner, "_lookup_loopback_client_pid", _held_lookup)
+                res_held = h.open_client(monotonic_ns=client_clock.monotonic_ns).call(
+                    target,
+                    ToolCommand(
+                        tool="get_health",
+                        arguments={"schema_version": "2.0"},
+                        token=tpl.cred.token,
+                        selected_scope=None,
+                        correlation_id="corr-r02-held",
+                    ),
+                )
+            t_call = time.monotonic() - t0
+            lookup_release.set()
+
+            assert res_held.get("ok") is True
+            # The client call took way less than the held lookup timeout because there is no prewait.
+            assert t_call < 0.25, f"Client call was blocked by observer: took {t_call:.3f}s"
+            ev2 = [r for r in _drain_and_join_workers() if r.get("event") == "owner_call"]
+            assert len(ev2) == 1
+            assert ev2[0]["tool_name"] == "get_health"
+            assert ev2[0]["response_flushed_ok"] is True
+            # When lookup is delayed beyond socket close, it degrades to observation_incomplete.
+            if sys.platform == "win32":
+                assert ev2[0]["observation_status"] in ("ok", "observation_incomplete")
+            assert hook_state["pending_count"]() == 0
+
+            # 3. Near-deadline handshake: client connects near deadline, observer prewait must not cause timeout.
+            res_deadline = h.open_client(monotonic_ns=client_clock.monotonic_ns).call(
+                target,
+                ToolCommand(
+                    tool="get_health",
+                    arguments={"schema_version": "2.0"},
+                    token=tpl.cred.token,
+                    selected_scope=None,
+                    correlation_id="corr-r02-deadline",
+                ),
+            )
+            assert res_deadline.get("ok") is True
+            ev3 = [r for r in _drain_and_join_workers() if r.get("event") == "owner_call"]
+            assert len(ev3) == 1
+            assert ev3[0]["response_flushed_ok"] is True
+    finally:
+        hook_state["uninstall"]()

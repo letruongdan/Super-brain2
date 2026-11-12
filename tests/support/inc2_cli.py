@@ -367,8 +367,12 @@ def _win32_job_pids(job_handle: int) -> tuple[int, ...] | None:
             count = min(cap, int(buf.NumberOfProcessIdsInList))
             return tuple(int(buf.ProcessIdList[i]) for i in range(count) if int(buf.ProcessIdList[i]) > 0)
         err = ctypes.get_last_error()
-        if err == error_more_data and int(buf.NumberOfAssignedProcesses) > cap:
-            cap = min(4096, max(cap * 2, int(buf.NumberOfAssignedProcesses)))
+        if err == error_more_data:
+            assigned = int(buf.NumberOfAssignedProcesses)
+            next_cap = max(cap * 2, assigned)
+            if next_cap > 4096 or next_cap <= cap:
+                return None
+            cap = next_cap
             continue
         return None
     return None
@@ -501,6 +505,51 @@ def _set_win32_job_kill_on_close(job_handle: int) -> None:
         ctypes.byref(info),
         ctypes.sizeof(info),
     )
+
+
+def _win32_resume_process(proc_handle: int | None) -> bool:
+    """Resume all threads in a suspended Win32 process handle via NtResumeProcess."""
+    if sys.platform != "win32" or proc_handle is None:
+        return False
+    try:
+        ntdll = ctypes.WinDLL("ntdll")
+        ntdll.NtResumeProcess.argtypes = [ctypes.wintypes.HANDLE]
+        ntdll.NtResumeProcess.restype = ctypes.c_long
+        status = int(ntdll.NtResumeProcess(ctypes.wintypes.HANDLE(int(proc_handle))))
+        return bool(status == 0)
+    except Exception:  # noqa: BLE001 - non-fatal resume failure
+        return False
+
+
+def _win32_spawn_in_job(
+    job: _Win32ProcessJob | None,
+    popen_args: Sequence[str | Path | os.PathLike[str]],
+    *,
+    creationflags: int = 0,
+    **popen_kwargs: Any,
+) -> tuple[subprocess.Popen[Any], bool]:
+    """Spawn a subprocess attached to ``job`` before execution begins using CREATE_SUSPENDED."""
+    if sys.platform != "win32" or job is None or job.handle is None:
+        proc = subprocess.Popen(popen_args, creationflags=creationflags, **popen_kwargs)
+        assigned = job.assign_process(getattr(proc, "_handle", None)) if job is not None else False
+        return proc, assigned
+
+    create_suspended = 0x00000004
+    flags = creationflags | create_suspended
+    proc = subprocess.Popen(popen_args, creationflags=flags, **popen_kwargs)
+    proc_handle = getattr(proc, "_handle", None)
+    assigned = job.assign_process(proc_handle)
+    if not assigned:
+        with contextlib.suppress(Exception):
+            _win32_resume_process(proc_handle)
+            proc.kill()
+        return proc, False
+    resumed = _win32_resume_process(proc_handle)
+    if not resumed:
+        with contextlib.suppress(Exception):
+            proc.kill()
+        return proc, False
+    return proc, True
 
 
 def _win32_process_snapshot() -> list[tuple[int, int, int]] | None:
@@ -836,7 +885,11 @@ class InstalledServeProcess:
         self._endpoint_path = data_root / "endpoint.json"
         creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if sys.platform == "win32" else 0
         start_new_session = sys.platform != "win32"
-        self._proc: subprocess.Popen[bytes] = subprocess.Popen(
+        self._job: _Win32ProcessJob | None = (
+            _Win32ProcessJob(kill_on_close=True) if sys.platform == "win32" else None
+        )
+        self._proc, self._job_assigned = _win32_spawn_in_job(
+            self._job,
             list(args),
             cwd=cwd,
             env=clean_installed_subprocess_env(extra_env),
@@ -845,14 +898,6 @@ class InstalledServeProcess:
             stderr=subprocess.PIPE,
             creationflags=creationflags,
             start_new_session=start_new_session,
-        )
-        self._job: _Win32ProcessJob | None = (
-            _Win32ProcessJob(kill_on_close=True) if sys.platform == "win32" else None
-        )
-        self._job_assigned = (
-            self._job.assign_process(getattr(self._proc, "_handle", None))
-            if self._job is not None
-            else False
         )
         self._job_handle: int | None = (
             self._job.handle if (self._job is not None and self._job_assigned) else None
@@ -1156,7 +1201,11 @@ class InstalledMcpPipeSession:
         script = installed_script_path(env, script_name)
         assert script.is_file(), f"Installed console script not found: {script}"
         self._label = f"{script_name} {' '.join(args)}".strip()
-        self._proc: subprocess.Popen[bytes] = subprocess.Popen(
+        self._job: _Win32ProcessJob | None = (
+            _Win32ProcessJob(kill_on_close=False) if sys.platform == "win32" else None
+        )
+        self._proc, self._job_assigned = _win32_spawn_in_job(
+            self._job,
             [str(script), *args],
             cwd=cwd,
             env=clean_installed_subprocess_env(extra_env),
@@ -1178,14 +1227,6 @@ class InstalledMcpPipeSession:
         self._stderr_pump.start()
         self._writer: threading.Thread | None = None
         self._write_error: OSError | ValueError | None = None
-        self._job: _Win32ProcessJob | None = (
-            _Win32ProcessJob(kill_on_close=False) if sys.platform == "win32" else None
-        )
-        self._job_assigned = (
-            self._job.assign_process(getattr(self._proc, "_handle", None))
-            if self._job is not None
-            else False
-        )
         self._job_handle: int | None = (
             self._job.handle if (self._job is not None and self._job_assigned) else None
         )
@@ -1270,7 +1311,6 @@ class InstalledMcpPipeSession:
             )
         if self._write_error is not None:
             raise self._write_error
-        self._snapshot_descendant_identities()
         try:
             raw_line = self._lines.get(timeout=timeout)
         except queue.Empty as err:
@@ -1279,6 +1319,7 @@ class InstalledMcpPipeSession:
                 f"{self._label}: timed out after {timeout:.1f}s waiting for MCP response while stdin open "
                 f"(process_alive={alive}, stdin_closed={self._stdin.closed})\nstderr tail:\n{self._stderr_tail()}"
             ) from err
+        self._snapshot_descendant_identities()
         assert raw_line, (
             f"{self._label}: stdout reached EOF without emitting expected MCP response\n"
             f"stderr tail:\n{self._stderr_tail()}"

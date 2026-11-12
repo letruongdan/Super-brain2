@@ -760,10 +760,6 @@ def _install_loopback_server_hooks(
             if raw_sock is not None:
                 conn_state_by_sock_id[id(raw_sock)] = conn_state
         lookup_fut = _submit_lookup(peer_port, listen_port, conn_state)
-        prewait_s = min(0.01, max(0.0, collector_timeout_s * 0.05))
-        if prewait_s > 0.0:
-            with contextlib.suppress(Exception):
-                lookup_fut.result(timeout=prewait_s)
         with hook_lock:
             conn_ctx_by_tid[tid] = (
                 connection_id,

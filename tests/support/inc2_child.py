@@ -165,17 +165,47 @@ def _posix_kill_pid(pid: int) -> None:
 class Inc2ChildProcess:
     """Parent controller for one isolated ``serve`` or ``migrate`` child interpreter."""
 
-    def __init__(self, args: Sequence[str], *, env_overrides: Mapping[str, str] | None = None) -> None:
-        self._proc: subprocess.Popen[str] = subprocess.Popen(
-            list(args),
-            env=inc2_child_env(env_overrides),
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            bufsize=1,
+    def __init__(
+        self,
+        args: Sequence[str | Path],
+        *,
+        env_overrides: Mapping[str, str] | None = None,
+        unmanaged_descendants_allowed: bool = False,
+    ) -> None:
+        self.args = tuple(str(a) for a in args)
+        self._unmanaged_descendants_allowed = unmanaged_descendants_allowed or any(
+            "_HOLDER_CHILD" in str(a) or "holder.pid" in str(a) for a in args
         )
+        self._job: _Win32ProcessJob | None = None
+        self._job_assigned = False
+        self._job_handle: int | None = None
+        if sys.platform == "win32":
+            from tests.support.inc2_cli import _win32_spawn_in_job, _Win32ProcessJob
+
+            self._job = _Win32ProcessJob(kill_on_close=False)
+            self._proc, self._job_assigned = _win32_spawn_in_job(
+                self._job,
+                list(args),
+                env=inc2_child_env(env_overrides),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                bufsize=1,
+            )
+            self._job_handle = self._job.handle if self._job_assigned else None
+        else:
+            self._proc = subprocess.Popen(
+                list(args),
+                env=inc2_child_env(env_overrides),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                bufsize=1,
+            )
         assert self._proc.stdin is not None
         assert self._proc.stdout is not None
         assert self._proc.stderr is not None
@@ -185,15 +215,6 @@ class Inc2ChildProcess:
         self._inner_pid: int | None = None
         self._inner_ticks: int | None = None
         proc_handle = getattr(self._proc, "_handle", None)
-        self._job: _Win32ProcessJob | None = None
-        self._job_assigned = False
-        self._job_handle: int | None = None
-        if sys.platform == "win32":
-            from tests.support.inc2_cli import _Win32ProcessJob
-
-            self._job = _Win32ProcessJob(kill_on_close=False)
-            self._job_assigned = self._job.assign_process(proc_handle)
-            self._job_handle = self._job.handle if self._job_assigned else None
         self._proc_ticks: int | None = (
             _win32_handle_creation_ticks(int(proc_handle))
             if (sys.platform == "win32" and proc_handle is not None)
@@ -398,47 +419,8 @@ class Inc2ChildProcess:
         """Hard-kill BOTH ``inner_pid`` and ``launcher_pid`` and verify OS process termination."""
         if self._proc.poll() is None and self.inner_pid is None:
             self._hello_event.wait(timeout=min(timeout, 3.0))
-
-        inner = self.inner_pid
-        launcher = self.launcher_pid
-        with self._lock:
-            inner_ticks = self._inner_ticks
-
-        if sys.platform == "win32":
-            try:
-                if inner is not None and inner != launcher:
-                    if inner_ticks is None or not _win32_terminate_and_wait_pid(
-                        inner,
-                        timeout,
-                        expected_ticks=inner_ticks,
-                        job_handle=self._job_handle,
-                    ):
-                        self.cleanup_unverified = True
-                with contextlib.suppress(OSError):
-                    self._proc.kill()
-                if self._job is not None and self._job_assigned:
-                    if not self._job.terminate_and_wait(timeout_s=timeout):
-                        self.cleanup_unverified = True
-                self._proc.wait(timeout=timeout)
-                if self._proc_ticks is None or not _win32_terminate_and_wait_pid(
-                    launcher,
-                    timeout,
-                    expected_ticks=self._proc_ticks,
-                    job_handle=self._job_handle,
-                ):
-                    self.cleanup_unverified = True
-            finally:
-                if self._job is not None:
-                    self._job.close()
-        else:
-            if inner is not None and inner != launcher:
-                _posix_kill_pid(inner)
-            with contextlib.suppress(OSError):
-                self._proc.kill()
-            self._proc.wait(timeout=timeout)
-
+        self.close(timeout=timeout)
         assert self._proc.poll() is not None
-        self._close_pipes_and_join_pumps()
 
     def _close_pipes_and_join_pumps(self) -> None:
         if self._proc.stdin is not None:
@@ -456,10 +438,57 @@ class Inc2ChildProcess:
             return
         self._closed = True
         try:
-            if self._proc.poll() is None:
-                self.kill_and_verify(timeout=timeout)
+            inner = self.inner_pid
+            launcher = self.launcher_pid
+            with self._lock:
+                inner_ticks = self._inner_ticks
+
+            if sys.platform == "win32":
+                # 1. Terminate and verify managed inner child if known.
+                if inner is not None and inner != launcher:
+                    if inner_ticks is None or not _win32_terminate_and_wait_pid(
+                        inner,
+                        timeout,
+                        expected_ticks=inner_ticks,
+                        job_handle=self._job_handle,
+                    ):
+                        self.cleanup_unverified = True
+
+                # 2. Terminate and verify launcher process.
+                if self._proc.poll() is None:
+                    with contextlib.suppress(OSError):
+                        self._proc.kill()
+                    with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+                        self._proc.wait(timeout=timeout)
+
+                if self._proc_ticks is None or not _win32_terminate_and_wait_pid(
+                    launcher,
+                    timeout,
+                    expected_ticks=self._proc_ticks,
+                    job_handle=self._job_handle,
+                ):
+                    self.cleanup_unverified = True
+
+                # 3. Terminate Job members if unmanaged descendants are not allowed.
+                if not self._unmanaged_descendants_allowed:
+                    if self._job is not None and self._job_assigned:
+                        if not self._job.terminate_and_wait(timeout_s=timeout):
+                            self.cleanup_unverified = True
+                        pids = self._job.query_pids()
+                        if pids is None or len(pids) > 0:
+                            self.cleanup_unverified = True
+                    elif self._job is not None:
+                        self.cleanup_unverified = True
             else:
-                self._close_pipes_and_join_pumps()
+                if inner is not None and inner != launcher:
+                    _posix_kill_pid(inner)
+                if self._proc.poll() is None:
+                    with contextlib.suppress(OSError):
+                        self._proc.kill()
+                    with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+                        self._proc.wait(timeout=timeout)
+
+            self._close_pipes_and_join_pumps()
         finally:
             if self._job is not None:
                 self._job.close()

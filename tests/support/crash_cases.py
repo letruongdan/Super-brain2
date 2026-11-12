@@ -70,6 +70,7 @@ from tests.support.inc2_cli import (
     InstalledServeProcess,
     _win32_descendant_identities_checked,
     _win32_popen_creation_ticks,
+    _win32_spawn_in_job,
     _win32_wait_or_terminate_pid,
     _Win32ProcessJob,
     clean_installed_subprocess_env,
@@ -531,7 +532,9 @@ def run_marked(
     stopped and reported with ``timed_out=True``. No sleep orders anything: every step waits on the child's output.
     """
     extra = {"SUPERBRAIN_CRASHPOINT": crashpoint} if crashpoint is not None else None
-    proc = subprocess.Popen(
+    job: _Win32ProcessJob | None = _Win32ProcessJob(kill_on_close=True) if sys.platform == "win32" else None
+    proc, _job_assigned = _win32_spawn_in_job(
+        job,
         list(cmd),
         cwd=cwd,
         env=clean_installed_subprocess_env(extra),
@@ -544,9 +547,6 @@ def run_marked(
         creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if sys.platform == "win32" else 0,
         start_new_session=sys.platform != "win32",
     )
-    job: _Win32ProcessJob | None = _Win32ProcessJob(kill_on_close=True) if sys.platform == "win32" else None
-    if job is not None:
-        job.assign_process(getattr(proc, "_handle", None))
     assert proc.stdout is not None and proc.stderr is not None
     stderr_lines: queue.Queue[str | None] = queue.Queue()
     stdout_box: list[str] = []
