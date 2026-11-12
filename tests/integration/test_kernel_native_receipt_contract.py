@@ -52,6 +52,9 @@ from tests.support.inc2_native import (
     TimespanRecord,
     encode_native_probe,
     parse_native_probe,
+    parse_owner_events_jsonl,
+    parse_owner_ready,
+    parse_socket_observations_jsonl,
     verify_native_connection,
 )
 from tests.support.inc2_native_owner import (
@@ -59,6 +62,7 @@ from tests.support.inc2_native_owner import (
     load_owner_observations,
     process_started_at_for_pid,
     spawn_observed_wheel_owner,
+    utc_now_z,
     verify_same_daemon,
 )
 from tests.support.inc2_transport import clone_owner_only_tree, make_trusted_test_dir, register_workspace_direct
@@ -819,7 +823,7 @@ def test_native_probe_reason_and_secret_redaction(trusted_tmp: Path) -> None:
 
 
 def _utc_now_z() -> str:
-    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    return utc_now_z()
 
 
 def _extract_mcp_structured(resp_frame: Mapping[str, JsonValue]) -> tuple[bool, dict[str, JsonValue]]:
@@ -880,12 +884,34 @@ def _build_wheel_probe_and_obs(
     host_proc = ProcessIdentity(pid=os.getpid(), started_at=process_started_at_for_pid(os.getpid()))
 
     deadline = time.monotonic() + 2.0
+    owner_ready_bytes = b""
+    owner_events_bytes = b""
+    sock_obs_bytes = b""
     owner_events: tuple[OwnerCallObservation, ...] = ()
     sock_events: tuple[SocketObservation, ...] = ()
     matching_owner: list[OwnerCallObservation] = []
     matching_sock: list[SocketObservation] = []
+    ready_file = owner_evidence_dir / "owner-ready.json"
+    events_file = owner_evidence_dir / "owner-events.jsonl"
+    sock_file = owner_evidence_dir / "socket-observations.jsonl"
     while True:
-        _, owner_events, sock_events = load_owner_observations(owner_evidence_dir)
+        try:
+            cand_ready = ready_file.read_bytes()
+            parse_owner_ready(cand_ready)
+            cand_events = events_file.read_bytes() if events_file.is_file() else b""
+            cand_socks = sock_file.read_bytes() if sock_file.is_file() else b""
+            cand_owner = parse_owner_events_jsonl(cand_events)
+            cand_sock_obs = parse_socket_observations_jsonl(cand_socks)
+        except (OSError, ProbeValidationError):
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.02)
+            continue
+        owner_ready_bytes = cand_ready
+        owner_events_bytes = cand_events
+        sock_obs_bytes = cand_socks
+        owner_events = cand_owner
+        sock_events = cand_sock_obs
         matching_owner = [
             ev for ev in owner_events if ev.tool_name == tool_name and ev.response_digest == resp_digest
         ]
@@ -917,9 +943,6 @@ def _build_wheel_probe_and_obs(
     host_calls_path = art_dir / "host-calls.jsonl"
     evidence_index_path = art_dir / "evidence-index.json"
 
-    owner_ready_bytes = (owner_evidence_dir / "owner-ready.json").read_bytes()
-    owner_events_bytes = (owner_evidence_dir / "owner-events.jsonl").read_bytes()
-    sock_obs_bytes = (owner_evidence_dir / "socket-observations.jsonl").read_bytes()
     owner_ready_copy.write_bytes(owner_ready_bytes)
     owner_events_copy.write_bytes(owner_events_bytes)
     sock_obs_copy.write_bytes(sock_obs_bytes)
@@ -3621,4 +3644,164 @@ def test_t9_r07_slow_collector_off_deadline_and_concurrent_calls(
         owner_events=(replace(oc, observation_status="observation_incomplete"),),
     )
     assert verify_native_connection(probe, registration=reg, observations=obs_inc) is False
+
+
+def test_utc_now_z_aligned_with_process_creation_clock_and_sub_millisecond_progression() -> None:
+    """UTC wall clock matches OS process-start resolution so fast child calls never invert or collide."""
+    from tests.support import inc2_native_owner
+
+    utc_now_fn = inc2_native_owner.utc_now_z
+    for _ in range(8):
+        t_before = utc_now_fn()
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(0.005)"])
+        try:
+            started = process_started_at_for_pid(proc.pid)
+            t_after = utc_now_fn()
+        finally:
+            proc.wait(timeout=5)
+        assert t_before <= started <= t_after, (
+            f"Clock skew between utc_now_z and process_started_at_for_pid: {t_before} <= {started} <= {t_after}"
+        )
+
+
+def test_wheel_probe_builder_avoids_toctou_when_owner_jsonl_grows_mid_build(
+    inc2_installed_env: InstalledEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """_build_wheel_probe_and_obs parses from the exact byte snapshot written into artifacts and evidence-index."""
+    tpl = get_shared_t7_transport_template()
+    case_dir = make_trusted_test_dir("inc2-t9-toctou")
+    try:
+        outside_cwd = case_dir / "outside-cwd"
+        chk_a = case_dir / "workspaces" / "repo-a"
+        outside_cwd.mkdir(parents=True, exist_ok=True)
+        chk_a.mkdir(parents=True, exist_ok=True)
+        os_adapters().permissions.secure_directory(outside_cwd)
+        os_adapters().permissions.secure_directory(chk_a)
+        data_root = case_dir / "data"
+        clone_owner_only_tree(tpl.root, data_root)
+        os_adapters().permissions.secure_directory(data_root)
+        adapters = os_adapters()
+        clock = FakeClock(datetime.now(UTC))
+        rt = open_kernel_job_runtime(data_root, adapters)
+        try:
+            cred = seed_principal_and_credential(rt.policy, owner_id="dan", harness_id="claude-code", machine_id="m-1")
+            ws_a = register_workspace_direct(
+                rt,
+                clock,
+                cred.principal,
+                alias="ws-t9-toctou",
+                checkout_dir=chk_a,
+                remote="https://github.example/dan/repo-toctou.git",
+            )
+            rt.store.reconcile_policy()
+        finally:
+            rt.close()
+        cred_file = write_credential_file(case_dir / "cred.txt", cred.token)
+        ep_path = data_root / "endpoint.json"
+        schema_copy = case_dir / "mcp-tools-v2.json"
+        schema_copy.write_bytes(inc2_installed_env.source_schema_path.read_bytes())
+        cfg_path = write_daemon_config_file(
+            case_dir / "daemon-config.json",
+            data_root=data_root,
+            expected_store_id=tpl.store_id,
+            cert_path=tpl.tls.cert_path,
+            key_path=tpl.tls.key_path,
+        )
+        prof_path, _ = write_client_profile_file(
+            case_dir / "profile-a.json",
+            endpoint_path=ep_path,
+            expected_store_id=tpl.store_id,
+            ca_file=tpl.tls.ca_cert_path,
+            leaf_cert_sha256=tpl.tls.leaf_cert_sha256,
+            credential_file=cred_file,
+            workspace={
+                "alias": ws_a.alias,
+                "checkout_path": str(chk_a),
+                "expected_workspace_id": ws_a.repo_id,
+                "expected_checkout_id": ws_a.checkout_id,
+            },
+        )
+        ev_dir = case_dir / "owner-ev"
+        with spawn_observed_wheel_owner(inc2_installed_env, cfg_path, ev_dir, cwd=outside_cwd) as owner:
+            with InstalledMcpPipeSession(
+                inc2_installed_env, "brain", ("mcp", "--profile", str(prof_path)), cwd=chk_a
+            ) as sess:
+                sess.send_frames_and_expect_response(mcp_init_frames(1))
+                st = _utc_now_z()
+                resp = sess.send_frames_and_expect_response(
+                    [
+                        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+                        mcp_call_frame(2, "get_health", {"schema_version": "2.0"}),
+                    ]
+                )
+                en = _utc_now_z()
+                is_err, sc_health = _extract_mcp_structured(resp)
+                assert is_err is False and cast(dict[str, Any], sc_health["data"])["ready"] is True
+                la_pid = sess._proc.pid
+                desc = sess._snapshot_descendants()
+                wk_pid = desc[-1] if desc else la_pid
+                la_proc = ProcessIdentity(pid=la_pid, started_at=process_started_at_for_pid(la_pid))
+                wk_proc = (
+                    la_proc
+                    if wk_pid == la_pid
+                    else ProcessIdentity(pid=wk_pid, started_at=process_started_at_for_pid(wk_pid))
+                )
+                rc, err = sess.finish()
+                assert rc == 0 and err == b""
+
+            # Wait until owner events settle, then inject a simulated concurrent append between poll parse & copy.
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                _, oc_rows, so_rows = load_owner_observations(ev_dir)
+                if oc_rows and so_rows:
+                    break
+                time.sleep(0.02)
+
+            appended_once = False
+            ev_path = ev_dir / "owner-events.jsonl"
+            so_path = ev_dir / "socket-observations.jsonl"
+            orig_mkdir = Path.mkdir
+
+            def _append_concurrent_event(self: Path, *args: Any, **kwargs: Any) -> None:
+                nonlocal appended_once
+                orig_mkdir(self, *args, **kwargs)
+                if not appended_once and self.name == "artifacts-call-toctou":
+                    appended_once = True
+                    first_oc = json.loads(ev_path.read_text(encoding="utf-8").splitlines()[0])
+                    first_oc["connection_id"] = "conn-concurrent-extra"
+                    first_oc["started_at"] = "2026-11-12T04:00:00.000000Z"
+                    first_oc["ended_at"] = "2026-11-12T04:00:00.001000Z"
+                    with ev_path.open("ab") as fh:
+                        fh.write(canonical_json(first_oc) + b"\n")
+                    first_so = json.loads(so_path.read_text(encoding="utf-8").splitlines()[0])
+                    first_so["connection_id"] = "conn-concurrent-extra"
+                    with so_path.open("ab") as fh:
+                        fh.write(canonical_json(first_so) + b"\n")
+
+            monkeypatch.setattr(Path, "mkdir", _append_concurrent_event)
+            probe, reg, obs = _build_wheel_probe_and_obs(
+                env=inc2_installed_env,
+                owner=owner,
+                evidence_root=case_dir,
+                owner_evidence_dir=ev_dir,
+                config_path=cfg_path,
+                profile_path=prof_path,
+                schema_copy_path=schema_copy,
+                task_id="task-toctou",
+                call_id="call-toctou",
+                host="claude-code",
+                credential_id=cred.credential_id,
+                principal_id=cred.principal.principal_id,
+                tool_name="get_health",
+                response_envelope=sc_health,
+                launcher_proc=la_proc,
+                worker_proc=wk_proc,
+                started_at=st,
+                ended_at=en,
+            )
+            assert appended_once is True
+            assert verify_native_connection(probe, registration=reg, observations=obs, require_native=False) is True
+    finally:
+        shutil.rmtree(case_dir, ignore_errors=True)
+
 

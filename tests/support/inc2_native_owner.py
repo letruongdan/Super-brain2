@@ -45,6 +45,7 @@ __all__ = [
     "process_started_at_for_pid",
     "run_observed_owner",
     "spawn_observed_wheel_owner",
+    "utc_now_z",
     "verify_same_daemon",
 ]
 
@@ -61,8 +62,35 @@ class ObservedWheelOwner:
     evidence_dir: Path
 
 
-def _utc_now_z() -> str:
+_WIN32_PRECISE_UTC_FN: Any = None
+_WIN32_PRECISE_UTC_LOOKED_UP = False
+
+
+def utc_now_z() -> str:
+    """Return canonical UTC RFC3339 timestamp with sub-millisecond OS kernel precision on Windows."""
+    if sys.platform == "win32":
+        global _WIN32_PRECISE_UTC_FN, _WIN32_PRECISE_UTC_LOOKED_UP
+        import ctypes
+        from ctypes import wintypes
+
+        if not _WIN32_PRECISE_UTC_LOOKED_UP:
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            fn = getattr(kernel32, "GetSystemTimePreciseAsFileTime", None)
+            if fn is not None:
+                fn.argtypes = [ctypes.POINTER(wintypes.FILETIME)]
+                fn.restype = None
+            _WIN32_PRECISE_UTC_FN = fn
+            _WIN32_PRECISE_UTC_LOOKED_UP = True
+        if _WIN32_PRECISE_UTC_FN is not None:
+            ft = wintypes.FILETIME()
+            _WIN32_PRECISE_UTC_FN(ctypes.byref(ft))
+            ticks_100ns = (int(ft.dwHighDateTime) << 32) | int(ft.dwLowDateTime)
+            dt = datetime(1601, 1, 1, tzinfo=UTC) + timedelta(microseconds=ticks_100ns // 10)
+            return dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+_utc_now_z = utc_now_z
 
 
 def process_started_at_for_pid(pid: int) -> str:
