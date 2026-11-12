@@ -206,6 +206,31 @@ def _gate_open(pattern: re.Pattern[str], text: str, lowered: str | None) -> bool
     return pairs is None or any(pair in text for pair in pairs)
 
 
+def _edge_units(component: str, edge: str, reverse: bool) -> int:
+    """Upper bound of ``edge`` characters a match of ``component`` needs at that end: literals in ``edge``, ``?`` and
+    ``[...]`` classes count one each; ``*`` counts none (it can match nothing) and the count goes on past it."""
+    units = 0
+    i = len(component) - 1 if reverse else 0
+    step = -1 if reverse else 1
+    while 0 <= i < len(component):
+        ch = component[i]
+        if ch == "*":
+            i += step
+            continue
+        if ch == "]" if reverse else ch == "[":
+            close = component.rfind("[", 0, i) if reverse else component.find("]", i + 2)
+            if close < 0:
+                break
+            units += 1
+            i = close + step
+            continue
+        if ch != "?" and ch not in edge:
+            break
+        units += 1
+        i += step
+    return units
+
+
 class _PathMatcher:
     """Component-boundary matcher for blocked path patterns (``name``, ``dir/`` and ``a/b`` chains)."""
 
@@ -222,6 +247,10 @@ class _PathMatcher:
         self._names = re.compile("|".join(f"(?:{n})" for n in names)) if names else None
         self._results: dict[str, bool] = {}
         self._needles = _path_needles(patterns)
+        components = [part for pattern in patterns for part in blocked_path_components(pattern)]
+        # Wrapper characters a token may need to keep at each end for some pattern to match (bounded, usually 0).
+        self.keep_lead = max((_edge_units(part, _PATH_LEAD, False) for part in components), default=0)
+        self.keep_trail = max((_edge_units(part, _PATH_TRAIL, True) for part in components), default=0)
 
     def blocked(self, token: str) -> bool:
         cached = self._results.get(token)

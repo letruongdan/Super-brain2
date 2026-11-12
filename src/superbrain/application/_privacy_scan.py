@@ -179,14 +179,18 @@ class _TextScans:
         token = match.group(0)
         core = token.lstrip(_PATH_LEAD)
         lead = len(token) - len(core)
-        core = core.rstrip(_PATH_TRAIL)
-        if not core or not self._paths.blocked(core):
-            if self._paths.blocked(token):
-                self.redacted += 1
-                return REDACTED
-            return token
-        self.redacted += 1
-        return token[:lead] + REDACTED + token[lead + len(core) :]
+        trail = len(core) - len(core.rstrip(_PATH_TRAIL))
+        # Shortest piece first, so wrapper punctuation that is not part of the blocked spelling stays.
+        for keep_lead in range(min(lead, self._paths.keep_lead) + 1):
+            for keep_trail in range(min(trail, self._paths.keep_trail) + 1):
+                start, end = lead - keep_lead, len(token) - trail + keep_trail
+                if start < end and self._paths.blocked(token[start:end]):
+                    self.redacted += 1
+                    return token[:start] + REDACTED + token[end:]
+        if (lead or trail) and self._paths.blocked(token):  # the whole spelling, wrappers included
+            self.redacted += 1
+            return REDACTED
+        return token
 
     def redact(self, text: str, *, entropy: bool = True) -> str:
         self.tick()
