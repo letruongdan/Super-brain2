@@ -349,8 +349,6 @@ class _PathMatcher:
             return next((hit for g in self._name_globs if (hit := g.single(low, lead, trail)) is not None), None)
         first, last = segs[0], segs[-1]
         mid = [part for part in segs[1:-1] if part and part != "."]
-        if self._matches_parts(mid):
-            return lead, trail
         for g in self._name_globs:
             if (p := g.first_edge(first, lead)) is not None:
                 return p, trail
