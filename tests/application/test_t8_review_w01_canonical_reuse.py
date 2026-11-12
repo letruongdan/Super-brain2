@@ -177,8 +177,8 @@ def test_w01_call_context_refuses_a_canonical_payload_that_is_not_non_empty_byte
 def test_w01_call_context_hides_the_canonical_payload_and_ignores_it_in_equality() -> None:
     secret = b'{"arguments":{"description":"w01-hidden-marker"}}'
     with_bytes = _ctx(canonical_payload=secret)
-    assert with_bytes.canonical_payload == secret  # type: ignore[attr-defined]
-    assert _ctx().canonical_payload is None  # type: ignore[attr-defined]
+    assert with_bytes.canonical_payload == secret
+    assert _ctx().canonical_payload is None
     assert "w01-hidden-marker" not in repr(with_bytes) and "canonical_payload" not in repr(with_bytes)
     assert with_bytes == _ctx() == _ctx(canonical_payload=b"{}")
 
@@ -236,7 +236,7 @@ def test_w01_dispatch_reuses_context_bytes_without_serializing_again(
             ),
             deadline_ns=harness._mono.monotonic_ns() + TOTAL_REQUEST_BUDGET_NS,
             selected_scope=harness.scope,
-            canonical_payload=canonical,  # type: ignore[call-arg]
+            canonical_payload=canonical,
         )
         return harness.bridge.dispatch(call, ctx, auth=auth)
 
