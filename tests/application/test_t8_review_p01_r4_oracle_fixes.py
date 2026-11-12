@@ -89,8 +89,9 @@ def test_p01_r4_match_all_pattern_exact_output() -> None:
     for suffix in _SUFFIXES:
         safe = PrivacyFilter().apply(["see `**` now" + suffix], _policy(("**",)))
         forms, count = _reference("see `**` now" + suffix, ("**",))
+        # Any one blocked spelling may be replaced (ruling 2026-11-12), so "`**`" may keep wrappers around it.
         assert isinstance(safe.value, list) and safe.value[0] in forms
-        assert "**" not in str(safe.value[0]) and str(safe.value[0]).startswith(f"{REDACTED} ")
+        assert str(safe.value[0]).startswith(f"{REDACTED} ") and str(safe.value[0]).count(REDACTED) == count
         assert safe.redacted_count == count == 3 + bool(suffix)
 
 
