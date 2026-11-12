@@ -303,11 +303,9 @@ class _Glob:
         n, h, t = len(seg), self.h, self.t
         if not self.star:
             low, high = max(0, n - h - trail), min(lead, n - h)
-            while (p := self._head_at(seg, low, high)) is not None:
-                if self._kept(seg[p : p + h]):
-                    return p, n - h - p
-                low = p + 1  # only a lone "." piece is dropped; the next fit is a different character
-            return None
+            # A lone "." can only sit at the end of the leading run, so no later start is left to try.
+            p = self._head_at(seg, low, high)
+            return (p, n - h - p) if p is not None and self._kept(seg[p : p + h]) else None
         p = self._head_at(seg, 0, min(lead, n - h - t))
         if p is None:
             return None
