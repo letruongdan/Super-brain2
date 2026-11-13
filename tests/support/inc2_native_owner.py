@@ -209,6 +209,63 @@ def _parse_lsof_client_pid(output: str, *, client_port: int, listen_port: int) -
     return None
 
 
+# xnu bsd/sys/proc_info.h: struct socket_fdinfo = proc_fileinfo (24) + socket_info; offsets below are into it.
+_PROC_ALL_PIDS = 1
+_PROC_PIDLISTFDS = 1
+_PROX_FDTYPE_SOCKET = 2
+_PROC_PIDFDSOCKETINFO = 3
+_SOCKET_FDINFO_SIZE = 792
+_SOI_FAMILY_OFF = 24 + 160
+_SOI_KIND_OFF = 24 + 232
+_INSI_OFF = 24 + 240  # union soi_proto: in_sockinfo (SOCKINFO_IN=1) or tcp_sockinfo starting with it (SOCKINFO_TCP=2)
+
+
+def _parse_socket_fdinfo(buf: bytes) -> tuple[str, int, str, int] | None:
+    """``(local_addr, local_port, remote_addr, remote_port)`` of an IPv4 TCP/IN ``socket_fdinfo``, else ``None``."""
+    if len(buf) < _INSI_OFF + 64:
+        return None
+    family = struct.unpack_from("<i", buf, _SOI_FAMILY_OFF)[0]
+    kind = struct.unpack_from("<i", buf, _SOI_KIND_OFF)[0]
+    if family != socket.AF_INET or kind not in (1, 2):
+        return None
+    fport, lport = struct.unpack_from("<ii", buf, _INSI_OFF)
+    faddr = socket.inet_ntoa(buf[_INSI_OFF + 32 + 12 : _INSI_OFF + 32 + 16])  # in4in6_addr: 3 pad words, then v4
+    laddr = socket.inet_ntoa(buf[_INSI_OFF + 48 + 12 : _INSI_OFF + 48 + 16])
+    return laddr, socket.ntohs(lport & 0xFFFF), faddr, socket.ntohs(fport & 0xFFFF)
+
+
+def _libproc_client_pid(client_port: int, listen_port: int) -> int | None:
+    """PID holding ``127.0.0.1:client_port -> 127.0.0.1:listen_port`` via libproc; ``None`` if absent/unavailable."""
+    import ctypes
+
+    try:
+        lib = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+    except OSError:
+        return None
+    want = ("127.0.0.1", client_port, "127.0.0.1", listen_port)
+    count = lib.proc_listpids(_PROC_ALL_PIDS, 0, None, 0)
+    if count <= 0:
+        return None
+    pids = (ctypes.c_int * (count // 4 + 64))()
+    got = lib.proc_listpids(_PROC_ALL_PIDS, 0, pids, ctypes.sizeof(pids))
+    for pid in pids[: max(0, got) // 4]:
+        if pid <= 0:
+            continue
+        size = lib.proc_pidinfo(pid, _PROC_PIDLISTFDS, 0, None, 0)
+        if size <= 0:
+            continue
+        fds = (ctypes.c_int32 * (size // 4 + 64))()  # struct proc_fdinfo {int32 proc_fd; uint32 proc_fdtype;}
+        used = lib.proc_pidinfo(pid, _PROC_PIDLISTFDS, 0, fds, ctypes.sizeof(fds))
+        for i in range(0, max(0, used) // 4 - 1, 2):
+            if fds[i + 1] != _PROX_FDTYPE_SOCKET:
+                continue
+            info = ctypes.create_string_buffer(_SOCKET_FDINFO_SIZE + 256)
+            n = lib.proc_pidfdinfo(pid, fds[i], _PROC_PIDFDSOCKETINFO, info, ctypes.sizeof(info))
+            if n > 0 and _parse_socket_fdinfo(info.raw[:n]) == want:
+                return int(pid)
+    return None
+
+
 def _lookup_loopback_client_pid(
     client_port: int,
     listen_port: int,
@@ -254,6 +311,10 @@ def _lookup_loopback_client_pid(
                     return pid
         return None
     if sys.platform == "darwin":
+        # lsof (fork+exec, tens of ms) loses short-lived loopback connections; the libproc kernel query does not.
+        pid = _libproc_client_pid(client_port, listen_port)
+        if pid is not None:
+            return pid
         try:
             proc = subprocess.run(
                 ["lsof", "-nP", "-F", "pn", f"-iTCP@127.0.0.1:{client_port}"],
