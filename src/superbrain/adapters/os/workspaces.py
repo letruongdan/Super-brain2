@@ -13,6 +13,7 @@ import os
 import re
 import stat
 import sys
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 from urllib.parse import urlsplit
@@ -140,6 +141,19 @@ def _is_absolute(raw: str) -> bool:
     return raw.startswith("/")
 
 
+def _fold(name: str) -> str:
+    """Name key under case- and normalization-insensitive comparison (APFS keeps bytes, compares folded)."""
+    return unicodedata.normalize("NFD", unicodedata.normalize("NFD", name).casefold())
+
+
+def _same_real_entry(entry: Path, target: Path) -> bool:
+    """``entry`` is a non-link directory entry for the same object as ``target`` (a link never names a component)."""
+    try:
+        return not stat.S_ISLNK(os.lstat(entry).st_mode) and os.path.samefile(entry, target)
+    except OSError:
+        return False
+
+
 def _on_disk_spelling(resolved: str) -> str:
     """Spell each component as its parent lists it: one identity on case-insensitive POSIX file systems (APFS)."""
     parts = Path(resolved).parts
@@ -150,8 +164,8 @@ def _on_disk_spelling(resolved: str) -> str:
         except OSError:
             entries = [name]  # unlistable ancestor: keep the resolved spelling (exact on case-sensitive systems)
         if name not in entries:
-            folded = name.casefold()
-            same = [e for e in entries if e.casefold() == folded and os.path.samefile(current / e, current / name)]
+            key = _fold(name)
+            same = [e for e in entries if _fold(e) == key and _same_real_entry(current / e, current / name)]
             if len(same) == 1:
                 name = same[0]
         current = current / name
