@@ -49,7 +49,7 @@ def _block(content: str) -> str:
 def _best(fn: Callable[[], object]) -> tuple[object, float]:
     best = float("inf")
     result: object = None
-    for _ in range(3):
+    for _ in range(5):  # best of 5: the gate runs 4 shards in parallel
         start = time.perf_counter()
         result = fn()
         best = min(best, time.perf_counter() - start)
@@ -124,7 +124,12 @@ def test_w02_unclosed_64_kib_block_is_refused_quickly(unit: str) -> None:
     assert _old(text) is None
     result, best = _best(lambda: _filter_all([text]))
     assert result is ErrorCode.INVALID_INPUT
-    assert best <= 2 * PLAN_BUDGET_PER_MIB_S / 16, f"refusal of one unclosed 64 KiB block took {best * 1000:.1f} ms"
+    plain = text.replace("<private>", "[private]")
+    _plain_result, without = _best(lambda: _filter_all([plain]))
+    # Twice the plan budget for 64 KiB, or twice the same text without the marker when the host is loaded (the gate
+    # runs 4 shards in parallel): contention slows both alike, a per-character scan only the refusal.
+    limit = max(2 * PLAN_BUDGET_PER_MIB_S / 16, 2 * without)
+    assert best <= limit, f"unclosed 64 KiB refusal took {best * 1000:.1f} ms (limit {limit * 1000:.1f} ms)"
 
 
 def test_w02_private_blocks_cost_about_the_same_as_the_same_text_without_markers() -> None:
