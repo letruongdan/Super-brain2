@@ -237,7 +237,8 @@ def _parse_lsof_client_pid(output: str, *, client_port: int, listen_port: int) -
 
 
 # xnu bsd/sys/proc_info.h: struct socket_fdinfo = proc_fileinfo (24) + socket_info; offsets below are into it.
-_PROC_UID_ONLY = 4  # only this user's processes: other users' fd tables are unreadable anyway
+_PROC_ALL_PIDS = 1
+_PROC_UID_ONLY = 4  # a non-root process can read only fd tables of its own effective uid (xnu CHECK_SAME_USER)
 _PROC_PIDLISTFDS = 1
 _PROX_FDTYPE_SOCKET = 2
 _PROC_PIDFDSOCKETINFO = 3
@@ -301,12 +302,13 @@ def _libproc_client_holders(client_port: int, listen_port: int) -> set[int] | No
         return None
     want = ("127.0.0.1", client_port, "127.0.0.1", listen_port)
     found: set[int] = set()
-    uid = int(getattr(os, "getuid", lambda: 0)())  # POSIX only; the any-OS fake ignores it
-    count = lib.proc_listpids(_PROC_UID_ONLY, uid, None, 0)
+    euid = int(getattr(os, "geteuid", lambda: 0)())  # POSIX only
+    list_kind, list_arg = (_PROC_UID_ONLY, euid) if euid else (_PROC_ALL_PIDS, 0)  # root reads every fd table
+    count = lib.proc_listpids(list_kind, list_arg, None, 0)
     if count <= 0:
         return None
     pids = (ctypes.c_int * (count // 4 + 64))()
-    got = lib.proc_listpids(_PROC_UID_ONLY, uid, pids, ctypes.sizeof(pids))
+    got = lib.proc_listpids(list_kind, list_arg, pids, ctypes.sizeof(pids))
     for pid in sorted(pids[: max(0, got) // 4], reverse=True):  # newest first: clients are recent processes
         if pid <= 0:
             continue

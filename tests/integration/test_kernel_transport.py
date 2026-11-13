@@ -1092,7 +1092,7 @@ class TestTransportLifecycleAndRelease:
             finally:
                 shutil.rmtree(case_dir_b, ignore_errors=True)
 
-            # (c) finish(stop_deadline) with 5 held workers returns False at the cutoff, without waiting for them
+            # (c) finish(stop_deadline) with 5 held workers returns False within 60 ms of the cutoff, not waiting
             with open_test_loopback_transport(transport_template, name="finish-held-workers") as h_held:
                 all_entered = threading.Event()
                 hold = threading.Event()
@@ -1131,17 +1131,16 @@ class TestTransportLifecycleAndRelease:
                         grace_c = 0.03
                         dl_c = time.perf_counter() + grace_c
                         h_held.server.quiesce(dl_c)
-                        t_fin_start = time.perf_counter()
                         fin_ok = h_held.server.finish(dl_c)
-                        fin_elapsed = time.perf_counter() - t_fin_start
+                        past_cutoff = time.perf_counter() - dl_c
                         with h_held.server._lock:
                             still_held = [w for w in h_held.server._workers.values() if w.is_alive()]
                         assert fin_ok is False, "Expected finish() to return False when workers are held past cutoff"
-                        # finish() must return at the cutoff rather than wait for the held workers: they are all still
-                        # held when it returns. The time bound only separates the 0.03 s cutoff from the 2 s hold; a
-                        # fixed 60 ms margin past the cutoff measured CI timer/scheduler slack (macOS: 63-74 ms).
+                        # I2-T6B-R02: finish() joins only within the remaining time of the same cutoff, with no extra
+                        # grace, so it returns at most 60 ms after the cutoff instant and every held worker is still
+                        # held when it does.
                         assert len(still_held) == 5 and not hold.is_set(), "finish() waited for held workers"
-                        assert fin_elapsed < 1.0, f"finish() with 5 held workers took {fin_elapsed:.4f}s"
+                        assert past_cutoff <= 0.06, f"finish() returned {past_cutoff:.4f}s after the cutoff (> 0.06s)"
                     finally:
                         hold.set()
                         for s in held_socks:

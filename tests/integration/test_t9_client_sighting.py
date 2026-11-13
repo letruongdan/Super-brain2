@@ -13,6 +13,7 @@ from __future__ import annotations
 import ctypes
 import os
 import queue
+import subprocess
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -151,8 +152,47 @@ def test_lookup_without_a_sighting_keeps_the_closing_rule(
     assert safe(CLIENT_PORT, LISTEN_PORT, conn) == (None, None, None, None)
 
 
-def test_libproc_lists_only_this_users_processes(hooks: tuple[Any, Any, Any]) -> None:
+@pytest.mark.parametrize(("euid", "listing"), [(501, (4, 501)), (0, (1, 0))], ids=["user", "root"])
+def test_libproc_lists_by_effective_uid_and_everything_as_root(
+    hooks: tuple[Any, Any, Any], monkeypatch: pytest.MonkeyPatch, euid: int, listing: tuple[int, int]
+) -> None:
+    # The fd tables a lookup can read are those of the effective uid: PROC_UID_ONLY (4) for it, or every process
+    # (PROC_ALL_PIDS = 1) when root, which reads all fd tables -- a uid-only listing would then hide holders from
+    # the uniqueness check. The real uid is never what decides it.
     safe, _mark_closing, fake = hooks
+    monkeypatch.setattr(os, "geteuid", lambda: euid, raising=False)
+    monkeypatch.setattr(os, "getuid", lambda: 777, raising=False)
     assert safe(CLIENT_PORT, LISTEN_PORT, _conn_state())[0] == HOLDER
-    uid = int(getattr(os, "getuid", lambda: 0)())
-    assert fake.listings and all(listing == (4, uid) for listing in fake.listings), fake.listings  # PROC_UID_ONLY
+    assert fake.listings and all(seen == listing for seen in fake.listings), fake.listings
+
+
+def test_a_sighting_from_an_earlier_lookup_never_carries_over(
+    hooks: tuple[Any, Any, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    safe, mark_closing, fake = hooks
+    later_conn = _conn_state()  # started before the first sighting, so a stale sighting would pass its start check
+    _next_tick()
+    first = safe(CLIENT_PORT, LISTEN_PORT, _conn_state())
+    assert first[0] == HOLDER and first[3] is not None
+    _next_tick()
+
+    # Second lookup on the same thread: libproc sees no holder at all.
+    fake.table[HOLDER] = []
+    lsof_out: list[str] = [""]
+
+    def run(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(cmd, 0, stdout=lsof_out[0], stderr="")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    assert safe(CLIENT_PORT, LISTEN_PORT, later_conn) == (None, None, None, None), "no holder, no binding"
+
+    # lsof (which records no sighting) names the holder, but the connection began closing during that lookup:
+    # only a sighting made by this lookup could keep the binding, so it is rejected under the closing rule.
+    lsof_out[0] = f"p{HOLDER}\nf3\nn127.0.0.1:{CLIENT_PORT}->127.0.0.1:{LISTEN_PORT}\n"
+
+    def closing_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        mark_closing(later_conn)
+        return run(cmd, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", closing_run)
+    assert safe(CLIENT_PORT, LISTEN_PORT, later_conn) == (None, None, None, None), "a stale sighting leaked"
