@@ -28,8 +28,10 @@ from superbrain.application._privacy_rules import (
 _PRIVATE_WORD = "[pP][rR][iI][vV][aA][tT][eE]"
 _PRIVATE_START = rf"<\s*(?:/\s*)?{_PRIVATE_WORD}"
 _PRIVATE_MARK = re.compile(_PRIVATE_START)
+# Block body: runs of non-``<`` text and ``<`` that does not start a marker (unrolled, so each character is
+# consumed once). It stops right before the first marker start, which must then be a closing marker.
 _PRIVATE_BLOCK = re.compile(
-    rf"<\s*{_PRIVATE_WORD}\s*>(?:(?!{_PRIVATE_START}).)*?<\s*/\s*{_PRIVATE_WORD}\s*>", re.DOTALL
+    rf"<\s*{_PRIVATE_WORD}\s*>[^<]*(?:<(?!\s*(?:/\s*)?{_PRIVATE_WORD})[^<]*)*<\s*/\s*{_PRIVATE_WORD}\s*>"
 )
 
 
