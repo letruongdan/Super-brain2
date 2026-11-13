@@ -444,8 +444,9 @@ def test_physical_identity_uses_real_filesystem_identity(trusted_tmp: Path) -> N
         _winapi.CreateJunction(str(real), str(link))
     else:
         lower = trusted_tmp / "repocase"
-        lower.mkdir()  # a distinct directory on a case-sensitive file system
-        assert physical_checkout(str(lower)).path_identity != base.path_identity
+        lower.mkdir(exist_ok=True)
+        same_directory = lower.samefile(real)
+        assert (physical_checkout(str(lower)).path_identity == base.path_identity) == same_directory
         link.symlink_to(real, target_is_directory=True)
     linked = physical_checkout(str(link))
     assert linked.path_identity == base.path_identity

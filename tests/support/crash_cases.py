@@ -906,7 +906,9 @@ def seed_legacy_pair(ctx: KernelCrashContext) -> KernelSeed:
         blocked = rt.store.store_content(b"t8-legacy-quarantined", "evidence", new_id(), RetentionClass.DURABLE, None)
         rt.policy.record_intent(IntentKind.QUARANTINE, {"digest": blocked})
         assert rt.store.reconcile_policy() == 1
-        seed_principal_and_credential(rt.policy, owner_id="dan", harness_id="claude-code", machine_id="m-1")
+        credential = seed_principal_and_credential(
+            rt.policy, owner_id="dan", harness_id="claude-code", machine_id="m-1"
+        )
         store_id, generation = rt.store.store_id, rt.policy.trust_generation()
     finally:
         rt.close()
@@ -926,6 +928,15 @@ def seed_legacy_pair(ctx: KernelCrashContext) -> KernelSeed:
         expected_store_id=store_id,
         cert_path=tls.cert_path,
         key_path=tls.key_path,
+    )
+    credential_file = write_credential_file(ctx.case_dir / "client" / "legacy-credential.txt", credential.token)
+    write_client_profile_file(
+        ctx.case_dir / "client" / "legacy-health-profile.json",
+        endpoint_path=DataRoot.at(data_root).endpoint_path,
+        expected_store_id=store_id,
+        ca_file=tls.ca_cert_path,
+        leaf_cert_sha256=tls.leaf_cert_sha256,
+        credential_file=credential_file,
     )
     assert schema_versions(data_root) == (2, 2)
     snapshot = pair_rows(data_root, ctx.case_dir / "ro-scratch")
@@ -1071,11 +1082,20 @@ def expect_crash_after_policy_swap(ctx: KernelCrashContext, seed: KernelSeed, ru
     assert repeat["store"] == {"status": "skipped", "from_version": 4, "to_version": 4}, repeat
     assert repeat["noop"] is True and pair_rows(data_root, scratch) == seed.snapshot
 
-    with spawn_installed_brain_serve(ctx.env, seed.config, data_root=data_root, cwd=ctx.cwd) as serve:
-        current = serve.wait_ready()
+    def assert_recovered_owner_ready(current: Endpoint) -> None:
         assert current.store_id == seed.store_id
-        rc, _, _, _ = serve.signal_and_wait_exit()
-        assert rc == 0
+        health = read_status(ctx.case_dir / "client" / "legacy-health-profile.json", os_adapters())
+        assert health.get("ok") is True, health
+        data = health["data"]
+        assert isinstance(data, dict) and data.get("ready") is True, health
+        assert (data.get("store_id"), data.get("writer_epoch")) == (seed.store_id, current.writer_epoch), health
+
+    # READY comes from the wheel owner's on_ready after transport startup.
+    # An endpoint file alone can precede that operational readiness boundary.
+    recovered = run_t8_child(ctx.env, "serve", seed.config, cwd=ctx.cwd, while_ready=assert_recovered_owner_ready)
+    assert recovered.ready is not None and not recovered.timed_out, recovered.describe()
+    assert recovered.result.returncode == 0, recovered.describe()
+    assert_entered(recovered)
     assert not root.endpoint_path.exists()
     after = pair_rows(data_root, scratch)
     assert after["ledger"][: len(seed.snapshot["ledger"])] == seed.snapshot["ledger"]

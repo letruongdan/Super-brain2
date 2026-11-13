@@ -408,17 +408,23 @@ class MockTlsServer:
     def close(self) -> None:
         self._stop_event.set()
         try:
-            self.listener_sock.close()
+            self.listener_sock.shutdown(socket.SHUT_RDWR)
         except OSError:
             pass
+        self.listener_sock.close()
         with self._lock:
             for s in self._client_sockets:
+                try:
+                    s.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
                 try:
                     s.close()
                 except OSError:
                     pass
             self._client_sockets.clear()
         self._thread.join(timeout=2.0)
+        assert not self._thread.is_alive(), "mock TLS accept loop did not exit"
 
 
 def _make_server_ctx(tls: SampleTlsMaterial) -> ssl.SSLContext:

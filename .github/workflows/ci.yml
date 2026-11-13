@@ -15,16 +15,28 @@ jobs:
         python: ["3.11", "3.14"]
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: astral-sh/setup-uv@v6
         with:
           version: "0.12.15"
+      - name: Prepare physical temporary directory
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          temporary = Path(os.environ["RUNNER_TEMP"]).resolve()
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as output:
+              output.write(f"TMPDIR={temporary}\n")
+          PY
       - name: Run the gate
         shell: bash
         run: |
           ev="${{ runner.temp }}/gate-evidence"
           mkdir -p "$ev"
           set +e
-          uv run --locked --python ${{ matrix.python }} python scripts/gate.py --python ${{ matrix.python }} --evidence-dir "$ev" > "$ev/launcher.out" 2> "$ev/launcher.err"
+          uv run --locked --python ${{ matrix.python }} python scripts/gate.py --python ${{ matrix.python }} --shards 4 --evidence-dir "$ev" > "$ev/launcher.out" 2> "$ev/launcher.err"
           code=$?
           echo "$code" > "$ev/launcher.exit"
           cat "$ev/launcher.out"

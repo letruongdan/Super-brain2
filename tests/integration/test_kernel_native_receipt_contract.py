@@ -10,7 +10,7 @@ import sys
 import time
 from collections.abc import Mapping
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 
@@ -2104,7 +2104,9 @@ def test_native_same_daemon_rejects_same_principal_and_mismatched_runtime(truste
         )
         is False
     )
-    assert verify_same_daemon(probe_a, replace(probe_b, os="linux")) is False
+    different_os = "linux" if probe_b.os != "linux" else "win32"
+    assert different_os != probe_b.os
+    assert verify_same_daemon(probe_a, replace(probe_b, os=different_os)) is False
     assert verify_same_daemon(probe_a, replace(probe_b, source_commit="b" * 40)) is False
 
 
@@ -3741,20 +3743,44 @@ def test_t9_r07_slow_collector_off_deadline_and_concurrent_calls(
 
 
 def test_utc_now_z_aligned_with_process_creation_clock_and_sub_millisecond_progression() -> None:
-    """UTC wall clock matches OS process-start resolution so fast child calls never invert or collide."""
+    """Windows creation time is exact; POSIX timestamps retain their OS source resolution."""
     from tests.support import inc2_native_owner
 
     utc_now_fn = inc2_native_owner.utc_now_z
     for _ in range(8):
         t_before = utc_now_fn()
-        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(0.005)"])
+        proc = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.buffer.read(1)"], stdin=subprocess.PIPE)
         try:
             started = process_started_at_for_pid(proc.pid)
             t_after = utc_now_fn()
+            created_at = datetime.fromisoformat(started.replace("Z", "+00:00"))
+            uncertainty = timedelta(0)
+            if sys.platform.startswith("linux"):
+                # /proc btime is an integer second and starttime is an integer
+                # clock tick. Verify the actual source projection independently.
+                boot_line = next(
+                    line for line in Path("/proc/stat").read_text(encoding="ascii").splitlines()
+                    if line.startswith("btime ")
+                )
+                boot_second = int(boot_line.split()[1])
+                stat_fields = Path(f"/proc/{proc.pid}/stat").read_text(encoding="ascii").rpartition(")")[2].split()
+                start_ticks = int(stat_fields[19])
+                ticks_per_second = os.sysconf("SC_CLK_TCK")
+                expected = datetime.fromtimestamp(boot_second + start_ticks / ticks_per_second, tz=UTC)
+                assert created_at == expected
+                uncertainty = timedelta(seconds=1 + 1 / ticks_per_second)
+            elif sys.platform != "win32":
+                # ps lstart supplies whole-second precision on the POSIX fallback.
+                uncertainty = timedelta(seconds=1)
         finally:
+            assert proc.stdin is not None
+            proc.stdin.close()
             proc.wait(timeout=5)
-        assert t_before <= started <= t_after, (
-            f"Clock skew between utc_now_z and process_started_at_for_pid: {t_before} <= {started} <= {t_after}"
+        before = datetime.fromisoformat(t_before.replace("Z", "+00:00"))
+        after = datetime.fromisoformat(t_after.replace("Z", "+00:00"))
+        assert before - uncertainty <= created_at <= after + uncertainty, (
+            f"Creation time outside the OS-resolution bracket: {t_before} <= {started} <= {t_after}; "
+            f"resolution uncertainty {uncertainty.total_seconds()} s"
         )
 
 

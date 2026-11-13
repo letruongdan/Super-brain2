@@ -258,7 +258,7 @@ def check_endpoint_entries_under_lease(root: DataRoot, lease: "WriterLease", os_
     entries = tuple(
         root.root / name
         for name in sorted(names)
-        if os.path.normcase(name) == ENDPOINT_NAME or os.path.normcase(name).startswith(ENDPOINT_STAGE_PREFIX)
+        if name.casefold() == ENDPOINT_NAME or name.casefold().startswith(ENDPOINT_STAGE_PREFIX)
     )
     if not entries:
         return ()

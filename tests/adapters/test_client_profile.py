@@ -626,7 +626,8 @@ def test_profile_refuses_replaced_file_and_unverified_cwd(monkeypatch: Any) -> N
             (read_client_ca, ca_file),
             (read_client_credential, cred_file),
         ):
-            original_bytes = target_file.read_bytes()
+            replacement = _write_secure_file(target_file.with_suffix(".replacement"), target_file.read_bytes())
+            assert not target_file.samefile(replacement)
 
             def _swapping_open(
                 path: str | os.PathLike[str],
@@ -634,12 +635,11 @@ def test_profile_refuses_replaced_file_and_unverified_cwd(monkeypatch: Any) -> N
                 mode: int = 0o777,
                 *,
                 _target: Path = target_file,
-                _orig: bytes = original_bytes,
+                _replacement: Path = replacement,
             ) -> int:
                 if Path(path).resolve() == _target.resolve():
-                    # Unlink and write a brand-new inode/file index at the same path right before os.open
-                    _target.unlink()
-                    _write_secure_file(_target, _orig)
+                    # Both files exist before the swap, so they have distinct identities.
+                    os.replace(_replacement, _target)
                 return real_os_open(path, flags, mode)
 
             with monkeypatch.context() as mp:

@@ -654,6 +654,8 @@ def _win32_process_snapshot() -> list[tuple[int, int, int]] | None:
 
 def _win32_process_creation_ticks(pid: int) -> int | None:
     """Return 100ns FILETIME creation ticks for ``pid``, or ``None`` if unavailable."""
+    if sys.platform != "win32":
+        return None
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.OpenProcess.argtypes = [ctypes.wintypes.DWORD, ctypes.wintypes.BOOL, ctypes.wintypes.DWORD]
     kernel32.OpenProcess.restype = ctypes.wintypes.HANDLE
@@ -694,6 +696,8 @@ def _win32_open_and_verify_handle(
 
     Returns ``(verified_ticks_or_None, verification_failed)``.
     """
+    if sys.platform != "win32":
+        return None, True
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.OpenProcess.argtypes = [ctypes.wintypes.DWORD, ctypes.wintypes.BOOL, ctypes.wintypes.DWORD]
     kernel32.OpenProcess.restype = ctypes.wintypes.HANDLE

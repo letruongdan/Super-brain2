@@ -382,7 +382,7 @@ def test_privacy_canary_absent_from_durable_and_observed_outputs(
         assert store_rows(
             root, f"SELECT evidence_id, content_digest FROM {EPISODE_TABLE} WHERE episode_id = ?", (episode_id,)
         ) == [(fresh["evidence_ids"][0], content_digest)]
-        ((meta,),) = store_rows(root, "SELECT meta FROM ledger WHERE kind = ? AND meta LIKE ?",
+        ((meta,),) = store_rows(root, "SELECT meta FROM ledger WHERE kind = ? AND CAST(meta AS TEXT) LIKE ?",
                                (EPISODE_KIND, f"%{episode_id}%"))
         assert content_digest.encode() in meta
         observed["fixture outbox"] = b"".join(proxy.outbox.values())

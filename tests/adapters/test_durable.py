@@ -507,21 +507,33 @@ def directory_fd_from_a_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     return opened
 
 
+def fail_full_fsync(monkeypatch: pytest.MonkeyPatch, code: int) -> list[int]:
+    flushed: list[int] = []
+
+    def full_fsync(fd: int) -> NoReturn:
+        flushed.append(fd)
+        raise OSError(code, "injected flush error")
+
+    monkeypatch.setattr(durable, "full_fsync", full_fsync)
+    return flushed
+
+
 @pytest.mark.parametrize("code", [errno.EINVAL, errno.ENOTSUP, errno.ENOSYS, errno.EBADF])
 def test_unsupported_directory_fsync_is_skipped(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, code: int) -> None:
     opened = directory_fd_from_a_file(tmp_path, monkeypatch)
-    synced = spy_fsync(monkeypatch, OSError(code, "unsupported"))
+    synced = fail_full_fsync(monkeypatch, code)
     assert durable._fsync_directory(tmp_path, nt=False) is False
     assert synced == opened and len(opened) == 1
 
 
 @pytest.mark.parametrize("code", [errno.EIO, errno.ENOSPC])
 def test_directory_fsync_failure_still_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, code: int) -> None:
-    directory_fd_from_a_file(tmp_path, monkeypatch)
-    spy_fsync(monkeypatch, OSError(code, "injected"))
+    opened = directory_fd_from_a_file(tmp_path, monkeypatch)
+    synced = fail_full_fsync(monkeypatch, code)
     with pytest.raises(OSError) as e:
         durable._fsync_directory(tmp_path, nt=False)
     assert e.value.errno == code
+    assert synced == opened and len(opened) == 1
 
 
 def test_sync_directory_continues_past_an_unsupported_directory_fsync(

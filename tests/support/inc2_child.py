@@ -214,7 +214,7 @@ class Inc2ChildProcess:
             proc_handle = getattr(self._proc, "_handle", None)
             self._proc_ticks: int | None = (
                 _win32_handle_creation_ticks(int(proc_handle))
-                if (sys.platform == "win32" and proc_handle is not None)
+                if proc_handle is not None
                 else None
             )
             self.cleanup_unverified = bool(self._job is not None and not self._job_assigned)
