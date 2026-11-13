@@ -1,6 +1,6 @@
 # Bàn giao SP1 đợt 2: kernel daemon, MCP shim và đường native
 
-Ngày cập nhật: 2026-11-12. Tài liệu này là bản bàn giao SP1 đợt 2 trên nhánh `codex/sp1-i2-task9` (tách từ mốc Task 8 `3527a99803059cb06b5120cd18edea2e1a828857`).
+Ngày cập nhật: 2026-11-13. Tài liệu này là bản bàn giao SP1 đợt 2 trên nhánh `codex/sp1-i2-task9` (tách từ mốc Task 8 `3527a99803059cb06b5120cd18edea2e1a828857`, sau đó merge closure Task 8 `978e63ae685d76b725114102eb932c140ef79f24` bằng merge commit `8439dbae40ef2595a6f547bdbc3d4489014a3065`).
 
 Theo quy tắc tuyên bố của [spec rev22 mục 17.2–17.5](../superpowers/specs/2026-10-30-super-brain2-system-design.md#172-các-gate): chỉ được tuyên bố đóng toàn bộ SP1 đợt 2 khi **toàn bộ** điều kiện sau cùng đạt trên đúng commit `HEAD` cuối có working tree sạch:
 1. Gate mặc định (`scripts/gate.py`, F4 dưới 300 s, 0 fail/error/XPASS, JUnit đầy đủ, `ruff`, strict `mypy`, `import-linter`) đạt trên đủ ma trận OS × Python áp dụng.
@@ -13,6 +13,7 @@ Tính đến thời điểm commit tài liệu này:
 - Các ô gate **Linux** và **macOS** (Python 3.11 và 3.14): **`not_run`**.
 - Các phép thử host thật theo D8 (**Codex desktop app** và **Claude Code**): **`not_run`** (chờ phê duyệt D8 tách biệt sau khi pin F4/perf trên commit cuối).
 - **Lớp 2** (spec §11.3): **`unknown`** (thuộc SP2 / SP7).
+- **Mục mở kế thừa từ Task 8 (`T9-OPEN-W1`):** mẫu wire 1 MiB qua daemon thật dao động quanh ngân sách local 100 ms (86,5–100,9 ms tại `978e63a`); điều kiện đóng ghi tại ledger Task 8 §13.
 - **Review độc lập cuối cho Task 9**: **`closure pending`**.
 
 ---
@@ -39,7 +40,7 @@ Tính đến thời điểm commit tài liệu này:
 
 ## 2. Cơ chế pin source, khác biệt spec và provenance artifact
 
-1. **Nhánh và base pin:** nhánh `codex/sp1-i2-task9` tách từ commit Task 8 `3527a99803059cb06b5120cd18edea2e1a828857`. Lưu ý checkout `sp1-increment2` ở `6a3a4d2` giữ bản spec rev22 trước phần giải thích mẫu đường dẫn ở §14.2, trong khi `3527a99` (và nhánh Task 9) giữ bản có `§14.2` tại [2026-10-30-super-brain2-system-design.md](../superpowers/specs/2026-10-30-super-brain2-system-design.md) (`sha256:a468a917f775d2fb8a00b519f5e5ed31d3273ca0b63ad7f8115b6678065783b7`). Toàn bộ điều khoản native, D2–D8 và T0 giống nhau.
+1. **Nhánh và base pin:** nhánh `codex/sp1-i2-task9` tách từ commit Task 8 `3527a99803059cb06b5120cd18edea2e1a828857`; closure Task 8 `978e63a` (tối ưu privacy/wire, review độc lập APPROVED) được merge vào nhánh tại `8439dba`, không xung đột, phần `src` của merge bằng đúng `978e63a`. Lưu ý checkout `sp1-increment2` ở `6a3a4d2` giữ bản spec rev22 trước phần giải thích mẫu đường dẫn ở §14.2, trong khi `3527a99` (và nhánh Task 9) giữ bản có `§14.2` tại [2026-10-30-super-brain2-system-design.md](../superpowers/specs/2026-10-30-super-brain2-system-design.md) (`sha256:a468a917f775d2fb8a00b519f5e5ed31d3273ca0b63ad7f8115b6678065783b7`). Toàn bộ điều khoản native, D2–D8 và T0 giống nhau.
 2. **Pin cấu hình bất biến kèm trong commit này:**
    - `pyproject.toml`: `sha256:4f54cc75470b21bb44257e9f434d4f043c8ad979c08c0a804eb956fece8a87a3`
    - `uv.lock`: `sha256:a17fae4c237aad0f0b13460a8672cf8b193fb1004316b98149c10532fdc399cb`
@@ -53,9 +54,11 @@ Tính đến thời điểm commit tài liệu này:
 
 ---
 
-## 3. Baseline Task 8 (`3527a99`) và ma trận Gate / OS của Task 9
+## 3. Baseline Task 8 và ma trận Gate / OS của Task 9
 
-### Baseline đã quan sát tại pin Task 8 (`3527a99803059cb06b5120cd18edea2e1a828857`)
+Receipt closure Task 8 tại `978e63a` (F4 accepted trên Windows 3.11.9 và 3.14.3; benchmark chỉ trượt ở mẫu wire 1 MiB, mục `T9-OPEN-W1`) nằm ở ledger Task 8 §13. Kết quả F4/benchmark trên pin cuối Task 9 được ghi vào ledger Task 9 ngoài Git sau khi chốt pin (quy tắc ở mục 2.3), không nhúng vào tài liệu này.
+
+### Baseline lịch sử tại pin Task 8 (`3527a99803059cb06b5120cd18edea2e1a828857`)
 
 *Chỉ dùng làm mốc đối chiếu; không thay thế receipt của commit Task 9.*
 
