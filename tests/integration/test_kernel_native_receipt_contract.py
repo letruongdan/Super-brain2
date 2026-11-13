@@ -51,6 +51,7 @@ from tests.support.inc2_native import (
     TerminalToolFacts,
     TimespanRecord,
     encode_native_probe,
+    parse_host_calls_jsonl,
     parse_native_probe,
     parse_owner_events_jsonl,
     parse_owner_ready,
@@ -406,6 +407,132 @@ def _sample_world(
     return probe, registration, observations, evidence_root
 
 
+def _pid(proc: ProcessIdentity | None) -> int | None:
+    return proc.pid if proc is not None else None
+
+
+def _started(proc: ProcessIdentity | None) -> str | None:
+    return proc.started_at if proc is not None else None
+
+
+def _host_call_record(hc: HostCallObservation) -> dict[str, JsonValue]:
+    return {
+        "call_id": hc.call_id,
+        "channel": hc.channel,
+        "host_process": hc.host_process.to_dict(),
+        "shim_launcher_process": hc.shim_launcher_process.to_dict(),
+        "shim_worker_process": hc.shim_worker_process.to_dict(),
+        "tool_name": hc.tool_name,
+        "terminal_ok": hc.terminal_ok,
+        "response_digest": hc.response_digest,
+        "started_at": hc.started_at,
+        "ended_at": hc.ended_at,
+    }
+
+
+def _owner_event_record(oc: OwnerCallObservation) -> dict[str, JsonValue]:
+    return {
+        "event": "owner_call",
+        "connection_id": oc.connection_id,
+        "observation_status": oc.observation_status,
+        "daemon_pid": oc.daemon_process.pid,
+        "daemon_started_at": oc.daemon_process.started_at,
+        "store_id": oc.store_id,
+        "writer_epoch": oc.writer_epoch,
+        "instance_id": oc.instance_id,
+        "principal_id": oc.principal_id,
+        "credential_id": oc.credential_id,
+        "tool_name": oc.tool_name,
+        "ready": oc.ready,
+        "auth_stamp_matched": oc.auth_stamp_matched,
+        "response_flushed_ok": oc.response_flushed_ok,
+        "response_digest": oc.response_digest,
+        "listen_host": oc.listen_host,
+        "listen_port": oc.listen_port,
+        "client_host": oc.client_host,
+        "client_port": oc.client_port,
+        "client_pid": _pid(oc.client_process),
+        "client_started_at": _started(oc.client_process),
+        "started_at": oc.started_at,
+        "ended_at": oc.ended_at,
+        "call_id": oc.call_id,
+        "selected_scope": dict(oc.selected_scope) if oc.selected_scope is not None else None,
+    }
+
+
+def _socket_record(so: SocketObservation) -> dict[str, JsonValue]:
+    return {
+        "event": "socket_observation",
+        "connection_id": so.connection_id,
+        "observation_status": so.observation_status,
+        "client_pid": _pid(so.client_process),
+        "client_started_at": _started(so.client_process),
+        "daemon_pid": so.daemon_process.pid,
+        "daemon_started_at": so.daemon_process.started_at,
+        "local_addr": so.local_addr,
+        "local_port": so.local_port,
+        "remote_addr": so.remote_addr,
+        "remote_port": so.remote_port,
+        "store_id": so.store_id,
+        "writer_epoch": so.writer_epoch,
+        "instance_id": so.instance_id,
+        "started_at": so.started_at,
+        "observed_at": so.observed_at,
+        "ended_at": so.ended_at,
+    }
+
+
+def _encode_jsonl(records: list[dict[str, JsonValue]]) -> bytes:
+    return b"".join(canonical_json(rec) + b"\n" for rec in records)
+
+
+def _obs_with_artifacts(
+    obs: ObservationSet,
+    ev_root: Path,
+    label: str,
+    *,
+    host_calls: tuple[HostCallObservation, ...] | None = None,
+    owner_events: tuple[OwnerCallObservation, ...] | None = None,
+    socket_observations: tuple[SocketObservation, ...] | None = None,
+    owner_ready: Mapping[str, JsonValue] | None = None,
+) -> ObservationSet:
+    """Return ``obs`` with the given channels written to re-indexed on-disk artifacts.
+
+    The verifier rejects any disk/memory difference before its semantic rules run, so a negative case that only
+    mutates memory is vacuous. ``owner_ready`` holds field overrides for ``owner-ready.json`` (disk only).
+    """
+    paths = dict(obs.artifact_paths)
+    idx = json.loads(paths["evidence_index"].read_text(encoding="utf-8"))
+    changed: dict[str, Any] = {}
+    # Each channel is encoded with its own typed encoder; the loop below only handles bytes.
+    encoded: list[tuple[str, tuple[Any, ...], bytes, tuple[Any, ...]]] = []
+    if host_calls is not None:
+        raw = _encode_jsonl([_host_call_record(rec) for rec in host_calls])
+        encoded.append(("host_calls", host_calls, raw, parse_host_calls_jsonl(raw)))
+    if owner_events is not None:
+        raw = _encode_jsonl([_owner_event_record(rec) for rec in owner_events])
+        encoded.append(("owner_events", owner_events, raw, parse_owner_events_jsonl(raw)))
+    if socket_observations is not None:
+        raw = _encode_jsonl([_socket_record(rec) for rec in socket_observations])
+        encoded.append(("socket_observations", socket_observations, raw, parse_socket_observations_jsonl(raw)))
+    for name, records, raw, parsed in encoded:
+        assert parsed == records, f"{name} does not round-trip through its parser"
+        paths[name] = ev_root / f"{label}-{name}.jsonl"
+        paths[name].write_bytes(raw)
+        idx["artifacts"][name] = digest_bytes(raw)
+        changed[name] = records
+    if owner_ready is not None:
+        ready = {**json.loads(paths["owner_ready"].read_text(encoding="utf-8")), **owner_ready}
+        raw = canonical_json(ready) + b"\n"
+        parse_owner_ready(raw)
+        paths["owner_ready"] = ev_root / f"{label}-owner-ready.json"
+        paths["owner_ready"].write_bytes(raw)
+        idx["artifacts"]["owner_ready"] = digest_bytes(raw)
+    paths["evidence_index"] = ev_root / f"{label}-evidence-index.json"
+    paths["evidence_index"].write_bytes(canonical_json(idx) + b"\n")
+    return replace(obs, artifact_paths=paths, **changed)
+
+
 def test_native_report_requires_registered_observer(trusted_tmp: Path) -> None:
     """Registered observer, pinned physical artifacts, path containment, and fixture-vs-native separation."""
     case_dir = trusted_tmp / "obs-case"
@@ -507,7 +634,7 @@ def test_native_call_join_rejects_reused_identity_and_missing_terminal(trusted_t
     # Full positive control with distinct launcher and worker.
     case_dir = trusted_tmp / "call-join"
     case_dir.mkdir(parents=True, exist_ok=True)
-    probe, reg, obs, _ = _sample_world(case_dir, launcher_same_as_worker=False)
+    probe, reg, obs, ev_root = _sample_world(case_dir, launcher_same_as_worker=False)
     assert verify_native_connection(probe, registration=reg, observations=obs) is True
 
     # Reused daemon PID with a different started_at MUST fail.
@@ -537,53 +664,30 @@ def test_native_call_join_rejects_reused_identity_and_missing_terminal(trusted_t
     )
 
     # Missing terminal host observation or unauthenticated / unflushed owner reply MUST fail.
-    assert (
-        verify_native_connection(
-            probe,
-            registration=reg,
-            observations=replace(obs, host_calls=(replace(obs.host_calls[0], terminal_ok=False),)),
+    # Every case is written to disk so the named rule, not the disk/memory mismatch, decides.
+    def _rejects(label: str, **channels: Any) -> bool:
+        return (
+            verify_native_connection(
+                probe, registration=reg, observations=_obs_with_artifacts(obs, ev_root, label, **channels)
+            )
+            is False
         )
-        is False
-    )
-    assert verify_native_connection(probe, registration=reg, observations=replace(obs, host_calls=())) is False
-    assert (
-        verify_native_connection(
-            probe,
-            registration=reg,
-            observations=replace(obs, owner_events=(replace(obs.owner_events[0], auth_stamp_matched=False),)),
-        )
-        is False
-    )
-    assert (
-        verify_native_connection(
-            probe,
-            registration=reg,
-            observations=replace(obs, owner_events=(replace(obs.owner_events[0], response_flushed_ok=False),)),
-        )
-        is False
-    )
-    assert (
-        verify_native_connection(
-            probe,
-            registration=reg,
-            observations=replace(obs, owner_events=(replace(obs.owner_events[0], ready=False),)),
-        )
-        is False
-    )
+
+    assert _rejects("hc-not-terminal", host_calls=(replace(obs.host_calls[0], terminal_ok=False),))
+    assert _rejects("hc-missing", host_calls=())
+    # An authenticated-but-unflushed or unauthenticated-but-ready owner reply cannot even be recorded:
+    # the owner-events parser rejects the inconsistent terminal facts.
+    for bad_facts in (
+        replace(obs.owner_events[0], auth_stamp_matched=False),
+        replace(obs.owner_events[0], response_flushed_ok=False),
+    ):
+        with pytest.raises(ProbeValidationError):
+            parse_owner_events_jsonl(_encode_jsonl([_owner_event_record(bad_facts)]))
+    assert _rejects("oc-not-ready", owner_events=(replace(obs.owner_events[0], ready=False),))
 
     # Missing or mismatched socket join MUST fail.
-    assert verify_native_connection(probe, registration=reg, observations=replace(obs, socket_observations=())) is False
-    assert (
-        verify_native_connection(
-            probe,
-            registration=reg,
-            observations=replace(
-                obs,
-                socket_observations=(replace(obs.socket_observations[0], remote_port=9999),),
-            ),
-        )
-        is False
-    )
+    assert _rejects("so-missing", socket_observations=())
+    assert _rejects("so-bad-port", socket_observations=(replace(obs.socket_observations[0], remote_port=9999),))
 
     # Missing runtime fields on passed probe or non-passed probe status MUST fail.
     assert (
@@ -1799,7 +1903,7 @@ def test_native_verifier_enforces_monotonic_timestamps_unique_joins_scope_and_li
     """Verifier rejects non-monotonic times, ambiguous/conflicting joins, asymmetric scopes, and stale lifecycles."""
     case_dir = trusted_tmp / "audit-contract-v2"
     case_dir.mkdir(parents=True, exist_ok=True)
-    probe, reg, obs, _ = _sample_world(case_dir)
+    probe, reg, obs, ev_root = _sample_world(case_dir)
     assert verify_native_connection(probe, registration=reg, observations=obs) is True
     assert (
         probe.daemon_process is not None
@@ -1812,17 +1916,21 @@ def test_native_verifier_enforces_monotonic_timestamps_unique_joins_scope_and_li
     oc = obs.owner_events[0]
     so = obs.socket_observations[0]
 
+    # Cases 1-6 are written to disk so the named rule, not the disk/memory mismatch, decides.
+    def _verify_disk(label: str, probe_case: NativeConnectionProbe = probe, **channels: Any) -> bool:
+        return verify_native_connection(
+            probe_case, registration=reg, observations=_obs_with_artifacts(obs, ev_root, label, **channels)
+        )
+
     # 1. Daemon started_at AFTER call ended_at must reject.
     future_daemon = ProcessIdentity(pid=probe.daemon_process.pid, started_at="2099-01-01T00:00:00.000000Z")
     assert (
-        verify_native_connection(
+        _verify_disk(
+            "audit-future-daemon",
             replace(probe, daemon_process=future_daemon),
-            registration=reg,
-            observations=replace(
-                obs,
-                owner_events=(replace(oc, daemon_process=future_daemon),),
-                socket_observations=(replace(so, daemon_process=future_daemon),),
-            ),
+            owner_events=(replace(oc, daemon_process=future_daemon),),
+            socket_observations=(replace(so, daemon_process=future_daemon),),
+            owner_ready={"daemon_started_at": future_daemon.started_at},
         )
         is False
     )
@@ -1830,65 +1938,64 @@ def test_native_verifier_enforces_monotonic_timestamps_unique_joins_scope_and_li
     # 2. Worker process spawned BEFORE its launcher/host parent must reject.
     impossible_worker = ProcessIdentity(pid=probe.shim_worker_process.pid, started_at="2020-01-01T00:00:00.000000Z")
     assert (
-        verify_native_connection(
+        _verify_disk(
+            "audit-impossible-worker",
             replace(probe, shim_worker_process=impossible_worker),
-            registration=reg,
-            observations=replace(
-                obs,
-                host_calls=(replace(hc, shim_worker_process=impossible_worker),),
-                socket_observations=(replace(so, client_process=impossible_worker),),
-            ),
+            host_calls=(replace(hc, shim_worker_process=impossible_worker),),
+            owner_events=(replace(oc, client_process=impossible_worker),),
+            socket_observations=(replace(so, client_process=impossible_worker),),
         )
         is False
     )
 
-    # 3. Disjoint host vs owner call timestamps (2020 vs 2099) must reject.
-    assert (
-        verify_native_connection(
-            probe,
-            registration=reg,
-            observations=replace(
-                obs,
-                host_calls=(
-                    replace(hc, started_at="2020-01-01T00:00:00.000000Z", ended_at="2020-01-01T00:00:01.000000Z"),
-                ),
-                owner_events=(
-                    replace(oc, started_at="2099-01-01T00:00:00.000000Z", ended_at="2099-01-01T00:00:01.000000Z"),
-                ),
-            ),
-        )
-        is False
-    )
+    # 3a. Host call disjoint from the probe's call timespan (2020) must reject.
+    hc_2020 = replace(hc, started_at="2020-01-01T00:00:00.000000Z", ended_at="2020-01-01T00:00:01.000000Z")
+    assert _verify_disk("audit-host-2020", host_calls=(hc_2020,)) is False
+    # 3b. Owner call disjoint from the host call (2099 vs 04:00) must reject.
+    oc_2099 = replace(oc, started_at="2099-01-01T00:00:00.000000Z", ended_at="2099-01-01T00:00:01.000000Z")
+    assert _verify_disk("audit-owner-2099", owner_events=(oc_2099,)) is False
 
     # 4. Conflicting failed owner event alongside healthy one (even with call_id=None) must reject.
+    # The failed event has its own worker socket, so only its failed terminal facts conflict.
     oc_anon = replace(oc, call_id=None)
-    oc_failed = replace(oc_anon, ready=False, auth_stamp_matched=False, response_flushed_ok=False)
+    oc_failed = replace(
+        oc_anon,
+        ready=False,
+        auth_stamp_matched=False,
+        response_flushed_ok=False,
+        connection_id="conn-t9-failed",
+        client_port=52002,
+    )
+    so_failed = replace(so, connection_id="conn-t9-failed", local_port=52002)
     assert (
-        verify_native_connection(
-            probe,
-            registration=reg,
-            observations=replace(obs, owner_events=(oc_anon, oc_failed)),
-        )
+        _verify_disk("audit-failed-owner", owner_events=(oc_anon, oc_failed), socket_observations=(so, so_failed))
         is False
     )
 
     # 5. Ambiguous duplicate matching owner events when call_id=None must reject.
+    assert _verify_disk("audit-dup-owner", owner_events=(oc_anon, oc_anon)) is False
+
+    # 6. Conflicting SocketObservation on the same local/remote 4-tuple must reject.
+    # Routed through the on-disk artifact so the tuple rule, not the disk/memory mismatch, decides.
+    spoof_client = ProcessIdentity(pid=99999, started_at=probe.shim_worker_process.started_at)
+    so_spoofed = replace(so, client_process=spoof_client, connection_id="conn-t9-spoofed")
     assert (
         verify_native_connection(
             probe,
             registration=reg,
-            observations=replace(obs, owner_events=(oc_anon, oc_anon)),
+            observations=_obs_with_artifacts(obs, ev_root, "audit-spoofed", socket_observations=(so, so_spoofed)),
         )
         is False
     )
-
-    # 6. Conflicting SocketObservation on the same local/remote 4-tuple must reject.
-    so_spoofed = replace(so, client_process=ProcessIdentity(pid=99999, started_at=probe.shim_worker_process.started_at))
+    # 6b. The same spoof reusing the worker's connection_id is rejected as a duplicate connection.
+    so_spoofed_dup = replace(so, client_process=spoof_client)
     assert (
         verify_native_connection(
             probe,
             registration=reg,
-            observations=replace(obs, socket_observations=(so, so_spoofed)),
+            observations=_obs_with_artifacts(
+                obs, ev_root, "audit-spoofed-dup", socket_observations=(so, so_spoofed_dup)
+            ),
         )
         is False
     )
@@ -2044,7 +2151,7 @@ def test_posix_socket_pid_lookup_and_concurrent_owner_call_client_binding(
     # 3. Client endpoint disambiguation across two concurrent workers with identical get_health replies.
     case_dir = trusted_tmp / "client-bind"
     case_dir.mkdir(parents=True, exist_ok=True)
-    probe, reg, obs, _ = _sample_world(case_dir)
+    probe, reg, obs, ev_root = _sample_world(case_dir)
     assert probe.shim_worker_process is not None
     worker_other = ProcessIdentity(
         pid=probe.shim_worker_process.pid + 1,
@@ -2061,7 +2168,7 @@ def test_posix_socket_pid_lookup_and_concurrent_owner_call_client_binding(
         verify_native_connection(
             probe,
             registration=reg,
-            observations=replace(obs, owner_events=(oc_wrong_client,)),
+            observations=_obs_with_artifacts(obs, ev_root, "client-bind-wrong", owner_events=(oc_wrong_client,)),
         )
         is False
     )
@@ -2686,7 +2793,11 @@ def test_native_verifier_rejects_null_response_digest(trusted_tmp: Path) -> None
     obs_null = replace(obs, host_calls=(hc_null,), owner_events=(oc_null,))
 
     assert verify_native_connection(probe_null, registration=reg, observations=obs_null) is False
-    assert verify_native_connection(probe, registration=reg, observations=obs_null) is False
+    # A terminal-ok host call or authenticated owner reply without a response digest cannot be recorded at all.
+    with pytest.raises(ProbeValidationError):
+        parse_host_calls_jsonl(_encode_jsonl([_host_call_record(hc_null)]))
+    with pytest.raises(ProbeValidationError):
+        parse_owner_events_jsonl(_encode_jsonl([_owner_event_record(oc_null)]))
     assert verify_same_daemon(probe_null, probe_second_null) is False
     assert verify_same_daemon(probe_null, probe_second) is False
     assert verify_same_daemon(probe, probe_second_null) is False
@@ -3044,7 +3155,7 @@ def test_t9_r01_rejects_unpinned_host_mode_versions_and_unbacked_artifacts(trust
     )
     assert verify_native_connection(probe, registration=replace(reg, run_id="run-other"), observations=obs) is False
 
-    # Unbacked memory-only mutation (differs from disk JSONL) must reject.
+    # Unbacked memory-only mutation (differs from disk JSONL) must reject. Deliberate artifact-mismatch case.
     assert (
         verify_native_connection(
             probe,
@@ -3265,21 +3376,22 @@ def test_t9_r02_rejects_null_owner_endpoints_and_requires_socket_connection_join
     assert verify_native_connection(probe, registration=reg, observations=obs_early_close) is False
 
     # Any None client_* bypass or invalid port on OwnerCallObservation must reject.
-    for bad_oc in (
-        replace(oc, client_host=None),
-        replace(oc, client_port=None),
-        replace(oc, client_port=0),
-        replace(oc, client_port=65536),
-        replace(oc, client_process=None),
+    # Written to disk so the endpoint rule, not the disk/memory mismatch, decides.
+    for i, bad_oc in enumerate(
+        (replace(oc, client_host=None), replace(oc, client_port=None), replace(oc, client_process=None))
     ):
         assert (
             verify_native_connection(
                 probe,
                 registration=reg,
-                observations=replace(obs, owner_events=(bad_oc,)),
+                observations=_obs_with_artifacts(obs, ev_root, f"null-endpoint-{i}", owner_events=(bad_oc,)),
             )
             is False
         )
+    # Out-of-range client ports cannot be recorded: the owner-events parser rejects them.
+    for bad_port in (0, 65536):
+        with pytest.raises(ProbeValidationError):
+            parse_owner_events_jsonl(_encode_jsonl([_owner_event_record(replace(oc, client_port=bad_port))]))
 
 
 def test_t9_r03_strict_owner_parsers_and_terminal_facts_consistency(trusted_tmp: Path) -> None:
@@ -3838,6 +3950,7 @@ def test_t9_r01_verifier_single_read_and_run_observed_owner_config_digest(
     with monkeypatch.context() as mp:
         mp.setattr(Path, "read_bytes", _split_read_bytes)
         # Digest check used hc_orig_bytes; parser MUST use that exact buffer and reject obs_tampered.
+        # Deliberate artifact-mismatch case: the rule under test is the single-read disk/memory comparison.
         assert verify_native_connection(probe, registration=reg, observations=obs_tampered) is False
         assert read_counts.get(hc_path.resolve(), 0) == 1
         for label, art_path in obs.artifact_paths.items():
@@ -4024,34 +4137,26 @@ def test_t9_r02_socket_observation_lifetime_and_post_close_lookup_rejection(
     # Verifier rejects missing/out-of-bounds observed_at, PID reuse, and overlapping 4-tuple reuse.
     case_dir = trusted_tmp / "r5-t9-r02-synth"
     case_dir.mkdir(parents=True, exist_ok=True)
-    probe, reg, obs, _ = _sample_world(case_dir)
+    probe, reg, obs, ev_root = _sample_world(case_dir)
     so0 = obs.socket_observations[0]
     assert verify_native_connection(probe, registration=reg, observations=obs) is True
+    # A missing or out-of-bounds observed_at cannot be recorded: the socket-observations parser rejects it,
+    # which is where this rule is enforced for on-disk evidence.
     for bad_so in (
         replace(so0, observed_at=None),
         replace(so0, observed_at="2026-11-12T04:00:02.001000Z"),  # Before socket started_at.
         replace(so0, observed_at="2026-11-12T04:00:02.149000Z"),  # After socket ended_at.
     ):
-        bad_obs = replace(obs, socket_observations=(bad_so,))
-        assert verify_native_connection(probe, registration=reg, observations=bad_obs) is False
+        with pytest.raises(ProbeValidationError):
+            parse_socket_observations_jsonl(_encode_jsonl([_socket_record(bad_so)]))
 
     # PID reuse: worker started AFTER observed_at must reject even if inside probe ended_at.
+    # The socket-observations parser rejects a client that started after the observation.
     assert probe.shim_worker_process is not None
     reused_worker = ProcessIdentity(pid=probe.shim_worker_process.pid, started_at="2026-11-12T04:00:02.030000Z")
     reused_so = replace(so0, client_process=reused_worker, observed_at="2026-11-12T04:00:02.020000Z")
-    assert (
-        verify_native_connection(
-            replace(probe, shim_worker_process=reused_worker),
-            registration=reg,
-            observations=replace(
-                obs,
-                host_calls=(replace(obs.host_calls[0], shim_worker_process=reused_worker),),
-                owner_events=(replace(obs.owner_events[0], client_process=reused_worker),),
-                socket_observations=(reused_so,),
-            ),
-        )
-        is False
-    )
+    with pytest.raises(ProbeValidationError):
+        parse_socket_observations_jsonl(_encode_jsonl([_socket_record(reused_so)]))
 
     # Concurrent 4-tuple reuse (overlapping lifetime on exact same 4-tuple even for same worker) must reject.
     so_overlap = replace(
@@ -4065,10 +4170,141 @@ def test_t9_r02_socket_observation_lifetime_and_post_close_lookup_rejection(
         verify_native_connection(
             probe,
             registration=reg,
-            observations=replace(obs, socket_observations=(so0, so_overlap)),
+            observations=_obs_with_artifacts(obs, ev_root, "r02-overlap", socket_observations=(so0, so_overlap)),
         )
         is False
     )
+
+
+def test_t9_d8_f1_four_tuple_reuse_is_judged_by_lifetime_overlap(trusted_tmp: Path) -> None:
+    """T9-D8-F1: a foreign socket on the worker's exact 4-tuple rejects only when its lifetime overlaps."""
+    case_dir = trusted_tmp / "t9-d8-f1"
+    case_dir.mkdir(parents=True, exist_ok=True)
+    probe, reg, obs, ev_root = _sample_world(case_dir)
+    so0 = obs.socket_observations[0]
+    assert probe.shim_worker_process is not None and so0.client_process == probe.shim_worker_process
+
+    def _verify(label: str, socks: tuple[SocketObservation, ...]) -> bool:
+        return verify_native_connection(
+            probe, registration=reg, observations=_obs_with_artifacts(obs, ev_root, label, socket_observations=socks)
+        )
+
+    # Harness twin: rewriting the artifact with only the worker socket still verifies.
+    assert _verify("baseline", (so0,)) is True
+
+    # Another client process (different pid and start time) on the worker's exact 4-tuple.
+    def _foreign(label: str, client_started: str, started: str, observed: str, ended: str) -> SocketObservation:
+        return replace(
+            so0,
+            client_process=ProcessIdentity(pid=5201, started_at=client_started),
+            connection_id=f"conn-t9-d8-f1-{label}",
+            started_at=started,
+            observed_at=observed,
+            ended_at=ended,
+        )
+
+    # Positive: OS ephemeral-port reuse; the foreign connection closed before the worker socket opened.
+    before = _foreign(
+        "before",
+        "2026-11-12T04:00:00.150000Z",
+        "2026-11-12T04:00:00.200000Z",
+        "2026-11-12T04:00:00.300000Z",
+        "2026-11-12T04:00:01.900000Z",
+    )
+    assert _verify("before", (so0, before)) is True
+
+    # Positive: the foreign connection opened only after the whole probe call and worker socket ended.
+    after = _foreign(
+        "after",
+        "2026-11-12T04:00:02.250000Z",
+        "2026-11-12T04:00:02.300000Z",
+        "2026-11-12T04:00:02.400000Z",
+        "2026-11-12T04:00:03.000000Z",
+    )
+    assert _verify("after", (so0, after)) is True
+
+    # Negative: foreign lifetime overlaps the worker socket by 1 ms (concurrent reuse / spoofing).
+    overlap_1ms = _foreign(
+        "overlap1ms",
+        "2026-11-12T04:00:00.150000Z",
+        "2026-11-12T04:00:00.200000Z",
+        "2026-11-12T04:00:00.300000Z",
+        "2026-11-12T04:00:02.006000Z",
+    )
+    assert _verify("overlap1ms", (so0, overlap_1ms)) is False
+
+    # Negative: foreign lifetime identical to the worker socket's.
+    overlap_exact = _foreign(
+        "overlapexact",
+        "2026-11-12T04:00:00.150000Z",
+        so0.started_at,
+        so0.observed_at or so0.started_at,
+        so0.ended_at,
+    )
+    assert _verify("overlapexact", (so0, overlap_exact)) is False
+
+    # Negative: touching lifetimes count as overlap (conservative), at either worker endpoint.
+    touch_before = _foreign(
+        "touchbefore",
+        "2026-11-12T04:00:00.150000Z",
+        "2026-11-12T04:00:00.200000Z",
+        "2026-11-12T04:00:00.300000Z",
+        so0.started_at,
+    )
+    assert _verify("touchbefore", (so0, touch_before)) is False
+    touch_after = _foreign(
+        "touchafter",
+        "2026-11-12T04:00:02.100000Z",
+        so0.ended_at,
+        "2026-11-12T04:00:02.200000Z",
+        "2026-11-12T04:00:03.000000Z",
+    )
+    assert _verify("touchafter", (so0, touch_after)) is False
+
+    # Negative: a zero-length foreign interval sitting exactly on either worker endpoint.
+    zero_at_start = _foreign("zerostart", "2026-11-12T04:00:00.150000Z", so0.started_at, so0.started_at, so0.started_at)
+    assert _verify("zerostart", (so0, zero_at_start)) is False
+    zero_at_end = _foreign("zeroend", "2026-11-12T04:00:02.100000Z", so0.ended_at, so0.ended_at, so0.ended_at)
+    assert _verify("zeroend", (so0, zero_at_end)) is False
+
+
+def test_t9_d8_f2_worker_socket_and_owner_connection_rules_are_each_pinned(trusted_tmp: Path) -> None:
+    """T9-D8-F2-R1: each worker-socket conjunct and the owner connection_id uniqueness rule rejects on its own."""
+    case_dir = trusted_tmp / "t9-d8-f2"
+    case_dir.mkdir(parents=True, exist_ok=True)
+    probe, reg, obs, ev_root = _sample_world(case_dir)
+    so0 = obs.socket_observations[0]
+    oc0 = obs.owner_events[0]
+    assert probe.daemon_process is not None and so0.client_process == probe.shim_worker_process
+
+    def _verify(label: str, **channels: Any) -> bool:
+        return verify_native_connection(
+            probe, registration=reg, observations=_obs_with_artifacts(obs, ev_root, label, **channels)
+        )
+
+    # Harness twin: an extra, unjoined but well-formed worker socket is accepted.
+    extra = replace(so0, connection_id="conn-t9-extra", local_port=52002)
+    assert _verify("extra-ok", socket_observations=(so0, extra)) is True
+
+    # Every worker socket must match the owner's binding, even one no owner event joins.
+    for label, bad_extra in (
+        ("extra-remote-port", replace(extra, remote_port=9999)),
+        ("extra-daemon", replace(extra, daemon_process=replace(probe.daemon_process, pid=4999))),
+        ("extra-local-addr", replace(extra, local_addr="127.0.0.2")),
+        ("extra-remote-addr", replace(extra, remote_addr="127.0.0.2")),
+        ("extra-store", replace(extra, store_id="store-t9-other")),
+        ("extra-epoch", replace(extra, writer_epoch=5)),
+        ("extra-instance", replace(extra, instance_id="inst-t9-other")),
+        ("extra-incomplete", replace(extra, observation_status="observation_incomplete")),
+    ):
+        assert _verify(label, socket_observations=(so0, bad_extra)) is False, label
+
+    # Owner connection_ids are unique even when the second event belongs to another call.
+    oc_other_call = replace(oc0, call_id="call-t9-other")
+    assert _verify("dup-conn-unrelated-after", owner_events=(oc0, oc_other_call)) is False
+    assert _verify("dup-conn-unrelated-before", owner_events=(oc_other_call, oc0)) is False
+    oc_other_anon = replace(oc_other_call, client_process=None)
+    assert _verify("dup-conn-no-client", owner_events=(oc0, oc_other_anon)) is False
 
 
 def test_t9_r03_tool_scope_symmetry_and_d8_terminal_shape(trusted_tmp: Path) -> None:

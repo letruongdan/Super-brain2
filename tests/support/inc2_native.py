@@ -1587,6 +1587,7 @@ def verify_native_connection(
         so_e = _parse_utc_dt(so.ended_at)
         if so_s is None or so_e is None or so_s > so_e:
             return False
+        # One 4-tuple may serve several connections over time (ephemeral port reuse) but never two at once.
         sock_tuple = (so.local_addr, so.local_port, so.remote_addr, so.remote_port)
         for prev_conn, prev_s, prev_e in sock_intervals_by_tuple.get(sock_tuple, ()):
             if prev_conn != so.connection_id and prev_s <= so_e and so_s <= prev_e:
@@ -1622,16 +1623,6 @@ def verify_native_connection(
     if not worker_socks or len(worker_socks) != len(worker_socks_all):
         return False
 
-    worker_tuples = {(so.local_addr, so.local_port, so.remote_addr, so.remote_port) for so in worker_socks}
-    for so in observations.socket_observations:
-        if (so.local_addr, so.local_port, so.remote_addr, so.remote_port) in worker_tuples and (
-            so.client_process != probe.shim_worker_process
-            or so.daemon_process != probe.daemon_process
-            or so.store_id != probe.binding.store_id
-            or so.writer_epoch != probe.binding.writer_epoch
-            or so.instance_id != probe.binding.instance_id
-        ):
-            return False
     worker_sock_by_conn = {so.connection_id: so for so in worker_socks}
 
     seen_owner_conns: set[str] = set()
