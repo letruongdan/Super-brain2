@@ -1,5 +1,6 @@
 """CI diagnostic (macOS): can the owner map a live loopback client socket to its PID, and how fast? Prints only."""
 
+import os
 import socket
 import subprocess
 import sys
@@ -47,6 +48,13 @@ for i in range(0, max(0, used) // 4 - 1, 2):
 print(f"--- started_at libproc={own._libproc_started_at(client.pid)} "
       f"ps={subprocess.run(['ps', '-o', 'lstart=', '-p', str(client.pid)], capture_output=True, text=True).stdout.strip()} "
       f"api={own.process_started_at_for_pid(client.pid)}", flush=True)
+for label in ("holders", "holders"):
+    t0 = time.monotonic()
+    h = own._libproc_client_holders(client_port, listen_port)
+    print(f"--- {label} scan -> {h} {time.monotonic() - t0:.4f}s", flush=True)
+nall = lib.proc_listpids(1, 0, None, 0) // 4
+nuid = lib.proc_listpids(4, os.getuid(), None, 0) // 4
+print(f"--- pids all~{nall} uid~{nuid}", flush=True)
 client.stdin.close()  # type: ignore[union-attr]
 client.wait(timeout=10)
 conn.close()
