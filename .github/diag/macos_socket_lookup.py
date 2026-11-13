@@ -44,6 +44,9 @@ for i in range(0, max(0, used) // 4 - 1, 2):
         n = lib.proc_pidfdinfo(client.pid, fds[i], own._PROC_PIDFDSOCKETINFO, info, ctypes.sizeof(info))
         print(f"fd {fds[i]} n={n} parsed={own._parse_socket_fdinfo(info.raw[:n]) if n > 0 else None}", flush=True)
         print("hex[176:340]=" + info.raw[176:340].hex(), flush=True)
+print(f"--- started_at libproc={own._libproc_started_at(client.pid)} "
+      f"ps={subprocess.run(['ps', '-o', 'lstart=', '-p', str(client.pid)], capture_output=True, text=True).stdout.strip()} "
+      f"api={own.process_started_at_for_pid(client.pid)}", flush=True)
 client.stdin.close()  # type: ignore[union-attr]
 client.wait(timeout=10)
 conn.close()

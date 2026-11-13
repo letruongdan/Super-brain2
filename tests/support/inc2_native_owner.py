@@ -140,6 +140,11 @@ def process_started_at_for_pid(pid: int) -> str:
         dt = datetime.fromtimestamp(btime_s + (start_ticks / float(hz)), tz=UTC)
         return dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
+    if sys.platform == "darwin":
+        # ps forks/execs (tens of ms, whole seconds); a short connection closes before it returns.
+        started = _libproc_started_at(pid)
+        if started is not None:
+            return started
     out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True, check=True)
     raw = " ".join(out.stdout.split())
     parsed = datetime.strptime(raw, "%a %b %d %H:%M:%S %Y").astimezone(UTC)
@@ -218,6 +223,28 @@ _SOCKET_FDINFO_SIZE = 792
 _SOI_FAMILY_OFF = 24 + 160
 _SOI_KIND_OFF = 24 + 232
 _INSI_OFF = 24 + 240  # union soi_proto: in_sockinfo (SOCKINFO_IN=1) or tcp_sockinfo starting with it (SOCKINFO_TCP=2)
+
+
+_PROC_PIDTBSDINFO = 3
+_PROC_BSDINFO_SIZE = 136  # struct proc_bsdinfo: pbi_pid at 12, pbi_start_tvsec at 120, pbi_start_tvusec at 128
+
+
+def _libproc_started_at(pid: int) -> str | None:
+    """Canonical UTC process start time from ``proc_bsdinfo`` (microseconds); ``None`` if unavailable."""
+    import ctypes
+
+    try:
+        lib = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+    except OSError:
+        return None
+    buf = ctypes.create_string_buffer(_PROC_BSDINFO_SIZE)
+    if lib.proc_pidinfo(pid, _PROC_PIDTBSDINFO, 0, buf, _PROC_BSDINFO_SIZE) != _PROC_BSDINFO_SIZE:
+        return None
+    if struct.unpack_from("<I", buf.raw, 12)[0] != pid:
+        return None
+    sec, usec = struct.unpack_from("<QQ", buf.raw, 120)
+    dt = datetime.fromtimestamp(sec, tz=UTC) + timedelta(microseconds=usec)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 def _parse_socket_fdinfo(buf: bytes) -> tuple[str, int, str, int] | None:
