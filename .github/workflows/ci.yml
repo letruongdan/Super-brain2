@@ -35,6 +35,12 @@ jobs:
         continue-on-error: true
         shell: bash
         run: uv run --locked --python ${{ matrix.python }} python .github/diag/macos_socket_lookup.py
+      - name: Trace observer lookups in failing native tests (macOS)
+        if: runner.os == 'macOS'
+        continue-on-error: true
+        shell: bash
+        run: |
+          PYTHONPATH=".github/diag:." uv run --locked --python ${{ matrix.python }} python -m pytest -q -s -p holders_trace -p no:cacheprovider             "tests/integration/test_kernel_native_receipt_contract.py::test_t9_r02_tls_close_before_worker_return_and_ready_port_mismatch"             "tests/integration/test_kernel_native_receipt_contract.py::test_two_principals_one_store_id" 2>&1 | grep -E "\[trace\]|passed|failed|Error" | head -80
       - name: Run the gate
         shell: bash
         run: |
