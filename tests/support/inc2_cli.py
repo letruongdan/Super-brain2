@@ -1330,6 +1330,7 @@ class InstalledMcpPipeSession:
             )
         if self._write_error is not None:
             raise self._write_error
+        self._snapshot_descendant_identities()
         try:
             raw_line = self._lines.get(timeout=timeout)
         except queue.Empty as err:
@@ -1338,7 +1339,6 @@ class InstalledMcpPipeSession:
                 f"{self._label}: timed out after {timeout:.1f}s waiting for MCP response while stdin open "
                 f"(process_alive={alive}, stdin_closed={self._stdin.closed})\nstderr tail:\n{self._stderr_tail()}"
             ) from err
-        self._snapshot_descendant_identities()
         assert raw_line, (
             f"{self._label}: stdout reached EOF without emitting expected MCP response\n"
             f"stderr tail:\n{self._stderr_tail()}"
