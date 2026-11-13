@@ -11,10 +11,10 @@ Theo quy tắc tuyên bố của [spec rev22 mục 17.2–17.5](../superpowers/s
 Tính đến thời điểm commit tài liệu này:
 - Phần code, unit/integration/architecture/crash/wheel tests của Task 1–9 và checklist vận hành đã **triển khai trên nhánh** (`implemented` về mặt mã nguồn chưa đóng review).
 - Các ô gate **Linux** và **macOS** (Python 3.11 và 3.14): **`not_run`**.
-- Các phép thử host thật theo D8 (**Codex desktop app** và **Claude Code**): **`not_run`** (chờ phê duyệt D8 tách biệt sau khi pin F4/perf trên commit cuối).
+- D8 đã được owner duyệt cho Codex desktop app và Claude Code. Archive tại pin sản phẩm 80a7608 có 10 probe Claude và 5 probe Codex đã qua verifier Round 12. Claude có A/B/C và A+B đồng thời. Codex còn thiếu health tại A và A+B đồng thời. Nghiệm thu cuối đối chiếu source, wheel và verifier của từng lượt trong ledger.
 - **Lớp 2** (spec §11.3): **`unknown`** (thuộc SP2 / SP7).
 - **Mục mở kế thừa từ Task 8 (`T9-OPEN-W1`):** mẫu wire 1 MiB qua daemon thật dao động quanh ngân sách local 100 ms (86,5–100,9 ms tại `978e63a`); điều kiện đóng ghi tại ledger Task 8 §13.
-- **Review độc lập cuối cho Task 9**: **`closure pending`**.
+- **Review độc lập cuối cho Task 9**: Round 12 đã duyệt sửa verifier và seal 162 file. Source đã được chốt ở commit tiếp theo của nhánh. Receipt cuối, gate native và ma trận OS còn được đối chiếu trong ledger.
 
 ---
 
@@ -88,9 +88,9 @@ Quy ước theo §17.3 / §17.5: các bài kiểm trong `tests/integration/test_
 
 | Host (Q4) | Trạng thái T0 lịch sử | Verdict native T9 hiện tại | Ghi chú & điều kiện |
 |---|---|---|---|
-| **Codex desktop app** (`26.1106.6628.0`, `codex_desktop_gui`; T0 `26.1029.7803.0`) | `passed` (`t0r1`/`t0r2`) | `not_run` | Host Q4 mục tiêu cho Codex trên Desktop GUI; đã có checklist cô lập, đề xuất D8 & verifier; chờ phê duyệt D8 của owner (không thay thế bằng CLI) sau kiểm tra pin cuối |
+| **Codex desktop app** (`26.1106.6628.0`, `codex_desktop_gui`; T0 `26.1029.7803.0`) | `passed` (`t0r1`/`t0r2`) | Có probe đạt trên 80a7608; nghiệm thu cuối còn chờ | A có job thành công, B/C có health và job thành công. Thiếu health A và A+B đồng thời. D8 đã duyệt. Source/wheel và verifier digest giữ theo từng receipt. |
 | **Codex CLI** (`codex-cli 0.167.0-alpha.4.1`, `codex_cli_exec`; T0 `0.166.0-alpha.6`) | *(chẩn đoán phụ T0)* | `not_run` | Chỉ làm chẩn đoán phụ theo `codex_cli_exec`; **không** thay thế verdict của **Codex desktop app** |
-| **Claude Code** (`2.1.322 (Claude Code)`, `claude_cli_mcp_isolated`; T0 `2.1.317`) | `passed` (`t0r3`) | `not_run` | Đã có checklist cô lập, hồ sơ xin phép D8 & verifier; chờ phê duyệt D8 + quota của owner sau kiểm tra pin cuối |
+| **Claude Code** (`2.1.322 (Claude Code)`, `claude_cli_mcp_isolated`; T0 `2.1.317`) | `passed` (`t0r3`) | Có probe đạt trên 80a7608; đối chiếu pin cuối trong ledger | D8 đã duyệt. Có health/job tại A/B/C và A+B đồng thời, đúng scope và chung daemon với các probe Codex. |
 | **Antigravity Desktop** (`1.23.2` / `agy 1.5.1`) | `failed_r1_unsupported_in_i2` | `not_run` *(ngoài tập I2)* | Đã loại khỏi tập hỗ trợ I2 theo Owner Ruling `2026-11-05T19:05:18+07:00`; giữ nguyên lịch sử failure `t0r2` cho SP7 |
 | **OpenCode** (`2.2.0`) | `not_run` | `not_run` | Chưa được chọn cho I2; cần quyết định phạm vi và D8 |
 | **Cursor** | `not_run` | `not_run` | Chưa cài đặt / chưa được chọn cho I2; cần quyết định phạm vi và D8 |
