@@ -173,9 +173,7 @@ class Inc2ChildProcess:
         unmanaged_descendants_allowed: bool = False,
     ) -> None:
         self.args = tuple(str(a) for a in args)
-        self._unmanaged_descendants_allowed = unmanaged_descendants_allowed or any(
-            "_HOLDER_CHILD" in str(a) or "holder.pid" in str(a) for a in args
-        )
+        self._unmanaged_descendants_allowed = bool(unmanaged_descendants_allowed)
         self._job: _Win32ProcessJob | None = None
         self._job_assigned = False
         self._job_handle: int | None = None
@@ -194,6 +192,8 @@ class Inc2ChildProcess:
                 encoding="utf-8",
                 bufsize=1,
             )
+            if not self._job_assigned:
+                raise RuntimeError("Inc2ChildProcess requires Win32 Job Object assignment")
             self._job_handle = self._job.handle if self._job_assigned else None
         else:
             self._proc = subprocess.Popen(
@@ -480,9 +480,9 @@ class Inc2ChildProcess:
                     elif self._job is not None:
                         self.cleanup_unverified = True
             else:
-                if inner is not None and inner != launcher:
-                    _posix_kill_pid(inner)
                 if self._proc.poll() is None:
+                    if inner is not None and inner != launcher:
+                        _posix_kill_pid(inner)
                     with contextlib.suppress(OSError):
                         self._proc.kill()
                     with contextlib.suppress(subprocess.TimeoutExpired, OSError):

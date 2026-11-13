@@ -209,7 +209,11 @@ def _parse_lsof_client_pid(output: str, *, client_port: int, listen_port: int) -
     return None
 
 
-def _lookup_loopback_client_pid(client_port: int, listen_port: int) -> int | None:
+def _lookup_loopback_client_pid(
+    client_port: int,
+    listen_port: int,
+    **kwargs: Any,
+) -> int | None:
     if client_port <= 0 or listen_port <= 0:
         return None
     if sys.platform == "win32":
@@ -407,7 +411,10 @@ def _install_loopback_server_hooks(
         observed_at: str | None = None
         observed_ns: int | None = None
         with contextlib.suppress(OSError, subprocess.SubprocessError):
-            client_pid = _lookup_loopback_client_pid(peer_port, listen_port)
+            try:
+                client_pid = _lookup_loopback_client_pid(peer_port, listen_port, conn_state=conn_state)
+            except TypeError:
+                client_pid = _lookup_loopback_client_pid(peer_port, listen_port)
             if client_pid is not None:
                 if conn_state is not None and (conn_state["closed_event"].is_set() or conn_state["closing"]):
                     return None, None, None, None
@@ -737,6 +744,7 @@ def _install_loopback_server_hooks(
             "lock": threading.Lock(),
             "conn_started_ns": time.monotonic_ns(),
             "closed_event": threading.Event(),
+            "worker_entered_event": threading.Event(),
             "closing": False,
             "closing_ns": None,
             "closing_at": None,
@@ -772,6 +780,7 @@ def _install_loopback_server_hooks(
                 conn_state,
             )
         try:
+            conn_state["worker_entered_event"].set()
             orig_conn_worker(self, conn_id, raw_sock, accept_ns)
         finally:
             _mark_conn_closing(conn_state)

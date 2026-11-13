@@ -529,10 +529,16 @@ def _win32_spawn_in_job(
     **popen_kwargs: Any,
 ) -> tuple[subprocess.Popen[Any], bool]:
     """Spawn a subprocess attached to ``job`` before execution begins using CREATE_SUSPENDED."""
-    if sys.platform != "win32" or job is None or job.handle is None:
+    if sys.platform != "win32":
         proc = subprocess.Popen(popen_args, creationflags=creationflags, **popen_kwargs)
-        assigned = job.assign_process(getattr(proc, "_handle", None)) if job is not None else False
-        return proc, assigned
+        return proc, False
+
+    if job is None:
+        proc = subprocess.Popen(popen_args, creationflags=creationflags, **popen_kwargs)
+        return proc, False
+
+    if job.handle is None:
+        raise RuntimeError("Win32 Job Object handle is missing or closed before spawn")
 
     create_suspended = 0x00000004
     flags = creationflags | create_suspended
@@ -541,14 +547,23 @@ def _win32_spawn_in_job(
     assigned = job.assign_process(proc_handle)
     if not assigned:
         with contextlib.suppress(Exception):
-            _win32_resume_process(proc_handle)
+            if proc_handle is not None:
+                kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+                kernel32.TerminateProcess(ctypes.wintypes.HANDLE(int(proc_handle)), 1)
             proc.kill()
-        return proc, False
+            proc.wait(timeout=5)
+        raise RuntimeError(f"Failed to assign process {proc.pid} to Win32 Job Object before execution")
+
     resumed = _win32_resume_process(proc_handle)
     if not resumed:
         with contextlib.suppress(Exception):
+            if proc_handle is not None:
+                kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+                kernel32.TerminateProcess(ctypes.wintypes.HANDLE(int(proc_handle)), 1)
             proc.kill()
-        return proc, False
+            proc.wait(timeout=5)
+        raise RuntimeError(f"Failed to resume process {proc.pid} in Win32 Job Object")
+
     return proc, True
 
 
@@ -899,6 +914,8 @@ class InstalledServeProcess:
             creationflags=creationflags,
             start_new_session=start_new_session,
         )
+        if sys.platform == "win32" and not self._job_assigned:
+            raise RuntimeError("InstalledServeProcess requires Win32 Job Object assignment")
         self._job_handle: int | None = (
             self._job.handle if (self._job is not None and self._job_assigned) else None
         )
@@ -1213,6 +1230,8 @@ class InstalledMcpPipeSession:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
+        if sys.platform == "win32" and not self._job_assigned:
+            raise RuntimeError("InstalledMcpPipeSession requires Win32 Job Object assignment")
         assert self._proc.stdin is not None
         assert self._proc.stdout is not None
         assert self._proc.stderr is not None

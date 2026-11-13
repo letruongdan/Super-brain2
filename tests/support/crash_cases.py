@@ -547,6 +547,13 @@ def run_marked(
         creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if sys.platform == "win32" else 0,
         start_new_session=sys.platform != "win32",
     )
+    if sys.platform == "win32" and not _job_assigned:
+        with contextlib.suppress(Exception):
+            proc.kill()
+            proc.wait(timeout=5)
+        if job is not None:
+            job.close()
+        raise RuntimeError("run_marked requires Win32 Job Object assignment")
     assert proc.stdout is not None and proc.stderr is not None
     stderr_lines: queue.Queue[str | None] = queue.Queue()
     stdout_box: list[str] = []

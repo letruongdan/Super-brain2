@@ -4865,6 +4865,136 @@ def test_t9_r05_inc2_child_suspended_spawn_and_early_launcher_exit_cleanup(
     assert str(leaked_child_pid) not in check.stdout
 
 
+def test_t9_r05_win32_spawn_in_job_fail_closed_and_suspended_termination(
+    trusted_tmp: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T9-R05 P2: _win32_spawn_in_job fails closed without handle, and kills suspended on assign failure."""
+    if sys.platform != "win32":
+        pytest.skip("Win32-only Job Object test")
+    from tests.support import crash_cases, inc2_cli
+
+    base_py = str(getattr(sys, "_base_executable", sys.executable))
+
+    # 1. Missing or closed job handle fails BEFORE launch: process is not executed.
+    marker1 = trusted_tmp / "marker_no_handle.txt"
+    job_closed = inc2_cli._Win32ProcessJob(kill_on_close=False)
+    job_closed.close()
+    assert job_closed.handle is None
+    with pytest.raises(RuntimeError, match="handle is missing or closed"):
+        inc2_cli._win32_spawn_in_job(
+            job_closed,
+            [base_py, "-c", f"import pathlib; pathlib.Path(r'{marker1}').write_text('ran')"],
+        )
+    assert not marker1.exists(), "Child process must not be launched when job handle is None"
+
+    # 2. Assignment failure terminates launcher while suspended without resuming: marker is NOT created.
+    marker2 = trusted_tmp / "marker_assign_fail.txt"
+    job_active = inc2_cli._Win32ProcessJob(kill_on_close=True)
+    try:
+        monkeypatch.setattr(job_active, "assign_process", lambda _handle: False)
+        with pytest.raises(RuntimeError, match="Failed to assign process"):
+            inc2_cli._win32_spawn_in_job(
+                job_active,
+                [base_py, "-c", f"import pathlib; pathlib.Path(r'{marker2}').write_text('ran')"],
+            )
+        assert not marker2.exists(), "Suspended child must be terminated without running when assignment fails"
+    finally:
+        job_active.close()
+
+    # 3. Resume failure terminates launcher: marker is NOT created.
+    marker3 = trusted_tmp / "marker_resume_fail.txt"
+    job_active2 = inc2_cli._Win32ProcessJob(kill_on_close=True)
+    try:
+        monkeypatch.setattr(inc2_cli, "_win32_resume_process", lambda _handle: False)
+        with pytest.raises(RuntimeError, match="Failed to resume process"):
+            inc2_cli._win32_spawn_in_job(
+                job_active2,
+                [base_py, "-c", f"import pathlib; pathlib.Path(r'{marker3}').write_text('ran')"],
+            )
+        assert not marker3.exists(), "Suspended child must not execute when resume fails"
+    finally:
+        job_active2.close()
+
+    # 4. run_marked fails closed if job assignment fails.
+    with monkeypatch.context() as mp:
+        mp.setattr(
+            crash_cases,
+            "_win32_spawn_in_job",
+            lambda *args, **kwargs: (
+                subprocess.Popen([base_py, "-c", "import sys; sys.exit(0)"]),
+                False,
+            ),
+        )
+        with pytest.raises(RuntimeError, match="run_marked requires Win32 Job Object assignment"):
+            crash_cases.run_marked([base_py, "-c", "import sys; sys.exit(0)"], cwd=trusted_tmp)
+
+
+def test_t9_r05_inc2_child_argv_optout_and_posix_cleanup_boundaries(
+    trusted_tmp: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T9-R05 P2: Argv substrings cannot opt-out; POSIX close skips blind PID kill when launcher exited."""
+    import threading
+    from unittest import mock
+
+    from tests.support import inc2_child
+
+    base_py = str(getattr(sys, "_base_executable", sys.executable))
+
+    # 1. Argv with holder.pid or _HOLDER_CHILD substrings must NOT override unmanaged_descendants_allowed=False.
+    p = inc2_child.Inc2ChildProcess(
+        [base_py, "-c", "import sys; sys.exit(0)", "holder.pid.backup", "_HOLDER_CHILD"],
+        unmanaged_descendants_allowed=False,
+    )
+    assert p._unmanaged_descendants_allowed is False, "Argv substring must not enable unmanaged opt-out"
+    p._proc.wait(timeout=5.0)
+    p.close()
+    assert p.cleanup_unverified is False
+
+    # 2. Explicit flag unmanaged_descendants_allowed=True is honored.
+    p_opt = inc2_child.Inc2ChildProcess(
+        [base_py, "-c", "import sys; sys.exit(0)"],
+        unmanaged_descendants_allowed=True,
+    )
+    assert p_opt._unmanaged_descendants_allowed is True
+    p_opt._proc.wait(timeout=5.0)
+    p_opt.close()
+
+    # 3. POSIX: when launcher has already exited (poll() is not None), do NOT call _posix_kill_pid with stored PID.
+    mock_proc = mock.MagicMock()
+    mock_proc.poll.return_value = 0
+    mock_proc.stdin = None
+    mock_proc.stdout = None
+    mock_proc.stderr = None
+
+    posix_child = object.__new__(inc2_child.Inc2ChildProcess)
+    posix_child._proc = mock_proc
+    posix_child._closed = False
+    posix_child._inner_pid = 23456
+    posix_child._inner_ticks = None
+    posix_child._proc_ticks = None
+    posix_child._job = None
+    posix_child._job_handle = None
+    posix_child._job_assigned = False
+    posix_child._unmanaged_descendants_allowed = False
+    posix_child.cleanup_unverified = False
+    posix_child._lock = threading.Lock()
+    posix_child._hello_event = threading.Event()
+    mock_pump = mock.MagicMock()
+    mock_pump.is_alive.return_value = False
+    posix_child._ctrl_pump = mock_pump
+    posix_child._err_pump = mock_pump
+
+    posix_kills: list[int] = []
+    with monkeypatch.context() as mp:
+        mp.setattr(sys, "platform", "linux")
+        mp.setattr(inc2_child, "_posix_kill_pid", posix_kills.append)
+        posix_child.close()
+
+    assert len(posix_kills) == 0, f"POSIX close must not send SIGKILL to inner PID when launcher exited: {posix_kills}"
+
+
 def test_t9_r02_handshake_independent_of_collector_latency(
     trusted_tmp: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -4934,9 +5064,22 @@ def test_t9_r02_handshake_independent_of_collector_latency(
             # Client call must complete rapidly (< 150ms), and observation must degrade to observation_incomplete.
             lookup_started = threading.Event()
             lookup_release = threading.Event()
+            barrier_error: list[str] = []
 
-            def _held_lookup(_peer_port: int, _listen_port: int) -> int | None:
+            def _held_lookup(
+                _peer_port: int,
+                _listen_port: int,
+                conn_state: dict[str, Any] | None = None,
+            ) -> int | None:
                 lookup_started.set()
+                # Barrier: worker must enter orig_conn_worker concurrently while lookup is held.
+                # If prewait is present (e.g. 10ms), worker is blocked on lookup_fut.result()
+                # and worker_entered_event will not be set within 5ms.
+                if conn_state is not None:
+                    if not conn_state["worker_entered_event"].wait(timeout=0.005):
+                        barrier_error.append(
+                            "worker was blocked by collector prewait and did not enter concurrently within 5ms"
+                        )
                 lookup_release.wait(timeout=1.0)
                 return os.getpid()
 
@@ -4954,6 +5097,9 @@ def test_t9_r02_handshake_independent_of_collector_latency(
                     ),
                 )
             t_call = time.monotonic() - t0
+            assert not barrier_error, barrier_error[0]
+            # Ensure connection is closed before releasing the held lookup so observation degrades.
+            time.sleep(0.05)
             lookup_release.set()
 
             assert res_held.get("ok") is True
@@ -4963,13 +5109,22 @@ def test_t9_r02_handshake_independent_of_collector_latency(
             assert len(ev2) == 1
             assert ev2[0]["tool_name"] == "get_health"
             assert ev2[0]["response_flushed_ok"] is True
-            # When lookup is delayed beyond socket close, it degrades to observation_incomplete.
+            # When lookup is delayed beyond socket close, it MUST degrade to observation_incomplete.
             if sys.platform == "win32":
-                assert ev2[0]["observation_status"] in ("ok", "observation_incomplete")
+                assert ev2[0]["observation_status"] == "observation_incomplete"
             assert hook_state["pending_count"]() == 0
 
             # 3. Near-deadline handshake: client connects near deadline, observer prewait must not cause timeout.
-            res_deadline = h.open_client(monotonic_ns=client_clock.monotonic_ns).call(
+            # Controlled clock advances with real elapsed time to catch prewait delays.
+            t_call_start = time.monotonic_ns()
+            client_start_ns = 10_000_000_000
+            tight_deadline_ns = client_start_ns + 100_000_000  # 100 ms budget
+
+            def _controlled_clock() -> int:
+                return client_start_ns + (time.monotonic_ns() - t_call_start)
+
+            client = h.open_client(monotonic_ns=_controlled_clock)
+            res_deadline = client.call(
                 target,
                 ToolCommand(
                     tool="get_health",
@@ -4978,10 +5133,13 @@ def test_t9_r02_handshake_independent_of_collector_latency(
                     selected_scope=None,
                     correlation_id="corr-r02-deadline",
                 ),
+                deadline_ns=tight_deadline_ns,
             )
             assert res_deadline.get("ok") is True
             ev3 = [r for r in _drain_and_join_workers() if r.get("event") == "owner_call"]
             assert len(ev3) == 1
             assert ev3[0]["response_flushed_ok"] is True
+            if sys.platform == "win32":
+                assert ev3[0]["observation_status"] == "ok"
     finally:
         hook_state["uninstall"]()

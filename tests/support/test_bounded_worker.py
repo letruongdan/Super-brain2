@@ -535,7 +535,10 @@ def test_inc2_child_close_is_bounded_when_descendant_holds_stdout(
 ) -> None:
     pid_path = tmp_path / "holder.pid"
     monkeypatch.setattr(inc2_child, "_PUMP_JOIN_S", _SHORT_TIMEOUT_S, raising=False)
-    child = inc2_child.Inc2ChildProcess([sys.executable, "-I", "-S", "-c", _HOLDER_CHILD, str(pid_path), "stdout"])
+    child = inc2_child.Inc2ChildProcess(
+        [sys.executable, "-I", "-S", "-c", _HOLDER_CHILD, str(pid_path), "stdout"],
+        unmanaged_descendants_allowed=True,
+    )
     grandchild = _wait_for_pid(pid_path)
     try:
         child.send_command("resume")
