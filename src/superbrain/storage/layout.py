@@ -105,7 +105,7 @@ def _existing_reserved_entries(root: Path) -> list[Path]:
             names = os.listdir(root)
         except OSError as err:
             raise BrainError(ErrorCode.IO_ERROR, f"cannot list data root {root}: {err}") from err
-        found.extend(root / n for n in sorted(names) if os.path.normcase(n).startswith(_RESERVED_SIBLING_PREFIXES))
+        found.extend(root / n for n in sorted(names) if n.casefold().startswith(_RESERVED_SIBLING_PREFIXES))
     return found
 
 

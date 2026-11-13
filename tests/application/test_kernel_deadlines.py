@@ -254,7 +254,7 @@ class DedicatedOwnerHarness:
         self.scope: Scope
         self.domain: FixtureKernelDomain
         self.bridge: KernelBridge
-        self.owner_tid: int = -1
+        self.owner_thread: threading.Thread | None = None
 
         self._thread = threading.Thread(target=self._owner_main, name="test-kernel-owner", daemon=True)
         self._thread.start()
@@ -264,7 +264,7 @@ class DedicatedOwnerHarness:
 
     def _owner_main(self) -> None:
         try:
-            self.owner_tid = threading.get_ident()
+            self.owner_thread = threading.current_thread()
             self.rt = _open_fixture_runtime(self._root_dir, self._os)
             self.seeded = seed_principal_and_credential(self.rt.policy)
             self.binding = _register_ws(
@@ -337,7 +337,7 @@ class DedicatedOwnerHarness:
             self._cv.notify_all()
 
     def run_on_owner(self, fn: Callable[[], _R]) -> _R:
-        assert threading.get_ident() != self.owner_tid
+        assert threading.current_thread() is not self.owner_thread
         out: list[object] = []
         err: list[BaseException] = []
         done = threading.Event()
@@ -1125,7 +1125,7 @@ def test_prequeue_auth_and_hmac_do_not_call_policy_store_while_owner_is_blocked(
                 _orig: Callable[..., object] = orig,
                 **kw: object,
             ) -> object:
-                if threading.get_ident() != harness.owner_tid:
+                if threading.current_thread() is not harness.owner_thread:
                     non_owner_policy_calls.append(_m)
                     raise AssertionError(f"PolicyStore.{_m} called off owner thread!")
                 return _orig(*args, **kw)

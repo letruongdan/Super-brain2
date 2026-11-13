@@ -457,7 +457,7 @@ def test_worker_imports_no_storage_and_runs_one_thread_serially(
     assert project and all(name.startswith(("superbrain.core", "superbrain.application")) for name in project)
     assert "sqlite3" not in imported
 
-    threads: list[int] = []
+    threads: list[threading.Thread] = []
     active = [0, 0]  # current, peak
     lock = threading.Lock()
 
@@ -465,7 +465,7 @@ def test_worker_imports_no_storage_and_runs_one_thread_serially(
         with lock:
             active[0] += 1
             active[1] = max(active)
-        threads.append(threading.get_ident())
+        threads.append(threading.current_thread())
         with lock:
             active[0] -= 1
         return ()
@@ -478,7 +478,8 @@ def test_worker_imports_no_storage_and_runs_one_thread_serially(
         leases.append(_running(service, rt, clock))
         executor.submit(_item(service, leases[-1]))
     assert [_command(executor) for _ in leases] == [WorkerCompleted(lease) for lease in leases]
-    assert len(set(threads)) == 1 and threads[0] != threading.get_ident() and active[1] == 1
+    # Thread objects, not get_ident(): an exited worker's ident can be reused by a new thread.
+    assert all(t is threads[0] for t in threads) and threads[0] is not threading.current_thread() and active[1] == 1
 
 
 def test_running_cancel_is_cooperative_old_callback_conflicts_and_late_usage_settles_once(

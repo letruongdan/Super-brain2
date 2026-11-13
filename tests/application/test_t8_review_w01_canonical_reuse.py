@@ -99,21 +99,22 @@ class _Spy:
     """Counts ``canonical_request_payload`` calls per thread through every module binding of the function."""
 
     def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        self.calls: list[int] = []
+        self.calls: list[threading.Thread] = []
         self._lock = threading.Lock()
 
         def spy(call: object) -> bytes:
             with self._lock:
-                self.calls.append(threading.get_ident())
+                self.calls.append(threading.current_thread())
             return _ORIGINAL(call)  # type: ignore[arg-type]
 
         for name, module in list(sys.modules.items()):
             if name.startswith("superbrain") and getattr(module, "canonical_request_payload", None) is _ORIGINAL:
                 monkeypatch.setattr(module, "canonical_request_payload", spy)
 
-    def on(self, thread_id: int) -> int:
+    def on(self, thread: threading.Thread | None) -> int:
+        # Thread objects, not get_ident(): an exited thread's ident can be reused by another thread.
         with self._lock:
-            return sum(1 for ident in self.calls if ident == thread_id)
+            return sum(1 for t in self.calls if t is thread)
 
 
 def _submit(h: DedicatedOwnerHarness, args: dict[str, JsonValue]) -> object:
@@ -195,7 +196,7 @@ def test_w01_owner_serializes_a_fresh_queued_request_at_most_once(
     spy = _Spy(monkeypatch)
     sub = _submit(harness, _args(key))
     _expect_ok("prepare_task", sub.wait(timeout=5.0))  # type: ignore[attr-defined]
-    owner_calls = spy.on(harness.owner_tid)
+    owner_calls = spy.on(harness.owner_thread)
     assert owner_calls <= 1, f"owner serialized the same queued call {owner_calls} times"
     monkeypatch.undo()
     assert _stored_digest(harness, key) == sub.queued.request_digest  # type: ignore[attr-defined]
@@ -210,7 +211,7 @@ def test_w01_owner_serializes_a_queued_replay_at_most_once(
     spy = _Spy(monkeypatch)
     replay = _submit(harness, _args(key))
     assert _expect_ok("prepare_task", replay.wait(timeout=5.0)) == first  # type: ignore[attr-defined]
-    owner_calls = spy.on(harness.owner_tid)
+    owner_calls = spy.on(harness.owner_thread)
     assert owner_calls <= 1, f"owner serialized the same queued replay {owner_calls} times"
 
 
@@ -242,6 +243,6 @@ def test_w01_dispatch_reuses_context_bytes_without_serializing_again(
 
     result = harness.run_on_owner(run)
     _expect_ok("prepare_task", result)  # type: ignore[arg-type]
-    assert spy.on(harness.owner_tid) == 0, "dispatch serialized the call although the context carried its bytes"
+    assert spy.on(harness.owner_thread) == 0, "dispatch serialized the call although the context carried its bytes"
     monkeypatch.undo()
     assert _stored_digest(harness, key) == compute_canonical_payload_hmac(_active_key(harness), canonical)

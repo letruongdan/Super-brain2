@@ -30,13 +30,18 @@ jobs:
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as output:
               output.write(f"TMPDIR={temporary}\n")
           PY
+      - name: Diagnose loopback socket-to-PID lookup (macOS)
+        if: runner.os == 'macOS'
+        continue-on-error: true
+        shell: bash
+        run: uv run --locked --python ${{ matrix.python }} python .github/diag/macos_socket_lookup.py
       - name: Run the gate
         shell: bash
         run: |
           ev="${{ runner.temp }}/gate-evidence"
           mkdir -p "$ev"
           set +e
-          uv run --locked --python ${{ matrix.python }} python scripts/gate.py --python ${{ matrix.python }} --shards 4 --evidence-dir "$ev" > "$ev/launcher.out" 2> "$ev/launcher.err"
+          uv run --locked --python ${{ matrix.python }} python scripts/gate.py --python ${{ matrix.python }} --evidence-dir "$ev" > "$ev/launcher.out" 2> "$ev/launcher.err"
           code=$?
           echo "$code" > "$ev/launcher.exit"
           cat "$ev/launcher.out"

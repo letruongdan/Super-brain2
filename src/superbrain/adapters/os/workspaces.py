@@ -140,6 +140,24 @@ def _is_absolute(raw: str) -> bool:
     return raw.startswith("/")
 
 
+def _on_disk_spelling(resolved: str) -> str:
+    """Spell each component as its parent lists it: one identity on case-insensitive POSIX file systems (APFS)."""
+    parts = Path(resolved).parts
+    current = Path(parts[0])
+    for name in parts[1:]:
+        try:
+            entries = os.listdir(current)
+        except OSError:
+            entries = [name]  # unlistable ancestor: keep the resolved spelling (exact on case-sensitive systems)
+        if name not in entries:
+            folded = name.casefold()
+            same = [e for e in entries if e.casefold() == folded and os.path.samefile(current / e, current / name)]
+            if len(same) == 1:
+                name = same[0]
+        current = current / name
+    return str(current)
+
+
 def physical_checkout(raw_path: object) -> PhysicalCheckout:
     """Resolve an owner-supplied checkout path to its physical identity (links/junctions followed by the OS).
 
@@ -156,6 +174,8 @@ def physical_checkout(raw_path: object) -> PhysicalCheckout:
     is_directory = False
     try:
         resolved = os.path.realpath(raw_path, strict=True)
+        if sys.platform != "win32":  # Windows realpath already returns the on-disk case
+            resolved = _on_disk_spelling(resolved)
         resolved_stat = os.stat(resolved)
         same_directory = os.path.samestat(os.stat(raw_path), resolved_stat)  # confirmation only, never identity
         is_directory = stat.S_ISDIR(resolved_stat.st_mode)

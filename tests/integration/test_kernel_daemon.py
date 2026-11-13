@@ -4710,7 +4710,7 @@ def test_concurrent_future_cancel_and_unexpected_owner_exit_keep_loop_safe(
 
     def _arm_cancel_on_delivery(
         fut: Future[Any],
-        expected_tid: int,
+        expected_thread: threading.Thread,
         *,
         armed_after: threading.Event,
     ) -> tuple[threading.Event, threading.Event, threading.Event]:
@@ -4726,7 +4726,7 @@ def test_concurrent_future_cancel_and_unexpected_owner_exit_keep_loop_safe(
 
         def _pause_once_for_cancel() -> bool:
             nonlocal triggered
-            if threading.get_ident() != expected_tid or not armed_after.is_set():
+            if threading.current_thread() is not expected_thread or not armed_after.is_set():
                 return False
             with trig_lock:
                 if triggered:
@@ -4796,14 +4796,14 @@ def test_concurrent_future_cancel_and_unexpected_owner_exit_keep_loop_safe(
         endpoint_path_a = DataRoot.at(root_a).endpoint_path
         assert ready_a.endpoint.port > 0
         assert endpoint_path_a.exists()
-        owner_tid = loop_a.run_owner_action(threading.get_ident).result(timeout=1.0)
+        owner_thread = loop_a.run_owner_action(threading.current_thread).result(timeout=1.0)
 
         # Subcase A1: apply_worker_command(WorkerUsage(...)) racing Future.cancel() on set_result.
         gate_1, release_1 = _hold_owner_gate()
         usage_fut = loop_a.apply_worker_command(WorkerUsage(invocation_id, expected_usage))
         usage_delivering, usage_cancelled, usage_delivered = _arm_cancel_on_delivery(
             usage_fut,
-            owner_tid,
+            owner_thread,
             armed_after=usage_committed,
         )
         release_1.set()
@@ -4819,7 +4819,7 @@ def test_concurrent_future_cancel_and_unexpected_owner_exit_keep_loop_safe(
         err_fut: Future[None] = loop_a.run_owner_action(_raise_not_found)
         err_delivering, err_cancelled, err_delivered = _arm_cancel_on_delivery(
             err_fut,
-            owner_tid,
+            owner_thread,
             armed_after=err_action_ran,
         )
         release_2.set()
@@ -4839,7 +4839,7 @@ def test_concurrent_future_cancel_and_unexpected_owner_exit_keep_loop_safe(
         )
         call_delivering, call_cancelled, call_delivered = _arm_cancel_on_delivery(
             call_fut,
-            owner_tid,
+            owner_thread,
             armed_after=get_job_ran,
         )
         release_3.set()
@@ -4859,7 +4859,7 @@ def test_concurrent_future_cancel_and_unexpected_owner_exit_keep_loop_safe(
         )
         reply_delivering, reply_cancelled, reply_delivered = _arm_cancel_on_delivery(
             reply_fut,
-            owner_tid,
+            owner_thread,
             armed_after=get_job_ran,
         )
         release_4.set()
@@ -5144,7 +5144,7 @@ def test_stop_applies_shared_cutoff_to_arbiter_join_and_reports_overrun_when_arb
     """I2-T6A-R03: ``stop()`` bounds deadline-arbiter join by shared cutoff and reports ``OVERRUN`` if still alive."""
     base_now = _daemon_template.base_time + dt.timedelta(minutes=5)
     tok_a = _daemon_template.cred_a.token
-    caller_tid = threading.get_ident()
+    caller_thread = threading.current_thread()
 
     # Part A: Arbiter callback blocked past shared stop() cutoff -> bounded return + ShutdownState.OVERRUN.
     root_a, _, cfg_a = _instantiate_case(trusted_tmp, "r03-arbiter-join-overrun", _daemon_template)
@@ -5162,12 +5162,12 @@ def test_stop_applies_shared_cutoff_to_arbiter_join_and_reports_overrun_when_arb
     release_arbiter_cb = threading.Event()
     cb_released_marker = threading.Event()
     arbiter_cb_exited = threading.Event()
-    arbiter_cb_tids: list[int] = []
+    arbiter_cb_threads: list[threading.Thread] = []
     arbiter_cb_envs: list[CallResult] = []
 
     def _on_arbiter_done_a(done_fut: Future[CallResult]) -> None:
         try:
-            arbiter_cb_tids.append(threading.get_ident())
+            arbiter_cb_threads.append(threading.current_thread())
             arbiter_cb_envs.append(done_fut.result())
             arbiter_cb_entered.set()
             release_arbiter_cb.wait(timeout=2.4)
@@ -5191,7 +5191,7 @@ def test_stop_applies_shared_cutoff_to_arbiter_join_and_reports_overrun_when_arb
     try:
         ready_a = loop_a.start(cfg_a)
         epoch_a = ready_a.identity.writer_epoch
-        owner_tid_a = loop_a.run_owner_action(threading.get_ident).result(timeout=1.0)
+        owner_thread_a = loop_a.run_owner_action(threading.current_thread).result(timeout=1.0)
 
         hold_fut_a = loop_a.run_owner_action(_hold_owner_a)
         assert owner_held_a.wait(timeout=1.0), "owner did not enter hold barrier"
@@ -5202,7 +5202,7 @@ def test_stop_applies_shared_cutoff_to_arbiter_join_and_reports_overrun_when_arb
         )
         expiring_fut_a.add_done_callback(_on_arbiter_done_a)
         assert arbiter_cb_entered.wait(timeout=2.5), "deadline arbiter did not settle expiring get_job"
-        assert arbiter_cb_tids and arbiter_cb_tids[0] not in {caller_tid, owner_tid_a}
+        assert arbiter_cb_threads and all(arbiter_cb_threads[0] is not t for t in (caller_thread, owner_thread_a))
         assert arbiter_cb_envs[0]["ok"] is False
         assert cast(dict[str, JsonValue], arbiter_cb_envs[0]["error"])["code"] == ErrorCode.DEADLINE_EXCEEDED.value
 
@@ -5299,11 +5299,11 @@ def test_stop_applies_shared_cutoff_to_arbiter_join_and_reports_overrun_when_arb
     arbiter_cb_entered_b = threading.Event()
     release_arbiter_cb_b = threading.Event()
     arbiter_cb_exited_b = threading.Event()
-    arbiter_cb_tids_b: list[int] = []
+    arbiter_cb_threads_b: list[threading.Thread] = []
 
     def _on_arbiter_done_b(_done_fut: Future[CallResult]) -> None:
         try:
-            arbiter_cb_tids_b.append(threading.get_ident())
+            arbiter_cb_threads_b.append(threading.current_thread())
             arbiter_cb_entered_b.set()
             release_arbiter_cb_b.wait(timeout=2.5)
         finally:
@@ -5319,7 +5319,7 @@ def test_stop_applies_shared_cutoff_to_arbiter_join_and_reports_overrun_when_arb
     loop_b = create_daemon_owner_loop(os_=adapters_b, clock=clock_b)
     try:
         loop_b.start(cfg_b)
-        owner_tid_b = loop_b.run_owner_action(threading.get_ident).result(timeout=1.0)
+        owner_thread_b = loop_b.run_owner_action(threading.current_thread).result(timeout=1.0)
         hold_fut_b = loop_b.run_owner_action(_hold_owner_b)
         assert owner_held_b.wait(timeout=1.0)
 
@@ -5329,7 +5329,7 @@ def test_stop_applies_shared_cutoff_to_arbiter_join_and_reports_overrun_when_arb
         )
         expiring_fut_b.add_done_callback(_on_arbiter_done_b)
         assert arbiter_cb_entered_b.wait(timeout=2.5), "Part B arbiter callback did not fire"
-        assert arbiter_cb_tids_b and arbiter_cb_tids_b[0] not in {caller_tid, owner_tid_b}
+        assert arbiter_cb_threads_b and all(arbiter_cb_threads_b[0] is not t for t in (caller_thread, owner_thread_b))
 
         release_owner_b.set()
         assert hold_fut_b.result(timeout=1.0) is True
@@ -5373,7 +5373,7 @@ def test_stop_applies_shared_cutoff_to_arbiter_join_and_reports_overrun_when_arb
     arbiter_cb_entered_c = threading.Event()
     release_arbiter_cb_c = threading.Event()
     arbiter_cb_exited_c = threading.Event()
-    arbiter_cb_tids_c: list[int] = []
+    arbiter_cb_threads_c: list[threading.Thread] = []
     owner_held_c = threading.Event()
     release_owner_c = threading.Event()
     stop_ev_c = threading.Event()
@@ -5384,7 +5384,7 @@ def test_stop_applies_shared_cutoff_to_arbiter_join_and_reports_overrun_when_arb
 
     def _on_arbiter_done_c(_done_fut: Future[CallResult]) -> None:
         try:
-            arbiter_cb_tids_c.append(threading.get_ident())
+            arbiter_cb_threads_c.append(threading.current_thread())
             arbiter_cb_entered_c.set()
             release_arbiter_cb_c.wait(timeout=2.5)
         finally:
@@ -5418,7 +5418,7 @@ def test_stop_applies_shared_cutoff_to_arbiter_join_and_reports_overrun_when_arb
     try:
         assert ready_ev_c.wait(timeout=BOUND_WAIT_S)
         lp_c = loop_c_ref[0]
-        owner_tid_c = lp_c.run_owner_action(threading.get_ident).result(timeout=1.0)
+        owner_thread_c = lp_c.run_owner_action(threading.current_thread).result(timeout=1.0)
         hold_fut_c = lp_c.run_owner_action(_hold_owner_c)
         assert owner_held_c.wait(timeout=1.0)
 
@@ -5428,7 +5428,7 @@ def test_stop_applies_shared_cutoff_to_arbiter_join_and_reports_overrun_when_arb
         )
         expiring_fut_c.add_done_callback(_on_arbiter_done_c)
         assert arbiter_cb_entered_c.wait(timeout=2.5), "Part C arbiter callback did not fire"
-        assert arbiter_cb_tids_c and arbiter_cb_tids_c[0] not in {caller_tid, owner_tid_c}
+        assert arbiter_cb_threads_c and all(arbiter_cb_threads_c[0] is not t for t in (caller_thread, owner_thread_c))
 
         release_owner_c.set()
         assert hold_fut_c.result(timeout=1.0) is True
@@ -5650,14 +5650,14 @@ def test_stop_callers_return_at_cutoff_without_waiting_on_burst_notifier_bootstr
 
     burst_lock = threading.Lock()
     burst_thread_names: list[str] = []
-    burst_spawner_tids: list[int] = []
+    burst_spawner_threads: list[threading.Thread] = []
 
     def _gated_thread_start(thread_self: threading.Thread) -> None:
         t_name = thread_self.name
         if isinstance(t_name, str) and t_name.startswith("superbrain-cancel-notify-"):
             with burst_lock:
                 burst_thread_names.append(t_name)
-                burst_spawner_tids.append(threading.get_ident())
+                burst_spawner_threads.append(threading.current_thread())
             burst_bootstrap_entered.set()
             release_burst_bootstrap.wait(timeout=5.0)
         orig_thread_start(thread_self)
@@ -5665,7 +5665,7 @@ def test_stop_callers_return_at_cutoff_without_waiting_on_burst_notifier_bootstr
     loop = create_daemon_owner_loop(os_=adapters, clock=clock)
     first_stop_done = threading.Event()
     second_stop_done = threading.Event()
-    stop_caller_tids: list[int] = []
+    stop_caller_threads: list[threading.Thread] = []
     stop_caller_lock = threading.Lock()
     first_rep_box: list[ShutdownReport] = []
     second_rep_box: list[ShutdownReport] = []
@@ -5678,7 +5678,7 @@ def test_stop_callers_return_at_cutoff_without_waiting_on_burst_notifier_bootstr
 
     def _stop_caller_1() -> None:
         with stop_caller_lock:
-            stop_caller_tids.append(threading.get_ident())
+            stop_caller_threads.append(threading.current_thread())
         try:
             first_rep_box.append(loop.stop(grace_s=0.08))
         except BaseException as exc:  # noqa: BLE001
@@ -5688,7 +5688,7 @@ def test_stop_callers_return_at_cutoff_without_waiting_on_burst_notifier_bootstr
 
     def _stop_caller_2() -> None:
         with stop_caller_lock:
-            stop_caller_tids.append(threading.get_ident())
+            stop_caller_threads.append(threading.current_thread())
         try:
             second_rep_box.append(loop.stop(grace_s=1.5))
         except BaseException as exc:  # noqa: BLE001
@@ -5763,7 +5763,8 @@ def test_stop_callers_return_at_cutoff_without_waiting_on_burst_notifier_bootstr
     assert second_err_box == []
     assert first_returned_before_release is True
     assert second_returned_before_release is True
-    assert set(burst_spawner_tids).isdisjoint(stop_caller_tids)
+    # Thread objects, not get_ident(): a finished stop caller's ident can be reused by another thread.
+    assert not any(b is s for b in burst_spawner_threads for s in stop_caller_threads)
     assert len(first_rep_box) == 1
     assert (first_rep_box[0].state, first_rep_box[0].error_code, first_rep_box[0].cancelled_requests) == (
         ShutdownState.OVERRUN,
@@ -6133,7 +6134,7 @@ def test_stop_callers_never_run_callbacks_inline_when_owner_closes_notifier_befo
         return release_owner.wait(BOUND_WAIT_S)
 
     cb_lock = threading.Lock()
-    cb_thread_ids: list[int] = []
+    cb_threads: list[threading.Thread] = []
     cb_thread_names: list[str] = []
     cb_envelopes: list[CallResult] = []
     reply_cb_items: list[OwnerReply] = []
@@ -6145,7 +6146,7 @@ def test_stop_callers_never_run_callbacks_inline_when_owner_closes_notifier_befo
         try:
             env = done_f.result()
             with cb_lock:
-                cb_thread_ids.append(threading.get_ident())
+                cb_threads.append(threading.current_thread())
                 cb_thread_names.append(threading.current_thread().name)
                 cb_envelopes.append(env)
             cb_entered.set()
@@ -6166,7 +6167,7 @@ def test_stop_callers_never_run_callbacks_inline_when_owner_closes_notifier_befo
 
     loop = create_daemon_owner_loop(os_=adapters, clock=clock)
     stop_caller_lock = threading.Lock()
-    stop_caller_tids: set[int] = set()
+    stop_caller_threads_late: list[threading.Thread] = []
     first_stop_done = threading.Event()
     second_stop_done = threading.Event()
     first_rep_box: list[ShutdownReport] = []
@@ -6181,7 +6182,7 @@ def test_stop_callers_never_run_callbacks_inline_when_owner_closes_notifier_befo
 
     def _stop_1() -> None:
         with stop_caller_lock:
-            stop_caller_tids.add(threading.get_ident())
+            stop_caller_threads_late.append(threading.current_thread())
         try:
             first_rep_box.append(loop.stop(grace_s=0.08))
         except BaseException as exc:  # noqa: BLE001
@@ -6191,7 +6192,7 @@ def test_stop_callers_never_run_callbacks_inline_when_owner_closes_notifier_befo
 
     def _stop_2() -> None:
         with stop_caller_lock:
-            stop_caller_tids.add(threading.get_ident())
+            stop_caller_threads_late.append(threading.current_thread())
         try:
             second_rep_box.append(loop.stop(grace_s=1.5))
         except BaseException as exc:  # noqa: BLE001
@@ -6236,7 +6237,7 @@ def test_stop_callers_never_run_callbacks_inline_when_owner_closes_notifier_befo
                 has_work = bool(args or kwargs)
                 call_args = args
             with stop_caller_lock:
-                is_stop_caller = threading.get_ident() in stop_caller_tids
+                is_stop_caller = any(threading.current_thread() is t for t in stop_caller_threads_late)
             should_gate = False
             if has_work and is_stop_caller:
                 with submit_gate_lock:
@@ -6309,7 +6310,8 @@ def test_stop_callers_never_run_callbacks_inline_when_owner_closes_notifier_befo
     assert second_err_box == []
     assert first_returned_before_cb_release is True
     assert second_returned_before_cb_release is True
-    assert set(cb_thread_ids).isdisjoint(stop_caller_tids)
+    # Thread objects, not get_ident(): Linux reuses a finished stop caller's ident for later threads.
+    assert not any(cb is s for cb in cb_threads for s in stop_caller_threads_late)
     assert len(first_rep_box) == 1
     assert (first_rep_box[0].state, first_rep_box[0].error_code, first_rep_box[0].cancelled_requests) == (
         ShutdownState.OVERRUN,

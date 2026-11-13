@@ -2914,13 +2914,13 @@ def test_owner_driver_non_release_error_quiesced_and_timeout_logging(
 
             # 2. _is_quiesced() becomes True right after read_admitted_tool_command -> flushes DAEMON_UNAVAILABLE.
             orig_is_quiesced = h.server._is_quiesced
-            quiesce_calls_by_tid: dict[int, int] = {}
+            quiesce_calls_by_thread: dict[threading.Thread, int] = {}
 
             def _quiesced_post_admission() -> bool:
                 if threading.current_thread().name.startswith("superbrain-loopback-conn-"):
-                    tid = threading.get_ident()
-                    n = quiesce_calls_by_tid.get(tid, 0) + 1
-                    quiesce_calls_by_tid[tid] = n
+                    conn_thread = threading.current_thread()
+                    n = quiesce_calls_by_thread.get(conn_thread, 0) + 1
+                    quiesce_calls_by_thread[conn_thread] = n
                     if n == 3:
                         return True
                 return orig_is_quiesced()
@@ -4630,12 +4630,13 @@ def test_t9_r07_collector_submit_and_finalizer_start_failures_preserve_worker_an
             with monkeypatch.context() as mp:
                 mp.setattr(native_owner, "_lookup_loopback_client_pid", lambda _c, _l: None)
                 mp.setattr(threading.Thread, "start", _fail_finalizer_start)
-                # Force lookup_fut not yet done when _schedule_emit runs by gating lookup briefly.
+                # Force lookup_fut not yet done when _schedule_emit runs: the lookup is held until the gate opens.
+                # The 2.0 s fallback only bounds a broken run; the gate is opened as soon as the checks below end.
                 gate = threading.Event()
                 mp.setattr(
                     native_owner,
                     "_lookup_loopback_client_pid",
-                    lambda _c, _l: (gate.wait(timeout=0.3), None)[1],
+                    lambda _c, _l: (gate.wait(timeout=2.0), None)[1],
                 )
                 try:
                     res_th = h.open_client(monotonic_ns=client_clock.monotonic_ns).call(
@@ -4649,6 +4650,18 @@ def test_t9_r07_collector_submit_and_finalizer_start_failures_preserve_worker_an
                         ),
                     )
                     assert res_th.get("ok") is True
+                    # The reply is flushed before the server's close bookkeeping, so the slot is released
+                    # shortly after the client returns (8-12 ms seen under heavy CPU contention). Wait up to
+                    # 0.25 s, checked while the lookup is still gated: a worker that waits on the lookup or
+                    # on the 0.5 s collector would still hold its slot at that point.
+                    release_deadline = time.monotonic() + 0.25
+                    while True:
+                        with h.server._lock:
+                            slots = h.server._active_slots
+                        if slots == 0 or time.monotonic() >= release_deadline:
+                            break
+                        time.sleep(0.002)
+                    assert slots == 0, "transport slot stayed held while the client-pid lookup was pending"
                 finally:
                     gate.set()
 
