@@ -68,6 +68,7 @@ from tests.support.crash_child import EVENT_ID, EVENT_PAYLOAD
 from tests.support.inc2_cli import (
     InstalledMcpPipeSession,
     InstalledServeProcess,
+    _rollback_child_setup,
     _win32_descendant_identities_checked,
     _win32_popen_creation_ticks,
     _win32_spawn_in_job,
@@ -532,12 +533,13 @@ def run_marked(
     stopped and reported with ``timed_out=True``. No sleep orders anything: every step waits on the child's output.
     """
     extra = {"SUPERBRAIN_CRASHPOINT": crashpoint} if crashpoint is not None else None
+    child_env = clean_installed_subprocess_env(extra)
     job: _Win32ProcessJob | None = _Win32ProcessJob(kill_on_close=True) if sys.platform == "win32" else None
     proc, _job_assigned = _win32_spawn_in_job(
         job,
         list(cmd),
         cwd=cwd,
-        env=clean_installed_subprocess_env(extra),
+        env=child_env,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -547,23 +549,21 @@ def run_marked(
         creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if sys.platform == "win32" else 0,
         start_new_session=sys.platform != "win32",
     )
-    if sys.platform == "win32" and not _job_assigned:
-        with contextlib.suppress(Exception):
-            proc.kill()
-            proc.wait(timeout=5)
-        if job is not None:
-            job.close()
-        raise RuntimeError("run_marked requires Win32 Job Object assignment")
-    assert proc.stdout is not None and proc.stderr is not None
-    stderr_lines: queue.Queue[str | None] = queue.Queue()
-    stdout_box: list[str] = []
-    out = proc.stdout
-    pumps = [
-        threading.Thread(target=_pump, args=(proc.stderr, stderr_lines), daemon=True),
-        threading.Thread(target=lambda: stdout_box.append(out.read()), daemon=True),
-    ]
-    for pump in pumps:
-        pump.start()
+    pumps: list[threading.Thread] = []
+    with _rollback_child_setup(proc, job, readers=pumps):
+        if sys.platform == "win32" and not _job_assigned:
+            raise RuntimeError("run_marked requires Win32 Job Object assignment")
+        assert proc.stdout is not None and proc.stderr is not None
+        stderr_lines: queue.Queue[str | None] = queue.Queue()
+        stdout_box: list[str] = []
+        out = proc.stdout
+        pumps.extend((
+            threading.Thread(target=lambda: stdout_box.append(out.read()), daemon=True),
+            threading.Thread(target=_pump, args=(proc.stderr, stderr_lines), daemon=True),
+        ))
+        for pump in pumps:
+            pump.start()
+
     seen: list[str] = []
     ready: Endpoint | None = None
     timed_out = False

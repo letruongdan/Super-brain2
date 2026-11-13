@@ -4936,6 +4936,7 @@ def test_t9_r05_inc2_child_argv_optout_and_posix_cleanup_boundaries(
 ) -> None:
     """T9-R05 P2: Argv substrings cannot opt-out; POSIX close skips blind PID kill when launcher exited."""
     import threading
+    from types import SimpleNamespace
     from unittest import mock
 
     from tests.support import inc2_child
@@ -4961,7 +4962,7 @@ def test_t9_r05_inc2_child_argv_optout_and_posix_cleanup_boundaries(
     p_opt._proc.wait(timeout=5.0)
     p_opt.close()
 
-    # 3. POSIX: when launcher has already exited (poll() is not None), do NOT call _posix_kill_pid with stored PID.
+    # 3. POSIX: when launcher has already exited, no bare-PID signal may target the stored PID.
     mock_proc = mock.MagicMock()
     mock_proc.poll.return_value = 0
     mock_proc.stdin = None
@@ -4988,8 +4989,9 @@ def test_t9_r05_inc2_child_argv_optout_and_posix_cleanup_boundaries(
 
     posix_kills: list[int] = []
     with monkeypatch.context() as mp:
-        mp.setattr(sys, "platform", "linux")
-        mp.setattr(inc2_child, "_posix_kill_pid", posix_kills.append)
+        mp.setattr(inc2_child, "sys", SimpleNamespace(platform="linux"))
+        mp.setattr(inc2_child, "signal", SimpleNamespace(SIGKILL=9), raising=False)
+        mp.setattr(inc2_child, "os", SimpleNamespace(kill=lambda pid, _sig: posix_kills.append(pid)))
         posix_child.close()
 
     assert len(posix_kills) == 0, f"POSIX close must not send SIGKILL to inner PID when launcher exited: {posix_kills}"

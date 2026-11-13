@@ -13,7 +13,6 @@ import contextlib
 import json
 import os
 import queue
-import signal
 import subprocess
 import sys
 import threading
@@ -156,12 +155,6 @@ def _win32_terminate_and_wait_pid(
         win32api.CloseHandle(handle)
 
 
-def _posix_kill_pid(pid: int) -> None:
-    if sys.platform != "win32":
-        with contextlib.suppress(ProcessLookupError, PermissionError):
-            os.kill(pid, signal.SIGKILL)
-
-
 class Inc2ChildProcess:
     """Parent controller for one isolated ``serve`` or ``migrate`` child interpreter."""
 
@@ -174,17 +167,18 @@ class Inc2ChildProcess:
     ) -> None:
         self.args = tuple(str(a) for a in args)
         self._unmanaged_descendants_allowed = bool(unmanaged_descendants_allowed)
+        from tests.support.inc2_cli import _rollback_child_setup, _win32_spawn_in_job, _Win32ProcessJob
+
+        child_env = inc2_child_env(env_overrides)
         self._job: _Win32ProcessJob | None = None
         self._job_assigned = False
         self._job_handle: int | None = None
         if sys.platform == "win32":
-            from tests.support.inc2_cli import _win32_spawn_in_job, _Win32ProcessJob
-
             self._job = _Win32ProcessJob(kill_on_close=False)
             self._proc, self._job_assigned = _win32_spawn_in_job(
                 self._job,
                 list(args),
-                env=inc2_child_env(env_overrides),
+                env=child_env,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -192,13 +186,10 @@ class Inc2ChildProcess:
                 encoding="utf-8",
                 bufsize=1,
             )
-            if not self._job_assigned:
-                raise RuntimeError("Inc2ChildProcess requires Win32 Job Object assignment")
-            self._job_handle = self._job.handle if self._job_assigned else None
         else:
             self._proc = subprocess.Popen(
                 list(args),
-                env=inc2_child_env(env_overrides),
+                env=child_env,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -206,41 +197,48 @@ class Inc2ChildProcess:
                 encoding="utf-8",
                 bufsize=1,
             )
-        assert self._proc.stdin is not None
-        assert self._proc.stdout is not None
-        assert self._proc.stderr is not None
+        readers: list[threading.Thread] = []
+        with _rollback_child_setup(self._proc, self._job, readers=readers):
+            if self._job is not None:
+                if not self._job_assigned:
+                    raise RuntimeError("Inc2ChildProcess requires Win32 Job Object assignment")
+                self._job_handle = self._job.handle
+            assert self._proc.stdin is not None
+            assert self._proc.stdout is not None
+            assert self._proc.stderr is not None
 
-        self._lock = threading.Lock()
-        self._hello_event = threading.Event()
-        self._inner_pid: int | None = None
-        self._inner_ticks: int | None = None
-        proc_handle = getattr(self._proc, "_handle", None)
-        self._proc_ticks: int | None = (
-            _win32_handle_creation_ticks(int(proc_handle))
-            if (sys.platform == "win32" and proc_handle is not None)
-            else None
-        )
-        self.cleanup_unverified = bool(self._job is not None and not self._job_assigned)
-        self._events: queue.Queue[dict[str, JsonValue] | None] = queue.Queue()
-        self._buffered_events: list[dict[str, JsonValue]] = []
-        self._terminal_result_event: dict[str, JsonValue] | None = None
-        self._stderr_lines: list[str] = []
-        self._closed = False
+            self._lock = threading.Lock()
+            self._hello_event = threading.Event()
+            self._inner_pid: int | None = None
+            self._inner_ticks: int | None = None
+            proc_handle = getattr(self._proc, "_handle", None)
+            self._proc_ticks: int | None = (
+                _win32_handle_creation_ticks(int(proc_handle))
+                if (sys.platform == "win32" and proc_handle is not None)
+                else None
+            )
+            self.cleanup_unverified = bool(self._job is not None and not self._job_assigned)
+            self._events: queue.Queue[dict[str, JsonValue] | None] = queue.Queue()
+            self._buffered_events: list[dict[str, JsonValue]] = []
+            self._terminal_result_event: dict[str, JsonValue] | None = None
+            self._stderr_lines: list[str] = []
+            self._closed = False
 
-        self._ctrl_pump = threading.Thread(
-            target=self._pump_control,
-            args=(self._proc.stdout,),
-            name="inc2-child-ctrl-pump",
-            daemon=True,
-        )
-        self._err_pump = threading.Thread(
-            target=self._pump_stderr,
-            args=(self._proc.stderr,),
-            name="inc2-child-stderr-pump",
-            daemon=True,
-        )
-        self._ctrl_pump.start()
-        self._err_pump.start()
+            self._ctrl_pump = threading.Thread(
+                target=self._pump_control,
+                args=(self._proc.stdout,),
+                name="inc2-child-ctrl-pump",
+                daemon=True,
+            )
+            self._err_pump = threading.Thread(
+                target=self._pump_stderr,
+                args=(self._proc.stderr,),
+                name="inc2-child-stderr-pump",
+                daemon=True,
+            )
+            readers.extend((self._ctrl_pump, self._err_pump))
+            self._ctrl_pump.start()
+            self._err_pump.start()
 
     @property
     def launcher_pid(self) -> int:
@@ -416,11 +414,12 @@ class Inc2ChildProcess:
         return self.wait_result(timeout=timeout)
 
     def kill_and_verify(self, timeout: float = 10.0) -> None:
-        """Hard-kill BOTH ``inner_pid`` and ``launcher_pid`` and verify OS process termination."""
+        """Terminate the supervised process and require verified cleanup."""
         if self._proc.poll() is None and self.inner_pid is None:
             self._hello_event.wait(timeout=min(timeout, 3.0))
         self.close(timeout=timeout)
         assert self._proc.poll() is not None
+        assert not self.cleanup_unverified, "Child process cleanup could not be verified"
 
     def _close_pipes_and_join_pumps(self) -> None:
         if self._proc.stdin is not None:
@@ -433,7 +432,7 @@ class Inc2ChildProcess:
                     stream.close()
 
     def close(self, timeout: float = 10.0) -> None:
-        """Idempotent teardown ensuring zero leaked child or launcher processes."""
+        """Stop owned processes and flag cleanup that could not be verified."""
         if self._closed:
             return
         self._closed = True
@@ -481,14 +480,24 @@ class Inc2ChildProcess:
                         self.cleanup_unverified = True
             else:
                 if self._proc.poll() is None:
-                    if inner is not None and inner != launcher:
-                        _posix_kill_pid(inner)
                     with contextlib.suppress(OSError):
                         self._proc.kill()
                     with contextlib.suppress(subprocess.TimeoutExpired, OSError):
                         self._proc.wait(timeout=timeout)
 
             self._close_pipes_and_join_pumps()
+            if sys.platform != "win32":
+                # POSIX Popen owns the direct process. A PID from the control
+                # pipe cannot establish ownership of a different process.
+                reported_inner = self.inner_pid
+                self.cleanup_unverified = (
+                    self._proc.poll() is None
+                    or (reported_inner is not None and reported_inner != launcher)
+                    or (
+                        not self._unmanaged_descendants_allowed
+                        and (self._ctrl_pump.is_alive() or self._err_pump.is_alive())
+                    )
+                )
         finally:
             if self._job is not None:
                 self._job.close()

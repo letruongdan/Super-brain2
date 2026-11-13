@@ -27,8 +27,9 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
+from itertools import zip_longest
 from pathlib import Path
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, cast
@@ -521,6 +522,51 @@ def _win32_resume_process(proc_handle: int | None) -> bool:
         return False
 
 
+@contextlib.contextmanager
+def _rollback_child_setup(
+    proc: subprocess.Popen[Any] | None,
+    job: _Win32ProcessJob | None,
+    *,
+    readers: Sequence[threading.Thread] = (),
+) -> Iterator[None]:
+    """Release setup-owned processes, pipes and Job if initialization fails."""
+    try:
+        yield
+    except BaseException as setup_error:
+        try:
+            if job is not None and job.assigned:
+                try:
+                    if not job.terminate_and_wait():
+                        setup_error.add_note("Could not verify termination of all Win32 Job members")
+                except OSError as err:
+                    setup_error.add_note(f"Win32 Job termination failed: {err}")
+            if proc is not None:
+                with contextlib.suppress(OSError):
+                    proc.kill()
+                try:
+                    proc.wait(timeout=5)
+                except (OSError, subprocess.TimeoutExpired) as err:
+                    setup_error.add_note(f"Could not verify termination of process {proc.pid}: {err}")
+                if proc.stdin is not None:
+                    with contextlib.suppress(OSError, ValueError):
+                        proc.stdin.close()
+                for reader, pipe in zip_longest(readers, (proc.stdout, proc.stderr)):
+                    if reader is not None and reader.ident is not None:
+                        reader.join(timeout=0.5)
+                    if reader is not None and reader.is_alive():
+                        setup_error.add_note("A child pipe reader remained blocked during rollback")
+                    elif pipe is not None:
+                        with contextlib.suppress(OSError, ValueError):
+                            pipe.close()
+        finally:
+            if job is not None:
+                try:
+                    job.close()
+                except OSError as err:
+                    setup_error.add_note(f"Win32 Job handle close failed: {err}")
+        raise
+
+
 def _win32_spawn_in_job(
     job: _Win32ProcessJob | None,
     popen_args: Sequence[str | Path | os.PathLike[str]],
@@ -528,42 +574,22 @@ def _win32_spawn_in_job(
     creationflags: int = 0,
     **popen_kwargs: Any,
 ) -> tuple[subprocess.Popen[Any], bool]:
-    """Spawn a subprocess attached to ``job`` before execution begins using CREATE_SUSPENDED."""
-    if sys.platform != "win32":
-        proc = subprocess.Popen(popen_args, creationflags=creationflags, **popen_kwargs)
-        return proc, False
-
-    if job is None:
-        proc = subprocess.Popen(popen_args, creationflags=creationflags, **popen_kwargs)
-        return proc, False
+    """Attach the suspended child before resuming it; release the Job on setup failure."""
+    if sys.platform != "win32" or job is None:
+        return subprocess.Popen(popen_args, creationflags=creationflags, **popen_kwargs), False
 
     if job.handle is None:
         raise RuntimeError("Win32 Job Object handle is missing or closed before spawn")
 
     create_suspended = 0x00000004
-    flags = creationflags | create_suspended
-    proc = subprocess.Popen(popen_args, creationflags=flags, **popen_kwargs)
-    proc_handle = getattr(proc, "_handle", None)
-    assigned = job.assign_process(proc_handle)
-    if not assigned:
-        with contextlib.suppress(Exception):
-            if proc_handle is not None:
-                kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-                kernel32.TerminateProcess(ctypes.wintypes.HANDLE(int(proc_handle)), 1)
-            proc.kill()
-            proc.wait(timeout=5)
-        raise RuntimeError(f"Failed to assign process {proc.pid} to Win32 Job Object before execution")
-
-    resumed = _win32_resume_process(proc_handle)
-    if not resumed:
-        with contextlib.suppress(Exception):
-            if proc_handle is not None:
-                kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-                kernel32.TerminateProcess(ctypes.wintypes.HANDLE(int(proc_handle)), 1)
-            proc.kill()
-            proc.wait(timeout=5)
-        raise RuntimeError(f"Failed to resume process {proc.pid} in Win32 Job Object")
-
+    with _rollback_child_setup(None, job):
+        proc = subprocess.Popen(popen_args, creationflags=creationflags | create_suspended, **popen_kwargs)
+    with _rollback_child_setup(proc, job):
+        proc_handle = getattr(proc, "_handle", None)
+        if not job.assign_process(proc_handle):
+            raise RuntimeError(f"Failed to assign process {proc.pid} to Win32 Job Object before execution")
+        if not _win32_resume_process(proc_handle):
+            raise RuntimeError(f"Failed to resume process {proc.pid} in Win32 Job Object")
     return proc, True
 
 
@@ -900,6 +926,7 @@ class InstalledServeProcess:
         self._endpoint_path = data_root / "endpoint.json"
         creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if sys.platform == "win32" else 0
         start_new_session = sys.platform != "win32"
+        child_env = clean_installed_subprocess_env(extra_env)
         self._job: _Win32ProcessJob | None = (
             _Win32ProcessJob(kill_on_close=True) if sys.platform == "win32" else None
         )
@@ -907,24 +934,25 @@ class InstalledServeProcess:
             self._job,
             list(args),
             cwd=cwd,
-            env=clean_installed_subprocess_env(extra_env),
+            env=child_env,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             creationflags=creationflags,
             start_new_session=start_new_session,
         )
-        if sys.platform == "win32" and not self._job_assigned:
-            raise RuntimeError("InstalledServeProcess requires Win32 Job Object assignment")
-        self._job_handle: int | None = (
-            self._job.handle if (self._job is not None and self._job_assigned) else None
-        )
-        self._proc_ticks: int | None = (
-            _win32_popen_creation_ticks(self._proc) if sys.platform == "win32" else None
-        )
-        self._descendant_identities: list[tuple[int, int]] = []
-        self._closed = False
-        self.cleanup_unverified = bool(self._job is not None and not self._job_assigned)
+        with _rollback_child_setup(self._proc, self._job):
+            if sys.platform == "win32" and not self._job_assigned:
+                raise RuntimeError("InstalledServeProcess requires Win32 Job Object assignment")
+            self._job_handle: int | None = (
+                self._job.handle if (self._job is not None and self._job_assigned) else None
+            )
+            self._proc_ticks: int | None = (
+                _win32_popen_creation_ticks(self._proc) if sys.platform == "win32" else None
+            )
+            self._descendant_identities: list[tuple[int, int]] = []
+            self._closed = False
+            self.cleanup_unverified = bool(self._job is not None and not self._job_assigned)
 
     @property
     def pid(self) -> int:
@@ -1218,6 +1246,7 @@ class InstalledMcpPipeSession:
         script = installed_script_path(env, script_name)
         assert script.is_file(), f"Installed console script not found: {script}"
         self._label = f"{script_name} {' '.join(args)}".strip()
+        child_env = clean_installed_subprocess_env(extra_env)
         self._job: _Win32ProcessJob | None = (
             _Win32ProcessJob(kill_on_close=False) if sys.platform == "win32" else None
         )
@@ -1225,36 +1254,39 @@ class InstalledMcpPipeSession:
             self._job,
             [str(script), *args],
             cwd=cwd,
-            env=clean_installed_subprocess_env(extra_env),
+            env=child_env,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
-        if sys.platform == "win32" and not self._job_assigned:
-            raise RuntimeError("InstalledMcpPipeSession requires Win32 Job Object assignment")
-        assert self._proc.stdin is not None
-        assert self._proc.stdout is not None
-        assert self._proc.stderr is not None
-        self._stdin = self._proc.stdin
-        self._stdout = self._proc.stdout
-        self._stderr = self._proc.stderr
-        self._lines: queue.Queue[bytes] = queue.Queue()
-        self._reader = threading.Thread(target=self._read_stdout_lines, daemon=True)
-        self._reader.start()
-        self._stderr_bytes = bytearray()
-        self._stderr_pump = threading.Thread(target=self._drain_stderr, daemon=True)
-        self._stderr_pump.start()
-        self._writer: threading.Thread | None = None
-        self._write_error: OSError | ValueError | None = None
-        self._job_handle: int | None = (
-            self._job.handle if (self._job is not None and self._job_assigned) else None
-        )
-        self._proc_ticks: int | None = (
-            _win32_popen_creation_ticks(self._proc) if sys.platform == "win32" else None
-        )
-        self._descendants: list[tuple[int, int]] = []
-        self._closed = False
-        self.cleanup_unverified = bool(self._job is not None and not self._job_assigned)
+        readers: list[threading.Thread] = []
+        with _rollback_child_setup(self._proc, self._job, readers=readers):
+            if sys.platform == "win32" and not self._job_assigned:
+                raise RuntimeError("InstalledMcpPipeSession requires Win32 Job Object assignment")
+            assert self._proc.stdin is not None
+            assert self._proc.stdout is not None
+            assert self._proc.stderr is not None
+            self._stdin = self._proc.stdin
+            self._stdout = self._proc.stdout
+            self._stderr = self._proc.stderr
+            self._lines: queue.Queue[bytes] = queue.Queue()
+            self._reader = threading.Thread(target=self._read_stdout_lines, daemon=True)
+            self._stderr_bytes = bytearray()
+            self._stderr_pump = threading.Thread(target=self._drain_stderr, daemon=True)
+            self._writer: threading.Thread | None = None
+            self._write_error: OSError | ValueError | None = None
+            self._job_handle: int | None = (
+                self._job.handle if (self._job is not None and self._job_assigned) else None
+            )
+            self._proc_ticks: int | None = (
+                _win32_popen_creation_ticks(self._proc) if sys.platform == "win32" else None
+            )
+            self._descendants: list[tuple[int, int]] = []
+            self._closed = False
+            self.cleanup_unverified = bool(self._job is not None and not self._job_assigned)
+            readers.extend((self._reader, self._stderr_pump))
+            self._reader.start()
+            self._stderr_pump.start()
 
     def _read_stdout_lines(self) -> None:
         try:
