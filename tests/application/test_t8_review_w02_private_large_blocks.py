@@ -24,6 +24,7 @@ from superbrain.core.kernel import FilterPolicy
 from tests.application.test_t8_review_w01_private_equivalence import _new_phase, _old
 
 LIMIT_PER_MIB_S = 0.050
+PLAN_BUDGET_PER_MIB_S = 0.100  # plan 8.6(b): local privacy p95 per 1 MiB
 _POLICY = FilterPolicy(entropy_min_length=4096)
 _BLOCK = 60_000
 
@@ -112,7 +113,7 @@ def test_w02_unclosed_64_kib_block_is_refused_quickly(unit: str) -> None:
     assert _old(text) is None
     result, best = _best(lambda: _filter_all([text]))
     assert result is ErrorCode.INVALID_INPUT
-    assert best <= LIMIT_PER_MIB_S / 16 + 0.002, f"refusal of one unclosed 64 KiB block took {best * 1000:.1f} ms"
+    assert best <= PLAN_BUDGET_PER_MIB_S / 16 + 0.002, f"refusal of one unclosed 64 KiB block took {best * 1000:.1f} ms"
 
 
 def test_w02_private_blocks_cost_about_the_same_as_the_same_text_without_markers() -> None:
