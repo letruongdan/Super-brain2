@@ -92,6 +92,16 @@ def utc_now_z() -> str:
 
 _utc_now_z = utc_now_z
 
+# When a lookup first saw the holder of the client socket (per lookup thread): a uniqueness scan may finish after the
+# connection starts closing, but the binding is only as late as that sighting, not as the end of the scan.
+_SIGHTING = threading.local()
+
+
+def _note_sighting() -> None:
+    if getattr(_SIGHTING, "ns", None) is None:
+        _SIGHTING.ns = time.monotonic_ns()
+        _SIGHTING.at = _utc_now_z()
+
 
 def process_started_at_for_pid(pid: int) -> str:
     """Return canonical UTC RFC3339 process creation timestamp for ``pid``."""
@@ -297,7 +307,7 @@ def _libproc_client_holders(client_port: int, listen_port: int) -> set[int] | No
         return None
     pids = (ctypes.c_int * (count // 4 + 64))()
     got = lib.proc_listpids(_PROC_UID_ONLY, uid, pids, ctypes.sizeof(pids))
-    for pid in pids[: max(0, got) // 4]:
+    for pid in sorted(pids[: max(0, got) // 4], reverse=True):  # newest first: clients are recent processes
         if pid <= 0:
             continue
         size = lib.proc_pidinfo(pid, _PROC_PIDLISTFDS, 0, None, 0)
@@ -311,6 +321,7 @@ def _libproc_client_holders(client_port: int, listen_port: int) -> set[int] | No
             info = ctypes.create_string_buffer(_SOCKET_FDINFO_SIZE + 256)
             n = lib.proc_pidfdinfo(pid, fds[i], _PROC_PIDFDSOCKETINFO, info, ctypes.sizeof(info))
             if n > 0 and _parse_socket_fdinfo(info.raw[:n]) == want:
+                _note_sighting()
                 found.add(int(pid))
     return found
 
@@ -520,17 +531,22 @@ def _install_loopback_server_hooks(
         client_started_at: str | None = None
         observed_at: str | None = None
         observed_ns: int | None = None
+        sighted = False
         with contextlib.suppress(OSError, subprocess.SubprocessError):
+            _SIGHTING.ns = _SIGHTING.at = None
             try:
                 client_pid = _lookup_loopback_client_pid(peer_port, listen_port, conn_state=conn_state)
             except TypeError:
                 client_pid = _lookup_loopback_client_pid(peer_port, listen_port)
             if client_pid is not None:
-                if conn_state is not None and (conn_state["closed_event"].is_set() or conn_state["closing"]):
+                sighted = _SIGHTING.ns is not None
+                if not sighted and conn_state is not None and (
+                    conn_state["closed_event"].is_set() or conn_state["closing"]
+                ):
                     return None, None, None, None
                 client_started_at = process_started_at_for_pid(client_pid)
-                observed_ns = time.monotonic_ns()
-                observed_at = _utc_now_z()
+                observed_ns = _SIGHTING.ns if sighted else time.monotonic_ns()
+                observed_at = _SIGHTING.at if sighted else _utc_now_z()
         if (
             client_pid is None
             or client_started_at is None
@@ -540,11 +556,12 @@ def _install_loopback_server_hooks(
             return None, None, None, None
         if conn_state is not None:
             with conn_state["lock"]:
-                if (
-                    conn_state["closing"]
-                    or conn_state["closed_event"].is_set()
-                    or observed_ns < conn_state["conn_started_ns"]
-                ):
+                closing_ns = conn_state["closing_ns"]
+                if sighted:  # the holder was seen at observed_ns; only a close that began before it disqualifies
+                    late = closing_ns is not None and closing_ns < observed_ns
+                else:
+                    late = conn_state["closing"] or conn_state["closed_event"].is_set()
+                if late or observed_ns < conn_state["conn_started_ns"]:
                     return None, None, None, None
         return client_pid, client_started_at, observed_at, observed_ns
 
