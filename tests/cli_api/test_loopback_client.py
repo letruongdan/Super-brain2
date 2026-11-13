@@ -905,29 +905,44 @@ def test_wrong_identity_receives_only_probe(inc2_tls_material: SampleTlsMaterial
 
             return _handler
 
-        with MockTlsServer(valid_server_ctx, handler=make_handler(payload)) as server:
-            ep = Endpoint(
-                version=1,
-                host="127.0.0.1",
-                port=server.port,
-                store_id="store-1",
-                writer_epoch=1,
-                instance_id="inst-1",
-                contract="mcp-tools-v2",
-            )
-            target = LoopbackTarget(ep, "store-1", valid_ca_pem, valid_leaf_sha)
+        # An attempt can end before the identity reply is evaluated: the 2 s real-time connect budget can expire
+        # under a CI stall, or the mock server's TLS handshake can fail under load (seen in WSL: client
+        # SSLError UNEXPECTED_MESSAGE, server handshake_count 0, no probe received). Every attempt must still send
+        # at most one probe, no POST and no secret; a fresh attempt (at most 3) is made only when the server
+        # received no probe or the deadline expired.
+        attempts = 0
+        for _ in range(3):
+            attempts += 1
+            with MockTlsServer(valid_server_ctx, handler=make_handler(payload)) as server:
+                ep = Endpoint(
+                    version=1,
+                    host="127.0.0.1",
+                    port=server.port,
+                    store_id="store-1",
+                    writer_epoch=1,
+                    instance_id="inst-1",
+                    contract="mcp-tools-v2",
+                )
+                target = LoopbackTarget(ep, "store-1", valid_ca_pem, valid_leaf_sha)
 
-            with pytest.raises(LoopbackTransportError) as exc_info:
-                client.call(target, command)
-            assert exc_info.value.request_may_have_run is False, f"Failed request_may_have_run on subcase {label}"
-            assert server.get_count == 1, f"Expected exactly 1 probe on {label}"
-            assert server.post_count == 0, f"Expected 0 POSTs on {label}"
-            # Verify the GET request had NO Authorization header
-            assert len(server.requests) >= 1
-            assert "authorization" not in server.requests[0].headers
-            # Verify zero token or tool args leaked across raw decrypted wire
-            assert secret_token.encode() not in server.raw_http_bytes
-            assert b"get_health" not in server.raw_http_bytes
+                with pytest.raises(LoopbackTransportError) as exc_info:
+                    client.call(target, command)
+                assert exc_info.value.request_may_have_run is False, f"Failed request_may_have_run on subcase {label}"
+                assert server.get_count <= 1, f"Expected at most 1 probe on {label}"
+                assert server.post_count == 0, f"Expected 0 POSTs on {label}"
+                # Verify the GET request had NO Authorization header
+                assert all("authorization" not in r.headers for r in server.requests)
+                # Verify zero token or tool args leaked across raw decrypted wire
+                assert secret_token.encode() not in server.raw_http_bytes
+                assert b"get_health" not in server.raw_http_bytes
+                if server.get_count == 1 and exc_info.value.code is not ErrorCode.DEADLINE_EXCEEDED:
+                    break
+        assert exc_info.value.code is ErrorCode.IDENTITY_MISMATCH, (
+            f"{label}: identity never evaluated after {attempts} attempt(s): {exc_info.value.code} "
+            f"(handshakes={server.handshake_count}, probes={server.get_count}, cause={exc_info.value.__cause__!r})"
+        )
+        assert server.get_count == 1, f"Expected exactly 1 probe on {label}"
+        assert len(server.requests) == 1
 
     # Subcase: Overlong 5,000-digit Content-Length on GET /v2/identity fails identity verification with 0 POSTs
     def overlong_cl_identity_handler(req: MockHttpRequest, sock: ssl.SSLSocket) -> bytes | None:

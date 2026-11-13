@@ -4333,6 +4333,58 @@ def test_t9_d8_f2_worker_socket_and_owner_connection_rules_are_each_pinned(trust
     assert _verify("dup-conn-no-client", owner_events=(oc0, oc_other_anon)) is False
 
 
+def test_t9_f8_previous_call_still_closing_is_not_attributed_to_the_host_call(trusted_tmp: Path) -> None:
+    """T9-F8: back-to-back calls from one worker verify; only owner events received inside the host call relate.
+
+    The host stamps a call's start before sending it and the owner stamps receipt on the same machine clock, so an
+    owner event received before the host call started belongs to an earlier call, even if it is still closing.
+    """
+    case_dir = trusted_tmp / "t9-f8"
+    case_dir.mkdir(parents=True, exist_ok=True)
+    probe, reg, obs, ev_root = _sample_world(case_dir, tool_name="get_job")
+    so0, oc0, hc0 = obs.socket_observations[0], obs.owner_events[0], obs.host_calls[0]
+    assert (hc0.started_at, hc0.ended_at) == ("2026-11-12T04:00:02.000000Z", "2026-11-12T04:00:02.150000Z")
+    assert verify_native_connection(probe, registration=reg, observations=obs) is True
+
+    def _previous_call(label: str, started_at: str) -> bool:
+        # The same worker's earlier get_health call on its own connection; its reply was already delivered, but
+        # the owner records its end (and its socket's) only once the connection closes inside this host call.
+        prev_so = replace(
+            so0,
+            connection_id=f"conn-t9-f8-{label}",
+            local_port=52002,
+            started_at="2026-11-12T04:00:01.980000Z",
+            observed_at="2026-11-12T04:00:01.985000Z",
+            ended_at="2026-11-12T04:00:02.004000Z",
+        )
+        prev_oc = replace(
+            oc0,
+            tool_name="get_health",
+            selected_scope=None,
+            call_id=None,  # wheel owners cannot see host call ids
+            response_digest=digest_bytes(canonical_json({"ok": True, "data": {"ready": True, "prev": label}})),
+            connection_id=prev_so.connection_id,
+            client_port=prev_so.local_port,
+            started_at=started_at,
+            ended_at="2026-11-12T04:00:02.003000Z",
+        )
+        return verify_native_connection(
+            probe,
+            registration=reg,
+            observations=_obs_with_artifacts(
+                obs, ev_root, label, owner_events=(prev_oc, oc0), socket_observations=(prev_so, so0)
+            ),
+        )
+
+    # Received 10 ms before the host call started: an earlier call still closing -> not this call's evidence.
+    assert _previous_call("before", "2026-11-12T04:00:01.990000Z") is True
+    # Received 1 ms after the host call started: a second call during this call -> related, and it conflicts.
+    assert _previous_call("inside", "2026-11-12T04:00:02.001000Z") is False
+    # Received at the host call's start stamp: the host stamps before sending, so a request the owner already
+    # holds at that instant can only be concurrent or forged -> related, and it conflicts.
+    assert _previous_call("at-start", "2026-11-12T04:00:02.000000Z") is False
+
+
 def test_t9_r03_tool_scope_symmetry_and_d8_terminal_shape(trusted_tmp: Path) -> None:
     """T9-R03: Reject scoped shallow get_health, non-D8 ok tools, and malformed host/owner terminals."""
     from tests.support.inc2_native import parse_host_calls_jsonl, parse_owner_events_jsonl

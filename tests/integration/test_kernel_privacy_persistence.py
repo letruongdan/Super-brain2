@@ -41,7 +41,7 @@ from superbrain.core.kernel import (
 from superbrain.storage.backup import create_store_backup
 from superbrain.storage.runtime import Runtime
 from superbrain.workers.executor import JobContext, JobExecutor, JobHandlerError, WorkItem
-from tests.integration.test_kernel_receipts import intercept_sends
+from tests.integration.test_kernel_receipts import intercept_sends, record_sends_by_connection, wait_for_frames
 from tests.support import inc2_t8_harness
 from tests.support.inc2_cli import (
     InstalledMcpPipeSession,
@@ -343,12 +343,13 @@ def test_privacy_canary_absent_from_durable_and_observed_outputs(
             assert any(L1_CONTENT in data for data in observed.values()), "no safe content reached the shim"
 
             lost = [False]
+            record_send, frames_done = record_sends_by_connection()
 
             def drop_episode(raw: bytes, real_send: Callable[[bytes], int]) -> int | None:
                 if not lost[0] and b'"episode_id"' in raw:
                     lost[0] = True
                     raise BrokenPipeError("fixture lost the committed response")
-                return None
+                return record_send(raw, real_send)
 
             sends = intercept_sends(h, drop_episode)
             retry_args = episode_args(task_id, "privacy-response-loss-0001", _canary_evidence())
@@ -368,6 +369,10 @@ def test_privacy_canary_absent_from_durable_and_observed_outputs(
             )
             assert proxy.filtered_calls == 3 and count(root, EPISODE_TABLE) == 2
             assert len(proxy.outbox) == 2
+            # The server records a send after send() returns: wait (bounded) until the last reply is recorded in
+            # full so the privacy scan covers every byte the daemon wrote.
+            rejected = f'"{ErrorCode.INVALID_INPUT.value}"'.encode()
+            assert wait_for_frames(frames_done, rejected, WAIT_S), "the rejected reply was never recorded"
             observed["daemon HTTP sends"] = b"".join(sends)
         _dead_letter(h, rt, template, binding)
         live = h.loop.run_owner_action(lambda: _live_files(rt, root)).result(timeout=WAIT_S)
@@ -509,7 +514,6 @@ def test_health_stays_shallow_under_owner_saturation(
                 assert overflow["error"]["code"] == ErrorCode.STORE_BUSY.value
 
                 read_ns: list[int] = []
-                write_ns: list[int] = []
                 db_opens: list[str] = []
                 read_tool = read_admitted_tool_command
                 connect = cast(Callable[..., sqlite3.Connection], sqlite3.connect)
@@ -518,10 +522,7 @@ def test_health_stays_shallow_under_owner_saturation(
                     read_ns.append(time.perf_counter_ns())
                     return read_tool(*args, **kwargs)
 
-                def sent(raw: bytes, send: Callable[[bytes], int]) -> int:
-                    count = send(raw)
-                    write_ns.append(time.perf_counter_ns())
-                    return count
+                sent, frames_done = record_sends_by_connection()
 
                 def open_db(*args: Any, **kwargs: Any) -> sqlite3.Connection:
                     db_opens.append("opened")
@@ -532,7 +533,11 @@ def test_health_stays_shallow_under_owner_saturation(
                     monitor.setattr(sqlite3, "connect", open_db)
                     monitor.setattr(_loopback_server, "read_admitted_tool_command", read)
                     health = _success(shim.call("get_health", {"schema_version": "2.0", "deep": False}))
-                assert len(read_ns) == 1 and 0 < write_ns[-1] - read_ns[0] <= TOTAL_REQUEST_BUDGET_NS
+                # The health frame is identified by content and completeness, never as "the last send": the
+                # server records a send after send() returns, so the client can hold the reply first.
+                written = wait_for_frames(frames_done, b'"policy_schema_version"', WAIT_S)
+                assert len(read_ns) == 1 and len(written) == 1, (read_ns, written)
+                assert 0 < written[0] - read_ns[0] <= TOTAL_REQUEST_BUDGET_NS
                 assert db_opens == [] and not release.is_set() and not blocker.done()
                 assert all(not future.done() for future in waiting), "shallow health drained the owner queue"
                 assert health["ready"] is True

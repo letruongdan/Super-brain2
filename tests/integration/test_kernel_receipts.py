@@ -259,6 +259,65 @@ def intercept_sends(h: TransportHarness, on_send: Callable[[bytes, Callable[[byt
     return written
 
 
+def record_sends_by_connection() -> tuple[
+    Callable[[bytes, Callable[[bytes], int]], int], Callable[[bytes], list[int]]
+]:
+    """An ``intercept_sends`` hook that timestamps every send per server connection thread, and a reader.
+
+    ``frames_done(marker)`` returns, for each complete HTTP response frame whose body contains ``marker``, the perf
+    counter ns at which its last byte was accepted. The server records a send only after ``send()`` returns, so a
+    client can hold the reply before the record exists: callers wait (bounded) for the frame instead of reading
+    "the last send", which may be an earlier one.
+    """
+    sends: dict[threading.Thread, list[tuple[int, bytes]]] = {}
+    lock = threading.Lock()
+
+    def record(raw: bytes, real: Callable[[bytes], int]) -> int:
+        count = real(raw)
+        done = time.perf_counter_ns()
+        with lock:
+            sends.setdefault(threading.current_thread(), []).append((done, raw[:count]))
+        return count
+
+    def frames_done(marker: bytes) -> list[int]:
+        with lock:
+            conns = [list(chunks) for chunks in sends.values()]
+        found: list[int] = []
+        for chunks in conns:
+            stream = b"".join(chunk for _ns, chunk in chunks)
+            ends: list[int] = []
+            total = 0
+            for _ns, chunk in chunks:
+                total += len(chunk)
+                ends.append(total)
+            pos = 0
+            while (head_end := stream.find(b"\r\n\r\n", pos)) >= 0:
+                head = stream[pos:head_end]
+                length = next(
+                    (int(v) for k, _, v in (ln.partition(b":") for ln in head.split(b"\r\n"))
+                     if k.strip().lower() == b"content-length"),
+                    None,
+                )
+                assert length is not None, "response frame without Content-Length"
+                frame_end = head_end + 4 + length
+                if frame_end > len(stream):
+                    break  # incomplete: its last send has not been recorded (yet)
+                if marker in stream[head_end + 4:frame_end]:
+                    found.append(next(ns for (ns, _c), end in zip(chunks, ends, strict=True) if end >= frame_end))
+                pos = frame_end
+        return found
+
+    return record, frames_done
+
+
+def wait_for_frames(frames_done: Callable[[bytes], list[int]], marker: bytes, timeout: float) -> list[int]:
+    """Poll ``frames_done(marker)`` until it reports a frame or ``timeout`` seconds pass; returns the last result."""
+    deadline = time.monotonic() + timeout
+    while not (found := frames_done(marker)) and time.monotonic() < deadline:
+        time.sleep(0.005)
+    return found
+
+
 def replies_done(h: TransportHarness) -> Callable[[int], None]:
     """Count owner replies; the returned ``wait(n)`` blocks until ``n`` replies completed (an owner barrier)."""
     cond = threading.Condition()
@@ -309,13 +368,7 @@ def test_writable_shim_observes_commit_unknown_before_release(
             assert release.wait(timeout=BARRIER_S), "the test never released the commit barrier"
 
         proxy.inner.before_apply_hook = hold
-        flushed: list[tuple[int, bytes]] = []
-
-        def record(raw: bytes, real: Callable[[bytes], int]) -> int:
-            sent = real(raw)
-            flushed.append((time.perf_counter_ns(), raw[:sent]))
-            return sent
-
+        record, frames_done = record_sends_by_connection()
         intercept_sends(h, record)
         key = "idem-t8-commit-unknown-0001"
         frame = mcp_call_frame(
@@ -343,17 +396,11 @@ def test_writable_shim_observes_commit_unknown_before_release(
                     result = cast(dict[str, Any], first["result"])
                     sc = result["structuredContent"]
                     assert result["isError"] is True and sc["error"]["code"] == ErrorCode.COMMIT_OUTCOME_UNKNOWN.value
-                    stream = b"".join(raw for _, raw in flushed)
-                    response = b"HTTP/1.1 " + stream.rsplit(b"HTTP/1.1 ", 1)[1]
-                    head, _, body = response.partition(b"\r\n\r\n")
-                    length = next(
-                        int(v)
-                        for k, _, v in (ln.partition(b":") for ln in head.split(b"\r\n"))
-                        if k.lower() == b"content-length"
-                    )
-                    assert len(body) == length, "the daemon did not flush the complete HTTP body"
-                    assert b"commit_outcome_unknown" in body
-                    flush_ms = (flushed[-1][0] - t0) / 1_000_000
+                    # Only a complete frame counts; the wait covers the server recording its send after the
+                    # client already holds the reply.
+                    flushed = wait_for_frames(frames_done, b"commit_outcome_unknown", BARRIER_S)
+                    assert len(flushed) == 1, "the daemon did not flush the complete commit_outcome_unknown body"
+                    flush_ms = (flushed[0] - t0) / 1_000_000
                     assert 1475 <= flush_ms <= 1500, f"daemon finished flushing at t0 + {flush_ms:.3f} ms"
                     again = shim.send_frames_and_expect_response([frame | {"id": 3}], timeout=BARRIER_S)
                     again_sc = cast(dict[str, Any], again["result"])["structuredContent"]
@@ -581,7 +628,8 @@ def test_complete_http_with_broken_stdout_stays_served_only(
     Positive twin: that explicit ``record_outcome`` then records exactly one ReadAck for the attempt."""
     with fixture_daemon(monkeypatch, tpl, root) as (h, _proxy, tracker):
         task_id, delivery_id = _task(h, tpl, "idem-t8-stdout-prep-0001")
-        written = intercept_sends(h, lambda raw, real: None)
+        record, frames_done = record_sends_by_connection()
+        intercept_sends(h, record)
         profile = shim_profile(h, ws_a(tpl), "stdout", tpl.cred.token)
         caller = build_tool_caller(profile, Path(ws_a(tpl).checkout_path), os_adapters())
         init, initialized = mcp_init_frames(1)
@@ -590,7 +638,8 @@ def test_complete_http_with_broken_stdout_stays_served_only(
         stdout = _BrokenStdout()
         run_stdio(stdin, stdout, caller)  # type: ignore[arg-type]
         assert stdout.failed >= 1, "the shim never tried to write the artifact to its host"
-        assert b"served_receipt_id" in b"".join(written), "the daemon never flushed the artifact"
+        # Bounded wait: the server records its send only after send() returns, possibly after the shim read it.
+        assert wait_for_frames(frames_done, b"served_receipt_id", BARRIER_S), "the daemon never flushed the artifact"
         ((attempt_id, _lr, _state),) = attempts(root)
         assert settled_state(tracker, root, str(attempt_id)) == "served_only"
         settle(h)

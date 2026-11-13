@@ -1663,7 +1663,9 @@ def verify_native_connection(
             return oc.call_id == probe.observed_call_id
         oc_start = _parse_utc_dt(oc.started_at)
         oc_end = _parse_utc_dt(oc.ended_at)
-        if oc_start is None or oc_end is None or oc_end < hc_start or oc_start > hc_end:
+        # The owner cannot receive this call's request before the host issues it (same clock): an event received
+        # earlier belongs to a previous call, even while its connection is still closing inside this window.
+        if oc_start is None or oc_end is None or oc_end < hc_start or oc_start < hc_start or oc_start > hc_end:
             return False
         if oc.connection_id is not None and oc.connection_id in sock_by_conn:
             so = sock_by_conn[oc.connection_id]
