@@ -112,7 +112,7 @@ def test_w02_unclosed_64_kib_block_is_refused_quickly(unit: str) -> None:
     assert _old(text) is None
     result, best = _best(lambda: _filter_all([text]))
     assert result is ErrorCode.INVALID_INPUT
-    assert best <= LIMIT_PER_MIB_S / 16 + 0.005, f"refusal of one unclosed 64 KiB block took {best * 1000:.1f} ms"
+    assert best <= LIMIT_PER_MIB_S / 16 + 0.002, f"refusal of one unclosed 64 KiB block took {best * 1000:.1f} ms"
 
 
 def test_w02_private_blocks_cost_about_the_same_as_the_same_text_without_markers() -> None:
