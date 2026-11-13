@@ -206,37 +206,201 @@ def _gate_open(pattern: re.Pattern[str], text: str, lowered: str | None) -> bool
     return pairs is None or any(pair in text for pair in pairs)
 
 
+def _glob_units(glob: str) -> list[str]:
+    """fnmatch units of one component: ``*``, ``?``, a closed ``[...]`` class, or one literal character."""
+    units: list[str] = []
+    i = 0
+    while i < len(glob):
+        if glob[i] == "[":
+            j = i + 1
+            if j < len(glob) and glob[j] == "!":
+                j += 1
+            if j < len(glob) and glob[j] == "]":
+                j += 1
+            close = glob.find("]", j)
+            if close >= 0:
+                units.append(glob[i : close + 1])
+                i = close + 1
+                continue
+        units.append(glob[i])
+        i += 1
+    return units
+
+
+def _unit_regex(unit: str) -> str:
+    """One fnmatch unit as an unanchored regex (``fnmatch.translate`` ends with a two-character end anchor)."""
+    translated = fnmatch.translate(unit)
+    assert translated.endswith(("\\Z", "\\z"))
+    return translated[:-2]
+
+
+class _Glob:
+    """One component glob, with the fixed-width head/tail used to pick the few trimmed spellings worth testing.
+
+    Each non-``*`` unit matches exactly one character. Without ``*`` a match has a fixed width. With ``*``, a match
+    is head + anything + tail with stars at both inner ends, so keeping more characters next to a matching head or
+    tail never breaks a match: the smallest trim whose head (tail) fits is the only one to test. Fits are found by
+    one regex search (the tail on the reversed text), so the cost is linear in the wrapper run, not per position.
+    """
+
+    def __init__(self, glob: str) -> None:
+        self.full = re.compile(fnmatch.translate(glob))
+        units = _glob_units(glob)
+        self.star = "*" in units
+        if self.star:
+            first = units.index("*")
+            last = len(units) - 1 - units[::-1].index("*")
+            head, tail = units[:first], units[last + 1 :]
+            # Only stars between head and tail: a fitting head and tail with room between them is a full match.
+            self.simple = all(unit == "*" for unit in units[first : last + 1])
+        else:
+            head, tail = units, []
+            self.simple = True
+        self.h, self.t = len(head), len(tail)
+        self.head_rx = re.compile("".join(map(_unit_regex, head)))
+        self.tail_rx = re.compile("".join(map(_unit_regex, tail)))
+        self.tail_rev_rx = re.compile("".join(map(_unit_regex, reversed(tail))))
+
+    def _kept(self, piece: str) -> bool:
+        return piece not in ("", ".") and (self.simple or self.full.fullmatch(piece) is not None)
+
+    def _head_at(self, seg: str, low: int, high: int) -> int | None:
+        """Smallest ``p`` in ``[low, high]`` where the head fits at ``seg[p:]``."""
+        if high < low:
+            return None
+        found = self.head_rx.search(seg, low, high + self.h)
+        return found.start() if found else None
+
+    def _tail_at(self, rev: str, high: int) -> int | None:
+        """Smallest ``s <= high`` where the tail fits right before the last ``s`` characters (``rev`` = reversed)."""
+        if high < 0:
+            return None
+        found = self.tail_rev_rx.search(rev, 0, high + self.t)
+        return found.start() if found else None
+
+    def first_edge(self, seg: str, lead: int) -> int | None:
+        """Smallest ``p <= lead`` with ``seg[p:]`` a kept, matching component (``None`` when there is none)."""
+        n, h, t = len(seg), self.h, self.t
+        if not self.star:
+            p = n - h if 0 <= n - h <= lead and self.head_rx.fullmatch(seg, n - h) else None
+        else:
+            tail_fits = n - t >= 0 and self.tail_rx.fullmatch(seg, n - t) is not None
+            p = self._head_at(seg, 0, min(lead, n - h - t)) if tail_fits else None
+        return p if p is not None and self._kept(seg[p:]) else None
+
+    def last_edge(self, seg: str, rev: str, trail: int) -> int | None:
+        """Smallest ``s <= trail`` with ``seg[:len - s]`` a kept, matching component."""
+        n, h, t = len(seg), self.h, self.t
+        if not self.star:
+            s = n - h if 0 <= n - h <= trail and self.head_rx.fullmatch(seg, 0, h) else None
+        else:
+            head_fits = self.head_rx.fullmatch(seg, 0, h) is not None
+            s = self._tail_at(rev, min(trail, n - h - t)) if head_fits else None
+        return s if s is not None and self._kept(seg[: n - s]) else None
+
+    def single(self, seg: str, rev: str, lead: int, trail: int) -> tuple[int, int] | None:
+        """``(p, s)`` with ``seg[p:len - s]`` a kept match, both trims inside their runs (``None`` when none)."""
+        n, h, t = len(seg), self.h, self.t
+        if not self.star:
+            low, high = max(0, n - h - trail), min(lead, n - h)
+            # A lone "." can only sit at the end of the leading run, so no later start is left to try.
+            p = self._head_at(seg, low, high)
+            return (p, n - h - p) if p is not None and self._kept(seg[p : p + h]) else None
+        p = self._head_at(seg, 0, lead)
+        if p is None:
+            return None
+        s = self._tail_at(rev, min(trail, n - h - t - p))  # negative when head and tail would overlap: no match
+        return (p, s) if s is not None and self._kept(seg[p : n - s]) else None
+
+
 class _PathMatcher:
     """Component-boundary matcher for blocked path patterns (``name``, ``dir/`` and ``a/b`` chains)."""
 
     def __init__(self, patterns: tuple[str, ...]) -> None:
         self._chains: list[list[re.Pattern[str]]] = []
+        self._name_globs: list[_Glob] = []
+        self._chain_globs: list[list[_Glob]] = []
         names: list[str] = []
         for pattern in patterns:
             # ``name``, ``dir/`` and ``a/b`` (either separator): globs over a window of consecutive token components.
             parts = blocked_path_components(pattern)
             if len(parts) == 1:
                 names.append(fnmatch.translate(parts[0]))
+                self._name_globs.append(_Glob(parts[0]))
             elif parts:
                 self._chains.append([re.compile(fnmatch.translate(part)) for part in parts])
+                self._chain_globs.append([_Glob(part) for part in parts])
         self._names = re.compile("|".join(f"(?:{n})" for n in names)) if names else None
         self._results: dict[str, bool] = {}
         self._needles = _path_needles(patterns)
+
+    def may_block(self, token: str) -> bool:
+        """False only when no spelling inside ``token`` can match: every match holds one of the needles."""
+        if self._needles is None:
+            return True
+        low = token.lower()
+        return any(needle in low for needle in self._needles)
 
     def blocked(self, token: str) -> bool:
         cached = self._results.get(token)
         if cached is not None:
             return cached
         result = self._matches(token)
-        if len(self._results) < 1024:
+        if len(token) <= 256 and len(self._results) < 1024:  # bounded memory: long tokens are not cached
             self._results[token] = result
         return result
+
+    def find(self, token: str) -> tuple[int, int] | None:
+        """§14.2 for a wrapped token: ``(p, s)`` such that ``token[p:len - s]`` is a blocked spelling, where ``p``
+        and ``s`` trim inside the leading and trailing wrapper runs (measured on the whole token), else ``None``.
+
+        Trimming only changes the first and the last component, so the token is split once and each glob is tested
+        on a handful of edge spellings (see ``_Glob``): linear in the token, with no cap on the wrapper runs.
+        """
+        low = token.lower()  # wrapper runs are ASCII, so their lengths match between ``token`` and ``low``
+        lead = len(low) - len(low.lstrip(_PATH_LEAD))
+        trail = len(low) - len(low.rstrip(_PATH_TRAIL))
+        if lead + trail < len(low) and self.blocked(token[lead : len(token) - trail]):
+            return lead, trail  # the fully trimmed spelling first: every wrapper outside it is kept
+        if not lead and not trail:
+            return None
+        segs = _PATH_SPLIT.split(low)
+        if len(segs) == 1:
+            rev = low[::-1]
+            return next((hit for g in self._name_globs if (hit := g.single(low, rev, lead, trail)) is not None), None)
+        first, last = segs[0], segs[-1]
+        last_rev = last[::-1]
+        mid = [part for part in segs[1:-1] if part and part != "."]
+        for g in self._name_globs:
+            if (p := g.first_edge(first, lead)) is not None:
+                return p, trail
+            if (s := g.last_edge(last, last_rev, trail)) is not None:
+                return lead, s
+        for chain in self._chain_globs:
+            inner = len(chain) - 1
+            if len(mid) >= inner and all(g.full.fullmatch(part) for g, part in zip(chain[1:], mid, strict=False)):
+                if (p := chain[0].first_edge(first, lead)) is not None:
+                    return p, trail
+            if len(mid) >= inner and all(
+                g.full.fullmatch(part) for g, part in zip(chain[:-1], mid[len(mid) - inner :], strict=True)
+            ):
+                if (s := chain[-1].last_edge(last, last_rev, trail)) is not None:
+                    return lead, s
+            if len(mid) == len(chain) - 2 and all(
+                g.full.fullmatch(part) for g, part in zip(chain[1:-1], mid, strict=True)
+            ):
+                p, s = chain[0].first_edge(first, lead), chain[-1].last_edge(last, last_rev, trail)
+                if p is not None and s is not None:
+                    return p, s
+        return None
 
     def _matches(self, token: str) -> bool:
         low = token.lower()
         if self._needles is not None and not any(needle in low for needle in self._needles):
             return False
-        parts = [p for p in _PATH_SPLIT.split(low) if p and p != "."]
+        return self._matches_parts([p for p in _PATH_SPLIT.split(low) if p and p != "."])
+
+    def _matches_parts(self, parts: list[str]) -> bool:
         for index, part in enumerate(parts):
             if self._names is not None and self._names.fullmatch(part):
                 return True

@@ -12,8 +12,6 @@ from superbrain.application._privacy_rules import (
     _CREDENTIAL_USER,
     _FIXED_TOKENS,
     _KEY_VALUE_SECRET,
-    _PATH_LEAD,
-    _PATH_TRAIL,
     _PEM_BEGIN,
     _PEM_END,
     _SEGMENT,
@@ -22,6 +20,18 @@ from superbrain.application._privacy_rules import (
     _PathMatcher,
     _Reject,
     _tokenish,
+)
+
+# ``\s`` and ``str.isspace`` agree (one Unicode whitespace table). Only ASCII letters lowercase to the letters of
+# "private" (checked over every code point), so these classes equal a match on the lowercased text. Two blank
+# runs are never adjacent (a ``/`` sits between them), which keeps long blank runs linear.
+_PRIVATE_WORD = "[pP][rR][iI][vV][aA][tT][eE]"
+_PRIVATE_START = rf"<\s*(?:/\s*)?{_PRIVATE_WORD}"
+_PRIVATE_MARK = re.compile(_PRIVATE_START)
+# Block body: runs of non-``<`` text and ``<`` that does not start a marker (unrolled, so each character is
+# consumed once). It stops right before the first marker start, which must then be a closing marker.
+_PRIVATE_BLOCK = re.compile(
+    rf"<\s*{_PRIVATE_WORD}\s*>[^<]*(?:<(?!\s*(?:/\s*)?{_PRIVATE_WORD})[^<]*)*<\s*/\s*{_PRIVATE_WORD}\s*>"
 )
 
 
@@ -49,73 +59,17 @@ class _TextScans:
     def _private(self, text: str) -> str:
         """``<private>…</private>`` -> ``[redacted]``; any malformed, orphan or nested marker refuses.
 
-        A marker is ``<`` [ws] [``/``] [ws] ``private`` [ws] ``>`` (case-insensitive). Each ``private`` occurrence
-        is inspected once, looking back over the whitespace run before it and forward over the one after it.
+        A marker starts with ``<`` [ws] [``/``] [ws] ``private`` (case-insensitive) and must close with [ws] ``>``.
+        Valid blocks are an opening marker, text holding no marker start, and a closing marker; a marker start left
+        after replacing them (unclosed, orphan, nested or without ``>``) refuses. Two regex passes, linear.
         """
         if "<" not in text:
             return text
-        low = text.lower()
-        if "private" not in low:
-            return text
-        if len(low) != len(text):  # a few characters lowercase to two; keep offsets aligned with ``text``
-            low = "".join(ch.lower() if len(ch.lower()) == 1 else ch for ch in text)
-        n = len(low)
-        out: list[str] = []
-        cursor = 0
-        open_at = -1
-        find = low.find
-        index = find("private")
-        while index != -1:
-            end = index + 7
-            if index >= 1 and end < n:
-                prev_ch = low[index - 1]
-                next_ch = low[end]
-                if prev_ch == "<" and next_ch == ">":
-                    if open_at >= 0:
-                        raise _Reject
-                    out.append(text[cursor : index - 1])
-                    open_at = index - 1
-                    index = find("private", end)
-                    continue
-                if prev_ch == "/" and index >= 2 and low[index - 2] == "<" and next_ch == ">":
-                    if open_at < 0:
-                        raise _Reject
-                    out.append(REDACTED)
-                    self.redacted += 1
-                    cursor = end + 1
-                    open_at = -1
-                    index = find("private", end)
-                    continue
-            j = index - 1
-            while j >= 0 and low[j].isspace():
-                j -= 1
-            closing = j >= 0 and low[j] == "/"
-            if closing:
-                j -= 1
-                while j >= 0 and low[j].isspace():
-                    j -= 1
-            if j >= 0 and low[j] == "<":
-                k = end
-                while k < n and low[k].isspace():
-                    k += 1
-                if k >= n or low[k] != ">":
-                    raise _Reject
-                if not closing:
-                    if open_at >= 0:
-                        raise _Reject
-                    out.append(text[cursor:j])
-                    open_at = j
-                else:
-                    if open_at < 0:
-                        raise _Reject
-                    out.append(REDACTED)
-                    self.redacted += 1
-                    cursor, open_at = k + 1, -1
-            index = find("private", end)
-        if open_at >= 0:
+        new, count = _PRIVATE_BLOCK.subn(REDACTED, text)
+        if _PRIVATE_MARK.search(new):
             raise _Reject
-        out.append(text[cursor:])
-        return "".join(out)
+        self.redacted += count
+        return new
 
     def _pem(self, text: str) -> str:
         out: list[str] = []
@@ -176,17 +130,16 @@ class _TextScans:
         return f"{match.group(1)} {REDACTED}"
 
     def _blocked_path(self, match: re.Match[str]) -> str:
+        """§14.2: replace a blocked spelling of the token (any trim of its wrapper runs); wrappers outside it stay."""
         token = match.group(0)
-        core = token.lstrip(_PATH_LEAD)
-        lead = len(token) - len(core)
-        core = core.rstrip(_PATH_TRAIL)
-        if not core or not self._paths.blocked(core):
-            if self._paths.blocked(token):
-                self.redacted += 1
-                return REDACTED
+        if not self._paths.may_block(token):
             return token
+        found = self._paths.find(token)
+        if found is None:
+            return token
+        start, cut = found
         self.redacted += 1
-        return token[:lead] + REDACTED + token[lead + len(core) :]
+        return token[:start] + REDACTED + token[len(token) - cut :]
 
     def redact(self, text: str, *, entropy: bool = True) -> str:
         self.tick()
