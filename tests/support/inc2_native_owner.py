@@ -221,6 +221,7 @@ _PROX_FDTYPE_SOCKET = 2
 _PROC_PIDFDSOCKETINFO = 3
 _SOCKET_FDINFO_SIZE = 792
 _SOI_FAMILY_OFF = 24 + 160
+_SOI_PROTOCOL_OFF = 24 + 156
 _SOI_KIND_OFF = 24 + 232
 _INSI_OFF = 24 + 240  # union soi_proto: in_sockinfo (SOCKINFO_IN=1) or tcp_sockinfo starting with it (SOCKINFO_TCP=2)
 
@@ -248,12 +249,14 @@ def _libproc_started_at(pid: int) -> str | None:
 
 
 def _parse_socket_fdinfo(buf: bytes) -> tuple[str, int, str, int] | None:
-    """``(local_addr, local_port, remote_addr, remote_port)`` of an IPv4 TCP/IN ``socket_fdinfo``, else ``None``."""
+    """``(local_addr, local_port, remote_addr, remote_port)`` of an IPv4 TCP ``socket_fdinfo``, else ``None``."""
     if len(buf) < _INSI_OFF + 64:
         return None
     family = struct.unpack_from("<i", buf, _SOI_FAMILY_OFF)[0]
     kind = struct.unpack_from("<i", buf, _SOI_KIND_OFF)[0]
-    if family != socket.AF_INET or kind not in (1, 2):
+    protocol = struct.unpack_from("<i", buf, _SOI_PROTOCOL_OFF)[0]
+    # SOCKINFO_IN (1) also covers UDP, whose port namespace can share the tuple: TCP only (SOCKINFO_TCP=2, proto 6).
+    if family != socket.AF_INET or kind != 2 or protocol != socket.IPPROTO_TCP:
         return None
     fport, lport = struct.unpack_from("<ii", buf, _INSI_OFF)
     faddr = socket.inet_ntoa(buf[_INSI_OFF + 32 + 12 : _INSI_OFF + 32 + 16])  # in4in6_addr: 3 pad words, then v4
@@ -270,6 +273,7 @@ def _libproc_client_pid(client_port: int, listen_port: int) -> int | None:
     except OSError:
         return None
     want = ("127.0.0.1", client_port, "127.0.0.1", listen_port)
+    found: set[int] = set()
     count = lib.proc_listpids(_PROC_ALL_PIDS, 0, None, 0)
     if count <= 0:
         return None
@@ -289,8 +293,8 @@ def _libproc_client_pid(client_port: int, listen_port: int) -> int | None:
             info = ctypes.create_string_buffer(_SOCKET_FDINFO_SIZE + 256)
             n = lib.proc_pidfdinfo(pid, fds[i], _PROC_PIDFDSOCKETINFO, info, ctypes.sizeof(info))
             if n > 0 and _parse_socket_fdinfo(info.raw[:n]) == want:
-                return int(pid)
-    return None
+                found.add(int(pid))
+    return found.pop() if len(found) == 1 else None  # an fd shared by two processes is ambiguous
 
 
 def _lookup_loopback_client_pid(
