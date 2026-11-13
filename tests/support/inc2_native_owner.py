@@ -173,14 +173,25 @@ def _parse_proc_net_tcp_inode(text: str, *, client_port: int, listen_port: int, 
     return None
 
 
+def _single(holders: set[int]) -> int | None:
+    """The holder PID when exactly one process holds the socket; an fd shared by two processes is ambiguous."""
+    return next(iter(holders)) if len(holders) == 1 else None
+
+
 def _find_pid_by_socket_inode(inode: int, *, proc_root: Path | None = None) -> int | None:
-    """Locate the owning PID whose ``/proc/<pid>/fd/*`` references ``socket:[inode]``."""
+    """The single PID whose ``/proc/<pid>/fd/*`` references ``socket:[inode]`` (``None`` if none or several)."""
+    return _single(_socket_inode_holders(inode, proc_root=proc_root))
+
+
+def _socket_inode_holders(inode: int, *, proc_root: Path | None = None) -> set[int]:
+    """Every PID whose ``/proc/<pid>/fd/*`` references ``socket:[inode]``."""
     root = _LINUX_PROC_ROOT if proc_root is None else proc_root
     target = f"socket:[{inode}]"
+    holders: set[int] = set()
     try:
         entries = list(root.iterdir())
     except OSError:
-        return None
+        return holders
     for pid_dir in entries:
         if not pid_dir.name.isdigit():
             continue
@@ -192,16 +203,17 @@ def _find_pid_by_socket_inode(inode: int, *, proc_root: Path | None = None) -> i
         for fd_path in fd_entries:
             try:
                 if os.readlink(fd_path) == target:
-                    return int(pid_dir.name)
+                    holders.add(int(pid_dir.name))
             except OSError:
                 continue
-    return None
+    return holders
 
 
 def _parse_lsof_client_pid(output: str, *, client_port: int, listen_port: int) -> int | None:
     """Parse ``lsof -nP -F pn`` output and return the PID owning ``127.0.0.1:client_port->127.0.0.1:listen_port``."""
     target_name = f"127.0.0.1:{client_port}->127.0.0.1:{listen_port}"
     current_pid: int | None = None
+    holders: set[int] = set()
     for raw_line in output.splitlines():
         if raw_line.startswith("p"):
             try:
@@ -210,8 +222,8 @@ def _parse_lsof_client_pid(output: str, *, client_port: int, listen_port: int) -
                 current_pid = None
         elif raw_line.startswith("n") and current_pid is not None:
             if raw_line[1:].strip() == target_name:
-                return current_pid
-    return None
+                holders.add(current_pid)
+    return _single(holders)
 
 
 # xnu bsd/sys/proc_info.h: struct socket_fdinfo = proc_fileinfo (24) + socket_info; offsets below are into it.
@@ -265,7 +277,12 @@ def _parse_socket_fdinfo(buf: bytes) -> tuple[str, int, str, int] | None:
 
 
 def _libproc_client_pid(client_port: int, listen_port: int) -> int | None:
-    """PID holding ``127.0.0.1:client_port -> 127.0.0.1:listen_port`` via libproc; ``None`` if absent/unavailable."""
+    """The single PID holding ``127.0.0.1:client_port -> 127.0.0.1:listen_port`` via libproc, else ``None``."""
+    return _single(_libproc_client_holders(client_port, listen_port) or set())
+
+
+def _libproc_client_holders(client_port: int, listen_port: int) -> set[int] | None:
+    """PIDs holding the client TCP socket via libproc; ``None`` when libproc is unavailable or lists no processes."""
     import ctypes
 
     try:
@@ -294,7 +311,7 @@ def _libproc_client_pid(client_port: int, listen_port: int) -> int | None:
             n = lib.proc_pidfdinfo(pid, fds[i], _PROC_PIDFDSOCKETINFO, info, ctypes.sizeof(info))
             if n > 0 and _parse_socket_fdinfo(info.raw[:n]) == want:
                 found.add(int(pid))
-    return found.pop() if len(found) == 1 else None  # an fd shared by two processes is ambiguous
+    return found
 
 
 def _lookup_loopback_client_pid(
@@ -337,15 +354,15 @@ def _lookup_loopback_client_pid(
                 continue
             inode = _parse_proc_net_tcp_inode(text, client_port=client_port, listen_port=listen_port, ipv6=is_v6)
             if inode is not None:
-                pid = _find_pid_by_socket_inode(inode)
-                if pid is not None:
-                    return pid
+                holders = _socket_inode_holders(inode)
+                if holders:
+                    return _single(holders)  # final: a later table must not resolve an ambiguous holder set
         return None
     if sys.platform == "darwin":
         # lsof (fork+exec, tens of ms) loses short-lived loopback connections; the libproc kernel query does not.
-        pid = _libproc_client_pid(client_port, listen_port)
-        if pid is not None:
-            return pid
+        holders = _libproc_client_holders(client_port, listen_port)
+        if holders:
+            return _single(holders)  # final: lsof must not resolve what libproc found ambiguous
         try:
             proc = subprocess.run(
                 ["lsof", "-nP", "-F", "pn", f"-iTCP@127.0.0.1:{client_port}"],

@@ -10,8 +10,11 @@ process table, with ``socket_fdinfo`` buffers built at the module's own offsets.
 from __future__ import annotations
 
 import ctypes
+import os
 import socket
 import struct
+import subprocess
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -125,3 +128,141 @@ def test_libproc_lookup_refuses_two_pids_holding_the_tcp_socket(monkeypatch: pyt
 def test_libproc_lookup_ignores_the_server_side_tuple(monkeypatch: pytest.MonkeyPatch) -> None:
     # Only the server side of the connection (reversed tuple) exists: no client pid.
     assert _lookup(monkeypatch, {401: [(6, _server())]}) is None
+
+
+# --- No later path may resolve an ambiguity (T9-PORT-F3-R2) ----------------------------------------------------------
+# Seams: the platform branch reads the module's ``sys.platform`` (patched as ``owner.sys``), the lsof fallback calls
+# ``subprocess.run`` (patched), the Linux path reads ``_LINUX_PROC_ROOT`` (patched to a fake tree) and resolves fd
+# links with ``os.readlink`` (patched, so no symlinks are needed and the tests run on Windows too).
+
+LSOF_NAME = f"n127.0.0.1:{CLIENT_PORT}->127.0.0.1:{LISTEN_PORT}"
+
+
+def test_lsof_output_with_two_holders_is_ambiguous() -> None:
+    out = f"p100\nf3\n{LSOF_NAME}\np200\nf4\n{LSOF_NAME}\n"
+    assert owner._parse_lsof_client_pid(out, client_port=CLIENT_PORT, listen_port=LISTEN_PORT) is None
+
+
+def test_lsof_output_with_one_holder_on_two_fds_names_it() -> None:
+    out = f"p100\nf3\n{LSOF_NAME}\nf4\n{LSOF_NAME}\n"
+    assert owner._parse_lsof_client_pid(out, client_port=CLIENT_PORT, listen_port=LISTEN_PORT) == 100
+
+
+def _on(monkeypatch: pytest.MonkeyPatch, platform: str) -> None:
+    monkeypatch.setattr(owner, "sys", type("FakeSys", (), {"platform": platform})())
+
+
+def _lsof(monkeypatch: pytest.MonkeyPatch, stdout: str | None) -> list[list[str]]:
+    """Patch ``subprocess.run``; ``stdout=None`` makes any call fail the test."""
+    calls: list[list[str]] = []
+
+    def run(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append(cmd)
+        assert stdout is not None, "lsof must not run once libproc found the connection"
+        return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    return calls
+
+
+def test_darwin_ambiguous_libproc_result_is_final(monkeypatch: pytest.MonkeyPatch) -> None:
+    _on(monkeypatch, "darwin")
+    calls = _lsof(monkeypatch, None)
+    fake = _FakeLibproc({301: [(4, TCP)], 302: [(4, TCP)]})
+    monkeypatch.setattr(ctypes, "CDLL", lambda *_a, **_k: fake)
+    assert owner._lookup_loopback_client_pid(CLIENT_PORT, LISTEN_PORT) is None
+    assert calls == []
+
+
+@pytest.mark.parametrize("libproc", ["unavailable", "no-pids"])
+def test_darwin_falls_back_to_lsof_only_without_libproc_data(monkeypatch: pytest.MonkeyPatch, libproc: str) -> None:
+    _on(monkeypatch, "darwin")
+    calls = _lsof(monkeypatch, f"p100\nf3\n{LSOF_NAME}\n")
+    if libproc == "unavailable":
+
+        def no_lib(*_a: Any, **_k: Any) -> Any:
+            raise OSError("libproc.dylib not found")
+
+        monkeypatch.setattr(ctypes, "CDLL", no_lib)
+    else:
+        empty = _FakeLibproc({})
+        monkeypatch.setattr(ctypes, "CDLL", lambda *_a, **_k: empty)
+    assert owner._lookup_loopback_client_pid(CLIENT_PORT, LISTEN_PORT) == 100
+    assert len(calls) == 1 and calls[0][0] == "lsof"
+
+
+def _tcp_row(local_hex: str, remote_hex: str, inode: int) -> str:
+    return f"   0: {local_hex}:{CLIENT_PORT:04X} {remote_hex}:{LISTEN_PORT:04X} 01 00000000:00000000 00:00000000 " \
+        f"00000000  1000        0 {inode} 1 0000000000000000 20 4 30 10 -1"
+
+
+V4 = "0100007F"
+V6 = "0000000000000000FFFF00000100007F"
+HEADER = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode"
+
+
+def _fake_proc(
+    monkeypatch: pytest.MonkeyPatch, root: Path, *, tcp: list[str], tcp6: list[str], fds: dict[int, list[int]]
+) -> None:
+    """``fds``: pid -> socket inodes its fds link to (one fd per entry)."""
+    (root / "net").mkdir(parents=True)
+    (root / "net" / "tcp").write_text("\n".join([HEADER, *tcp]) + "\n", encoding="ascii")
+    (root / "net" / "tcp6").write_text("\n".join([HEADER, *tcp6]) + "\n", encoding="ascii")
+    links: dict[str, str] = {}
+    for pid, inodes in fds.items():
+        (root / str(pid) / "fd").mkdir(parents=True)
+        for fd, inode in enumerate(inodes, start=3):
+            path = root / str(pid) / "fd" / str(fd)
+            path.write_bytes(b"")
+            links[str(path)] = f"socket:[{inode}]"
+    (root / "self").mkdir()  # non-numeric entries are skipped
+
+    def readlink(path: Any, *_a: Any, **_k: Any) -> str:
+        try:
+            return links[str(path)]
+        except KeyError:
+            raise OSError(f"not a link: {path}") from None
+
+    monkeypatch.setattr(os, "readlink", readlink)
+    monkeypatch.setattr(owner, "_LINUX_PROC_ROOT", root)
+    _on(monkeypatch, "linux")
+
+
+@pytest.mark.parametrize(
+    ("table", "fds", "expected"),
+    [
+        ("tcp", {501: [111]}, 501),
+        ("tcp", {501: [111], 502: [111]}, None),
+        ("tcp", {501: [111, 111]}, 501),
+        ("tcp6", {601: [222], 602: [222]}, None),
+        ("tcp6", {601: [222, 222]}, 601),
+    ],
+    ids=["tcp-one-holder", "tcp-two-holders", "tcp-one-holder-two-fds", "tcp6-two-holders", "tcp6-one-holder-two-fds"],
+)
+def test_linux_socket_inode_binds_only_a_single_holder(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, table: str, fds: dict[int, list[int]], expected: int | None
+) -> None:
+    rows = {"tcp": [_tcp_row(V4, V4, 111)], "tcp6": [_tcp_row(V6, V6, 222)]}
+    _fake_proc(
+        monkeypatch,
+        tmp_path / "proc",
+        tcp=rows["tcp"] if table == "tcp" else [],
+        tcp6=rows["tcp6"] if table == "tcp6" else [],
+        fds=fds,
+    )
+    assert owner._lookup_loopback_client_pid(CLIENT_PORT, LISTEN_PORT) == expected
+
+
+def test_linux_ambiguous_tcp_holder_is_not_resolved_by_the_tcp6_table(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The tcp table names the connection but two processes hold it; a single holder found later through tcp6
+    # must not turn that ambiguity into a binding.
+    _fake_proc(
+        monkeypatch,
+        tmp_path / "proc",
+        tcp=[_tcp_row(V4, V4, 111)],
+        tcp6=[_tcp_row(V6, V6, 222)],
+        fds={501: [111], 502: [111], 601: [222]},
+    )
+    assert owner._lookup_loopback_client_pid(CLIENT_PORT, LISTEN_PORT) is None
