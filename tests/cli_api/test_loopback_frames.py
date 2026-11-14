@@ -7,6 +7,7 @@ import random
 import socket
 import ssl
 import threading
+import time
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
@@ -786,10 +787,19 @@ def test_slow_header_pipelined_bytes_and_tls(inc2_tls_material: SampleTlsMateria
         assert client_ssl.recv(9) == b"TLS_READY"
 
         orig_to = client_ssl.gettimeout()
-        server_ssl.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
         clock.set(1_000_000_000)
         tls_reader = FramedReader(client_ssl, clock)
-        assert tls_reader.has_pipelined_bytes(clock.now_ns + 10_000_000_000) is True
+        deadline_ns = clock.now_ns + 10_000_000_000
+        assert tls_reader.has_pipelined_bytes(deadline_ns) is False
+        server_ssl.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+        # sendall acknowledges the sending socket, not receipt of application bytes. This probe is
+        # deliberately nonblocking, including when a TLS control record precedes the application record.
+        wall_deadline_ns = time.monotonic_ns() + deadline_ns - clock.now_ns
+        while not tls_reader.has_pipelined_bytes(deadline_ns):
+            assert client_ssl.gettimeout() == orig_to
+            assert time.monotonic_ns() < wall_deadline_ns, "sent TLS response did not become readable"
+            time.sleep(0.001)
+        assert tls_reader.has_pipelined_bytes(deadline_ns) is True
         # Verify original timeout was restored.
         assert client_ssl.gettimeout() == orig_to
         # Verify bytes are preserved and readable.

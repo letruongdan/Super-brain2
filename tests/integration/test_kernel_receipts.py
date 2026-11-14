@@ -665,15 +665,19 @@ def test_read_ack_while_pending_is_in_progress_and_restart_turns_orphan_pending_
     with fixture_daemon(monkeypatch, tpl, root) as (h, _proxy, _tracker):
         task_id, delivery_id = _task(h, tpl, "idem-t8-pending-prep-001")
         held: list[Any] = []
+        finalizer_entered = threading.Event()
 
         def never_finalize(completion: Any) -> Future[Any]:
             held.append(completion)
+            finalizer_entered.set()
             return Future()
 
         h.loop.finalize_send_attempt = never_finalize  # type: ignore[method-assign]
         art = artifact_args(tpl, task_id, "idem-t8-pending-art-0001")
         data = ok(call(h, "get_artifact", art, token=tpl.cred.token, scope=scope_of(ws_a(tpl))))
         receipt = str(data["served_receipt_id"])
+        # Receiving the full frame can precede the server's post-send finalizer call.
+        assert finalizer_entered.wait(BARRIER_S), "the send attempt never reached the held finalizer"
         ((first_id, logical, state),) = attempts(root)
         assert held and (first_id, state) == (receipt, "pending")
         pend = call(

@@ -324,7 +324,7 @@ def create_daemon_owner_loop(
 
 @contextlib.contextmanager
 def _signal_stop_guard(target: threading.Event) -> Iterator[Callable[[], bool]]:
-    """Install stop handlers that set ``target`` at once in every phase; yields ``signalled()``.
+    """Latch stop signals and request ``target`` asynchronously in every phase; yields ``signalled()``.
 
     The handler never touches ``target``: CPython runs it on the main thread, which may be inside ``target.wait()``
     holding its condition lock. It only records the signal and wakes a watcher thread that calls ``target.set()``.
@@ -406,7 +406,7 @@ def serve(
         on_listener_bound=bound_listeners.append,
     )
     effective_stop = stop_event if stop_event is not None else threading.Event()
-    with _signal_stop_guard(effective_stop):
+    with _signal_stop_guard(effective_stop) as signalled:
         ready = loop.start(config)
         server: LoopbackServer | None = None
         try:
@@ -421,7 +421,13 @@ def serve(
                 monotonic_ns=resolved_mono.monotonic_ns,
                 stop_event=effective_stop,
             )
+            # The synchronous signal latch is authoritative during startup;
+            # the background Event conversion may not have run yet.
+            if signalled() or effective_stop.is_set():
+                raise BrainError(ErrorCode.DAEMON_UNAVAILABLE, "daemon unavailable")
             server.start()
+            if signalled() or effective_stop.is_set():
+                raise BrainError(ErrorCode.DAEMON_UNAVAILABLE, "daemon unavailable")
         except BaseException as err:  # noqa: BLE001
             code = err.code if isinstance(err, BrainError) else ErrorCode.INTEGRITY_FAILURE
             _LOGGER.error("loopback server startup failed (phase=loopback_startup, code=%s)", code.value)

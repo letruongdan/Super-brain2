@@ -39,8 +39,21 @@ MAX_ACTIVE_CONNECTIONS = 32
 SERVER_HANDSHAKE_BUDGET_NS = 1_000_000_000
 _ACCEPT_POLL_S = 0.005
 _REPLY_WAIT_SLICE_S = 0.005
+_JOIN_WAIT_SLICE_S = 0.001
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _join_before_cutoff(thread: threading.Thread | None, deadline: float) -> None:
+    if thread is None or thread is threading.current_thread():
+        return
+    while thread.is_alive():
+        remaining = deadline - time.perf_counter()
+        if remaining <= 0:
+            return
+        # Long timed joins can return well past their requested timeout on
+        # coalescing OS timers. Recheck the shared cutoff after short waits.
+        _safe_join(thread, min(remaining, _JOIN_WAIT_SLICE_S))
 
 
 class LoopbackServer:
@@ -179,9 +192,7 @@ class LoopbackServer:
             effective_dl = self._stop_deadline if self._stop_deadline is not None else dl
             accept_thread = self._accept_thread
 
-        rem = effective_dl - time.perf_counter()
-        if rem > 0:
-            _safe_join(accept_thread, rem)
+        _join_before_cutoff(accept_thread, effective_dl)
 
         while True:
             with self._lock:
@@ -191,7 +202,7 @@ class LoopbackServer:
             rem = effective_dl - time.perf_counter()
             if rem <= 0:
                 break
-            _safe_join(workers[0], rem)
+            _join_before_cutoff(workers[0], effective_dl)
 
         self._abort_wake.set()
         with self._lock:
@@ -204,8 +215,7 @@ class LoopbackServer:
             self._abort_all_active_sockets()
 
         if abort_thread is not None:
-            rem_abort = max(0.0, effective_dl - time.perf_counter())
-            _safe_join(abort_thread, rem_abort)
+            _join_before_cutoff(abort_thread, effective_dl)
 
         with self._lock:
             still_alive = any(w.is_alive() for w in self._workers.values()) or (
