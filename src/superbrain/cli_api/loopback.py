@@ -127,6 +127,23 @@ def _has_connection_close(headers: tuple[str, ...]) -> bool:
     return False
 
 
+def _prepare_tool_request(command: ToolCommand) -> tuple[str, bytes]:
+    if (
+        not isinstance(command, ToolCommand)
+        or not isinstance(command.token, str)
+        or not command.token
+        or any(ord(ch) <= 0x20 or ord(ch) >= 0x7F for ch in command.token)
+    ):
+        raise LoopbackTransportError(ErrorCode.INVALID_INPUT, "invalid input", request_may_have_run=False)
+    try:
+        return command.token, encode_call(command)
+    except BrainError as err:
+        msg = err.message if is_safe_wire_message(err.message) else SAFE_WIRE_MESSAGES_BY_CODE[err.code]
+        raise LoopbackTransportError(err.code, msg, request_may_have_run=False) from err
+    except (TypeError, ValueError, UnicodeError) as err:
+        raise LoopbackTransportError(ErrorCode.INVALID_INPUT, "invalid input", request_may_have_run=False) from err
+
+
 class PinnedConnection:
     """Single-use TLS connection bound to a verified loopback daemon identity."""
 
@@ -150,6 +167,11 @@ class PinnedConnection:
         self._closed = False
 
     def call(self, command: ToolCommand, *, deadline_ns: int | None = None) -> CallResult:
+        return self._call(lambda: _prepare_tool_request(command), deadline_ns=deadline_ns)
+
+    def _call(
+        self, prepare: Callable[[], tuple[str, bytes]], *, deadline_ns: int | None,
+    ) -> CallResult:
         with self._lock:
             if self._claimed or self._closed or self._sock is None or self._reader is None:
                 raise LoopbackTransportError(
@@ -169,34 +191,7 @@ class PinnedConnection:
             if explicit_dl is not None:
                 eff_deadline_ns = min(explicit_dl, self._tool_deadline_ns)
 
-            if not isinstance(command, ToolCommand):
-                raise LoopbackTransportError(
-                    ErrorCode.INVALID_INPUT,
-                    "invalid input",
-                    request_may_have_run=False,
-                )
-            if (
-                not isinstance(command.token, str)
-                or not command.token
-                or any(ord(ch) <= 0x20 or ord(ch) >= 0x7F for ch in command.token)
-            ):
-                raise LoopbackTransportError(
-                    ErrorCode.INVALID_INPUT,
-                    "invalid input",
-                    request_may_have_run=False,
-                )
-
-            try:
-                body_bytes = encode_call(command)
-            except BrainError as err:
-                msg = err.message if is_safe_wire_message(err.message) else SAFE_WIRE_MESSAGES_BY_CODE[err.code]
-                raise LoopbackTransportError(err.code, msg, request_may_have_run=False) from err
-            except (TypeError, ValueError, UnicodeError) as err:
-                raise LoopbackTransportError(
-                    ErrorCode.INVALID_INPUT,
-                    "invalid input",
-                    request_may_have_run=False,
-                ) from err
+            token, body_bytes = prepare()
 
             _remaining_budget_s(self._monotonic_ns, eff_deadline_ns, request_may_have_run=False)
             if reader.has_pipelined_bytes(eff_deadline_ns):
@@ -210,7 +205,7 @@ class PinnedConnection:
             post_head = (
                 f"POST {TOOL_CALL_PATH} HTTP/1.1\r\n"
                 f"Host: 127.0.0.1:{ep.port}\r\n"
-                f"Authorization: Bearer {command.token}\r\n"
+                f"Authorization: Bearer {token}\r\n"
                 f"{HEADER_STORE_ID}: {ep.store_id}\r\n"
                 f"{HEADER_WRITER_EPOCH}: {ep.writer_epoch}\r\n"
                 f"{HEADER_INSTANCE_ID}: {ep.instance_id}\r\n"
@@ -571,8 +566,14 @@ class LoopbackClient:
         *,
         deadline_ns: int | None = None,
     ) -> CallResult:
+        deadline_ns = _validate_optional_deadline(deadline_ns, request_may_have_run=False)
+        if deadline_ns is not None:
+            _remaining_budget_s(self._monotonic_ns, deadline_ns, request_may_have_run=False)
+        # Prepare the body before the identity response starts the server's
+        # POST budget. The pinned connection is still required to send it.
+        prepared = _prepare_tool_request(command)
         conn = self.connect(target, deadline_ns=deadline_ns)
         try:
-            return conn.call(command, deadline_ns=deadline_ns)
+            return conn._call(lambda: prepared, deadline_ns=deadline_ns)
         finally:
             conn.close()

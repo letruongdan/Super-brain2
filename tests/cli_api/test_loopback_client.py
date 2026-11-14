@@ -34,6 +34,8 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
+from superbrain.cli_api import loopback
+from superbrain.cli_api._loopback_wire import encode_call as encode_wire_call
 from superbrain.cli_api.loopback import (
     LoopbackClient,
     LoopbackTarget,
@@ -778,6 +780,82 @@ def test_pin_checked_before_any_http(
 # -----------------------------------------------------------------------------
 # Test 2: test_wrong_identity_receives_only_probe
 # -----------------------------------------------------------------------------
+
+
+
+@pytest.mark.parametrize("case", ["matched_identity", "wrong_identity", "deadline_during_encode"])
+def test_call_prepares_body_before_connect_and_sends_only_after_identity(
+    inc2_tls_material: SampleTlsMaterial,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    """Encoding precedes connect, and a failed identity or deadline prevents POST."""
+    clock = FakeClock()
+    client = LoopbackClient(monotonic_ns=clock.now_ns)
+    deadline_ns = clock.now_ns() + 2_000_000_000
+    marker = "w1-local-request-marker"
+    token = "w1-test-bearer"
+    arguments = {"schema_version": "2.0", "idempotency_key": marker}
+    command = ToolCommand(tool="submit_episode", arguments=arguments, token=token)
+    events: list[str] = []
+    original_connect = socket.socket.connect
+
+    def encode_call(value: ToolCommand) -> bytes:
+        body = encode_wire_call(value)
+        if case == "deadline_during_encode":
+            clock.advance_ns(deadline_ns - clock.now_ns())
+        events.append("encoded")
+        return body
+
+    with MockTlsServer(
+        _make_server_ctx(inc2_tls_material),
+        store_id="wrong-store" if case == "wrong_identity" else "store-1",
+    ) as server:
+        address = ("127.0.0.1", server.port)
+
+        def connect(sock: socket.socket, peer: tuple[str, int]) -> None:
+            if peer == address:
+                events.append("connect")
+            original_connect(sock, peer)
+
+        monkeypatch.setattr(loopback, "encode_call", encode_call)
+        monkeypatch.setattr(socket.socket, "connect", connect)
+        target = LoopbackTarget(
+            Endpoint(
+                version=1, host="127.0.0.1", port=server.port, store_id="store-1",
+                writer_epoch=1, instance_id="inst-1", contract="mcp-tools-v2",
+            ),
+            "store-1",
+            inc2_tls_material.ca_cert_path.read_text(),
+            inc2_tls_material.leaf_cert_sha256,
+        )
+
+        if case == "matched_identity":
+            assert client.call(target, command, deadline_ns=deadline_ns) == {"ok": True, "data": {"health": "ok"}}
+            assert [(request.method, request.path) for request in server.requests] == [
+                ("GET", "/v2/identity"), ("POST", "/v2/tools/call"),
+            ]
+            probe, post = server.requests
+            assert "authorization" not in probe.headers and probe.body == b""
+            assert post.headers["authorization"] == f"Bearer {token}"
+            assert json.loads(post.body) == {
+                "tool": "submit_episode", "arguments": arguments, "correlation_id": None, "selected_scope": None,
+            }
+            assert events == ["encoded", "connect"]
+        else:
+            with pytest.raises(LoopbackTransportError) as caught:
+                client.call(target, command, deadline_ns=deadline_ns)
+            assert caught.value.request_may_have_run is False
+            assert token.encode() not in server.raw_http_bytes and marker.encode() not in server.raw_http_bytes
+            assert server.post_count == 0
+            if case == "wrong_identity":
+                assert caught.value.code is ErrorCode.IDENTITY_MISMATCH
+                assert [(request.method, request.path) for request in server.requests] == [("GET", "/v2/identity")]
+                assert events == ["encoded", "connect"]
+            else:
+                assert caught.value.code is ErrorCode.DEADLINE_EXCEEDED
+                assert server.accept_count == 0
+                assert events == ["encoded"]
 
 
 def test_wrong_identity_receives_only_probe(inc2_tls_material: SampleTlsMaterial) -> None:

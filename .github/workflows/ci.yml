@@ -7,7 +7,9 @@ on:
 jobs:
   gate:
     name: gate (${{ matrix.os }}, python ${{ matrix.python }})
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.os == 'macos-latest' && 'macos-15-intel' || matrix.os }}
+    env:
+      T9_TEST_SEAL_R19_SHA256: ${{ vars.T9_TEST_SEAL_R19_SHA256 }}
     strategy:
       fail-fast: false
       matrix:
@@ -17,9 +19,19 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - name: Use reviewed LF bytes in this checkout and gate worktrees
+        shell: bash
+        run: |
+          git config core.autocrlf false
+          git checkout-index --all --force
       - uses: astral-sh/setup-uv@v6
         with:
           version: "0.12.15"
+      - name: Check reviewer seal before execution
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/seal-evidence"
+          uv run --locked --python ${{ matrix.python }} python .verification/test_lock.py check --root . --manifest .verification/task9-seal.json --expected-digest "$T9_TEST_SEAL_R19_SHA256" > "$RUNNER_TEMP/seal-evidence/check-before.json" 2> "$RUNNER_TEMP/seal-evidence/check-before.stderr.log"
       - name: Prepare physical temporary directory
         shell: bash
         run: |
@@ -71,6 +83,20 @@ jobs:
         run: |
           mkdir -p "${{ runner.temp }}/perf-evidence"
           uv run --locked --python ${{ matrix.python }} python -m tests.integration.test_kernel_performance --evidence-dir "${{ runner.temp }}/perf-evidence"
+      - name: Check reviewer seal after execution
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/seal-evidence"
+          uv run --locked --python ${{ matrix.python }} python .verification/test_lock.py check --root . --manifest .verification/task9-seal.json --expected-digest "$T9_TEST_SEAL_R19_SHA256" > "$RUNNER_TEMP/seal-evidence/check-after.json" 2> "$RUNNER_TEMP/seal-evidence/check-after.stderr.log"
+      - name: Upload seal evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: seal-evidence-${{ matrix.os }}-${{ matrix.python }}
+          path: ${{ runner.temp }}/seal-evidence/
+          include-hidden-files: true
+          if-no-files-found: error
       - name: Upload receipt
         if: always()
         uses: actions/upload-artifact@v4

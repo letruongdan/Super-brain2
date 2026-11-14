@@ -8,6 +8,7 @@ import socket
 import ssl
 import threading
 from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import pytest
@@ -104,6 +105,23 @@ def socket_pair() -> Iterator[tuple[socket.socket, socket.socket]]:
 
 
 @contextlib.contextmanager
+def feed_frame(payload: bytes) -> Iterator[socket.socket]:
+    """Feed a complete frame while the reader drains the bounded socket buffer."""
+    with socket_pair() as (receiver, sender), ThreadPoolExecutor(max_workers=1) as executor:
+        sender.settimeout(5.0)
+
+        def send() -> None:
+            try:
+                sender.sendall(payload)
+            finally:
+                sender.shutdown(socket.SHUT_WR)
+
+        sent = executor.submit(send)
+        yield receiver
+        sent.result()
+
+
+@contextlib.contextmanager
 def tracking_socket_pair() -> Iterator[tuple[TrackingSocket, socket.socket]]:
     client_sock, server_sock = socket.socketpair()
     track_sock = TrackingSocket(fileno=client_sock.detach())
@@ -182,8 +200,7 @@ def test_header_caps_apply_before_stdlib_parser() -> None:
     line_8192 = prefix + (b"a" * pad_len_exact) + suffix
     assert len(line_8192) == 8_192
 
-    with socket_pair() as (client_sock, server_sock):
-        server_sock.sendall(line_8192 + b"\r\n")
+    with feed_frame(line_8192 + b"\r\n") as client_sock:
         reader = FramedReader(client_sock, clock)
         head = reader.read_request_head(ample_deadline)
         assert isinstance(head, RequestHead)
@@ -195,8 +212,7 @@ def test_header_caps_apply_before_stdlib_parser() -> None:
 
     line_8193 = prefix + (b"a" * (pad_len_exact + 1)) + suffix
     assert len(line_8193) == 8_193
-    with socket_pair() as (client_sock, server_sock):
-        server_sock.sendall(line_8193 + b"\r\n")
+    with feed_frame(line_8193 + b"\r\n") as client_sock:
         reader = FramedReader(client_sock, clock)
         with pytest.raises(HttpFramingError) as exc_req_cap:
             reader.read_request_head(ample_deadline)
@@ -211,8 +227,7 @@ def test_header_caps_apply_before_stdlib_parser() -> None:
     status_8192 = status_pfx + b"OK" + (b" " * status_pad_exact) + status_sfx
     assert len(status_8192) == 8_192
 
-    with socket_pair() as (client_sock, server_sock):
-        server_sock.sendall(status_8192 + b"\r\n")
+    with feed_frame(status_8192 + b"\r\n") as client_sock:
         reader = FramedReader(client_sock, clock)
         resp = reader.read_response_head(ample_deadline)
         assert isinstance(resp, ResponseHead)
@@ -222,8 +237,7 @@ def test_header_caps_apply_before_stdlib_parser() -> None:
 
     status_8193 = status_pfx + b"OK" + (b" " * (status_pad_exact + 1)) + status_sfx
     assert len(status_8193) == 8_193
-    with socket_pair() as (client_sock, server_sock):
-        server_sock.sendall(status_8193 + b"\r\n")
+    with feed_frame(status_8193 + b"\r\n") as client_sock:
         reader = FramedReader(client_sock, clock)
         with pytest.raises(HttpFramingError) as exc_resp_cap:
             reader.read_response_head(ample_deadline)
@@ -237,8 +251,7 @@ def test_header_caps_apply_before_stdlib_parser() -> None:
     block_16384 = h_pfx + (b"x" * h_pad_exact) + h_sfx
     assert len(block_16384) == 16_384
 
-    with socket_pair() as (client_sock, server_sock):
-        server_sock.sendall(b"GET / HTTP/1.1\r\n" + block_16384)
+    with feed_frame(b"GET / HTTP/1.1\r\n" + block_16384) as client_sock:
         reader = FramedReader(client_sock, clock)
         head_block = reader.read_request_head(ample_deadline)
         assert len(head_block.headers) == 1
@@ -246,22 +259,19 @@ def test_header_caps_apply_before_stdlib_parser() -> None:
 
     block_16385 = h_pfx + (b"x" * (h_pad_exact + 1)) + h_sfx
     assert len(block_16385) == 16_385
-    with socket_pair() as (client_sock, server_sock):
-        server_sock.sendall(b"GET / HTTP/1.1\r\n" + block_16385)
+    with feed_frame(b"GET / HTTP/1.1\r\n" + block_16385) as client_sock:
         reader = FramedReader(client_sock, clock)
         with pytest.raises(HttpFramingError) as exc_hb_req:
             reader.read_request_head(ample_deadline)
         assert exc_hb_req.value.code is ErrorCode.INVALID_INPUT
         assert exc_hb_req.value.http_status == 400
 
-    with socket_pair() as (client_sock, server_sock):
-        server_sock.sendall(b"HTTP/1.1 200 OK\r\n" + block_16384)
+    with feed_frame(b"HTTP/1.1 200 OK\r\n" + block_16384) as client_sock:
         reader = FramedReader(client_sock, clock)
         resp_block = reader.read_response_head(ample_deadline)
         assert len(resp_block.headers) == 1
 
-    with socket_pair() as (client_sock, server_sock):
-        server_sock.sendall(b"HTTP/1.1 200 OK\r\n" + block_16385)
+    with feed_frame(b"HTTP/1.1 200 OK\r\n" + block_16385) as client_sock:
         reader = FramedReader(client_sock, clock)
         with pytest.raises(HttpFramingError) as exc_hb_resp:
             reader.read_response_head(ample_deadline)
