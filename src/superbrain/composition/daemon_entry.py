@@ -322,14 +322,17 @@ def create_daemon_owner_loop(
 
 
 @contextlib.contextmanager
-def _signal_stop_guard(target: threading.Event) -> Iterator[None]:
+def _signal_stop_guard(target: threading.Event) -> Iterator[Callable[[], bool]]:
+    """Install stop handlers; yields ``signalled()``. The caller's poll loop turns a signal into ``target.set()``."""
+    flag = [False]
     if threading.current_thread() is not threading.main_thread():
-        yield
+        yield lambda: flag[0]
         return
     saved: list[tuple[signal.Signals, Callable[[int, FrameType | None], object] | int | None]] = []
 
     def _handler(_signum: int, _frame: FrameType | None) -> None:
-        target.set()
+        # Lock-free on purpose: the interrupted main thread may hold ``target``'s condition lock (inside wait()).
+        flag[0] = True
 
     candidates: list[signal.Signals] = [signal.SIGINT, signal.SIGTERM]
     sigbreak = getattr(signal, "SIGBREAK", None)
@@ -342,7 +345,7 @@ def _signal_stop_guard(target: threading.Event) -> Iterator[None]:
             signal.signal(sig, _handler)
             saved.append((sig, prev))
     try:
-        yield
+        yield lambda: flag[0]
     finally:
         for sig, prev in saved:
             with contextlib.suppress(OSError, ValueError, TypeError):
@@ -388,7 +391,7 @@ def serve(
         on_listener_bound=bound_listeners.append,
     )
     effective_stop = stop_event if stop_event is not None else threading.Event()
-    with _signal_stop_guard(effective_stop):
+    with _signal_stop_guard(effective_stop) as signalled:
         ready = loop.start(config)
         server: LoopbackServer | None = None
         try:
@@ -429,6 +432,9 @@ def serve(
                 on_ready(ready, loop)
             try:
                 while not effective_stop.wait(timeout=0.02):
+                    if signalled():
+                        effective_stop.set()
+                        break
                     if loop.is_stopping or loop.wait_closed(timeout=0.0) is not None:
                         break
             except KeyboardInterrupt:
