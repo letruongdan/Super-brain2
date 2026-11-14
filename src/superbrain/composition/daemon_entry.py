@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import math
+import queue
 import signal
 import threading
 import time
@@ -323,16 +324,28 @@ def create_daemon_owner_loop(
 
 @contextlib.contextmanager
 def _signal_stop_guard(target: threading.Event) -> Iterator[Callable[[], bool]]:
-    """Install stop handlers; yields ``signalled()``. The caller's poll loop turns a signal into ``target.set()``."""
+    """Install stop handlers that set ``target`` at once in every phase; yields ``signalled()``.
+
+    The handler never touches ``target``: CPython runs it on the main thread, which may be inside ``target.wait()``
+    holding its condition lock. It only records the signal and wakes a watcher thread that calls ``target.set()``.
+    """
     flag = [False]
     if threading.current_thread() is not threading.main_thread():
         yield lambda: flag[0]
         return
     saved: list[tuple[signal.Signals, Callable[[int, FrameType | None], object] | int | None]] = []
+    wake: queue.SimpleQueue[int | None] = queue.SimpleQueue()
 
-    def _handler(_signum: int, _frame: FrameType | None) -> None:
-        # Lock-free on purpose: the interrupted main thread may hold ``target``'s condition lock (inside wait()).
+    def _watch() -> None:
+        while wake.get() is not None:
+            target.set()
+
+    watcher = threading.Thread(target=_watch, name="superbrain-stop-signal", daemon=True)
+    watcher.start()
+
+    def _handler(signum: int, _frame: FrameType | None) -> None:
         flag[0] = True
+        wake.put_nowait(signum)  # SimpleQueue.put is reentrant: documented safe from a signal handler
 
     candidates: list[signal.Signals] = [signal.SIGINT, signal.SIGTERM]
     sigbreak = getattr(signal, "SIGBREAK", None)
@@ -350,6 +363,8 @@ def _signal_stop_guard(target: threading.Event) -> Iterator[Callable[[], bool]]:
         for sig, prev in saved:
             with contextlib.suppress(OSError, ValueError, TypeError):
                 signal.signal(sig, prev)
+        wake.put_nowait(None)  # after restore: every signal the handler queued is applied before the watcher exits
+        watcher.join(timeout=1.0)
 
 
 def serve(
@@ -391,7 +406,7 @@ def serve(
         on_listener_bound=bound_listeners.append,
     )
     effective_stop = stop_event if stop_event is not None else threading.Event()
-    with _signal_stop_guard(effective_stop) as signalled:
+    with _signal_stop_guard(effective_stop):
         ready = loop.start(config)
         server: LoopbackServer | None = None
         try:
@@ -432,9 +447,6 @@ def serve(
                 on_ready(ready, loop)
             try:
                 while not effective_stop.wait(timeout=0.02):
-                    if signalled():
-                        effective_stop.set()
-                        break
                     if loop.is_stopping or loop.wait_closed(timeout=0.0) is not None:
                         break
             except KeyboardInterrupt:
