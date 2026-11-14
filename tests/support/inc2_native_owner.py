@@ -199,23 +199,25 @@ def _socket_inode_holders(inode: int, *, proc_root: Path | None = None) -> set[i
     target = f"socket:[{inode}]"
     holders: set[int] = set()
     try:
-        entries = list(root.iterdir())
+        entries = [p for p in root.iterdir() if p.name.isdigit()]
     except OSError:
         return holders
+    # Newest processes first: client subprocesses are recent processes with high PIDs
+    entries.sort(key=lambda p: int(p.name), reverse=True)
     for pid_dir in entries:
-        if not pid_dir.name.isdigit():
-            continue
         fd_dir = pid_dir / "fd"
         try:
-            fd_entries = list(fd_dir.iterdir())
+            with os.scandir(fd_dir) as scan:
+                for entry in scan:
+                    try:
+                        if os.readlink(entry.path) == target:
+                            _note_sighting()
+                            holders.add(int(pid_dir.name))
+                            break
+                    except OSError:
+                        continue
         except OSError:
             continue
-        for fd_path in fd_entries:
-            try:
-                if os.readlink(fd_path) == target:
-                    holders.add(int(pid_dir.name))
-            except OSError:
-                continue
     return holders
 
 
@@ -358,6 +360,7 @@ def _lookup_loopback_client_pid(
                 continue
             if socket.ntohs(lport_net & 0xFFFF) == client_port and socket.ntohs(rport_net & 0xFFFF) == listen_port:
                 if pid > 0:
+                    _note_sighting()
                     return int(pid)
         return None
     if sys.platform.startswith("linux"):

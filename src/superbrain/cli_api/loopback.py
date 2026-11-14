@@ -373,6 +373,7 @@ class LoopbackClient:
                 ) from err
 
             raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            raw_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             rem_s = _remaining_budget_s(self._monotonic_ns, connect_deadline_ns, request_may_have_run=False)
             raw_sock.settimeout(rem_s)
             raw_sock.connect(("127.0.0.1", target.endpoint.port))

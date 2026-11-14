@@ -171,7 +171,7 @@
     "tests/support/inc2_kernel_domain.py": "sha256:429e1296c8112ef694625b05d248a8c95b855b6851abfef1889d5c63c43d6ffa",
     "tests/support/inc2_lifecycle.py": "sha256:e3107bcdc538a00bd8832561e901c2b3f93e82eedb4401963a3b3d92865a29d9",
     "tests/support/inc2_native.py": "sha256:829717c8b4a19427f369c5666348dd8fa1141632cd5cf35a1eea376faeabbd40",
-    "tests/support/inc2_native_owner.py": "sha256:791bcb8fc3dafa20502ed459fcd26d4899dbab34f7addcc9c41acf144cc0fbe7",
+    "tests/support/inc2_native_owner.py": "sha256:01882c875043d1b64a15595bcd255b537769312418bc8f09615708872aa18c4d",
     "tests/support/inc2_observer.py": "sha256:138726e616e9a2cc28b5014cce95700b50fa9130333559e392126a07c29af9d5",
     "tests/support/inc2_t8_child.py": "sha256:c849a8e35076667729ae5edd8d54517a935b2a7a8c36383ed6f052d0f09712f7",
     "tests/support/inc2_t8_domain.py": "sha256:ac4c7d67ad2d28af81ede46fc4dc726f48be99c580cbfd5554113f66bfc3fffa",

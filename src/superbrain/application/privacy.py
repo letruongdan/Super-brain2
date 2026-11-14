@@ -121,6 +121,57 @@ def _high_entropy(text: str, minimum: float) -> bool:
     return _shannon_from_counts(counts, total) >= minimum
 
 
+@dataclasses.dataclass(frozen=True)
+class _CompiledPolicy:
+    sensitive: frozenset[str]
+    paths: _PathMatcher
+    min_segment: int
+    max_words: int
+    prefixes: frozenset[str]
+    contained: tuple[str, ...]
+    candidate: re.Pattern[str]
+    entropy_thresh: float
+    entropy_min_distinct: float
+    min_u: tuple[int, ...]
+    path_scan: bool
+    path_needle: re.Pattern[str] | None
+    path_token: re.Pattern[str]
+
+
+@lru_cache(maxsize=32)
+def _compile_policy(policy: FilterPolicy) -> _CompiledPolicy:
+    sensitive = frozenset(_joined_key(k) for k in policy.sensitive_keys) - {""}
+    paths = _PathMatcher(policy.blocked_path_patterns)
+    min_segment = policy.entropy_min_length
+    max_words = max((len(_key_words(k)) for k in policy.sensitive_keys), default=1)
+    prefixes = frozenset(name[:i] for name in sensitive for i in range(1, len(name) + 1))
+    contained = tuple(sorted(name for name in sensitive if len(name) >= _CONTAINMENT_MIN))
+    candidate = re.compile(rf"[\x21-\x7e]{{{policy.entropy_min_length},}}")
+    entropy_thresh = 2 ** -(policy.entropy_min_bits + 1e-12)
+    entropy_min_distinct = 2 ** (policy.entropy_min_bits - 1e-12)
+    min_u = _min_u_table(float(policy.entropy_min_bits))
+    needles = _path_needles(policy.blocked_path_patterns)
+    path_scan = bool(policy.blocked_path_patterns)
+    path_needle = re.compile("|".join(map(re.escape, needles))) if needles else None
+    dotted = needles is not None and all("." in needle or "_" in needle for needle in needles)
+    path_token = _DOTTED_PATH_TOKEN if dotted else _PATH_TOKEN
+    return _CompiledPolicy(
+        sensitive=sensitive,
+        paths=paths,
+        min_segment=min_segment,
+        max_words=max_words,
+        prefixes=prefixes,
+        contained=contained,
+        candidate=candidate,
+        entropy_thresh=entropy_thresh,
+        entropy_min_distinct=entropy_min_distinct,
+        min_u=min_u,
+        path_scan=path_scan,
+        path_needle=path_needle,
+        path_token=path_token,
+    )
+
+
 class _Run(_TextScans):
     def __init__(self, policy: FilterPolicy, monotonic_ns: Callable[[], int], deadline_ns: int | None) -> None:
         self.policy = policy
@@ -129,24 +180,21 @@ class _Run(_TextScans):
         self._input_bytes = 0
         self._monotonic_ns = monotonic_ns
         self._deadline_ns = deadline_ns
-        self._sensitive = frozenset(_joined_key(k) for k in policy.sensitive_keys) - {""}
-        self._paths = _PathMatcher(policy.blocked_path_patterns)
-        self._min_segment = policy.entropy_min_length
-        self._max_words = max((len(_key_words(k)) for k in policy.sensitive_keys), default=1)
-        # Vocabulary = joined forms of every sensitive name (``access_token`` -> ``accesstoken``), so one word equal
-        # to a joined multi-word name matches; ``_prefixes`` only prunes windows that can no longer reach one.
-        self._prefixes = frozenset(name[:i] for name in self._sensitive for i in range(1, len(name) + 1))
-        self._contained = tuple(sorted(name for name in self._sensitive if len(name) >= _CONTAINMENT_MIN))
+        compiled = _compile_policy(policy)
+        self._sensitive = compiled.sensitive
+        self._paths = compiled.paths
+        self._min_segment = compiled.min_segment
+        self._max_words = compiled.max_words
+        self._prefixes = compiled.prefixes
+        self._contained = compiled.contained
+        self._candidate = compiled.candidate
+        self._entropy_thresh = compiled.entropy_thresh
+        self._entropy_min_distinct = compiled.entropy_min_distinct
+        self._min_u = compiled.min_u
+        self._path_scan = compiled.path_scan
+        self._path_needle = compiled.path_needle
+        self._path_token = compiled.path_token
         self._redactions: dict[tuple[str, bool], tuple[str, int]] = {}
-        self._candidate = re.compile(rf"[\x21-\x7e]{{{self.policy.entropy_min_length},}}")
-        self._entropy_thresh = 2 ** -(policy.entropy_min_bits + 1e-12)
-        self._entropy_min_distinct = 2 ** (policy.entropy_min_bits - 1e-12)
-        self._min_u = _min_u_table(float(policy.entropy_min_bits))
-        needles = _path_needles(policy.blocked_path_patterns)
-        self._path_scan = bool(policy.blocked_path_patterns)
-        self._path_needle = re.compile("|".join(map(re.escape, needles))) if needles else None
-        dotted = needles is not None and all("." in needle or "_" in needle for needle in needles)
-        self._path_token = _DOTTED_PATH_TOKEN if dotted else _PATH_TOKEN
 
     def tick(self) -> None:
         if self._deadline_ns is not None and self._monotonic_ns() >= self._deadline_ns:
