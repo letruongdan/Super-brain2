@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import hmac
 import threading
+import time
 from collections.abc import Callable
 
 from superbrain.core.errors import BrainError, ErrorCode
@@ -66,14 +67,15 @@ class Reservation:
     def __init__(
         self,
         *,
-        state_lock: threading.Lock,
+        table: ReservationTable,
         deadlines: RequestDeadlines,
         scope_key: ReservationScopeKey | None = None,
         request_digest_key_id: str | None = None,
         request_digest: str | None = None,
         on_response: Callable[[CallResult], None] | None = None,
     ) -> None:
-        self._state_lock = state_lock
+        self._table = table
+        self._state_lock = table._lock
         self._reservation_id = new_id()
         self._scope_key = scope_key
         self._request_digest_key_id = request_digest_key_id
@@ -136,12 +138,17 @@ class Reservation:
         with self._state_lock:
             if self._cancelled or self._phase not in (ReservationPhase.QUEUED, ReservationPhase.PREPARING):
                 return False
-            if now_ns >= self._deadlines.handler_deadline_ns or now_ns >= self._deadlines.commit_waiter_cutoff_ns:
-                self._cancelled = True
-                self._phase = ReservationPhase.CANCELLED
-                return False
-            self._phase = ReservationPhase.COMMITTING
-            return True
+            expire = self._table._shutdown_expiry_locked()
+            if expire is None:
+                if now_ns >= min(self._deadlines.handler_deadline_ns, self._deadlines.commit_waiter_cutoff_ns):
+                    self._cancelled = True
+                    self._phase = ReservationPhase.CANCELLED
+                    return False
+                self._phase = ReservationPhase.COMMITTING
+                return True
+        # The existing cancellation path acquires the table lock and settles callbacks.
+        expire()
+        return False
 
 
 class ReservationTable:
@@ -152,6 +159,26 @@ class ReservationTable:
         self._active: dict[ReservationScopeKey, Reservation] = {}
         self._tracked: dict[str, Reservation] = {}
         self._on_change = on_change
+        self._stop_cutoff: tuple[float, Callable[[], None]] | None = None
+
+    def pin_stop_cutoff(self, deadline: float, expire: Callable[[], None]) -> None:
+        with self._lock:
+            if self._stop_cutoff is None:
+                self._stop_cutoff = (deadline, expire)
+
+    def _shutdown_expiry_locked(self) -> Callable[[], None] | None:
+        cutoff = self._stop_cutoff
+        if cutoff is None or time.perf_counter() < cutoff[0]:
+            return None
+        return cutoff[1]
+
+    def expire_shutdown_if_due(self) -> bool:
+        with self._lock:
+            expire = self._shutdown_expiry_locked()
+        if expire is None:
+            return False
+        expire()
+        return True
 
     def has_tracked(self) -> bool:
         with self._lock:
@@ -205,7 +232,7 @@ class ReservationTable:
                 raise BrainError(ErrorCode.IDEMPOTENCY_CONFLICT, "idempotency conflict")
 
             reservation = Reservation(
-                state_lock=self._lock,
+                table=self,
                 deadlines=resolved_deadlines,
                 scope_key=key,
                 request_digest_key_id=request_digest_key_id,
@@ -229,7 +256,7 @@ class ReservationTable:
             raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
         with self._lock:
             ticket = Reservation(
-                state_lock=self._lock,
+                table=self,
                 deadlines=deadlines,
                 on_response=on_response,
             )
@@ -330,7 +357,10 @@ class ReservationTable:
         with self._lock:
             if reservation._cancelled or reservation._phase is not ReservationPhase.QUEUED:
                 return False
-            if (
+            expire = self._shutdown_expiry_locked()
+            if expire is not None:
+                claimed = False
+            elif (
                 now_ns >= reservation._deadlines.handler_deadline_ns
                 or now_ns >= reservation._deadlines.commit_waiter_cutoff_ns
             ):
@@ -349,7 +379,9 @@ class ReservationTable:
                 reservation._phase = ReservationPhase.PREPARING
                 claimed = True
 
-        if settled_here:
+        if expire is not None:
+            expire()
+        elif settled_here:
             _deliver_settled(reservation, expired_env, deliver_cb)
         return claimed
 
@@ -450,54 +482,73 @@ class ReservationTable:
         if reservation._state_lock is not self._lock:
             raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
         encode_envelope(response)
-        deliver_cb: Callable[[CallResult], None] | None = None
-        deliver_env: CallResult = response
-        settled_here = False
-        won = False
 
         with self._lock:
-            prior_phase = reservation._phase
-            self._tracked.pop(reservation.reservation_id, None)
-            if reservation._scope_key is not None and self._active.get(reservation._scope_key) is reservation:
-                del self._active[reservation._scope_key]
-            if not reservation._response_settled:
-                if (
-                    now_ns is not None
-                    and prior_phase is ReservationPhase.COMMITTING
-                    and now_ns >= reservation._deadlines.commit_waiter_cutoff_ns
-                ):
-                    reservation._phase = ReservationPhase.COMPLETED
-                    deliver_env = make_checked_error(ErrorCode.COMMIT_OUTCOME_UNKNOWN, "commit outcome unknown")
-                    reservation._response_settled = True
-                    reservation._response = deliver_env
-                    settled_here = True
-                    deliver_cb = reservation._on_response
-                elif (
-                    now_ns is not None
-                    and prior_phase in (ReservationPhase.QUEUED, ReservationPhase.PREPARING)
-                    and now_ns >= reservation._deadlines.handler_deadline_ns
-                ):
-                    reservation._cancelled = True
-                    reservation._phase = ReservationPhase.CANCELLED
-                    deliver_env = make_checked_error(ErrorCode.DEADLINE_EXCEEDED, "deadline exceeded")
-                    reservation._response_settled = True
-                    reservation._response = deliver_env
-                    settled_here = True
-                    deliver_cb = reservation._on_response
-                else:
-                    if prior_phase is not ReservationPhase.CANCELLED:
-                        reservation._phase = ReservationPhase.COMPLETED
-                    reservation._response_settled = True
-                    reservation._response = response
-                    settled_here = True
-                    won = True
-                    deliver_cb = reservation._on_response
-            elif prior_phase is not ReservationPhase.CANCELLED:
-                reservation._phase = ReservationPhase.COMPLETED
-
+            expire = (
+                self._shutdown_expiry_locked()
+                if reservation._phase in (ReservationPhase.QUEUED, ReservationPhase.PREPARING)
+                else None
+            )
+            if expire is None:
+                result = self._finish_owner_locked(reservation, response, now_ns)
+        if expire is not None:
+            # Keep the request tracked until shutdown counts and settles it.
+            expire()
+            with self._lock:
+                result = self._finish_owner_locked(reservation, response, now_ns)
+        won, settled_here, deliver_env, deliver_cb = result
         if settled_here:
             _deliver_settled(reservation, deliver_env, deliver_cb)
         return won
+
+    def _finish_owner_locked(
+        self, reservation: Reservation, response: CallResult, now_ns: int | None,
+    ) -> tuple[bool, bool, CallResult, Callable[[CallResult], None] | None]:
+        deliver_cb: Callable[[CallResult], None] | None = None
+        deliver_env = response
+        settled_here = False
+        won = False
+
+        prior_phase = reservation._phase
+        self._tracked.pop(reservation.reservation_id, None)
+        if reservation._scope_key is not None and self._active.get(reservation._scope_key) is reservation:
+            del self._active[reservation._scope_key]
+        if not reservation._response_settled:
+            if (
+                now_ns is not None
+                and prior_phase is ReservationPhase.COMMITTING
+                and now_ns >= reservation._deadlines.commit_waiter_cutoff_ns
+            ):
+                reservation._phase = ReservationPhase.COMPLETED
+                deliver_env = make_checked_error(ErrorCode.COMMIT_OUTCOME_UNKNOWN, "commit outcome unknown")
+                reservation._response_settled = True
+                reservation._response = deliver_env
+                settled_here = True
+                deliver_cb = reservation._on_response
+            elif (
+                now_ns is not None
+                and prior_phase in (ReservationPhase.QUEUED, ReservationPhase.PREPARING)
+                and now_ns >= reservation._deadlines.handler_deadline_ns
+            ):
+                reservation._cancelled = True
+                reservation._phase = ReservationPhase.CANCELLED
+                deliver_env = make_checked_error(ErrorCode.DEADLINE_EXCEEDED, "deadline exceeded")
+                reservation._response_settled = True
+                reservation._response = deliver_env
+                settled_here = True
+                deliver_cb = reservation._on_response
+            else:
+                if prior_phase is not ReservationPhase.CANCELLED:
+                    reservation._phase = ReservationPhase.COMPLETED
+                reservation._response_settled = True
+                reservation._response = response
+                settled_here = True
+                won = True
+                deliver_cb = reservation._on_response
+        elif prior_phase is not ReservationPhase.CANCELLED:
+            reservation._phase = ReservationPhase.COMPLETED
+
+        return won, settled_here, deliver_env, deliver_cb
 
 
 def reserve(

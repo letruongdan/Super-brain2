@@ -5140,6 +5140,7 @@ def test_cancelled_request_future_callback_does_not_delay_first_or_concurrent_st
 def test_stop_applies_shared_cutoff_to_arbiter_join_and_reports_overrun_when_arbiter_callback_blocks(
     trusted_tmp: Path,
     _daemon_template: _DaemonTemplate,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """I2-T6A-R03: ``stop()`` bounds deadline-arbiter join by shared cutoff and reports ``OVERRUN`` if still alive."""
     base_now = _daemon_template.base_time + dt.timedelta(minutes=5)
@@ -5334,22 +5335,30 @@ def test_stop_applies_shared_cutoff_to_arbiter_join_and_reports_overrun_when_arb
         release_owner_b.set()
         assert hold_fut_b.result(timeout=1.0) is True
 
-        with ThreadPoolExecutor(max_workers=1) as pool_b:
+        arbiter_b = arbiter_cb_threads_b[0]
+        original_join_b = arbiter_b.join
+        stopper_join_b = threading.Event()
+
+        def observe_stopper_join(timeout: float | None = None) -> None:
+            if threading.current_thread() is not owner_thread_b:
+                stopper_join_b.set()
+            original_join_b(timeout)
+
+        with monkeypatch.context() as hooks_b, ThreadPoolExecutor(max_workers=1) as pool_b:
+            hooks_b.setattr(arbiter_b, "join", observe_stopper_join)
             stop_fut_b = pool_b.submit(loop_b.stop, grace_s=1.50)
-            _wait_until(
-                lambda: not DataRoot.at(root_b).endpoint_path.exists(),
-                timeout=1.35,
-                desc="Part B owner closed runtime while arbiter callback remained held",
-            )
             try:
-                with pytest.raises(TimeoutError):
-                    stop_fut_b.result(timeout=0.08)
+                assert stopper_join_b.wait(1.43), "Part B stop caller never joined the held arbiter"
+                assert not DataRoot.at(root_b).endpoint_path.exists()
+                assert not stop_fut_b.done() and not arbiter_cb_exited_b.is_set()
+                assert time.perf_counter() < loop_b._stop_wall_deadline, "Part B missed the timely-release window"
             finally:
                 release_arbiter_cb_b.set()
             rep_b = stop_fut_b.result(timeout=1.5)
 
         assert arbiter_cb_exited_b.wait(timeout=1.0)
         assert (rep_b.state, rep_b.error_code) == (ShutdownState.STOPPED, None)
+        assert rep_b.endpoint_removed is True
         assert loop_b.wait_closed(timeout=0.0) == rep_b
     finally:
         release_arbiter_cb_b.set()

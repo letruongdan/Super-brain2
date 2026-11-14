@@ -90,6 +90,23 @@ jobs:
         run: |
           mkdir -p "${{ runner.temp }}/perf-evidence"
           uv run --locked --python ${{ matrix.python }} python -m tests.integration.test_kernel_performance --evidence-dir "${{ runner.temp }}/perf-evidence"
+      - name: Profile one Windows storage case
+        if: always() && runner.os == 'Windows'
+        continue-on-error: true
+        shell: bash
+        env:
+          PYTHONPATH: .
+        run: |
+          ev="$RUNNER_TEMP/windows-storage-profile"
+          mkdir -p "$ev"
+          uv run --locked --python ${{ matrix.python }} python .github/diag/windows_storage_probe.py canary --source-commit "${{ github.sha }}" --seal-digest "$T9_TEST_SEAL_R19_SHA256" --output "$ev/canary" --basetemp "$TEMP/r25-profile-pytest" --cache-dir "$TEMP/r25-profile-cache" > "$ev/launcher.log" 2>&1
+      - name: Upload Windows storage profile
+        if: always() && runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-storage-profile-${{ matrix.python }}
+          path: ${{ runner.temp }}/windows-storage-profile/
+          if-no-files-found: warn
       - name: Check reviewer seal after execution
         if: always()
         shell: bash

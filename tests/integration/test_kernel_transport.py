@@ -872,6 +872,7 @@ class TestTransportLifecycleAndRelease:
             stop_event = threading.Event()
             ready_ev = threading.Event()
             ready_holder: list[Ready] = []
+            owner_holder: list[OwnerLoop] = []
             domain = TransportTestDomain(
                 ws_a=transport_template.ws_a,
                 pause_idem_keys={"idem-shut-pause-001"},
@@ -879,8 +880,9 @@ class TestTransportLifecycleAndRelease:
             domain.allow_apply_finish.clear()
             serve_res: list[int] = []
 
-            def _on_ready(r: Ready, _loop: OwnerLoop) -> None:
+            def _on_ready(r: Ready, owner: OwnerLoop) -> None:
                 ready_holder.append(r)
+                owner_holder.append(owner)
                 ready_ev.set()
 
             t: threading.Thread | None = None
@@ -987,7 +989,18 @@ class TestTransportLifecycleAndRelease:
                     admit_existing_pair(data_root, transport_template.store_id, os_adapters(), purpose="serve")
                 assert exc_lock.value.code == ErrorCode.WRITER_HELD
 
-                # Unblock SQLite transaction
+                # EOF on either accepted socket can precede the owner cutoff.
+                # Keep the SQLite operation parked through the actual pinned cutoff.
+                owner = owner_holder[0]
+                observe_cutoff_until = time.perf_counter() + 1.0
+                while owner.ready is not None and time.perf_counter() < observe_cutoff_until:
+                    threading.Event().wait(0.001)
+                assert owner.ready is None, "owner did not begin shutdown after transport quiesce"
+                owner_cutoff = owner._stop_wall_deadline
+                assert 0.0 < owner_cutoff <= observe_cutoff_until + 0.06
+                while (remaining := owner_cutoff - time.perf_counter()) > 0:
+                    threading.Event().wait(remaining)
+
                 domain.allow_apply_finish.set()
                 t.join(timeout=3.0)
                 th_call.join(timeout=2.0)

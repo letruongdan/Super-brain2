@@ -248,6 +248,8 @@ class _AdmittedOwnerSession(OwnerSession):
         did_work = False
         if self._executor is not None:
             while (wcmd := self._executor.next_command(0.0)) is not None:
+                if self._bridge.reservations.expire_shutdown_if_due():
+                    break
                 with contextlib.suppress(BrainError):
                     self._job_service.apply_command(wcmd)
                 did_work = True
@@ -325,6 +327,9 @@ class _AdmittedOwnerSession(OwnerSession):
 
     def has_pending_owner_work(self) -> bool:
         return self._bridge.queue_depth() > 0
+
+    def pin_stop_cutoff(self, deadline: float, expire: Callable[[], None]) -> None:
+        self._bridge.reservations.pin_stop_cutoff(deadline, expire)
 
     def mark_stopping(self) -> None:
         with self._metrics_lock:

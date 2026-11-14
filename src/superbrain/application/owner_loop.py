@@ -90,6 +90,7 @@ class OwnerSession(Protocol):
     def arbitrate_deadlines(self) -> bool: ...
     def step_owner_work(self, *, allow_new_jobs: bool) -> bool: ...
     def has_pending_owner_work(self) -> bool: ...
+    def pin_stop_cutoff(self, deadline: float, expire: Callable[[], None]) -> None: ...
     def mark_stopping(self) -> None: ...
     def mark_overrun(self) -> None: ...
     def shutdown_metrics(self) -> tuple[int, bool]: ...
@@ -264,7 +265,7 @@ class OwnerLoop:
                 return fut
 
             def _task() -> None:
-                if self._drain_expired:
+                if self._expire_drain_if_due(session):
                     if is_collecting_deferred_callbacks():
                         safe_set_exception(fut, _unavailable_error())
                     else:
@@ -334,6 +335,11 @@ class OwnerLoop:
         )
         return cancelled_total
 
+    def _expire_drain_if_due(self, session: OwnerSession) -> bool:
+        if not self._drain_expired and self._stop_requested and time.perf_counter() >= self._stop_wall_deadline:
+            self._trigger_overrun(session)
+        return self._drain_expired
+
     def stop(self, grace_s: float = DEFAULT_SHUTDOWN_GRACE_S) -> ShutdownReport:
         if (
             isinstance(grace_s, bool)
@@ -350,10 +356,14 @@ class OwnerLoop:
             session = self._session
             first_stopper = not self._stop_requested
             if first_stopper:
+                def expire() -> None:
+                    self._trigger_overrun(session)
+
+                session.pin_stop_cutoff(candidate_deadline, expire)
+                self._stop_wall_deadline = candidate_deadline
                 self._stop_requested = True
                 self._stopping = True
                 self._ready_value = None
-                self._stop_wall_deadline = candidate_deadline
                 session.mark_stopping()
                 wall_deadline = candidate_deadline
             else:
@@ -506,15 +516,12 @@ class OwnerLoop:
         try:
             while True:
                 self._owner_wake.clear()
-                if self._drain_expired:
-                    break
-
                 did_work = False
-                while not self._drain_expired and (task := self._pop_internal()) is not None:
+                while not self._expire_drain_if_due(session) and (task := self._pop_internal()) is not None:
                     task()
                     did_work = True
 
-                if self._drain_expired:
+                if self._expire_drain_if_due(session):
                     break
 
                 if session.step_owner_work(allow_new_jobs=not self._stopping):
@@ -528,7 +535,7 @@ class OwnerLoop:
                     rem_worker = max(0.0, self._stop_wall_deadline - time.perf_counter())
                     if not session.join_worker(rem_worker):
                         self._trigger_overrun(session)
-                    else:
+                    elif not self._expire_drain_if_due(session):
                         session.step_owner_work(allow_new_jobs=False)
                     break
 
@@ -584,8 +591,16 @@ class OwnerLoop:
                     worker_drained=False,
                     error_code=unexpected_error_code,
                 )
-            with self._lifecycle_lock:
-                self._final_report = report
             with self._overrun_lock:
-                self._closed_done.set()
+                with self._lifecycle_lock:
+                    report = replace(report, cancelled_requests=self._cancelled_requests)
+                    # Judge completion at publication. A stop caller may still
+                    # be descheduled after its wait expires, or observe a timely
+                    # completion only after the cutoff.
+                    if report.state is ShutdownState.STOPPED and (
+                        self._overrun_cancelled or time.perf_counter() >= self._stop_wall_deadline
+                    ):
+                        report = replace(report, state=ShutdownState.OVERRUN, error_code=ErrorCode.DEADLINE_EXCEEDED)
+                    self._final_report = report
+                    self._closed_done.set()
                 self._notifier.close()
