@@ -718,15 +718,39 @@ def run_kernel_case(case: KernelCrashCase, ctx: KernelCrashContext) -> None:
             while_ready=lambda ready: trigger(ctx, seeded, ready),
             args=args,
         )
-        assert_request_crashed(run, case.crashpoint)
+        first = seeded.notes.get("first")
+        if run.result.hit is None and _pre_commit_refusal(first) is not None:
+            # A terminal pre-commit refusal (the request ran out of its deadline or found the store busy before
+            # COMMIT) never reached the crashpoint: prove nothing was committed, then fail -- never retry.
+            before = seeded.notes.get("before")
+            after = fixture_rows(seeded.data_root, ctx.case_dir / "ro-scratch")
+            assert after == before, f"a refused request left durable state; trigger result: {first!r}"
+            raise AssertionError(f"{case.crashpoint} not exercised: trigger result {first!r}; {run.describe()}")
+        # The trigger's own reply tells a request that ended before the crashpoint apart from a daemon that
+        # ignored the fault.
+        assert_request_crashed(run, case.crashpoint, trigger_result=first)
     case.expect(ctx, seeded, run)
 
 
-def assert_request_crashed(run: MarkedRun, crashpoint: str) -> None:
+PRE_COMMIT_REFUSALS = frozenset({ErrorCode.DEADLINE_EXCEEDED.value, ErrorCode.STORE_BUSY.value})
+"""Terminal refusals a request can get before COMMIT; under CPU starvation they stop it short of the crashpoint."""
+
+
+def _pre_commit_refusal(result: object) -> str | None:
+    """The refusal code when the trigger's tool result is a terminal pre-commit refusal, else ``None``."""
+    if not isinstance(result, dict) or result.get("isError") is not True:
+        return None
+    sc = result.get("structuredContent")
+    error = sc.get("error") if isinstance(sc, dict) else None
+    code = error.get("code") if isinstance(error, dict) else None
+    return code if isinstance(code, str) and code in PRE_COMMIT_REFUSALS else None
+
+
+def assert_request_crashed(run: MarkedRun, crashpoint: str, *, trigger_result: object = None) -> None:
     """The daemon reached READY, then the triggering request made this invocation exit 86 at ``crashpoint``."""
     r = run.result
     assert r.returncode == CRASH_EXIT and r.hit == crashpoint and run.ready is not None and not run.timed_out, (
-        f"the request did not crash the daemon at {crashpoint!r}: {run.describe()}"
+        f"the request did not crash the daemon at {crashpoint!r}: {run.describe()}; trigger result: {trigger_result!r}"
     )
     assert_entered(run)
     assert r.stderr.index("READY ") < r.stderr.index("CRASHPOINT_HIT "), run.describe()
