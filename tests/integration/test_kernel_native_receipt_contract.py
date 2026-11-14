@@ -3600,9 +3600,11 @@ def test_t9_r07_slow_collector_off_deadline_and_concurrent_calls(
 ) -> None:
     """T9-R07: Slow/failing OS socket lookup runs off request thread, preserves concurrent calls, marks incomplete."""
     import concurrent.futures
+    import contextlib
     import queue
     import threading
 
+    from superbrain.cli_api import _loopback_server
     from superbrain.core.kernel import ToolCommand
     from tests.support import inc2_native_owner as native_owner
     from tests.support.inc2_transport import FakeMonotonicClock, open_test_loopback_transport
@@ -3616,6 +3618,8 @@ def test_t9_r07_slow_collector_off_deadline_and_concurrent_calls(
 
     slow_entered = threading.Event()
     slow_release = threading.Event()
+    fast_lookup_done = threading.Event()
+    slow_peer_port: dict[str, int | None] = {"port": None}
     lookup_lock = threading.Lock()
     call_idx = {"n": 0}
     mode_state = {"error": False}
@@ -3627,10 +3631,15 @@ def test_t9_r07_slow_collector_off_deadline_and_concurrent_calls(
             call_idx["n"] += 1
             idx = call_idx["n"]
         if idx == 1:
+            slow_peer_port["port"] = peer_port
             slow_entered.set()
             slow_release.wait(timeout=3.0)
             return None
-        return os.getpid()
+        try:
+            native_owner._note_sighting()
+            return os.getpid()
+        finally:
+            fast_lookup_done.set()
 
     hook_state = native_owner._install_loopback_server_hooks(
         eq=eq,
@@ -3642,10 +3651,27 @@ def test_t9_r07_slow_collector_off_deadline_and_concurrent_calls(
     )
     try:
         with open_test_loopback_transport(tpl, name="r07-slow-collector") as h:
+            orig_release_reply = _loopback_server.LoopbackServer._release_owner_reply
+
+            def _wait_fast_lookup_before_reply(
+                self: Any,
+                ssl_sock: Any,
+                reply: Any,
+                tool_deadline_ns: int,
+            ) -> None:
+                peer_port = 0
+                with contextlib.suppress(OSError):
+                    peer_port = int(ssl_sock.getpeername()[1])
+                slow_port = slow_peer_port["port"]
+                if not mode_state["error"] and slow_port is not None and peer_port != slow_port:
+                    assert fast_lookup_done.wait(timeout=2.0)
+                orig_release_reply(self, ssl_sock, reply, tool_deadline_ns)
+
             client_clock = FakeMonotonicClock(h.mono_clock.now)
             target = h.make_target()
             with monkeypatch.context() as mp:
                 mp.setattr(native_owner, "_lookup_loopback_client_pid", _mock_lookup)
+                mp.setattr(_loopback_server.LoopbackServer, "_release_owner_reply", _wait_fast_lookup_before_reply)
 
                 def _call(corr: str) -> dict[str, Any]:
                     return h.open_client(monotonic_ns=client_clock.monotonic_ns).call(
@@ -3677,6 +3703,7 @@ def test_t9_r07_slow_collector_off_deadline_and_concurrent_calls(
             if "flush" in hook_state:
                 hook_state["flush"](timeout=1.0)
     finally:
+        fast_lookup_done.set()
         slow_release.set()
         hook_state["uninstall"]()
 
@@ -4059,13 +4086,18 @@ def test_t9_r02_socket_observation_lifetime_and_post_close_lookup_rejection(
     eq: queue.Queue[dict[str, object] | None] = queue.Queue()
 
     post_close_gate = threading.Event()
+    live_lookup_done = threading.Event()
     lookup_mode = {"kind": "post_close"}
 
     def _mock_lookup(c_port: int, l_port: int) -> int | None:
         if lookup_mode["kind"] == "post_close":
             assert post_close_gate.wait(timeout=3.0)
             return 47001
-        return os.getpid()
+        try:
+            native_owner._note_sighting()
+            return os.getpid()
+        finally:
+            live_lookup_done.set()
 
     def _mock_start(pid: int) -> str:
         if pid == 47001:
@@ -4085,12 +4117,23 @@ def test_t9_r02_socket_observation_lifetime_and_post_close_lookup_rejection(
             from superbrain.cli_api import _loopback_server
 
             orig_wrapped_worker = _loopback_server.LoopbackServer._conn_worker
+            orig_release_reply = _loopback_server.LoopbackServer._release_owner_reply
 
             def _worker_then_signal_close(self: Any, conn_id: Any, raw_sock: Any, accept_ns: int) -> None:
                 try:
                     orig_wrapped_worker(self, conn_id, raw_sock, accept_ns)
                 finally:
                     post_close_gate.set()
+
+            def _wait_live_lookup_before_reply(
+                self: Any,
+                ssl_sock: Any,
+                reply: Any,
+                tool_deadline_ns: int,
+            ) -> None:
+                if lookup_mode["kind"] == "fast_live":
+                    assert live_lookup_done.wait(timeout=2.0)
+                orig_release_reply(self, ssl_sock, reply, tool_deadline_ns)
 
             client_clock = FakeMonotonicClock(h.mono_clock.now)
             target = h.make_target()
@@ -4114,6 +4157,7 @@ def test_t9_r02_socket_observation_lifetime_and_post_close_lookup_rejection(
 
                 lookup_mode["kind"] = "fast_live"
                 mp.setattr(_loopback_server.LoopbackServer, "_conn_worker", orig_wrapped_worker)
+                mp.setattr(_loopback_server.LoopbackServer, "_release_owner_reply", _wait_live_lookup_before_reply)
                 res_live = h.open_client(monotonic_ns=client_clock.monotonic_ns).call(
                     target,
                     ToolCommand(
@@ -4127,6 +4171,7 @@ def test_t9_r02_socket_observation_lifetime_and_post_close_lookup_rejection(
                 assert res_live.get("ok") is True
                 hook_state["flush"](timeout=2.0)
     finally:
+        live_lookup_done.set()
         post_close_gate.set()
         hook_state["uninstall"]()
 
@@ -4788,6 +4833,7 @@ def test_t9_r02_tls_close_before_worker_return_and_ready_port_mismatch(
     real_lookup_fn = native_owner._lookup_loopback_client_pid
     after_close_gate = threading.Event()
     lookup_finished = threading.Event()
+    live_lookup_finished = threading.Event()
     mode = {"kind": "after_tls_close"}
 
     def _gated_real_lookup(client_port: int, listen_port: int) -> int | None:
@@ -4797,6 +4843,11 @@ def test_t9_r02_tls_close_before_worker_return_and_ready_port_mismatch(
                 return real_lookup_fn(client_port, listen_port)
             finally:
                 lookup_finished.set()
+        if mode["kind"] == "live":
+            try:
+                return real_lookup_fn(client_port, listen_port)
+            finally:
+                live_lookup_finished.set()
         return real_lookup_fn(client_port, listen_port)
 
     try:
@@ -4817,6 +4868,16 @@ def test_t9_r02_tls_close_before_worker_return_and_ready_port_mismatch(
                     assert (ssl_sock is None or ssl_sock.fileno() == -1) and raw_sock.fileno() == -1
                     after_close_gate.set()
                     lookup_finished.wait(timeout=2.0)
+
+            def _wait_live_before_reply(
+                self: Any,
+                ssl_sock: Any,
+                reply: Any,
+                tool_deadline_ns: int,
+            ) -> None:
+                if mode["kind"] == "live":
+                    assert live_lookup_finished.wait(timeout=2.0)
+                orig_release_reply(self, ssl_sock, reply, tool_deadline_ns)
 
             def _abort_during_reply_and_wait(
                 self: Any,
@@ -4840,6 +4901,11 @@ def test_t9_r02_tls_close_before_worker_return_and_ready_port_mismatch(
                     _loopback_server.LoopbackServer,
                     "_release_conn",
                     _wait_after_close_before_worker_return,
+                )
+                mp.setattr(
+                    _loopback_server.LoopbackServer,
+                    "_release_owner_reply",
+                    _wait_live_before_reply,
                 )
 
                 # 1. Keep client TLS socket open past _graceful_close_conn before _conn_worker returns.
@@ -4930,6 +4996,7 @@ def test_t9_r02_tls_close_before_worker_return_and_ready_port_mismatch(
                     abort_sock.close()
                 hook_state["flush"](timeout=2.0)
     finally:
+        live_lookup_finished.set()
         after_close_gate.set()
         hook_state["uninstall"]()
 

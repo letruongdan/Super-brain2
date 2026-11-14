@@ -1,6 +1,6 @@
 # Checklist kiểm chứng kết nối native · SP1 đợt 2 (Task 9)
 
-Ngày cập nhật: 2026-11-14. Tài liệu vận hành cho Task 9 (spec rev22 §2 Q4, §4.3, §5.9, §17.2–17.5; D1–D8; [biên bản freeze T0](../reviews/2026-11-06-sp1-increment2-t0-closure-and-d2-freeze.json)). Mọi receipt phát sinh từ fixture hoặc wheel test mang `kind="fixture"`, **không** bao giờ được nâng thành `native`. Chỉ cấp `native connection accepted` cho từng host sau khi có `NativeConnectionProbe` (`kind="native"`, `status="passed"`, schema `sp1-i2-native-connection-v1`) đi qua cùng verifier `tests/support/inc2_native.py::verify_native_connection` với `ObserverRegistration` do coordinator pin độc lập từ ngoài payload.
+Ngày cập nhật: 2026-11-15. Tài liệu vận hành cho Task 9 (spec rev22 §2 Q4, §4.3, §5.9, §17.2–17.5; D1–D8; [biên bản freeze T0](../reviews/2026-11-06-sp1-increment2-t0-closure-and-d2-freeze.json)). Mọi receipt phát sinh từ fixture hoặc wheel test mang `kind="fixture"`, **không** bao giờ được nâng thành `native`. Chỉ cấp `native connection accepted` cho từng host sau khi có `NativeConnectionProbe` (`kind="native"`, `status="passed"`, schema `sp1-i2-native-connection-v1`) đi qua cùng verifier `tests/support/inc2_native.py::verify_native_connection` với `ObserverRegistration` do coordinator pin độc lập từ ngoài payload.
 
 ---
 
@@ -108,7 +108,7 @@ Mọi receipt JSON và log giữ ở `task-9/native/` phải vượt qua parser 
 
 ### Quy trình dừng và cleanup sau mỗi lần thử
 
-1. Lưu toàn bộ `NativeConnectionProbe` JSON, observer index và socket/owner metadata đã lọc tại `C:\Users\letru\sb2-trusted-local\d8-live\final-<short_sha>\` và/hoặc `.superpowers/sdd/2026-11-04-sp1-increment2-daemon-mcp-kernel/task-9/` (`ledger.md`, `final-r29-<short_sha>/`, `native/<host>/<run_id>/`) **trước** khi dọn thư mục làm việc.
+1. Lưu toàn bộ `NativeConnectionProbe` JSON, observer index và socket/owner metadata đã lọc tại `C:\Users\letru\sb2-trusted-local\d8-live\final-<short_sha>\` và/hoặc `.superpowers/sdd/2026-11-04-sp1-increment2-daemon-mcp-kernel/task-9/` (`ledger.md`, `final-r30-<short_sha>/`, `native/<host>/<run_id>/`) **trước** khi dọn thư mục làm việc.
 2. Đóng các cửa sổ/session test của host, xác nhận tất cả tiến trình `shim` (`launcher` + `worker`) đã kết thúc theo đúng `(pid, started_at)`.
 3. Gửi tín hiệu dừng nhẹ (`CTRL_BREAK_EVENT` trên Windows / `SIGTERM` trên POSIX) tới daemon owner theo đúng `(pid, started_at)`; xác nhận mã thoát sạch, file `writer.lock` đã được nhả và `endpoint.json` đã bị xóa.
 4. Kiểm tra physical path và owner của toàn bộ thư mục synthetic trước khi xóa; tuyệt đối không dùng xóa đệ quy qua link/junction.

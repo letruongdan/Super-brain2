@@ -52,10 +52,9 @@ SYNC_TIMEOUT_S = 600.0
 COLLECT_TIMEOUT_S = 300.0
 def default_pytest_shards(platform_name: str = sys.platform, cpu_count: int | None = None) -> int:
     """Return the platform default pytest shard count."""
+    del platform_name
     cpus = max(1, (os.cpu_count() if cpu_count is None else cpu_count) or 1)
-    cap = 8 if platform_name == "win32" else 4
-    multiplier = 2 if platform_name == "win32" else 1
-    return min(cap, cpus * multiplier)
+    return min(4, cpus)
 
 
 PYTEST_SHARDS = default_pytest_shards()
@@ -270,8 +269,8 @@ def parse_collected(text: str) -> list[str]:
     return ids
 
 
-_WHEEL_SETUP_COST_MS = 18_500
-_DEFAULT_CASE_COST_MS = 90
+_WHEEL_SETUP_COST_MS = 8_000
+_DEFAULT_CASE_COST_MS = 20
 _WHEEL_FIXTURE_FILES: frozenset[str] = frozenset(
     {
         "tests/contract/test_mcp_v2_schema.py",
@@ -284,64 +283,90 @@ _WHEEL_FIXTURE_FILES: frozenset[str] = frozenset(
         "tests/integration/test_t9_benchmark_scratch.py",
     }
 )
-# Calibrated Windows CI file costs (win314 43602277902 JUnit XML and Shard 0 runs, excluding shared wheel setup).
+# Calibrated Windows CI file costs (win314 43574161358 4-shard JUnit minus 13s shared wheel setup where applicable,
+# plus win311 43615432733 weights for newly added suites).
 _HEAVY_FILE_COST_MS: dict[str, int] = {
-    "tests/storage/test_kernel_revocation.py": 77_628,
-    "tests/integration/test_kernel_daemon.py": 57_656,
-    "tests/storage/test_backup.py": 57_294,
+    "tests/storage/test_backup.py": 55_078,
+    "tests/storage/test_kernel_revocation.py": 48_986,
     "tests/integration/test_kernel_crash_recovery.py": 48_741,
-    "tests/storage/test_restore.py": 41_628,
-    "tests/storage/test_remediation_i2_t3_lineage.py": 39_324,
-    "tests/integration/test_kernel_native_receipt_contract.py": 34_472,
-    "tests/storage/test_crash_matrix.py": 33_474,
-    "tests/storage/test_kernel_idempotency.py": 28_893,
-    "tests/storage/test_kernel_workspaces.py": 27_419,
-    "tests/integration/test_kernel_shim.py": 25_328,
-    "tests/integration/test_kernel_receipts.py": 24_186,
-    "tests/storage/test_retention.py": 23_927,
-    "tests/storage/test_policy_store.py": 22_998,
-    "tests/storage/test_remediation_c04_r9_imported_backup_ancestors.py": 22_925,
-    "tests/application/test_kernel_job_worker.py": 22_837,
-    "tests/storage/test_remediation_i2_t5.py": 22_714,
-    "tests/storage/test_cas.py": 21_459,
-    "tests/storage/test_remediation_i2_os01.py": 20_703,
-    "tests/application/test_kernel_deadlines.py": 20_325,
-    "tests/application/test_kernel_send_attempts.py": 19_644,
+    "tests/integration/test_kernel_daemon.py": 44_843,
+    "tests/storage/test_restore.py": 38_585,
+    "tests/storage/test_remediation_i2_t3_lineage.py": 36_470,
+    "tests/storage/test_crash_matrix.py": 31_836,
+    "tests/storage/test_kernel_workspaces.py": 28_218,
+    "tests/application/test_t8_review_p01_r2_edge_globs.py": 25_748,
+    "tests/storage/test_kernel_idempotency.py": 24_876,
+    "tests/integration/test_kernel_native_receipt_contract.py": 21_472,
+    "tests/application/test_t8_review_p01_wrapped_paths.py": 20_309,
+    "tests/storage/test_runtime.py": 18_623,
     "tests/storage/test_kernel_identity.py": 18_365,
-    "tests/storage/test_remediation_i2_t4a.py": 17_748,
-    "tests/storage/test_runtime.py": 16_613,
-    "tests/storage/test_kernel_jobs.py": 16_590,
-    "tests/storage/test_reconcile.py": 13_983,
-    "tests/storage/test_remediation_c04_r8_backup_files.py": 13_753,
-    "tests/storage/test_remediation_c02_r6_restore_marker.py": 13_632,
-    "tests/storage/test_ledger.py": 13_050,
-    "tests/application/test_t8_review_p01_r2_edge_globs.py": 12_269,
-    "tests/application/test_t8_review_p01_wrapped_paths.py": 10_904,
-    "tests/architecture/test_gate_receipt.py": 10_688,
+    "tests/application/test_kernel_send_attempts.py": 16_338,
+    "tests/storage/test_remediation_i2_t4a.py": 13_941,
+    "tests/storage/test_ledger.py": 12_257,
+    "tests/architecture/test_gate_receipt.py": 11_642,
+    "tests/storage/test_remediation_c04_r8_backup_files.py": 11_591,
+    "tests/application/test_kernel_deadlines.py": 11_539,
+    "tests/integration/test_kernel_receipts.py": 11_186,
+    "tests/storage/test_policy_store.py": 10_921,
+    "tests/storage/test_remediation_i2_t5.py": 10_726,
     "tests/storage/test_migrate.py": 10_546,
-    "tests/storage/test_remediation_c01_wal_admission.py": 9_331,
+    "tests/storage/test_remediation_i2_os01.py": 10_457,
+    "tests/storage/test_reconcile.py": 10_305,
+    "tests/integration/test_kernel_shim.py": 10_229,
+    "tests/storage/test_kernel_jobs.py": 9_984,
+    "tests/storage/test_cas.py": 9_899,
     "tests/storage/test_kernel_migration.py": 9_209,
-    "tests/storage/test_errors.py": 8_883,
-    "tests/storage/test_remediation_c04_cas_shard_boundary.py": 8_493,
+    "tests/storage/test_remediation_c02_r6_restore_marker.py": 9_044,
+    "tests/storage/test_remediation_c04_r9_imported_backup_ancestors.py": 8_409,
     "tests/integration/test_kernel_transport.py": 8_366,
     "tests/integration/test_kernel_cli.py": 7_882,
     "tests/application/test_t8_closure_privacy_r2.py": 7_793,
-    "tests/application/test_remediation_i2_t4bc.py": 7_209,
-    "tests/storage/test_writer.py": 6_533,
-    "tests/storage/test_remediation_c04_r2_cas_siblings.py": 6_326,
-    "tests/storage/test_swap.py": 6_147,
-    "tests/storage/test_remediation_c02_lost_main_db.py": 5_656,
-    "tests/application/test_kernel_daemon_worker.py": 5_525,
-    "tests/storage/test_cas_gc.py": 5_506,
+    "tests/storage/test_errors.py": 7_538,
+    "tests/application/test_remediation_i2_t4bc.py": 7_331,
+    "tests/application/test_t8_review_p01_r3_spellings.py": 6_919,
+    "tests/storage/test_retention.py": 6_613,
+    "tests/application/test_kernel_daemon_worker.py": 6_393,
+    "tests/application/test_kernel_job_worker.py": 6_324,
+    "tests/storage/test_cas_gc.py": 5_999,
+    "tests/storage/test_remediation_c01_wal_admission.py": 5_951,
+    "tests/storage/test_writer.py": 5_749,
+    "tests/storage/test_remediation_c04_cas_shard_boundary.py": 5_522,
+    "tests/integration/test_kernel_performance.py": 5_505,
+    "tests/integration/test_t9_signal_stop_conversion.py": 5_392,
+    "tests/storage/test_swap.py": 5_341,
+    "tests/storage/test_remediation_c04_r6_backup_container_perms.py": 5_179,
+    "tests/storage/test_remediation_c02_r8_restore_carryover.py": 4_802,
+    "tests/storage/test_remediation_c02_lost_main_db.py": 4_792,
+    "tests/integration/test_kernel_privacy_persistence.py": 4_724,
+    "tests/support/test_bounded_worker.py": 4_597,
+    "tests/application/test_t8_review_w01_private_equivalence.py": 4_430,
+    "tests/cli_api/test_t9_tcp_latency.py": 4_086,
+    "tests/integration/test_t9_r22_stop_completion.py": 3_969,
+    "tests/application/test_t8_review_p01_n04_short_spellings.py": 3_824,
+    "tests/storage/test_remediation_c04_r2_cas_siblings.py": 3_649,
+    "tests/storage/test_remediation_i2_t3_mirror_history.py": 3_324,
+    "tests/application/test_t8_review_w01_canonical_reuse.py": 3_173,
+    "tests/adapters/test_durable.py": 2_996,
+    "tests/architecture/test_remediation_c08_r11_raw_path_admission.py": 2_992,
+    "tests/storage/test_remediation_c01_r4_reading_leftovers.py": 2_708,
+    "tests/application/test_t8_closure_privacy.py": 2_699,
+    "tests/integration/test_kernel_serve_signal_lifecycle.py": 2_595,
+    "tests/application/test_remediation_i2_t5_worker.py": 2_423,
+    "tests/support/test_crash_harness.py": 2_389,
+    "tests/integration/test_t9_startup_signal_latch.py": 2_362,
+    "tests/integration/test_t9_benchmark_scratch.py": 2_318,
+    "tests/storage/test_remediation_c01_r5_policy_wal_reader.py": 2_278,
+    "tests/storage/test_remediation_c05_r2_resync.py": 2_272,
+    "tests/application/test_t8_closure_privacy_r2_gates.py": 2_201,
+    "tests/application/test_t8_review_p01_n01_linear.py": 2_075,
 }
 
 
 def _estimated_file_cost_ms(file: str, count: int) -> int:
     normalized = file.replace("\\", "/")
-    fallback = count * _DEFAULT_CASE_COST_MS
     if normalized in _HEAVY_FILE_COST_MS:
-        return max(_HEAVY_FILE_COST_MS[normalized], fallback)
-    return fallback
+        return _HEAVY_FILE_COST_MS[normalized]
+    return count * _DEFAULT_CASE_COST_MS
 
 
 def shard_files(collected_ids: Sequence[str], shards: int) -> list[list[str]]:
@@ -365,10 +390,9 @@ def shard_files(collected_ids: Sequence[str], shards: int) -> list[list[str]]:
     if has_wheel:
         groups[0].sort()
         loads[0] += _WHEEL_SETUP_COST_MS
-    # Keep non-wheel tests off shard 0 whenever wheel suites sit there so slow wheel rebuilds never stack.
-    target_indices = range(1, size) if (has_wheel and size > 1) else range(size)
+    # Balance non-wheel tests across all shards (including shard 0) so wheel overhead does not skew shard loads.
     for cost, file in sorted(remaining, key=lambda item: (-item[0], item[1])):
-        index = min(target_indices, key=lambda idx: (loads[idx], idx))
+        index = min(range(size), key=lambda idx: (loads[idx], idx))
         groups[index].append(file)
         loads[index] += cost
     return [group for group in groups if group]

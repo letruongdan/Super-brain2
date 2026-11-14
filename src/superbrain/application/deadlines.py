@@ -273,6 +273,9 @@ class KernelDeadlineCoordinator:
         ts = self._monotonic_clock.monotonic_ns() if now_ns is None else now_ns
         return self._reservations.arbitrate_at(ts)
 
+    def next_deadline_ns(self) -> int | None:
+        return self._reservations.next_deadline_ns()
+
     def process_next(self, *, block: bool = False, timeout: float | None = None) -> bool:
         item: tuple[QueuedKernelRequest, Reservation] | None = None
         with self._queue_cv:

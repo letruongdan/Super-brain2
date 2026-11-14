@@ -409,6 +409,9 @@ class KernelBridge(KernelBlobStagePort):
     def arbitrate_deadlines(self, now_ns: int | None = None) -> tuple[tuple[Reservation, CallResult], ...]:
         return self._coordinator.arbitrate(now_ns)
 
+    def next_deadline_ns(self) -> int | None:
+        return self._coordinator.next_deadline_ns()
+
     def process_next_queued(self, *, block: bool = False, timeout: float | None = None) -> bool:
         return self._coordinator.process_next(block=block, timeout=timeout)
 

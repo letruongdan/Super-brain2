@@ -184,7 +184,6 @@ def open_inc2_installed_env(scratch: Path) -> Iterator[InstalledEnv]:
             "--offline",
             "--no-dev",
             "--no-install-project",
-            "--link-mode=copy",
             "--python",
             sys.executable,
         ],

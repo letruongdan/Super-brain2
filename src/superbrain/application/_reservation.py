@@ -184,6 +184,23 @@ class ReservationTable:
         with self._lock:
             return bool(self._tracked)
 
+    def next_deadline_ns(self) -> int | None:
+        """Return earliest unsettled arbiter deadline or commit cutoff across tracked reservations."""
+        earliest: int | None = None
+        with self._lock:
+            for res in self._tracked.values():
+                if res._cancelled or res._response_settled:
+                    continue
+                if res._phase in (ReservationPhase.QUEUED, ReservationPhase.PREPARING):
+                    dl = res._deadlines.handler_deadline_ns
+                elif res._phase is ReservationPhase.COMMITTING:
+                    dl = res._deadlines.commit_waiter_cutoff_ns
+                else:
+                    continue
+                if earliest is None or dl < earliest:
+                    earliest = dl
+        return earliest
+
     def state_lock_locked(self) -> bool:
         """True iff the shared reservation/arbiter state lock is currently held."""
         return self._lock.locked()

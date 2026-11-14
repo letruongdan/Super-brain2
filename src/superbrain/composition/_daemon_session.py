@@ -244,6 +244,9 @@ class _AdmittedOwnerSession(OwnerSession):
         self._bridge.arbitrate_deadlines()
         return self._bridge.reservations.has_tracked()
 
+    def next_deadline_ns(self) -> int | None:
+        return self._bridge.next_deadline_ns()
+
     def step_owner_work(self, *, allow_new_jobs: bool) -> bool:
         did_work = False
         if self._executor is not None:

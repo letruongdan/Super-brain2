@@ -51,6 +51,11 @@ from superbrain.ports.policy import Intent
 _T = TypeVar("_T")
 
 _ARBITER_ACTIVE_POLL_S = 0.004
+_ARBITER_NEAR_CUTOFF_NS = 35_000_000
+_ARBITER_SAFETY_MARGIN_NS = 30_000_000
+_ARBITER_CLOCK_PROBE_NS = 200_000
+_ARBITER_YIELD_CAP_NS = 40_000_000
+_ARBITER_PROGRESS_CHECK_NS = 2_000_000
 _WORKER_IDLE_POLL_S = 0.05
 _LOGGER = logging.getLogger(__name__)
 
@@ -88,6 +93,7 @@ class OwnerSession(Protocol):
     def has_job_handlers(self) -> bool: ...
     def submit_queued_reply(self, command: ToolCommand, receive_ns: int, future: Future[OwnerReply]) -> None: ...
     def arbitrate_deadlines(self) -> bool: ...
+    def next_deadline_ns(self) -> int | None: ...
     def step_owner_work(self, *, allow_new_jobs: bool) -> bool: ...
     def has_pending_owner_work(self) -> bool: ...
     def pin_stop_cutoff(self, deadline: float, expire: Callable[[], None]) -> None: ...
@@ -457,18 +463,69 @@ class OwnerLoop:
         with self._internal_lock:
             return bool(self._internal_queue)
 
+    def _wait_near_deadline(self, session: OwnerSession, next_dl: int, start_mono: int) -> None:
+        # Guard against Condition.wait / pthread_cond_timedwait_relative_np coalescing overshoots
+        # near cutoff, while falling back to bounded waits on frozen or hooked test clocks.
+        t0_wall = time.perf_counter_ns()
+        while (
+            not self._arbiter_stop
+            and not self._arbiter_wake.is_set()
+            and (time.perf_counter_ns() - t0_wall) < _ARBITER_CLOCK_PROBE_NS
+        ):
+            time.sleep(0)
+        if self._arbiter_stop or self._arbiter_wake.is_set():
+            return
+        t1_wall = time.perf_counter_ns()
+        t1_mono = session.monotonic_clock.monotonic_ns()
+        if t1_mono >= next_dl:
+            return
+        wall_delta = max(1, t1_wall - t0_wall)
+        mono_delta = t1_mono - start_mono
+        if wall_delta > mono_delta * 2 or mono_delta > wall_delta * 2:
+            self._arbiter_wake.wait(timeout=_ARBITER_ACTIVE_POLL_S)
+            return
+        cur_mono = t1_mono
+        while (
+            not self._arbiter_stop
+            and not self._arbiter_wake.is_set()
+            and cur_mono < next_dl
+        ):
+            elapsed_wall = time.perf_counter_ns() - t0_wall
+            if elapsed_wall >= _ARBITER_YIELD_CAP_NS:
+                return
+            if (
+                elapsed_wall >= _ARBITER_PROGRESS_CHECK_NS
+                and (cur_mono - start_mono) * 2 < elapsed_wall
+            ):
+                self._arbiter_wake.wait(timeout=_ARBITER_ACTIVE_POLL_S)
+                return
+            time.sleep(0)
+            cur_mono = session.monotonic_clock.monotonic_ns()
+
     def _arbiter_main(self, session: OwnerSession) -> None:
         while not self._arbiter_stop:
             self._arbiter_wake.clear()
-            has_tracked = False
+            next_dl: int | None = None
             with contextlib.suppress(Exception):
-                has_tracked = session.arbitrate_deadlines()
+                session.arbitrate_deadlines()
+                next_dl = session.next_deadline_ns()
             if self._arbiter_stop:
                 break
-            if has_tracked:
-                self._arbiter_wake.wait(timeout=_ARBITER_ACTIVE_POLL_S)
-            else:
+            if next_dl is None:
                 self._arbiter_wake.wait()
+                continue
+            now_ns = session.monotonic_clock.monotonic_ns()
+            rem_ns = next_dl - now_ns
+            if rem_ns <= 0:
+                continue
+            if rem_ns > _ARBITER_NEAR_CUTOFF_NS:
+                wait_s = min(
+                    _ARBITER_ACTIVE_POLL_S,
+                    max(0.0005, (rem_ns - _ARBITER_SAFETY_MARGIN_NS) / 1_000_000_000.0),
+                )
+                self._arbiter_wake.wait(timeout=wait_s)
+            else:
+                self._wait_near_deadline(session, next_dl, now_ns)
 
     def _owner_main(self, config: DaemonConfig) -> None:
         assert self._session_factory is not None

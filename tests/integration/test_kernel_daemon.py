@@ -3319,7 +3319,7 @@ def test_shutdown_report_metrics_and_shared_concurrent_stop_cutoff(
         with contextlib.suppress(BrainError):
             loop_a.stop()
 
-    # Subcase B1: Concurrent stop(grace_s=0.0) shares first stopper's 0.40s cutoff instead of imposing 0.0s.
+    # Subcase B1: Concurrent stop(grace_s=0.0) shares first stopper's 1.0s cutoff instead of imposing 0.0s.
     _, _, cfg_b1 = _instantiate_case(trusted_tmp, "b3-shared-cutoff", _daemon_template)
     clock_b1 = FakeClock(base_now)
     adapters_b1 = os_adapters(clock=clock_b1)
@@ -3358,7 +3358,7 @@ def test_shutdown_report_metrics_and_shared_concurrent_stop_cutoff(
         stop_2_done = threading.Event()
 
         def _run_stopper_1() -> None:
-            rep_1_box.append(loop_b1.stop(grace_s=0.40))
+            rep_1_box.append(loop_b1.stop(grace_s=1.0))
 
         def _run_stopper_2() -> None:
             try:

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import datetime as dt
 import threading
+import time
 from collections.abc import Callable, Mapping
+from concurrent.futures import Future
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TypeVar, cast
@@ -22,6 +24,7 @@ from superbrain.application.deadlines import (
     reserve,
 )
 from superbrain.application.idempotency import compute_idempotency_key_hash
+from superbrain.application.owner_loop import AuthGate, OwnerLoop, OwnerSession
 from superbrain.composition.kernel_bridge import KernelBridge
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.ids import new_id
@@ -31,26 +34,41 @@ from superbrain.core.kernel import (
     LOCAL_PHASE_BUDGET_NS,
     RESPONSE_RESERVE_NS,
     TOTAL_REQUEST_BUDGET_NS,
+    ArtifactSendAttempt,
     AuthSnapshot,
+    BootstrapAuthorization,
     CallContext,
     CallResult,
+    DaemonConfig,
+    Endpoint,
     Identity,
+    InvocationRecord,
+    JobRecord,
+    OwnerReply,
     PrivateRequestAuth,
+    Ready,
     RequestAuthView,
     RequestDeadlines,
     ReservationPhase,
     ReservationScopeKey,
     Scope,
+    SendAttemptCompletion,
+    ShutdownReport,
+    ShutdownState,
     SnapshotDescriptor,
     SnapshotObservation,
     SnapshotStatus,
     StoredResult,
+    ToolCommand,
+    WorkerCommand,
     WorkspaceBinding,
+    WorkspaceRegistration,
 )
 from superbrain.core.wire import normalize_call
 from superbrain.ports.clock import MonotonicClock
 from superbrain.ports.kernel import KernelTx
 from superbrain.ports.os import OsAdapters
+from superbrain.ports.policy import Intent
 from superbrain.storage.idempotency import KernelIdempotencyStore, StrictKernelStore
 from superbrain.storage.kernel_schema import KERNEL_POLICY_MIGRATIONS, KERNEL_STORE_MIGRATIONS
 from superbrain.storage.runtime import Runtime, open_runtime
@@ -2044,3 +2062,419 @@ def test_r2_workspace_hint_replay_and_conflict_not_short_circuited_prequeue(
         _expect_err("prepare_task", sub_committed_conflict.wait(timeout=1.0), ErrorCode.IDEMPOTENCY_CONFLICT)
     finally:
         rt.close()
+
+
+# --- 16. R30: ReservationTable.next_deadline_ns() and OwnerLoop near-cutoff precision arbiter ----------------------
+
+
+def test_reservation_table_next_deadline_ns_tracks_active_phases_only() -> None:
+    def _phase(res: Reservation) -> ReservationPhase:
+        return res.phase
+
+    table = ReservationTable()
+    assert table.next_deadline_ns() is None
+
+    # 1) QUEUED uses handler_deadline_ns (min(handler, cutoff)).
+    dl_queued = RequestDeadlines(
+        receive_ns=100,
+        handler_deadline_ns=1_000,
+        commit_waiter_cutoff_ns=2_000,
+        total_deadline_ns=3_000,
+    )
+    res_a = reserve(
+        ("dan", "prepare_task", "sha256:" + "1" * 64),
+        "sha256:" + "a" * 64,
+        table=table,
+        deadlines=dl_queued,
+    )
+    assert _phase(res_a) is ReservationPhase.QUEUED
+    assert table.next_deadline_ns() == 1_000
+
+    # 2) PREPARING keeps tracking handler_deadline_ns.
+    assert table.try_claim_for_owner(res_a, 500) is True
+    assert _phase(res_a) is ReservationPhase.PREPARING
+    assert table.next_deadline_ns() == 1_000
+
+    # 3) COMMITTING switches tracked deadline from handler_deadline_ns to commit_waiter_cutoff_ns.
+    assert enter_commit(res_a, 600) is True
+    assert _phase(res_a) is ReservationPhase.COMMITTING
+    assert table.next_deadline_ns() == 2_000
+
+    # 4) Arbitrating a COMMITTING reservation settles _response_settled while keeping _tracked;
+    # next_deadline_ns must become None.
+    settled = table.arbitrate_at(2_000)
+    assert len(settled) == 1
+    assert res_a.response_settled is True
+    assert _phase(res_a) is ReservationPhase.COMMITTING
+    assert table.has_tracked() is True
+    assert table.next_deadline_ns() is None
+
+    # 5) Cancelled PREPARING reservation also returns None even though it remains in _tracked.
+    dl_prep = RequestDeadlines(
+        receive_ns=100,
+        handler_deadline_ns=1_200,
+        commit_waiter_cutoff_ns=2_200,
+        total_deadline_ns=3_200,
+    )
+    res_prep = reserve(
+        ("dan", "prepare_task", "sha256:" + "2" * 64),
+        "sha256:" + "b" * 64,
+        table=table,
+        deadlines=dl_prep,
+    )
+    assert table.try_claim_for_owner(res_prep, 700) is True
+    assert table.next_deadline_ns() == 1_200
+    assert table.cancel_before_commit(res_prep, 750) is True
+    assert res_prep.cancelled is True
+    assert table.next_deadline_ns() is None
+
+    # 6) Multi-reservation minimum ignores settled/cancelled entries and picks soonest active deadline.
+    dl_committing = RequestDeadlines(
+        receive_ns=100,
+        handler_deadline_ns=900,
+        commit_waiter_cutoff_ns=3_000,
+        total_deadline_ns=4_000,
+    )
+    dl_soon_queued = RequestDeadlines(
+        receive_ns=100,
+        handler_deadline_ns=2_500,
+        commit_waiter_cutoff_ns=4_000,
+        total_deadline_ns=5_000,
+    )
+    dl_later_prep = RequestDeadlines(
+        receive_ns=100,
+        handler_deadline_ns=5_000,
+        commit_waiter_cutoff_ns=6_000,
+        total_deadline_ns=7_000,
+    )
+    res_comm = reserve(
+        ("dan", "prepare_task", "sha256:" + "3" * 64),
+        "sha256:" + "c" * 64,
+        table=table,
+        deadlines=dl_committing,
+    )
+    assert enter_commit(res_comm, 800) is True
+    res_later = reserve(
+        ("dan", "prepare_task", "sha256:" + "4" * 64),
+        "sha256:" + "d" * 64,
+        table=table,
+        deadlines=dl_later_prep,
+    )
+    assert table.try_claim_for_owner(res_later, 800) is True
+    res_soon = reserve(
+        ("dan", "prepare_task", "sha256:" + "5" * 64),
+        "sha256:" + "e" * 64,
+        table=table,
+        deadlines=dl_soon_queued,
+    )
+    assert table.next_deadline_ns() == 2_500
+
+    # Clean up sequentially and observe minimum advancing accurately.
+    table.arbitrate_at(2_500)
+    assert res_soon.cancelled is True
+    assert table.next_deadline_ns() == 3_000
+    assert table.finish_owner_execution(res_comm, {"ok": True, "data": {}}) is True
+    assert table.next_deadline_ns() == 5_000
+    assert table.finish_owner_execution(res_later, {"ok": True, "data": {}}) is True
+    assert table.finish_owner_execution(res_a, {"ok": True, "data": {}}) is False
+    assert table.finish_owner_execution(res_prep, {"ok": True, "data": {}}) is False
+    assert table.next_deadline_ns() is None
+
+
+class _ArbiterTestSession:
+    """Minimal ``OwnerSession`` backed by a live ``ReservationTable`` for arbiter wakeup verification."""
+
+    def __init__(
+        self,
+        *,
+        clock: FakeClock,
+        mono: MonotonicClock,
+        table: ReservationTable,
+        ready: Ready,
+    ) -> None:
+        self._clock = clock
+        self._mono = mono
+        self._table = table
+        self._ready = ready
+        self._auth_gate = AuthGate(
+            store_id=ready.identity.store_id,
+            writer_epoch=ready.identity.writer_epoch,
+            instance_id=ready.identity.instance_id,
+        )
+
+    @property
+    def ready(self) -> Ready:
+        return self._ready
+
+    @property
+    def auth_gate(self) -> AuthGate:
+        return self._auth_gate
+
+    @property
+    def clock(self) -> FakeClock:
+        return self._clock
+
+    @property
+    def monotonic_clock(self) -> MonotonicClock:
+        return self._mono
+
+    @property
+    def has_job_handlers(self) -> bool:
+        return False
+
+    def submit_queued_reply(self, command: ToolCommand, receive_ns: int, future: Future[OwnerReply]) -> None:
+        raise NotImplementedError
+
+    def arbitrate_deadlines(self) -> bool:
+        self._table.arbitrate_at(self._mono.monotonic_ns())
+        return self._table.has_tracked()
+
+    def next_deadline_ns(self) -> int | None:
+        return self._table.next_deadline_ns()
+
+    def step_owner_work(self, *, allow_new_jobs: bool) -> bool:
+        del allow_new_jobs
+        return False
+
+    def has_pending_owner_work(self) -> bool:
+        return False
+
+    def pin_stop_cutoff(self, deadline: float, expire: Callable[[], None]) -> None:
+        self._table.pin_stop_cutoff(deadline, expire)
+
+    def mark_stopping(self) -> None:
+        return None
+
+    def mark_overrun(self) -> None:
+        return None
+
+    def shutdown_metrics(self) -> tuple[int, bool]:
+        return 0, True
+
+    def begin_stop(self) -> None:
+        self._auth_gate.close()
+
+    def join_worker(self, timeout_s: float) -> bool:
+        del timeout_s
+        return True
+
+    def prepare_cancel_uncommitted_for_shutdown(self) -> tuple[int, tuple[Callable[[], None], ...]]:
+        return self._table.prepare_cancel_all_uncommitted(
+            {"ok": False, "error": {"code": "daemon_unavailable", "message": "daemon unavailable"}}
+        )
+
+    def cancel_uncommitted_for_shutdown(self) -> int:
+        count, thunks = self.prepare_cancel_uncommitted_for_shutdown()
+        for thunk in thunks:
+            thunk()
+        return count
+
+    def apply_worker_command(self, cmd: WorkerCommand) -> JobRecord | InvocationRecord:
+        raise NotImplementedError
+
+    def finalize_send_attempt(self, completion: SendAttemptCompletion) -> ArtifactSendAttempt:
+        raise NotImplementedError
+
+    def interrupt_send_attempt(self, send_attempt_id: str) -> ArtifactSendAttempt:
+        raise NotImplementedError
+
+    def revoke_credential(self, credential_id: str, authorization: BootstrapAuthorization) -> Intent:
+        raise NotImplementedError
+
+    def register_workspace(
+        self, registration: WorkspaceRegistration, authorization: BootstrapAuthorization
+    ) -> WorkspaceBinding:
+        raise NotImplementedError
+
+    def teardown_on_owner(self, *, overrun: bool, cancelled_requests: int = 0) -> ShutdownReport:
+        return ShutdownReport(
+            state=ShutdownState.OVERRUN if overrun else ShutdownState.STOPPED,
+            drained_requests=0,
+            cancelled_requests=cancelled_requests,
+            worker_drained=True,
+            endpoint_removed=True,
+            error_code=ErrorCode.DEADLINE_EXCEEDED if overrun else None,
+        )
+
+    def adopt_after_owner_exit(self, exited_owner: threading.Thread) -> None:
+        del exited_owner
+        return None
+
+
+class _CountingMonotonicClock:
+    """Thread-safe ``MonotonicClock`` wrapper counting arbiter/owner reads."""
+
+    def __init__(self, inner: MonotonicClock) -> None:
+        self._inner = inner
+        self._lock = threading.Lock()
+        self.reads = 0
+
+    def monotonic_ns(self) -> int:
+        with self._lock:
+            self.reads += 1
+        return self._inner.monotonic_ns()
+
+
+def _arbiter_test_config(base_dir: Path) -> tuple[DaemonConfig, Ready]:
+    identity = Identity(store_id="store-arbiter-r30", writer_epoch=1, instance_id="inst-arbiter-r30")
+    cfg = DaemonConfig(
+        version=1,
+        data_root=base_dir,
+        expected_store_id=identity.store_id,
+        cert_path=base_dir / "cert.pem",
+        key_path=base_dir / "key.pem",
+    )
+    ready = Ready(
+        endpoint=Endpoint(
+            version=1,
+            host="127.0.0.1",
+            port=44444,
+            store_id=identity.store_id,
+            writer_epoch=identity.writer_epoch,
+            instance_id=identity.instance_id,
+        ),
+        identity=identity,
+        tls_not_after=CLOCK_START + dt.timedelta(hours=1),
+        leaf_cert_sha256="f" * 64,
+    )
+    return cfg, ready
+
+
+def test_owner_loop_arbiter_precision_under_wait_overshoot_and_non_real_clock_safety(
+    trusted_tmp: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_wall = FakeClock(CLOCK_START)
+    cfg, ready = _arbiter_test_config(trusted_tmp / "arbiter-r30")
+
+    # Part A: With simulated +22 ms Event.wait timer-coalescing overshoot, OwnerLoop still settles
+    # COMMITTING within < 5 ms of cutoff on real-rate SystemMonotonicClock.
+    sys_mono = SystemMonotonicClock()
+    wake_cb: list[Callable[[], None]] = []
+    table_a = ReservationTable(on_change=lambda: wake_cb[0]() if wake_cb else None)
+
+    def _factory_a(
+        _cfg: DaemonConfig,
+        _owner_wake: Callable[[], None],
+        arbiter_wake: Callable[[], None],
+    ) -> OwnerSession:
+        wake_cb.append(arbiter_wake)
+        return cast(
+            OwnerSession,
+            _ArbiterTestSession(clock=fake_wall, mono=sys_mono, table=table_a, ready=ready),
+        )
+
+    loop_a = OwnerLoop(session_factory=_factory_a)
+    settled_a = threading.Event()
+    settled_info: list[tuple[CallResult, int]] = []
+
+    def _on_resp_a(env: CallResult) -> None:
+        settled_info.append((env, sys_mono.monotonic_ns()))
+        settled_a.set()
+
+    with monkeypatch.context() as mp:
+        arbiter_wake_ev = loop_a._arbiter_wake
+        orig_wait = threading.Event.wait
+
+        def _overshoot_wait(ev: threading.Event, timeout: float | None = None) -> bool:
+            if ev is arbiter_wake_ev and timeout is not None:
+                return orig_wait(ev, timeout=timeout + 0.022)
+            return orig_wait(ev, timeout=timeout)
+
+        mp.setattr(threading.Event, "wait", _overshoot_wait)
+        loop_a.start(cfg)
+        try:
+            # Verify both immediate-zone (18 ms, deterministic against 4 ms + 22 ms overshoot = >= 26 ms)
+            # and wait-recovery (90 ms, exercises Event.wait overshoot + precision recovery) cutoffs.
+            for idx, horizon_ms in enumerate((18, 90), start=1):
+                settled_a.clear()
+                settled_info.clear()
+                start_ns = sys_mono.monotonic_ns()
+                cutoff_ns = start_ns + horizon_ms * MS
+                dl = RequestDeadlines(
+                    receive_ns=start_ns,
+                    handler_deadline_ns=start_ns + (horizon_ms - 1) * MS,
+                    commit_waiter_cutoff_ns=cutoff_ns,
+                    total_deadline_ns=cutoff_ns + RESPONSE_RESERVE_NS,
+                )
+                res = reserve(
+                    ("dan", "submit_episode", f"sha256:{idx}" + "1" * 63),
+                    f"sha256:{idx}" + "a" * 63,
+                    table=table_a,
+                    deadlines=dl,
+                    on_response=_on_resp_a,
+                )
+                assert enter_commit(res, start_ns) is True
+                assert settled_a.wait(timeout=1.5), f"arbiter failed to settle COMMITTING request ({horizon_ms}ms)"
+                env, settled_ns = settled_info[0]
+                assert env == {
+                    "ok": False,
+                    "error": {"code": "commit_outcome_unknown", "message": "commit outcome unknown"},
+                }
+                lag_ns = settled_ns - cutoff_ns
+                assert lag_ns >= 0, f"arbiter settled before cutoff ({horizon_ms}ms): lag_ns={lag_ns}"
+                assert lag_ns < 5 * MS, (
+                    f"arbiter overshot {horizon_ms}ms cutoff by {lag_ns / MS:.3f} ms (>= 5 ms)"
+                )
+                table_a.finish_owner_execution(res, {"ok": True, "data": {}})
+        finally:
+            rep_a = loop_a.stop(grace_s=1.0)
+            assert rep_a.state is ShutdownState.STOPPED
+
+    # Part B: Frozen and +1ns-per-read FakeMonotonicClocks inside rem_ns <= 35 ms must NOT spin or hang stop().
+    for mode in ("frozen", "plus_1ns"):
+        fake_mono = FakeMonotonicClock(start_ns=10_000 * MS)
+        if mode == "plus_1ns":
+            fake_mono.set_read_hook(lambda cur: cur + 1)
+        counted_mono = _CountingMonotonicClock(fake_mono)
+        wake_cb_b: list[Callable[[], None]] = []
+
+        def _wake_b(holder: list[Callable[[], None]] = wake_cb_b) -> None:
+            if holder:
+                holder[0]()
+
+        table_b = ReservationTable(on_change=_wake_b)
+
+        def _factory_b(
+            _cfg: DaemonConfig,
+            _owner_wake: Callable[[], None],
+            arbiter_wake: Callable[[], None],
+            *,
+            mono_arg: MonotonicClock = counted_mono,
+            table_arg: ReservationTable = table_b,
+            holder: list[Callable[[], None]] = wake_cb_b,
+        ) -> OwnerSession:
+            holder.append(arbiter_wake)
+            return cast(
+                OwnerSession,
+                _ArbiterTestSession(clock=fake_wall, mono=mono_arg, table=table_arg, ready=ready),
+            )
+
+        loop_b = OwnerLoop(session_factory=_factory_b)
+        loop_b.start(cfg)
+        try:
+            dl_b = RequestDeadlines(
+                receive_ns=10_000 * MS,
+                handler_deadline_ns=10_005 * MS,
+                commit_waiter_cutoff_ns=10_010 * MS,
+                total_deadline_ns=10_035 * MS,
+            )
+            res_b = reserve(
+                ("dan", "submit_episode", "sha256:" + "9" * 64),
+                "sha256:" + "f" * 64,
+                table=table_b,
+                deadlines=dl_b,
+            )
+            assert enter_commit(res_b, 10_000 * MS) is True
+            time.sleep(0.05)
+            assert res_b.response_settled is False, f"{mode} fake clock prematurely reached cutoff"
+            assert counted_mono.reads < 200, (
+                f"arbiter spun inside <=35ms window on {mode} fake clock: reads={counted_mono.reads}"
+            )
+        finally:
+            t_stop = time.perf_counter()
+            rep_b = loop_b.stop(grace_s=1.0)
+            stop_elapsed = time.perf_counter() - t_stop
+            table_b.finish_owner_execution(res_b, {"ok": True, "data": {}})
+            assert rep_b.state is ShutdownState.STOPPED
+            assert stop_elapsed < 0.5, f"stop() hung on {mode} fake clock: took {stop_elapsed:.3f}s"

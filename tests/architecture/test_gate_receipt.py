@@ -1438,12 +1438,12 @@ def test_shard_file_partition_is_complete_disjoint_and_deterministic(shards: int
 @pytest.mark.parametrize(
     ("platform_name", "cpu_count", "expected"),
     [
-        ("win32", 1, 2),
-        ("win32", 2, 4),
-        ("win32", 4, 8),
-        ("win32", 16, 8),
-        ("win32", None, 2),
-        ("win32", 0, 2),
+        ("win32", 1, 1),
+        ("win32", 2, 2),
+        ("win32", 4, 4),
+        ("win32", 16, 4),
+        ("win32", None, 1),
+        ("win32", 0, 1),
         ("linux", 1, 1),
         ("linux", 4, 4),
         ("linux", 8, 4),
@@ -1837,11 +1837,15 @@ def test_shard_files_colocates_wheel_fixture_files_into_shard_zero() -> None:
         groups = gate.shard_files(inventory, shards)
         assert len(groups) == shards
         assert all(groups)
-        assert set(groups[0]) == set(expected_wheel_files), (
-            f"shard 0 must be dedicated exclusively to wheel fixture files when size > 1: {groups[0]}"
+        assert set(expected_wheel_files) <= set(groups[0]), (
+            f"all wheel fixture files must co-locate into shard 0 when size > 1: {groups[0]}"
         )
         for other_shard in groups[1:]:
             assert not (set(expected_wheel_files) & set(other_shard)), groups
+        if shards == 2:
+            assert set(groups[0]) - set(expected_wheel_files), (
+                f"shard 0 must accept non-wheel overflow when lighter than other shards: {groups[0]}"
+            )
 
     # Degenerate subsets with fewer non-wheel files than (shards - 1) never emit empty shard groups.
     wheel_only = [f"{path}::test_case" for path in expected_wheel_files]
@@ -1910,20 +1914,29 @@ def test_gate_wheel_fixture_files_and_weights_stay_aligned_with_tests() -> None:
     for rel_path in configured | set(heavy_cfg):
         assert (repo_root / rel_path).is_file(), f"stale gate shard config entry: {rel_path}"
 
-    # Verify full-repository 8-shard plan isolates wheel suites on Shard 0 and balances heavy non-wheel files.
+    # Verify full-repository 4-shard LPT plan places all wheel suites on Shard 0, balances overflow onto Shard 0,
+    # spreads top heavy non-wheel files, and stays tightly balanced within 5_000 ms across all 4 shards.
     all_inventory = [
         f"{path.relative_to(repo_root).as_posix()}::test_case" for path in sorted(tests_root.rglob("test_*.py"))
     ]
-    eight_groups = gate.shard_files(all_inventory, 8)
-    assert len(eight_groups) == 8
-    assert set(eight_groups[0]) == configured, eight_groups[0]
-    top_five_non_wheel = {
+    four_groups = gate.shard_files(all_inventory, 4)
+    assert len(four_groups) == 4
+    assert all(four_groups)
+    assert configured <= set(four_groups[0]), four_groups[0]
+    for worker_group in four_groups[1:]:
+        assert not (configured & set(worker_group)), worker_group
+    assert set(four_groups[0]) - configured, "shard 0 must accept non-wheel overflow on full 4-shard LPT plan"
+    top_three_non_wheel = {
+        "tests/storage/test_backup.py",
         "tests/storage/test_kernel_revocation.py",
         "tests/integration/test_kernel_daemon.py",
-        "tests/storage/test_backup.py",
-        "tests/storage/test_restore.py",
-        "tests/storage/test_remediation_i2_t3_lineage.py",
     }
-    for worker_group in eight_groups[1:]:
-        assert len(set(worker_group) & top_five_non_wheel) <= 1, f"top-5 heavy files stacked: {worker_group}"
+    for worker_group in four_groups:
+        assert len(set(worker_group) & top_three_non_wheel) <= 1, f"top-3 heavy non-wheel stacked: {worker_group}"
+    loads = [
+        sum(gate._estimated_file_cost_ms(rel_path, 1) for rel_path in group)
+        + (gate._WHEEL_SETUP_COST_MS if idx == 0 else 0)
+        for idx, group in enumerate(four_groups)
+    ]
+    assert max(loads) - min(loads) <= 5_000, f"4-shard LPT load imbalance > 5_000 ms: loads={loads}"
     assert gate.shard_files(ALL_SHARD_IDS, 2) == [["t/test_a.py"], ["t/test_b.py"]]
