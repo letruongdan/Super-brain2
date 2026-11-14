@@ -488,6 +488,7 @@ class LoopbackServer:
             if rem_s <= 0.0:
                 return
 
+            raw_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             raw_sock.setblocking(True)
             ssl_sock = self._ssl_context.wrap_socket(raw_sock, server_side=True, do_handshake_on_connect=False)
             with self._lock:

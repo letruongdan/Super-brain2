@@ -107,6 +107,24 @@ jobs:
           name: windows-storage-profile-${{ matrix.python }}
           path: ${{ runner.temp }}/windows-storage-profile/
           if-no-files-found: warn
+      - name: Trace the commit deadline path on macOS
+        if: always() && runner.os == 'macOS'
+        continue-on-error: true
+        timeout-minutes: 2
+        shell: bash
+        env:
+          PYTHONPATH: .
+        run: |
+          ev="$RUNNER_TEMP/commit-deadline-profile"
+          mkdir -p "$ev"
+          uv run --locked --python ${{ matrix.python }} python .github/diag/commit_deadline_probe.py --output "$ev/once" --basetemp "$TMPDIR/r26-commit-trace-pytest" --cache-dir "$TMPDIR/r26-commit-trace-cache" --source-commit "${{ github.sha }}" --seal-digest "$T9_TEST_SEAL_R19_SHA256" > "$ev/launcher.log" 2>&1
+      - name: Upload the macOS commit deadline profile
+        if: always() && runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: commit-deadline-profile-${{ matrix.python }}
+          path: ${{ runner.temp }}/commit-deadline-profile/
+          if-no-files-found: warn
       - name: Check reviewer seal after execution
         if: always()
         shell: bash

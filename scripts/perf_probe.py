@@ -9,7 +9,6 @@ import queue
 import shutil
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -313,12 +312,14 @@ def measure(repo: Path, attempt: Path) -> perf.ProbeMeasurements:
     )
     from tests.support.inc2_fixture import open_inc2_installed_env
     from tests.support.inc2_t8_harness import clone_template_root, store_rows
+    from tests.support.inc2_transport import make_trusted_test_dir
 
     template = get_shared_t7_transport_template()
     assert template.ws_a is not None
     binding = template.ws_a
-    with tempfile.TemporaryDirectory(prefix="sb2-perf-") as tmp:
-        scratch = Path(tmp)
+    with contextlib.ExitStack() as cleanup:
+        scratch = make_trusted_test_dir("sb2-perf")
+        cleanup.callback(shutil.rmtree, scratch)
         os_adapters().permissions.secure_directory(scratch)
         with open_inc2_installed_env(scratch) as env:
             wheel_identity = verify_installed_wheel_isolation(env, cwd=scratch)
