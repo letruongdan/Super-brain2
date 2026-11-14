@@ -33,6 +33,8 @@ _PRIVATE_MARK = re.compile(_PRIVATE_START)
 _PRIVATE_BLOCK = re.compile(
     rf"<\s*{_PRIVATE_WORD}\s*>[^<]*(?:<(?!\s*(?:/\s*)?{_PRIVATE_WORD})[^<]*)*<\s*/\s*{_PRIVATE_WORD}\s*>"
 )
+# ASCII non-space whitespace characters matched by ``\s``, kept as a string tuple (no module regex).
+_NON_SPACE_ASCII_WS = ("\t", "\n", "\r", "\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\x1f")
 
 
 class _TextScans:
@@ -96,17 +98,48 @@ class _TextScans:
         """
         if "://" not in text or "@" not in text:
             return text
+        spaces_only = text.isascii()
+        if spaces_only:
+            for ws in _NON_SPACE_ASCII_WS:
+                if ws in text:
+                    spaces_only = False
+                    break
         out: list[str] = []
         cursor = 0
         seg_end = seg_last_at = -1
         index = text.find("://")
         while index != -1:
             start = index + 3
+            next_at = text.find("@", start)
+            if next_at == -1:
+                break
             if start > seg_end:
-                segment = _SEGMENT.match(text, start)
-                seg_end = segment.end() if segment is not None else start
-                seg_last_at = text.rfind("@", start, seg_end)
-            if seg_last_at > start and _CREDENTIAL_USER.match(text, start, seg_end):
+                if spaces_only:
+                    sp = text.find(" ", start)
+                    seg_end = len(text) if sp == -1 else sp
+                else:
+                    segment = _SEGMENT.match(text, start)
+                    seg_end = segment.end() if segment is not None else start
+                seg_last_at = -1 if next_at >= seg_end else text.rfind("@", start, seg_end)
+            if seg_last_at <= start:
+                at = -1
+            elif spaces_only:
+                colon = text.find(":", start, seg_end)
+                if (
+                    colon != -1
+                    and "/" not in text[start:colon]
+                    and "?" not in text[start:colon]
+                    and "#" not in text[start:colon]
+                ):
+                    at = seg_last_at
+                else:
+                    stop = seg_end
+                    for sep in ("/", "?", "#"):
+                        pos = text.find(sep, start, stop)
+                        if pos != -1:
+                            stop = pos
+                    at = -1 if next_at >= stop else text.rfind("@", start, stop)
+            elif _CREDENTIAL_USER.match(text, start, seg_end):
                 at = seg_last_at
             else:
                 authority = _AUTHORITY.match(text, start)
@@ -118,6 +151,8 @@ class _TextScans:
                 self.redacted += 1
                 cursor = at
             index = text.find("://", max(at, start))
+        if not out:
+            return text
         out.append(text[cursor:])
         return "".join(out)
 

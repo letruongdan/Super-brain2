@@ -201,9 +201,25 @@ def _gate_open(pattern: re.Pattern[str], text: str, lowered: str | None) -> bool
         if lowered is None:
             return True
         text = lowered
-    if not any(needle in text for needle in needles):
+    if pairs is not None and "=" not in text and ":" not in text:
         return False
-    return pairs is None or any(pair in text for pair in pairs)
+    if len(needles) == 5:
+        first = needles[0]
+        if first == "ghp_" and "gh" not in text:
+            return False
+        if first == "xoxb-" and "xox" not in text:
+            return False
+    for needle in needles:
+        if needle in text:
+            break
+    else:
+        return False
+    if pairs is None:
+        return True
+    for pair in pairs:
+        if pair in text:
+            return True
+    return False
 
 
 def _glob_units(glob: str) -> list[str]:
@@ -333,6 +349,17 @@ class _PathMatcher:
         self._names = re.compile("|".join(f"(?:{n})" for n in names)) if names else None
         self._results: dict[str, bool] = {}
         self._needles = _path_needles(patterns)
+
+    def fresh(self) -> _PathMatcher:
+        """Clone immutable compiled matchers with an empty per-run result cache."""
+        clone = object.__new__(_PathMatcher)
+        clone._chains = self._chains
+        clone._name_globs = self._name_globs
+        clone._chain_globs = self._chain_globs
+        clone._names = self._names
+        clone._needles = self._needles
+        clone._results = {}
+        return clone
 
     def may_block(self, token: str) -> bool:
         """False only when no spelling inside ``token`` can match: every match holds one of the needles."""

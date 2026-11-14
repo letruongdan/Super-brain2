@@ -1782,3 +1782,100 @@ def test_unknown_junit_encoding_keeps_its_raw_bytes_and_later_shard_evidence(
         "pytest-shard-0" in reason and any(word in reason.lower() for word in ("encoding", "parse"))
         for reason in receipt["reasons"]
     ), receipt["reasons"]
+
+
+def test_shard_files_colocates_wheel_fixture_files_into_shard_zero() -> None:
+    expected_wheel_files = sorted(
+        {
+            "tests/contract/test_mcp_v2_schema.py",
+            "tests/integration/test_kernel_cli.py",
+            "tests/integration/test_kernel_crash_recovery.py",
+            "tests/integration/test_kernel_native_receipt_contract.py",
+            "tests/integration/test_kernel_privacy_persistence.py",
+            "tests/integration/test_kernel_receipts.py",
+            "tests/integration/test_kernel_shim.py",
+            "tests/integration/test_t9_benchmark_scratch.py",
+        }
+    )
+    non_wheel_files = [
+        "tests/storage/test_backup.py",
+        "tests/storage/test_kernel_revocation.py",
+        "tests/storage/test_restore.py",
+        "tests/core/test_canonical.py",
+        "tests/core/test_faults.py",
+    ]
+    inventory = [f"{path}::test_case_{idx}" for path in (*expected_wheel_files, *non_wheel_files) for idx in range(3)]
+    for shards in (2, 4):
+        groups = gate.shard_files(inventory, shards)
+        assert len(groups) == shards
+        assert all(groups)
+        assert set(expected_wheel_files).issubset(set(groups[0])), groups
+        for other_shard in groups[1:]:
+            assert not (set(expected_wheel_files) & set(other_shard)), groups
+
+    # Degenerate subsets with fewer non-wheel files than (shards - 1) never emit empty shard groups.
+    wheel_only = [f"{path}::test_case" for path in expected_wheel_files]
+    assert gate.shard_files(wheel_only, 4) == [expected_wheel_files]
+    assert gate.shard_files([], 4) == []
+    assert gate.shard_files(
+        [f"{expected_wheel_files[0]}::test_a", f"{expected_wheel_files[1]}::test_b", "tests/core/test_x.py::test_c"], 4
+    ) == [
+        sorted([expected_wheel_files[0], expected_wheel_files[1]]),
+        ["tests/core/test_x.py"],
+    ]
+
+
+def test_shard_files_balances_heavy_low_case_storage_files_by_millisecond_cost() -> None:
+    # Low-case heavy storage files must balance across shards rather than stack behind high-case fast files.
+    heavy_low_case = [
+        "tests/storage/test_backup.py",
+        "tests/storage/test_kernel_revocation.py",
+        "tests/storage/test_restore.py",
+        "tests/storage/test_crash_matrix.py",
+        "tests/storage/test_remediation_i2_t3_lineage.py",
+        "tests/storage/test_kernel_idempotency.py",
+    ]
+    fast_high_case = ["tests/core/test_fast_a.py", "tests/core/test_fast_b.py", "tests/core/test_fast_c.py"]
+    inventory = [f"{path}::test_{i}" for path in heavy_low_case for i in range(4)] + [
+        f"{path}::test_{i}" for path in fast_high_case for i in range(60)
+    ]
+    groups = gate.shard_files(inventory, 4)
+    assert len(groups) == 4
+    per_shard_heavy_counts = [sum(1 for f in group if f in heavy_low_case) for group in groups]
+    assert max(per_shard_heavy_counts) <= 2, f"heavy low-case files stacked unevenly: {groups}"
+    assert min(per_shard_heavy_counts) >= 1, f"a shard received zero heavy files while others stacked: {groups}"
+    assert gate.shard_files(ALL_SHARD_IDS, 2) == [["t/test_a.py"], ["t/test_b.py"]]
+
+
+def test_gate_wheel_fixture_files_and_weights_stay_aligned_with_tests() -> None:
+    import ast
+
+    assert gate.TEST_JOB_BUDGET_S == 300.0
+    repo_root = Path(__file__).resolve().parents[2]
+    tests_root = repo_root / "tests"
+    discovered: set[str] = set()
+    for path in sorted(tests_root.rglob("test_*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        rel = path.relative_to(repo_root).as_posix()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                args = [arg.arg for arg in (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs)]
+                if "inc2_installed_env" in args:
+                    discovered.add(rel)
+            elif isinstance(node, ast.Call):
+                if isinstance(node.func, ast.Attribute) and node.func.attr == "usefixtures":
+                    for arg in node.args:
+                        if isinstance(arg, ast.Constant) and arg.value == "inc2_installed_env":
+                            discovered.add(rel)
+
+    wheel_cfg = getattr(gate, "_WHEEL_FIXTURE_FILES", None)
+    assert wheel_cfg is not None, "scripts.gate must define _WHEEL_FIXTURE_FILES"
+    configured = set(wheel_cfg)
+    assert configured == discovered, (
+        f"_WHEEL_FIXTURE_FILES out of sync with tests using inc2_installed_env: "
+        f"missing={sorted(discovered - configured)}, stale={sorted(configured - discovered)}"
+    )
+    heavy_cfg = getattr(gate, "_HEAVY_FILE_COST_MS", None)
+    assert isinstance(heavy_cfg, dict) and heavy_cfg, "scripts.gate must define _HEAVY_FILE_COST_MS"
+    for rel_path in configured | set(heavy_cfg):
+        assert (repo_root / rel_path).is_file(), f"stale gate shard config entry: {rel_path}"

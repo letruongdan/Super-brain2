@@ -10,13 +10,17 @@ start times are not under test here.
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import os
 import queue
+import socket
+import struct
 import subprocess
 import threading
 import time
 from collections.abc import Callable, Iterator
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -139,7 +143,7 @@ def test_lookup_started_after_closing_is_rejected_up_front(hooks: tuple[Any, Any
 def test_lookup_without_a_sighting_keeps_the_closing_rule(
     hooks: tuple[Any, Any, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # A lookup that records no sighting (Windows/Linux paths, monkeypatched lookups): a connection closing when the
+    # A lookup that records no sighting (e.g., lsof fallback or monkeypatched lookups): a connection closing when the
     # lookup returns is rejected, as before.
     safe, mark_closing, _fake = hooks
     conn = _conn_state()
@@ -196,3 +200,218 @@ def test_a_sighting_from_an_earlier_lookup_never_carries_over(
 
     monkeypatch.setattr(subprocess, "run", closing_run)
     assert safe(CLIENT_PORT, LISTEN_PORT, later_conn) == (None, None, None, None), "a stale sighting leaked"
+
+
+@contextlib.contextmanager
+def _safe_identity_hooks(
+    monkeypatch: pytest.MonkeyPatch, *, platform: str, on_started_at: Callable[[int], None] | None = None
+) -> Iterator[tuple[Any, Any]]:
+    monkeypatch.setattr(owner, "sys", type("FakeSys", (), {"platform": platform})())
+
+    def fake_started_at(pid: int) -> str:
+        if on_started_at is not None:
+            on_started_at(pid)
+        return "2026-11-14T00:00:00.000000Z"
+
+    monkeypatch.setattr(owner, "process_started_at_for_pid", fake_started_at)
+    state = owner._install_loopback_server_hooks(
+        eq=queue.Queue(), daemon_pid=os.getpid(), daemon_started_at="2026-11-14T00:00:00.000000Z"
+    )
+    try:
+        tap = _loopback_server.LoopbackServer._conn_worker
+        safe = _closure_fn(_closure_fn(tap, "_submit_lookup"), "_safe_client_identity")
+        mark_closing = _closure_fn(tap, "_mark_conn_closing")
+        yield safe, mark_closing
+    finally:
+        state["uninstall"]()
+
+
+def _make_fake_proc(tmp_path: Path, pid_fds: dict[int, tuple[str, ...]]) -> Path:
+    proc_root = tmp_path / "proc"
+    (proc_root / "net").mkdir(parents=True)
+    ip_hex = "0100007F"
+    (proc_root / "net" / "tcp").write_text(
+        "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
+        f"   0: {ip_hex}:{CLIENT_PORT:04X} {ip_hex}:{LISTEN_PORT:04X} "
+        "01 00000000:00000000 00:00000000 00000000  1000        0 998877 1 0 0 0 0\n",
+        encoding="ascii",
+    )
+    for pid, fds in pid_fds.items():
+        fd_dir = proc_root / str(pid) / "fd"
+        fd_dir.mkdir(parents=True)
+        for fd_name in fds:
+            (fd_dir / fd_name).write_text("", encoding="ascii")
+    return proc_root
+
+
+def test_linux_proc_checks_own_pid_before_newer_pids_and_keeps_early_sighting(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    newer_pids = [HOLDER + 1, HOLDER + 50, HOLDER + 300]
+    proc_root = _make_fake_proc(tmp_path, {HOLDER: ("3",), **{pid: ("3",) for pid in newer_pids}})
+    monkeypatch.setattr(owner, "_LINUX_PROC_ROOT", proc_root, raising=False)
+    seen_pids: list[int] = []
+    close_triggered = False
+
+    with _safe_identity_hooks(monkeypatch, platform="linux") as (safe, mark_closing):
+        conn = _conn_state()
+
+        def fake_readlink(path: Any) -> str:
+            nonlocal close_triggered
+            p = Path(path)
+            pid = int(p.parent.parent.name)
+            seen_pids.append(pid)
+            if pid != HOLDER and not close_triggered:
+                close_triggered = True
+                _next_tick()
+                mark_closing(conn)
+            return "socket:[998877]" if pid == HOLDER else "pipe:[11]"
+
+        monkeypatch.setattr(os, "readlink", fake_readlink)
+        pid, _started, observed_at, observed_ns = safe(CLIENT_PORT, LISTEN_PORT, conn)
+
+    assert close_triggered, "newer PIDs were never scanned after checking self PID"
+    assert pid == HOLDER, "self PID sighted before close during newer-PID scan must stay bound"
+    assert seen_pids[0] == HOLDER, f"os.getpid() must be checked first when proc_root is None; order={seen_pids}"
+    assert seen_pids[1:] == sorted(newer_pids, reverse=True), f"remaining PIDs must scan descending; order={seen_pids}"
+    assert conn["closing"] and conn["closing_ns"] is not None
+    assert observed_ns is not None and observed_ns < conn["closing_ns"]
+    assert observed_at is not None and observed_at <= conn["closing_at"]
+
+
+def test_linux_proc_multi_holder_still_rejects_after_checking_own_pid(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    newer_pids = [HOLDER + 50, HOLDER + 300]
+    proc_root = _make_fake_proc(tmp_path, {HOLDER: ("3",), **{pid: ("4",) for pid in newer_pids}})
+    monkeypatch.setattr(owner, "_LINUX_PROC_ROOT", proc_root, raising=False)
+    seen_pids: list[int] = []
+
+    with _safe_identity_hooks(monkeypatch, platform="linux") as (safe, _mark_closing):
+        def fake_readlink(path: Any) -> str:
+            pid = int(Path(path).parent.parent.name)
+            seen_pids.append(pid)
+            return "socket:[998877]" if pid in (HOLDER, HOLDER + 300) else "pipe:[11]"
+
+        monkeypatch.setattr(os, "readlink", fake_readlink)
+        result = safe(CLIENT_PORT, LISTEN_PORT, _conn_state())
+
+    assert result == (None, None, None, None), "multi-holder fd sharing must still be rejected by _single(holders)"
+    assert seen_pids == [HOLDER, HOLDER + 300, HOLDER + 50]
+
+
+def test_linux_proc_closes_before_sighting_is_rejected(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    proc_root = _make_fake_proc(tmp_path, {HOLDER: ("3",)})
+    monkeypatch.setattr(owner, "_LINUX_PROC_ROOT", proc_root, raising=False)
+
+    with _safe_identity_hooks(monkeypatch, platform="linux") as (safe, mark_closing):
+        conn = _conn_state()
+
+        def fake_readlink(_path: Any) -> str:
+            mark_closing(conn)
+            _next_tick()
+            return "socket:[998877]"
+
+        monkeypatch.setattr(os, "readlink", fake_readlink)
+        assert safe(CLIENT_PORT, LISTEN_PORT, conn) == (None, None, None, None)
+
+
+def test_linux_proc_explicit_proc_root_scans_descending_without_self_shortcut(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    proc_root = _make_fake_proc(tmp_path, {HOLDER: ("3",), HOLDER + 10: ("3",), HOLDER + 50: ("4",)})
+    seen_pids: list[int] = []
+
+    def fake_readlink(path: Any) -> str:
+        pid = int(Path(path).parent.parent.name)
+        seen_pids.append(pid)
+        return "socket:[998877]" if pid in (HOLDER, HOLDER + 50) else "pipe:[11]"
+
+    monkeypatch.setattr(os, "readlink", fake_readlink)
+    holders = owner._socket_inode_holders(998877, proc_root=proc_root)
+    assert holders == {HOLDER, HOLDER + 50}
+    assert seen_pids == [HOLDER + 50, HOLDER + 10, HOLDER], (
+        f"explicit proc_root must not jump to os.getpid(); {seen_pids}"
+    )
+
+
+def _make_fake_iphlpapi(
+    rows: list[tuple[int, str, int, str, int, int]], on_table: Callable[[], None] | None = None
+) -> Any:
+    raw_rows = []
+    for state, laddr_s, lport, raddr_s, rport, pid in rows:
+        laddr = struct.unpack("<I", socket.inet_aton(laddr_s))[0]
+        raddr = struct.unpack("<I", socket.inet_aton(raddr_s))[0]
+        raw_rows.append(struct.pack("=6I", state, laddr, socket.htons(lport), raddr, socket.htons(rport), pid))
+    payload = struct.pack("=I", len(raw_rows)) + b"".join(raw_rows)
+
+    class _FakeIphlpapi:
+        def GetExtendedTcpTable(
+            self, buf: Any, size_ref: Any, _order: bool, _family: int, _table_class: int, _reserved: int
+        ) -> int:
+            if buf is None:
+                if hasattr(size_ref, "_obj"):
+                    size_ref._obj.value = len(payload)
+                return 122
+            if on_table is not None:
+                on_table()
+            ctypes.memmove(buf, payload, len(payload))
+            return 0
+
+    return lambda *_args, **_kwargs: _FakeIphlpapi()
+
+
+def test_windows_tcp_table_sighting_keeps_binding_when_close_begins_after_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        ctypes,
+        "WinDLL",
+        _make_fake_iphlpapi([(5, "127.0.0.1", CLIENT_PORT, "127.0.0.1", LISTEN_PORT, HOLDER)]),
+        raising=False,
+    )
+    conn = _conn_state()
+    holder_holder: dict[str, Any] = {}
+
+    def close_after_sighting(_pid: int) -> None:
+        _next_tick()
+        holder_holder["mark"](conn)
+
+    with _safe_identity_hooks(
+        monkeypatch,
+        platform="win32",
+        on_started_at=close_after_sighting,
+    ) as (safe, mark_closing):
+        holder_holder["mark"] = mark_closing
+        pid, _started, observed_at, observed_ns = safe(CLIENT_PORT, LISTEN_PORT, conn)
+
+    assert pid == HOLDER, "Windows PID sighted while live must remain bound if close begins afterwards"
+    assert conn["closing"] and conn["closing_ns"] is not None
+    assert observed_ns is not None and observed_ns < conn["closing_ns"]
+    assert observed_at is not None and observed_at <= conn["closing_at"]
+
+
+@pytest.mark.parametrize("row_pid", [HOLDER, 0], ids=["close-before-table-match", "zero-pid-ignored"])
+def test_windows_tcp_table_close_before_lookup_or_zero_pid_is_rejected(
+    monkeypatch: pytest.MonkeyPatch, row_pid: int
+) -> None:
+    holder_holder: dict[str, Any] = {}
+    conn = _conn_state()
+
+    def close_before_match() -> None:
+        if row_pid > 0:
+            holder_holder["mark"](conn)
+            _next_tick()
+
+    monkeypatch.setattr(
+        ctypes,
+        "WinDLL",
+        _make_fake_iphlpapi(
+            [(5, "127.0.0.1", CLIENT_PORT, "127.0.0.1", LISTEN_PORT, row_pid)],
+            on_table=close_before_match,
+        ),
+        raising=False,
+    )
+    with _safe_identity_hooks(monkeypatch, platform="win32") as (safe, mark_closing):
+        holder_holder["mark"] = mark_closing
+        assert safe(CLIENT_PORT, LISTEN_PORT, conn) == (None, None, None, None)

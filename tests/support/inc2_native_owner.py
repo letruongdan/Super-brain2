@@ -198,26 +198,37 @@ def _socket_inode_holders(inode: int, *, proc_root: Path | None = None) -> set[i
     root = _LINUX_PROC_ROOT if proc_root is None else proc_root
     target = f"socket:[{inode}]"
     holders: set[int] = set()
-    try:
-        entries = [p for p in root.iterdir() if p.name.isdigit()]
-    except OSError:
-        return holders
-    # Newest processes first: client subprocesses are recent processes with high PIDs
-    entries.sort(key=lambda p: int(p.name), reverse=True)
-    for pid_dir in entries:
-        fd_dir = pid_dir / "fd"
+
+    def _scan_pid_fds(pid: int, fd_dir: Path) -> None:
         try:
             with os.scandir(fd_dir) as scan:
                 for entry in scan:
                     try:
                         if os.readlink(entry.path) == target:
                             _note_sighting()
-                            holders.add(int(pid_dir.name))
+                            holders.add(pid)
                             break
                     except OSError:
                         continue
         except OSError:
+            pass
+
+    my_pid: int | None = None
+    if proc_root is None:
+        my_pid = os.getpid()
+        _scan_pid_fds(my_pid, root / str(my_pid) / "fd")
+
+    try:
+        with os.scandir(root) as proc_scan:
+            pids = [int(entry.name) for entry in proc_scan if entry.name.isdigit()]
+    except OSError:
+        return holders
+    # Newest processes first: client subprocesses are recent processes with high PIDs
+    pids.sort(reverse=True)
+    for pid in pids:
+        if pid == my_pid:
             continue
+        _scan_pid_fds(pid, root / str(pid) / "fd")
     return holders
 
 

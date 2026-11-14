@@ -99,3 +99,50 @@ def test_socket_configuration_failure_releases_slot_before_tls_and_next_connecti
         assert result["ok"] is True and harness.submit_count == 1
         data = result.get("data")
         assert isinstance(data, dict) and data["store_id"] == tcp_template.store_id
+
+
+def test_loopback_client_connect_sets_tcp_nodelay_before_connect(
+    tcp_template: TransportTemplate, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with open_test_loopback_transport(tcp_template, name="tcp-client-nodelay") as harness:
+        client = harness.open_client()
+        target = harness.make_target()
+        client_tid = threading.get_ident()
+        events: list[tuple[Any, ...]] = []
+        observed_in_connect: list[int] = []
+        orig_setsockopt = socket.socket.setsockopt
+        orig_connect = socket.socket.connect
+
+        def trace_setsockopt(sock: socket.socket, level: int, option: int, value: Any, *rest: Any) -> None:
+            if threading.get_ident() == client_tid:
+                events.append(("setsockopt", id(sock), level, option, value))
+            orig_setsockopt(sock, level, option, value, *rest)
+
+        def trace_connect(sock: socket.socket, address: Any) -> None:
+            if threading.get_ident() == client_tid:
+                observed_in_connect.append(sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY))
+                events.append(("connect", id(sock), address))
+            orig_connect(sock, address)
+
+        with monkeypatch.context() as hooks:
+            hooks.setattr(socket.socket, "setsockopt", trace_setsockopt)
+            hooks.setattr(socket.socket, "connect", trace_connect)
+            result = client.call(
+                target,
+                ToolCommand("get_health", {"schema_version": "2.0", "deep": False}, token=tcp_template.cred.token),
+            )
+
+        assert result["ok"] is True
+        connect_events = [
+            (idx, ev[1])
+            for idx, ev in enumerate(events)
+            if ev[0] == "connect" and ev[2] == ("127.0.0.1", target.endpoint.port)
+        ]
+        assert len(connect_events) == 1, events
+        connect_idx, client_sock_id = connect_events[0]
+        assert any(
+            idx < connect_idx
+            and ev == ("setsockopt", client_sock_id, socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            for idx, ev in enumerate(events)
+        ), f"client TCP_NODELAY=1 must be set before connect(); events={events}"
+        assert observed_in_connect and observed_in_connect[0] != 0, "TCP_NODELAY was disabled during connect()"

@@ -262,17 +262,95 @@ def parse_collected(text: str) -> list[str]:
     return ids
 
 
+_WHEEL_SETUP_COST_MS = 18_500
+_DEFAULT_CASE_COST_MS = 90
+_WHEEL_FIXTURE_FILES: frozenset[str] = frozenset(
+    {
+        "tests/contract/test_mcp_v2_schema.py",
+        "tests/integration/test_kernel_cli.py",
+        "tests/integration/test_kernel_crash_recovery.py",
+        "tests/integration/test_kernel_native_receipt_contract.py",
+        "tests/integration/test_kernel_privacy_persistence.py",
+        "tests/integration/test_kernel_receipts.py",
+        "tests/integration/test_kernel_shim.py",
+        "tests/integration/test_t9_benchmark_scratch.py",
+    }
+)
+# Calibrated net Windows CI file costs (excluding shared session wheel setup).
+_HEAVY_FILE_COST_MS: dict[str, int] = {
+    "tests/storage/test_backup.py": 55_078,
+    "tests/storage/test_kernel_revocation.py": 48_986,
+    "tests/integration/test_kernel_crash_recovery.py": 48_741,
+    "tests/integration/test_kernel_daemon.py": 44_843,
+    "tests/storage/test_restore.py": 38_585,
+    "tests/storage/test_remediation_i2_t3_lineage.py": 36_470,
+    "tests/storage/test_crash_matrix.py": 31_836,
+    "tests/storage/test_kernel_workspaces.py": 28_218,
+    "tests/application/test_t8_review_p01_r2_edge_globs.py": 25_748,
+    "tests/storage/test_kernel_idempotency.py": 24_876,
+    "tests/integration/test_kernel_native_receipt_contract.py": 20_972,
+    "tests/application/test_t8_review_p01_wrapped_paths.py": 20_309,
+    "tests/storage/test_runtime.py": 18_623,
+    "tests/storage/test_kernel_identity.py": 18_365,
+    "tests/application/test_kernel_send_attempts.py": 16_338,
+    "tests/storage/test_remediation_i2_t4a.py": 13_941,
+    "tests/storage/test_ledger.py": 12_257,
+    "tests/architecture/test_gate_receipt.py": 11_642,
+    "tests/storage/test_remediation_c04_r8_backup_files.py": 11_591,
+    "tests/application/test_kernel_deadlines.py": 11_539,
+    "tests/storage/test_policy_store.py": 10_921,
+    "tests/storage/test_remediation_i2_t5.py": 10_726,
+    "tests/integration/test_kernel_receipts.py": 10_686,
+    "tests/storage/test_migrate.py": 10_546,
+    "tests/storage/test_remediation_i2_os01.py": 10_457,
+    "tests/storage/test_reconcile.py": 10_305,
+    "tests/storage/test_kernel_jobs.py": 9_984,
+    "tests/storage/test_cas.py": 9_899,
+    "tests/storage/test_kernel_migration.py": 9_209,
+    "tests/storage/test_remediation_c02_r6_restore_marker.py": 9_044,
+    "tests/storage/test_remediation_c04_r9_imported_backup_ancestors.py": 8_409,
+    "tests/integration/test_kernel_transport.py": 8_366,
+    "tests/integration/test_kernel_cli.py": 7_882,
+    "tests/application/test_t8_closure_privacy_r2.py": 7_793,
+    "tests/integration/test_kernel_shim.py": 7_729,
+    "tests/storage/test_errors.py": 7_538,
+}
+
+
+def _estimated_file_cost_ms(file: str, count: int) -> int:
+    normalized = file.replace("\\", "/")
+    fallback = count * _DEFAULT_CASE_COST_MS
+    if normalized in _HEAVY_FILE_COST_MS:
+        return max(_HEAVY_FILE_COST_MS[normalized], fallback)
+    return fallback
+
+
 def shard_files(collected_ids: Sequence[str], shards: int) -> list[list[str]]:
-    """Group whole test files, using the number of collected cases as the cost estimate."""
+    """Group whole test files by estimated millisecond cost, co-locating session wheel setup."""
     counts = Counter(node.split("::", 1)[0] for node in collected_ids)
     size = min(max(1, shards), len(counts))
+    if size == 0:
+        return []
     groups: list[list[str]] = [[] for _ in range(size)]
     loads = [0] * size
-    for file, count in sorted(counts.items(), key=lambda item: (-item[1], item[0])):
+    remaining: list[tuple[int, str]] = []
+    has_wheel = False
+    for file, count in counts.items():
+        cost = _estimated_file_cost_ms(file, count)
+        if size > 1 and file.replace("\\", "/") in _WHEEL_FIXTURE_FILES:
+            groups[0].append(file)
+            loads[0] += cost
+            has_wheel = True
+        else:
+            remaining.append((cost, file))
+    if has_wheel:
+        groups[0].sort()
+        loads[0] += _WHEEL_SETUP_COST_MS
+    for cost, file in sorted(remaining, key=lambda item: (-item[0], item[1])):
         index = loads.index(min(loads))
         groups[index].append(file)
-        loads[index] += count
-    return groups
+        loads[index] += cost
+    return [group for group in groups if group]
 
 
 def _split_classname(classname: str, root: Path | None) -> tuple[str, list[str]]:

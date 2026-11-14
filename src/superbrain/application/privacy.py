@@ -182,7 +182,7 @@ class _Run(_TextScans):
         self._deadline_ns = deadline_ns
         compiled = _compile_policy(policy)
         self._sensitive = compiled.sensitive
-        self._paths = compiled.paths
+        self._paths = compiled.paths.fresh()
         self._min_segment = compiled.min_segment
         self._max_words = compiled.max_words
         self._prefixes = compiled.prefixes
@@ -349,7 +349,7 @@ class _Run(_TextScans):
             candidates = [word for word in masked.split() if len(word) >= min_len]
             if not candidates:
                 return text
-            if masked.isprintable() or all(word.isprintable() for word in candidates):
+            if all(word.isprintable() for word in candidates):
                 parts: list[str] = []
                 cursor = 0
                 search_pos = 0

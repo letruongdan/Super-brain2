@@ -1,6 +1,6 @@
 # Bàn giao SP1 đợt 2: kernel daemon, MCP shim và đường native
 
-Ngày cập nhật: 2026-11-13. Tài liệu này là bản bàn giao SP1 đợt 2 trên nhánh `codex/sp1-i2-task9` (tách từ mốc Task 8 `3527a99803059cb06b5120cd18edea2e1a828857`, sau đó merge closure Task 8 `978e63ae685d76b725114102eb932c140ef79f24` bằng merge commit `8439dbae40ef2595a6f547bdbc3d4489014a3065`).
+Ngày cập nhật: 2026-11-14. Tài liệu này là bản bàn giao SP1 đợt 2 trên nhánh `codex/sp1-i2-task9` (tách từ mốc Task 8 `3527a99803059cb06b5120cd18edea2e1a828857`, sau đó merge closure Task 8 `978e63ae685d76b725114102eb932c140ef79f24` bằng merge commit `8439dbae40ef2595a6f547bdbc3d4489014a3065`).
 
 Theo quy tắc tuyên bố của [spec rev22 mục 17.2–17.5](../superpowers/specs/2026-10-30-super-brain2-system-design.md#172-các-gate): chỉ được tuyên bố đóng toàn bộ SP1 đợt 2 khi **toàn bộ** điều kiện sau cùng đạt trên đúng commit `HEAD` cuối có working tree sạch:
 1. Gate mặc định (`scripts/gate.py`, F4 dưới 300 s, 0 fail/error/XPASS, JUnit đầy đủ, `ruff`, strict `mypy`, `import-linter`) đạt trên đủ ma trận OS × Python áp dụng.
@@ -8,13 +8,13 @@ Theo quy tắc tuyên bố của [spec rev22 mục 17.2–17.5](../superpowers/s
 3. Gate native có `NativeConnectionProbe` hợp lệ (`kind="native"`, `status="passed"`) cho từng host đã chọn trên cùng kho/epoch/instance với phê duyệt D8 của owner.
 4. Review độc lập toàn nhánh xác nhận đúng commit pin, test seal, ledger và inventory cuối.
 
-Tính đến thời điểm commit tài liệu này:
-- Phần code, unit/integration/architecture/crash/wheel tests của Task 1–9 và checklist vận hành đã **triển khai trên nhánh** (`implemented` về mặt mã nguồn chưa đóng review).
-- Các ô gate **Linux** và **macOS** (Python 3.11 và 3.14): **`not_run`**.
-- D8 đã được owner duyệt cho Codex desktop app và Claude Code. Archive tại pin sản phẩm 80a7608 có 10 probe Claude và 5 probe Codex đã qua verifier Round 12. Claude có A/B/C và A+B đồng thời. Codex còn thiếu health tại A và A+B đồng thời. Nghiệm thu cuối đối chiếu source, wheel và verifier của từng lượt trong ledger.
+Tính đến thời điểm commit tài liệu này (trước khi chốt/chạy nghiệm thu cuối trên `HEAD` theo quy tắc không vòng lặp T9-P01):
+- Phần code, unit/integration/architecture/crash/wheel tests của Task 1–9 và checklist vận hành đã **triển khai trên nhánh** (`implemented` ở mức mã nguồn trước nghiệm thu pin cuối).
+- **Ma trận gate & benchmark trên pin cuối (`pending_after_commit`)**: gồm ma trận CI 6 ô (`win32`, `linux`, `macos` × Python `3.11` và `3.14`, artifact lưu ngoài Git dưới `.superpowers/sdd/2026-11-04-sp1-increment2-daemon-mcp-kernel/task-9/github-run-<run_id>/`) và ma trận local 4 ô (`win32`, `linux/ext4` × Python `3.11` và `3.14`, artifact lưu ngoài Git dưới `.superpowers/sdd/2026-11-04-sp1-increment2-daemon-mcp-kernel/task-9/final-r28-<short_sha>/`), tổng hợp kiểm chứng tại `.superpowers/sdd/2026-11-04-sp1-increment2-daemon-mcp-kernel/task-9/ledger.md`. Chỉ công nhận đạt khi `receipt.start.commit == receipt.end.commit == HEAD` cuối sạch và khớp seal test của commit đó.
+- **Kết nối native D8 (`Codex desktop app` và `Claude Code`)**: D8 đã được owner duyệt cho **Codex desktop app** và **Claude Code** với root cô lập theo pin cuối tại `C:\Users\letru\sb2-trusted-local\d8-live\final-<short_sha>\`. Các probe lịch sử ở pin trung gian trước đây không thay thế nghiệm thu trên wheel và commit pin cuối; kết quả probe thực tế trên pin cuối và biên bản đối chiếu verifier giữ tại `.superpowers/sdd/2026-11-04-sp1-increment2-daemon-mcp-kernel/task-9/ledger.md` và `C:\Users\letru\sb2-trusted-local\d8-live\final-<short_sha>\`.
 - **Lớp 2** (spec §11.3): **`unknown`** (thuộc SP2 / SP7).
-- **Mục mở kế thừa từ Task 8 (`T9-OPEN-W1`):** mẫu wire 1 MiB qua daemon thật dao động quanh ngân sách local 100 ms (86,5–100,9 ms tại `978e63a`); điều kiện đóng ghi tại ledger Task 8 §13.
-- **Review độc lập cuối cho Task 9**: Round 12 đã duyệt sửa verifier và seal 162 file. Source đã được chốt ở commit tiếp theo của nhánh. Receipt cuối, gate native và ma trận OS còn được đối chiếu trong ledger.
+- **Mục mở kế thừa từ Task 8 (`T9-OPEN-W1`)**: mẫu wire 1 MiB qua daemon thật phải đạt ngân sách trên đúng commit pin cuối (`ledger.md`, `final-r28-<short_sha>/`, `github-run-<run_id>/`).
+- **Review độc lập cuối cho Task 9**: đang chờ đối chiếu trên đúng commit pin cuối (các seal/review trung gian trước đây chỉ mang tính lịch sử; nghiệm thu cuối kiểm đúng commit `HEAD`, full test seal, ledger, ma trận CI/local và D8 receipt cuối).
 
 ---
 
@@ -22,7 +22,7 @@ Tính đến thời điểm commit tài liệu này:
 
 ### Đã hoàn thiện trong kernel SP1 đợt 2
 
-- **Hợp đồng wire và schema:** [schemas/mcp-tools-v2.json](../../schemas/mcp-tools-v2.json) (`sha256:4cf906a67cfde9edf636bac5e2fa3667653d895fdc5c4c9b9e2648f000857dfc`), canonical JSON, ID validation và typed `BrainError`.
+- **Hợp đồng wire và schema:** [schemas/mcp-tools-v2.json](../../schemas/mcp-tools-v2.json) (`sha256:a8d2317c2a56191a5c08510a6c3c26b7141ebfd43943385507bfc60bc8df65a1`), canonical JSON, ID validation và typed `BrainError`.
 - **Transport D2 (TLS loopback + state machine 2 bước):** bind `127.0.0.1:<ephemeral_port>`, private CA và leaf cert theo từng kho (`cryptography`), client pin leaf + check SAN/thời hạn, `GET /v2/identity` không mang bearer trước khi gửi `POST /v2/tools/call` có bearer trên cùng socket, deadline monotonic 2 s TLS + 2 s tool (`1.5 s` daemon + phần dự phòng).
 - **Vận hành daemon owner và CLI/MCP shim (D1, D3):** `brain serve --config <ABS>`, `brain migrate --offline --config <ABS>`, `brain-mcp` và `brain mcp --profile <ABS>` (stdio MCP `2025-06-18`) thực thi `single-checkout-owner-profile-v1`, xác minh raw path, physical identity và launch CWD, tiêm `workspace_hint` và `selected_scope={repo_id, checkout_id}` trước HMAC digest.
 - **Policy v3 & Store v4:** principal `(owner_id, harness_id, machine_id)`, bearer `<credential_uuidv7>.<secret>` lưu hash SHA-256 + constant-time verify, `AuthGate` nguyên tử (generation + trust generation + grant stamp), registry workspace trên policy và reconcile theo intent ID vào kho, HMAC-SHA256 `idempotency` với replay/conflict/lost-response recovery, mô hình `Delivery`/`ServedReceipt`/`ReadAck`, `LineageRef`/`LineageSet`/`LineagedField`, tương thích S1=A (`snapshot_status`), và `Job`/`JobService`/`ProviderInvocation` với lease/attempt/cancel/settlement.
@@ -40,14 +40,15 @@ Tính đến thời điểm commit tài liệu này:
 
 ## 2. Cơ chế pin source, khác biệt spec và provenance artifact
 
-1. **Nhánh và base pin:** nhánh `codex/sp1-i2-task9` tách từ commit Task 8 `3527a99803059cb06b5120cd18edea2e1a828857`; closure Task 8 `978e63a` (tối ưu privacy/wire, review độc lập APPROVED) được merge vào nhánh tại `8439dba`, không xung đột, phần `src` của merge bằng đúng `978e63a`. Lưu ý checkout `sp1-increment2` ở `6a3a4d2` giữ bản spec rev22 trước phần giải thích mẫu đường dẫn ở §14.2, trong khi `3527a99` (và nhánh Task 9) giữ bản có `§14.2` tại [2026-10-30-super-brain2-system-design.md](../superpowers/specs/2026-10-30-super-brain2-system-design.md) (`sha256:a468a917f775d2fb8a00b519f5e5ed31d3273ca0b63ad7f8115b6678065783b7`). Toàn bộ điều khoản native, D2–D8 và T0 giống nhau.
+1. **Nhánh và base pin:** nhánh `codex/sp1-i2-task9` tách từ commit Task 8 `3527a99803059cb06b5120cd18edea2e1a828857`; closure Task 8 `978e63a` (tối ưu privacy/wire, review độc lập APPROVED) được merge vào nhánh tại `8439dba`, không xung đột, phần `src` của merge bằng đúng `978e63a`. Lưu ý checkout `sp1-increment2` ở `6a3a4d2` giữ bản spec rev22 trước phần giải thích mẫu đường dẫn ở §14.2, trong khi `3527a99` (và nhánh Task 9) giữ bản có `§14.2` tại [2026-10-30-super-brain2-system-design.md](../superpowers/specs/2026-10-30-super-brain2-system-design.md) (`sha256:560eea11f23d75a677cc684ae33f85c79c3e3291ac4a1ca77a8778f0f24e8ff4`). Toàn bộ điều khoản native, D2–D8 và T0 giống nhau.
 2. **Pin cấu hình bất biến kèm trong commit này:**
    - `pyproject.toml`: `sha256:4f54cc75470b21bb44257e9f434d4f043c8ad979c08c0a804eb956fece8a87a3`
-   - `uv.lock`: `sha256:a17fae4c237aad0f0b13460a8672cf8b193fb1004316b98149c10532fdc399cb`
-   - `schemas/mcp-tools-v2.json`: `sha256:4cf906a67cfde9edf636bac5e2fa3667653d895fdc5c4c9b9e2648f000857dfc`
-   - `docs/superpowers/specs/2026-11-04-sp1-increment2-kernel-decisions.md`: `sha256:1fa6cb104918866ba08ef1a52153e05635214f45d90e920ddb43b6bc0477969b`
-   - `docs/superpowers/plans/2026-11-04-sp1-increment2-daemon-mcp-kernel.md`: `sha256:6761e5c2a4d45964033278e4b67abf67bb02b610e8e34b8279e34ad8e0ec2623`
-3. **Quy tắc pin không vòng lặp (Plan T9-P01):** tài liệu bàn giao được commit **trước** khi chạy `scripts/gate.py` và benchmark cuối. Do đó mọi receipt của Task 9 được lưu ngoài tracked Git dưới `.superpowers/sdd/2026-11-04-sp1-increment2-daemon-mcp-kernel/task-9/` (`test-seal-final.json`, `ledger.md`, `final-<short_sha>/`), và **chỉ có hiệu lực** khi `receipt.start.commit == receipt.end.commit == git rev-parse HEAD`, `tree_clean == true`, và digest seal test khớp đúng commit đó. Bất kỳ chỉnh sửa file tracked nào đều làm các receipt cũ hết hiệu lực kiểm chứng.
+   - `uv.lock`: `sha256:b0431c4a5ad311ce1d1e25edc1698d0eea6fbad9b5f1b7d2fe16e2983cc4b419`
+   - `schemas/mcp-tools-v2.json`: `sha256:a8d2317c2a56191a5c08510a6c3c26b7141ebfd43943385507bfc60bc8df65a1`
+   - `docs/superpowers/specs/2026-10-30-super-brain2-system-design.md`: `sha256:560eea11f23d75a677cc684ae33f85c79c3e3291ac4a1ca77a8778f0f24e8ff4`
+   - `docs/superpowers/specs/2026-11-04-sp1-increment2-kernel-decisions.md`: `sha256:bb9072099f36e9142cfd1b5f72687556e8af4919769d276b4fc8d35a2ab50596`
+   - `docs/superpowers/plans/2026-11-04-sp1-increment2-daemon-mcp-kernel.md`: `sha256:1e957f93bd1b4c6908d8634394eb317c3955d45dc362a75595f765f33ed9fb6a`
+3. **Quy tắc pin không vòng lặp (Plan T9-P01):** tài liệu bàn giao được commit **trước** khi chạy `scripts/gate.py`, benchmark và native probe trên pin cuối. Do đó mọi receipt của Task 9 được lưu ngoài tracked Git dưới `.superpowers/sdd/2026-11-04-sp1-increment2-daemon-mcp-kernel/task-9/` (`ledger.md`, `github-run-<run_id>/`, `final-r28-<short_sha>/`, `test-seal-final.json`) và root D8 cô lập `C:\Users\letru\sb2-trusted-local\d8-live\final-<short_sha>\`, và **chỉ có hiệu lực** khi `receipt.start.commit == receipt.end.commit == git rev-parse HEAD`, `tree_clean == true`, và digest seal test khớp đúng commit đó. Bất kỳ chỉnh sửa file tracked nào đều làm các receipt cũ hết hiệu lực kiểm chứng.
 4. **Provenance build wheel:**
    - Benchmark `tests/integration/test_kernel_performance.py` tự build một wheel sạch từ commit được pin vào temp riêng và ghi `wheel_digest` trong receipt `perf-*.json`.
    - Mọi phép thử native D8 về sau phải ghi rõ `shim_build_digest` của đúng file `.whl` đã cài vào môi trường host (gắn cùng `source_commit`, `uv.lock` và `schema_sha256`), không ghép chéo digest wheel của benchmark sang lượt native.
@@ -69,16 +70,17 @@ Receipt closure Task 8 tại `978e63a` (F4 accepted trên Windows 3.11.9 và 3.1
 
 ### Ma trận Gate & OS cho commit cuối Task 9 (`codex/sp1-i2-task9`)
 
-Môi trường Windows sử dụng `LOCALAPPDATA=C:\Users\letru\sb2-trusted-local` và `TEMP`/`TMP=C:\Users\letru\sb2-trusted-local\gate-temp` vì `AppData\Local` mặc định của session Codex mang SID takeover rights; guard quyền sản phẩm được giữ nguyên trạng không nới lỏng.
+Môi trường Windows local sử dụng `LOCALAPPDATA=C:\Users\letru\sb2-trusted-local` và `TEMP`/`TMP=C:\Users\letru\sb2-trusted-local\gate-temp` vì `AppData\Local` mặc định của session Codex mang SID takeover rights; guard quyền sản phẩm được giữ nguyên trạng không nới lỏng. Theo quy tắc T9-P01, toàn bộ ma trận CI 6 ô và ma trận local 4 ô phải được kiểm chứng sau khi chốt commit cuối `HEAD`, đối chiếu qua `.superpowers/sdd/2026-11-04-sp1-increment2-daemon-mcp-kernel/task-9/ledger.md`:
 
-| OS | CPython | Trạng thái F4 & Benchmark trên pin cuối T9 | Đường dẫn kiểm chứng trong ledger | Điều kiện đóng ô |
+| Kênh / OS | CPython | Trạng thái trên pin cuối T9 (T9-P01) | Đường dẫn kiểm chứng trong ledger | Điều kiện đóng ô |
 |---|---|---|---|---|
-| Native Windows 11 (`win32`, configured trusted root) | `3.11.9` | **Sắp chạy tuần tự sau commit này** *(chưa đóng tới khi đọc `accepted=true` trên `HEAD`)* | `.superpowers/sdd/2026-11-04-sp1-increment2-daemon-mcp-kernel/task-9/final-<head>/gate-3.11.9/` & `perf-3.11.9/` | Chạy `scripts/gate.py --python 3.11.9` (< 300 s, 0 fail/error/XPASS, JUnit parity, seal khớp trước/sau) và `test_kernel_performance` |
-| Native Windows 11 (`win32`, configured trusted root) | `3.14.3` | **Sắp chạy tuần tự sau commit này** *(chưa đóng tới khi đọc `accepted=true` trên `HEAD`)* | `.superpowers/sdd/2026-11-04-sp1-increment2-daemon-mcp-kernel/task-9/final-<head>/gate-3.14.3/` & `perf-3.14.3/` | Chạy `scripts/gate.py --python 3.14.3` (< 300 s, 0 fail/error/XPASS, JUnit parity, seal khớp trước/sau) và `test_kernel_performance` |
-| Linux / ext4 | `3.11` | `not_run` | *(trống; WSL `final-r13-linux` thuộc I1 `e09d8a0`, không thay I2)* | Chạy `scripts/gate.py` và `test_kernel_performance` trên clone Linux sạch ở đúng commit pin cuối T9 |
-| Linux / ext4 | `3.14` | `not_run` | *(trống)* | Như trên cho CPython 3.14 |
-| macOS | `3.11` | `not_run` | *(trống; mypy platform override không thay runtime macOS)* | Chạy `scripts/gate.py` (`F_FULLFSYNC`, permissions POSIX) và `test_kernel_performance` trên macOS ở đúng commit pin cuối T9 |
-| macOS | `3.14` | `not_run` | *(trống)* | Như trên cho CPython 3.14 |
+| Local Native Windows 11 (`win32`, configured trusted root) | `3.11.9` | `pending_after_commit` *(kiểm chứng sau commit `HEAD` cuối; các vòng trước không thay pin cuối)* | `.superpowers/sdd/2026-11-04-sp1-increment2-daemon-mcp-kernel/task-9/final-r28-<short_sha>/` & `ledger.md` | Chạy `scripts/gate.py --python 3.11.9` (< 300 s, 0 fail/error/XPASS, JUnit parity, seal khớp trước/sau) và `test_kernel_performance` trên đúng `HEAD` |
+| Local Native Windows 11 (`win32`, configured trusted root) | `3.14.3` | `pending_after_commit` *(kiểm chứng sau commit `HEAD` cuối)* | `.superpowers/sdd/2026-11-04-sp1-increment2-daemon-mcp-kernel/task-9/final-r28-<short_sha>/` & `ledger.md` | Chạy `scripts/gate.py --python 3.14.3` (< 300 s, 0 fail/error/XPASS, JUnit parity, seal khớp trước/sau) và `test_kernel_performance` trên đúng `HEAD` |
+| Local Linux / ext4 (`wsl` / ext4 clean clone) | `3.11` | `pending_after_commit` *(kiểm chứng sau commit `HEAD` cuối)* | `.superpowers/sdd/2026-11-04-sp1-increment2-daemon-mcp-kernel/task-9/final-r28-<short_sha>/` & `ledger.md` | Chạy `scripts/gate.py` và `test_kernel_performance` trên clone Linux sạch ở đúng commit `HEAD` cuối |
+| Local Linux / ext4 (`wsl` / ext4 clean clone) | `3.14` | `pending_after_commit` *(kiểm chứng sau commit `HEAD` cuối)* | `.superpowers/sdd/2026-11-04-sp1-increment2-daemon-mcp-kernel/task-9/final-r28-<short_sha>/` & `ledger.md` | Như trên cho CPython 3.14 trên đúng commit `HEAD` cuối |
+| CI GitHub Actions Windows | `3.11` & `3.14` | `pending_after_commit` *(2 ô CI thuộc ma trận 6 ô trên `HEAD` cuối)* | `.superpowers/sdd/2026-11-04-sp1-increment2-daemon-mcp-kernel/task-9/github-run-<run_id>/` & `ledger.md` | Toàn bộ job & artifact CI khớp đúng commit `HEAD` cuối, `accepted=true` F4 + benchmark |
+| CI GitHub Actions Linux | `3.11` & `3.14` | `pending_after_commit` *(2 ô CI thuộc ma trận 6 ô trên `HEAD` cuối)* | `.superpowers/sdd/2026-11-04-sp1-increment2-daemon-mcp-kernel/task-9/github-run-<run_id>/` & `ledger.md` | Toàn bộ job & artifact CI khớp đúng commit `HEAD` cuối, `accepted=true` F4 + benchmark |
+| CI GitHub Actions macOS | `3.11` & `3.14` | `pending_after_commit` *(2 ô CI thuộc ma trận 6 ô trên `HEAD` cuối; `mypy` override không thay runtime macOS)* | `.superpowers/sdd/2026-11-04-sp1-increment2-daemon-mcp-kernel/task-9/github-run-<run_id>/` & `ledger.md` | Chạy `scripts/gate.py` (`F_FULLFSYNC`, POSIX permissions) và `test_kernel_performance` trên runner macOS ở đúng `HEAD` cuối |
 
 ---
 
@@ -86,14 +88,14 @@ Môi trường Windows sử dụng `LOCALAPPDATA=C:\Users\letru\sb2-trusted-loca
 
 Quy ước theo §17.3 / §17.5: các bài kiểm trong `tests/integration/test_kernel_native_receipt_contract.py` là bằng chứng **contract và fixture qua wheel cài đặt thật** (`kind="fixture"`, `host_mode="wheel_mcp_pipe"`/`"fixture_mcp_stdio"`), hoàn toàn không thay thế `NativeHostReceipt` từ tiến trình host thật.
 
-| Host (Q4) | Trạng thái T0 lịch sử | Verdict native T9 hiện tại | Ghi chú & điều kiện |
+| Host (Q4) | Trạng thái T0 lịch sử | Verdict native T9 theo pin cuối (T9-P01) | Ghi chú & nơi đối chiếu |
 |---|---|---|---|
-| **Codex desktop app** (`26.1106.6628.0`, `codex_desktop_gui`; T0 `26.1029.7803.0`) | `passed` (`t0r1`/`t0r2`) | Có probe đạt trên 80a7608; nghiệm thu cuối còn chờ | A có job thành công, B/C có health và job thành công. Thiếu health A và A+B đồng thời. D8 đã duyệt. Source/wheel và verifier digest giữ theo từng receipt. |
-| **Codex CLI** (`codex-cli 0.167.0-alpha.4.1`, `codex_cli_exec`; T0 `0.166.0-alpha.6`) | *(chẩn đoán phụ T0)* | `not_run` | Chỉ làm chẩn đoán phụ theo `codex_cli_exec`; **không** thay thế verdict của **Codex desktop app** |
-| **Claude Code** (`2.1.322 (Claude Code)`, `claude_cli_mcp_isolated`; T0 `2.1.317`) | `passed` (`t0r3`) | Có probe đạt trên 80a7608; đối chiếu pin cuối trong ledger | D8 đã duyệt. Có health/job tại A/B/C và A+B đồng thời, đúng scope và chung daemon với các probe Codex. |
-| **Antigravity Desktop** (`1.23.2` / `agy 1.5.1`) | `failed_r1_unsupported_in_i2` | `not_run` *(ngoài tập I2)* | Đã loại khỏi tập hỗ trợ I2 theo Owner Ruling `2026-11-05T19:05:18+07:00`; giữ nguyên lịch sử failure `t0r2` cho SP7 |
-| **OpenCode** (`2.2.0`) | `not_run` | `not_run` | Chưa được chọn cho I2; cần quyết định phạm vi và D8 |
-| **Cursor** | `not_run` | `not_run` | Chưa cài đặt / chưa được chọn cho I2; cần quyết định phạm vi và D8 |
+| **Codex desktop app** (`26.1106.6628.0`, `codex_desktop_gui`; T0 `26.1029.7803.0`) | `passed` (`t0r1`/`t0r2`) | `pending_after_commit` *(D8 đã duyệt; kiểm trên wheel pin cuối)* | D8 đã duyệt. Probe thực tế chạy ở root cô lập `C:\Users\letru\sb2-trusted-local\d8-live\final-<short_sha>\` và lưu đối chiếu wheel/verifier/source trên đúng pin cuối trong `.superpowers/sdd/2026-11-04-sp1-increment2-daemon-mcp-kernel/task-9/ledger.md`. |
+| **Codex CLI** (`codex-cli 0.167.0-alpha.4.1`, `codex_cli_exec`; T0 `0.166.0-alpha.6`) | *(chẩn đoán phụ T0)* | *(chẩn đoán phụ; không thay Codex desktop app)* | Chỉ làm chẩn đoán phụ theo `codex_cli_exec`; **không** thay thế verdict của **Codex desktop app**. |
+| **Claude Code** (`2.1.322 (Claude Code)`, `claude_cli_mcp_isolated`; T0 `2.1.317`) | `passed` (`t0r3`) | `pending_after_commit` *(D8 đã duyệt; kiểm trên wheel pin cuối)* | D8 đã duyệt. Probe thực tế chạy ở root cô lập `C:\Users\letru\sb2-trusted-local\d8-live\final-<short_sha>\` (chung daemon với probe Codex trên đúng pin cuối) và lưu đối chiếu trong `.superpowers/sdd/2026-11-04-sp1-increment2-daemon-mcp-kernel/task-9/ledger.md`. |
+| **Antigravity Desktop** (`1.23.2` / `agy 1.5.1`) | `failed_r1_unsupported_in_i2` | *(ngoài tập I2)* | Đã loại khỏi tập hỗ trợ I2 theo Owner Ruling `2026-11-05T19:05:18+07:00`; giữ nguyên lịch sử failure `t0r2` cho SP7 |
+| **OpenCode** (`2.2.0`) | `not_run` | *(chưa chọn trong I2)* | Chưa được chọn cho I2; cần quyết định phạm vi và D8 |
+| **Cursor** | `not_run` | *(chưa cài đặt / chưa chọn trong I2)* | Chưa cài đặt / chưa được chọn cho I2; cần quyết định phạm vi và D8 |
 
 ---
 
@@ -111,4 +113,4 @@ Quy ước theo §17.3 / §17.5: các bài kiểm trong `tests/integration/test_
   - Tình huống 21, 24 (restore giữ `writer.lock`/revocation; requeue job & invocation `outcome_unknown`): T2/T5/T8 crash & recovery tests.
   - Tình huống 29, 30 (lineage ref/inheritance): `LineageSet` & `LineagedField` model/ref trong T3; truyền lineage đầy đủ qua continuity/Jev thuộc SP2–SP5.
 - **Lớp 2 (`§11.3`):** giữ `unknown`.
-- **Phê duyệt và review độc lập (`closure pending`):** mọi receipt, RED/GREEN/mutation log, seal digest (`test-seal-9.1-r3.json`, `test-seal-9.2-r2.json`, `test-seal-final.json`), provenance review và báo cáo cuối nằm trong ledger ngoài Git tại `.superpowers/sdd/2026-11-04-sp1-increment2-daemon-mcp-kernel/task-9/ledger.md`. Chỉ khi hoàn tất F4/perf trên pin cuối, thu đủ host native đã duyệt và có review độc lập đồng thuận mới được đóng SP1 đợt 2.
+- **Phê duyệt và review độc lập (`closure pending`):** mọi receipt, RED/GREEN/mutation log, seal digest (`test-seal-final.json`, `.verification/task9-seal.json`), ma trận CI (`github-run-<run_id>/`), ma trận local (`final-r28-<short_sha>/`), kết quả native D8 (`C:\Users\letru\sb2-trusted-local\d8-live\final-<short_sha>\`), provenance review và báo cáo cuối nằm trong ledger ngoài Git tại `.superpowers/sdd/2026-11-04-sp1-increment2-daemon-mcp-kernel/task-9/ledger.md`. Chỉ khi hoàn tất ma trận F4/benchmark trên pin cuối, thu đủ probe native đã duyệt trên đúng wheel pin cuối và có review độc lập đồng thuận mới được đóng SP1 đợt 2.
