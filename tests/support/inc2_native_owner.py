@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import itertools
 import os
 import queue
 import shutil
@@ -92,6 +93,22 @@ def utc_now_z() -> str:
 
 _utc_now_z = utc_now_z
 
+# Monotonic tie-breaker for coarse OS clocks (e.g., Windows Python 3.11 monotonic_ns uses ~15.6 ms ticks).
+_ORDER_SEQ = itertools.count(1)
+
+
+def _stamp_ns() -> tuple[int, int]:
+    return time.monotonic_ns(), next(_ORDER_SEQ)
+
+
+def _before(a_ns: int, a_seq: int | None, b_ns: int, b_seq: int | None) -> bool:
+    if a_ns != b_ns:
+        return a_ns < b_ns
+    if a_seq is not None and b_seq is not None:
+        return a_seq < b_seq
+    return False
+
+
 # When a lookup first saw the holder of the client socket (per lookup thread): a uniqueness scan may finish after the
 # connection starts closing, but the binding is only as late as that sighting, not as the end of the scan.
 _SIGHTING = threading.local()
@@ -99,7 +116,9 @@ _SIGHTING = threading.local()
 
 def _note_sighting() -> None:
     if getattr(_SIGHTING, "ns", None) is None:
-        _SIGHTING.ns = time.monotonic_ns()
+        ns, seq = _stamp_ns()
+        _SIGHTING.ns = ns
+        _SIGHTING.seq = seq
         _SIGHTING.at = _utc_now_z()
 
 
@@ -522,7 +541,9 @@ def _install_loopback_server_hooks(
         with c_state["lock"]:
             if not c_state["closing"]:
                 c_state["closing"] = True
-                c_state["closing_ns"] = time.monotonic_ns()
+                closing_ns, closing_seq = _stamp_ns()
+                c_state["closing_ns"] = closing_ns
+                c_state["closing_seq"] = closing_seq
                 c_state["closing_at"] = _utc_now_z()
 
     def _lookup_state_for_socks(*socks: Any) -> dict[str, Any] | None:
@@ -547,9 +568,10 @@ def _install_loopback_server_hooks(
         client_started_at: str | None = None
         observed_at: str | None = None
         observed_ns: int | None = None
+        observed_seq: int | None = None
         sighted = False
         with contextlib.suppress(OSError, subprocess.SubprocessError):
-            _SIGHTING.ns = _SIGHTING.at = None
+            _SIGHTING.ns = _SIGHTING.seq = _SIGHTING.at = None
             try:
                 client_pid = _lookup_loopback_client_pid(peer_port, listen_port, conn_state=conn_state)
             except TypeError:
@@ -561,8 +583,13 @@ def _install_loopback_server_hooks(
                 ):
                     return None, None, None, None
                 client_started_at = process_started_at_for_pid(client_pid)
-                observed_ns = _SIGHTING.ns if sighted else time.monotonic_ns()
-                observed_at = _SIGHTING.at if sighted else _utc_now_z()
+                if sighted:
+                    observed_ns = _SIGHTING.ns
+                    observed_seq = getattr(_SIGHTING, "seq", None)
+                    observed_at = _SIGHTING.at
+                else:
+                    observed_ns, observed_seq = _stamp_ns()
+                    observed_at = _utc_now_z()
         if (
             client_pid is None
             or client_started_at is None
@@ -574,11 +601,22 @@ def _install_loopback_server_hooks(
             with conn_state["lock"]:
                 closing_ns = conn_state["closing_ns"]
                 if sighted:  # the holder was seen at observed_ns; only a close that began before it disqualifies
-                    late = closing_ns is not None and closing_ns < observed_ns
+                    late = closing_ns is not None and _before(
+                        closing_ns,
+                        conn_state.get("closing_seq"),
+                        observed_ns,
+                        observed_seq,
+                    )
                 else:
                     late = conn_state["closing"] or conn_state["closed_event"].is_set()
-                if late or observed_ns < conn_state["conn_started_ns"]:
+                if late or _before(
+                    observed_ns,
+                    observed_seq,
+                    conn_state["conn_started_ns"],
+                    conn_state.get("conn_started_seq"),
+                ):
                     return None, None, None, None
+                conn_state["observed_seq"] = observed_seq
         return client_pid, client_started_at, observed_at, observed_ns
 
     def _submit_lookup(
@@ -712,16 +750,24 @@ def _install_loopback_server_hooks(
 
             closed_at: str | None = None
             closed_ns: int | None = None
+            closed_seq: int | None = None
             closing_ns: int | None = None
+            closing_seq: int | None = None
+            observed_seq: int | None = None
             conn_started_ns: int | None = None
+            conn_started_seq: int | None = None
             if conn_state is not None:
                 with contextlib.suppress(Exception):
                     conn_state["closed_event"].wait(timeout=max(0.0, wait_s))
                 with conn_state["lock"]:
                     closing_ns = conn_state["closing_ns"]
+                    closing_seq = conn_state.get("closing_seq")
                     closed_at = conn_state["closed_at"]
                     closed_ns = conn_state["closed_ns"]
+                    closed_seq = conn_state.get("closed_seq")
+                    observed_seq = conn_state.get("observed_seq")
                     conn_started_ns = conn_state["conn_started_ns"]
+                    conn_started_seq = conn_state.get("conn_started_seq")
 
             obs_ok = (
                 client_pid is not None
@@ -732,7 +778,9 @@ def _install_loopback_server_hooks(
                 and closed_at is not None
                 and closed_ns is not None
                 and conn_started_ns is not None
-                and conn_started_ns <= observed_ns <= closing_ns <= closed_ns
+                and not _before(observed_ns, observed_seq, conn_started_ns, conn_started_seq)
+                and not _before(closing_ns, closing_seq, observed_ns, observed_seq)
+                and not _before(closed_ns, closed_seq, closing_ns, closing_seq)
                 and conn_started_at <= observed_at <= closed_at
             )
             obs_status = "ok" if obs_ok else "observation_incomplete"
@@ -883,16 +931,21 @@ def _install_loopback_server_hooks(
         conn_key = (id(self), conn_id_int)
         connection_id = f"conn-{conn_id_int}"
         conn_started_at = _utc_now_z()
+        conn_started_ns, conn_started_seq = _stamp_ns()
         conn_state: dict[str, Any] = {
             "lock": threading.Lock(),
-            "conn_started_ns": time.monotonic_ns(),
+            "conn_started_ns": conn_started_ns,
+            "conn_started_seq": conn_started_seq,
             "closed_event": threading.Event(),
             "worker_entered_event": threading.Event(),
             "closing": False,
             "closing_ns": None,
+            "closing_seq": None,
             "closing_at": None,
+            "observed_seq": None,
             "closed_at": None,
             "closed_ns": None,
+            "closed_seq": None,
             "raw_sock": raw_sock,
             "ssl_sock": None,
         }
@@ -928,7 +981,9 @@ def _install_loopback_server_hooks(
         finally:
             _mark_conn_closing(conn_state)
             with conn_state["lock"]:
-                conn_state["closed_ns"] = time.monotonic_ns()
+                closed_ns, closed_seq = _stamp_ns()
+                conn_state["closed_ns"] = closed_ns
+                conn_state["closed_seq"] = closed_seq
                 conn_state["closed_at"] = _utc_now_z()
                 ssl_sock_ref = conn_state.get("ssl_sock")
                 conn_state["raw_sock"] = None

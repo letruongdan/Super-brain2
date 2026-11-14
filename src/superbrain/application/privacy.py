@@ -19,16 +19,9 @@ import dataclasses
 import math
 import re
 import time
-
-try:
-    from _collections import _count_elements  # type: ignore[import-not-found]
-except ImportError:
-
-    def _count_elements(mapping: dict[str, int], iterable: str) -> None:
-        for elem in iterable:
-            mapping[elem] = mapping.get(elem, 0) + 1
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from functools import lru_cache
+from typing import TypeVar
 
 from superbrain.application._privacy_rules import (
     _BENIGN_CONTAINING_WORDS,
@@ -37,9 +30,12 @@ from superbrain.application._privacy_rules import (
     _DOTTED_PATH_TOKEN,
     _ENTROPY_EDGE,
     _ID_SEGMENTS,
+    _JSON_SAFE_NL_BYTES,
     _MAX_INT,
     _NODE_OVERHEAD,
     _PATH_TOKEN,
+    _PRINTABLE_AND_WS_BYTES,
+    _PRINTABLE_NON_WS_BYTES,
     _STATUS_VALUE_RE,
     MAX_ARRAY_ITEMS,
     MAX_DEPTH,
@@ -49,17 +45,25 @@ from superbrain.application._privacy_rules import (
     REDACTED,
     REJECTED_MESSAGE,
     STATUS_FIELDS,
+    _build_path_prefilter,
     _Deadline,
     _exempt_structural,
+    _fast_patterns,
+    _FastScanPatterns,
     _is_structural_id,
     _joined_key,
     _key_words,
     _path_needles,
     _PathMatcher,
+    _PathPrefilter,
     _Reject,
     _structural_kind,
 )
-from superbrain.application._privacy_scan import _TextScans
+from superbrain.application._privacy_scan import (
+    _fast_scans_active,
+    _shipped_rules_active,
+    _TextScans,
+)
 from superbrain.core.canonical import canonical_json
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.jsonvalue import JsonValue
@@ -70,8 +74,18 @@ from superbrain.core.kernel import (
     SafePayload,
 )
 
+_CountKeyT = TypeVar("_CountKeyT", str, int)
 
-def _shannon_from_counts(counts: Mapping[str, int], total: int) -> float:
+try:
+    from _collections import _count_elements  # type: ignore[import-not-found]
+except ImportError:
+
+    def _count_elements(mapping: dict[_CountKeyT, int], iterable: Iterable[_CountKeyT]) -> None:
+        for elem in iterable:
+            mapping[elem] = mapping.get(elem, 0) + 1
+
+
+def _shannon_from_counts(counts: Mapping[str, int] | Mapping[int, int], total: int) -> float:
     if total <= 256:
         weights = _entropy_weights(total)
         return -sum([weights[c] for c in counts.values()])
@@ -88,6 +102,12 @@ def _shannon_bits(text: str) -> float:
 def _entropy_weights(total: int) -> tuple[float, ...]:
     """Cache bounded numeric probability tables, without retaining input text."""
     return (0.0, *((count / total) * math.log2(count / total) for count in range(1, total + 1)))
+
+
+@lru_cache(maxsize=1)
+def _entropy_weights_table() -> tuple[tuple[float, ...], ...]:
+    """Tuple of per-length entropy weights for lengths 0..256 (math constants only)."""
+    return tuple(_entropy_weights(n) for n in range(257))
 
 
 @lru_cache(maxsize=32)
@@ -126,6 +146,7 @@ class _CompiledPolicy:
     sensitive: frozenset[str]
     paths: _PathMatcher
     min_segment: int
+    min_word: int
     max_words: int
     prefixes: frozenset[str]
     contained: tuple[str, ...]
@@ -133,9 +154,15 @@ class _CompiledPolicy:
     entropy_thresh: float
     entropy_min_distinct: float
     min_u: tuple[int, ...]
+    w_table: tuple[tuple[float, ...], ...]
+    thresh_sq: tuple[float, ...]
+    fast: _FastScanPatterns
+    redacted_spaces: str
+    edge_bytes: bytes
     path_scan: bool
-    path_needle: re.Pattern[str] | None
+    path_prefilter: _PathPrefilter
     path_token: re.Pattern[str]
+    reusable_lower: bool
 
 
 @lru_cache(maxsize=32)
@@ -149,16 +176,22 @@ def _compile_policy(policy: FilterPolicy) -> _CompiledPolicy:
     candidate = re.compile(rf"[\x21-\x7e]{{{policy.entropy_min_length},}}")
     entropy_thresh = 2 ** -(policy.entropy_min_bits + 1e-12)
     entropy_min_distinct = 2 ** (policy.entropy_min_bits - 1e-12)
+    min_word = max(min_segment, math.ceil(entropy_min_distinct))
     min_u = _min_u_table(float(policy.entropy_min_bits))
+    w_table = _entropy_weights_table()
+    thresh_sq = tuple(entropy_thresh * (n * n) for n in range(257))
+    fast = _fast_patterns()
     needles = _path_needles(policy.blocked_path_patterns)
     path_scan = bool(policy.blocked_path_patterns)
-    path_needle = re.compile("|".join(map(re.escape, needles))) if needles else None
+    path_prefilter = _build_path_prefilter(needles)
+    reusable_lower = needles is None or not any(n in REDACTED for n in needles)
     dotted = needles is not None and all("." in needle or "_" in needle for needle in needles)
     path_token = _DOTTED_PATH_TOKEN if dotted else _PATH_TOKEN
     return _CompiledPolicy(
         sensitive=sensitive,
         paths=paths,
         min_segment=min_segment,
+        min_word=min_word,
         max_words=max_words,
         prefixes=prefixes,
         contained=contained,
@@ -166,9 +199,15 @@ def _compile_policy(policy: FilterPolicy) -> _CompiledPolicy:
         entropy_thresh=entropy_thresh,
         entropy_min_distinct=entropy_min_distinct,
         min_u=min_u,
+        w_table=w_table,
+        thresh_sq=thresh_sq,
+        fast=fast,
+        redacted_spaces=" " * len(REDACTED),
+        edge_bytes=_ENTROPY_EDGE.encode("ascii"),
         path_scan=path_scan,
-        path_needle=path_needle,
+        path_prefilter=path_prefilter,
         path_token=path_token,
+        reusable_lower=reusable_lower,
     )
 
 
@@ -180,10 +219,12 @@ class _Run(_TextScans):
         self._input_bytes = 0
         self._monotonic_ns = monotonic_ns
         self._deadline_ns = deadline_ns
+        self._has_deadline = deadline_ns is not None
         compiled = _compile_policy(policy)
         self._sensitive = compiled.sensitive
         self._paths = compiled.paths.fresh()
         self._min_segment = compiled.min_segment
+        self._min_word = compiled.min_word
         self._max_words = compiled.max_words
         self._prefixes = compiled.prefixes
         self._contained = compiled.contained
@@ -191,10 +232,20 @@ class _Run(_TextScans):
         self._entropy_thresh = compiled.entropy_thresh
         self._entropy_min_distinct = compiled.entropy_min_distinct
         self._min_u = compiled.min_u
+        self._w_table = compiled.w_table
+        self._thresh_sq = compiled.thresh_sq
+        self._fast = compiled.fast
+        self._redacted_spaces = compiled.redacted_spaces
+        self._edge_bytes = compiled.edge_bytes
         self._path_scan = compiled.path_scan
-        self._path_needle = compiled.path_needle
+        self._path_prefilter = compiled.path_prefilter
         self._path_token = compiled.path_token
+        self._reusable_lower = compiled.reusable_lower and _shipped_rules_active()
+        self._shipped_scans_ok = _fast_scans_active()
         self._redactions: dict[tuple[str, bool], tuple[str, int]] = {}
+        self._entropy_verdict_b: dict[bytes, bool] = {}
+        self._verdict_hits = 0
+        self._verdict_probes = 0
 
     def tick(self) -> None:
         if self._deadline_ns is not None and self._monotonic_ns() >= self._deadline_ns:
@@ -322,7 +373,7 @@ class _Run(_TextScans):
             raise _Reject
 
     def _check_text(self, text: str) -> None:
-        size = len(text.encode("utf-8"))
+        size = len(text) if text.isascii() else len(text.encode("utf-8"))
         if size > MAX_TEXT_BYTES:
             raise _Reject
         self._count(size)
@@ -333,8 +384,10 @@ class _Run(_TextScans):
         Exempt: a run that is (inside surrounding punctuation) a canonical UUID or ``sha256:<64 hex>``. The
         ``[redacted]`` sentinel is a run boundary, never part of a candidate.
         """
-        masked = text.replace(REDACTED, " " * len(REDACTED)) if REDACTED in text else text
         min_len = self._min_segment
+        if len(text) < min_len:
+            return text
+        masked = text.replace(REDACTED, self._redacted_spaces) if REDACTED in text else text
         min_bits = self.policy.entropy_min_bits
         thresh = self._entropy_thresh
         min_distinct = self._entropy_min_distinct
@@ -346,45 +399,90 @@ class _Run(_TextScans):
         redacted_sentinel = REDACTED
 
         if masked.isascii():
-            candidates = [word for word in masked.split() if len(word) >= min_len]
-            if not candidates:
-                return text
-            if all(word.isprintable() for word in candidates):
+            mb = masked.encode("ascii")
+            if not mb.translate(None, _PRINTABLE_AND_WS_BYTES):
+                min_word = self._min_word
+                candidates = [word for word in mb.split() if len(word) >= min_word]
+                if not candidates:
+                    return text
                 parts: list[str] = []
+                append = parts.append
                 cursor = 0
                 search_pos = 0
                 count = 0
-                find = masked.find
-                for token in candidates:
-                    total = len(token)
-                    idx = find(token, search_pos)
+                find = mb.find
+                edge_b = self._edge_bytes
+                w_table = self._w_table
+                thresh_sq = self._thresh_sq
+                p94_tr = _PRINTABLE_NON_WS_BYTES.translate
+                counts_b: dict[int, int] = {}
+                clear_counts = counts_b.clear
+                count_vals = counts_b.values
+                verdict_b = self._entropy_verdict_b
+                verdict_get = verdict_b.get
+                s_len = len
+                use_verdict = self._verdict_hits > 0 or self._verdict_probes < 4
+                for token_b in candidates:
+                    total = s_len(token_b)
+                    idx = find(token_b, search_pos)
                     search_pos = idx + total
-                    if total < min_distinct:
-                        continue
-                    if total >= 36:
-                        clean = token.strip(edge) if (token[0] in edge or token[-1] in edge) else token
-                        if is_structural(clean):
+                    if use_verdict:
+                        cached = verdict_get(token_b)
+                        if cached is not None:
+                            self._verdict_hits += 1
+                            if cached:
+                                append(text[cursor:idx])
+                                append(redacted_sentinel)
+                                cursor = search_pos
+                                count += 1
                             continue
-                    distinct = len(set(token))
+                        self._verdict_probes += 1
+                        if self._verdict_hits == 0 and self._verdict_probes >= 4:
+                            use_verdict = False
+                    if total >= 36 and (total == 36 or total == 71 or token_b[0] in edge_b or token_b[-1] in edge_b):
+                        clean_b = token_b.strip(edge_b)
+                        if s_len(clean_b) in (36, 71) and is_structural(clean_b.decode("ascii")):
+                            if use_verdict and s_len(verdict_b) < 512:
+                                verdict_b[token_b] = False
+                            continue
+                    distinct = 94 - s_len(p94_tr(None, token_b))
                     if distinct < min_distinct:
+                        if use_verdict and s_len(verdict_b) < 512:
+                            verdict_b[token_b] = False
                         continue
                     if total <= 256 and distinct >= min_u_table[total]:
-                        parts.extend((text[cursor:idx], redacted_sentinel))
+                        if use_verdict and s_len(verdict_b) < 512:
+                            verdict_b[token_b] = True
+                        append(text[cursor:idx])
+                        append(redacted_sentinel)
                         cursor = search_pos
                         count += 1
                         continue
-                    counts: dict[str, int] = {}
-                    count_elements(counts, token)
-                    if (
-                        sum([c * c for c in counts.values()]) < thresh * (total * total)
-                        or shannon_from_counts(counts, total) >= min_bits
-                    ):
-                        parts.extend((text[cursor:idx], redacted_sentinel))
+                    clear_counts()
+                    count_elements(counts_b, token_b)
+                    sq = 0
+                    for c in count_vals():
+                        sq += c * c
+                    if total <= 256:
+                        if sq < thresh_sq[total]:
+                            redact_token = True
+                        else:
+                            weights = w_table[total]
+                            redact_token = -sum([weights[c] for c in count_vals()]) >= min_bits
+                    elif sq < thresh * (total * total):
+                        redact_token = True
+                    else:
+                        redact_token = shannon_from_counts(counts_b, total) >= min_bits
+                    if use_verdict and s_len(verdict_b) < 512:
+                        verdict_b[token_b] = redact_token
+                    if redact_token:
+                        append(text[cursor:idx])
+                        append(redacted_sentinel)
                         cursor = search_pos
                         count += 1
                 if not count:
                     return text
-                parts.append(text[cursor:])
+                append(text[cursor:])
                 self.redacted += count
                 return "".join(parts)
 
@@ -484,6 +582,63 @@ def admissible_field_path(path: tuple[str | int, ...], policy: FilterPolicy) -> 
     return admissible
 
 
+_JSON_FALLBACK = object()
+
+
+def _exact_json_bytes(value: object, limit: int) -> int | object:
+    if value is None:
+        return 4
+    if type(value) is bool:
+        return 4 if value else 5
+    if type(value) is int:
+        return len(str(value))
+    if type(value) is str:
+        if value.isascii():
+            if value.isprintable():
+                return 2 + len(value) + value.count('"') + value.count("\\")
+            vb = value.encode("ascii")
+            if not vb.translate(None, _JSON_SAFE_NL_BYTES):
+                return 2 + len(vb) + vb.count(b'"') + vb.count(b"\\") + vb.count(b"\n")
+        return _JSON_FALLBACK
+    if type(value) is list:
+        n = len(value)
+        total = 2 + (n - 1 if n > 1 else 0)
+        for item in value:
+            size = _exact_json_bytes(item, limit)
+            if size is _JSON_FALLBACK:
+                return _JSON_FALLBACK
+            assert type(size) is int
+            total += size
+            if total > limit:
+                return limit + 1
+        return total
+    if type(value) is dict:
+        n = len(value)
+        total = 2 + (n - 1 if n > 1 else 0)
+        for key, item in value.items():
+            if type(key) is not str or not (key.isascii() and key.isprintable()):
+                return _JSON_FALLBACK
+            key_size = 2 + len(key) + key.count('"') + key.count("\\")
+            val_size = _exact_json_bytes(item, limit)
+            if val_size is _JSON_FALLBACK:
+                return _JSON_FALLBACK
+            assert type(val_size) is int
+            total += key_size + 1 + val_size
+            if total > limit:
+                return limit + 1
+        return total
+    return _JSON_FALLBACK
+
+
+def _json_bytes_within_cap(value: JsonValue, limit: int) -> bool:
+    """Exact UTF-8 ``canonical_json`` byte cap check without allocating a full 1 MiB JSON buffer on ASCII trees."""
+    size = _exact_json_bytes(value, limit)
+    if size is _JSON_FALLBACK:
+        return len(canonical_json(value)) <= limit
+    assert type(size) is int
+    return size <= limit
+
+
 class PrivacyFilter:
     """Stateless filter; ``monotonic_ns`` is injectable so the shared local budget can be tested exactly.
 
@@ -510,7 +665,7 @@ class PrivacyFilter:
         cleaned: JsonValue = None
         try:
             cleaned = project_manual_submission(run.value(value, 1), policy)
-            if len(canonical_json(cleaned)) > MAX_TOTAL_BYTES:
+            if not _json_bytes_within_cap(cleaned, MAX_TOTAL_BYTES):
                 outcome = ErrorCode.INVALID_INPUT
             run.tick()  # fail closed: no SafePayload is returned once now >= deadline_ns
         except _Deadline:

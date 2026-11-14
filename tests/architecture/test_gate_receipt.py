@@ -1435,8 +1435,33 @@ def test_shard_file_partition_is_complete_disjoint_and_deterministic(shards: int
     assert set(selected) == files and len(selected) == len(files)
 
 
-def test_gate_defaults_to_at_most_four_shards() -> None:
-    assert getattr(gate, "PYTEST_SHARDS", None) == min(4, os.cpu_count() or 1)
+@pytest.mark.parametrize(
+    ("platform_name", "cpu_count", "expected"),
+    [
+        ("win32", 1, 2),
+        ("win32", 2, 4),
+        ("win32", 4, 8),
+        ("win32", 16, 8),
+        ("win32", None, 2),
+        ("win32", 0, 2),
+        ("linux", 1, 1),
+        ("linux", 4, 4),
+        ("linux", 8, 4),
+        ("darwin", 3, 3),
+        ("darwin", 8, 4),
+    ],
+)
+def test_gate_defaults_to_expected_platform_shard_cap(
+    platform_name: str, cpu_count: int | None, expected: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    default_shards = getattr(gate, "default_pytest_shards", None)
+    assert callable(default_shards), "scripts.gate must define default_pytest_shards"
+    assert getattr(gate, "PYTEST_SHARDS", None) == default_shards(sys.platform)
+    if cpu_count is not None:
+        assert default_shards(platform_name, cpu_count) == expected
+    monkeypatch.setattr(os, "cpu_count", lambda: cpu_count)
+    assert default_shards(platform_name, cpu_count) == expected
+    assert default_shards(platform_name) == expected
 
 
 def _junit_for_shard(ids: Sequence[str]) -> bytes:
@@ -1801,15 +1826,20 @@ def test_shard_files_colocates_wheel_fixture_files_into_shard_zero() -> None:
         "tests/storage/test_backup.py",
         "tests/storage/test_kernel_revocation.py",
         "tests/storage/test_restore.py",
+        "tests/storage/test_retention.py",
+        "tests/storage/test_cas.py",
+        "tests/storage/test_runtime.py",
         "tests/core/test_canonical.py",
         "tests/core/test_faults.py",
     ]
     inventory = [f"{path}::test_case_{idx}" for path in (*expected_wheel_files, *non_wheel_files) for idx in range(3)]
-    for shards in (2, 4):
+    for shards in (2, 4, 8):
         groups = gate.shard_files(inventory, shards)
         assert len(groups) == shards
         assert all(groups)
-        assert set(expected_wheel_files).issubset(set(groups[0])), groups
+        assert set(groups[0]) == set(expected_wheel_files), (
+            f"shard 0 must be dedicated exclusively to wheel fixture files when size > 1: {groups[0]}"
+        )
         for other_shard in groups[1:]:
             assert not (set(expected_wheel_files) & set(other_shard)), groups
 
@@ -1879,3 +1909,21 @@ def test_gate_wheel_fixture_files_and_weights_stay_aligned_with_tests() -> None:
     assert isinstance(heavy_cfg, dict) and heavy_cfg, "scripts.gate must define _HEAVY_FILE_COST_MS"
     for rel_path in configured | set(heavy_cfg):
         assert (repo_root / rel_path).is_file(), f"stale gate shard config entry: {rel_path}"
+
+    # Verify full-repository 8-shard plan isolates wheel suites on Shard 0 and balances heavy non-wheel files.
+    all_inventory = [
+        f"{path.relative_to(repo_root).as_posix()}::test_case" for path in sorted(tests_root.rglob("test_*.py"))
+    ]
+    eight_groups = gate.shard_files(all_inventory, 8)
+    assert len(eight_groups) == 8
+    assert set(eight_groups[0]) == configured, eight_groups[0]
+    top_five_non_wheel = {
+        "tests/storage/test_kernel_revocation.py",
+        "tests/integration/test_kernel_daemon.py",
+        "tests/storage/test_backup.py",
+        "tests/storage/test_restore.py",
+        "tests/storage/test_remediation_i2_t3_lineage.py",
+    }
+    for worker_group in eight_groups[1:]:
+        assert len(set(worker_group) & top_five_non_wheel) <= 1, f"top-5 heavy files stacked: {worker_group}"
+    assert gate.shard_files(ALL_SHARD_IDS, 2) == [["t/test_a.py"], ["t/test_b.py"]]

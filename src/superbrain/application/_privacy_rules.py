@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import dataclasses
 import fnmatch
 import hashlib
 import re
 import unicodedata
+from collections.abc import Sequence
 from functools import lru_cache
 
 from superbrain.core.kernel import (
@@ -24,6 +26,11 @@ MAX_TOTAL_BYTES = 1024 * 1024
 _NODE_OVERHEAD = 2
 _MAX_INT = 2**63
 STATUS_FIELDS: frozenset[str] = frozenset({"schema_version", "status", "outcome", "state"})
+# Exact ASCII printable + split-whitespace bytes (excludes \x1c-\x1f where bytes.split and str.split differ).
+_PRINTABLE_AND_WS_BYTES = bytes(range(0x20, 0x7F)) + b"\t\n\r\x0b\x0c"
+_PRINTABLE_NON_WS_BYTES = bytes(range(0x21, 0x7F))
+_JSON_SAFE_NL_BYTES = bytes(range(0x20, 0x7F)) + b"\n"
+_KV_WORDS = ("token", "passw", "pwd", "passphrase", "secret", "key")
 
 _UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 _STATUS_VALUE_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
@@ -155,14 +162,95 @@ def _path_needles(patterns: tuple[str, ...]) -> tuple[str, ...] | None:
         if not best:
             return None
         needles.add(best)
-    return tuple(sorted(needles))
+    raw = sorted(needles)
+    kept = [needle for needle in raw if not any(other != needle and other in needle for other in raw)]
+    return tuple(kept)
+
+
+def _trie_regex(strings: Sequence[str]) -> str:
+    """Compile sorted non-empty literal suffixes into a prefix-factored regex alternation."""
+    buckets: dict[str, list[str]] = {}
+    for item in strings:
+        buckets.setdefault(item[0], []).append(item)
+    parts: list[str] = []
+    for ch, items in buckets.items():
+        if len(items) == 1:
+            parts.append(re.escape(items[0]))
+            continue
+        tails = [item[1:] for item in items]
+        if "" in tails:
+            parts.append(re.escape(ch))
+            continue
+        parts.append(f"{re.escape(ch)}(?:{_trie_regex(tails)})")
+    return "|".join(parts)
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _PathPrefilter:
+    """Linear prefilter equivalent to ``any(n in lowered for n in needles)`` (or open when ``open_all``)."""
+
+    open_all: bool
+    dot_re: re.Pattern[str] | None
+    groups: tuple[tuple[str, tuple[str, ...]], ...]
+    singles: tuple[str, ...]
+
+    def matches(self, lowered: str) -> bool:
+        if self.open_all:
+            return True
+        for needle in self.singles:
+            if needle in lowered:
+                return True
+        for prefix, group in self.groups:
+            if prefix in lowered:
+                for needle in group:
+                    if needle in lowered:
+                        return True
+        return self.dot_re is not None and "." in lowered and self.dot_re.search(lowered) is not None
+
+
+@lru_cache(maxsize=32)
+def _build_path_prefilter(needles: tuple[str, ...] | None) -> _PathPrefilter:
+    """Group path needles into singleton literals, 3-char prefix buckets, and a factored dot regex."""
+    if needles is None:
+        return _PathPrefilter(open_all=True, dot_re=None, groups=(), singles=())
+    dot_tails: list[str] = []
+    other: list[str] = []
+    for needle in needles:
+        if len(needle) > 1 and needle[0] == ".":
+            dot_tails.append(needle[1:])
+        else:
+            other.append(needle)
+    dot_re: re.Pattern[str] | None = None
+    if len(dot_tails) >= 2:
+        dot_re = re.compile(rf"\.(?:{_trie_regex(dot_tails)})")
+    elif dot_tails:
+        other.append("." + dot_tails[0])
+    prefix_buckets: dict[str, list[str]] = {}
+    singles: list[str] = []
+    for needle in other:
+        if len(needle) >= 3:
+            prefix_buckets.setdefault(needle[:3], []).append(needle)
+        else:
+            singles.append(needle)
+    groups: list[tuple[str, tuple[str, ...]]] = []
+    for prefix, items in prefix_buckets.items():
+        if len(items) >= 2:
+            groups.append((prefix, tuple(items)))
+        elif len(items[0]) >= 5 and items[0][0] == "_":
+            # Guard rare leading-underscore filenames (e.g. ``_netrc``) by their rarer tail first.
+            groups.append((items[0][1:], (items[0],)))
+        else:
+            singles.append(items[0])
+    return _PathPrefilter(open_all=False, dot_re=dot_re, groups=tuple(groups), singles=tuple(singles))
 
 
 # Gates for the shipped rules, each pinned to the exact rule text (flags + pattern) it was checked against. An edited
 # or added rule has no entry and always runs, so a gate can never be stale; no regex is parsed to build one.
 # (needles one of which every match holds, "<last char><separator>" pairs or None, compare case-folded)
 _RuleGate = tuple[tuple[str, ...], tuple[str, ...] | None, bool]
-_KV_PAIRS = ("d=", "d:", "e=", "e:", "n=", "n:", "t=", "t:", "y=", "y:", " =", " :", "\t=", "\t:")
+_KV_EQ_PAIRS = ("d=", "e=", "n=", "t=", "y=", " =", "\t=")
+_KV_COLON_PAIRS = ("d:", "e:", "n:", "t:", "y:", " :", "\t:")
+_KV_PAIRS = (*_KV_EQ_PAIRS, *_KV_COLON_PAIRS)
 _RULE_GATES: dict[str, _RuleGate] = {
     "a640d3fcd03f3622": (("authorization", "proxy-authorization"), None, True),  # _AUTH_HEADER
     "2b74d6348b7f85b8": (("bearer", "basic", "token"), None, True),  # _AUTH_SCHEME
@@ -177,6 +265,7 @@ _RULE_GATES: dict[str, _RuleGate] = {
 }  # the third entry is _KEY_VALUE_SECRET
 
 
+@lru_cache(maxsize=64)
 def _rule_text_digest(pattern: re.Pattern[str]) -> str:
     return hashlib.sha256(f"{pattern.flags}\0{pattern.pattern}".encode()).hexdigest()[:16]
 
@@ -185,6 +274,93 @@ def _rule_text_digest(pattern: re.Pattern[str]) -> str:
 def _rule_gate(pattern: re.Pattern[str]) -> _RuleGate | None:
     """The gate checked for exactly this rule text, or ``None``: the rule always runs."""
     return _RULE_GATES.get(_rule_text_digest(pattern))
+
+
+def _shipped_rules_intact(
+    auth_header: re.Pattern[str],
+    auth_scheme: re.Pattern[str],
+    fixed_tokens: tuple[re.Pattern[str], ...],
+    key_value: re.Pattern[str],
+) -> bool:
+    """True only when every rule passed matches a shipped gate pinned in ``_RULE_GATES``."""
+    return (
+        _rule_gate(auth_header) is not None
+        and _rule_gate(auth_scheme) is not None
+        and _rule_gate(key_value) is not None
+        and all(_rule_gate(pattern) is not None for pattern in fixed_tokens)
+    )
+
+
+_FIXED_TOKEN_DIGESTS: tuple[str, ...] = (
+    "b28cd107992a4ba1",
+    "092ac9a36b30cd8f",
+    "86297f39e32a8e45",
+    "4aed425b63d1fcb7",
+    "4f2fc09f0b773dcb",
+    "fb1e448c567540e2",
+    "a05f078b9a278638",
+)
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _FastScanPatterns:
+    """Prefilter and fast-path helper patterns bound inside an ``lru_cache``, keeping module globals untouched."""
+
+    priv_lower: re.Pattern[str]
+    ui_neg: re.Pattern[str]
+    ui_repl: str
+    b_auth: re.Pattern[str]
+    gh_both: re.Pattern[str]
+    gh: re.Pattern[str]
+    sk: re.Pattern[str]
+    xox: re.Pattern[str]
+    eyj: re.Pattern[str]
+
+
+@lru_cache(maxsize=1)
+def _fast_patterns() -> _FastScanPatterns:
+    """Compile and cache non-rule helper/prefilter regexes once without adding module ``re.Pattern`` globals."""
+    return _FastScanPatterns(
+        priv_lower=re.compile(r"<private>[^<]*</private>"),
+        ui_neg=re.compile(r"://[^/?#\s@]+@(?![^\s@]*@)"),
+        ui_repl=f"://{REDACTED}@",
+        b_auth=re.compile(r"b(?:earer|asic)"),
+        gh_both=re.compile(r"g(?:ithub_pat_|h[pousr]_)"),
+        gh=re.compile(r"gh[pousr]_"),
+        sk=re.compile(r"sk-[A-Za-z0-9_-]{16,}"),
+        xox=re.compile(r"xox[baprs]-"),
+        eyj=re.compile(r"eyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}"),
+    )
+
+
+def _fast_scans_intact(
+    auth_header: re.Pattern[str],
+    auth_scheme: re.Pattern[str],
+    fixed_tokens: tuple[re.Pattern[str], ...],
+    key_value: re.Pattern[str],
+    priv_mark: re.Pattern[str],
+    priv_block: re.Pattern[str],
+    authority: re.Pattern[str],
+    segment: re.Pattern[str],
+    cred_user: re.Pattern[str],
+) -> bool:
+    """True only when every shipped rule and scan helper matches its exact unmodified pattern and order."""
+    return (
+        auth_header is _AUTH_HEADER
+        and auth_scheme is _AUTH_SCHEME
+        and fixed_tokens == _FIXED_TOKENS
+        and key_value is _KEY_VALUE_SECRET
+        and _rule_text_digest(auth_header) == "a640d3fcd03f3622"
+        and _rule_text_digest(auth_scheme) == "2b74d6348b7f85b8"
+        and _rule_text_digest(key_value) == "800fedecfd83067a"
+        and len(fixed_tokens) == 7
+        and tuple(_rule_text_digest(pattern) for pattern in fixed_tokens) == _FIXED_TOKEN_DIGESTS
+        and _rule_text_digest(priv_mark) == "5e39f4b39086bff6"
+        and _rule_text_digest(priv_block) == "04d7c49d316c286e"
+        and _rule_text_digest(authority) == "e8c71458b8472664"
+        and _rule_text_digest(segment) == "bbd92f285662d9bb"
+        and _rule_text_digest(cred_user) == "838390bd43b0bdde"
+    )
 
 
 def _gate_open(pattern: re.Pattern[str], text: str, lowered: str | None) -> bool:
@@ -201,8 +377,28 @@ def _gate_open(pattern: re.Pattern[str], text: str, lowered: str | None) -> bool
         if lowered is None:
             return True
         text = lowered
-    if pairs is not None and "=" not in text and ":" not in text:
-        return False
+    if pairs is _KV_PAIRS:
+        has_pair = False
+        if "=" in text:
+            for pair in _KV_EQ_PAIRS:
+                if pair in text:
+                    has_pair = True
+                    break
+        if not has_pair and ":" in text:
+            for pair in _KV_COLON_PAIRS:
+                if pair in text:
+                    has_pair = True
+                    break
+        if not has_pair:
+            return False
+    elif pairs is not None:
+        if "=" not in text and ":" not in text:
+            return False
+        for pair in pairs:
+            if pair in text:
+                break
+        else:
+            return False
     if len(needles) == 5:
         first = needles[0]
         if first == "ghp_" and "gh" not in text:
@@ -211,13 +407,6 @@ def _gate_open(pattern: re.Pattern[str], text: str, lowered: str | None) -> bool
             return False
     for needle in needles:
         if needle in text:
-            break
-    else:
-        return False
-    if pairs is None:
-        return True
-    for pair in pairs:
-        if pair in text:
             return True
     return False
 

@@ -20,6 +20,7 @@ import subprocess
 import threading
 import time
 from collections.abc import Callable, Iterator
+from concurrent.futures import Future
 from pathlib import Path
 from typing import Any
 
@@ -70,16 +71,20 @@ def _next_tick() -> None:
 
 
 def _conn_state() -> dict[str, Any]:
+    seq_src = getattr(owner, "_ORDER_SEQ", None)
     return {
         "lock": threading.Lock(),
         "conn_started_ns": time.monotonic_ns(),
+        "conn_started_seq": next(seq_src) if seq_src is not None else None,
         "closed_event": threading.Event(),
         "worker_entered_event": threading.Event(),
         "closing": False,
         "closing_ns": None,
+        "closing_seq": None,
         "closing_at": None,
         "closed_at": None,
         "closed_ns": None,
+        "closed_seq": None,
         "raw_sock": None,
         "ssl_sock": None,
     }
@@ -415,3 +420,157 @@ def test_windows_tcp_table_close_before_lookup_or_zero_pid_is_rejected(
     with _safe_identity_hooks(monkeypatch, platform="win32") as (safe, mark_closing):
         holder_holder["mark"] = mark_closing
         assert safe(CLIENT_PORT, LISTEN_PORT, conn) == (None, None, None, None)
+
+
+def test_equal_monotonic_tick_sighting_before_closing_stays_bound(
+    hooks: tuple[Any, Any, _ScanLibproc], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    safe, mark_closing, fake = hooks
+    frozen_ns = 9_876_543_210
+    monkeypatch.setattr(time, "monotonic_ns", lambda: frozen_ns)
+    conn = _conn_state()
+
+    fake.on_pid[OTHER] = lambda: mark_closing(conn)
+    pid, _started, observed_at, observed_ns = safe(CLIENT_PORT, LISTEN_PORT, conn)
+
+    assert pid == HOLDER, "live sighting before closing on the same monotonic tick must remain bound"
+    assert conn["closing"] and conn["closing_ns"] == frozen_ns
+    assert observed_ns == frozen_ns
+    assert observed_at is not None and observed_at <= conn["closing_at"]
+
+
+def test_equal_monotonic_tick_closing_before_sighting_is_rejected(
+    hooks: tuple[Any, Any, _ScanLibproc], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    safe, mark_closing, fake = hooks
+    frozen_ns = 9_876_543_210
+    monkeypatch.setattr(time, "monotonic_ns", lambda: frozen_ns)
+    conn = _conn_state()
+
+    fake.on_listing = lambda: mark_closing(conn)
+    assert safe(CLIENT_PORT, LISTEN_PORT, conn) == (None, None, None, None)
+    assert conn["closing"] and conn["closing_ns"] == frozen_ns
+
+
+def test_equal_monotonic_tick_sighting_before_conn_started_is_rejected(
+    hooks: tuple[Any, Any, _ScanLibproc], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    safe, _mark_closing, fake = hooks
+    frozen_ns = 9_876_543_210
+    monkeypatch.setattr(time, "monotonic_ns", lambda: frozen_ns)
+    conn = _conn_state()
+
+    def advance_conn_start_after_sighting() -> None:
+        seq_src = getattr(owner, "_ORDER_SEQ", None)
+        with conn["lock"]:
+            conn["conn_started_ns"] = frozen_ns
+            conn["conn_started_seq"] = next(seq_src) if seq_src is not None else 999_999_999
+
+    fake.on_pid[OTHER] = advance_conn_start_after_sighting
+    assert safe(CLIENT_PORT, LISTEN_PORT, conn) == (None, None, None, None)
+
+
+def test_legacy_conn_state_without_seq_keys_works_without_keyerror(
+    hooks: tuple[Any, Any, _ScanLibproc], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    safe, mark_closing, fake = hooks
+    conn_live = _conn_state()
+    for key in ("conn_started_seq", "closing_seq", "closed_seq"):
+        conn_live.pop(key, None)
+    assert safe(CLIENT_PORT, LISTEN_PORT, conn_live)[0] == HOLDER
+
+    conn_closing = _conn_state()
+    for key in ("conn_started_seq", "closing_seq", "closed_seq"):
+        conn_closing.pop(key, None)
+
+    def close_before_sighting() -> None:
+        mark_closing(conn_closing)
+        _next_tick()
+
+    monkeypatch.setattr(fake, "on_listing", close_before_sighting)
+    assert safe(CLIENT_PORT, LISTEN_PORT, conn_closing) == (None, None, None, None)
+
+
+def test_finalize_resolves_equal_monotonic_tick_by_sequence(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(owner, "sys", type("FakeSys", (), {"platform": "darwin"})())
+    monkeypatch.setattr(owner, "process_started_at_for_pid", lambda pid: "2026-11-14T00:00:00.000000Z")
+    fake = _ScanLibproc({HOLDER: [(5, TCP)], OTHER: []})
+    monkeypatch.setattr(ctypes, "CDLL", lambda *_a, **_k: fake)
+    frozen_ns = 9_876_543_210
+    monkeypatch.setattr(time, "monotonic_ns", lambda: frozen_ns)
+
+    eq: queue.Queue[dict[str, Any]] = queue.Queue()
+    state = owner._install_loopback_server_hooks(
+        eq=eq, daemon_pid=os.getpid(), daemon_started_at="2026-11-14T00:00:00.000000Z"
+    )
+    try:
+        tap = _loopback_server.LoopbackServer._conn_worker
+        safe = _closure_fn(_closure_fn(tap, "_submit_lookup"), "_safe_client_identity")
+        mark_closing = _closure_fn(tap, "_mark_conn_closing")
+        schedule_emit = _closure_fn(tap, "_schedule_emit")
+        gate = type("DummyGate", (), {"identity": None})()
+        seq_src = getattr(owner, "_ORDER_SEQ", None)
+
+        def emit_case(
+            conn: dict[str, Any], res: tuple[int | None, str | None, str | None, int | None]
+        ) -> dict[str, Any]:
+            fut: Future[tuple[int | None, str | None, str | None, int | None]] = Future()
+            fut.set_result(res)
+            conn["closed_event"].set()
+            schedule_emit(
+                gate=gate,
+                connection_id="conn-seq",
+                conn_started_at="2026-11-14T00:00:00.000000Z",
+                lookup_fut=fut,
+                conn_state=conn,
+                principal_id="p1",
+                credential_id="c1",
+                tool_name="read",
+                ready_val=True,
+                auth_matched=True,
+                response_flushed_ok=True,
+                resp_digest="sha256:0",
+                listen_host="127.0.0.1",
+                listen_port=LISTEN_PORT,
+                peer_host="127.0.0.1",
+                peer_port=CLIENT_PORT,
+                req_started_at="2026-11-14T00:00:00.000000Z",
+                ended_at="2026-11-14T23:59:59.000000Z",
+                selected_scope=None,
+            )
+            return eq.get_nowait()
+
+        # In-order equal-tick lifecycle passes finalize.
+        conn_ok = _conn_state()
+        res_ok = safe(CLIENT_PORT, LISTEN_PORT, conn_ok)
+        assert res_ok[0] == HOLDER
+        mark_closing(conn_ok)
+        conn_ok["closed_ns"] = frozen_ns
+        conn_ok["closed_seq"] = next(seq_src) if seq_src is not None else None
+        conn_ok["closed_at"] = "2026-11-14T23:59:59.000000Z"
+        assert emit_case(conn_ok, res_ok)["observation_status"] == "ok"
+
+        # Equal-tick closed_seq before closing_seq fails finalize.
+        conn_oob = _conn_state()
+        res_oob = safe(CLIENT_PORT, LISTEN_PORT, conn_oob)
+        assert res_oob[0] == HOLDER
+        early_closed_seq = next(seq_src) if seq_src is not None else 1
+        mark_closing(conn_oob)
+        conn_oob["closed_ns"] = frozen_ns
+        conn_oob["closed_seq"] = early_closed_seq
+        conn_oob["closed_at"] = "2026-11-14T23:59:59.000000Z"
+        ev_oob = emit_case(conn_oob, res_oob)
+        assert ev_oob["observation_status"] == "observation_incomplete"
+        assert ev_oob["client_pid"] is None
+
+        # Legacy conn_state without *_seq keys still passes finalize cleanly.
+        conn_legacy = _conn_state()
+        res_legacy = safe(CLIENT_PORT, LISTEN_PORT, conn_legacy)
+        mark_closing(conn_legacy)
+        conn_legacy["closed_ns"] = frozen_ns
+        conn_legacy["closed_at"] = "2026-11-14T23:59:59.000000Z"
+        for key in ("conn_started_seq", "observed_seq", "closing_seq", "closed_seq"):
+            conn_legacy.pop(key, None)
+        assert emit_case(conn_legacy, res_legacy)["observation_status"] == "ok"
+    finally:
+        state["uninstall"]()
