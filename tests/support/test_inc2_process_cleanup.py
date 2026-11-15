@@ -3,15 +3,21 @@
 from __future__ import annotations
 
 import json
+import socket
+import ssl
 import subprocess
 import sys
 import threading
+from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
+from superbrain.adapters.os import os_adapters
+from superbrain.core.kernel import ENDPOINT_VERSION, Endpoint
 from tests.support import inc2_child, inc2_cli
+from tests.support.inc2_fixture import SampleTlsMaterial
 
 _PYTHON = str(getattr(sys, "_base_executable", sys.executable))
 
@@ -204,3 +210,95 @@ def test_win32_second_pump_start_failure_rolls_back_child(monkeypatch: pytest.Mo
                     pipe.close()
         for job in jobs:
             job.close()
+
+
+def test_installed_serve_process_wait_ready_requires_tls_handshake_acceptance(
+    trusted_tmp: Path,
+    inc2_tls_material: SampleTlsMaterial,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """wait_ready must not return as soon as endpoint.json exists if the TLS listener is not accepting."""
+    ep_path = trusted_tmp / "endpoint.json"
+    probe_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe_sock.bind(("127.0.0.1", 0))
+    closed_port = int(probe_sock.getsockname()[1])
+    probe_sock.close()
+
+    ep = Endpoint(
+        version=ENDPOINT_VERSION,
+        host="127.0.0.1",
+        port=closed_port,
+        store_id="store-wait-ready-probe",
+        writer_epoch=1,
+        instance_id="inst-wait-ready-probe",
+    )
+    ep_path.write_bytes(ep.encode_canonical())
+    adapters = os_adapters()
+    adapters.permissions.secure_file(ep_path)
+
+    fake_proc = SimpleNamespace(poll=lambda: None)
+    dummy = object.__new__(inc2_cli.InstalledServeProcess)
+    dummy._proc = cast(subprocess.Popen[Any], fake_proc)
+    dummy._endpoint_path = ep_path
+    dummy._descendant_identities = []
+    dummy._proc_ticks = None
+    dummy._job = None
+    dummy._job_handle = None
+    dummy.cleanup_unverified = False
+
+    # 1. With endpoint.json published on a non-accepting port, wait_ready must NOT return early.
+    with pytest.raises(AssertionError, match="TLS"):
+        inc2_cli.InstalledServeProcess.wait_ready(dummy, timeout=0.2)
+
+    # 2. Once a real TLS listener binds and accepts, wait_ready returns the verified Endpoint.
+    server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    server_ctx.load_cert_chain(
+        certfile=str(inc2_tls_material.leaf_cert_path),
+        keyfile=str(inc2_tls_material.leaf_key_path),
+    )
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(4)
+    listener.settimeout(0.2)
+    live_port = int(listener.getsockname()[1])
+    live_ep = Endpoint(
+        version=ENDPOINT_VERSION,
+        host="127.0.0.1",
+        port=live_port,
+        store_id="store-wait-ready-probe",
+        writer_epoch=1,
+        instance_id="inst-wait-ready-probe",
+    )
+    ep_path.write_bytes(live_ep.encode_canonical())
+    adapters.permissions.secure_file(ep_path)
+
+    stop_accept = threading.Event()
+    accept_errors: list[BaseException] = []
+
+    def _accept_once() -> None:
+        while not stop_accept.is_set():
+            try:
+                conn, _ = listener.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                return
+            try:
+                with server_ctx.wrap_socket(conn, server_side=True):
+                    return
+            except OSError as err:
+                accept_errors.append(err)
+                return
+
+    thread = threading.Thread(target=_accept_once, daemon=True)
+    thread.start()
+    monkeypatch.setattr(dummy, "snapshot_descendant_pids", lambda: ())
+    try:
+        returned = inc2_cli.InstalledServeProcess.wait_ready(dummy, timeout=2.0)
+        assert returned == live_ep
+        assert accept_errors == []
+    finally:
+        stop_accept.set()
+        listener.close()
+        thread.join(timeout=2.0)

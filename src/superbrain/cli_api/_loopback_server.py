@@ -36,7 +36,7 @@ from superbrain.core.kernel import (
 from superbrain.core.wire import encode_envelope, make_error_envelope
 
 MAX_ACTIVE_CONNECTIONS = 32
-SERVER_HANDSHAKE_BUDGET_NS = 1_000_000_000
+SERVER_HANDSHAKE_BUDGET_NS = 2_000_000_000
 _ACCEPT_POLL_S = 0.005
 _REPLY_WAIT_SLICE_S = 0.005
 _JOIN_WAIT_SLICE_S = 0.001

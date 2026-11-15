@@ -269,7 +269,7 @@ def parse_collected(text: str) -> list[str]:
     return ids
 
 
-_WHEEL_SETUP_COST_MS = 8_000
+_WHEEL_SETUP_COST_MS = 24_000
 _DEFAULT_CASE_COST_MS = 20
 _WHEEL_FIXTURE_FILES: frozenset[str] = frozenset(
     {
@@ -283,8 +283,8 @@ _WHEEL_FIXTURE_FILES: frozenset[str] = frozenset(
         "tests/integration/test_t9_benchmark_scratch.py",
     }
 )
-# Calibrated Windows CI file costs (win314 43574161358 4-shard JUnit minus 13s shared wheel setup where applicable,
-# plus win311 43615432733 weights for newly added suites).
+# Calibrated Windows CI file costs (win311 43625045535 + win314 43574161358 baseline weights, keeping
+# top_three_non_wheel separated while balancing LPT buckets and isolating 24s wheel setup onto Shard 0).
 _HEAVY_FILE_COST_MS: dict[str, int] = {
     "tests/storage/test_backup.py": 55_078,
     "tests/storage/test_kernel_revocation.py": 48_986,
@@ -294,32 +294,32 @@ _HEAVY_FILE_COST_MS: dict[str, int] = {
     "tests/storage/test_remediation_i2_t3_lineage.py": 36_470,
     "tests/storage/test_crash_matrix.py": 31_836,
     "tests/storage/test_kernel_workspaces.py": 28_218,
+    "tests/storage/test_kernel_migration.py": 25_830,
     "tests/application/test_t8_review_p01_r2_edge_globs.py": 25_748,
+    "tests/storage/test_remediation_i2_t5.py": 25_690,
     "tests/storage/test_kernel_idempotency.py": 24_876,
+    "tests/storage/test_policy_store.py": 24_750,
+    "tests/storage/test_runtime.py": 23_170,
+    "tests/storage/test_remediation_i2_os01.py": 22_650,
+    "tests/integration/test_kernel_cli.py": 22_280,
+    "tests/storage/test_cas.py": 22_270,
+    "tests/storage/test_ledger.py": 21_750,
     "tests/integration/test_kernel_native_receipt_contract.py": 21_472,
+    "tests/application/test_kernel_deadlines.py": 20_820,
     "tests/application/test_t8_review_p01_wrapped_paths.py": 20_309,
-    "tests/storage/test_runtime.py": 18_623,
+    "tests/storage/test_migrate.py": 20_060,
     "tests/storage/test_kernel_identity.py": 18_365,
     "tests/application/test_kernel_send_attempts.py": 16_338,
     "tests/storage/test_remediation_i2_t4a.py": 13_941,
-    "tests/storage/test_ledger.py": 12_257,
     "tests/architecture/test_gate_receipt.py": 11_642,
     "tests/storage/test_remediation_c04_r8_backup_files.py": 11_591,
-    "tests/application/test_kernel_deadlines.py": 11_539,
     "tests/integration/test_kernel_receipts.py": 11_186,
-    "tests/storage/test_policy_store.py": 10_921,
-    "tests/storage/test_remediation_i2_t5.py": 10_726,
-    "tests/storage/test_migrate.py": 10_546,
-    "tests/storage/test_remediation_i2_os01.py": 10_457,
     "tests/storage/test_reconcile.py": 10_305,
     "tests/integration/test_kernel_shim.py": 10_229,
     "tests/storage/test_kernel_jobs.py": 9_984,
-    "tests/storage/test_cas.py": 9_899,
-    "tests/storage/test_kernel_migration.py": 9_209,
     "tests/storage/test_remediation_c02_r6_restore_marker.py": 9_044,
     "tests/storage/test_remediation_c04_r9_imported_backup_ancestors.py": 8_409,
     "tests/integration/test_kernel_transport.py": 8_366,
-    "tests/integration/test_kernel_cli.py": 7_882,
     "tests/application/test_t8_closure_privacy_r2.py": 7_793,
     "tests/storage/test_errors.py": 7_538,
     "tests/application/test_remediation_i2_t4bc.py": 7_331,
@@ -369,6 +369,25 @@ def _estimated_file_cost_ms(file: str, count: int) -> int:
     return count * _DEFAULT_CASE_COST_MS
 
 
+def _is_storage_file(path: str) -> bool:
+    return path.replace("\\", "/").startswith("tests/storage/")
+
+
+def _order_bucket_for_io_stagger(shard_idx: int, group: list[str]) -> list[str]:
+    """Order files within a shard to stagger heavy SQLite/fsync storage suites across shards."""
+    if shard_idx == 0:
+        wheel = sorted(f for f in group if f.replace("\\", "/") in _WHEEL_FIXTURE_FILES)
+        non_wheel = [f for f in group if f.replace("\\", "/") not in _WHEEL_FIXTURE_FILES]
+        non_storage = [f for f in non_wheel if not _is_storage_file(f)]
+        storage = [f for f in non_wheel if _is_storage_file(f)]
+        return [*wheel, *non_storage, *storage]
+    storage = [f for f in group if _is_storage_file(f)]
+    non_storage = [f for f in group if not _is_storage_file(f)]
+    if shard_idx == 1:
+        return [*storage, *non_storage]
+    return [*non_storage, *storage]
+
+
 def shard_files(collected_ids: Sequence[str], shards: int) -> list[list[str]]:
     """Group whole test files by estimated millisecond cost, isolating session wheel setup onto shard 0."""
     counts = Counter(node.split("::", 1)[0] for node in collected_ids)
@@ -395,6 +414,8 @@ def shard_files(collected_ids: Sequence[str], shards: int) -> list[list[str]]:
         index = min(range(size), key=lambda idx: (loads[idx], idx))
         groups[index].append(file)
         loads[index] += cost
+    if size > 1:
+        return [_order_bucket_for_io_stagger(idx, group) for idx, group in enumerate(groups) if group]
     return [group for group in groups if group]
 
 

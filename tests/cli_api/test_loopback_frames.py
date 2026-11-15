@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import datetime as dt
 import random
 import socket
 import ssl
@@ -10,10 +11,11 @@ import threading
 import time
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
+from superbrain.application.owner_loop import OwnerLoop, OwnerSession
 from superbrain.cli_api._http_frames import (
     MAX_BODY_BYTES,
     MAX_HEADER_BLOCK_BYTES,
@@ -25,6 +27,7 @@ from superbrain.cli_api._http_frames import (
     ResponseHead,
     write_all,
 )
+from superbrain.cli_api._loopback_server import SERVER_HANDSHAKE_BUDGET_NS, LoopbackServer
 from superbrain.cli_api._loopback_wire import (
     HEADER_INSTANCE_ID,
     HEADER_STORE_ID,
@@ -38,10 +41,22 @@ from superbrain.cli_api._loopback_wire import (
     encode_call,
     encode_identity_response,
 )
+from superbrain.cli_api.loopback import CLIENT_CONNECT_BUDGET_NS
+from superbrain.composition._endpoint import build_server_ssl_context
 from superbrain.core._wire_catalog import EXPECTED_TOOL_ORDER
 from superbrain.core.canonical import canonical_json
 from superbrain.core.errors import BrainError, ErrorCode
-from superbrain.core.kernel import ENDPOINT_CONTRACT, Identity, Scope, ToolCommand
+from superbrain.core.kernel import (
+    ENDPOINT_CONTRACT,
+    ENDPOINT_HOST,
+    ENDPOINT_VERSION,
+    DaemonConfig,
+    Endpoint,
+    Identity,
+    Ready,
+    Scope,
+    ToolCommand,
+)
 from superbrain.core.wire import encode_envelope
 from tests.support.inc2_fixture import SampleTlsMaterial
 
@@ -1046,3 +1061,53 @@ def test_wire_call_preserves_scope_and_arguments() -> None:
         with pytest.raises(BrainError) as exc_ident:
             decode_identity_response(bad_ident_payload)
         assert exc_ident.value.code is ErrorCode.INVALID_INPUT
+
+
+def test_loopback_server_handshake_budget_matches_client_connect_budget() -> None:
+    """Server TLS handshake budget must match the 2s client connect budget under CI load."""
+    assert SERVER_HANDSHAKE_BUDGET_NS == CLIENT_CONNECT_BUDGET_NS == 2_000_000_000
+
+
+def test_loopback_server_reuses_prevalidated_ssl_context(inc2_tls_material: SampleTlsMaterial) -> None:
+    """LoopbackServer must keep the prevalidated SSLContext passed from build_server_ssl_context."""
+    cfg = DaemonConfig(
+        version=1,
+        data_root=inc2_tls_material.directory,
+        expected_store_id="store-tls-reuse",
+        cert_path=inc2_tls_material.leaf_cert_path,
+        key_path=inc2_tls_material.leaf_key_path,
+    )
+    ssl_ctx = build_server_ssl_context(cfg)
+    assert isinstance(ssl_ctx, ssl.SSLContext)
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind((ENDPOINT_HOST, 0))
+        sock.listen(1)
+        port = int(sock.getsockname()[1])
+        ep = Endpoint(
+            version=ENDPOINT_VERSION,
+            host=ENDPOINT_HOST,
+            port=port,
+            store_id="store-tls-reuse",
+            writer_epoch=1,
+            instance_id="inst-tls-reuse",
+        )
+        ready = Ready(
+            endpoint=ep,
+            identity=ep.identity,
+            tls_not_after=dt.datetime.now(dt.UTC) + dt.timedelta(days=1),
+            leaf_cert_sha256=inc2_tls_material.leaf_cert_sha256,
+        )
+        owner = OwnerLoop(lambda *_args: cast(OwnerSession, object()))
+        server = LoopbackServer(
+            listener=sock,
+            ssl_context=ssl_ctx,
+            ready=ready,
+            owner=owner,
+            monotonic_ns=time.monotonic_ns,
+            stop_event=threading.Event(),
+        )
+        assert server._ssl_context is ssl_ctx
+    finally:
+        sock.close()

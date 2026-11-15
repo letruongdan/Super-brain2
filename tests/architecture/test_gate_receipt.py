@@ -1881,6 +1881,43 @@ def test_shard_files_balances_heavy_low_case_storage_files_by_millisecond_cost()
     assert gate.shard_files(ALL_SHARD_IDS, 2) == [["t/test_a.py"], ["t/test_b.py"]]
 
 
+def test_shard_files_staggers_storage_vs_non_storage_io() -> None:
+    wheel_files = sorted(gate._WHEEL_FIXTURE_FILES)[:2]
+    storage_files = [
+        "tests/storage/test_backup.py",
+        "tests/storage/test_kernel_revocation.py",
+        "tests/storage/test_restore.py",
+        "tests/storage/test_crash_matrix.py",
+    ]
+    non_storage_files = [
+        "tests/integration/test_kernel_daemon.py",
+        "tests/application/test_kernel_deadlines.py",
+        "tests/application/test_kernel_send_attempts.py",
+        "tests/core/test_canonical.py",
+    ]
+    inventory = [f"{path}::test_case" for path in (*wheel_files, *storage_files, *non_storage_files)]
+    groups = gate.shard_files(inventory, 4)
+    assert len(groups) == 4
+    assert [f for f in groups[0] if f in set(wheel_files)] == wheel_files
+    assert groups[0][: len(wheel_files)] == wheel_files
+    assert groups[1][0].startswith("tests/storage/"), groups[1]
+    assert not groups[2][0].startswith("tests/storage/"), groups[2]
+    assert not groups[3][0].startswith("tests/storage/"), groups[3]
+    # Full partition invariant: shard 0 runs wheel -> non-storage -> storage;
+    # shard 1 runs storage-first; shards 2/3 run non-storage-first.
+    g0_non_wheel = [f for f in groups[0] if f not in set(wheel_files)]
+    assert [f.startswith("tests/storage/") for f in g0_non_wheel] == sorted(
+        f.startswith("tests/storage/") for f in g0_non_wheel
+    ), groups[0]
+    assert [not f.startswith("tests/storage/") for f in groups[1]] == sorted(
+        not f.startswith("tests/storage/") for f in groups[1]
+    ), groups[1]
+    for shard_idx in (2, 3):
+        assert [f.startswith("tests/storage/") for f in groups[shard_idx]] == sorted(
+            f.startswith("tests/storage/") for f in groups[shard_idx]
+        ), groups[shard_idx]
+
+
 def test_gate_wheel_fixture_files_and_weights_stay_aligned_with_tests() -> None:
     import ast
 
@@ -1939,4 +1976,7 @@ def test_gate_wheel_fixture_files_and_weights_stay_aligned_with_tests() -> None:
         for idx, group in enumerate(four_groups)
     ]
     assert max(loads) - min(loads) <= 5_000, f"4-shard LPT load imbalance > 5_000 ms: loads={loads}"
+    assert four_groups[1][0].startswith("tests/storage/"), four_groups[1][:3]
+    assert not four_groups[2][0].startswith("tests/storage/"), four_groups[2][:3]
+    assert not four_groups[3][0].startswith("tests/storage/"), four_groups[3][:3]
     assert gate.shard_files(ALL_SHARD_IDS, 2) == [["t/test_a.py"], ["t/test_b.py"]]

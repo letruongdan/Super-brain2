@@ -23,6 +23,8 @@ import os
 import queue
 import shutil
 import signal
+import socket
+import ssl
 import subprocess
 import sys
 import threading
@@ -915,6 +917,20 @@ def is_writer_lock_held(data_root: Path) -> bool:
     return False
 
 
+def _probe_loopback_tls_ready(host: str, port: int, timeout_s: float) -> bool:
+    """Return whether ``(host, port)`` accepts TCP and completes a TLS handshake within ``timeout_s``."""
+    step_timeout = min(max(timeout_s, 0.05), 0.5)
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        with socket.create_connection((host, port), timeout=step_timeout) as raw_sock:
+            with ctx.wrap_socket(raw_sock, server_hostname=host):
+                return True
+    except (OSError, ssl.SSLError):
+        return False
+
+
 class InstalledServeProcess:
     """Subprocess controller for foreground ``brain serve --config <abs>`` or wheel fixture daemon."""
 
@@ -992,7 +1008,7 @@ class InstalledServeProcess:
         return tuple(pid for pid, _ in self.snapshot_descendant_identities())
 
     def wait_ready(self, timeout: float = 15.0) -> Endpoint:
-        """Poll ``endpoint.json`` until published and verified, ensuring the foreground process stays alive."""
+        """Poll ``endpoint.json`` until published, TLS-ready, and verified while the foreground process stays alive."""
         adapters = os_adapters()
         deadline = time.perf_counter() + timeout
         last_err: Exception | None = None
@@ -1008,10 +1024,13 @@ class InstalledServeProcess:
             if self._endpoint_path.exists():
                 try:
                     ep = read_client_endpoint(self._endpoint_path, adapters)
-                    self.snapshot_descendant_pids()
-                    return ep
                 except (BrainError, OSError) as err:
                     last_err = err
+                else:
+                    if _probe_loopback_tls_ready(ep.host, ep.port, deadline - time.perf_counter()):
+                        self.snapshot_descendant_pids()
+                        return ep
+                    last_err = OSError("loopback TLS listener not yet accepting handshakes")
             time.sleep(0.01)
         raise AssertionError(f"Timed out waiting for endpoint.json at {self._endpoint_path} (last_err={last_err})")
 

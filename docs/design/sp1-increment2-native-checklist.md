@@ -108,7 +108,7 @@ Mọi receipt JSON và log giữ ở `task-9/native/` phải vượt qua parser 
 
 ### Quy trình dừng và cleanup sau mỗi lần thử
 
-1. Lưu toàn bộ `NativeConnectionProbe` JSON, observer index và socket/owner metadata đã lọc tại `C:\Users\letru\sb2-trusted-local\d8-live\final-<short_sha>\` và/hoặc `.superpowers/sdd/2026-11-04-sp1-increment2-daemon-mcp-kernel/task-9/` (`ledger.md`, `final-r30-<short_sha>/`, `native/<host>/<run_id>/`) **trước** khi dọn thư mục làm việc.
+1. Lưu toàn bộ `NativeConnectionProbe` JSON, observer index và socket/owner metadata đã lọc tại `C:\Users\letru\sb2-trusted-local\d8-live\final-<short_sha>\` và/hoặc `.superpowers/sdd/2026-11-04-sp1-increment2-daemon-mcp-kernel/task-9/` (`ledger.md`, `final-r31-<short_sha>/`, `native/<host>/<run_id>/`) **trước** khi dọn thư mục làm việc.
 2. Đóng các cửa sổ/session test của host, xác nhận tất cả tiến trình `shim` (`launcher` + `worker`) đã kết thúc theo đúng `(pid, started_at)`.
 3. Gửi tín hiệu dừng nhẹ (`CTRL_BREAK_EVENT` trên Windows / `SIGTERM` trên POSIX) tới daemon owner theo đúng `(pid, started_at)`; xác nhận mã thoát sạch, file `writer.lock` đã được nhả và `endpoint.json` đã bị xóa.
 4. Kiểm tra physical path và owner của toàn bộ thư mục synthetic trước khi xóa; tuyệt đối không dùng xóa đệ quy qua link/junction.

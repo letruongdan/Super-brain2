@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+import atexit
 import datetime as dt
+import shutil
+import subprocess
+import tempfile
+import zipfile
 from pathlib import Path
 from typing import cast
 
@@ -1519,14 +1524,89 @@ def test_cross_revision_v1_workspace_register_root_reopens_reconciles_and_blocks
         rt_b2.close()
 
 
+_HIST_V2_COMMIT = "6a67b384c16c5a405f2a26b3ecb4b67e4ab26652"
+_HIST_V2_SRC_CACHE: dict[tuple[Path, str], tuple[Path | None, bool]] = {}
+
+
+def _ensure_historical_v2_src(
+    repo_root: Path,
+    os_: OsAdapters,
+    hist_commit: str = _HIST_V2_COMMIT,
+) -> tuple[Path | None, bool]:
+    """Return ``(hist_src, non_shallow)`` with a cached read-only ``src/`` tree for ``hist_commit``."""
+    key = (repo_root.resolve(), hist_commit)
+    if key in _HIST_V2_SRC_CACHE:
+        cached_src, cached_non_shallow = _HIST_V2_SRC_CACHE[key]
+        if cached_src is None or (cached_src / "superbrain" / "__init__.py").is_file():
+            return cached_src, cached_non_shallow
+
+    shallow_proc = subprocess.run(
+        ["git", "rev-parse", "--is-shallow-repository"],
+        cwd=repo_root,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    non_shallow = shallow_proc.returncode == 0 and shallow_proc.stdout.strip() == "false"
+    has_hist_commit = (
+        subprocess.run(
+            ["git", "cat-file", "-e", f"{hist_commit}^{{commit}}"],
+            cwd=repo_root,
+            capture_output=True,
+            check=False,
+        ).returncode
+        == 0
+    )
+    if non_shallow:
+        assert has_hist_commit, f"non-shallow repository must contain historical commit {hist_commit}"
+
+    if not has_hist_commit:
+        _HIST_V2_SRC_CACHE[key] = (None, non_shallow)
+        return None, non_shallow
+
+    hist_base = Path(tempfile.mkdtemp(prefix="sb2-hist-6a67b38-"))
+    atexit.register(shutil.rmtree, hist_base, ignore_errors=True)
+    try:
+        hist_zip = hist_base / "hist.zip"
+        arch_proc = subprocess.run(
+            ["git", "archive", "--format=zip", f"--output={hist_zip}", hist_commit, "src"],
+            cwd=repo_root,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert arch_proc.returncode == 0, arch_proc.stderr
+        hist_dir = hist_base / "tree"
+        hist_dir.mkdir()
+        os_.permissions.secure_directory(hist_dir)
+        with zipfile.ZipFile(hist_zip) as zf:
+            for member in zf.infolist():
+                member_path = Path(member.filename)
+                member_parts = member_path.parts
+                assert (
+                    bool(member_parts)
+                    and member_parts[0] == "src"
+                    and ".." not in member_parts
+                    and not member_path.is_absolute()
+                    and not member_path.drive
+                ), f"unsafe zip entry: {member.filename}"
+            zf.extractall(hist_dir)
+        hist_zip.unlink(missing_ok=True)
+        hist_src = hist_dir / "src"
+        assert (hist_src / "superbrain" / "__init__.py").is_file()
+        _HIST_V2_SRC_CACHE[key] = (hist_src, non_shallow)
+        return hist_src, non_shallow
+    except BaseException:
+        shutil.rmtree(hist_base, ignore_errors=True)
+        raise
+
+
 def test_historical_v2_writer_is_fenced_before_policy_mutation_across_migrate_and_restore(
     trusted_tmp: Path, os_: OsAdapters, clock: FakeClock
 ) -> None:
     import os
     import shutil
-    import subprocess
     import sys
-    import zipfile
     from typing import Literal
 
     from superbrain.composition.migrate_entry import migrate_offline
@@ -1569,55 +1649,9 @@ def test_historical_v2_writer_is_fenced_before_policy_mutation_across_migrate_an
             db.close()
 
     repo_root = Path(__file__).resolve().parents[2]
-    hist_commit = "6a67b384c16c5a405f2a26b3ecb4b67e4ab26652"
-    shallow_proc = subprocess.run(
-        ["git", "rev-parse", "--is-shallow-repository"],
-        cwd=repo_root,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    has_hist_commit = (
-        subprocess.run(
-            ["git", "cat-file", "-e", f"{hist_commit}^{{commit}}"],
-            cwd=repo_root,
-            capture_output=True,
-            check=False,
-        ).returncode
-        == 0
-    )
-    if shallow_proc.returncode == 0 and shallow_proc.stdout.strip() == "false":
-        assert has_hist_commit, f"non-shallow repository must contain historical commit {hist_commit}"
-
-    part_a_ran = False
-    if has_hist_commit:
-        part_a_ran = True
-        hist_zip = trusted_tmp / "hist-6a67b38.zip"
-        arch_proc = subprocess.run(
-            ["git", "archive", "--format=zip", f"--output={hist_zip}", hist_commit, "src"],
-            cwd=repo_root,
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        assert arch_proc.returncode == 0, arch_proc.stderr
-        hist_dir = trusted_tmp / "hist-6a67b38"
-        hist_dir.mkdir()
-        os_.permissions.secure_directory(hist_dir)
-        with zipfile.ZipFile(hist_zip) as zf:
-            for member in zf.infolist():
-                member_path = Path(member.filename)
-                member_parts = member_path.parts
-                assert (
-                    bool(member_parts)
-                    and member_parts[0] == "src"
-                    and ".." not in member_parts
-                    and not member_path.is_absolute()
-                    and not member_path.drive
-                ), f"unsafe zip entry: {member.filename}"
-            zf.extractall(hist_dir)
-        hist_src = hist_dir / "src"
-        assert (hist_src / "superbrain" / "__init__.py").is_file()
+    hist_src, non_shallow = _ensure_historical_v2_src(repo_root, os_)
+    part_a_ran = hist_src is not None
+    if hist_src is not None:
 
         driver_path = trusted_tmp / "hist_6a67b38_driver.py"
         driver_code = (
@@ -2151,7 +2185,7 @@ def test_historical_v2_writer_is_fenced_before_policy_mutation_across_migrate_an
         finally:
             _close_hist_worker()
 
-    if shallow_proc.returncode == 0 and shallow_proc.stdout.strip() == "false":
+    if non_shallow:
         assert part_a_ran is True
 
     # --- Part B: Shallow-Clone-Safe In-Process Historical-v2 Tuple & Recovery Fence Checks ---
@@ -2474,9 +2508,7 @@ def test_historical_restore_policy_cannot_strip_main_store_fence_before_authorit
     import os
     import shutil
     import sqlite3
-    import subprocess
     import sys
-    import zipfile
     from typing import Literal
 
     from superbrain.composition.migrate_entry import migrate_offline
@@ -2567,55 +2599,9 @@ def test_historical_restore_policy_cannot_strip_main_store_fence_before_authorit
             db.close()
 
     repo_root = Path(__file__).resolve().parents[2]
-    hist_commit = "6a67b384c16c5a405f2a26b3ecb4b67e4ab26652"
-    shallow_proc = subprocess.run(
-        ["git", "rev-parse", "--is-shallow-repository"],
-        cwd=repo_root,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    has_hist_commit = (
-        subprocess.run(
-            ["git", "cat-file", "-e", f"{hist_commit}^{{commit}}"],
-            cwd=repo_root,
-            capture_output=True,
-            check=False,
-        ).returncode
-        == 0
-    )
-    if shallow_proc.returncode == 0 and shallow_proc.stdout.strip() == "false":
-        assert has_hist_commit, f"non-shallow repository must contain historical commit {hist_commit}"
-
-    part_a_ran = False
-    if has_hist_commit:
-        part_a_ran = True
-        hist_zip = trusted_tmp / "hist-r4-6a67b38.zip"
-        arch_proc = subprocess.run(
-            ["git", "archive", "--format=zip", f"--output={hist_zip}", hist_commit, "src"],
-            cwd=repo_root,
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        assert arch_proc.returncode == 0, arch_proc.stderr
-        hist_dir = trusted_tmp / "hist-r4-6a67b38"
-        hist_dir.mkdir()
-        os_.permissions.secure_directory(hist_dir)
-        with zipfile.ZipFile(hist_zip) as zf:
-            for member in zf.infolist():
-                member_path = Path(member.filename)
-                member_parts = member_path.parts
-                assert (
-                    bool(member_parts)
-                    and member_parts[0] == "src"
-                    and ".." not in member_parts
-                    and not member_path.is_absolute()
-                    and not member_path.drive
-                ), f"unsafe zip entry: {member.filename}"
-            zf.extractall(hist_dir)
-        hist_src = hist_dir / "src"
-        assert (hist_src / "superbrain" / "__init__.py").is_file()
+    hist_src, non_shallow = _ensure_historical_v2_src(repo_root, os_)
+    part_a_ran = hist_src is not None
+    if hist_src is not None:
 
         driver_path = trusted_tmp / "hist_r4_6a67b38_driver.py"
         driver_code = (
@@ -3271,7 +3257,7 @@ def test_historical_restore_policy_cannot_strip_main_store_fence_before_authorit
         finally:
             _close_r4_worker()
 
-    if shallow_proc.returncode == 0 and shallow_proc.stdout.strip() == "false":
+    if non_shallow:
         assert part_a_ran is True
 
     # --- Part B: Unconditional Shallow-Clone-Safe In-Process Checks ---
