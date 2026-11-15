@@ -14,6 +14,7 @@ import os
 import socket
 import struct
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -154,7 +155,7 @@ def test_libproc_lookup_ignores_the_server_side_tuple(monkeypatch: pytest.Monkey
 # --- No later path may resolve an ambiguity (T9-PORT-F3-R2) ----------------------------------------------------------
 # Seams: the platform branch reads the module's ``sys.platform`` (patched as ``owner.sys``), the lsof fallback calls
 # ``subprocess.run`` (patched), the Linux path reads ``_LINUX_PROC_ROOT`` (patched to a fake tree) and resolves fd
-# links with ``os.readlink`` (patched, so no symlinks are needed and the tests run on Windows too).
+# links with the fake holder callback, without requiring Linux directory-fd syscalls on other hosts.
 
 LSOF_NAME = f"n127.0.0.1:{CLIENT_PORT}->127.0.0.1:{LISTEN_PORT}"
 
@@ -228,6 +229,31 @@ V6 = "0000000000000000FFFF00000100007F"
 HEADER = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode"
 
 
+def _patch_fake_linux_holders(
+    monkeypatch: pytest.MonkeyPatch, root: Path, readlink: Callable[[Path], str]
+) -> None:
+    """Supply only the fake per-process kernel query to the portable scan tests."""
+    def holder(pid: int, pid_dir: Path, target: str) -> bool:
+        assert pid_dir == root / str(pid)
+        if not (pid_dir / "fd").is_dir():
+            return False
+        with os.scandir(pid_dir / "fd") as entries:
+            for entry in entries:
+                try:
+                    matched = readlink(Path(entry.path)) == target
+                except OSError:
+                    continue
+                if matched:
+                    if getattr(owner._SIGHTING, "ns", None) is None:
+                        owner._store_sighting(
+                            pid, "2020-01-01T00:00:00.000000Z", owner._stamp_ns(), owner._utc_now_z()
+                        )
+                    return True
+        return False
+
+    monkeypatch.setattr(owner, "_linux_socket_holder", holder)
+
+
 def _fake_proc(
     monkeypatch: pytest.MonkeyPatch, root: Path, *, tcp: list[str], tcp6: list[str], fds: dict[int, list[int]]
 ) -> None:
@@ -250,7 +276,7 @@ def _fake_proc(
         except KeyError:
             raise OSError(f"not a link: {path}") from None
 
-    monkeypatch.setattr(os, "readlink", readlink)
+    _patch_fake_linux_holders(monkeypatch, root, readlink)
     monkeypatch.setattr(owner, "_LINUX_PROC_ROOT", root)
     _on(monkeypatch, "linux")
 

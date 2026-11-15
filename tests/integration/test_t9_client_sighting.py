@@ -31,7 +31,13 @@ from typing import Any
 import pytest
 
 from superbrain.cli_api import _loopback_server
-from tests.integration.test_t9_libproc_client_pid import CLIENT_PORT, LISTEN_PORT, TCP, _FakeLibproc
+from tests.integration.test_t9_libproc_client_pid import (
+    CLIENT_PORT,
+    LISTEN_PORT,
+    TCP,
+    _FakeLibproc,
+    _patch_fake_linux_holders,
+)
 from tests.support import inc2_native_owner as owner
 
 HOLDER = os.getpid()
@@ -301,7 +307,7 @@ def test_linux_proc_checks_own_pid_before_newer_pids_and_keeps_early_sighting(
                 mark_closing(conn)
             return "socket:[998877]" if pid == HOLDER else "pipe:[11]"
 
-        monkeypatch.setattr(os, "readlink", fake_readlink)
+        _patch_fake_linux_holders(monkeypatch, proc_root, fake_readlink)
         pid, _started, observed_at, observed_ns = safe(CLIENT_PORT, LISTEN_PORT, conn)
 
     assert close_triggered, "newer PIDs were never scanned after checking self PID"
@@ -328,7 +334,7 @@ def test_linux_proc_multi_holder_still_rejects_after_checking_own_pid(
             seen_pids.append(pid)
             return "socket:[998877]" if pid in (HOLDER, HOLDER + 300) else "pipe:[11]"
 
-        monkeypatch.setattr(os, "readlink", fake_readlink)
+        _patch_fake_linux_holders(monkeypatch, proc_root, fake_readlink)
         result = safe(CLIENT_PORT, LISTEN_PORT, _conn_state())
 
     assert result == (None, None, None, None), "multi-holder fd sharing must still be rejected by _single(holders)"
@@ -347,7 +353,7 @@ def test_linux_proc_closes_before_sighting_is_rejected(monkeypatch: pytest.Monke
             _next_tick()
             return "socket:[998877]"
 
-        monkeypatch.setattr(os, "readlink", fake_readlink)
+        _patch_fake_linux_holders(monkeypatch, proc_root, fake_readlink)
         assert safe(CLIENT_PORT, LISTEN_PORT, conn) == (None, None, None, None)
 
 
@@ -362,7 +368,7 @@ def test_linux_proc_explicit_proc_root_scans_descending_without_self_shortcut(
         seen_pids.append(pid)
         return "socket:[998877]" if pid in (HOLDER, HOLDER + 50) else "pipe:[11]"
 
-    monkeypatch.setattr(os, "readlink", fake_readlink)
+    _patch_fake_linux_holders(monkeypatch, proc_root, fake_readlink)
     holders = owner._socket_inode_holders(998877, proc_root=proc_root)
     assert holders == {HOLDER, HOLDER + 50}
     assert seen_pids == [HOLDER + 50, HOLDER + 10, HOLDER], (
@@ -850,7 +856,7 @@ def test_linux_proc_mru_recent_clients_and_nearby_pid_ordering(
         seen_pids.append(pid)
         return "socket:[998877]" if pid in active_holders else "pipe:[11]"
 
-    monkeypatch.setattr(os, "readlink", fake_readlink)
+    _patch_fake_linux_holders(monkeypatch, proc_root, fake_readlink)
 
     # 1. Cold MRU: my_pid first, then > my_pid ascending (1001, 1052 before distant shards), then < my_pid descending.
     assert owner._lookup_loopback_client_pid(CLIENT_PORT, LISTEN_PORT) == 1052

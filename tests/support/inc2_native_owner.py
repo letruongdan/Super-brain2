@@ -143,6 +143,15 @@ def _before(a_ns: int, a_seq: int | None, b_ns: int, b_seq: int | None) -> bool:
 _SIGHTING = threading.local()
 
 
+def _store_sighting(
+    pid: int | None, started_at: str | None, stamp: tuple[int, int], observed_at: str
+) -> None:
+    _SIGHTING.pid = pid
+    _SIGHTING.started_at = started_at
+    _SIGHTING.ns, _SIGHTING.seq = stamp
+    _SIGHTING.at = observed_at
+
+
 def _process_start_or_none(pid: int) -> str | None:
     try:
         return process_started_at_for_pid(pid)
@@ -152,14 +161,12 @@ def _process_start_or_none(pid: int) -> str | None:
 
 def _note_sighting(pid: int | None = None, started_before: str | None = None) -> None:
     if getattr(_SIGHTING, "ns", None) is None:
-        ns, seq = _stamp_ns()
+        stamp = _stamp_ns()
         observed_at = _utc_now_z()
         started_after = _process_start_or_none(pid) if pid is not None else None
         # Keep an unknown identity unknown. A later query after the uniqueness
         # scan may see no process, or a different process reusing the PID.
-        _SIGHTING.pid = pid
-        _SIGHTING.started_at = started_before if started_before == started_after else None
-        _SIGHTING.ns, _SIGHTING.seq, _SIGHTING.at = ns, seq, observed_at
+        _store_sighting(pid, started_before if started_before == started_after else None, stamp, observed_at)
 
 
 def _linux_boot_parameters() -> tuple[float, int]:
@@ -180,6 +187,28 @@ def _lookup_process_clock() -> Iterator[None]:
         yield
     finally:
         _SIGHTING.linux_boot_parameters = previous
+
+
+def _read_linux_process_start(pid: int, proc_dir_fd: int | None = None) -> str:
+    boot_parameters = getattr(_SIGHTING, "linux_boot_parameters", None)
+    if boot_parameters is None:
+        boot_parameters = _linux_boot_parameters()
+    btime_s, hz = boot_parameters
+    try:
+        if proc_dir_fd is None:
+            raw = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+        else:
+            with open(
+                "stat", encoding="ascii", opener=lambda name, flags: os.open(name, flags, dir_fd=proc_dir_fd)
+            ) as f:
+                raw = f.read()
+        if not raw.startswith(f"{pid} ("):
+            raise ValueError("unexpected PID")
+        start_ticks = int(raw.rpartition(")")[2].split()[19])
+    except (IndexError, ValueError) as error:
+        raise OSError("process creation time unavailable") from error
+    dt = datetime.fromtimestamp(btime_s + (start_ticks / float(hz)), tz=UTC)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 def process_started_at_for_pid(pid: int) -> str:
@@ -217,17 +246,7 @@ def process_started_at_for_pid(pid: int) -> str:
                 kernel32.CloseHandle(handle)
 
     if sys.platform.startswith("linux"):
-        proc_stat = Path(f"/proc/{pid}/stat")
-        boot_parameters = getattr(_SIGHTING, "linux_boot_parameters", None)
-        if boot_parameters is None:
-            boot_parameters = _linux_boot_parameters()
-        btime_s, hz = boot_parameters
-        try:
-            start_ticks = int(proc_stat.read_text(encoding="ascii").rpartition(")")[2].split()[19])
-        except (IndexError, ValueError) as error:
-            raise OSError("process creation time unavailable") from error
-        dt = datetime.fromtimestamp(btime_s + (start_ticks / float(hz)), tz=UTC)
-        return dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        return _read_linux_process_start(pid)
 
     if sys.platform == "darwin":
         started = _libproc_started_at(pid)
@@ -280,31 +299,56 @@ def _remember_recent_client_pid(pid: int) -> None:
         _RECENT_CLIENT_PIDS.appendleft(pid)
 
 
+def _linux_socket_holder(pid: int, pid_dir: Path, target: str) -> bool:
+    """Inspect descriptors and matching process metadata through one pinned procfs directory."""
+    if sys.platform == "win32":
+        return False
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    try:
+        proc_dir_fd = os.open(pid_dir, flags)
+        try:
+            fd_dir = os.open("fd", flags, dir_fd=proc_dir_fd)
+            try:
+                with os.scandir(fd_dir) as scan:
+                    for entry in scan:
+                        try:
+                            link = os.readlink(entry.name, dir_fd=fd_dir)
+                        except OSError:
+                            continue
+                        if link != target:
+                            continue
+                        if getattr(_SIGHTING, "ns", None) is None:
+                            stamp, observed_at = _stamp_ns(), _utc_now_z()
+                            started_at = None
+                            with contextlib.suppress(OSError):
+                                started_at = _read_linux_process_start(pid, proc_dir_fd)
+                            _store_sighting(pid, started_at, stamp, observed_at)
+                        return True
+            finally:
+                with contextlib.suppress(OSError):
+                    os.close(fd_dir)
+        finally:
+            with contextlib.suppress(OSError):
+                os.close(proc_dir_fd)
+    except OSError:
+        pass
+    return False
+
+
 def _socket_inode_holders(inode: int, *, proc_root: Path | None = None) -> set[int]:
     """Every PID whose ``/proc/<pid>/fd/*`` references ``socket:[inode]``."""
     root = _LINUX_PROC_ROOT if proc_root is None else proc_root
     target = f"socket:[{inode}]"
     holders: set[int] = set()
 
-    def _scan_pid_fds(pid: int, fd_dir: Path) -> None:
-        started_before = _process_start_or_none(pid)
-        try:
-            with os.scandir(fd_dir) as scan:
-                for entry in scan:
-                    try:
-                        if os.readlink(entry.path) == target:
-                            _note_sighting(pid, started_before)
-                            holders.add(pid)
-                            break
-                    except OSError:
-                        continue
-        except OSError:
-            pass
+    def scan_pid(pid: int) -> None:
+        if _linux_socket_holder(pid, root / str(pid), target):
+            holders.add(pid)
 
     my_pid: int | None = None
     if proc_root is None:
         my_pid = os.getpid()
-        _scan_pid_fds(my_pid, root / str(my_pid) / "fd")
+        scan_pid(my_pid)
 
     try:
         with os.scandir(root) as proc_scan:
@@ -328,7 +372,7 @@ def _socket_inode_holders(inode: int, *, proc_root: Path | None = None) -> set[i
         ordered_pids.extend(sorted(p for p in pids if p > my_pid and p not in scanned))
         ordered_pids.extend(sorted((p for p in pids if p < my_pid and p not in scanned), reverse=True))
         for pid in ordered_pids:
-            _scan_pid_fds(pid, root / str(pid) / "fd")
+            scan_pid(pid)
         for pid in ordered_pids:
             if pid in holders:
                 _remember_recent_client_pid(pid)
@@ -336,7 +380,7 @@ def _socket_inode_holders(inode: int, *, proc_root: Path | None = None) -> set[i
         # Preserve descending numeric order for explicit proc_root test fixtures.
         pids.sort(reverse=True)
         for pid in pids:
-            _scan_pid_fds(pid, root / str(pid) / "fd")
+            scan_pid(pid)
     return holders
 
 

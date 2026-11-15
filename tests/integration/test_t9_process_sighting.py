@@ -151,15 +151,25 @@ def test_shared_real_client_fd_stays_ambiguous() -> None:
         hooks['uninstall']()
 
 
+def _is_linux_stat(path: Any, dir_fd: int | None, pid: int) -> bool:
+    if not isinstance(path, (str, bytes, os.PathLike)):
+        return False
+    target = Path(os.fsdecode(path))
+    pid_dir = Path(f'/proc/{pid}')
+    if dir_fd is None:
+        return target == pid_dir / 'stat'
+    return target == Path('stat') and os.path.samestat(os.fstat(dir_fd), pid_dir.stat())
+
+
 @LINUX_ONLY
-@pytest.mark.parametrize('identity_fault', ['unknown', 'changed_after_fd_match'])
+@pytest.mark.parametrize('identity_fault', ['unknown', 'changed_after_fd_match', 'retargeted_unpinned_path'])
 def test_real_fd_with_unknown_or_changed_process_identity_is_refused(
     monkeypatch: pytest.MonkeyPatch, identity_fault: str
 ) -> None:
-    """Fault only the OS creation-time boundary; real PID/FD/tuple are unchanged.
+    """Fault only process metadata after a real FD sighting.
 
-    The changed-time fault models PID reuse across the FD read. It can only
-    produce a refusal, never positive/native evidence containing an invented ID.
+    Reject unavailable or inconsistent pinned metadata. A retargeted unpinned
+    name must leave the actual socket holder's pinned creation time unchanged.
     """
     hooks, safe, _close = _safe_hooks()
     proc = None
@@ -186,7 +196,10 @@ def test_real_fd_with_unknown_or_changed_process_identity_is_refused(
                 assert inode is not None
                 target = f'socket:[{inode}]'
                 original_readlink = os.readlink
-                original_started = owner.process_started_at_for_pid
+                expected_started = owner.process_started_at_for_pid(proc.pid)
+                real_open = os.open
+                real_read_text = Path.read_text
+                faulted_stat_reads = 0
                 matched = False
 
                 def readlink_and_switch(path: Any, *args: Any, **kwargs: Any) -> str:
@@ -196,20 +209,48 @@ def test_real_fd_with_unknown_or_changed_process_identity_is_refused(
                         matched = True
                     return cast(str, result)
 
-                def creation_time(pid: int) -> str:
-                    if pid == proc.pid:
+                def open_stat(path: Any, *args: Any, **kwargs: Any) -> int:
+                    nonlocal faulted_stat_reads
+                    dir_fd = kwargs.get('dir_fd')
+                    if matched and _is_linux_stat(path, dir_fd, proc.pid):
                         if identity_fault == 'unknown':
-                            raise OSError('creation_time_unavailable')
-                        if matched:
-                            # Static negative-fault value; must never become accepted observation.
-                            return '2099-01-01T00:00:00.000000Z'
-                    return original_started(pid)
+                            faulted_stat_reads += 1
+                            raise FileNotFoundError('creation time unavailable')
+                        if identity_fault == 'changed_after_fd_match':
+                            faulted_stat_reads += 1
+                            # Real stat from a distinct process. Its PID field must not label the observed socket.
+                            return real_open(f'/proc/{os.getpid()}/stat', *args, **{**kwargs, 'dir_fd': None})
+                    return real_open(path, *args, **kwargs)
+
+                def read_unpinned(path: Path, *args: Any, **kwargs: Any) -> str:
+                    nonlocal faulted_stat_reads
+                    if (
+                        identity_fault == 'retargeted_unpinned_path'
+                        and matched
+                        and _is_linux_stat(path, None, proc.pid)
+                    ):
+                        faulted_stat_reads += 1
+                        stat = real_read_text(path, *args, **kwargs)
+                        head, sep, tail = stat.rpartition(')')
+                        fields = tail.split()
+                        fields[19] = str(int(fields[19]) + 1_000)
+                        return head + sep + ' ' + ' '.join(fields)
+                    return real_read_text(path, *args, **kwargs)
 
                 monkeypatch.setattr(os, 'readlink', readlink_and_switch)
-                monkeypatch.setattr(owner, 'process_started_at_for_pid', creation_time)
-                assert safe(client_port, listener.getsockname()[1], conn) == (None, None, None, None), (
-                    'unknown or changing process creation identity must never label a live socket'
-                )
+                monkeypatch.setattr(os, 'open', open_stat)
+                monkeypatch.setattr(Path, 'read_text', read_unpinned)
+                result = safe(client_port, listener.getsockname()[1], conn)
+                assert matched, 'fault oracle must reach an actual matching FD'
+                if identity_fault == 'retargeted_unpinned_path':
+                    assert result[0:2] == (proc.pid, expected_started)
+                    assert result[2] is not None and result[3] is not None
+                    assert faulted_stat_reads == 0, 'after the FD match no naked PID path may attribute its lifetime'
+                else:
+                    assert faulted_stat_reads == 1, 'negative must fault the matching process stat read'
+                    assert result == (None, None, None, None), (
+                        'unknown or changing process creation identity must never label a live socket'
+                    )
     finally:
         if proc is not None:
             assert proc.stdin is not None
@@ -292,6 +333,12 @@ def test_live_holder_with_unavailable_kernel_start_cannot_use_ps_time(
                         creation_file = Path(f'/proc/{pid}/stat')
                         original_exists = Path.exists
                         original_read_text = Path.read_text
+                        original_open = os.open
+
+                        def open_stat(path: Any, *args: Any, **kwargs: Any) -> int:
+                            if _is_linux_stat(path, kwargs.get('dir_fd'), pid):
+                                raise FileNotFoundError('creation metadata was unavailable')
+                            return original_open(path, *args, **kwargs)
 
                         def exists(path: Path, *args: Any, **kwargs: Any) -> bool:
                             return path != creation_file and original_exists(path, *args, **kwargs)
@@ -301,6 +348,7 @@ def test_live_holder_with_unavailable_kernel_start_cannot_use_ps_time(
                                 raise FileNotFoundError('creation metadata was unavailable')
                             return original_read_text(path, *args, **kwargs)
 
+                        monkeypatch.setattr(os, 'open', open_stat)
                         monkeypatch.setattr(Path, 'exists', exists)
                         monkeypatch.setattr(Path, 'read_text', read_text)
                     else:
