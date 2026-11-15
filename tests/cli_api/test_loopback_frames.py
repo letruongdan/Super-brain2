@@ -11,11 +11,13 @@ import threading
 import time
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
 
 from superbrain.application.owner_loop import OwnerLoop, OwnerSession
+from superbrain.cli_api import _loopback_server as loopback_server_module
 from superbrain.cli_api._http_frames import (
     MAX_BODY_BYTES,
     MAX_HEADER_BLOCK_BYTES,
@@ -1063,9 +1065,51 @@ def test_wire_call_preserves_scope_and_arguments() -> None:
         assert exc_ident.value.code is ErrorCode.INVALID_INPUT
 
 
-def test_loopback_server_handshake_budget_matches_client_connect_budget() -> None:
-    """Server TLS handshake budget must match the 2s client connect budget under CI load."""
-    assert SERVER_HANDSHAKE_BUDGET_NS == CLIENT_CONNECT_BUDGET_NS == 2_000_000_000
+def test_loopback_server_and_client_keep_separate_handshake_connect_budgets() -> None:
+    """D5: server handshake cap 1s; client TLS + identity aggregate cap 2s."""
+    assert SERVER_HANDSHAKE_BUDGET_NS == 1_000_000_000
+    assert CLIENT_CONNECT_BUDGET_NS == 2_000_000_000
+
+
+@pytest.mark.parametrize(
+    ("elapsed_ns", "expected_remaining_ns"),
+    (
+        (0, 1_000_000_000),
+        (500_000_000, 500_000_000),
+        (999_999_999, 1),
+        (1_000_000_000, 0),
+        (1_250_000_000, 0),
+        (2_000_000_000, 0),
+    ),
+)
+def test_loopback_server_handshake_timeout_uses_one_second_absolute_cap(
+    elapsed_ns: int,
+    expected_remaining_ns: int,
+) -> None:
+    server = object.__new__(LoopbackServer)
+    clock = FakeClock(10_000_000_000 + elapsed_ns)
+    server._monotonic_ns = clock
+    server._lock = threading.Lock()
+    server._quiesced = False
+    server._stop_deadline = None
+    # Match the actual worker's accept timestamp + server phase budget. The
+    # expected values are independently specified above, not derived from it.
+    handshake_deadline = 10_000_000_000 + SERVER_HANDSHAKE_BUDGET_NS
+    assert server._handshake_timeout_s(handshake_deadline) == expected_remaining_ns / 1_000_000_000
+
+
+@pytest.mark.parametrize("stop_remaining_s", (0.05, -0.05))
+def test_loopback_server_handshake_timeout_keeps_earlier_stop_cutoff(
+    monkeypatch: pytest.MonkeyPatch,
+    stop_remaining_s: float,
+) -> None:
+    server = object.__new__(LoopbackServer)
+    server._monotonic_ns = FakeClock(10_000_000_000)
+    server._lock = threading.Lock()
+    server._quiesced = True
+    server._stop_deadline = 100.0 + stop_remaining_s
+    monkeypatch.setattr(loopback_server_module, "time", SimpleNamespace(perf_counter=lambda: 100.0))
+    assert server._handshake_timeout_s(11_000_000_000) == pytest.approx(max(0.0, stop_remaining_s))
 
 
 def test_loopback_server_reuses_prevalidated_ssl_context(inc2_tls_material: SampleTlsMaterial) -> None:

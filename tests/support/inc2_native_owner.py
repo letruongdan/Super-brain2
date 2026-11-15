@@ -143,12 +143,43 @@ def _before(a_ns: int, a_seq: int | None, b_ns: int, b_seq: int | None) -> bool:
 _SIGHTING = threading.local()
 
 
-def _note_sighting() -> None:
+def _process_start_or_none(pid: int) -> str | None:
+    try:
+        return process_started_at_for_pid(pid)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _note_sighting(pid: int | None = None, started_before: str | None = None) -> None:
     if getattr(_SIGHTING, "ns", None) is None:
         ns, seq = _stamp_ns()
-        _SIGHTING.ns = ns
-        _SIGHTING.seq = seq
-        _SIGHTING.at = _utc_now_z()
+        observed_at = _utc_now_z()
+        started_after = _process_start_or_none(pid) if pid is not None else None
+        # Keep an unknown identity unknown. A later query after the uniqueness
+        # scan may see no process, or a different process reusing the PID.
+        _SIGHTING.pid = pid
+        _SIGHTING.started_at = started_before if started_before == started_after else None
+        _SIGHTING.ns, _SIGHTING.seq, _SIGHTING.at = ns, seq, observed_at
+
+
+def _linux_boot_parameters() -> tuple[float, int]:
+    if sys.platform == "win32":
+        raise OSError("process clock unavailable")
+    for line in Path("/proc/stat").read_text(encoding="ascii").splitlines():
+        if line.startswith("btime "):
+            return float(line.split()[1]), int(os.sysconf("SC_CLK_TCK"))
+    raise OSError("process clock unavailable")
+
+
+@contextmanager
+def _lookup_process_clock() -> Iterator[None]:
+    previous = getattr(_SIGHTING, "linux_boot_parameters", None)
+    try:
+        if sys.platform.startswith("linux") and previous is None:
+            _SIGHTING.linux_boot_parameters = _linux_boot_parameters()
+        yield
+    finally:
+        _SIGHTING.linux_boot_parameters = previous
 
 
 def process_started_at_for_pid(pid: int) -> str:
@@ -185,28 +216,25 @@ def process_started_at_for_pid(pid: int) -> str:
             if close_handle:
                 kernel32.CloseHandle(handle)
 
-    proc_stat = Path(f"/proc/{pid}/stat")
-    sys_stat = Path("/proc/stat")
-    if proc_stat.exists() and sys_stat.exists():
-        btime_s = 0.0
-        for line in sys_stat.read_text(encoding="ascii").splitlines():
-            if line.startswith("btime "):
-                btime_s = float(line.split()[1])
-                break
-        start_ticks = int(proc_stat.read_text(encoding="ascii").rpartition(")")[2].split()[19])
-        hz = os.sysconf("SC_CLK_TCK")
+    if sys.platform.startswith("linux"):
+        proc_stat = Path(f"/proc/{pid}/stat")
+        boot_parameters = getattr(_SIGHTING, "linux_boot_parameters", None)
+        if boot_parameters is None:
+            boot_parameters = _linux_boot_parameters()
+        btime_s, hz = boot_parameters
+        try:
+            start_ticks = int(proc_stat.read_text(encoding="ascii").rpartition(")")[2].split()[19])
+        except (IndexError, ValueError) as error:
+            raise OSError("process creation time unavailable") from error
         dt = datetime.fromtimestamp(btime_s + (start_ticks / float(hz)), tz=UTC)
         return dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
     if sys.platform == "darwin":
-        # ps forks/execs (tens of ms, whole seconds); a short connection closes before it returns.
         started = _libproc_started_at(pid)
         if started is not None:
             return started
-    out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True, check=True)
-    raw = " ".join(out.stdout.split())
-    parsed = datetime.strptime(raw, "%a %b %d %H:%M:%S %Y").astimezone(UTC)
-    return parsed.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    # Whole-second ps output cannot distinguish two lifetimes of a reused PID.
+    raise OSError("process creation time unavailable")
 
 
 _LINUX_PROC_ROOT = Path("/proc")
@@ -259,12 +287,13 @@ def _socket_inode_holders(inode: int, *, proc_root: Path | None = None) -> set[i
     holders: set[int] = set()
 
     def _scan_pid_fds(pid: int, fd_dir: Path) -> None:
+        started_before = _process_start_or_none(pid)
         try:
             with os.scandir(fd_dir) as scan:
                 for entry in scan:
                     try:
                         if os.readlink(entry.path) == target:
-                            _note_sighting()
+                            _note_sighting(pid, started_before)
                             holders.add(pid)
                             break
                     except OSError:
@@ -404,6 +433,7 @@ def _libproc_client_holders(client_port: int, listen_port: int) -> set[int] | No
     for pid in sorted(pids[: max(0, got) // 4], reverse=True):  # newest first: clients are recent processes
         if pid <= 0:
             continue
+        started_before = _process_start_or_none(int(pid))
         size = lib.proc_pidinfo(pid, _PROC_PIDLISTFDS, 0, None, 0)
         if size <= 0:
             continue
@@ -415,7 +445,37 @@ def _libproc_client_holders(client_port: int, listen_port: int) -> set[int] | No
             info = ctypes.create_string_buffer(_SOCKET_FDINFO_SIZE + 256)
             n = lib.proc_pidfdinfo(pid, fds[i], _PROC_PIDFDSOCKETINFO, info, ctypes.sizeof(info))
             if n > 0 and _parse_socket_fdinfo(info.raw[:n]) == want:
-                _note_sighting()
+                _note_sighting(int(pid), started_before)
+                found.add(int(pid))
+    return found
+
+
+def _win32_tcp_client_pids(client_port: int, listen_port: int) -> set[int]:
+    if sys.platform != "win32":
+        return set()
+    import ctypes
+    from ctypes import wintypes
+
+    iphlpapi = ctypes.WinDLL("iphlpapi", use_last_error=True)
+    size = wintypes.DWORD(0)
+    iphlpapi.GetExtendedTcpTable(None, ctypes.byref(size), False, 2, 5, 0)
+    buf = (ctypes.c_ubyte * (size.value + 4096))()
+    size2 = wintypes.DWORD(len(buf))
+    if iphlpapi.GetExtendedTcpTable(buf, ctypes.byref(size2), False, 2, 5, 0) != 0:
+        return set()
+    num = ctypes.c_uint32.from_buffer(buf, 0).value
+    found: set[int] = set()
+    for idx in range(num):
+        base = 4 + idx * 24
+        _state, laddr, lport_net, raddr, rport_net, pid = (
+            ctypes.c_uint32.from_buffer(buf, base + offset * 4).value for offset in range(6)
+        )
+        if socket.inet_ntoa(struct.pack("<I", laddr)) != "127.0.0.1":
+            continue
+        if socket.inet_ntoa(struct.pack("<I", raddr)) != "127.0.0.1":
+            continue
+        if socket.ntohs(lport_net & 0xFFFF) == client_port and socket.ntohs(rport_net & 0xFFFF) == listen_port:
+            if pid > 0:
                 found.add(int(pid))
     return found
 
@@ -428,31 +488,16 @@ def _lookup_loopback_client_pid(
     if client_port <= 0 or listen_port <= 0:
         return None
     if sys.platform == "win32":
-        import ctypes
-        from ctypes import wintypes
-
-        iphlpapi = ctypes.WinDLL("iphlpapi", use_last_error=True)
-        size = wintypes.DWORD(0)
-        iphlpapi.GetExtendedTcpTable(None, ctypes.byref(size), False, 2, 5, 0)
-        buf = (ctypes.c_ubyte * (size.value + 4096))()
-        size2 = wintypes.DWORD(len(buf))
-        if iphlpapi.GetExtendedTcpTable(buf, ctypes.byref(size2), False, 2, 5, 0) != 0:
+        pid = _single(_win32_tcp_client_pids(client_port, listen_port))
+        if pid is None:
             return None
-        num = ctypes.c_uint32.from_buffer(buf, 0).value
-        for idx in range(num):
-            base = 4 + idx * 24
-            _state, laddr, lport_net, raddr, rport_net, pid = (
-                ctypes.c_uint32.from_buffer(buf, base + offset * 4).value for offset in range(6)
-            )
-            if socket.inet_ntoa(struct.pack("<I", laddr)) != "127.0.0.1":
-                continue
-            if socket.inet_ntoa(struct.pack("<I", raddr)) != "127.0.0.1":
-                continue
-            if socket.ntohs(lport_net & 0xFFFF) == client_port and socket.ntohs(rport_net & 0xFFFF) == listen_port:
-                if pid > 0:
-                    _note_sighting()
-                    return int(pid)
-        return None
+        started_before = _process_start_or_none(pid)
+        # The initial table only discovers a candidate. Re-observe the row
+        # inside the creation-time bracket so PID reuse cannot relabel it.
+        if _win32_tcp_client_pids(client_port, listen_port) != {pid}:
+            return None
+        _note_sighting(pid, started_before)
+        return pid
     if sys.platform.startswith("linux"):
         conn_state = kwargs.get("conn_state")
         for attempt in range(4):
@@ -641,24 +686,24 @@ def _install_loopback_server_hooks(
         sighted = False
         with contextlib.suppress(OSError, subprocess.SubprocessError):
             _SIGHTING.ns = _SIGHTING.seq = _SIGHTING.at = None
-            try:
-                client_pid = _lookup_loopback_client_pid(peer_port, listen_port, conn_state=conn_state)
-            except TypeError:
-                client_pid = _lookup_loopback_client_pid(peer_port, listen_port)
+            _SIGHTING.pid = _SIGHTING.started_at = None
+            with _lookup_process_clock():
+                try:
+                    client_pid = _lookup_loopback_client_pid(peer_port, listen_port, conn_state=conn_state)
+                except TypeError:
+                    client_pid = _lookup_loopback_client_pid(peer_port, listen_port)
             if client_pid is not None:
                 sighted = _SIGHTING.ns is not None
-                if not sighted and conn_state is not None and (
-                    conn_state["closed_event"].is_set() or conn_state["closing"]
-                ):
+                if not sighted:
+                    # A PID returned after an external scan (e.g. lsof) does
+                    # not establish its creation identity at a live sighting.
                     return None, None, None, None
-                client_started_at = process_started_at_for_pid(client_pid)
-                if sighted:
-                    observed_ns = _SIGHTING.ns
-                    observed_seq = getattr(_SIGHTING, "seq", None)
-                    observed_at = _SIGHTING.at
-                else:
-                    observed_ns, observed_seq = _stamp_ns()
-                    observed_at = _utc_now_z()
+                if _SIGHTING.pid != client_pid or _SIGHTING.started_at is None:
+                    return None, None, None, None
+                client_started_at = _SIGHTING.started_at
+                observed_ns = _SIGHTING.ns
+                observed_seq = getattr(_SIGHTING, "seq", None)
+                observed_at = _SIGHTING.at
         if (
             client_pid is None
             or client_started_at is None

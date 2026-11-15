@@ -3636,7 +3636,7 @@ def test_t9_r07_slow_collector_off_deadline_and_concurrent_calls(
             slow_release.wait(timeout=3.0)
             return None
         try:
-            native_owner._note_sighting()
+            native_owner._note_sighting(os.getpid(), native_owner.process_started_at_for_pid(os.getpid()))
             return os.getpid()
         finally:
             fast_lookup_done.set()
@@ -4094,15 +4094,17 @@ def test_t9_r02_socket_observation_lifetime_and_post_close_lookup_rejection(
             assert post_close_gate.wait(timeout=3.0)
             return 47001
         try:
-            native_owner._note_sighting()
+            native_owner._note_sighting(os.getpid(), native_owner.process_started_at_for_pid(os.getpid()))
             return os.getpid()
         finally:
             live_lookup_done.set()
 
+    live_started_at = process_started_at_for_pid(os.getpid())
+
     def _mock_start(pid: int) -> str:
         if pid == 47001:
             return "2026-11-12T03:00:00.000000Z"
-        return native_owner.utc_now_z()
+        return live_started_at
 
     hook_state = native_owner._install_loopback_server_hooks(
         eq=eq,

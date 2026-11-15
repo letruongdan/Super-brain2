@@ -244,6 +244,9 @@ def _safe_identity_hooks(
         return start_at
 
     monkeypatch.setattr(owner, "process_started_at_for_pid", fake_started_at)
+    if platform == "linux":
+        # This fixture supplies synthetic PIDs and must not read the host's /proc/stat.
+        monkeypatch.setattr(owner, "_linux_boot_parameters", lambda: (0.0, 100))
     state = owner._install_loopback_server_hooks(
         eq=queue.Queue(), daemon_pid=os.getpid(), daemon_started_at=start_at
     )
@@ -415,9 +418,15 @@ def test_windows_tcp_table_sighting_keeps_binding_when_close_begins_after_lookup
     conn = _conn_state()
     holder_holder: dict[str, Any] = {}
 
+    creation_reads = 0
+
     def close_after_sighting(_pid: int) -> None:
-        _next_tick()
-        holder_holder["mark"](conn)
+        nonlocal creation_reads
+        creation_reads += 1
+        # First read precedes the OS table; the second follows the live sighting.
+        if creation_reads == 2:
+            _next_tick()
+            holder_holder["mark"](conn)
 
     with _safe_identity_hooks(
         monkeypatch,
@@ -699,7 +708,7 @@ def test_tap_write_json_flushes_immediately_and_preserves_tight_client_deadline(
 
     def _gated_lookup(_peer: int, _listen: int, **_kw: Any) -> int | None:
         assert lookup_gate.wait(timeout=1.5)
-        owner._note_sighting()
+        owner._note_sighting(HOLDER, owner.process_started_at_for_pid(HOLDER))
         return HOLDER
 
     def _lookup_future_for_tid() -> Future[Any]:
@@ -779,7 +788,7 @@ def test_tap_write_json_flushes_immediately_and_preserves_tight_client_deadline(
 
                 def _slow_120ms(_peer: int, _listen: int, **_kw: Any) -> int | None:
                     time.sleep(0.12)
-                    owner._note_sighting()
+                    owner._note_sighting(os.getpid(), owner.process_started_at_for_pid(os.getpid()))
                     return os.getpid()
 
                 with monkeypatch.context() as mp:
@@ -888,10 +897,12 @@ def test_linux_lookup_retries_briefly_while_live_and_stops_on_close(
         attempts += 1
         if attempts < 3:
             return set()
-        owner._note_sighting()
+        owner._note_sighting(HOLDER, owner.process_started_at_for_pid(HOLDER))
         return {HOLDER}
 
     with monkeypatch.context() as mp:
+        started_at, _end_at = _utc_bounds()
+        mp.setattr(owner, "process_started_at_for_pid", lambda _pid: started_at)
         mp.setattr(owner, "_socket_inode_holders", _holders_on_third)
         owner._SIGHTING.ns = owner._SIGHTING.seq = owner._SIGHTING.at = None
         pid = owner._lookup_loopback_client_pid(CLIENT_PORT, LISTEN_PORT, conn_state=conn_live)

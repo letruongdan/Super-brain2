@@ -181,6 +181,12 @@ def test_darwin_ambiguous_libproc_result_is_final(monkeypatch: pytest.MonkeyPatc
     calls = _lsof(monkeypatch, None)
     fake = _FakeLibproc({301: [(4, TCP)], 302: [(4, TCP)]})
     _patch_libproc_cdll(monkeypatch, fake)
+
+    def unknown_creation(_pid: int) -> str:
+        raise OSError("creation_time_unavailable")
+
+    # Unknown process identity must not remove a socket holder from ambiguity.
+    monkeypatch.setattr(owner, "process_started_at_for_pid", unknown_creation)
     assert owner._lookup_loopback_client_pid(CLIENT_PORT, LISTEN_PORT) is None
     assert calls == []
 

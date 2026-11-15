@@ -2340,87 +2340,86 @@ def _arbiter_test_config(base_dir: Path) -> tuple[DaemonConfig, Ready]:
     return cfg, ready
 
 
-def test_owner_loop_arbiter_precision_under_wait_overshoot_and_non_real_clock_safety(
-    trusted_tmp: Path,
+@pytest.mark.parametrize("phase", ("queued", "preparing", "committing"))
+@pytest.mark.parametrize("horizon_ms", (18, 90))
+@pytest.mark.parametrize("wait_overshoot_ms", (0, 22))
+def test_owner_loop_arbiter_wait_uses_shared_cutoff_and_rechecks_after_wake(
+    phase: str,
+    horizon_ms: int,
+    wait_overshoot_ms: int,
     monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # D5 requires scheduler-free boundary races. The OS may return from a timed
+    # wait late; program-selected waits must not extend the shared cutoff, and
+    # the first arbiter execution at/after it must select exactly one response.
+    start_ns = 10_000 * MS
+    mono = FakeMonotonicClock(start_ns=start_ns)
+    _, ready = _arbiter_test_config(Path.cwd() / "unused-arbiter-config")
+    table = ReservationTable()
+    session = _ArbiterTestSession(clock=FakeClock(CLOCK_START), mono=mono, table=table, ready=ready)
+    loop = OwnerLoop()
+    deadlines = RequestDeadlines(
+        receive_ns=start_ns,
+        handler_deadline_ns=start_ns + (horizon_ms - 1) * MS,
+        commit_waiter_cutoff_ns=start_ns + horizon_ms * MS,
+        total_deadline_ns=start_ns + horizon_ms * MS + RESPONSE_RESERVE_NS,
+    )
+    cutoff_ns = start_ns + (horizon_ms if phase == "committing" else horizon_ms - 1) * MS
+    responses: list[tuple[CallResult, int]] = []
+    wait_calls: list[tuple[int, int]] = []
+
+    def on_response(envelope: CallResult) -> None:
+        responses.append((envelope, mono.monotonic_ns()))
+        loop._arbiter_stop = True
+
+    reservation = reserve(
+        ("dan", "submit_episode", "sha256:" + "1" * 64),
+        "sha256:" + "a" * 64,
+        table=table,
+        deadlines=deadlines,
+        on_response=on_response,
+    )
+    if phase == "preparing":
+        assert table.try_claim_for_owner(reservation, start_ns) is True
+    elif phase == "committing":
+        assert enter_commit(reservation, start_ns) is True
+
+    def controlled_wait(timeout: float | None = None) -> bool:
+        now_ns = mono.monotonic_ns()
+        assert timeout is not None, "an active reservation must use a bounded wait"
+        selected_ns = round(timeout * 1_000_000_000)
+        assert 0 < selected_ns <= cutoff_ns - now_ns, (
+            "arbiter selected a wait beyond the shared cutoff",
+            selected_ns,
+            cutoff_ns - now_ns,
+        )
+        wait_calls.append((now_ns, selected_ns))
+        assert len(wait_calls) < 100, "arbiter failed to make bounded clock progress"
+        mono.advance(selected_ns + wait_overshoot_ms * MS)
+        return False
+
+    monkeypatch.setattr(loop._arbiter_wake, "wait", controlled_wait)
+    loop._arbiter_main(cast(OwnerSession, session))
+    assert wait_calls, "positive twin must exercise waiting before arbitration"
+    assert len(responses) == 1
+    envelope, settled_ns = responses[0]
+    code = "commit_outcome_unknown" if phase == "committing" else "deadline_exceeded"
+    message = "commit outcome unknown" if phase == "committing" else "deadline exceeded"
+    assert envelope == {"ok": False, "error": {"code": code, "message": message}}
+    assert settled_ns >= cutoff_ns
+    assert settled_ns == mono.monotonic_ns(), "no additional wait may follow the eligible cutoff"
+    if wait_overshoot_ms == 0:
+        assert settled_ns == cutoff_ns, "an exact clock must settle at the exact phase cutoff"
+    table.arbitrate_at(settled_ns + 100 * MS)
+    table.finish_owner_execution(reservation, {"ok": True, "data": {}})
+    assert len(responses) == 1, "late owner completion must not replace the selected timeout"
+
+
+def test_owner_loop_arbiter_non_real_clock_safety(
+    trusted_tmp: Path,
 ) -> None:
     fake_wall = FakeClock(CLOCK_START)
     cfg, ready = _arbiter_test_config(trusted_tmp / "arbiter-r30")
-
-    # Part A: With simulated +22 ms Event.wait timer-coalescing overshoot, OwnerLoop still settles
-    # COMMITTING within < 5 ms of cutoff on real-rate SystemMonotonicClock.
-    sys_mono = SystemMonotonicClock()
-    wake_cb: list[Callable[[], None]] = []
-    table_a = ReservationTable(on_change=lambda: wake_cb[0]() if wake_cb else None)
-
-    def _factory_a(
-        _cfg: DaemonConfig,
-        _owner_wake: Callable[[], None],
-        arbiter_wake: Callable[[], None],
-    ) -> OwnerSession:
-        wake_cb.append(arbiter_wake)
-        return cast(
-            OwnerSession,
-            _ArbiterTestSession(clock=fake_wall, mono=sys_mono, table=table_a, ready=ready),
-        )
-
-    loop_a = OwnerLoop(session_factory=_factory_a)
-    settled_a = threading.Event()
-    settled_info: list[tuple[CallResult, int]] = []
-
-    def _on_resp_a(env: CallResult) -> None:
-        settled_info.append((env, sys_mono.monotonic_ns()))
-        settled_a.set()
-
-    with monkeypatch.context() as mp:
-        arbiter_wake_ev = loop_a._arbiter_wake
-        orig_wait = threading.Event.wait
-
-        def _overshoot_wait(ev: threading.Event, timeout: float | None = None) -> bool:
-            if ev is arbiter_wake_ev and timeout is not None:
-                return orig_wait(ev, timeout=timeout + 0.022)
-            return orig_wait(ev, timeout=timeout)
-
-        mp.setattr(threading.Event, "wait", _overshoot_wait)
-        loop_a.start(cfg)
-        try:
-            # Verify both immediate-zone (18 ms, deterministic against 4 ms + 22 ms overshoot = >= 26 ms)
-            # and wait-recovery (90 ms, exercises Event.wait overshoot + precision recovery) cutoffs.
-            for idx, horizon_ms in enumerate((18, 90), start=1):
-                settled_a.clear()
-                settled_info.clear()
-                start_ns = sys_mono.monotonic_ns()
-                cutoff_ns = start_ns + horizon_ms * MS
-                dl = RequestDeadlines(
-                    receive_ns=start_ns,
-                    handler_deadline_ns=start_ns + (horizon_ms - 1) * MS,
-                    commit_waiter_cutoff_ns=cutoff_ns,
-                    total_deadline_ns=cutoff_ns + RESPONSE_RESERVE_NS,
-                )
-                res = reserve(
-                    ("dan", "submit_episode", f"sha256:{idx}" + "1" * 63),
-                    f"sha256:{idx}" + "a" * 63,
-                    table=table_a,
-                    deadlines=dl,
-                    on_response=_on_resp_a,
-                )
-                assert enter_commit(res, start_ns) is True
-                assert settled_a.wait(timeout=1.5), f"arbiter failed to settle COMMITTING request ({horizon_ms}ms)"
-                env, settled_ns = settled_info[0]
-                assert env == {
-                    "ok": False,
-                    "error": {"code": "commit_outcome_unknown", "message": "commit outcome unknown"},
-                }
-                lag_ns = settled_ns - cutoff_ns
-                assert lag_ns >= 0, f"arbiter settled before cutoff ({horizon_ms}ms): lag_ns={lag_ns}"
-                assert lag_ns < 5 * MS, (
-                    f"arbiter overshot {horizon_ms}ms cutoff by {lag_ns / MS:.3f} ms (>= 5 ms)"
-                )
-                table_a.finish_owner_execution(res, {"ok": True, "data": {}})
-        finally:
-            rep_a = loop_a.stop(grace_s=1.0)
-            assert rep_a.state is ShutdownState.STOPPED
-
     # Part B: Frozen and +1ns-per-read FakeMonotonicClocks inside rem_ns <= 35 ms must NOT spin or hang stop().
     for mode in ("frozen", "plus_1ns"):
         fake_mono = FakeMonotonicClock(start_ns=10_000 * MS)
