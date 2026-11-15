@@ -43,7 +43,8 @@ jobs:
           from pathlib import Path
           temporary = Path(os.environ["RUNNER_TEMP"]).resolve()
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as output:
-              output.write(f"TMPDIR={temporary}\n")
+              for var in ("TMPDIR", "TEMP", "TMP"):
+                  output.write(f"{var}={temporary}\n")
           PY
       - name: Diagnose loopback socket-to-PID lookup (macOS)
         if: runner.os == 'macOS'

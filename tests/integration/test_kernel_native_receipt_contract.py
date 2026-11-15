@@ -11,6 +11,7 @@ import time
 from collections.abc import Mapping
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from functools import partial
 from pathlib import Path
 from typing import Any, cast
 
@@ -1217,17 +1218,25 @@ def _build_wheel_probe_and_obs(
     return probe, registration, observations
 
 
+_spawn_positive_observed_owner = partial(
+    spawn_observed_wheel_owner,
+    socket_readiness=sys.platform.startswith("linux"),
+)
+
+
 def _invoke_wheel_shim_health(
     env: InstalledEnv,
     profile_path: Path,
     *,
     cwd: Path,
+    readiness_env: Mapping[str, str] | None = None,
 ) -> tuple[dict[str, JsonValue], ProcessIdentity, ProcessIdentity, str, str]:
     with InstalledMcpPipeSession(
         env,
         "brain",
         ("mcp", "--profile", str(profile_path)),
         cwd=cwd,
+        extra_env=readiness_env,
     ) as pipe_sess:
         resp_init = pipe_sess.send_frames_and_expect_response(mcp_init_frames(1))
         assert resp_init.get("id") == 1
@@ -1326,12 +1335,14 @@ def test_two_principals_one_store_id(inc2_installed_env: InstalledEnv) -> None:
         )
 
         ev_dir = case_dir / "owner-evidence"
-        with spawn_observed_wheel_owner(inc2_installed_env, cfg_path, ev_dir, cwd=outside_cwd) as owner:
+        with _spawn_positive_observed_owner(inc2_installed_env, cfg_path, ev_dir, cwd=outside_cwd) as owner:
             venv_resolved = str(inc2_installed_env.venv_dir.resolve()).lower()
             assert owner.module_file.lower().startswith(venv_resolved)
             assert owner.schema_sha256 == inc2_installed_env.source_schema_sha256
 
-            sc_a, la_a, wk_a, st_a, en_a = _invoke_wheel_shim_health(inc2_installed_env, prof_a, cwd=outside_cwd)
+            sc_a, la_a, wk_a, st_a, en_a = _invoke_wheel_shim_health(
+                inc2_installed_env, prof_a, cwd=outside_cwd, readiness_env=owner.client_readiness_env
+            )
             probe_a, reg_a, obs_a = _build_wheel_probe_and_obs(
                 env=inc2_installed_env,
                 owner=owner,
@@ -1359,7 +1370,9 @@ def test_two_principals_one_store_id(inc2_installed_env: InstalledEnv) -> None:
                 verify_native_connection(probe_a, registration=reg_a, observations=obs_a, require_native=False) is True
             )
 
-            sc_b, la_b, wk_b, st_b, en_b = _invoke_wheel_shim_health(inc2_installed_env, prof_b, cwd=outside_cwd)
+            sc_b, la_b, wk_b, st_b, en_b = _invoke_wheel_shim_health(
+                inc2_installed_env, prof_b, cwd=outside_cwd, readiness_env=owner.client_readiness_env
+            )
             probe_b, reg_b, obs_b = _build_wheel_probe_and_obs(
                 env=inc2_installed_env,
                 owner=owner,
@@ -1392,7 +1405,9 @@ def test_two_principals_one_store_id(inc2_installed_env: InstalledEnv) -> None:
             assert probe_a.binding.principal_id != probe_b.binding.principal_id
 
             # Two credentials with identical (owner_id, harness_id, machine_id) map to ONE principal_id.
-            sc_d, la_d, wk_d, st_d, en_d = _invoke_wheel_shim_health(inc2_installed_env, prof_dup, cwd=outside_cwd)
+            sc_d, la_d, wk_d, st_d, en_d = _invoke_wheel_shim_health(
+                inc2_installed_env, prof_dup, cwd=outside_cwd, readiness_env=owner.client_readiness_env
+            )
             probe_dup, reg_dup, obs_dup = _build_wheel_probe_and_obs(
                 env=inc2_installed_env,
                 owner=owner,
@@ -1483,8 +1498,10 @@ def test_two_hosts_reject_different_daemon_epochs(inc2_installed_env: InstalledE
         )
 
         ev1 = case_dir / "ev-epoch-1"
-        with spawn_observed_wheel_owner(inc2_installed_env, cfg_path, ev1, cwd=outside_cwd) as owner1:
-            sc1, la1, wk1, st1, en1 = _invoke_wheel_shim_health(inc2_installed_env, prof_1, cwd=outside_cwd)
+        with _spawn_positive_observed_owner(inc2_installed_env, cfg_path, ev1, cwd=outside_cwd) as owner1:
+            sc1, la1, wk1, st1, en1 = _invoke_wheel_shim_health(
+                inc2_installed_env, prof_1, cwd=outside_cwd, readiness_env=owner1.client_readiness_env
+            )
             probe_1, reg_1, obs_1 = _build_wheel_probe_and_obs(
                 env=inc2_installed_env,
                 owner=owner1,
@@ -1508,7 +1525,9 @@ def test_two_hosts_reject_different_daemon_epochs(inc2_installed_env: InstalledE
             assert (
                 verify_native_connection(probe_1, registration=reg_1, observations=obs_1, require_native=False) is True
             )
-            sc1b, la1b, wk1b, st1b, en1b = _invoke_wheel_shim_health(inc2_installed_env, prof_2, cwd=outside_cwd)
+            sc1b, la1b, wk1b, st1b, en1b = _invoke_wheel_shim_health(
+                inc2_installed_env, prof_2, cwd=outside_cwd, readiness_env=owner1.client_readiness_env
+            )
             probe_1b, reg_1b, obs_1b = _build_wheel_probe_and_obs(
                 env=inc2_installed_env,
                 owner=owner1,
@@ -1537,8 +1556,10 @@ def test_two_hosts_reject_different_daemon_epochs(inc2_installed_env: InstalledE
         assert is_writer_lock_held(data_root) is False
 
         ev2 = case_dir / "ev-epoch-2"
-        with spawn_observed_wheel_owner(inc2_installed_env, cfg_path, ev2, cwd=outside_cwd) as owner2:
-            sc2, la2, wk2, st2, en2 = _invoke_wheel_shim_health(inc2_installed_env, prof_2, cwd=outside_cwd)
+        with _spawn_positive_observed_owner(inc2_installed_env, cfg_path, ev2, cwd=outside_cwd) as owner2:
+            sc2, la2, wk2, st2, en2 = _invoke_wheel_shim_health(
+                inc2_installed_env, prof_2, cwd=outside_cwd, readiness_env=owner2.client_readiness_env
+            )
             probe_2, reg_2, obs_2 = _build_wheel_probe_and_obs(
                 env=inc2_installed_env,
                 owner=owner2,
@@ -1692,10 +1713,14 @@ def test_native_workspace_transition_rejects_stale_shim_and_scope(inc2_installed
         assert digest_a != digest_b
 
         ev_dir = case_dir / "owner-ev"
-        with spawn_observed_wheel_owner(inc2_installed_env, cfg_path, ev_dir, cwd=outside_cwd) as owner:
+        with _spawn_positive_observed_owner(inc2_installed_env, cfg_path, ev_dir, cwd=outside_cwd) as owner:
             # 1. Workspace A shim: get_health ready, job_a authorized, job_b cross-checkout denied, ws-b hint refused.
             with InstalledMcpPipeSession(
-                inc2_installed_env, "brain", ("mcp", "--profile", str(prof_a)), cwd=chk_a
+                inc2_installed_env,
+                "brain",
+                ("mcp", "--profile", str(prof_a)),
+                cwd=chk_a,
+                extra_env=owner.client_readiness_env,
             ) as sess_a:
                 sess_a.send_frames_and_expect_response(mcp_init_frames(1))
                 resp_ha = sess_a.send_frames_and_expect_response(
@@ -1806,7 +1831,11 @@ def test_native_workspace_transition_rejects_stale_shim_and_scope(inc2_installed
 
             # 3. Fresh shim B launched with profile B in chk_b accesses job_b cleanly and rejects job_a!
             with InstalledMcpPipeSession(
-                inc2_installed_env, "brain", ("mcp", "--profile", str(prof_b)), cwd=chk_b
+                inc2_installed_env,
+                "brain",
+                ("mcp", "--profile", str(prof_b)),
+                cwd=chk_b,
+                extra_env=owner.client_readiness_env,
             ) as sess_b:
                 sess_b.send_frames_and_expect_response(mcp_init_frames(1))
                 resp_hb = sess_b.send_frames_and_expect_response(
@@ -2453,17 +2482,29 @@ def test_two_concurrent_live_shims_same_repo_checkouts_replaced_root_and_reused_
 
         ev_dir = base / "owner-ev"
         ev_dir.mkdir(parents=True, exist_ok=True)
-        with spawn_observed_wheel_owner(inc2_installed_env, cfg_path, ev_dir, cwd=base) as owner:
+        with _spawn_positive_observed_owner(inc2_installed_env, cfg_path, ev_dir, cwd=base) as owner:
             # Open TWO shims CONCURRENTLY (same repo, two checkouts; plus third principal bob).
             with (
                 InstalledMcpPipeSession(
-                    inc2_installed_env, "brain-mcp", ["--profile", str(prof_a)], cwd=chk_a
+                    inc2_installed_env,
+                    "brain-mcp",
+                    ["--profile", str(prof_a)],
+                    cwd=chk_a,
+                    extra_env=owner.client_readiness_env,
                 ) as sess_a,
                 InstalledMcpPipeSession(
-                    inc2_installed_env, "brain-mcp", ["--profile", str(prof_a2)], cwd=chk_a2
+                    inc2_installed_env,
+                    "brain-mcp",
+                    ["--profile", str(prof_a2)],
+                    cwd=chk_a2,
+                    extra_env=owner.client_readiness_env,
                 ) as sess_a2,
                 InstalledMcpPipeSession(
-                    inc2_installed_env, "brain-mcp", ["--profile", str(prof_bob)], cwd=outside_cwd
+                    inc2_installed_env,
+                    "brain-mcp",
+                    ["--profile", str(prof_bob)],
+                    cwd=outside_cwd,
+                    extra_env=owner.client_readiness_env,
                 ) as sess_bob,
             ):
                 sess_a.send_frames_and_expect_response(mcp_init_frames(1))
@@ -2739,8 +2780,10 @@ def test_two_concurrent_live_shims_same_repo_checkouts_replaced_root_and_reused_
             )
             ev_rep_dir = base / "owner-ev-rep"
             ev_rep_dir.mkdir(parents=True, exist_ok=True)
-            with spawn_observed_wheel_owner(inc2_installed_env, cfg_replaced, ev_rep_dir, cwd=base) as owner_rep:
-                r_rep, l_rep, w_rep, tr0, tr1 = _invoke_wheel_shim_health(inc2_installed_env, prof_rep, cwd=base)
+            with _spawn_positive_observed_owner(inc2_installed_env, cfg_replaced, ev_rep_dir, cwd=base) as owner_rep:
+                r_rep, l_rep, w_rep, tr0, tr1 = _invoke_wheel_shim_health(
+                    inc2_installed_env, prof_rep, cwd=base, readiness_env=owner_rep.client_readiness_env
+                )
             probe_rep, reg_rep, obs_rep = _build_wheel_probe_and_obs(
                 env=inc2_installed_env,
                 owner=owner_rep,
@@ -3871,9 +3914,13 @@ def test_wheel_probe_builder_avoids_toctou_when_owner_jsonl_grows_mid_build(
             },
         )
         ev_dir = case_dir / "owner-ev"
-        with spawn_observed_wheel_owner(inc2_installed_env, cfg_path, ev_dir, cwd=outside_cwd) as owner:
+        with _spawn_positive_observed_owner(inc2_installed_env, cfg_path, ev_dir, cwd=outside_cwd) as owner:
             with InstalledMcpPipeSession(
-                inc2_installed_env, "brain", ("mcp", "--profile", str(prof_path)), cwd=chk_a
+                inc2_installed_env,
+                "brain",
+                ("mcp", "--profile", str(prof_path)),
+                cwd=chk_a,
+                extra_env=owner.client_readiness_env,
             ) as sess:
                 sess.send_frames_and_expect_response(mcp_init_frames(1))
                 st = _utc_now_z()

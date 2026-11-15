@@ -1,5 +1,6 @@
 """The gate receipt accepts only a complete, source-bound, fully-accounted run."""
 
+import errno
 import inspect
 import json
 import math
@@ -7,6 +8,7 @@ import os
 import platform
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1440,7 +1442,8 @@ def test_shard_file_partition_is_complete_disjoint_and_deterministic(shards: int
     [
         ("win32", 1, 1),
         ("win32", 2, 2),
-        ("win32", 4, 4),
+        ("win32", 4, 2),
+        ("win32", 8, 4),
         ("win32", 16, 4),
         ("win32", None, 1),
         ("win32", 0, 1),
@@ -1891,9 +1894,11 @@ def test_shard_files_staggers_storage_vs_non_storage_io() -> None:
     ]
     non_storage_files = [
         "tests/integration/test_kernel_daemon.py",
-        "tests/application/test_kernel_deadlines.py",
+        "tests/architecture/test_gate_receipt.py",
         "tests/application/test_kernel_send_attempts.py",
-        "tests/core/test_canonical.py",
+        "tests/application/test_kernel_deadlines.py",
+        "tests/application/test_t8_review_p01_wrapped_paths.py",
+        "tests/application/test_t8_review_p01_r2_edge_globs.py",
     ]
     inventory = [f"{path}::test_case" for path in (*wheel_files, *storage_files, *non_storage_files)]
     groups = gate.shard_files(inventory, 4)
@@ -1980,3 +1985,369 @@ def test_gate_wheel_fixture_files_and_weights_stay_aligned_with_tests() -> None:
     assert not four_groups[2][0].startswith("tests/storage/"), four_groups[2][:3]
     assert not four_groups[3][0].startswith("tests/storage/"), four_groups[3][:3]
     assert gate.shard_files(ALL_SHARD_IDS, 2) == [["t/test_a.py"], ["t/test_b.py"]]
+
+
+def _init_temp_git_repo(repo: Path) -> str:
+    """Create a tiny local git repository and return its HEAD commit SHA."""
+    repo.mkdir(parents=True, exist_ok=True)
+    for args in (
+        ("init", "-q"),
+        ("config", "core.autocrlf", "false"),
+        ("config", "commit.gpgSign", "false"),
+        ("config", "user.name", "Gate Cleanup Test"),
+        ("config", "user.email", "cleanup@example.invalid"),
+    ):
+        subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, text=True, timeout=20)
+    (repo / "tracked.txt").write_text("baseline\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "tracked.txt"], check=True, capture_output=True, timeout=20)
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-qm", "init"],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    return subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True, timeout=20).strip()
+
+
+def test_remove_gate_worktree_drops_real_owned_checkout_and_preserves_sentinels(tmp_path: Path) -> None:
+    """Ordinary cleanup removes owned physical worktree + git registration while leaving siblings untouched."""
+    remove_fn = getattr(gate, "_remove_gate_worktree", None)
+    identity_fn = getattr(gate, "_worktree_identity", None)
+    assert callable(remove_fn) and callable(identity_fn)
+
+    base = tmp_path.resolve(strict=True)
+    repo = base / "repo"
+    allocator = base / "allocator"
+    outside = base / "outside"
+    allocator.mkdir()
+    outside.mkdir()
+    head_sha = _init_temp_git_repo(repo)
+
+    sibling = allocator / "sibling-worktree"
+    sibling.mkdir()
+    sentinels = (sibling / "sibling.txt", outside / "outside.txt")
+    for p in sentinels:
+        p.write_bytes(b"preserve me\n")
+    before = {p: (p.read_bytes(), p.stat().st_ino) for p in sentinels}
+
+    wt = allocator / "gate-owned-wt"
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "--detach", str(wt), head_sha],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    wt_id = identity_fn(wt, allocator)
+    remove_fn(repo, wt, allocator, wt_id)
+
+    assert not wt.exists()
+    listed = subprocess.check_output(
+        ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+        text=True,
+        timeout=20,
+    )
+    paths = [
+        Path(line.removeprefix("worktree ")).resolve()
+        for line in listed.splitlines()
+        if line.startswith("worktree ")
+    ]
+    assert paths == [repo]
+    for p, (content, inode) in before.items():
+        assert p.read_bytes() == content and p.stat().st_ino == inode
+
+
+@pytest.mark.parametrize("err_kind", ["permission_error", "winerror_5", "winerror_32"])
+def test_remove_gate_worktree_unregistered_win32_orphan_retries_transient_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, err_kind: str
+) -> None:
+    """Recoverable unregistered win32 leftover removes cleanly after bounded transient retries."""
+    remove_fn = getattr(gate, "_remove_gate_worktree", None)
+    identity_fn = getattr(gate, "_worktree_identity", None)
+    assert callable(remove_fn) and callable(identity_fn)
+
+    class _WinAccessDeniedError(OSError):
+        winerror = 5
+
+    class _WinSharingViolationError(OSError):
+        winerror = 32
+
+    base = tmp_path.resolve(strict=True)
+    repo = base / "repo"
+    repo.mkdir()
+    allocator = base / "allocator"
+    allocator.mkdir()
+    wt = allocator / "orphan-wt"
+    wt.mkdir()
+    (wt / "held.txt").write_text("transient lock\n", encoding="utf-8")
+    sibling = allocator / "sibling"
+    sibling.mkdir()
+    (sibling / "ok.txt").write_text("intact\n", encoding="utf-8")
+    wt_id = identity_fn(wt, allocator)
+
+    def _fake_run(argv: Sequence[str], *, cwd: Path, timeout_s: float = 120.0) -> tuple[int, str, float]:
+        if argv[3:5] == ["worktree", "remove"]:
+            return 255, "fatal: failed to remove worktree", 0.01
+        if argv[3:5] == ["worktree", "list"]:
+            return 0, f"worktree {repo}\x00HEAD deadbeef\x00\x00", 0.01
+        raise AssertionError(f"unexpected git command: {argv}")
+
+    real_rmtree = shutil.rmtree
+    attempts = 0
+
+    def _flaky_rmtree(path: str | Path, *args: Any, **kwargs: Any) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts <= 2:
+            if err_kind == "winerror_5":
+                raise _WinAccessDeniedError(errno.EACCES, "Access is denied")
+            if err_kind == "winerror_32":
+                raise _WinSharingViolationError(errno.EACCES, "The process cannot access the file")
+            raise PermissionError(errno.EACCES, "sharing violation")
+        real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(gate, "run", _fake_run)
+    monkeypatch.setattr(shutil, "rmtree", _flaky_rmtree)
+
+    t0 = time.monotonic()
+    remove_fn(repo, wt, allocator, wt_id)
+    elapsed = time.monotonic() - t0
+
+    assert attempts == 3
+    assert elapsed < 0.5
+    assert not wt.exists()
+    assert (sibling / "ok.txt").read_text(encoding="utf-8") == "intact\n"
+
+
+def test_remove_gate_worktree_persistent_lock_fails_fast_and_preserves_phase_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Persistent lock refuses acceptance cleanly within 0.2s retry budget and preserves failed phase receipt."""
+    remove_fn = getattr(gate, "_remove_gate_worktree", None)
+    identity_fn = getattr(gate, "_worktree_identity", None)
+    assert callable(remove_fn) and callable(identity_fn)
+
+    base = tmp_path.resolve(strict=True)
+    repo = base / "repo"
+    repo.mkdir()
+    allocator = base / "allocator"
+    allocator.mkdir()
+    wt = allocator / "locked-wt"
+    wt.mkdir()
+    (wt / "locked.txt").write_text("still locked\n", encoding="utf-8")
+    wt_id = identity_fn(wt, allocator)
+
+    def _fake_run(argv: Sequence[str], *, cwd: Path, timeout_s: float = 120.0) -> tuple[int, str, float]:
+        if argv[3:5] == ["worktree", "remove"]:
+            return 255, "fatal: cannot delete locked worktree", 0.01
+        if argv[3:5] == ["worktree", "list"]:
+            return 0, f"worktree {repo}\x00HEAD deadbeef\x00\x00", 0.01
+        raise AssertionError(f"unexpected git command: {argv}")
+
+    attempts = 0
+    sleep_delays: list[float] = []
+
+    def _always_locked(_path: str | Path, *args: Any, **kwargs: Any) -> None:
+        nonlocal attempts
+        attempts += 1
+        raise PermissionError(errno.EACCES, "persistent lock")
+
+    with monkeypatch.context() as mp:
+        mp.setattr(sys, "platform", "win32")
+        mp.setattr(gate, "run", _fake_run)
+        mp.setattr(shutil, "rmtree", _always_locked)
+        mp.setattr(time, "sleep", sleep_delays.append)
+
+        with pytest.raises(
+            RuntimeError,
+            match="fatal: cannot delete locked worktree.*fallback rmtree failed: .*persistent lock",
+        ):
+            remove_fn(repo, wt, allocator, wt_id)
+
+    assert attempts == 5
+    assert sum(sleep_delays) <= 0.20 + 1e-9
+    assert (wt / "locked.txt").read_text(encoding="utf-8") == "still locked\n"
+
+    # End-to-end receipt guard: persistent cleanup error does not hide failed phase outcome.
+    e2e_base = (base / "e2e").resolve()
+    e2e_base.mkdir()
+    fake = FakeRunner(e2e_base, codes={"pytest": 1}, remove_fails=True)
+    receipt = run_with(e2e_base, monkeypatch, fake)
+    assert receipt["accepted"] is False
+    pytest_phase = next(p for p in receipt["phases"] if p["name"] == "pytest")
+    assert pytest_phase["exit_code"] == 1
+    reasons = [str(r) for r in receipt["reasons"]]
+    assert any("phase pytest exited with 1" in r for r in reasons)
+    assert any("not removed" in r for r in reasons)
+
+
+def test_remove_gate_worktree_refuses_replaced_reparse_outside_or_registered_targets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Safety guards block rmtree on replaced inode, mid-fallback swap, reparse/outside path, or registered dir."""
+    remove_fn = getattr(gate, "_remove_gate_worktree", None)
+    identity_fn = getattr(gate, "_worktree_identity", None)
+    registered_fn = getattr(gate, "_is_worktree_registered", None)
+    assert callable(remove_fn) and callable(identity_fn) and callable(registered_fn)
+
+    base = tmp_path.resolve(strict=True)
+    repo = base / "repo"
+    repo.mkdir()
+    allocator = base / "allocator"
+    outside = base / "outside"
+    allocator.mkdir()
+    outside.mkdir()
+
+    rmtree_calls: list[Path] = []
+    monkeypatch.setattr(shutil, "rmtree", lambda p, *_a, **_kw: rmtree_calls.append(Path(p)))
+    monkeypatch.setattr(sys, "platform", "win32")
+
+    # 1. Replaced directory at exact same spelling BEFORE git worktree remove runs.
+    wt = allocator / "wt-replaced"
+    wt.mkdir()
+    orig_id = identity_fn(wt, allocator)
+    retained = allocator / "wt-retained"
+    wt.rename(retained)
+    wt.mkdir()
+    (wt / "new-owner.txt").write_text("unrelated\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="refused to remove replaced or unverified worktree"):
+        remove_fn(repo, wt, allocator, orig_id)
+    assert (wt / "new-owner.txt").read_text(encoding="utf-8") == "unrelated\n"
+    assert retained.is_dir() and rmtree_calls == []
+
+    # 2. Replaced directory between failed `git worktree remove` and fallback `rmtree`.
+    wt_swap = allocator / "wt-swap"
+    wt_swap.mkdir()
+    swap_id = identity_fn(wt_swap, allocator)
+    swapped_to = allocator / "wt-swapped-orig"
+
+    def _swap_during_remove(argv: Sequence[str], *, cwd: Path, timeout_s: float = 120.0) -> tuple[int, str, float]:
+        if argv[3:5] == ["worktree", "remove"]:
+            wt_swap.rename(swapped_to)
+            wt_swap.mkdir()
+            (wt_swap / "victim.txt").write_text("must survive\n", encoding="utf-8")
+            return 255, "fatal: remove failed", 0.01
+        raise AssertionError(f"unexpected git command: {argv}")
+
+    with monkeypatch.context() as mp:
+        mp.setattr(gate, "run", _swap_during_remove)
+        with pytest.raises(RuntimeError, match="refused fallback removal of replaced worktree"):
+            remove_fn(repo, wt_swap, allocator, swap_id)
+    assert (wt_swap / "victim.txt").read_text(encoding="utf-8") == "must survive\n"
+    assert swapped_to.is_dir() and rmtree_calls == []
+
+    # 2b. Replaced directory between transient rmtree attempt 1 and attempt 2.
+    wt_swap_retry = allocator / "wt-swap-retry"
+    wt_swap_retry.mkdir()
+    retry_swap_id = identity_fn(wt_swap_retry, allocator)
+    retry_swapped_to = allocator / "wt-swapped-retry-orig"
+    retry_rmtree_calls: list[Path] = []
+
+    def _run_unregistered_swap(argv: Sequence[str], *, cwd: Path, timeout_s: float = 120.0) -> tuple[int, str, float]:
+        if argv[3:5] == ["worktree", "remove"]:
+            return 255, "fatal: remove failed", 0.01
+        if argv[3:6] == ["worktree", "list", "--porcelain"]:
+            return 0, f"worktree {repo.resolve()}\nHEAD {'0' * 40}\n", 0.01
+        raise AssertionError(f"unexpected git command: {argv}")
+
+    def _rmtree_swap_after_attempt_1(path: os.PathLike[str] | str, *_a: object, **_kw: object) -> None:
+        retry_rmtree_calls.append(Path(path))
+        if len(retry_rmtree_calls) == 1:
+            wt_swap_retry.rename(retry_swapped_to)
+            wt_swap_retry.mkdir()
+            (wt_swap_retry / "victim.txt").write_text("must survive retry\n", encoding="utf-8")
+            raise PermissionError(13, "transient access denied", str(path))
+        raise AssertionError(f"unexpected second rmtree call on replaced path: {path}")
+
+    with monkeypatch.context() as mp:
+        mp.setattr(gate, "run", _run_unregistered_swap)
+        mp.setattr(shutil, "rmtree", _rmtree_swap_after_attempt_1)
+        with pytest.raises(RuntimeError, match="refused fallback removal of replaced worktree"):
+            remove_fn(repo, wt_swap_retry, allocator, retry_swap_id)
+    assert (wt_swap_retry / "victim.txt").read_text(encoding="utf-8") == "must survive retry\n"
+    assert retry_swapped_to.is_dir() and len(retry_rmtree_calls) == 1
+
+    # 3. Outside directory and reparse-point attribute rejected by _worktree_identity.
+    outside_wt = outside / "escape"
+    outside_wt.mkdir()
+    with pytest.raises(OSError, match="escaped allocator"):
+        identity_fn(outside_wt, allocator)
+
+    wt_rep = allocator / "reparse-wt"
+    wt_rep.mkdir()
+    orig_lstat = wt_rep.lstat()
+
+    class _FakeReparseStat:
+        st_mode = orig_lstat.st_mode
+        st_dev = orig_lstat.st_dev
+        st_ino = orig_lstat.st_ino
+        st_file_attributes = stat.FILE_ATTRIBUTE_REPARSE_POINT
+
+    with monkeypatch.context() as mp:
+        mp.setattr(Path, "lstat", lambda self: _FakeReparseStat() if self == wt_rep else os.lstat(self))
+        with pytest.raises(OSError, match="reparse point"):
+            identity_fn(wt_rep, allocator)
+
+    # 4. Empty/non-porcelain worktree list fails closed (still registered -> no rmtree fallback).
+    wt_reg = allocator / "still-reg"
+    wt_reg.mkdir()
+    reg_id = identity_fn(wt_reg, allocator)
+
+    def _run_empty_list(argv: Sequence[str], *, cwd: Path, timeout_s: float = 120.0) -> tuple[int, str, float]:
+        if argv[3:5] == ["worktree", "remove"]:
+            return 255, "remove refused", 0.01
+        if argv[3:5] == ["worktree", "list"]:
+            return 0, "", 0.01
+        raise AssertionError(f"unexpected git command: {argv}")
+
+    with monkeypatch.context() as mp:
+        mp.setattr(gate, "run", _run_empty_list)
+        assert registered_fn(repo, wt_reg) is True
+        with pytest.raises(RuntimeError, match="remove refused"):
+            remove_fn(repo, wt_reg, allocator, reg_id)
+    assert rmtree_calls == [] and wt_reg.is_dir()
+
+
+def test_is_worktree_registered_tolerates_broken_unrelated_worktree_entries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unrelated broken entry in `git worktree list` never crashes cleanup check for the owned checkout."""
+    registered_fn = getattr(gate, "_is_worktree_registered", None)
+    assert callable(registered_fn)
+
+    base = tmp_path.resolve(strict=True)
+    repo = base / "repo"
+    repo.mkdir()
+    broken = base / "missing-worktree-entry"
+    owned = base / "allocator" / "owned-wt"
+    owned.parent.mkdir()
+    owned.mkdir()
+
+    def _run_with_broken(argv: Sequence[str], *, cwd: Path, timeout_s: float = 120.0) -> tuple[int, str, float]:
+        if argv[3:5] == ["worktree", "list"]:
+            payload = (
+                f"worktree {repo}\x00HEAD aaa\x00\x00"
+                f"worktree {broken}\x00HEAD bbb\x00prunable gitdir file points to non-existent location\x00\x00"
+            )
+            return 0, payload, 0.01
+        raise AssertionError(f"unexpected git command: {argv}")
+
+    monkeypatch.setattr(gate, "run", _run_with_broken)
+    assert registered_fn(repo, owned) is False
+
+    def _run_with_broken_and_owned(
+        argv: Sequence[str], *, cwd: Path, timeout_s: float = 120.0
+    ) -> tuple[int, str, float]:
+        if argv[3:5] == ["worktree", "list"]:
+            payload = (
+                f"worktree {repo}\x00HEAD aaa\x00\x00"
+                f"worktree {broken}\x00HEAD bbb\x00prunable\x00\x00"
+                f"worktree {owned}\x00HEAD ccc\x00\x00"
+            )
+            return 0, payload, 0.01
+        raise AssertionError(f"unexpected git command: {argv}")
+
+    monkeypatch.setattr(gate, "run", _run_with_broken_and_owned)
+    assert registered_fn(repo, owned) is True

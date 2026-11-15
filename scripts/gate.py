@@ -17,6 +17,8 @@ import math
 import os
 import platform as host_platform
 import re
+import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -52,8 +54,9 @@ SYNC_TIMEOUT_S = 600.0
 COLLECT_TIMEOUT_S = 300.0
 def default_pytest_shards(platform_name: str = sys.platform, cpu_count: int | None = None) -> int:
     """Return the platform default pytest shard count."""
-    del platform_name
     cpus = max(1, (os.cpu_count() if cpu_count is None else cpu_count) or 1)
+    if platform_name == "win32" and cpus <= 4:
+        return min(2, cpus)
     return min(4, cpus)
 
 
@@ -269,7 +272,7 @@ def parse_collected(text: str) -> list[str]:
     return ids
 
 
-_WHEEL_SETUP_COST_MS = 18_000
+_WHEEL_SETUP_COST_MS = 2_000
 _DEFAULT_CASE_COST_MS = 20
 _WHEEL_FIXTURE_FILES: frozenset[str] = frozenset(
     {
@@ -283,90 +286,151 @@ _WHEEL_FIXTURE_FILES: frozenset[str] = frozenset(
         "tests/integration/test_t9_benchmark_scratch.py",
     }
 )
-# Calibrated Windows CI file costs (R31 run 43658639712 baseline weights, keeping
-# top_three_non_wheel separated while balancing LPT buckets and isolating 18s wheel setup onto Shard 0).
+# Calibrated across all 142 test files from R39 windows-2022 CI 3.14 and local Windows 3.11.9 timings
+# (0.60/0.40 ci/local blend for wheel files, 0.75/0.25 for non-wheel files; 2s non-testcase wheel session overhead).
 _HEAVY_FILE_COST_MS: dict[str, int] = {
-    "tests/storage/test_backup.py": 48500,
-    "tests/storage/test_kernel_revocation.py": 48000,
-    "tests/integration/test_kernel_daemon.py": 45500,
-    "tests/integration/test_kernel_crash_recovery.py": 44107,
-    "tests/storage/test_remediation_i2_t3_lineage.py": 41881,
-    "tests/storage/test_restore.py": 38585,
-    "tests/storage/test_kernel_workspaces.py": 30990,
-    "tests/storage/test_kernel_idempotency.py": 29389,
-    "tests/storage/test_crash_matrix.py": 29331,
-    "tests/storage/test_ledger.py": 28000,
-    "tests/storage/test_kernel_migration.py": 25834,
-    "tests/storage/test_remediation_i2_t5.py": 25692,
-    "tests/storage/test_runtime.py": 23172,
-    "tests/storage/test_remediation_i2_os01.py": 22652,
-    "tests/storage/test_kernel_identity.py": 22014,
-    "tests/integration/test_kernel_native_receipt_contract.py": 21946,
-    "tests/storage/test_cas.py": 20909,
-    "tests/application/test_kernel_deadlines.py": 20817,
-    "tests/storage/test_migrate.py": 20065,
-    "tests/application/test_kernel_send_attempts.py": 19164,
-    "tests/integration/test_kernel_cli.py": 18919,
-    "tests/storage/test_kernel_jobs.py": 18235,
-    "tests/storage/test_remediation_i2_t4a.py": 17297,
-    "tests/integration/test_kernel_receipts.py": 17276,
-    "tests/storage/test_policy_store.py": 16292,
-    "tests/storage/test_reconcile.py": 14311,
-    "tests/storage/test_remediation_c02_r6_restore_marker.py": 14113,
-    "tests/application/test_t8_review_p01_r2_edge_globs.py": 12246,
-    "tests/application/test_t8_review_p01_wrapped_paths.py": 12040,
-    "tests/storage/test_retention.py": 11640,
-    "tests/architecture/test_gate_receipt.py": 11237,
-    "tests/storage/test_remediation_c04_r8_backup_files.py": 11232,
-    "tests/integration/test_kernel_transport.py": 11060,
-    "tests/integration/test_kernel_shim.py": 9979,
-    "tests/integration/test_kernel_privacy_persistence.py": 9898,
-    "tests/contract/test_mcp_v2_schema.py": 9891,
-    "tests/storage/test_remediation_c01_wal_admission.py": 9475,
-    "tests/storage/test_remediation_c04_r9_imported_backup_ancestors.py": 9174,
-    "tests/application/test_kernel_daemon_worker.py": 9136,
-    "tests/application/test_remediation_i2_t4bc.py": 8978,
-    "tests/storage/test_errors.py": 8587,
-    "tests/storage/test_remediation_c04_r6_backup_container_perms.py": 7425,
-    "tests/application/test_kernel_job_worker.py": 7053,
-    "tests/storage/test_remediation_c04_cas_shard_boundary.py": 7031,
-    "tests/application/test_t8_review_w01_canonical_reuse.py": 6390,
-    "tests/storage/test_cas_gc.py": 6141,
-    "tests/integration/test_t9_r22_stop_completion.py": 5298,
-    "tests/storage/test_remediation_c01_r4_reading_leftovers.py": 5295,
-    "tests/integration/test_kernel_serve_signal_lifecycle.py": 5246,
-    "tests/integration/test_kernel_performance.py": 4950,
-    "tests/storage/test_writer.py": 4932,
-    "tests/storage/test_remediation_c04_r2_cas_siblings.py": 4873,
-    "tests/storage/test_flush_routing.py": 4742,
-    "tests/integration/test_t9_signal_stop_conversion.py": 4638,
-    "tests/storage/test_remediation_c02_r8_restore_carryover.py": 4616,
-    "tests/support/test_bounded_worker.py": 4263,
-    "tests/application/test_t8_review_p01_r3_spellings.py": 3989,
-    "tests/architecture/test_remediation_c08_r11_raw_path_admission.py": 3980,
-    "tests/storage/test_remediation_c05_shard_parent_sync.py": 3903,
-    "tests/storage/test_remediation_c02_lost_main_db.py": 3866,
-    "tests/storage/test_swap.py": 3411,
-    "tests/integration/test_t9_startup_signal_latch.py": 3188,
-    "tests/storage/test_remediation_c02_r7_live_marker.py": 2789,
-    "tests/cli_api/test_t9_tcp_latency.py": 2727,
-    "tests/storage/test_remediation_c05_r2_resync.py": 2434,
-    "tests/integration/test_t9_r21_shutdown_wait.py": 2395,
-    "tests/storage/test_remediation_c02_r4_intents_signal.py": 2374,
-    "tests/storage/test_remediation_c01_r5_policy_wal_reader.py": 2149,
-    "tests/storage/test_remediation_i2_t3_mirror_history.py": 1989,
-    "tests/adapters/test_durable.py": 1848,
-    "tests/application/test_t8_review_p01_r4_oracle_fixes.py": 1721,
-    "tests/support/test_crash_harness.py": 1699,
-    "tests/application/test_t8_review_p01_n01_linear.py": 1656,
-    "tests/application/test_t8_review_p01_n04_short_spellings.py": 1653,
-    "tests/architecture/test_remediation_c06_gate_xpass.py": 1372,
-    "tests/application/test_t8_review_p01_n03_r2_inner_literals.py": 1228,
-    "tests/application/test_t8_closure_privacy_r2.py": 1146,
-    "tests/integration/test_t9_benchmark_scratch.py": 1051,
-    "tests/storage/test_remediation_i2_t5_residual.py": 1031,
-    "tests/application/test_t8_review_p01_n01_r2_edges.py": 1029,
-    "tests/application/test_t8_review_w01_private_equivalence.py": 1027,
+    "tests/storage/test_kernel_revocation.py": 60513,
+    "tests/integration/test_kernel_crash_recovery.py": 53089,
+    "tests/integration/test_kernel_daemon.py": 49531,
+    "tests/storage/test_backup.py": 39600,
+    "tests/storage/test_restore.py": 37536,
+    "tests/storage/test_remediation_i2_t3_lineage.py": 33011,
+    "tests/storage/test_crash_matrix.py": 31813,
+    "tests/integration/test_kernel_native_receipt_contract.py": 30901,
+    "tests/integration/test_kernel_cli.py": 23843,
+    "tests/storage/test_kernel_migration.py": 23429,
+    "tests/storage/test_ledger.py": 23216,
+    "tests/storage/test_runtime.py": 19607,
+    "tests/storage/test_cas.py": 19255,
+    "tests/storage/test_kernel_identity.py": 18926,
+    "tests/storage/test_remediation_i2_t5.py": 18716,
+    "tests/storage/test_kernel_idempotency.py": 17914,
+    "tests/storage/test_migrate.py": 17161,
+    "tests/storage/test_policy_store.py": 17082,
+    "tests/storage/test_remediation_i2_os01.py": 16895,
+    "tests/storage/test_kernel_workspaces.py": 16668,
+    "tests/architecture/test_gate_receipt.py": 15215,
+    "tests/application/test_kernel_send_attempts.py": 14887,
+    "tests/application/test_kernel_deadlines.py": 14060,
+    "tests/application/test_t8_review_p01_wrapped_paths.py": 13742,
+    "tests/integration/test_kernel_receipts.py": 13295,
+    "tests/application/test_t8_review_p01_r2_edge_globs.py": 12890,
+    "tests/storage/test_remediation_i2_t4a.py": 12071,
+    "tests/integration/test_kernel_transport.py": 10683,
+    "tests/storage/test_reconcile.py": 10666,
+    "tests/integration/test_kernel_shim.py": 10566,
+    "tests/application/test_kernel_job_worker.py": 9829,
+    "tests/storage/test_kernel_jobs.py": 9408,
+    "tests/integration/test_kernel_privacy_persistence.py": 8325,
+    "tests/contract/test_mcp_v2_schema.py": 7790,
+    "tests/application/test_kernel_daemon_worker.py": 6934,
+    "tests/storage/test_remediation_c04_r8_backup_files.py": 6831,
+    "tests/storage/test_remediation_c02_r6_restore_marker.py": 6048,
+    "tests/application/test_remediation_i2_t4bc.py": 5991,
+    "tests/storage/test_remediation_c04_r6_backup_container_perms.py": 5893,
+    "tests/integration/test_t9_signal_stop_conversion.py": 5830,
+    "tests/storage/test_writer.py": 5653,
+    "tests/storage/test_remediation_i2_t3_mirror_history.py": 5234,
+    "tests/application/test_t8_review_p01_r3_spellings.py": 5076,
+    "tests/storage/test_remediation_c04_cas_shard_boundary.py": 4909,
+    "tests/support/test_bounded_worker.py": 4903,
+    "tests/storage/test_swap.py": 4736,
+    "tests/storage/test_remediation_c01_wal_admission.py": 4652,
+    "tests/storage/test_errors.py": 4608,
+    "tests/storage/test_cas_gc.py": 4542,
+    "tests/integration/test_t9_r22_stop_completion.py": 4476,
+    "tests/application/test_t8_review_w01_canonical_reuse.py": 4349,
+    "tests/integration/test_kernel_serve_signal_lifecycle.py": 4280,
+    "tests/integration/test_kernel_performance.py": 3779,
+    "tests/storage/test_remediation_c01_r4_reading_leftovers.py": 3714,
+    "tests/storage/test_remediation_c02_r8_restore_carryover.py": 3638,
+    "tests/storage/test_flush_routing.py": 3551,
+    "tests/storage/test_remediation_c05_shard_parent_sync.py": 2976,
+    "tests/support/test_crash_harness.py": 2854,
+    "tests/architecture/test_remediation_c08_r11_raw_path_admission.py": 2634,
+    "tests/architecture/test_remediation_c06_gate_xpass.py": 2434,
+    "tests/storage/test_remediation_c04_r9_imported_backup_ancestors.py": 2298,
+    "tests/storage/test_retention.py": 2185,
+    "tests/integration/test_t9_startup_signal_latch.py": 2132,
+    "tests/application/test_remediation_i2_t5_worker.py": 2100,
+    "tests/application/test_t8_review_p01_n04_short_spellings.py": 1966,
+    "tests/storage/test_remediation_c01_r5_policy_wal_reader.py": 1810,
+    "tests/integration/test_t9_r21_shutdown_wait.py": 1770,
+    "tests/adapters/test_durable.py": 1769,
+    "tests/storage/test_remediation_c02_lost_main_db.py": 1691,
+    "tests/cli_api/test_t9_tcp_latency.py": 1665,
+    "tests/application/test_t8_review_p01_n01_linear.py": 1611,
+    "tests/application/test_t8_review_p01_n03_r2_inner_literals.py": 1584,
+    "tests/application/test_t8_closure_privacy_r2.py": 1574,
+    "tests/storage/test_remediation_c02_r7_live_marker.py": 1424,
+    "tests/integration/test_t9_signal_stop_guard.py": 1392,
+    "tests/integration/test_t9_client_sighting.py": 1381,
+    "tests/storage/test_remediation_i2_t5_residual.py": 1272,
+    "tests/application/test_t8_review_p01_n01_r2_edges.py": 1247,
+    "tests/adapters/test_client_profile.py": 1233,
+    "tests/architecture/test_imports.py": 1190,
+    "tests/storage/test_remediation_c04_r2_cas_siblings.py": 1102,
+    "tests/integration/test_t9_benchmark_scratch.py": 1095,
+    "tests/application/test_t8_review_w02_private_large_blocks.py": 1070,
+    "tests/architecture/test_t8_review_w02_canonical_payload_source.py": 1069,
+    "tests/application/test_t8_review_p01_n03_edge_cost.py": 1038,
+    "tests/storage/test_schema.py": 1026,
+    "tests/storage/test_remediation_c05_r2_resync.py": 916,
+    "tests/application/test_t8_closure_privacy.py": 897,
+    "tests/storage/test_remediation_c04_r5_backup_cas_link.py": 867,
+    "tests/architecture/test_remediation_c08_r13_unavailable_drive.py": 832,
+    "tests/architecture/test_t9_ci_checkout_bytes.py": 742,
+    "tests/application/test_t8_review_w01_private_equivalence.py": 737,
+    "tests/architecture/test_remediation_i2_os01.py": 677,
+    "tests/application/test_t8_review_p01_r4_oracle_fixes.py": 593,
+    "tests/cli_api/test_loopback_client.py": 591,
+    "tests/application/test_t8_privacy_performance_equivalence.py": 566,
+    "tests/application/test_kernel_privacy.py": 545,
+    "tests/storage/test_layout.py": 544,
+    "tests/storage/test_remediation_c03_handler_downgrade.py": 481,
+    "tests/support/test_inc2_process_cleanup.py": 464,
+    "tests/storage/test_remediation_c02_r4_intents_signal.py": 406,
+    "tests/core/test_faults.py": 343,
+    "tests/architecture/test_t9_ci_seal.py": 321,
+    "tests/core/test_ids.py": 308,
+    "tests/mcp/test_stdio.py": 266,
+    "tests/application/test_t8_closure_privacy_r2_gates.py": 259,
+    "tests/storage/test_t9_endpoint_casefold.py": 257,
+    "tests/cli_api/test_loopback_frames.py": 165,
+    "tests/storage/test_t9_reserved_sibling_casefold.py": 164,
+    "tests/application/test_t9_privacy_non_retention.py": 152,
+    "tests/application/test_t8_closure_privacy_r5_shapes.py": 125,
+    "tests/architecture/test_remediation_c08_r6_root_itself.py": 113,
+    "tests/cli_api/test_t8_closure_wire.py": 107,
+    "tests/storage/test_kinds.py": 96,
+    "tests/architecture/test_remediation_c08_r9_missing_root_linked_parent.py": 91,
+    "tests/application/test_t8_closure_privacy_r5_paths.py": 84,
+    "tests/architecture/test_remediation_c08_r8_root_links.py": 68,
+    "tests/architecture/test_remediation_c08_r4_preflight_failures.py": 61,
+    "tests/integration/test_t9_libproc_client_pid.py": 61,
+    "tests/architecture/test_remediation_c08_gate_environment.py": 59,
+    "tests/composition/test_client_scope.py": 58,
+    "tests/integration/test_t8_closure_perf_probe_r5.py": 58,
+    "tests/application/test_t8_review_r01_path_enforcement.py": 57,
+    "tests/application/test_remediation_i2_t3_privacy.py": 54,
+    "tests/adapters/test_paths.py": 53,
+    "tests/adapters/test_permissions.py": 53,
+    "tests/application/test_t8_closure_privacy_r4_literals.py": 28,
+    "tests/architecture/test_remediation_c08_r2_real_probe.py": 22,
+    "tests/application/test_t8_closure_prequeue.py": 16,
+    "tests/application/test_t8_review_p02_rule_gates.py": 13,
+    "tests/storage/test_t9_checkout_spelling.py": 13,
+    "tests/application/test_kernel_lineage.py": 12,
+    "tests/integration/test_t8_review_20261112_perf_attribution.py": 12,
+    "tests/support/test_fs.py": 12,
+    "tests/application/test_t8_closure_privacy_r3_casefold.py": 10,
+    "tests/integration/test_t8_closure_perf_probe.py": 10,
+    "tests/core/test_t8_closure_normalize.py": 9,
+    "tests/integration/test_t8_review_20261112_perf_replay.py": 9,
+    "tests/integration/test_t9_process_sighting.py": 9,
+    "tests/core/test_canonical.py": 8,
+    "tests/application/test_t8_review_p02_r2_rule_discovery.py": 1,
+    "tests/integration/test_t9_linux_scan_budget.py": 1,
 }
 
 
@@ -584,11 +648,97 @@ def run(cmd: Sequence[str], *, cwd: Path, timeout_s: float) -> tuple[int | None,
         return None, (output or "") + kill_note, time.monotonic() - began
 
 
+_TRANSIENT_CLEANUP_SLEEP_S: tuple[float, ...] = (0.02, 0.04, 0.06, 0.06)
+_TRANSIENT_WINERRORS: frozenset[int] = frozenset({5, 32})
+
+
 def _git(repo: Path, *args: str) -> str:
     code, output, _ = run(["git", "-C", str(repo), *args], cwd=repo, timeout_s=GIT_TIMEOUT_S)
     if code != 0:
         raise RuntimeError(f"git {' '.join(args)} failed ({code}): {output.strip()}")
     return output
+
+
+def _worktree_identity(worktree: Path, allocator: Path) -> tuple[int, int]:
+    """Return ``(st_dev, st_ino)`` if ``worktree`` is a physical non-reparse child of ``allocator``."""
+    info = worktree.lstat()
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    if getattr(info, "st_file_attributes", 0) & reparse_flag:
+        raise OSError(f"worktree is a Windows reparse point: {worktree}")
+    if not stat.S_ISDIR(info.st_mode):
+        raise OSError(f"worktree is not a directory: {worktree}")
+    if worktree.parent != allocator or worktree.resolve(strict=True) != worktree:
+        raise OSError(f"worktree escaped allocator {allocator}: {worktree}")
+    return (info.st_dev, info.st_ino)
+
+
+def _is_worktree_registered(repo: Path, worktree: Path) -> bool:
+    """Return ``True`` if ``worktree`` is still registered (or listing cannot prove otherwise)."""
+    output = _git(repo, "worktree", "list", "--porcelain", "-z")
+    raw_paths = [field.removeprefix("worktree ") for field in output.split("\x00") if field.startswith("worktree ")]
+    if not raw_paths:  # fail closed on empty/non-porcelain output (e.g. mocked runners)
+        return True
+    target_keys = {os.path.normcase(os.path.normpath(os.fspath(worktree)))}
+    try:
+        target_keys.add(os.path.normcase(os.path.normpath(os.fspath(worktree.resolve(strict=True)))))
+    except OSError:
+        pass
+    for raw in raw_paths:
+        entry = Path(raw)
+        candidates = [entry]
+        try:
+            candidates.append(entry.resolve(strict=True))
+        except OSError:
+            pass
+        for candidate in candidates:
+            if os.path.normcase(os.path.normpath(os.fspath(candidate))) in target_keys:
+                return True
+    return False
+
+
+def _is_transient_cleanup_error(err: OSError) -> bool:
+    return isinstance(err, PermissionError) or getattr(err, "winerror", None) in _TRANSIENT_WINERRORS
+
+
+def _remove_gate_worktree(
+    repo: Path, worktree: Path, allocator: Path, worktree_id: tuple[int, int] | None
+) -> None:
+    """Remove only the original physical worktree directory owned by this gate attempt."""
+    if not os.path.lexists(worktree):
+        _git(repo, "worktree", "prune")
+        return
+    if worktree_id is None or _worktree_identity(worktree, allocator) != worktree_id:
+        raise RuntimeError(f"refused to remove replaced or unverified worktree {worktree}")
+    try:
+        _git(repo, "worktree", "remove", "--force", str(worktree))
+        return
+    except RuntimeError as err:
+        if not os.path.lexists(worktree):
+            _git(repo, "worktree", "prune")
+            return
+        if _worktree_identity(worktree, allocator) != worktree_id:
+            raise RuntimeError(f"refused fallback removal of replaced worktree {worktree}: {err}") from err
+        if sys.platform != "win32" or _is_worktree_registered(repo, worktree):
+            raise
+        deadline = time.monotonic() + 0.18
+        delays = iter(_TRANSIENT_CLEANUP_SLEEP_S)
+        while True:
+            if not os.path.lexists(worktree):
+                _git(repo, "worktree", "prune")
+                return
+            if _worktree_identity(worktree, allocator) != worktree_id:
+                raise RuntimeError(f"refused fallback removal of replaced worktree {worktree}: {err}") from err
+            try:
+                shutil.rmtree(worktree)
+                return
+            except OSError as rm_err:
+                if not _is_transient_cleanup_error(rm_err):
+                    raise RuntimeError(f"{err}; fallback rmtree failed: {rm_err}") from rm_err
+                delay = next(delays, None)
+                remaining = deadline - time.monotonic()
+                if delay is None or remaining <= 0:
+                    raise RuntimeError(f"{err}; fallback rmtree failed: {rm_err}") from rm_err
+                time.sleep(min(delay, remaining))
 
 
 def tree_is_clean(repo: Path) -> bool:
@@ -724,7 +874,8 @@ def run_gate(
             })
         return code, output, seconds, error
 
-    worktree = Path(tempfile.gettempdir()) / f"superbrain-gate-{uuid.uuid4().hex[:12]}"
+    allocator = Path(tempfile.gettempdir()).resolve()
+    worktree = allocator / f"superbrain-gate-{uuid.uuid4().hex[:12]}"
     extra: list[str] = []
     log: list[str] = []
     phases: list[PhaseResult] = []
@@ -736,6 +887,7 @@ def run_gate(
     end: SourceIdentity | None = None
     resolved: str | None = None
     created = False
+    worktree_id: tuple[int, int] | None = None
     cleanup_error: str | None = None
     junit = worktree.parent / f"{worktree.name}-junit.xml"
     junit_paths = [junit]
@@ -850,6 +1002,7 @@ def run_gate(
             resolved = _git(repo, "rev-parse", "HEAD").strip()
             _git(repo, "worktree", "add", "--detach", str(worktree), resolved)
             created = True
+            worktree_id = _worktree_identity(worktree, allocator)
             start = source_identity(worktree)
         except (RuntimeError, OSError) as err:
             extra.append(f"source identity could not be read at start: {type(err).__name__}: {err}")
@@ -960,10 +1113,7 @@ def run_gate(
                 extra.append(f"junit temp file was not removed: {err}")
         if created:
             try:
-                if worktree.exists():
-                    _git(repo, "worktree", "remove", "--force", str(worktree))
-                else:  # the worktree disappeared during the run: drop git's record of it
-                    _git(repo, "worktree", "prune")
+                _remove_gate_worktree(repo, worktree, allocator, worktree_id)
             except (RuntimeError, OSError) as err:
                 cleanup_error = str(err)
 

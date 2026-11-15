@@ -10,9 +10,13 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hmac
+import ipaddress
 import itertools
+import json
 import os
 import queue
+import secrets
 import shutil
 import signal
 import socket
@@ -22,9 +26,9 @@ import sys
 import threading
 import time
 from collections import deque
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -52,6 +56,12 @@ __all__ = [
 ]
 
 
+_READINESS_ENV_VAR = "SUPERBRAIN_TEST_SOCKET_READINESS"
+_OWNER_READINESS_TOKEN_ENV = "_SUPERBRAIN_OWNER_SOCKET_READINESS_TOKEN"
+_READINESS_PATH = "/__test_socket_readiness"
+_MAX_READINESS_BODY_BYTES = 4096
+
+
 @dataclass(frozen=True)
 class ObservedWheelOwner:
     process_identity: ProcessIdentity
@@ -62,6 +72,7 @@ class ObservedWheelOwner:
     module_file: str
     schema_sha256: str
     evidence_dir: Path
+    client_readiness_env: Mapping[str, str] = field(default_factory=dict)
 
 
 def _init_real_win32_dll_cls() -> Any:
@@ -259,11 +270,61 @@ def process_started_at_for_pid(pid: int) -> str:
 _LINUX_PROC_ROOT = Path("/proc")
 
 
-def _parse_proc_net_tcp_inode(text: str, *, client_port: int, listen_port: int, ipv6: bool = False) -> int | None:
-    """Return socket inode for loopback ``127.0.0.1:client_port -> 127.0.0.1:listen_port`` from ``/proc/net/tcp*``."""
-    addr_hex = "0000000000000000FFFF00000100007F" if ipv6 else "0100007F"
-    local_target = f"{addr_hex}:{client_port:04X}"
-    remote_target = f"{addr_hex}:{listen_port:04X}"
+def _normalize_ip_addr(host: str) -> str:
+    text = host.strip()
+    if text.startswith("[") and text.endswith("]"):
+        text = text[1:-1]
+    try:
+        addr = ipaddress.ip_address(text)
+    except ValueError:
+        return text.lower()
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+        return str(addr.ipv4_mapped)
+    return str(addr)
+
+
+def _format_host_header(ip_str: str, port: int) -> str:
+    if ":" in ip_str:
+        return f"[{ip_str}]:{port}"
+    return f"{ip_str}:{port}"
+
+
+def _ip_hex_proc_net_tcp(ip_str: str, *, ipv6: bool) -> str | None:
+    try:
+        addr = ipaddress.ip_address(_normalize_ip_addr(ip_str))
+    except ValueError:
+        return None
+    if not ipv6:
+        if not isinstance(addr, ipaddress.IPv4Address):
+            return None
+        word = struct.unpack("=I", addr.packed)[0]
+        return f"{word:08X}"
+    if isinstance(addr, ipaddress.IPv4Address):
+        addr6 = ipaddress.ip_address(f"::ffff:{addr}")
+    else:
+        addr6 = addr
+    assert isinstance(addr6, ipaddress.IPv6Address)
+    words = struct.unpack("=4I", addr6.packed)
+    return "".join(f"{w:08X}" for w in words)
+
+
+def _parse_proc_net_tcp_inode(
+    text: str,
+    *,
+    client_port: int,
+    listen_port: int,
+    client_ip: str = "127.0.0.1",
+    server_ip: str = "127.0.0.1",
+    ipv6: bool = False,
+) -> int | None:
+    """Return unique socket inode matching ``client_ip:client_port -> server_ip:listen_port`` from ``/proc/net``."""
+    local_hex = _ip_hex_proc_net_tcp(client_ip, ipv6=ipv6)
+    remote_hex = _ip_hex_proc_net_tcp(server_ip, ipv6=ipv6)
+    if local_hex is None or remote_hex is None:
+        return None
+    local_target = f"{local_hex}:{client_port:04X}"
+    remote_target = f"{remote_hex}:{listen_port:04X}"
+    matched_inodes: set[int] = set()
     for line in text.splitlines()[1:]:
         parts = line.split()
         if len(parts) < 10:
@@ -274,8 +335,8 @@ def _parse_proc_net_tcp_inode(text: str, *, client_port: int, listen_port: int, 
             except ValueError:
                 continue
             if inode > 0:
-                return inode
-    return None
+                matched_inodes.add(inode)
+    return next(iter(matched_inodes)) if len(matched_inodes) == 1 else None
 
 
 def _single(holders: set[int]) -> int | None:
@@ -531,7 +592,20 @@ def _lookup_loopback_client_pid(
 ) -> int | None:
     if client_port <= 0 or listen_port <= 0:
         return None
+    conn_state = kwargs.get("conn_state")
+    expected_tuple = conn_state.get("expected_tuple") if isinstance(conn_state, dict) else None
+    client_ip = "127.0.0.1"
+    server_ip = "127.0.0.1"
+    if isinstance(expected_tuple, tuple) and len(expected_tuple) == 4:
+        if int(expected_tuple[1]) != int(client_port) or int(expected_tuple[3]) != int(listen_port):
+            return None
+        client_ip = _normalize_ip_addr(str(expected_tuple[0]))
+        server_ip = _normalize_ip_addr(str(expected_tuple[2]))
+    matched_tuple = (client_ip, int(client_port), server_ip, int(listen_port))
+
     if sys.platform == "win32":
+        if (client_ip, server_ip) != ("127.0.0.1", "127.0.0.1"):
+            return None
         pid = _single(_win32_tcp_client_pids(client_port, listen_port))
         if pid is None:
             return None
@@ -540,21 +614,31 @@ def _lookup_loopback_client_pid(
         # inside the creation-time bracket so PID reuse cannot relabel it.
         if _win32_tcp_client_pids(client_port, listen_port) != {pid}:
             return None
+        _SIGHTING.tuple = matched_tuple
         _note_sighting(pid, started_before)
         return pid
     if sys.platform.startswith("linux"):
-        conn_state = kwargs.get("conn_state")
         for attempt in range(4):
             for name, is_v6 in (("tcp", False), ("tcp6", True)):
                 try:
                     text = (_LINUX_PROC_ROOT / "net" / name).read_text(encoding="ascii", errors="replace")
                 except OSError:
                     continue
-                inode = _parse_proc_net_tcp_inode(text, client_port=client_port, listen_port=listen_port, ipv6=is_v6)
+                inode = _parse_proc_net_tcp_inode(
+                    text,
+                    client_port=client_port,
+                    listen_port=listen_port,
+                    client_ip=client_ip,
+                    server_ip=server_ip,
+                    ipv6=is_v6,
+                )
                 if inode is not None:
                     holders = _socket_inode_holders(inode)
                     if holders:
-                        return _single(holders)  # final: a later table must not resolve an ambiguous holder set
+                        pid = _single(holders)  # final: a later table must not resolve an ambiguous holder set
+                        if pid is not None and getattr(_SIGHTING, "pid", None) == pid:
+                            _SIGHTING.tuple = matched_tuple
+                        return pid
             if attempt >= 3:
                 break
             if conn_state is not None:
@@ -564,10 +648,15 @@ def _lookup_loopback_client_pid(
             time.sleep(0.001)
         return None
     if sys.platform == "darwin":
+        if (client_ip, server_ip) != ("127.0.0.1", "127.0.0.1"):
+            return None
         # lsof (fork+exec, tens of ms) loses short-lived loopback connections; the libproc kernel query does not.
         holders = _libproc_client_holders(client_port, listen_port)
         if holders:
-            return _single(holders)  # final: lsof must not resolve what libproc found ambiguous
+            pid = _single(holders)  # final: lsof must not resolve what libproc found ambiguous
+            if pid is not None and getattr(_SIGHTING, "pid", None) == pid:
+                _SIGHTING.tuple = matched_tuple
+            return pid
         try:
             proc = subprocess.run(
                 ["lsof", "-nP", "-F", "pn", f"-iTCP@127.0.0.1:{client_port}"],
@@ -580,7 +669,10 @@ def _lookup_loopback_client_pid(
             return None
         if proc.returncode != 0 and not proc.stdout:
             return None
-        return _parse_lsof_client_pid(proc.stdout, client_port=client_port, listen_port=listen_port)
+        pid = _parse_lsof_client_pid(proc.stdout, client_port=client_port, listen_port=listen_port)
+        if pid is not None and getattr(_SIGHTING, "pid", None) == pid:
+            _SIGHTING.tuple = matched_tuple
+        return pid
     return None
 
 
@@ -617,11 +709,13 @@ def _install_loopback_server_hooks(
     instance_id: str | None = None,
     initial_ready: bool = True,
     collector_timeout_s: float = 1.5,
+    socket_readiness_token: str | None = None,
 ) -> dict[str, Any]:
     from concurrent.futures import Future, ThreadPoolExecutor
 
     from superbrain.application._auth_gate import AuthGate
     from superbrain.cli_api import _loopback_server, _server_http
+    from superbrain.cli_api._http_frames import HttpFramingError, write_all
     from superbrain.core.canonical import digest_bytes
     from superbrain.core.wire import encode_envelope
 
@@ -703,6 +797,9 @@ def _install_loopback_server_hooks(
                 c_state["closing_ns"] = closing_ns
                 c_state["closing_seq"] = closing_seq
                 c_state["closing_at"] = _utc_now_z()
+            wake = c_state.get("readiness_wakeup")
+            if wake is not None:
+                wake.set()
 
     def _lookup_state_for_socks(*socks: Any) -> dict[str, Any] | None:
         with hook_lock:
@@ -728,9 +825,12 @@ def _install_loopback_server_hooks(
         observed_ns: int | None = None
         observed_seq: int | None = None
         sighted = False
+        sighted_tuple: tuple[str, int, str, int] | None = None
+        expected_tuple = conn_state.get("expected_tuple") if conn_state is not None else None
         with contextlib.suppress(OSError, subprocess.SubprocessError):
             _SIGHTING.ns = _SIGHTING.seq = _SIGHTING.at = None
             _SIGHTING.pid = _SIGHTING.started_at = None
+            _SIGHTING.tuple = None
             with _lookup_process_clock():
                 try:
                     client_pid = _lookup_loopback_client_pid(peer_port, listen_port, conn_state=conn_state)
@@ -744,6 +844,7 @@ def _install_loopback_server_hooks(
                     return None, None, None, None
                 if _SIGHTING.pid != client_pid or _SIGHTING.started_at is None:
                     return None, None, None, None
+                sighted_tuple = getattr(_SIGHTING, "tuple", None)
                 client_started_at = _SIGHTING.started_at
                 observed_ns = _SIGHTING.ns
                 observed_seq = getattr(_SIGHTING, "seq", None)
@@ -755,6 +856,11 @@ def _install_loopback_server_hooks(
             or observed_ns is None
         ):
             return None, None, None, None
+        if isinstance(expected_tuple, tuple) and len(expected_tuple) == 4:
+            if (int(expected_tuple[1]), int(expected_tuple[3])) != (int(peer_port), int(listen_port)):
+                return None, None, None, None
+            if sighted_tuple is not None and sighted_tuple != expected_tuple:
+                return None, None, None, None
         if conn_state is not None:
             with conn_state["lock"]:
                 closing_ns = conn_state["closing_ns"]
@@ -775,6 +881,8 @@ def _install_loopback_server_hooks(
                 ):
                     return None, None, None, None
                 conn_state["observed_seq"] = observed_seq
+                if "sighted_tuple" in conn_state:
+                    conn_state["sighted_tuple"] = sighted_tuple or expected_tuple
         return client_pid, client_started_at, observed_at, observed_ns
 
     def _submit_lookup(
@@ -976,6 +1084,58 @@ def _install_loopback_server_hooks(
             active_finalizers[:] = [t for t in active_finalizers if t.is_alive()]
             active_finalizers.append(th)
 
+    class _ReplayHeadReader:
+        """Replay an already-parsed HTTP request head when a connection opts out of readiness."""
+
+        def __init__(self, inner: Any, head: Any) -> None:
+            self._inner = inner
+            self._head: Any | None = head
+
+        def read_request_head(self, deadline_ns: int) -> Any:
+            if self._head is not None:
+                head = self._head
+                self._head = None
+                return head
+            return self._inner.read_request_head(deadline_ns)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._inner, name)
+
+    def _sock_live_tuple(sock: Any) -> tuple[str, int, str, int] | None:
+        try:
+            if sock is None or sock.fileno() == -1:
+                return None
+            shost, sport = sock.getsockname()[:2]
+            phost, pport = sock.getpeername()[:2]
+        except OSError:
+            return None
+        return (_normalize_ip_addr(str(phost)), int(pport), _normalize_ip_addr(str(shost)), int(sport))
+
+    def _write_readiness_response(
+        sock: Any,
+        *,
+        status: int,
+        ok_val: bool,
+        ready_val: bool,
+        close_conn: bool,
+        deadline_ns: int,
+        monotonic_ns: Any,
+    ) -> bool:
+        body = json.dumps({"ok": ok_val, "ready": ready_val}, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        reason = "OK" if status == 200 else "Service Unavailable"
+        conn_hdr = "close" if close_conn else "keep-alive"
+        frame = (
+            f"HTTP/1.1 {status} {reason}\r\n"
+            f"Content-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            f"Connection: {conn_hdr}\r\n\r\n"
+        ).encode("ascii") + body
+        try:
+            write_all(sock, frame, deadline_ns, monotonic_ns)
+        except (OSError, HttpFramingError):
+            return False
+        return True
+
     def _tap_handle_ident(
         ssl_sock: Any,
         reader: Any,
@@ -987,8 +1147,178 @@ def _install_loopback_server_hooks(
         tid = threading.get_ident()
         with hook_lock:
             conn_ctx = conn_ctx_by_tid.get(tid)
-        if conn_ctx is not None:
-            _register_conn_sock(conn_ctx[7], ssl_sock)
+        conn_state = conn_ctx[7] if conn_ctx is not None else None
+        if conn_state is not None:
+            _register_conn_sock(conn_state, ssl_sock)
+        if not socket_readiness_token:
+            return bool(
+                orig_handle_ident(
+                    ssl_sock,
+                    reader,
+                    ready,
+                    deadline_ns=deadline_ns,
+                    monotonic_ns=monotonic_ns,
+                )
+            )
+        try:
+            head = reader.read_request_head(deadline_ns)
+        except HttpFramingError as err:
+            server_http_mod.handle_framing_failure(
+                ssl_sock,
+                err,
+                deadline_ns=deadline_ns,
+                monotonic_ns=monotonic_ns,
+            )
+            return False
+        if head.method != "POST" or head.target != _READINESS_PATH:
+            replay_reader = _ReplayHeadReader(reader, head)
+            return bool(
+                orig_handle_ident(
+                    ssl_sock,
+                    replay_reader,
+                    ready,
+                    deadline_ns=deadline_ns,
+                    monotonic_ns=monotonic_ns,
+                )
+            )
+
+        if (
+            conn_ctx is None
+            or conn_state is None
+            or head.get_all("Authorization")
+            or head.content_length is None
+            or head.content_length <= 0
+            or head.content_length > _MAX_READINESS_BODY_BYTES
+        ):
+            _write_readiness_response(
+                ssl_sock,
+                status=503,
+                ok_val=False,
+                ready_val=False,
+                close_conn=True,
+                deadline_ns=deadline_ns,
+                monotonic_ns=monotonic_ns,
+            )
+            return False
+
+        try:
+            raw_body = reader.read_exact(head.content_length, deadline_ns)
+            has_pipelined = bool(reader.has_pipelined_bytes(deadline_ns))
+        except HttpFramingError as err:
+            server_http_mod.handle_framing_failure(
+                ssl_sock,
+                err,
+                deadline_ns=deadline_ns,
+                monotonic_ns=monotonic_ns,
+            )
+            return False
+
+        try:
+            payload = json.loads(raw_body.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            payload = None
+
+        token_valid = (
+            isinstance(payload, dict)
+            and set(payload.keys()) == {"token"}
+            and isinstance(payload.get("token"), str)
+            and hmac.compare_digest(payload["token"], socket_readiness_token)
+        )
+        live_tuple = _sock_live_tuple(ssl_sock)
+        expected_tuple = conn_state.get("expected_tuple")
+        host_vals = head.get_all("Host")
+        host_valid = (
+            live_tuple is not None
+            and len(host_vals) == 1
+            and host_vals[0] == _format_host_header(live_tuple[2], live_tuple[3])
+        )
+        if not token_valid or has_pipelined or live_tuple is None or live_tuple != expected_tuple or not host_valid:
+            _write_readiness_response(
+                ssl_sock,
+                status=503,
+                ok_val=False,
+                ready_val=False,
+                close_conn=True,
+                deadline_ns=deadline_ns,
+                monotonic_ns=monotonic_ns,
+            )
+            return False
+
+        with conn_state["lock"]:
+            if conn_state["closing"] or conn_state["closed_event"].is_set() or conn_state["closing_ns"] is not None:
+                return False
+
+        lookup_fut = conn_ctx[6]
+        conn_state["client_readiness_requested"].set()
+        wake_ev = conn_state["readiness_wakeup"]
+        while not lookup_fut.done():
+            with conn_state["lock"]:
+                if (
+                    conn_state["closing"]
+                    or conn_state["closed_event"].is_set()
+                    or conn_state["closing_ns"] is not None
+                ):
+                    break
+            rem_ns = deadline_ns - monotonic_ns()
+            if rem_ns <= 0 or ssl_sock.fileno() == -1:
+                break
+            wake_ev.wait(timeout=min(0.02, rem_ns / 1_000_000_000.0))
+
+        post_wait_tuple = _sock_live_tuple(ssl_sock)
+        c_pid: int | None = None
+        c_started_at: str | None = None
+        c_obs_at: str | None = None
+        c_obs_ns: int | None = None
+        if lookup_fut.done() and not lookup_fut.cancelled():
+            with contextlib.suppress(Exception):
+                c_pid, c_started_at, c_obs_at, c_obs_ns = lookup_fut.result()
+
+        ack_allowed = False
+        already_closing = True
+        with conn_state["lock"]:
+            already_closing = bool(
+                conn_state["closing"]
+                or conn_state["closed_event"].is_set()
+                or conn_state["closing_ns"] is not None
+            )
+            ack_allowed = (
+                not already_closing
+                and monotonic_ns() < deadline_ns
+                and post_wait_tuple == live_tuple
+                and isinstance(c_pid, int)
+                and c_pid > 0
+                and isinstance(c_started_at, str)
+                and bool(c_started_at)
+                and isinstance(c_obs_at, str)
+                and bool(c_obs_at)
+                and isinstance(c_obs_ns, int)
+                and conn_state.get("observed_seq") is not None
+                and conn_state.get("sighted_tuple") == live_tuple
+            )
+
+        if not ack_allowed:
+            if not already_closing and monotonic_ns() < deadline_ns and ssl_sock.fileno() != -1:
+                _write_readiness_response(
+                    ssl_sock,
+                    status=503,
+                    ok_val=False,
+                    ready_val=False,
+                    close_conn=True,
+                    deadline_ns=deadline_ns,
+                    monotonic_ns=monotonic_ns,
+                )
+            return False
+
+        if not _write_readiness_response(
+            ssl_sock,
+            status=200,
+            ok_val=True,
+            ready_val=True,
+            close_conn=False,
+            deadline_ns=deadline_ns,
+            monotonic_ns=monotonic_ns,
+        ):
+            return False
         return bool(
             orig_handle_ident(
                 ssl_sock,
@@ -1090,12 +1420,30 @@ def _install_loopback_server_hooks(
         connection_id = f"conn-{conn_id_int}"
         conn_started_at = _utc_now_z()
         conn_started_ns, conn_started_seq = _stamp_ns()
+        listen_host = "127.0.0.1"
+        listen_port = 0
+        peer_host = "127.0.0.1"
+        peer_port = 0
+        with contextlib.suppress(OSError):
+            lhost, lport = raw_sock.getsockname()[:2]
+            phost, pport = raw_sock.getpeername()[:2]
+            listen_host, listen_port = str(lhost), int(lport)
+            peer_host, peer_port = str(phost), int(pport)
+        expected_tuple = (
+            (_normalize_ip_addr(peer_host), peer_port, _normalize_ip_addr(listen_host), listen_port)
+            if peer_port > 0 and listen_port > 0
+            else None
+        )
         conn_state: dict[str, Any] = {
             "lock": threading.Lock(),
             "conn_started_ns": conn_started_ns,
             "conn_started_seq": conn_started_seq,
             "closed_event": threading.Event(),
             "worker_entered_event": threading.Event(),
+            "client_readiness_requested": threading.Event(),
+            "readiness_wakeup": threading.Event(),
+            "expected_tuple": expected_tuple,
+            "sighted_tuple": None,
             "closing": False,
             "closing_ns": None,
             "closing_seq": None,
@@ -1107,21 +1455,18 @@ def _install_loopback_server_hooks(
             "raw_sock": raw_sock,
             "ssl_sock": None,
         }
-        listen_host = "127.0.0.1"
-        listen_port = 0
-        peer_host = "127.0.0.1"
-        peer_port = 0
-        with contextlib.suppress(OSError):
-            lhost, lport = raw_sock.getsockname()[:2]
-            phost, pport = raw_sock.getpeername()[:2]
-            listen_host, listen_port = str(lhost), int(lport)
-            peer_host, peer_port = str(phost), int(pport)
         with hook_lock:
             conn_state_by_conn_key[conn_key] = conn_state
             conn_states_by_server.setdefault(id(self), set()).add(conn_key)
             if raw_sock is not None:
                 conn_state_by_sock_id[id(raw_sock)] = conn_state
         lookup_fut = _submit_lookup(peer_port, listen_port, conn_state)
+        wake_ev: threading.Event = conn_state["readiness_wakeup"]
+
+        def _signal_readiness_wakeup(_fut: Future[Any], *, ev: threading.Event = wake_ev) -> None:
+            ev.set()
+
+        lookup_fut.add_done_callback(_signal_readiness_wakeup)
         with hook_lock:
             conn_ctx_by_tid[tid] = (
                 connection_id,
@@ -1416,7 +1761,13 @@ def _install_loopback_server_hooks(
     }
 
 
-def run_observed_owner(config_path: Path, evidence_dir: Path, stop: threading.Event) -> int:
+def run_observed_owner(
+    config_path: Path,
+    evidence_dir: Path,
+    stop: threading.Event,
+    *,
+    socket_readiness_token: str | None = None,
+) -> int:
     """Run the production owner loop via ``_explicit_owner_adapters`` and record sanitized call observations."""
     if not isinstance(config_path, Path) or not config_path.is_absolute():
         raise ValueError("absolute config_path required")
@@ -1467,6 +1818,7 @@ def run_observed_owner(config_path: Path, evidence_dir: Path, stop: threading.Ev
         daemon_pid=daemon_pid,
         daemon_started_at=daemon_started_at,
         initial_ready=False,
+        socket_readiness_token=socket_readiness_token,
     )
 
     def _on_ready(ready: Ready, _loop: OwnerLoop) -> None:
@@ -1533,12 +1885,20 @@ def spawn_observed_wheel_owner(
     evidence_dir: Path,
     *,
     cwd: Path,
+    socket_readiness: bool = False,
 ) -> Iterator[ObservedWheelOwner]:
     """Spawn ``inc2_native_owner.py`` under ``env.venv_python -I`` and wait until ready."""
     from tests.support.inc2_cli import clean_installed_subprocess_env
     from tests.support.inc2_native import OwnerReadyObservation, ProcessIdentity, parse_owner_ready
 
     evidence_dir.mkdir(parents=True, exist_ok=True)
+    readiness_token = secrets.token_hex(16) if socket_readiness else None
+    client_readiness_env: dict[str, str] = (
+        {_READINESS_ENV_VAR: readiness_token} if readiness_token is not None else {}
+    )
+    owner_extra_env: dict[str, str] | None = (
+        {_OWNER_READINESS_TOKEN_ENV: readiness_token} if readiness_token is not None else None
+    )
     cmd = [
         str(env.venv_python),
         "-I",
@@ -1551,7 +1911,7 @@ def spawn_observed_wheel_owner(
     proc = subprocess.Popen(
         cmd,
         cwd=cwd,
-        env=clean_installed_subprocess_env(),
+        env=clean_installed_subprocess_env(owner_extra_env),
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -1592,6 +1952,7 @@ def spawn_observed_wheel_owner(
             module_file=ready_obs.module_file,
             schema_sha256=ready_obs.schema_sha256,
             evidence_dir=evidence_dir,
+            client_readiness_env=client_readiness_env,
         )
         yield owner
     finally:
@@ -1684,8 +2045,14 @@ def _wheel_child_main(argv: list[str]) -> int:
             with contextlib.suppress(OSError, ValueError):
                 signal.signal(sig, lambda _s, _f: stop.set())
 
+    readiness_token = os.environ.pop(_OWNER_READINESS_TOKEN_ENV, None)
     threading.Thread(target=_watch_stdin, daemon=True).start()
-    return run_observed_owner(Path(ns.config), Path(ns.evidence_dir), stop)
+    return run_observed_owner(
+        Path(ns.config),
+        Path(ns.evidence_dir),
+        stop,
+        socket_readiness_token=readiness_token,
+    )
 
 
 def _child_bootstrap() -> int:

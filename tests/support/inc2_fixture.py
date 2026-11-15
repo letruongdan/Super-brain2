@@ -207,6 +207,22 @@ def open_inc2_installed_env(scratch: Path) -> Iterator[InstalledEnv]:
         cwd=scratch,
     )
 
+    purelib_dir = Path(
+        subprocess.check_output(
+            [str(venv_python), "-I", "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"],
+            text=True,
+            encoding="utf-8",
+            timeout=30.0,
+        ).strip()
+    )
+    hook_src = Path(__file__).resolve().with_name("_socket_readiness_hook.py").read_bytes()
+    (purelib_dir / "_superbrain_test_readiness.py").write_bytes(hook_src)
+    (purelib_dir / "_superbrain_test_readiness.pth").write_text(
+        'import os; os.environ.get("SUPERBRAIN_TEST_SOCKET_READINESS") '
+        'and __import__("_superbrain_test_readiness").install()\n',
+        encoding="utf-8",
+    )
+
     yield InstalledEnv(
         venv_dir=venv_dir,
         venv_python=venv_python,
