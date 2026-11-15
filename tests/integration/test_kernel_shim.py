@@ -403,6 +403,7 @@ def test_installed_shim_exposes_packaged_catalog_and_calls_daemon(
     inc2_installed_env: InstalledEnv,
     shim_bundle: ShimTemplateBundle,
     shim_scratch_root: Path,
+    request: pytest.FixtureRequest,
 ) -> None:
     """Installed ``brain mcp`` and ``brain-mcp`` expose packaged catalog and call production/fixture daemons."""
     assert callable(select_workspace)
@@ -552,6 +553,7 @@ def test_installed_shim_exposes_packaged_catalog_and_calls_daemon(
         fix_daemon.wait_ready()
 
         delivery_ids: list[str] = []
+        assignment_ids: list[str] = []
         for script_name, base_args in (
             ("brain-mcp", ("--profile", str(profile_path))),
             ("brain", ("mcp", "--profile", str(profile_path))),
@@ -577,6 +579,37 @@ def test_installed_shim_exposes_packaged_catalog_and_calls_daemon(
                 assert fix_init.get("id") == 1
                 fix_call = fix_sess.send_frames_and_expect_response([initialized_notif_frame, prep_fix_frame])
                 assert fix_call.get("id") == 2
+                first_result = _extract_tool_result(fix_call)
+                first_sc = first_result.get("structuredContent")
+                first_error = first_sc.get("error") if isinstance(first_sc, dict) else None
+                committed_assignment: str | None = None
+                if (
+                    first_result.get("isError") is True
+                    and isinstance(first_sc, dict)
+                    and first_sc.get("ok") is False
+                    and isinstance(first_error, dict)
+                    and first_error.get("code") == ErrorCode.COMMIT_OUTCOME_UNKNOWN.value
+                ):
+                    request.node.user_properties.append(
+                        ("initial_prepare_error", ErrorCode.COMMIT_OUTCOME_UNKNOWN.value)
+                    )
+                    # Durable visibility is D4's completion authority. This is
+                    # a bounded wait for this fixture's sole prepare commit,
+                    # followed by one same-key protocol replay, never a test rerun.
+                    until = time.monotonic() + 5.0
+                    with sqlite3.connect(f"file:{data_root / 'store' / 'brain.db'}?mode=ro", uri=True) as conn:
+                        while True:
+                            rows = conn.execute(
+                                "SELECT assignment_id FROM idempotency WHERE tool = 'prepare_task'"
+                            ).fetchall()
+                            if rows:
+                                assert len(rows) == 1 and isinstance(rows[0][0], str)
+                                committed_assignment = rows[0][0]
+                                break
+                            assert time.monotonic() < until, "the unknown prepare attempt never committed"
+                            threading.Event().wait(0.01)
+                    fix_call = fix_sess.send_frames_and_expect_response([prep_fix_frame | {"id": 3}])
+                    assert fix_call.get("id") == 3
                 rc_fix_proc, stderr_fix_proc = fix_sess.finish()
                 assert rc_fix_proc == 0
                 assert stderr_fix_proc == b""
@@ -593,9 +626,13 @@ def test_installed_shim_exposes_packaged_catalog_and_calls_daemon(
             assert isinstance(ctx_obj, dict)
             assert ctx_obj.get("summary_md") == f"catalog_sha256={inc2_installed_env.source_schema_sha256}"
             delivery_ids.append(str(data["delivery_id"]))
+            assignment_ids.append(str(data["assignment_id"]))
+            if committed_assignment is not None:
+                assert data["assignment_id"] == committed_assignment
 
-        # Both entrypoints replayed the exact same committed delivery_id.
+        # Both entrypoints replayed the exact same committed delivery/assignment.
         assert len(delivery_ids) == 2 and delivery_ids[0] == delivery_ids[1]
+        assert len(assignment_ids) == 2 and assignment_ids[0] == assignment_ids[1]
 
         rc_fix, _, _, _ = fix_daemon.signal_and_wait_exit()
         assert rc_fix == 0

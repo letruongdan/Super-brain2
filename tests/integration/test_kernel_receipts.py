@@ -1099,20 +1099,35 @@ def _lineage_tables(data_root: Path) -> dict[str, list[tuple[Any, ...]]]:
 
 
 def test_snapshot_fallback_preserves_known_and_unknown_sources_through_rebuild(
-    monkeypatch: pytest.MonkeyPatch, tpl: TransportTemplate, root: Path
+    monkeypatch: pytest.MonkeyPatch, tpl: TransportTemplate, root: Path,
+    request: pytest.FixtureRequest,
 ) -> None:
     """An ``unavailable`` delivery keeps, field by field, the known source and the unknown mark in the ledger
     events, in the projections, and identically after a projection rebuild."""
     with fixture_daemon(monkeypatch, tpl, root) as (h, proxy, _tracker):
-        data = ok(
-            call(
-                h,
-                "prepare_task",
-                prepare_args("idem-t8-rebuild-prep-01"),
-                token=tpl.cred.token,
-                scope=scope_of(ws_a(tpl)),
-            )
-        )
+        args = prepare_args("idem-t8-rebuild-prep-01")
+
+        def prepare() -> dict[str, Any]:
+            return call(h, "prepare_task", args, token=tpl.cred.token, scope=scope_of(ws_a(tpl)))
+
+        first: dict[str, Any] | None
+        try:
+            first = prepare()
+        except LoopbackTransportError as error:
+            assert error.code is ErrorCode.DEADLINE_EXCEEDED and error.request_may_have_run
+            request.node.user_properties.append(("initial_prepare_transport", error.code.value))
+            first = None
+        if first is None or (
+            first.get("ok") is False
+            and code(first) in {ErrorCode.COMMIT_OUTCOME_UNKNOWN.value, ErrorCode.DEADLINE_EXCEEDED.value}
+        ):
+            if first is not None:
+                request.node.user_properties.append(("initial_prepare_error", code(first)))
+            # D5: finish the original owner attempt, then replay the exact same
+            # business key. Each attempt retains the original protocol budgets.
+            settle(h)
+            first = prepare()
+        data = ok(first)
         assert data["snapshot_status"] == "unavailable"
         task_id = str(data["task_id"])
         events: dict[str, set[tuple[Any, ...]]] = {}
@@ -1133,3 +1148,6 @@ def test_snapshot_fallback_preserves_known_and_unknown_sources_through_rebuild(
         h.loop.run_owner_action(lambda: proxy.inner.store.rebuild_projections()).result(timeout=BARRIER_S)
         assert _lineage_tables(root) == before, "a rebuild changed field or task lineage"
         assert _field_lineage(root, task_id, ("skills", 0)) == skills
+        assert proxy.inner.apply_calls == 1
+        assert count(root, "p_fixture_domain_deliveries") == 1
+        assert count(root, "idempotency") == 1
