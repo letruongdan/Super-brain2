@@ -48,7 +48,7 @@ def test_ci_checks_externally_anchored_seal_before_and_after_acceptance() -> Non
     )
     assert normalize is not None and normalize < before_at
     assert re.search(r"git checkout-index\s+(?:--all\s+--force|--force\s+--all)", steps[normalize])
-    assert set(ci_matrix_list("os")) == {"windows-latest", "macos-latest", "ubuntu-latest"}
+    assert set(ci_matrix_list("os")) == {"windows-2022", "macos-latest", "ubuntu-latest"}
     assert ci_matrix_list("python") == ["3.11", "3.14"]
     uploads = [step for step in steps if "upload-artifact" in step and "seal-evidence" in step]
     assert len(uploads) == 1

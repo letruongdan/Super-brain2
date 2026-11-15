@@ -1090,7 +1090,7 @@ def ci_matrix_list(name: str) -> list[str]:
 
 def test_ci_keeps_the_six_matrix_cells() -> None:
     text = CI_FILE.read_text(encoding="utf-8")
-    assert set(ci_matrix_list("os")) == {"windows-latest", "macos-latest", "ubuntu-latest"}
+    assert set(ci_matrix_list("os")) == {"windows-2022", "macos-latest", "ubuntu-latest"}
     assert ci_matrix_list("python") == ["3.11", "3.14"]
     assert "exclude:" not in text and "include:" not in text
 
