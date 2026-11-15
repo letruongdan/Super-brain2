@@ -2,9 +2,9 @@
 that exact client->listen connection, never from another protocol's socket on the same 4-tuple, never ambiguously.
 
 Seam: ``_libproc_client_pid`` does ``import ctypes`` and calls ``ctypes.CDLL(...)`` at call time, so patching the
-``ctypes.CDLL`` attribute hands it a fake libproc. The fake implements only the three calls the lookup makes
-(``proc_listpids``, ``proc_pidinfo(PROC_PIDLISTFDS)``, ``proc_pidfdinfo(PROC_PIDFDSOCKETINFO)``) over an in-memory
-process table, with ``socket_fdinfo`` buffers built at the module's own offsets.
+``ctypes.CDLL`` attribute hands it a fake libproc. The fake implements socket lookup and process creation metadata
+through ``proc_listpids``, ``proc_pidinfo(PROC_PIDLISTFDS/PROC_PIDTBSDINFO)`` and
+``proc_pidfdinfo(PROC_PIDFDSOCKETINFO)`` over an in-memory process table. Its buffers follow the Darwin ABI.
 """
 
 from __future__ import annotations
@@ -85,6 +85,15 @@ class _FakeLibproc:
         return 4 * min(len(pids), size // 4)
 
     def proc_pidinfo(self, pid: int, flavor: int, _arg: int, buf: Any, size: int) -> int:
+        if flavor == owner._PROC_PIDTBSDINFO:
+            if pid not in self.table:
+                return 0
+            # Darwin proc_bsdinfo ABI: pid at 12, creation seconds/useconds at 120/128.
+            info = bytearray(136)
+            struct.pack_into("<I", info, 12, pid)
+            struct.pack_into("<QQ", info, 120, 1_700_000_000, 123_456)
+            ctypes.memmove(buf, bytes(info), min(len(info), size))
+            return min(len(info), size)
         assert flavor == owner._PROC_PIDLISTFDS
         fds = self.table.get(pid, [])
         if buf is None:
@@ -112,6 +121,7 @@ def _patch_libproc_cdll(monkeypatch: pytest.MonkeyPatch, libproc_provider: Any) 
 
 
 def _lookup(monkeypatch: pytest.MonkeyPatch, table: dict[int, list[tuple[int, bytes]]]) -> int | None:
+    _on(monkeypatch, "darwin")
     fake = _FakeLibproc(table)
     _patch_libproc_cdll(monkeypatch, fake)
     return owner._libproc_client_pid(CLIENT_PORT, LISTEN_PORT)
