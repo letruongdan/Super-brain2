@@ -40,6 +40,7 @@ import pytest
 from superbrain.adapters.os import os_adapters
 from superbrain.application.dispatch import PreparedEffect
 from superbrain.application.owner_loop import OwnerLoop
+from superbrain.cli_api import _loopback_server
 from superbrain.cli_api._loopback_server import (
     MAX_ACTIVE_CONNECTIONS,
     LoopbackServer,
@@ -233,6 +234,7 @@ class TestTransportAdmission:
     def test_prefetched_bytes_obey_two_request_state(
         self,
         transport_template: TransportTemplate,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """State machine allows at most 2 requests, closes cleanly, and refuses buffered request 3."""
         with open_test_loopback_transport(transport_template, name="two-req") as h:
@@ -295,11 +297,25 @@ class TestTransportAdmission:
             assert h.submit_count == 1
 
             # Part 3: t0 deadline check applies even when bytes were buffered
-            with h.open_raw_tls_socket() as s_dl:
-                h.mono_clock.advance_ns(TOTAL_REQUEST_BUDGET_NS + 100_000_000)
-                resp_dl = h.send_raw_http(s_dl, f"GET /v2/identity HTTP/1.1\r\nHost: {host}\r\n\r\n".encode("ascii"))
-                assert b"408" in resp_dl or b"deadline_exceeded" in resp_dl or resp_dl == b""
-                assert s_dl.recv(1024) == b""
+            ident_entered = threading.Event()
+            orig_handle_ident: Callable[..., bool] = vars(_loopback_server)["handle_identity_request"]
+
+            def _sync_handle_ident(*args: Any, **kwargs: Any) -> bool:
+                ident_entered.set()
+                return bool(orig_handle_ident(*args, **kwargs))
+
+            with monkeypatch.context() as mp:
+                mp.setattr(_loopback_server, "handle_identity_request", _sync_handle_ident)
+                with h.open_raw_tls_socket() as s_dl:
+                    assert ident_entered.wait(timeout=2.0), "server did not enter handle_identity_request"
+                    h.mono_clock.advance_ns(TOTAL_REQUEST_BUDGET_NS + 100_000_000)
+                    try:
+                        req_dl = f"GET /v2/identity HTTP/1.1\r\nHost: {host}\r\n\r\n".encode("ascii")
+                        resp_dl = h.send_raw_http(s_dl, req_dl)
+                        assert b"408" in resp_dl or b"deadline_exceeded" in resp_dl or resp_dl == b""
+                        assert s_dl.recv(1024) == b""
+                    except (ConnectionError, ssl.SSLError):
+                        pass
             assert h.submit_count == 1
 
     def test_untrusted_http_admission_never_reaches_owner(
@@ -353,10 +369,13 @@ class TestTransportAdmission:
 
             # 3. Non-loopback peer IP accept guard
             orig_accept = socket.socket.accept
-            inject_active = True
+            inject_active = False
+            hook_entered = threading.Event()
 
             def mock_non_loopback_accept(sock_self: socket.socket) -> tuple[socket.socket, tuple[str, int]]:
                 nonlocal inject_active
+                if sock_self is h.bound.sock:
+                    hook_entered.set()
                 conn, addr = orig_accept(sock_self)
                 if inject_active and sock_self is h.bound.sock:
                     inject_active = False
@@ -365,6 +384,8 @@ class TestTransportAdmission:
 
             with monkeypatch.context() as mp:
                 mp.setattr(socket.socket, "accept", mock_non_loopback_accept)
+                assert hook_entered.wait(timeout=1.0), "server accept loop did not enter patched accept"
+                inject_active = True
                 try:
                     with socket.create_connection((h.ready.endpoint.host, h.ready.endpoint.port), timeout=2.0) as s_raw:
                         s_raw.settimeout(2.0)

@@ -466,6 +466,10 @@ class OwnerLoop:
     def _wait_near_deadline(self, session: OwnerSession, next_dl: int, start_mono: int) -> None:
         # Guard against Condition.wait / pthread_cond_timedwait_relative_np coalescing overshoots
         # near cutoff, while falling back to bounded waits on frozen or hooked test clocks.
+        del start_mono
+        t0_mono = session.monotonic_clock.monotonic_ns()
+        if t0_mono >= next_dl or self._arbiter_wake.is_set() or self._arbiter_stop:
+            return
         t0_wall = time.perf_counter_ns()
         while (
             not self._arbiter_stop
@@ -480,27 +484,26 @@ class OwnerLoop:
         if t1_mono >= next_dl:
             return
         wall_delta = max(1, t1_wall - t0_wall)
-        mono_delta = t1_mono - start_mono
-        if wall_delta > mono_delta * 2 or mono_delta > wall_delta * 2:
+        mono_delta = t1_mono - t0_mono
+        if wall_delta > mono_delta * 4:
             self._arbiter_wake.wait(timeout=_ARBITER_ACTIVE_POLL_S)
             return
-        cur_mono = t1_mono
-        while (
-            not self._arbiter_stop
-            and not self._arbiter_wake.is_set()
-            and cur_mono < next_dl
-        ):
+        if wall_delta >= _ARBITER_YIELD_CAP_NS:
+            return
+        while not self._arbiter_stop and not self._arbiter_wake.is_set():
+            time.sleep(0)
             elapsed_wall = time.perf_counter_ns() - t0_wall
             if elapsed_wall >= _ARBITER_YIELD_CAP_NS:
                 return
+            cur_mono = session.monotonic_clock.monotonic_ns()
+            if cur_mono >= next_dl:
+                return
             if (
                 elapsed_wall >= _ARBITER_PROGRESS_CHECK_NS
-                and (cur_mono - start_mono) * 2 < elapsed_wall
+                and (cur_mono - t0_mono) * 4 < elapsed_wall
             ):
                 self._arbiter_wake.wait(timeout=_ARBITER_ACTIVE_POLL_S)
                 return
-            time.sleep(0)
-            cur_mono = session.monotonic_clock.monotonic_ns()
 
     def _arbiter_main(self, session: OwnerSession) -> None:
         while not self._arbiter_stop:

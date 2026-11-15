@@ -100,9 +100,20 @@ class _FakeLibproc:
         return min(len(info), size)
 
 
+def _patch_libproc_cdll(monkeypatch: pytest.MonkeyPatch, libproc_provider: Any) -> None:
+    real_cdll: Any = ctypes.CDLL
+
+    def _cdll(name: Any, *args: Any, **kwargs: Any) -> Any:
+        if name is not None and "libproc" in str(name).lower():
+            return libproc_provider() if callable(libproc_provider) else libproc_provider
+        return real_cdll(name, *args, **kwargs)
+
+    monkeypatch.setattr(ctypes, "CDLL", _cdll)
+
+
 def _lookup(monkeypatch: pytest.MonkeyPatch, table: dict[int, list[tuple[int, bytes]]]) -> int | None:
     fake = _FakeLibproc(table)
-    monkeypatch.setattr(ctypes, "CDLL", lambda *_a, **_k: fake)
+    _patch_libproc_cdll(monkeypatch, fake)
     return owner._libproc_client_pid(CLIENT_PORT, LISTEN_PORT)
 
 
@@ -169,7 +180,7 @@ def test_darwin_ambiguous_libproc_result_is_final(monkeypatch: pytest.MonkeyPatc
     _on(monkeypatch, "darwin")
     calls = _lsof(monkeypatch, None)
     fake = _FakeLibproc({301: [(4, TCP)], 302: [(4, TCP)]})
-    monkeypatch.setattr(ctypes, "CDLL", lambda *_a, **_k: fake)
+    _patch_libproc_cdll(monkeypatch, fake)
     assert owner._lookup_loopback_client_pid(CLIENT_PORT, LISTEN_PORT) is None
     assert calls == []
 
@@ -183,10 +194,10 @@ def test_darwin_falls_back_to_lsof_only_without_libproc_data(monkeypatch: pytest
         def no_lib(*_a: Any, **_k: Any) -> Any:
             raise OSError("libproc.dylib not found")
 
-        monkeypatch.setattr(ctypes, "CDLL", no_lib)
+        _patch_libproc_cdll(monkeypatch, no_lib)
     else:
         empty = _FakeLibproc({})
-        monkeypatch.setattr(ctypes, "CDLL", lambda *_a, **_k: empty)
+        _patch_libproc_cdll(monkeypatch, empty)
     assert owner._lookup_loopback_client_pid(CLIENT_PORT, LISTEN_PORT) == 100
     assert len(calls) == 1 and calls[0][0] == "lsof"
 

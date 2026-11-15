@@ -21,6 +21,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -63,8 +64,39 @@ class ObservedWheelOwner:
     evidence_dir: Path
 
 
-_WIN32_PRECISE_UTC_FN: Any = None
-_WIN32_PRECISE_UTC_LOOKED_UP = False
+def _init_real_win32_dll_cls() -> Any:
+    if sys.platform != "win32":
+        return None
+    import ctypes
+
+    return getattr(ctypes, "WinDLL", None)
+
+
+_REAL_WIN32_DLL_CLS: Any = _init_real_win32_dll_cls()
+
+
+def _resolve_win32_precise_utc_fn() -> Any:
+    if sys.platform != "win32":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    except OSError:
+        return None
+    if _REAL_WIN32_DLL_CLS is not None and not isinstance(kernel32, _REAL_WIN32_DLL_CLS):
+        return None
+    fn = getattr(kernel32, "GetSystemTimePreciseAsFileTime", None)
+    if fn is None:
+        return None
+    fn.argtypes = [ctypes.POINTER(wintypes.FILETIME)]
+    fn.restype = None
+    return fn
+
+
+_WIN32_PRECISE_UTC_FN: Any = _resolve_win32_precise_utc_fn()
+_WIN32_PRECISE_UTC_LOOKED_UP = _WIN32_PRECISE_UTC_FN is not None
 
 
 def utc_now_z() -> str:
@@ -74,14 +106,11 @@ def utc_now_z() -> str:
         import ctypes
         from ctypes import wintypes
 
-        if not _WIN32_PRECISE_UTC_LOOKED_UP:
-            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-            fn = getattr(kernel32, "GetSystemTimePreciseAsFileTime", None)
+        if _WIN32_PRECISE_UTC_FN is None and not _WIN32_PRECISE_UTC_LOOKED_UP:
+            fn = _resolve_win32_precise_utc_fn()
             if fn is not None:
-                fn.argtypes = [ctypes.POINTER(wintypes.FILETIME)]
-                fn.restype = None
-            _WIN32_PRECISE_UTC_FN = fn
-            _WIN32_PRECISE_UTC_LOOKED_UP = True
+                _WIN32_PRECISE_UTC_FN = fn
+                _WIN32_PRECISE_UTC_LOOKED_UP = True
         if _WIN32_PRECISE_UTC_FN is not None:
             ft = wintypes.FILETIME()
             _WIN32_PRECISE_UTC_FN(ctypes.byref(ft))
@@ -212,6 +241,17 @@ def _find_pid_by_socket_inode(inode: int, *, proc_root: Path | None = None) -> i
     return _single(_socket_inode_holders(inode, proc_root=proc_root))
 
 
+_RECENT_CLIENT_PIDS_LOCK = threading.Lock()
+_RECENT_CLIENT_PIDS: deque[int] = deque(maxlen=16)
+
+
+def _remember_recent_client_pid(pid: int) -> None:
+    with _RECENT_CLIENT_PIDS_LOCK:
+        with contextlib.suppress(ValueError):
+            _RECENT_CLIENT_PIDS.remove(pid)
+        _RECENT_CLIENT_PIDS.appendleft(pid)
+
+
 def _socket_inode_holders(inode: int, *, proc_root: Path | None = None) -> set[int]:
     """Every PID whose ``/proc/<pid>/fd/*`` references ``socket:[inode]``."""
     root = _LINUX_PROC_ROOT if proc_root is None else proc_root
@@ -242,12 +282,32 @@ def _socket_inode_holders(inode: int, *, proc_root: Path | None = None) -> set[i
             pids = [int(entry.name) for entry in proc_scan if entry.name.isdigit()]
     except OSError:
         return holders
-    # Newest processes first: client subprocesses are recent processes with high PIDs
-    pids.sort(reverse=True)
-    for pid in pids:
-        if pid == my_pid:
-            continue
-        _scan_pid_fds(pid, root / str(pid) / "fd")
+
+    if proc_root is None:
+        assert my_pid is not None
+        pid_set = set(pids)
+        with _RECENT_CLIENT_PIDS_LOCK:
+            recent_snapshot = list(_RECENT_CLIENT_PIDS)
+        scanned: set[int] = {my_pid}
+        ordered_pids: list[int] = []
+        for rpid in recent_snapshot:
+            if rpid in pid_set and rpid not in scanned:
+                scanned.add(rpid)
+                ordered_pids.append(rpid)
+        # Child shims spawned right after this daemon have PIDs just above my_pid; scan ascending first
+        # so distant higher-PID shards do not delay sighting, then check remaining lower PIDs descending.
+        ordered_pids.extend(sorted(p for p in pids if p > my_pid and p not in scanned))
+        ordered_pids.extend(sorted((p for p in pids if p < my_pid and p not in scanned), reverse=True))
+        for pid in ordered_pids:
+            _scan_pid_fds(pid, root / str(pid) / "fd")
+        for pid in ordered_pids:
+            if pid in holders:
+                _remember_recent_client_pid(pid)
+    else:
+        # Preserve descending numeric order for explicit proc_root test fixtures.
+        pids.sort(reverse=True)
+        for pid in pids:
+            _scan_pid_fds(pid, root / str(pid) / "fd")
     return holders
 
 
@@ -394,16 +454,25 @@ def _lookup_loopback_client_pid(
                     return int(pid)
         return None
     if sys.platform.startswith("linux"):
-        for name, is_v6 in (("tcp", False), ("tcp6", True)):
-            try:
-                text = (_LINUX_PROC_ROOT / "net" / name).read_text(encoding="ascii", errors="replace")
-            except OSError:
-                continue
-            inode = _parse_proc_net_tcp_inode(text, client_port=client_port, listen_port=listen_port, ipv6=is_v6)
-            if inode is not None:
-                holders = _socket_inode_holders(inode)
-                if holders:
-                    return _single(holders)  # final: a later table must not resolve an ambiguous holder set
+        conn_state = kwargs.get("conn_state")
+        for attempt in range(4):
+            for name, is_v6 in (("tcp", False), ("tcp6", True)):
+                try:
+                    text = (_LINUX_PROC_ROOT / "net" / name).read_text(encoding="ascii", errors="replace")
+                except OSError:
+                    continue
+                inode = _parse_proc_net_tcp_inode(text, client_port=client_port, listen_port=listen_port, ipv6=is_v6)
+                if inode is not None:
+                    holders = _socket_inode_holders(inode)
+                    if holders:
+                        return _single(holders)  # final: a later table must not resolve an ambiguous holder set
+            if attempt >= 3:
+                break
+            if conn_state is not None:
+                closed_ev = conn_state.get("closed_event")
+                if conn_state.get("closing") or (closed_ev is not None and closed_ev.is_set()):
+                    break
+            time.sleep(0.001)
         return None
     if sys.platform == "darwin":
         # lsof (fork+exec, tens of ms) loses short-lived loopback connections; the libproc kernel query does not.
@@ -977,6 +1046,7 @@ def _install_loopback_server_hooks(
             )
         try:
             conn_state["worker_entered_event"].set()
+            time.sleep(0)
             orig_conn_worker(self, conn_id, raw_sock, accept_ns)
         finally:
             _mark_conn_closing(conn_state)

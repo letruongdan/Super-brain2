@@ -5184,10 +5184,15 @@ def test_t9_r05_win32_job_pids_cap_break_on_large_assigned_count() -> None:
 
     from tests.support import inc2_cli as cli
 
-    with mock.patch("ctypes.WinDLL") as mock_windll:
-        mock_k32 = mock.MagicMock()
-        mock_windll.return_value = mock_k32
+    real_windll: Any = vars(ctypes)["WinDLL"]
+    mock_k32 = mock.MagicMock()
 
+    def _scoped_windll(name: str, *args: Any, **kwargs: Any) -> Any:
+        if Path(str(name)).stem.lower() == "kernel32":
+            return mock_k32
+        return real_windll(name, *args, **kwargs)
+
+    with mock.patch("ctypes.WinDLL", side_effect=_scoped_windll):
         def fake_query(h: Any, info_class: Any, buf: Any, buf_size: Any, ret_len: Any) -> int:
             ctypes.cast(buf, ctypes.POINTER(wintypes.DWORD))[0] = 4097
             return 0
