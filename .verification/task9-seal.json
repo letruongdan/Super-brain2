@@ -88,7 +88,7 @@
     "tests/integration/test_kernel_cli.py": "sha256:933e6604b5702cad1555e5e7dba42b29b2b50d52f393dc9653a600f86880584c",
     "tests/integration/test_kernel_crash_recovery.py": "sha256:ac18d511afa9302d70ceebf6ba4e4b4b0d4cbf64e9ff51f2d81e1254fbf1c8f0",
     "tests/integration/test_kernel_daemon.py": "sha256:5a295b84125b32385a0d80eaa3d8e8eb7686eb4d4e4b89962e62061ffd1a2d6c",
-    "tests/integration/test_kernel_native_receipt_contract.py": "sha256:6a82bddc5c369751bcd615ff717db06f47f9726f4a6f5eca59c9cdf12196d96d",
+    "tests/integration/test_kernel_native_receipt_contract.py": "sha256:48d171ddddd691dfaa5df0e0d01174c49776f4c007fbe8c214431dbec616d577",
     "tests/integration/test_kernel_performance.py": "sha256:42af100cecac427169e1ad2cb286a82979c861722ff42133fd28b994c488561e",
     "tests/integration/test_kernel_privacy_persistence.py": "sha256:67a58f4c67f3115c9f035fe57305fd813245700de5383ce758ede39f830985fd",
     "tests/integration/test_kernel_receipts.py": "sha256:f64b609958b44f19f13ebf647cb992264ca88df7b760804799026d1acd87c7e9",

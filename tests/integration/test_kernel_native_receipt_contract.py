@@ -2132,9 +2132,11 @@ def test_posix_socket_pid_lookup_and_concurrent_owner_call_client_binding(
     fake_fd_dir = proc_root / "4242" / "fd"
     fake_fd_dir.mkdir(parents=True)
     monkeypatch.setattr(native_owner, "_LINUX_PROC_ROOT", proc_root, raising=False)
-    monkeypatch.setattr(
-        os,
-        "readlink",
+    from tests.integration.test_t9_libproc_client_pid import _patch_fake_linux_holders
+
+    _patch_fake_linux_holders(
+        monkeypatch,
+        proc_root,
         lambda path: "socket:[998877]" if str(path).endswith("fd\\3") or str(path).endswith("fd/3") else "",
     )
     (fake_fd_dir / "3").write_text("", encoding="utf-8")
