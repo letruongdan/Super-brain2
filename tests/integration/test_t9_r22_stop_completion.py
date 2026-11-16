@@ -2,8 +2,9 @@
 
 Work drains inside one monotonic grace. Queued or preparing work cannot cross into execution or
 commit after the cutoff. Cleanup after grace cannot become clean shutdown.
-Real owner/runtime/lease are retained. Only the stop caller's return from Event.wait is delayed, after
-the actual shared cutoff has elapsed. The timely-owner twin must still return STOPPED.
+Real owner/runtime/lease and bounded Event waits are retained. D5's controlled clock orders owner
+completion and delayed stop-caller observation across the same shared cutoff without scheduler races.
+The timely-owner twin must still return STOPPED.
 """
 
 from __future__ import annotations
@@ -11,13 +12,14 @@ from __future__ import annotations
 import contextlib
 import datetime as dt
 import threading
-import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from superbrain.adapters.os import os_adapters
+from superbrain.application import _reservation, owner_loop
 from superbrain.application.deadlines import Reservation
 from superbrain.application.jobs import JobService
 from superbrain.composition.daemon_entry import DaemonTestHooks, create_daemon_owner_loop
@@ -40,6 +42,7 @@ from tests.integration.test_kernel_daemon import (
     _DaemonTemplate,
     _DaemonTestDomain,
     _episode_args,
+    _FakeMonotonicClock,
     _instantiate_case,
 )
 from tests.support.clock import FakeClock
@@ -66,7 +69,12 @@ def test_shutdown_result_follows_owner_completion_cutoff_not_stop_caller_schedul
 ) -> None:
     clock = FakeClock(_daemon_template.base_time + dt.timedelta(minutes=5))
     root, _, config = _instantiate_case(trusted_tmp, "r22-stop-completion", _daemon_template)
-    adapters = os_adapters(clock=clock)
+    mono = _FakeMonotonicClock()
+    wall_time = SimpleNamespace(perf_counter=lambda: mono.monotonic_ns() / 1_000_000_000)
+    # Both production cutoff consumers and request deadlines share this controlled monotonic clock.
+    monkeypatch.setattr(owner_loop, "time", wall_time)
+    monkeypatch.setattr(_reservation, "time", wall_time)
+    adapters = os_adapters(clock=clock, monotonic=mono)
     workspace = _daemon_template.ws_a
     domain = _DaemonTestDomain(ws_a=workspace)
     entered = threading.Event()
@@ -116,6 +124,9 @@ def test_shutdown_result_follows_owner_completion_cutoff_not_stop_caller_schedul
         stop_wait_started.set()
         result = original_wait(timeout)
         if not result:
+            if late_owner:
+                # The owner is still held; cross the shared cutoff before allowing its cleanup.
+                mono.set(round(loop._stop_wall_deadline * 1_000_000_000) + 1)
             stop_wait_expired.set()
             assert resume_stopper.wait(4.0), "test did not release delayed stop caller"
         elif not late_owner:
@@ -175,22 +186,18 @@ def test_shutdown_result_follows_owner_completion_cutoff_not_stop_caller_schedul
                         assert entered.wait(2.0), "owner did not reach real runtime close"
                     if late_owner:
                         assert stop_wait_expired.wait(2.0), "owner was not held through the actual cutoff"
-                        # Event.wait may round a short timeout slightly down on Windows.
-                        # Establish actual monotonic expiry before releasing the owner.
-                        while (remaining := loop._stop_wall_deadline - time.perf_counter()) > 0:
-                            threading.Event().wait(remaining)
-                        assert time.perf_counter() >= loop._stop_wall_deadline
+                        assert wall_time.perf_counter() >= loop._stop_wall_deadline
                     release_owner.set()
                     if owner_action is not None:
                         assert owner_action.result(timeout=2.0) is True
                     assert original_wait(2.0), "owner did not complete real runtime cleanup"
                     if not late_owner:
-                        assert time.perf_counter() < loop._stop_wall_deadline, (
+                        assert wall_time.perf_counter() < loop._stop_wall_deadline, (
                             "positive owner did not finish inside grace"
                         )
                         # Late observation by the caller must not turn timely completion into an overrun.
-                        while (remaining := loop._stop_wall_deadline - time.perf_counter()) > 0:
-                            threading.Event().wait(remaining)
+                        mono.set(round(loop._stop_wall_deadline * 1_000_000_000) + 1)
+                        assert wall_time.perf_counter() >= loop._stop_wall_deadline
                     assert not stopping.done(), "stop caller delay was not exercised"
                     resume_stopper.set()
                     report = stopping.result(timeout=2.0)

@@ -1863,7 +1863,9 @@ def test_shard_files_colocates_wheel_fixture_files_into_shard_zero() -> None:
     ]
 
 
-def test_shard_files_balances_heavy_low_case_storage_files_by_millisecond_cost() -> None:
+def test_shard_files_balances_heavy_low_case_storage_files_by_millisecond_cost(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     # Low-case heavy storage files must balance across shards rather than stack behind high-case fast files.
     heavy_low_case = [
         "tests/storage/test_backup.py",
@@ -1874,6 +1876,10 @@ def test_shard_files_balances_heavy_low_case_storage_files_by_millisecond_cost()
         "tests/storage/test_kernel_idempotency.py",
     ]
     fast_high_case = ["tests/core/test_fast_a.py", "tests/core/test_fast_b.py", "tests/core/test_fast_c.py"]
+    # Scheduling behavior is independent of the platform's periodically recalibrated measurements.
+    weights = dict.fromkeys(heavy_low_case, 6_000)
+    weights.update(dict.fromkeys(fast_high_case, 1_000))
+    monkeypatch.setattr(gate, "_HEAVY_FILE_COST_MS", weights)
     inventory = [f"{path}::test_{i}" for path in heavy_low_case for i in range(4)] + [
         f"{path}::test_{i}" for path in fast_high_case for i in range(60)
     ]
@@ -1967,11 +1973,12 @@ def test_gate_wheel_fixture_files_and_weights_stay_aligned_with_tests() -> None:
     for worker_group in four_groups[1:]:
         assert not (configured & set(worker_group)), worker_group
     assert set(four_groups[0]) - configured, "shard 0 must accept non-wheel overflow on full 4-shard LPT plan"
-    top_three_non_wheel = {
-        "tests/integration/test_kernel_daemon.py",
-        "tests/storage/test_remediation_i2_t3_lineage.py",
-        "tests/storage/test_crash_matrix.py",
-    }
+    ranked_non_wheel = sorted(
+        ((rel_path, cost) for rel_path, cost in heavy_cfg.items() if rel_path not in configured),
+        key=lambda item: (-item[1], item[0]),
+    )
+    top_three_non_wheel = {rel_path for rel_path, _cost in ranked_non_wheel[:3]}
+    assert len(top_three_non_wheel) == 3
     for worker_group in four_groups:
         assert len(set(worker_group) & top_three_non_wheel) <= 1, f"top-3 heavy non-wheel stacked: {worker_group}"
     loads = [

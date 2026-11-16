@@ -285,151 +285,152 @@ _WHEEL_FIXTURE_FILES: frozenset[str] = frozenset(
         "tests/integration/test_t9_benchmark_scratch.py",
     }
 )
-# Calibrated across all 142 test files from R39 windows-2022 CI 3.14 and local Windows 3.11.9 timings
-# (0.60/0.40 ci/local blend for wheel files, 0.75/0.25 for non-wheel files; 2s non-testcase wheel session overhead).
+# Calibrated from all 143 files in complete R41 windows-2022 CI 3.11 JUnit timings (00b17a3).
+# Only scheduling estimates change; the collected inventory, shared 300s budget and wheel overhead remain intact.
 _HEAVY_FILE_COST_MS: dict[str, int] = {
-    "tests/integration/test_kernel_crash_recovery.py": 53089,
-    "tests/integration/test_kernel_daemon.py": 49531,
-    "tests/storage/test_remediation_i2_t3_lineage.py": 33011,
-    "tests/storage/test_crash_matrix.py": 31813,
-    "tests/integration/test_kernel_native_receipt_contract.py": 30901,
-    "tests/storage/test_kernel_revocation.py": 30500,
-    "tests/storage/test_backup.py": 26500,
-    "tests/storage/test_restore.py": 24000,
-    "tests/integration/test_kernel_cli.py": 23843,
-    "tests/storage/test_kernel_migration.py": 23429,
-    "tests/storage/test_ledger.py": 23216,
-    "tests/storage/test_runtime.py": 19607,
-    "tests/storage/test_cas.py": 19255,
-    "tests/storage/test_remediation_i2_t5.py": 18716,
-    "tests/storage/test_kernel_idempotency.py": 17914,
-    "tests/storage/test_migrate.py": 17161,
-    "tests/storage/test_policy_store.py": 17082,
-    "tests/storage/test_remediation_i2_os01.py": 16895,
-    "tests/storage/test_kernel_workspaces.py": 16668,
-    "tests/architecture/test_gate_receipt.py": 15215,
-    "tests/application/test_kernel_send_attempts.py": 14887,
-    "tests/application/test_kernel_deadlines.py": 14060,
-    "tests/application/test_t8_review_p01_wrapped_paths.py": 13742,
-    "tests/integration/test_kernel_receipts.py": 13295,
-    "tests/application/test_t8_review_p01_r2_edge_globs.py": 12890,
-    "tests/storage/test_remediation_i2_t4a.py": 12071,
-    "tests/integration/test_kernel_transport.py": 10683,
-    "tests/storage/test_reconcile.py": 10666,
-    "tests/integration/test_kernel_shim.py": 10566,
-    "tests/application/test_kernel_job_worker.py": 9829,
-    "tests/storage/test_kernel_jobs.py": 9408,
-    "tests/integration/test_kernel_privacy_persistence.py": 8325,
-    "tests/contract/test_mcp_v2_schema.py": 7790,
-    "tests/application/test_kernel_daemon_worker.py": 6934,
-    "tests/storage/test_remediation_c04_r8_backup_files.py": 6831,
-    "tests/storage/test_kernel_identity.py": 6500,
-    "tests/storage/test_remediation_c02_r6_restore_marker.py": 6048,
-    "tests/application/test_remediation_i2_t4bc.py": 5991,
-    "tests/storage/test_remediation_c04_r6_backup_container_perms.py": 5893,
-    "tests/integration/test_t9_signal_stop_conversion.py": 5830,
-    "tests/storage/test_writer.py": 5653,
-    "tests/storage/test_remediation_i2_t3_mirror_history.py": 5234,
-    "tests/application/test_t8_review_p01_r3_spellings.py": 5076,
-    "tests/storage/test_remediation_c04_cas_shard_boundary.py": 4909,
-    "tests/support/test_bounded_worker.py": 4903,
-    "tests/storage/test_swap.py": 4736,
-    "tests/storage/test_remediation_c01_wal_admission.py": 4652,
-    "tests/storage/test_errors.py": 4608,
-    "tests/storage/test_cas_gc.py": 4542,
-    "tests/integration/test_t9_r22_stop_completion.py": 4476,
-    "tests/application/test_t8_review_w01_canonical_reuse.py": 4349,
-    "tests/integration/test_kernel_serve_signal_lifecycle.py": 4280,
-    "tests/integration/test_kernel_performance.py": 3779,
-    "tests/storage/test_remediation_c01_r4_reading_leftovers.py": 3714,
-    "tests/storage/test_remediation_c02_r8_restore_carryover.py": 3638,
-    "tests/storage/test_flush_routing.py": 3551,
-    "tests/storage/test_remediation_c05_shard_parent_sync.py": 2976,
-    "tests/support/test_crash_harness.py": 2854,
-    "tests/architecture/test_remediation_c08_r11_raw_path_admission.py": 2634,
-    "tests/architecture/test_remediation_c06_gate_xpass.py": 2434,
-    "tests/storage/test_remediation_c04_r9_imported_backup_ancestors.py": 2298,
-    "tests/storage/test_retention.py": 2185,
-    "tests/integration/test_t9_startup_signal_latch.py": 2132,
-    "tests/application/test_remediation_i2_t5_worker.py": 2100,
-    "tests/application/test_t8_review_p01_n04_short_spellings.py": 1966,
-    "tests/storage/test_remediation_c01_r5_policy_wal_reader.py": 1810,
-    "tests/integration/test_t9_r21_shutdown_wait.py": 1770,
-    "tests/adapters/test_durable.py": 1769,
-    "tests/storage/test_remediation_c02_lost_main_db.py": 1691,
-    "tests/cli_api/test_t9_tcp_latency.py": 1665,
-    "tests/application/test_t8_review_p01_n01_linear.py": 1611,
-    "tests/application/test_t8_review_p01_n03_r2_inner_literals.py": 1584,
-    "tests/application/test_t8_closure_privacy_r2.py": 1574,
-    "tests/storage/test_remediation_c02_r7_live_marker.py": 1424,
-    "tests/integration/test_t9_signal_stop_guard.py": 1392,
-    "tests/integration/test_t9_client_sighting.py": 1381,
-    "tests/storage/test_remediation_i2_t5_residual.py": 1272,
-    "tests/application/test_t8_review_p01_n01_r2_edges.py": 1247,
-    "tests/adapters/test_client_profile.py": 1233,
-    "tests/architecture/test_imports.py": 1190,
-    "tests/storage/test_remediation_c04_r2_cas_siblings.py": 1102,
-    "tests/integration/test_t9_benchmark_scratch.py": 1095,
-    "tests/application/test_t8_review_w02_private_large_blocks.py": 1070,
-    "tests/architecture/test_t8_review_w02_canonical_payload_source.py": 1069,
-    "tests/application/test_t8_review_p01_n03_edge_cost.py": 1038,
-    "tests/storage/test_schema.py": 1026,
-    "tests/storage/test_remediation_c05_r2_resync.py": 916,
-    "tests/application/test_t8_closure_privacy.py": 897,
-    "tests/storage/test_remediation_c04_r5_backup_cas_link.py": 867,
-    "tests/architecture/test_remediation_c08_r13_unavailable_drive.py": 832,
-    "tests/architecture/test_t9_ci_checkout_bytes.py": 742,
-    "tests/application/test_t8_review_w01_private_equivalence.py": 737,
-    "tests/architecture/test_remediation_i2_os01.py": 677,
-    "tests/application/test_t8_review_p01_r4_oracle_fixes.py": 593,
-    "tests/cli_api/test_loopback_client.py": 591,
-    "tests/application/test_t8_privacy_performance_equivalence.py": 566,
-    "tests/application/test_kernel_privacy.py": 545,
-    "tests/storage/test_layout.py": 544,
-    "tests/storage/test_remediation_c03_handler_downgrade.py": 481,
-    "tests/support/test_inc2_process_cleanup.py": 464,
-    "tests/storage/test_remediation_c02_r4_intents_signal.py": 406,
-    "tests/core/test_faults.py": 343,
-    "tests/architecture/test_t9_ci_seal.py": 321,
-    "tests/core/test_ids.py": 308,
-    "tests/mcp/test_stdio.py": 266,
-    "tests/application/test_t8_closure_privacy_r2_gates.py": 259,
-    "tests/storage/test_t9_endpoint_casefold.py": 257,
-    "tests/cli_api/test_loopback_frames.py": 165,
-    "tests/storage/test_t9_reserved_sibling_casefold.py": 164,
-    "tests/application/test_t9_privacy_non_retention.py": 152,
-    "tests/application/test_t8_closure_privacy_r5_shapes.py": 125,
-    "tests/architecture/test_remediation_c08_r6_root_itself.py": 113,
-    "tests/cli_api/test_t8_closure_wire.py": 107,
-    "tests/storage/test_kinds.py": 96,
-    "tests/architecture/test_remediation_c08_r9_missing_root_linked_parent.py": 91,
-    "tests/application/test_t8_closure_privacy_r5_paths.py": 84,
-    "tests/architecture/test_remediation_c08_r8_root_links.py": 68,
-    "tests/architecture/test_remediation_c08_r4_preflight_failures.py": 61,
-    "tests/integration/test_t9_libproc_client_pid.py": 61,
-    "tests/architecture/test_remediation_c08_gate_environment.py": 59,
-    "tests/composition/test_client_scope.py": 58,
-    "tests/integration/test_t8_closure_perf_probe_r5.py": 58,
-    "tests/application/test_t8_review_r01_path_enforcement.py": 57,
-    "tests/application/test_remediation_i2_t3_privacy.py": 54,
-    "tests/adapters/test_paths.py": 53,
-    "tests/adapters/test_permissions.py": 53,
-    "tests/application/test_t8_closure_privacy_r4_literals.py": 28,
-    "tests/architecture/test_remediation_c08_r2_real_probe.py": 22,
-    "tests/application/test_t8_closure_prequeue.py": 16,
-    "tests/application/test_t8_review_p02_rule_gates.py": 13,
-    "tests/storage/test_t9_checkout_spelling.py": 13,
-    "tests/application/test_kernel_lineage.py": 12,
-    "tests/integration/test_t8_review_20261112_perf_attribution.py": 12,
-    "tests/support/test_fs.py": 12,
-    "tests/application/test_t8_closure_privacy_r3_casefold.py": 10,
-    "tests/integration/test_t8_closure_perf_probe.py": 10,
-    "tests/core/test_t8_closure_normalize.py": 9,
-    "tests/integration/test_t8_review_20261112_perf_replay.py": 9,
-    "tests/integration/test_t9_process_sighting.py": 9,
-    "tests/core/test_canonical.py": 8,
-    "tests/application/test_t8_review_p02_r2_rule_discovery.py": 1,
+    "tests/storage/test_kernel_revocation.py": 96850,
+    "tests/storage/test_backup.py": 67651,
+    "tests/integration/test_kernel_daemon.py": 60864,
+    "tests/integration/test_kernel_crash_recovery.py": 40193,
+    "tests/storage/test_crash_matrix.py": 34331,
+    "tests/storage/test_remediation_i2_t3_lineage.py": 33772,
+    "tests/storage/test_kernel_migration.py": 30796,
+    "tests/storage/test_restore.py": 30237,
+    "tests/storage/test_kernel_workspaces.py": 28726,
+    "tests/storage/test_kernel_idempotency.py": 28465,
+    "tests/storage/test_ledger.py": 25610,
+    "tests/storage/test_remediation_i2_os01.py": 24939,
+    "tests/storage/test_cas.py": 24438,
+    "tests/storage/test_remediation_i2_t5.py": 23411,
+    "tests/storage/test_kernel_identity.py": 22029,
+    "tests/storage/test_migrate.py": 21962,
+    "tests/storage/test_runtime.py": 20816,
+    "tests/integration/test_t9_socket_readiness.py": 20341,
+    "tests/integration/test_kernel_native_receipt_contract.py": 19358,
+    "tests/application/test_kernel_send_attempts.py": 18156,
+    "tests/integration/test_kernel_cli.py": 17344,
+    "tests/integration/test_kernel_receipts.py": 15795,
+    "tests/storage/test_remediation_c02_r6_restore_marker.py": 14945,
+    "tests/storage/test_policy_store.py": 14206,
+    "tests/storage/test_reconcile.py": 13874,
+    "tests/application/test_kernel_deadlines.py": 12114,
+    "tests/integration/test_kernel_shim.py": 11539,
+    "tests/storage/test_kernel_jobs.py": 11450,
+    "tests/architecture/test_gate_receipt.py": 10979,
+    "tests/integration/test_kernel_privacy_persistence.py": 10646,
+    "tests/storage/test_remediation_i2_t4a.py": 10215,
+    "tests/application/test_kernel_daemon_worker.py": 9884,
+    "tests/storage/test_remediation_c04_r9_imported_backup_ancestors.py": 9776,
+    "tests/application/test_kernel_job_worker.py": 9556,
+    "tests/application/test_t8_review_p01_r2_edge_globs.py": 9332,
+    "tests/storage/test_remediation_c04_r8_backup_files.py": 9112,
+    "tests/storage/test_errors.py": 9068,
+    "tests/application/test_t8_review_p01_wrapped_paths.py": 9039,
+    "tests/storage/test_remediation_c04_cas_shard_boundary.py": 8579,
+    "tests/integration/test_kernel_transport.py": 8262,
+    "tests/contract/test_mcp_v2_schema.py": 6797,
+    "tests/application/test_remediation_i2_t4bc.py": 5693,
+    "tests/integration/test_t9_r22_stop_completion.py": 5514,
+    "tests/storage/test_remediation_i2_t3_mirror_history.py": 5044,
+    "tests/storage/test_remediation_c02_lost_main_db.py": 5001,
+    "tests/storage/test_writer.py": 4858,
+    "tests/application/test_t8_review_w01_canonical_reuse.py": 4589,
+    "tests/storage/test_remediation_c01_wal_admission.py": 4454,
+    "tests/storage/test_flush_routing.py": 4377,
+    "tests/storage/test_remediation_c04_r6_backup_container_perms.py": 4068,
+    "tests/support/test_bounded_worker.py": 3971,
+    "tests/storage/test_remediation_c01_r4_reading_leftovers.py": 3856,
+    "tests/storage/test_retention.py": 3804,
+    "tests/integration/test_t9_signal_stop_conversion.py": 3421,
+    "tests/architecture/test_remediation_c08_r11_raw_path_admission.py": 3402,
+    "tests/integration/test_kernel_serve_signal_lifecycle.py": 3331,
+    "tests/application/test_t8_review_p01_r3_spellings.py": 3166,
+    "tests/storage/test_cas_gc.py": 3101,
+    "tests/integration/test_kernel_performance.py": 2788,
+    "tests/application/test_remediation_i2_t5_worker.py": 2570,
+    "tests/storage/test_remediation_c02_r8_restore_carryover.py": 2326,
+    "tests/storage/test_swap.py": 2215,
+    "tests/integration/test_t9_r21_shutdown_wait.py": 2211,
+    "tests/storage/test_remediation_c02_r4_intents_signal.py": 2162,
+    "tests/storage/test_remediation_c01_r5_policy_wal_reader.py": 2153,
+    "tests/integration/test_t9_startup_signal_latch.py": 1930,
+    "tests/cli_api/test_t9_tcp_latency.py": 1856,
+    "tests/storage/test_remediation_c05_shard_parent_sync.py": 1681,
+    "tests/support/test_crash_harness.py": 1677,
+    "tests/integration/test_t9_client_sighting.py": 1663,
+    "tests/application/test_t8_review_p01_n04_short_spellings.py": 1643,
+    "tests/storage/test_remediation_c04_r5_backup_cas_link.py": 1446,
+    "tests/adapters/test_durable.py": 1442,
+    "tests/application/test_t8_review_p01_n01_linear.py": 1435,
+    "tests/storage/test_remediation_c05_r2_resync.py": 1386,
+    "tests/storage/test_remediation_c03_handler_downgrade.py": 1087,
+    "tests/storage/test_remediation_c04_r2_cas_siblings.py": 1077,
+    "tests/application/test_t8_review_p01_n03_r2_inner_literals.py": 1063,
+    "tests/architecture/test_remediation_c06_gate_xpass.py": 1008,
+    "tests/storage/test_remediation_i2_t5_residual.py": 975,
+    "tests/application/test_t8_closure_privacy_r2.py": 895,
+    "tests/application/test_t8_review_p01_n01_r2_edges.py": 808,
+    "tests/application/test_t8_closure_privacy.py": 795,
+    "tests/integration/test_t9_benchmark_scratch.py": 772,
+    "tests/integration/test_t9_signal_stop_guard.py": 758,
+    "tests/application/test_t8_review_p01_n03_edge_cost.py": 742,
+    "tests/application/test_t8_review_w02_private_large_blocks.py": 735,
+    "tests/architecture/test_t8_review_w02_canonical_payload_source.py": 659,
+    "tests/architecture/test_imports.py": 640,
+    "tests/application/test_t8_review_w01_private_equivalence.py": 549,
+    "tests/cli_api/test_loopback_client.py": 542,
+    "tests/architecture/test_remediation_i2_os01.py": 503,
+    "tests/architecture/test_t9_ci_checkout_bytes.py": 473,
+    "tests/architecture/test_remediation_c08_r13_unavailable_drive.py": 434,
+    "tests/application/test_t8_review_p01_r4_oracle_fixes.py": 394,
+    "tests/storage/test_remediation_c02_r7_live_marker.py": 385,
+    "tests/application/test_t8_privacy_performance_equivalence.py": 348,
+    "tests/storage/test_layout.py": 341,
+    "tests/adapters/test_client_profile.py": 314,
+    "tests/support/test_inc2_process_cleanup.py": 302,
+    "tests/application/test_kernel_privacy.py": 243,
+    "tests/core/test_ids.py": 209,
+    "tests/core/test_faults.py": 186,
+    "tests/mcp/test_stdio.py": 176,
+    "tests/storage/test_t9_checkout_spelling.py": 176,
+    "tests/architecture/test_t9_ci_seal.py": 167,
+    "tests/storage/test_schema.py": 159,
+    "tests/application/test_t8_closure_privacy_r2_gates.py": 142,
+    "tests/storage/test_t9_endpoint_casefold.py": 129,
+    "tests/cli_api/test_loopback_frames.py": 92,
+    "tests/application/test_t9_privacy_non_retention.py": 87,
+    "tests/cli_api/test_t8_closure_wire.py": 76,
+    "tests/storage/test_t9_reserved_sibling_casefold.py": 69,
+    "tests/application/test_t8_closure_privacy_r5_shapes.py": 67,
+    "tests/integration/test_t9_libproc_client_pid.py": 57,
+    "tests/composition/test_client_scope.py": 51,
+    "tests/architecture/test_remediation_c08_r8_root_links.py": 43,
+    "tests/architecture/test_remediation_c08_r6_root_itself.py": 41,
+    "tests/application/test_t8_closure_privacy_r5_paths.py": 35,
+    "tests/architecture/test_remediation_c08_r9_missing_root_linked_parent.py": 29,
+    "tests/architecture/test_remediation_c08_r4_preflight_failures.py": 27,
+    "tests/application/test_t8_closure_privacy_r4_literals.py": 26,
+    "tests/adapters/test_permissions.py": 23,
+    "tests/application/test_t8_review_r01_path_enforcement.py": 21,
+    "tests/architecture/test_remediation_c08_gate_environment.py": 20,
+    "tests/integration/test_t8_closure_perf_probe_r5.py": 20,
+    "tests/adapters/test_paths.py": 18,
+    "tests/application/test_remediation_i2_t3_privacy.py": 16,
+    "tests/architecture/test_remediation_c08_r2_real_probe.py": 16,
+    "tests/integration/test_t9_process_sighting.py": 10,
+    "tests/application/test_t8_closure_prequeue.py": 8,
+    "tests/integration/test_t8_review_20261112_perf_attribution.py": 7,
+    "tests/core/test_t8_closure_normalize.py": 6,
+    "tests/integration/test_t8_closure_perf_probe.py": 6,
+    "tests/integration/test_t8_review_20261112_perf_replay.py": 6,
+    "tests/application/test_t8_closure_privacy_r3_casefold.py": 5,
+    "tests/application/test_t8_review_p02_rule_gates.py": 4,
+    "tests/support/test_fs.py": 4,
+    "tests/application/test_kernel_lineage.py": 3,
+    "tests/storage/test_kinds.py": 2,
+    "tests/core/test_canonical.py": 1,
     "tests/integration/test_t9_linux_scan_budget.py": 1,
+    "tests/application/test_t8_review_p02_r2_rule_discovery.py": 0,
 }
 
 
@@ -654,7 +655,12 @@ def _win32_assign_job(proc: subprocess.Popen[str]) -> int | None:
     return int(job)
 
 
+_WIN32_JOB_DRAIN_TIMEOUT_S = 1.0
+_WIN32_MAX_JOB_PIDS = 16_384
+
+
 def _win32_close_job(job: int | None, *, terminate: bool) -> None:
+    """Reap owned job processes before releasing their mapped worktree images."""
     if job is None or sys.platform != "win32":
         return
     import ctypes
@@ -663,13 +669,92 @@ def _win32_close_job(job: int | None, *, terminate: bool) -> None:
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
     kernel32.TerminateJobObject.restype = wintypes.BOOL
+    kernel32.QueryInformationJobObject.argtypes = [
+        wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD, wintypes.LPVOID,
+    ]
+    kernel32.QueryInformationJobObject.restype = wintypes.BOOL
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
     kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
     kernel32.CloseHandle.restype = wintypes.BOOL
+    deadline = time.monotonic() + _WIN32_JOB_DRAIN_TIMEOUT_S
+    handles: list[int] = []
+
+    def process_ids() -> list[int]:
+        capacity = 64
+        while True:
+            class ProcessList(ctypes.Structure):
+                _fields_ = [
+                    ("assigned", wintypes.DWORD),
+                    ("count", wintypes.DWORD),
+                    ("ids", ctypes.c_size_t * capacity),
+                ]
+
+            info = ProcessList()
+            ctypes.set_last_error(0)
+            ok = kernel32.QueryInformationJobObject(job, 3, ctypes.byref(info), ctypes.sizeof(info), None)
+            error = ctypes.get_last_error()
+            if not ok and error != 234:  # ERROR_MORE_DATA: retry the whole list, never truncate it.
+                raise RuntimeError(f"Win32 job process query failed ({error})")
+            if not ok or info.count < info.assigned:
+                needed = max(capacity * 2, int(info.assigned))
+                if needed > _WIN32_MAX_JOB_PIDS or time.monotonic() >= deadline:
+                    raise RuntimeError("Win32 job process list exceeds the drain limit")
+                capacity = needed
+                continue
+            if info.count > capacity or info.count != info.assigned:
+                raise RuntimeError("Win32 job process list is incomplete")
+            pids = [int(info.ids[index]) for index in range(info.count)]
+            if any(pid <= 0 or pid > 0xFFFFFFFF for pid in pids) or len(pids) != len(set(pids)):
+                raise RuntimeError("Win32 job process list is invalid")
+            return pids
+
+    terminated = False
     try:
-        if terminate:
-            kernel32.TerminateJobObject(job, 1)
+        while True:
+            pids = process_ids()
+            if not pids:
+                if terminate and not terminated and not kernel32.TerminateJobObject(job, 1):
+                    raise RuntimeError("Win32 empty job termination failed")
+                return
+            batch: list[int] = []
+            for pid in pids:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("Win32 job process drain timed out")
+                ctypes.set_last_error(0)
+                handle = kernel32.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE, no PID-based termination.
+                if not handle:
+                    error = ctypes.get_last_error()
+                    if error == 87:  # ERROR_INVALID_PARAMETER: the listed process has already exited.
+                        continue
+                    raise RuntimeError(f"Win32 job process handle could not be opened ({error})")
+                batch.append(int(handle))
+                handles.append(int(handle))
+            if not terminated:
+                # Normal close already has KILL_ON_JOB_CLOSE semantics. Keep the handle open until drained.
+                if not kernel32.TerminateJobObject(job, 1):
+                    raise RuntimeError("Win32 job termination failed")
+                terminated = True
+            for handle in batch:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError("Win32 job process drain timed out")
+                result = kernel32.WaitForSingleObject(handle, max(1, math.ceil(remaining * 1000)))
+                if result != 0:  # WAIT_OBJECT_0 alone proves that image teardown completed.
+                    raise RuntimeError(f"Win32 job process did not finish before teardown ({result})")
+            if time.monotonic() >= deadline:
+                raise RuntimeError("Win32 job process drain timed out")
     finally:
-        kernel32.CloseHandle(job)
+        close_failed = False
+        for handle in handles:
+            if not kernel32.CloseHandle(handle):
+                close_failed = True
+        if not kernel32.CloseHandle(job):
+            close_failed = True
+        if close_failed:
+            raise RuntimeError("Win32 job drain handle cleanup failed")
 
 
 def _kill_tree(proc: subprocess.Popen[str]) -> None:
@@ -690,6 +775,13 @@ def _kill_tree(proc: subprocess.Popen[str]) -> None:
 _STEP_PID: ContextVar[int | None] = ContextVar("_STEP_PID", default=None)
 
 
+class _ProcessCleanupError(RuntimeError):
+    def __init__(self, message: str, *, output: str, seconds: float) -> None:
+        super().__init__(message)
+        self.output = output
+        self.seconds = seconds
+
+
 def run(cmd: Sequence[str], *, cwd: Path, timeout_s: float) -> tuple[int | None, str, float]:
     """Run ``cmd``; return ``(exit_code or None on timeout, combined output, seconds)``."""
     began = time.monotonic()
@@ -707,6 +799,7 @@ def run(cmd: Sequence[str], *, cwd: Path, timeout_s: float) -> tuple[int | None,
     job = _win32_assign_job(proc)
     _STEP_PID.set(proc.pid)
     timed_out = False
+    output = ""
     try:
         output, _ = proc.communicate(timeout=timeout_s)
         return proc.returncode, output, time.monotonic() - began
@@ -721,8 +814,11 @@ def run(cmd: Sequence[str], *, cwd: Path, timeout_s: float) -> tuple[int | None,
                 proc.kill()
             except OSError:
                 pass
-        _win32_close_job(job, terminate=True)
-        job = None
+        closing_job, job = job, None
+        try:
+            _win32_close_job(closing_job, terminate=True)
+        except RuntimeError as err:  # retain the original timeout and captured subprocess output
+            kill_note += f"\n<draining the timed-out process tree failed: {err}>"
         try:
             output, _ = proc.communicate(timeout=KILL_GRACE_S)
         except subprocess.TimeoutExpired:
@@ -730,7 +826,12 @@ def run(cmd: Sequence[str], *, cwd: Path, timeout_s: float) -> tuple[int | None,
         return None, (output or "") + kill_note, time.monotonic() - began
     finally:
         if job is not None:
-            _win32_close_job(job, terminate=timed_out)
+            try:
+                _win32_close_job(job, terminate=timed_out)
+            except RuntimeError as err:
+                raise _ProcessCleanupError(
+                    str(err), output=output or "", seconds=time.monotonic() - began,
+                ) from err
 
 
 _TRANSIENT_CLEANUP_SLEEP_S: tuple[float, ...] = (0.02, 0.04, 0.06, 0.06)
@@ -943,6 +1044,8 @@ def run_gate(
             never_started = _STEP_PID.get() is None
             stage = "could not start" if never_started and isinstance(err, OSError) else "failed while running"
             code, output, seconds, error = None, "", 0.0, f"{stage}: {type(err).__name__}: {err}"
+            if isinstance(err, _ProcessCleanupError):
+                output, seconds = err.output, err.seconds
         with record_lock:
             rel = ev.write(f"steps/{len(steps):02d}-{name}.log", output.encode("utf-8", "replace"))
             steps.append({
