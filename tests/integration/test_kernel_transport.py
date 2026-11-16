@@ -1764,10 +1764,14 @@ class TestTransportLifecycleAndRelease:
 
                 # Intercept interrupt_send_attempt to advance clock by 10 ms (reaching 1,500 ms) as soon as called
                 orig_interrupt = h.loop.interrupt_send_attempt
+                interrupted: Future[Future[Any]] = Future()
 
                 def _intercept_interrupt(send_attempt_id: str) -> Future[Any]:
                     h.mono_clock.advance_ns(10_000_000)
-                    return orig_interrupt(send_attempt_id)
+                    future = orig_interrupt(send_attempt_id)
+                    if not interrupted.done():
+                        interrupted.set_result(future)
+                    return future
 
                 h.loop.interrupt_send_attempt = _intercept_interrupt  # type: ignore[method-assign]
 
@@ -1785,9 +1789,10 @@ class TestTransportLifecycleAndRelease:
                 assert res_a["error"]["code"] == "policy_unavailable"
                 assert "# Loaded Skill L1" not in canonical_json(res_a).decode("utf-8")
 
-                # Release owner hold and sync
+                # Client receipt and an unrelated owner barrier may precede transport's interrupt handoff.
                 owner_hold_ev.set()
                 h.loop.run_owner_action(lambda: None).result(timeout=2.0)
+                interrupted.result(timeout=2.0).result(timeout=2.0)
 
                 assert h.count_send_attempts("served_only") == 0
                 assert h.count_send_attempts("unknown") == 1

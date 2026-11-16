@@ -328,6 +328,22 @@ def test_normal_job_cleanup_unknown_is_recorded_as_receipt_refusal_with_a_positi
     edge = JobOs([])
     edge.query_error = query_error
     edge.install(monkeypatch, clock=False)
+    real_popen = subprocess.Popen
+
+    class Win32ProcessBoundary:
+        # Only the unavailable native handle is synthetic; stdout, PID, waits and clock stay real.
+        _handle = 333
+
+        def __init__(self, process: subprocess.Popen[str]) -> None:
+            self.process = process
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self.process, name)
+
+    def popen_with_native_handle(*args: Any, **kwargs: Any) -> Win32ProcessBoundary:
+        return Win32ProcessBoundary(real_popen(*args, **kwargs))
+
+    monkeypatch.setattr(subprocess, "Popen", popen_with_native_handle)
     monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
     monkeypatch.setattr(gate, "collect_environment", lambda *_a, **_kw: facts())
     real_run = gate.run

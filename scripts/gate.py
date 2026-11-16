@@ -592,6 +592,8 @@ def _clean_env() -> dict[str, str]:
     env = dict(os.environ)
     for name in ("VIRTUAL_ENV", "UV_PROJECT_ENVIRONMENT", "PYTHONPATH", "PYTHONHOME"):
         env.pop(name, None)
+    if sys.platform == "win32":
+        env["UV_LINK_MODE"] = "copy"  # Mapped DLL hardlinks prevent ephemeral checkout removal on Windows Server.
     return env
 
 
