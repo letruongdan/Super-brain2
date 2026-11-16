@@ -921,6 +921,7 @@ def test_missing_or_corrupt_trust_authority_fails_closed_across_all_kernel_polic
 def test_overlong_and_unsupported_policy_version_metadata_fails_closed_without_writes(
     trusted_tmp: Path, os_: OsAdapters, clock: FakeClock
 ) -> None:
+    import shutil
     import sqlite3
     from collections.abc import Callable, Mapping
 
@@ -940,46 +941,58 @@ def test_overlong_and_unsupported_policy_version_metadata_fails_closed_without_w
     def _snapshot_authority_rows(db: sqlite3.Connection) -> dict[str, list[tuple[object, ...]]]:
         return {table: db.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall() for table in authority_tables}
 
+    # Seed a single canonical template runtime once, then clone for each metadata variation to avoid
+    # redundant migrations and filesystem sync overhead.
+    tpl_root = trusted_tmp / "policy-meta-template"
+    rt_tpl = open_runtime(
+        tpl_root,
+        os_,
+        store_migrations=KERNEL_STORE_MIGRATIONS,
+        policy_migrations=KERNEL_POLICY_MIGRATIONS,
+    )
+    store_id = rt_tpl.policy.store_id
+    gen = rt_tpl.policy.trust_generation()
+    expiry = clock.now() + dt.timedelta(hours=1)
+    seeded = seed_principal_and_credential(
+        rt_tpl.policy, owner_id="alice", harness_id="claude-code", machine_id="box-1"
+    )
+    reg_init = WorkspaceRegistration(
+        owner_id="alice",
+        principal_id=seeded.principal.principal_id,
+        machine_id="box-1",
+        alias="repo-init",
+        checkout_path=str(trusted_tmp / "tpl-chk-init"),
+        path_identity="alice:box-1:tpl:init",
+        locator=TrustedLocator(
+            scheme="https",
+            canonical_locator="https://example.invalid/alice/tpl.git",
+            locator_digest=digest_bytes(b"https://example.invalid/alice/tpl.git"),
+        ),
+    )
+    i_init = new_id()
+    auth_init = make_bootstrap_auth(
+        intent_id=i_init,
+        store_id=store_id,
+        owner_id="alice",
+        action="workspace_register",
+        subject_id=reg_init.subject_id,
+        trust_generation=gen,
+        expires_at=expiry,
+    )
+    binding = rt_tpl.policy.register_authorized_workspace(reg_init, auth_init)
+    ws_scope = Scope(repo_id=binding.repo_id, checkout_id=binding.checkout_id)
+    rt_tpl.close()
+
     def verify_live_meta_case(case_name: str, meta_updates: Mapping[str, str]) -> None:
+        case_root = trusted_tmp / f"policy-meta-{case_name}"
+        shutil.copytree(tpl_root, case_root)
         rt = open_runtime(
-            trusted_tmp / f"policy-meta-{case_name}",
+            case_root,
             os_,
             store_migrations=KERNEL_STORE_MIGRATIONS,
             policy_migrations=KERNEL_POLICY_MIGRATIONS,
         )
         try:
-            store_id = rt.policy.store_id
-            gen = rt.policy.trust_generation()
-            expiry = clock.now() + dt.timedelta(hours=1)
-            seeded = seed_principal_and_credential(
-                rt.policy, owner_id="alice", harness_id="claude-code", machine_id="box-1"
-            )
-            reg_init = WorkspaceRegistration(
-                owner_id="alice",
-                principal_id=seeded.principal.principal_id,
-                machine_id="box-1",
-                alias="repo-init",
-                checkout_path=str(trusted_tmp / f"{case_name}-chk-init"),
-                path_identity=f"alice:box-1:{case_name}:init",
-                locator=TrustedLocator(
-                    scheme="https",
-                    canonical_locator=f"https://example.invalid/alice/{case_name}.git",
-                    locator_digest=digest_bytes(f"https://example.invalid/alice/{case_name}.git".encode()),
-                ),
-            )
-            i_init = new_id()
-            auth_init = make_bootstrap_auth(
-                intent_id=i_init,
-                store_id=store_id,
-                owner_id="alice",
-                action="workspace_register",
-                subject_id=reg_init.subject_id,
-                trust_generation=gen,
-                expires_at=expiry,
-            )
-            binding = rt.policy.register_authorized_workspace(reg_init, auth_init)
-            ws_scope = Scope(repo_id=binding.repo_id, checkout_id=binding.checkout_id)
-
             with rt.policy._immediate() as db:
                 for m_key, m_val in meta_updates.items():
                     db.execute("UPDATE meta SET value = ? WHERE key = ?", (m_val, m_key))
@@ -1064,30 +1077,25 @@ def test_overlong_and_unsupported_policy_version_metadata_fails_closed_without_w
     # (never raw ValueError).
     for meta_key in ("schema_version", "min_reader_version"):
         closed_root = trusted_tmp / f"closed-overlong-{meta_key}"
-        rt_closed = open_runtime(
-            closed_root,
-            os_,
-            store_migrations=KERNEL_STORE_MIGRATIONS,
-            policy_migrations=KERNEL_POLICY_MIGRATIONS,
-        )
+        shutil.copytree(tpl_root, closed_root)
+        policy_db_path = closed_root / "policy" / "policy.db"
+        conn_closed = sqlite3.connect(policy_db_path)
         try:
-            closed_store_id = rt_closed.policy.store_id
-            policy_db_path = rt_closed.root.policy_db
-            with rt_closed.policy._immediate() as db_closed:
-                db_closed.execute("UPDATE meta SET value = ? WHERE key = ?", ("9" * 5000, meta_key))
+            conn_closed.execute("UPDATE meta SET value = ? WHERE key = ?", ("9" * 5000, meta_key))
+            conn_closed.commit()
         finally:
-            rt_closed.close()
+            conn_closed.close()
 
         with pytest.raises(BrainError) as exc_rsi:
             read_schema_info(policy_db_path)
         assert exc_rsi.value.code is ErrorCode.INTEGRITY_FAILURE
 
         with pytest.raises(BrainError) as exc_admit_serve:
-            admit_existing_pair(closed_root, closed_store_id, os_, purpose="serve")
+            admit_existing_pair(closed_root, store_id, os_, purpose="serve")
         assert exc_admit_serve.value.code is ErrorCode.INTEGRITY_FAILURE
 
         with pytest.raises(BrainError) as exc_admit_mig:
-            admit_existing_pair(closed_root, closed_store_id, os_, purpose="migrate")
+            admit_existing_pair(closed_root, store_id, os_, purpose="migrate")
         assert exc_admit_mig.value.code is ErrorCode.INTEGRITY_FAILURE
 
     # Non-hardcoded future policy tuple compatibility: injected next-version policy migration allows all 6

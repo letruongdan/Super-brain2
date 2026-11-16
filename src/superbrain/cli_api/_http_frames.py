@@ -391,11 +391,12 @@ def write_all(
     _remaining_seconds(monotonic_ns, deadline_ns)
     offset = 0
     total = len(data)
+    mv = memoryview(data)
     while offset < total:
         rem_s = _remaining_seconds(monotonic_ns, deadline_ns)
         sock.settimeout(rem_s)
         try:
-            sent = sock.send(data[offset:])
+            sent = sock.send(mv[offset:])
         except (TimeoutError, ssl.SSLWantReadError, ssl.SSLWantWriteError) as err:
             raise HttpFramingError(ErrorCode.DEADLINE_EXCEEDED, "deadline exceeded", http_status=408) from err
         except OSError as err:

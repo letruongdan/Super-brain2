@@ -54,9 +54,8 @@ SYNC_TIMEOUT_S = 600.0
 COLLECT_TIMEOUT_S = 300.0
 def default_pytest_shards(platform_name: str = sys.platform, cpu_count: int | None = None) -> int:
     """Return the platform default pytest shard count."""
+    del platform_name
     cpus = max(1, (os.cpu_count() if cpu_count is None else cpu_count) or 1)
-    if platform_name == "win32" and cpus <= 4:
-        return min(2, cpus)
     return min(4, cpus)
 
 
@@ -289,20 +288,19 @@ _WHEEL_FIXTURE_FILES: frozenset[str] = frozenset(
 # Calibrated across all 142 test files from R39 windows-2022 CI 3.14 and local Windows 3.11.9 timings
 # (0.60/0.40 ci/local blend for wheel files, 0.75/0.25 for non-wheel files; 2s non-testcase wheel session overhead).
 _HEAVY_FILE_COST_MS: dict[str, int] = {
-    "tests/storage/test_kernel_revocation.py": 60513,
     "tests/integration/test_kernel_crash_recovery.py": 53089,
     "tests/integration/test_kernel_daemon.py": 49531,
-    "tests/storage/test_backup.py": 39600,
-    "tests/storage/test_restore.py": 37536,
     "tests/storage/test_remediation_i2_t3_lineage.py": 33011,
     "tests/storage/test_crash_matrix.py": 31813,
     "tests/integration/test_kernel_native_receipt_contract.py": 30901,
+    "tests/storage/test_kernel_revocation.py": 30500,
+    "tests/storage/test_backup.py": 26500,
+    "tests/storage/test_restore.py": 24000,
     "tests/integration/test_kernel_cli.py": 23843,
     "tests/storage/test_kernel_migration.py": 23429,
     "tests/storage/test_ledger.py": 23216,
     "tests/storage/test_runtime.py": 19607,
     "tests/storage/test_cas.py": 19255,
-    "tests/storage/test_kernel_identity.py": 18926,
     "tests/storage/test_remediation_i2_t5.py": 18716,
     "tests/storage/test_kernel_idempotency.py": 17914,
     "tests/storage/test_migrate.py": 17161,
@@ -325,6 +323,7 @@ _HEAVY_FILE_COST_MS: dict[str, int] = {
     "tests/contract/test_mcp_v2_schema.py": 7790,
     "tests/application/test_kernel_daemon_worker.py": 6934,
     "tests/storage/test_remediation_c04_r8_backup_files.py": 6831,
+    "tests/storage/test_kernel_identity.py": 6500,
     "tests/storage/test_remediation_c02_r6_restore_marker.py": 6048,
     "tests/application/test_remediation_i2_t4bc.py": 5991,
     "tests/storage/test_remediation_c04_r6_backup_container_perms.py": 5893,
@@ -595,6 +594,84 @@ def _clean_env() -> dict[str, str]:
     return env
 
 
+def _win32_assign_job(proc: subprocess.Popen[str]) -> int | None:
+    """Assign a real Win32 Popen process to a kill-on-close Job Object; return handle or None."""
+    if sys.platform != "win32":
+        return None
+    raw_handle = getattr(proc, "_handle", None)
+    if isinstance(raw_handle, bool) or not isinstance(raw_handle, int) or raw_handle <= 0:
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
+    kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    kernel32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD]
+    kernel32.SetInformationJobObject.restype = wintypes.BOOL
+    kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    class _IoCounters(ctypes.Structure):
+        _fields_ = [(n, ctypes.c_uint64) for n in ("r", "w", "o", "rb", "wb", "ob")]
+
+    class _BasicLimit(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_int64),
+            ("PerJobUserTimeLimit", ctypes.c_int64),
+            ("LimitFlags", wintypes.DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", wintypes.DWORD),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", wintypes.DWORD),
+            ("SchedulingClass", wintypes.DWORD),
+        ]
+
+    class _ExtendedLimit(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", _BasicLimit),
+            ("IoInfo", _IoCounters),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+    job = kernel32.CreateJobObjectW(None, None)
+    if not job:
+        return None
+    info = _ExtendedLimit()
+    info.BasicLimitInformation.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    if not kernel32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info)):
+        kernel32.CloseHandle(job)
+        return None
+    if not kernel32.AssignProcessToJobObject(job, raw_handle):
+        kernel32.CloseHandle(job)
+        return None
+    return int(job)
+
+
+def _win32_close_job(job: int | None, *, terminate: bool) -> None:
+    if job is None or sys.platform != "win32":
+        return
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    kernel32.TerminateJobObject.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    try:
+        if terminate:
+            kernel32.TerminateJobObject(job, 1)
+    finally:
+        kernel32.CloseHandle(job)
+
+
 def _kill_tree(proc: subprocess.Popen[str]) -> None:
     if sys.platform == "win32":
         subprocess.run(
@@ -627,11 +704,14 @@ def run(cmd: Sequence[str], *, cwd: Path, timeout_s: float) -> tuple[int | None,
         errors="replace",
         start_new_session=sys.platform != "win32",
     )
+    job = _win32_assign_job(proc)
     _STEP_PID.set(proc.pid)
+    timed_out = False
     try:
         output, _ = proc.communicate(timeout=timeout_s)
         return proc.returncode, output, time.monotonic() - began
     except subprocess.TimeoutExpired:
+        timed_out = True
         kill_note = ""
         try:
             _kill_tree(proc)
@@ -641,11 +721,16 @@ def run(cmd: Sequence[str], *, cwd: Path, timeout_s: float) -> tuple[int | None,
                 proc.kill()
             except OSError:
                 pass
+        _win32_close_job(job, terminate=True)
+        job = None
         try:
             output, _ = proc.communicate(timeout=KILL_GRACE_S)
         except subprocess.TimeoutExpired:
             output = KILL_HANG_MARKER
         return None, (output or "") + kill_note, time.monotonic() - began
+    finally:
+        if job is not None:
+            _win32_close_job(job, terminate=timed_out)
 
 
 _TRANSIENT_CLEANUP_SLEEP_S: tuple[float, ...] = (0.02, 0.04, 0.06, 0.06)

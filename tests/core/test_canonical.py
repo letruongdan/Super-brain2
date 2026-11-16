@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from superbrain.core.canonical import canonical_digest, digest_bytes
+from superbrain.core.canonical import canonical_digest, canonical_json, digest_bytes, validate_json
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.jsonvalue import JsonValue
 
@@ -40,3 +40,53 @@ def test_digest_bytes_requires_bytes(value: object) -> None:
     with pytest.raises(BrainError) as failure:
         digest_bytes(value)  # type: ignore[arg-type]
     assert failure.value.code == ErrorCode.INVALID_INPUT
+
+
+def test_canonical_json_ascii_fast_path_equivalence_and_non_ascii_preservation() -> None:
+    # 1. Pure ASCII structures produce exact byte-for-byte output as standard JSON.
+    ascii_payload: dict[str, object] = {
+        "title": "clean ascii",
+        "nested": {"count": 42, "flag": True, "empty": None, "sub": ["a", "b", "c"]},
+        "escapes": "hello\nworld\ttab\"quote\\backslash",
+    }
+    raw_ascii = canonical_json(ascii_payload)
+    assert raw_ascii == (
+        b'{"escapes":"hello\\nworld\\ttab\\"quote\\\\backslash",'
+        b'"nested":{"count":42,"empty":null,"flag":true,"sub":["a","b","c"]},'
+        b'"title":"clean ascii"}'
+    )
+
+    # 2. Non-ASCII values and keys use UTF-8 without \u escapes.
+    unicode_val = {"greeting": "héllo world 🚀"}
+    raw_val = canonical_json(unicode_val)
+    assert raw_val == '{"greeting":"héllo world 🚀"}'.encode()
+    assert b"\\u" not in raw_val
+
+    unicode_key = {"k\u00e9y": "value"}
+    raw_key = canonical_json(unicode_key)
+    assert raw_key == '{"k\u00e9y":"value"}'.encode()
+    assert b"\\u" not in raw_key
+
+    # 3. Non-ASCII in deeply nested structure.
+    nested_unicode = {"a": [{"b": {"c": ["safe", "café"]}}]}
+    assert canonical_json(nested_unicode) == '{"a":[{"b":{"c":["safe","café"]}}]}'.encode()
+
+
+def test_validate_json_ascii_and_unicode_fast_paths() -> None:
+    # Valid ASCII and UTF-8 strings succeed without error.
+    validate_json({"ascii": "abc", "utf8": "café", "num": 123, "bool": False, "none": None})
+
+    # Reject non-finite floats.
+    with pytest.raises(BrainError) as exc_nan:
+        validate_json({"nan": float("nan")})
+    assert exc_nan.value.code == ErrorCode.INVALID_INPUT
+
+    # Reject non-string keys.
+    with pytest.raises(BrainError) as exc_key:
+        validate_json({123: "bad key"})
+    assert exc_key.value.code == ErrorCode.INVALID_INPUT
+
+    # Reject surrogate characters.
+    with pytest.raises(BrainError) as exc_surr:
+        validate_json({"bad": "\ud800"})
+    assert exc_surr.value.code == ErrorCode.INVALID_INPUT

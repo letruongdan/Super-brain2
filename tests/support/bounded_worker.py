@@ -224,7 +224,7 @@ class BoundedJsonWorker:
 
     def _reap(self) -> tuple[int, ...]:
         """End the worker and release the pipes without closing a stream another thread may be blocked on."""
-        survivors = _terminate(self._proc, _TERMINATE_TIMEOUT_S)
+        survivors = () if self._proc.poll() is not None else _terminate(self._proc, _TERMINATE_TIMEOUT_S)
         self._reader.join(_TERMINATE_TIMEOUT_S)
         writer = self._writer
         if writer is not None:

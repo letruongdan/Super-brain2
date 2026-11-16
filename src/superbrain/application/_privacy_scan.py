@@ -111,6 +111,8 @@ class _TextScans:
         return new
 
     def _pem(self, text: str) -> str:
+        if "-----BEGIN " not in text:
+            return text
         out: list[str] = []
         cursor = 0
         begin = _PEM_BEGIN.search(text)
@@ -172,8 +174,11 @@ class _TextScans:
             if spaces_only:
                 colon = find(":", start, seg_end)
                 if colon != -1:
-                    user = text[start:colon]
-                    cred = "/" not in user and "?" not in user and "#" not in user
+                    cred = (
+                        find("/", start, colon) == -1
+                        and find("?", start, colon) == -1
+                        and find("#", start, colon) == -1
+                    )
                 else:
                     cred = False
                 if cred:
@@ -236,14 +241,14 @@ class _TextScans:
                     lowered = new.lower()
         if has_deadline:
             self.tick()
-        if "token" in lowered or fast.b_auth.search(lowered) is not None:
+        if "token" in lowered or "bearer" in lowered or "basic" in lowered:
             new = _AUTH_SCHEME.sub(self._auth_scheme, text)
             if new != text:
                 text = new
                 if not reusable:
                     lowered = new.lower()
         ft = _FIXED_TOKENS
-        if fast.gh_both.search(text) is not None:
+        if ("gh" in text or "github_pat_" in text) and fast.gh_both.search(text) is not None:
             if "github_pat_" in text:
                 new = self._sub(ft[0], REDACTED, text)
                 if new != text:

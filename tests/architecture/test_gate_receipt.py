@@ -1442,7 +1442,7 @@ def test_shard_file_partition_is_complete_disjoint_and_deterministic(shards: int
     [
         ("win32", 1, 1),
         ("win32", 2, 2),
-        ("win32", 4, 2),
+        ("win32", 4, 4),
         ("win32", 8, 4),
         ("win32", 16, 4),
         ("win32", None, 1),
@@ -1826,6 +1826,7 @@ def test_shard_files_colocates_wheel_fixture_files_into_shard_zero() -> None:
         }
     )
     non_wheel_files = [
+        "tests/integration/test_kernel_daemon.py",
         "tests/storage/test_backup.py",
         "tests/storage/test_kernel_revocation.py",
         "tests/storage/test_restore.py",
@@ -1887,18 +1888,16 @@ def test_shard_files_balances_heavy_low_case_storage_files_by_millisecond_cost()
 def test_shard_files_staggers_storage_vs_non_storage_io() -> None:
     wheel_files = sorted(gate._WHEEL_FIXTURE_FILES)[:2]
     storage_files = [
-        "tests/storage/test_backup.py",
-        "tests/storage/test_kernel_revocation.py",
-        "tests/storage/test_restore.py",
+        "tests/storage/test_remediation_i2_t3_lineage.py",
         "tests/storage/test_crash_matrix.py",
+        "tests/storage/test_kernel_migration.py",
+        "tests/storage/test_ledger.py",
     ]
     non_storage_files = [
-        "tests/integration/test_kernel_daemon.py",
         "tests/architecture/test_gate_receipt.py",
         "tests/application/test_kernel_send_attempts.py",
         "tests/application/test_kernel_deadlines.py",
         "tests/application/test_t8_review_p01_wrapped_paths.py",
-        "tests/application/test_t8_review_p01_r2_edge_globs.py",
     ]
     inventory = [f"{path}::test_case" for path in (*wheel_files, *storage_files, *non_storage_files)]
     groups = gate.shard_files(inventory, 4)
@@ -1969,9 +1968,9 @@ def test_gate_wheel_fixture_files_and_weights_stay_aligned_with_tests() -> None:
         assert not (configured & set(worker_group)), worker_group
     assert set(four_groups[0]) - configured, "shard 0 must accept non-wheel overflow on full 4-shard LPT plan"
     top_three_non_wheel = {
-        "tests/storage/test_backup.py",
-        "tests/storage/test_kernel_revocation.py",
         "tests/integration/test_kernel_daemon.py",
+        "tests/storage/test_remediation_i2_t3_lineage.py",
+        "tests/storage/test_crash_matrix.py",
     }
     for worker_group in four_groups:
         assert len(set(worker_group) & top_three_non_wheel) <= 1, f"top-3 heavy non-wheel stacked: {worker_group}"
@@ -2351,3 +2350,46 @@ def test_is_worktree_registered_tolerates_broken_unrelated_worktree_entries(
 
     monkeypatch.setattr(gate, "run", _run_with_broken_and_owned)
     assert registered_fn(repo, owned) is True
+
+
+def test_win32_job_object_lifecycle_and_non_win32_graceful_noop(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Windows Job Object assigns subprocess, terminates on cleanup, and no-ops gracefully elsewhere."""
+    assign_fn = getattr(gate, "_win32_assign_job", None)
+    close_fn = getattr(gate, "_win32_close_job", None)
+    assert callable(assign_fn) and callable(close_fn)
+
+    # 1. Non-win32 platform returns None and close is a clean no-op.
+    with monkeypatch.context() as mp:
+        mp.setattr(sys, "platform", "linux")
+        fake_proc = subprocess.Popen([sys.executable, "-c", "pass"])
+        try:
+            assert assign_fn(fake_proc) is None
+            close_fn(None, terminate=True)
+            close_fn(12345, terminate=True)
+        finally:
+            fake_proc.wait()
+
+    # 2. None job is a safe no-op.
+    close_fn(None, terminate=False)
+    close_fn(None, terminate=True)
+
+    # 3. On Windows, assigning a real process returns an integer job handle and closing terminates cleanly.
+    if sys.platform == "win32":
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"])
+        job = None
+        try:
+            job = assign_fn(proc)
+            assert isinstance(job, int) and job != 0
+        finally:
+            if job is not None:
+                close_fn(job, terminate=True)
+            else:
+                proc.kill()
+            proc.wait(timeout=5)
+            assert proc.poll() is not None
+
+        # Boolean handles and invalid handles refuse assignment cleanly.
+        class _MockProcBool:
+            _handle = True
+
+        assert assign_fn(_MockProcBool()) is None

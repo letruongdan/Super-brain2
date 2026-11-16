@@ -25,30 +25,38 @@ def fake_link(monkeypatch: pytest.MonkeyPatch, path: Path) -> None:
 
 def digest_tree(path: Path) -> dict[str, str]:
     """Relative POSIX path -> sha256 of the content (``"<dir>"`` for directories), without following links."""
+    root_str = os.fspath(path)
+    prefix_len = len(root_str) if root_str.endswith(("/", "\\")) else len(root_str) + 1
     found: dict[str, str] = {}
-    for directory, dirnames, filenames in os.walk(path):
-        base = Path(directory)
+    for dirpath, dirnames, filenames in os.walk(root_str):
+        rel_dir = dirpath[prefix_len:].replace("\\", "/")
+        dir_prefix = f"{rel_dir}/" if rel_dir else ""
         for name in dirnames:
-            found[(base / name).relative_to(path).as_posix()] = "<dir>"
+            found[f"{dir_prefix}{name}"] = "<dir>"
         for name in filenames:
-            entry = base / name
-            found[entry.relative_to(path).as_posix()] = hashlib.sha256(entry.read_bytes()).hexdigest()
+            full_path = os.path.join(dirpath, name)
+            with open(full_path, "rb") as f:
+                found[f"{dir_prefix}{name}"] = hashlib.sha256(f.read()).hexdigest()
     return found
 
 
 def digest_data_root(path: Path) -> dict[str, str]:
     """``digest_tree`` of a tree holding a data root, except that ``writer.lock`` is digested from byte 1: on
     Windows the writer locks byte 0, and reading it through another handle fails while the lock is held."""
+    root_str = os.fspath(path)
+    prefix_len = len(root_str) if root_str.endswith(("/", "\\")) else len(root_str) + 1
     found: dict[str, str] = {}
-    for directory, dirnames, filenames in os.walk(path):
-        base = Path(directory)
+    for dirpath, dirnames, filenames in os.walk(root_str):
+        rel_dir = dirpath[prefix_len:].replace("\\", "/")
+        dir_prefix = f"{rel_dir}/" if rel_dir else ""
         for name in dirnames:
-            found[(base / name).relative_to(path).as_posix()] = "<dir>"
+            found[f"{dir_prefix}{name}"] = "<dir>"
         for name in filenames:
-            entry = base / name
-            with entry.open("rb") as f:
-                f.seek(1 if name == "writer.lock" else 0)
-                found[entry.relative_to(path).as_posix()] = hashlib.sha256(f.read()).hexdigest()
+            full_path = os.path.join(dirpath, name)
+            with open(full_path, "rb") as f:
+                if name == "writer.lock":
+                    f.seek(1)
+                found[f"{dir_prefix}{name}"] = hashlib.sha256(f.read()).hexdigest()
     return found
 
 
