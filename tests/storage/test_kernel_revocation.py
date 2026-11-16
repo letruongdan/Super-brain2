@@ -1622,6 +1622,7 @@ def test_historical_v2_writer_is_fenced_before_policy_mutation_across_migrate_an
     )
     from superbrain.storage.sqlite import open_readonly
     from superbrain.storage.swap import READY
+    from tests.support.inc2_transport import clone_owner_only_tree
 
     def _read_policy_state(policy_db: Path) -> dict[str, object]:
         db = open_readonly(policy_db)
@@ -2232,6 +2233,10 @@ def test_historical_v2_writer_is_fenced_before_policy_mutation_across_migrate_an
     finally:
         rt_b1_v2.close()
 
+    saved_v2_policy_bytes = (b1_root / "policy" / "policy.db").read_bytes()
+    v2_tpl = trusted_tmp / "part-b-v2-template"
+    clone_owner_only_tree(b1_root, v2_tpl)
+
     clock.advance(dt.timedelta(seconds=5))
     mig_b1_to_v3 = migrate_offline(
         DaemonConfig(1, b1_root, b1_store_id, trusted_tmp / "b1.pem", trusted_tmp / "b1.key"),
@@ -2247,6 +2252,9 @@ def test_historical_v2_writer_is_fenced_before_policy_mutation_across_migrate_an
     for leftover in list(b1_root.iterdir()):
         if leftover.name.startswith(("policy.replaced-", "store.replaced-")):
             shutil.rmtree(leftover)
+
+    v3_tpl = trusted_tmp / "part-b-v3-template"
+    clone_owner_only_tree(b1_root, v3_tpl)
 
     # B1. Against upgraded (store=2, policy=3) root, admit_existing_pair, open_runtime, and PolicyStore.open
     # with v2_policy all raise UNSUPPORTED_VERSION before any mutation.
@@ -2335,34 +2343,10 @@ def test_historical_v2_writer_is_fenced_before_policy_mutation_across_migrate_an
     # B3. Even if live policy.db is at v2 while live store.db holds policy.workspace_register at handler_version=2,
     # restore_policy with v2_policy or POLICY_MIGRATIONS raises UNSUPPORTED_VERSION before staging anything.
     b3_root = trusted_tmp / "part-b3-store-hv2"
-    rt_b3_v1 = open_runtime(b3_root, os_, store_migrations=STORE_MIGRATIONS, policy_migrations=POLICY_MIGRATIONS)
-    try:
-        b3_store_id = rt_b3_v1.policy.store_id
-        clock.advance(dt.timedelta(seconds=5))
-        b3_v1_pol_backup = create_policy_backup(rt_b3_v1.policy, os_, clock.now())
-    finally:
-        rt_b3_v1.close()
-
-    clock.advance(dt.timedelta(seconds=5))
-    migrate_offline(
-        DaemonConfig(1, b3_root, b3_store_id, trusted_tmp / "b3.pem", trusted_tmp / "b3.key"),
-        os_,
-        policy_migrations=v2_policy,
-        store_migrations=v2_store,
-    )
-    rt_b3_v2 = open_runtime(b3_root, os_, store_migrations=v2_store, policy_migrations=v2_policy)
-    try:
-        clock.advance(dt.timedelta(seconds=5))
-        b3_v2_pol_backup = create_policy_backup(rt_b3_v2.policy, os_, clock.now())
-    finally:
-        rt_b3_v2.close()
-    saved_v2_policy_bytes = (b3_root / "policy" / "policy.db").read_bytes()
-
-    clock.advance(dt.timedelta(seconds=5))
-    migrate_offline(
-        DaemonConfig(1, b3_root, b3_store_id, trusted_tmp / "b3.pem", trusted_tmp / "b3.key"),
-        os_,
-    )
+    clone_owner_only_tree(v3_tpl, b3_root)
+    b3_store_id = b1_store_id
+    b3_v1_pol_backup = b3_root / b1_v1_pol_backup.relative_to(b1_root)
+    b3_v2_pol_backup = b3_root / b1_v2_pol_backup.relative_to(b1_root)
     adm_b3 = admit_existing_pair(b3_root, b3_store_id, os_, purpose="serve")
     rt_b3_v3 = open_runtime_under_lease(adm_b3)
     try:
@@ -2427,9 +2411,8 @@ def test_historical_v2_writer_is_fenced_before_policy_mutation_across_migrate_an
     # B4a. Interrupted migration stage policy.migrating/READY with v3 policy.db alongside v2 live policy/
     # fences admit_existing_pair(..., policy_migrations=v2_policy) with UNSUPPORTED_VERSION and unchanged root bytes.
     b4a_root = trusted_tmp / "part-b4a-after-stage"
-    rt_b4a = open_runtime(b4a_root, os_, store_migrations=v2_store, policy_migrations=v2_policy)
-    b4a_store_id = rt_b4a.policy.store_id
-    rt_b4a.close()
+    clone_owner_only_tree(v2_tpl, b4a_root)
+    b4a_store_id = b1_store_id
 
     clock.advance(dt.timedelta(seconds=5))
     mig_b4a = migrate_offline(
@@ -2460,10 +2443,8 @@ def test_historical_v2_writer_is_fenced_before_policy_mutation_across_migrate_an
     # admit_existing_pair refuses untouched, and open_runtime(..., policy_migrations=v2_policy) promotes v3 and
     # fails PolicyStore.open with UNSUPPORTED_VERSION before any authority mutation.
     b4b_root = trusted_tmp / "part-b4b-between-renames"
-    rt_b4b = open_runtime(b4b_root, os_, store_migrations=v2_store, policy_migrations=v2_policy)
-    b4b_store_id = rt_b4b.policy.store_id
-    seed_principal_and_credential(rt_b4b.policy, owner_id="dan", harness_id="claude-code", machine_id="dev-b4b")
-    rt_b4b.close()
+    clone_owner_only_tree(v2_tpl, b4b_root)
+    b4b_store_id = b1_store_id
 
     clock.advance(dt.timedelta(seconds=5))
     mig_b4b = migrate_offline(
@@ -2525,6 +2506,7 @@ def test_historical_restore_policy_cannot_strip_main_store_fence_before_authorit
         read_schema_info,
     )
     from superbrain.storage.sqlite import open_readonly
+    from tests.support.inc2_transport import clone_owner_only_tree
 
     def _norm_blob(val: object) -> bytes:
         if isinstance(val, (bytes, bytearray, memoryview)):
@@ -3305,6 +3287,10 @@ def test_historical_restore_policy_cannot_strip_main_store_fence_before_authorit
     finally:
         rt_pb_v2.close()
 
+    saved_pb_pol_v2 = (pb_root / "policy" / "policy.db").read_bytes()
+    v2_pb_tpl = trusted_tmp / "part-b-pb-v2-tpl"
+    clone_owner_only_tree(pb_root, v2_pb_tpl)
+
     clock.advance(dt.timedelta(seconds=5))
     mig_pb_v3 = migrate_offline(
         DaemonConfig(1, pb_root, pb_store_id, trusted_tmp / "pb.pem", trusted_tmp / "pb.key"),
@@ -3392,13 +3378,9 @@ def test_historical_restore_policy_cannot_strip_main_store_fence_before_authorit
 
     # Case B2b: open policy is v3 while live store.db is v2 -> restore_store(..., migrations=v2_store) refuses.
     p3s2_root = trusted_tmp / "part-b-p3-s2"
-    rt_p3s2_seed = open_runtime(p3s2_root, os_, store_migrations=v2_store, policy_migrations=v2_policy)
-    try:
-        p3s2_sid = rt_p3s2_seed.policy.store_id
-        clock.advance(dt.timedelta(seconds=5))
-        p3s2_v2_sbak = create_store_backup(rt_p3s2_seed.store, os_, clock.now())
-    finally:
-        rt_p3s2_seed.close()
+    clone_owner_only_tree(v2_pb_tpl, p3s2_root)
+    p3s2_sid = pb_store_id
+    p3s2_v2_sbak = p3s2_root / pb_v2_store_backup.relative_to(pb_root)
     clock.advance(dt.timedelta(seconds=5))
     migrate_offline(
         DaemonConfig(1, p3s2_root, p3s2_sid, trusted_tmp / "p3s2.pem", trusted_tmp / "p3s2.key"),
@@ -3431,14 +3413,9 @@ def test_historical_restore_policy_cannot_strip_main_store_fence_before_authorit
 
     # Case B2c: open policy is v2 while live store.db has (2, 2) meta + handler_version=2 ledger row -> refuses.
     hv2_root = trusted_tmp / "part-b-hv2-only"
-    rt_hv2_seed = open_runtime(hv2_root, os_, store_migrations=v2_store, policy_migrations=v2_policy)
-    try:
-        hv2_sid = rt_hv2_seed.policy.store_id
-        clock.advance(dt.timedelta(seconds=5))
-        hv2_v2_sbak = create_store_backup(rt_hv2_seed.store, os_, clock.now())
-    finally:
-        rt_hv2_seed.close()
-    saved_hv2_pol_v2 = (hv2_root / "policy" / "policy.db").read_bytes()
+    clone_owner_only_tree(v2_pb_tpl, hv2_root)
+    hv2_sid = pb_store_id
+    hv2_v2_sbak = hv2_root / pb_v2_store_backup.relative_to(pb_root)
     clock.advance(dt.timedelta(seconds=5))
     migrate_offline(DaemonConfig(1, hv2_root, hv2_sid, trusted_tmp / "hv2.pem", trusted_tmp / "hv2.key"), os_)
     adm_hv2 = admit_existing_pair(hv2_root, hv2_sid, os_, purpose="serve")
@@ -3474,7 +3451,7 @@ def test_historical_restore_policy_cannot_strip_main_store_fence_before_authorit
             shutil.rmtree(leftover)
     for companion in ("policy.db-wal", "policy.db-shm"):
         (hv2_root / "policy" / companion).unlink(missing_ok=True)
-    (hv2_root / "policy" / "policy.db").write_bytes(saved_hv2_pol_v2)
+    (hv2_root / "policy" / "policy.db").write_bytes(saved_pb_pol_v2)
     os_.permissions.secure_file(hv2_root / "policy" / "policy.db")
     hv2_conn = sqlite3.connect(hv2_root / "store" / "brain.db")
     try:

@@ -285,10 +285,10 @@ _WHEEL_FIXTURE_FILES: frozenset[str] = frozenset(
         "tests/integration/test_t9_benchmark_scratch.py",
     }
 )
-# Calibrated from all 143 files in complete R41 windows-2022 CI 3.11 JUnit timings (00b17a3).
+# Calibrated from complete windows-2022 CI JUnit timings, updated for R44 revocation speedup (50000 ms).
 # Only scheduling estimates change; the collected inventory, shared 300s budget and wheel overhead remain intact.
 _HEAVY_FILE_COST_MS: dict[str, int] = {
-    "tests/storage/test_kernel_revocation.py": 96850,
+    "tests/storage/test_kernel_revocation.py": 50000,
     "tests/storage/test_backup.py": 67651,
     "tests/integration/test_kernel_daemon.py": 60864,
     "tests/integration/test_kernel_crash_recovery.py": 40193,
