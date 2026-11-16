@@ -337,6 +337,13 @@ def test_normal_job_cleanup_unknown_is_recorded_as_receipt_refusal_with_a_positi
         def __init__(self, process: subprocess.Popen[str]) -> None:
             self.process = process
 
+        def __enter__(self) -> Any:
+            self.process.__enter__()
+            return self
+
+        def __exit__(self, *args: Any) -> Any:
+            return self.process.__exit__(*args)
+
         def __getattr__(self, name: str) -> Any:
             return getattr(self.process, name)
 
