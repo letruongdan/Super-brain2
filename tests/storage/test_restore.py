@@ -1,7 +1,13 @@
 """Store and policy restore (spec 5.7): verify first, swap under the lease, reconcile only on the next open."""
 
+import atexit
 import os
+import shutil
 import sqlite3
+import sys
+import tempfile
+import threading
+import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -34,11 +40,53 @@ from tests.storage.test_retention import hold_event
 from tests.support.clock import FakeClock
 from tests.support.crash import paused_child, run_child, run_until_crash
 from tests.support.fs import corrupt_bytes, digest_data_root, digest_tree, file_identity
+from tests.support.inc2_fixture import _cleanup_dir
 
 BEFORE_ID = "0192f3a4-5b6c-7d8e-9f01-0000000000b1"
 AFTER_ID = "0192f3a4-5b6c-7d8e-9f01-0000000000a1"
 EVENT_ID = "0192f3a4-5b6c-7d8e-9f01-000000000e01"  # crash_child.EVENT_ID
 D = digest_bytes(b"event payload")  # crash_child.EVENT_PAYLOAD
+
+_RESTORE_SEED_LOCK = threading.Lock()
+_RESTORE_SEED_BASE: Path | None = None
+_RESTORE_SEED_CACHE: dict[str, tuple[Path, object]] = {}
+
+
+def _restore_seed_base() -> Path:
+    global _RESTORE_SEED_BASE
+    if _RESTORE_SEED_BASE is not None and _RESTORE_SEED_BASE.is_dir():
+        return _RESTORE_SEED_BASE
+    if sys.platform == "win32":
+        from superbrain.adapters.os.permissions import WindowsPermissionGuard
+
+        base = Path(os.environ["LOCALAPPDATA"]) / "superbrain-tests" / f"restore-tpl-{uuid.uuid4()}"
+        base.mkdir(parents=True, exist_ok=True)
+        WindowsPermissionGuard().secure_directory(base)
+    else:
+        base = Path(tempfile.mkdtemp(prefix="sb2-restore-tpl-"))
+        os.chmod(base, 0o700)
+    atexit.register(_cleanup_dir, base)
+    _RESTORE_SEED_BASE = base
+    return base
+
+
+def _is_fresh_seed_target(data_root: Path) -> bool:
+    """Return True when ``data_root`` does not exist or is an empty real directory safe for template cloning."""
+    if not os.path.lexists(data_root):
+        return True
+    return data_root.is_dir() and not os.path.islink(data_root) and not any(data_root.iterdir())
+
+
+def _copy_seed_tree(src: Path, dst: Path) -> None:
+    shutil.copytree(src, dst, dirs_exist_ok=True)
+    if sys.platform != "win32":
+        os.chmod(dst, 0o700)
+        for cur_dir, dirnames, filenames in os.walk(dst):
+            cur_path = Path(cur_dir)
+            for dname in dirnames:
+                os.chmod(cur_path / dname, 0o700)
+            for fname in filenames:
+                os.chmod(cur_path / fname, 0o600)
 
 
 # --- helpers ---------------------------------------------------------------------------------------------------
@@ -64,13 +112,29 @@ def markers(store: Store) -> list[str]:
 
 def seed_before_backup_after(data_root: Path) -> None:
     """Hold ``before``, take a ``store`` backup, then hold ``after``: the backup knows only ``before``."""
-    rt = open_runtime(data_root, os_adapters())
-    try:
-        hold(rt.store, "before", BEFORE_ID)
-        create_store_backup(rt.store, rt.os_, now())
-        hold(rt.store, "after", AFTER_ID)
-    finally:
-        rt.close()
+    if not _is_fresh_seed_target(data_root):
+        rt = open_runtime(data_root, os_adapters())
+        try:
+            hold(rt.store, "before", BEFORE_ID)
+            create_store_backup(rt.store, rt.os_, now())
+            hold(rt.store, "after", AFTER_ID)
+        finally:
+            rt.close()
+        return
+    with _RESTORE_SEED_LOCK:
+        cached = _RESTORE_SEED_CACHE.get("before_after")
+        if cached is None or not cached[0].is_dir():
+            tpl = _restore_seed_base() / "before_after"
+            rt = open_runtime(tpl, os_adapters())
+            try:
+                hold(rt.store, "before", BEFORE_ID)
+                create_store_backup(rt.store, rt.os_, now())
+                hold(rt.store, "after", AFTER_ID)
+            finally:
+                rt.close()
+            _RESTORE_SEED_CACHE["before_after"] = (tpl, None)
+            cached = (tpl, None)
+    _copy_seed_tree(cached[0], data_root)
 
 
 def latest_store_backup(root: DataRoot) -> Path:
@@ -114,16 +178,37 @@ def count_entries(store: Store, kind: str) -> int:
 
 def seed_event_and_backup(data_root: Path, clock: FakeClock | None = None) -> str:
     """Hold an event payload (expiring after 90 days on ``clock``, else never), then take a ``store`` backup."""
-    rt = open_runtime(data_root, os_adapters(clock=clock))
-    try:
-        if clock is not None:
-            d = hold_event(rt.store, clock)
-        else:
-            d = rt.store.store_content(b"event payload", "event", EVENT_ID, RetentionClass.EVENT_PAYLOAD, None)
-        create_store_backup(rt.store, rt.os_, rt.os_.clock.now())
-        return d
-    finally:
-        rt.close()
+    cache_key = "event_clock" if clock is not None else "event_realtime"
+    default_start = datetime(2026, 10, 30, 12, 0, tzinfo=UTC)
+    if not _is_fresh_seed_target(data_root) or (clock is not None and clock.now() != default_start):
+        rt = open_runtime(data_root, os_adapters(clock=clock))
+        try:
+            if clock is not None:
+                d = hold_event(rt.store, clock)
+            else:
+                d = rt.store.store_content(b"event payload", "event", EVENT_ID, RetentionClass.EVENT_PAYLOAD, None)
+            create_store_backup(rt.store, rt.os_, rt.os_.clock.now())
+            return d
+        finally:
+            rt.close()
+    with _RESTORE_SEED_LOCK:
+        cached = _RESTORE_SEED_CACHE.get(cache_key)
+        if cached is None or not cached[0].is_dir():
+            tpl = _restore_seed_base() / cache_key
+            seed_clk = FakeClock(datetime(2026, 10, 30, 12, 0, tzinfo=UTC)) if clock is not None else None
+            rt = open_runtime(tpl, os_adapters(clock=seed_clk))
+            try:
+                if seed_clk is not None:
+                    d = hold_event(rt.store, seed_clk)
+                else:
+                    d = rt.store.store_content(b"event payload", "event", EVENT_ID, RetentionClass.EVENT_PAYLOAD, None)
+                create_store_backup(rt.store, rt.os_, rt.os_.clock.now())
+            finally:
+                rt.close()
+            _RESTORE_SEED_CACHE[cache_key] = (tpl, d)
+            cached = (tpl, d)
+    _copy_seed_tree(cached[0], data_root)
+    return str(cached[1])
 
 
 def store_id_of(data_root: Path) -> str:
@@ -150,15 +235,35 @@ def policy_backup_of(data_root: Path) -> Path:
 
 def seed_policy_backup(data_root: Path) -> int:
     """A runtime whose trust generation was raised to 5, and a ``policy`` backup of it; returns that generation."""
-    rt = open_runtime(data_root, os_adapters())
-    rt.lease.raise_trust_hwm(4)
-    rt.close()
-    rt = open_runtime(data_root, os_adapters())  # the policy store is aligned to hwm + 1
-    try:
-        create_policy_backup(rt.policy, rt.os_, now())
-        return rt.policy.trust_generation()
-    finally:
+    if not _is_fresh_seed_target(data_root):
+        rt = open_runtime(data_root, os_adapters())
+        rt.lease.raise_trust_hwm(4)
         rt.close()
+        rt = open_runtime(data_root, os_adapters())  # the policy store is aligned to hwm + 1
+        try:
+            create_policy_backup(rt.policy, rt.os_, now())
+            return rt.policy.trust_generation()
+        finally:
+            rt.close()
+    with _RESTORE_SEED_LOCK:
+        cached = _RESTORE_SEED_CACHE.get("policy_gen5")
+        if cached is None or not cached[0].is_dir():
+            tpl = _restore_seed_base() / "policy_gen5"
+            rt = open_runtime(tpl, os_adapters())
+            rt.lease.raise_trust_hwm(4)
+            rt.close()
+            rt = open_runtime(tpl, os_adapters())
+            try:
+                create_policy_backup(rt.policy, rt.os_, now())
+                gen = rt.policy.trust_generation()
+            finally:
+                rt.close()
+            _RESTORE_SEED_CACHE["policy_gen5"] = (tpl, gen)
+            cached = (tpl, gen)
+    _copy_seed_tree(cached[0], data_root)
+    gen_val = cached[1]
+    assert isinstance(gen_val, int)
+    return gen_val
 
 
 def set_meta_versions(path: Path, version: int) -> None:

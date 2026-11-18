@@ -67,7 +67,7 @@ from superbrain.storage.kernel_schema import (
 from superbrain.storage.ledger import LedgerEntry
 from superbrain.storage.policy_store import PolicyStore
 from superbrain.storage.restore import restore_policy, restore_store
-from superbrain.storage.runtime import Runtime, admit_existing_pair, open_runtime, open_runtime_under_lease
+from superbrain.storage.runtime import Runtime, admit_existing_pair, open_runtime_under_lease
 from superbrain.storage.workspaces import (
     FieldLineageProjection,
     KernelWorkspaceStore,
@@ -79,6 +79,7 @@ from superbrain.storage.workspaces import (
 )
 from tests.storage.conftest import maintenance_lease
 from tests.support.clock import FakeClock
+from tests.support.inc2_fixture import open_cloned_runtime
 from tests.support.inc2_observer import DirectorySnapshotObserver
 from tests.support.kernel_auth import SeededCredential, make_bootstrap_auth, seed_principal_and_credential
 
@@ -135,9 +136,10 @@ def _desc(tree: str = TREE_1, *, dirty_digest: str | None = None) -> SnapshotDes
 
 def _open(root: Path, os_: OsAdapters) -> Runtime:
     handlers, kinds = kernel_store_extensions()
-    return open_runtime(
+    return open_cloned_runtime(
         root,
         os_,
+        role="kernel-b" if root.name in {"root-b", "foreign-root", "other", "b"} else "kernel",
         handlers=handlers,
         kinds=kinds,
         store_migrations=KERNEL_STORE_MIGRATIONS,

@@ -86,7 +86,7 @@ from tests.support.inc2_cli import (
     write_daemon_config_file,
     write_owner_only_bytes,
 )
-from tests.support.inc2_fixture import InstalledEnv
+from tests.support.inc2_fixture import InstalledEnv, open_cloned_runtime
 from tests.support.inc2_t8_job_cases import (
     cancel_args,
     expect_cancel,
@@ -919,9 +919,10 @@ def seed_legacy_pair(ctx: KernelCrashContext) -> KernelSeed:
     clock = FakeClock(dt.datetime.now(dt.UTC).replace(microsecond=0) - dt.timedelta(minutes=5))
     adapters = os_adapters(clock=clock)
     data_root = ctx.case_dir / "data"
-    rt = open_runtime(
+    rt = open_cloned_runtime(
         data_root,
         adapters,
+        role="crash-v2",
         store_migrations=KERNEL_STORE_MIGRATIONS[:2],
         policy_migrations=KERNEL_POLICY_MIGRATIONS[:2],
     )

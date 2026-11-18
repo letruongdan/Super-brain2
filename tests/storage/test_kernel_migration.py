@@ -41,6 +41,7 @@ from superbrain.storage.swap import READY
 from tests.storage.conftest import DEMO_KINDS, CounterProjection, counter, maintenance_lease
 from tests.support.clock import FakeClock
 from tests.support.fs import digest_tree, fake_link
+from tests.support.inc2_fixture import open_cloned_runtime
 
 
 def _loosen_file(path: Path) -> None:
@@ -54,9 +55,10 @@ def _loosen_file(path: Path) -> None:
 
 def test_two_schema_upgrade_restarts_between_swaps(trusted_tmp: Path, os_: OsAdapters, clock: FakeClock) -> None:
     root_path = trusted_tmp / "v1-root"
-    rt = open_runtime(
+    rt = open_cloned_runtime(
         root_path,
         os_,
+        role="kmig-v1",
         handlers=(CounterProjection(),),
         kinds=KindRegistry(DEMO_KINDS),
         store_migrations=STORE_MIGRATIONS,
@@ -198,9 +200,10 @@ def test_two_target_orchestration_with_injected_sequences_and_noop(
     trusted_tmp: Path, os_: OsAdapters, clock: FakeClock
 ) -> None:
     root_path = trusted_tmp / "injected-seq"
-    rt = open_runtime(
+    rt = open_cloned_runtime(
         root_path,
         os_,
+        role="kmig-v1",
         store_migrations=STORE_MIGRATIONS,
         policy_migrations=POLICY_MIGRATIONS,
     )
@@ -298,9 +301,10 @@ def test_two_target_orchestration_with_injected_sequences_and_noop(
         ("inter-s4-p2", KERNEL_STORE_MIGRATIONS, v2_policy_seq),
     ):
         inter_root = trusted_tmp / case_name
-        rt_inter = open_runtime(
+        rt_inter = open_cloned_runtime(
             inter_root,
             os_,
+            role="kmig-inter",
             store_migrations=seed_store_seq,
             policy_migrations=seed_policy_seq,
         )
@@ -365,9 +369,10 @@ def test_two_target_orchestration_with_injected_sequences_and_noop(
 
 
 def _make_v2_root(root_path: Path, os_: OsAdapters) -> str:
-    rt = open_runtime(
+    rt = open_cloned_runtime(
         root_path,
         os_,
+        role="kmig-demo",
         kinds=KindRegistry(DEMO_KINDS),
         store_migrations=KERNEL_STORE_MIGRATIONS,
         policy_migrations=KERNEL_POLICY_MIGRATIONS,

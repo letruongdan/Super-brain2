@@ -17,12 +17,14 @@ from superbrain.storage.kinds import CORE_KINDS, EntryKind, FieldType, KindRegis
 from superbrain.storage.layout import DataRoot, prepare_data_root, secure_subdirectories
 from superbrain.storage.ledger import LedgerEntry, ProjectionHandler
 from superbrain.storage.policy_store import PolicyStore
-from superbrain.storage.runtime import Runtime, open_runtime
+from superbrain.storage.runtime import Runtime
+from superbrain.storage.schema import POLICY_MIGRATIONS, STORE_MIGRATIONS
 from superbrain.storage.store import Store
 from superbrain.storage.swap import recover_interrupted_swaps
 from superbrain.storage.writer import WriterLease, acquire_writer
 from tests.support.clock import FakeClock
 from tests.support.crash import run_child
+from tests.support.inc2_fixture import open_cloned_runtime
 
 STORE_ID = "store-test-0001"
 CLOCK_START = datetime(2026, 10, 30, 12, 0, tzinfo=UTC)
@@ -180,8 +182,15 @@ class Env:
 
 @pytest.fixture
 def env(trusted_tmp: Path, os_: OsAdapters, clock: FakeClock) -> Iterator[Env]:
-    """A fresh data root opened with ``open_runtime`` (``DEMO_KINDS``), closed at teardown."""
-    runtime = open_runtime(trusted_tmp / "root", os_, kinds=KindRegistry(DEMO_KINDS))
+    """A fresh data root opened from a cached schema template (``DEMO_KINDS``), closed at teardown."""
+    runtime = open_cloned_runtime(
+        trusted_tmp / "root",
+        os_,
+        role="storage-env",
+        kinds=KindRegistry(DEMO_KINDS),
+        store_migrations=STORE_MIGRATIONS,
+        policy_migrations=POLICY_MIGRATIONS,
+    )
     try:
         yield Env(runtime, clock)
     finally:

@@ -224,7 +224,7 @@ def _clone_owner_only_tree(src: Path, dst: Path) -> None:
         for fname in filenames:
             sfile = Path(cur_dir) / fname
             tfile = target_base / fname
-            tfile.write_bytes(sfile.read_bytes())
+            shutil.copyfile(sfile, tfile)
             if sys.platform != "win32":
                 os.chmod(tfile, 0o600)
 
@@ -318,7 +318,7 @@ def _daemon_template(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_Daem
         adapters = os_adapters(clock=clock)
         root = base_dir / "template-data"
 
-        rt = open_kernel_job_runtime(root, adapters)
+        rt = open_kernel_job_runtime(root, adapters, role="daemon-tpl", use_template=False)
         store_id = rt.store.store_id
         try:
             cred_a = seed_principal_and_credential(

@@ -75,6 +75,7 @@ from tests.support.inc2_fixture import (
     FixtureKernelDomain,
     FixtureResourceSpec,
     fixture_store_extensions,
+    open_cloned_runtime,
     validate_response_envelope,
 )
 from tests.support.kernel_auth import SeededCredential, make_bootstrap_auth, seed_principal_and_credential
@@ -127,9 +128,10 @@ def _desc(tree: str = TREE_A, *, dirty_digest: str | None = None) -> SnapshotDes
 
 def _open_fixture_runtime(root: Path, os_: OsAdapters) -> Runtime:
     handlers, kinds = fixture_store_extensions()
-    return open_runtime(
+    return open_cloned_runtime(
         root,
         os_,
+        role="kernel-b" if root.name in {"root-b", "foreign-root", "other", "b"} else "kernel",
         handlers=handlers,
         kinds=kinds,
         store_migrations=KERNEL_STORE_MIGRATIONS,

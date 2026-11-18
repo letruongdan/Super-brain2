@@ -37,6 +37,7 @@ from tests.storage.test_retention import hold_event
 from tests.support.clock import FakeClock
 from tests.support.crash import run_child, run_until_crash
 from tests.support.fs import corrupt_bytes, digest_tree, set_mtime
+from tests.support.inc2_fixture import open_cloned_runtime
 
 E2 = "0192f3a4-5b6c-7d8e-9f01-000000000e02"
 E3 = "0192f3a4-5b6c-7d8e-9f01-000000000e03"
@@ -171,7 +172,16 @@ DAMAGE_CHECK = {
 
 @pytest.fixture
 def other_env(trusted_tmp: Path, os_: OsAdapters, clock: FakeClock) -> Iterator[Env]:
-    runtime = open_runtime(trusted_tmp / "other", os_, kinds=KindRegistry(DEMO_KINDS))
+    from superbrain.storage.schema import POLICY_MIGRATIONS, STORE_MIGRATIONS
+
+    runtime = open_cloned_runtime(
+        trusted_tmp / "other",
+        os_,
+        role="storage-other-env",
+        kinds=KindRegistry(DEMO_KINDS),
+        store_migrations=STORE_MIGRATIONS,
+        policy_migrations=POLICY_MIGRATIONS,
+    )
     try:
         yield Env(runtime, clock)
     finally:

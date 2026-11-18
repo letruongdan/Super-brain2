@@ -7,6 +7,7 @@ most once per pytest session rather than per test. No fixture flags exist in ``s
 
 from __future__ import annotations
 
+import atexit
 import datetime as dt
 import hashlib
 import ipaddress
@@ -14,9 +15,11 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
+import threading
 import uuid
 import warnings
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,6 +31,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
+from superbrain.adapters.os import os_adapters
 from superbrain.application.jobs import JobService
 from superbrain.composition.kernel_projections import kernel_store_extensions
 from superbrain.core.canonical import digest_bytes
@@ -36,8 +40,16 @@ from superbrain.ports.clock import Clock
 from superbrain.ports.os import OsAdapters
 from superbrain.storage.idempotency import StagedKernelStore
 from superbrain.storage.kernel_schema import KERNEL_POLICY_MIGRATIONS, KERNEL_STORE_MIGRATIONS
+from superbrain.storage.kinds import KindRegistry
+from superbrain.storage.layout import prepare_data_root
+from superbrain.storage.ledger import ProjectionHandler
+from superbrain.storage.policy_store import PolicyStore
 from superbrain.storage.runtime import Runtime, admit_existing_pair, open_runtime, open_runtime_under_lease
+from superbrain.storage.schema import Migration
+from superbrain.storage.store import Store
+from superbrain.storage.writer import acquire_writer
 from superbrain.workers.executor import JobContext, JobHandler
+from tests.support.clock import FakeClock
 
 if TYPE_CHECKING:
     from tests.support.inc2_kernel_domain import (
@@ -372,9 +384,145 @@ def fixture_job_registry() -> Mapping[str, JobHandler]:
     return {FIXTURE_JOB_KIND: fixture_job_handler}
 
 
-def open_kernel_job_runtime(root: Path, os_: OsAdapters) -> Runtime:
+_RUNTIME_TEMPLATE_LOCK = threading.Lock()
+_RUNTIME_TEMPLATE_BASE: Path | None = None
+_RUNTIME_TEMPLATE_CACHE: dict[tuple[object, ...], Path] = {}
+_RUNTIME_TEMPLATE_COUNTER = 0
+
+
+def _ensure_runtime_template_base() -> Path:
+    global _RUNTIME_TEMPLATE_BASE
+    if _RUNTIME_TEMPLATE_BASE is not None and _RUNTIME_TEMPLATE_BASE.is_dir():
+        return _RUNTIME_TEMPLATE_BASE
+    if sys.platform == "win32":
+        from superbrain.adapters.os.permissions import WindowsPermissionGuard
+
+        base = Path(os.environ["LOCALAPPDATA"]) / "superbrain-tests" / f"rt-tpl-{uuid.uuid4()}"
+        base.mkdir(parents=True, exist_ok=True)
+        WindowsPermissionGuard().secure_directory(base)
+    else:
+        base = Path(tempfile.mkdtemp(prefix="sb2-rt-tpl-"))
+        os.chmod(base, 0o700)
+    atexit.register(_cleanup_dir, base)
+    _RUNTIME_TEMPLATE_BASE = base
+    return base
+
+
+def _uses_real_adapters(os_: OsAdapters) -> bool:
+    """Return True when all OS/platform ports are real ``superbrain.*`` adapters (not test doubles)."""
+    return all(
+        type(adapter).__module__.startswith("superbrain.")
+        for adapter in (os_.paths, os_.publisher, os_.locks, os_.permissions, os_.traits)
+    )
+
+
+def open_cloned_runtime(
+    root: Path,
+    os_: OsAdapters,
+    *,
+    role: str = "default",
+    handlers: Sequence[ProjectionHandler] = (),
+    kinds: KindRegistry | None = None,
+    store_migrations: Sequence[Migration] = KERNEL_STORE_MIGRATIONS,
+    policy_migrations: Sequence[Migration] = KERNEL_POLICY_MIGRATIONS,
+) -> Runtime:
+    """Instantiate a fresh empty ``Runtime`` by cloning a cached closed schema template for ``role``.
+
+    Preserves full per-test writable root isolation, owner-only permissions, and distinct ``store_id``s
+    across ``role`` values while eliminating repeated SQLite ``CREATE TABLE`` / migration ``fsync``s in setup.
+    Falls back to direct ``open_runtime`` if ``root`` already exists or uses a non-default ``OsAdapters`` double.
+    """
+    global _RUNTIME_TEMPLATE_COUNTER
+    if os.path.lexists(root) or not _uses_real_adapters(os_):
+        return open_runtime(
+            root,
+            os_,
+            handlers=handlers,
+            kinds=kinds,
+            store_migrations=store_migrations,
+            policy_migrations=policy_migrations,
+        )
+
+    kinds_obj = kinds if kinds is not None else KindRegistry(())
+    key: tuple[object, ...] = (
+        role,
+        tuple((m.to_version, m.min_reader_version) for m in store_migrations),
+        tuple((m.to_version, m.min_reader_version) for m in policy_migrations),
+        tuple(sorted(kinds_obj.kinds())),
+        tuple((type(h).__module__, type(h).__qualname__, h.name, h.handler_version) for h in handlers),
+    )
+
+    with _RUNTIME_TEMPLATE_LOCK:
+        tpl_dir = _RUNTIME_TEMPLATE_CACHE.get(key)
+        if tpl_dir is None or not tpl_dir.is_dir():
+            if len(_RUNTIME_TEMPLATE_CACHE) >= 24:
+                return open_runtime(
+                    root,
+                    os_,
+                    handlers=handlers,
+                    kinds=kinds,
+                    store_migrations=store_migrations,
+                    policy_migrations=policy_migrations,
+                )
+            base = _ensure_runtime_template_base()
+            _RUNTIME_TEMPLATE_COUNTER += 1
+            tpl_dir = base / f"tpl-{_RUNTIME_TEMPLATE_COUNTER}"
+            seed_clock = FakeClock(dt.datetime(2026, 10, 30, 12, 0, tzinfo=dt.UTC))
+            seed_os = os_adapters(clock=seed_clock)
+            rt_tpl = open_runtime(
+                tpl_dir,
+                seed_os,
+                handlers=handlers,
+                kinds=kinds_obj,
+                store_migrations=store_migrations,
+                policy_migrations=policy_migrations,
+            )
+            rt_tpl.close()
+            _RUNTIME_TEMPLATE_CACHE[key] = tpl_dir
+
+    shutil.copytree(tpl_dir, root)
+    if sys.platform != "win32":
+        os.chmod(root, 0o700)
+        for cur_dir, dirnames, filenames in os.walk(root):
+            cur_path = Path(cur_dir)
+            for dname in dirnames:
+                os.chmod(cur_path / dname, 0o700)
+            for fname in filenames:
+                os.chmod(cur_path / fname, 0o600)
+
+    data_root = prepare_data_root(root, os_)
+    lease = acquire_writer(data_root, os_)
+    policy: PolicyStore | None = None
+    store: Store | None = None
+    try:
+        policy = PolicyStore.open(data_root, lease, os_, migrations=policy_migrations)
+        store = Store.open(data_root, lease, os_, policy, handlers, kinds_obj, migrations=store_migrations)
+        policy.mark_store_published()
+    except BaseException:
+        if store is not None and not store.closed:
+            store.close()
+        if policy is not None and not policy.closed:
+            policy.close()
+        lease.release()
+        raise
+    return Runtime(root=data_root, lease=lease, policy=policy, store=store, os_=os_)
+
+
+def open_kernel_job_runtime(
+    root: Path, os_: OsAdapters, *, role: str = "kernel-job", use_template: bool = True
+) -> Runtime:
     """A fresh kernel store opened with the composition projections (workspace + Task 5 job reducers)."""
     handlers, kinds = kernel_store_extensions()
+    if use_template:
+        return open_cloned_runtime(
+            root,
+            os_,
+            role=role,
+            handlers=handlers,
+            kinds=kinds,
+            store_migrations=KERNEL_STORE_MIGRATIONS,
+            policy_migrations=KERNEL_POLICY_MIGRATIONS,
+        )
     return open_runtime(
         root,
         os_,

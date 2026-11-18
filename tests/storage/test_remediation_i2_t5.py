@@ -15,6 +15,7 @@ import json
 import os
 import shutil
 import sqlite3
+import sys
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from functools import partial
@@ -70,6 +71,7 @@ from tests.support.inc2_fixture import (
     _make_trusted_session_dir,
     enqueue_job,
     kernel_job_service,
+    open_cloned_runtime,
     open_kernel_job_runtime,
     reopen_kernel_job_runtime,
 )
@@ -94,7 +96,16 @@ class _Seeded1024Template:
 
 @pytest.fixture
 def rt(trusted_tmp: Path, os_: OsAdapters) -> Iterator[Runtime]:
-    runtime = open_kernel_job_runtime(trusted_tmp / "r5-root", os_)
+    handlers, kinds = kernel_store_extensions()
+    runtime = open_cloned_runtime(
+        trusted_tmp / "r5-root",
+        os_,
+        role="t5-rt",
+        handlers=handlers,
+        kinds=kinds,
+        store_migrations=KERNEL_STORE_MIGRATIONS,
+        policy_migrations=KERNEL_POLICY_MIGRATIONS,
+    )
     try:
         yield runtime
     finally:
@@ -102,15 +113,16 @@ def rt(trusted_tmp: Path, os_: OsAdapters) -> Iterator[Runtime]:
 
 
 def _clone_closed_data_root(src: Path, dst: Path, os_: OsAdapters) -> None:
-    """Copy a closed data root inside ``trusted_tmp`` and apply owner-only permissions on every entry."""
+    """Copy a closed data root inside ``trusted_tmp`` keeping owner-only permissions on every entry."""
     shutil.copytree(src, dst)
-    os_.permissions.secure_directory(dst)
-    for cur_dir, dirnames, filenames in os.walk(dst):
-        cur_path = Path(cur_dir)
-        for dirname in dirnames:
-            os_.permissions.secure_directory(cur_path / dirname)
-        for filename in filenames:
-            os_.permissions.secure_file(cur_path / filename)
+    if sys.platform != "win32":
+        os_.permissions.secure_directory(dst)
+        for cur_dir, dirnames, filenames in os.walk(dst):
+            cur_path = Path(cur_dir)
+            for dirname in dirnames:
+                os_.permissions.secure_directory(cur_path / dirname)
+            for filename in filenames:
+                os_.permissions.secure_file(cur_path / filename)
 
 
 def _ledger_len(rt: Runtime) -> int:
@@ -206,7 +218,7 @@ def _seeded_1024_template(tmp_path_factory: pytest.TempPathFactory) -> Iterator[
         seed_clock = FakeClock(CLOCK_START)
         seed_os = os_adapters(clock=seed_clock)
         root = scratch / "template"
-        rt = open_kernel_job_runtime(root, seed_os)
+        rt = open_kernel_job_runtime(root, seed_os, role="t5-1024-tpl")
         store_id = rt.store.store_id
         try:
             dan = seed_principal_and_credential(rt.policy, owner_id=OWNER).principal

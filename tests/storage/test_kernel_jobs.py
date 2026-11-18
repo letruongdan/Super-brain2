@@ -52,6 +52,7 @@ from tests.support.clock import FakeClock
 from tests.support.inc2_fixture import (
     enqueue_job,
     kernel_job_service,
+    open_cloned_runtime,
     open_kernel_job_runtime,
     reopen_kernel_job_runtime,
 )
@@ -77,7 +78,16 @@ RESERVE = UsageReservation(max_amount="1.5")
 
 @pytest.fixture
 def rt(trusted_tmp: Path, os_: OsAdapters) -> Iterator[Runtime]:
-    runtime = open_kernel_job_runtime(trusted_tmp / "jroot", os_)
+    handlers, kinds = kernel_store_extensions()
+    runtime = open_cloned_runtime(
+        trusted_tmp / "jroot",
+        os_,
+        role="kernel-jobs-rt",
+        handlers=handlers,
+        kinds=kinds,
+        store_migrations=KERNEL_STORE_MIGRATIONS,
+        policy_migrations=KERNEL_POLICY_MIGRATIONS,
+    )
     try:
         yield runtime
     finally:

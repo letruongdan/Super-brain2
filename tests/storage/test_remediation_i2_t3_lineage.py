@@ -68,9 +68,10 @@ from superbrain.ports.kernel import KernelTx, SourceRestrictionPort
 from superbrain.ports.os import OsAdapters
 from superbrain.storage.kernel_schema import KERNEL_POLICY_MIGRATIONS, KERNEL_STORE_MIGRATIONS
 from superbrain.storage.kinds import RetentionClass
-from superbrain.storage.runtime import Runtime, open_runtime
+from superbrain.storage.runtime import Runtime
 from superbrain.storage.workspaces import KernelWorkspaceStore, StoreSourceRestrictions
 from tests.support.clock import FakeClock
+from tests.support.inc2_fixture import open_cloned_runtime
 from tests.support.kernel_auth import SeededCredential, make_bootstrap_auth, seed_principal_and_credential
 
 MS = 1_000_000
@@ -107,9 +108,10 @@ def _desc(tree: str) -> SnapshotDescriptor:
 
 def _open(root: Path, os_: OsAdapters) -> Runtime:
     handlers, kinds = kernel_store_extensions()
-    return open_runtime(
+    return open_cloned_runtime(
         root,
         os_,
+        role="kernel-b" if root.name in {"root-b", "foreign-root", "other", "b"} else "kernel",
         handlers=handlers,
         kinds=kinds,
         store_migrations=KERNEL_STORE_MIGRATIONS,

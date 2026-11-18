@@ -45,7 +45,6 @@ from superbrain.storage.kernel_schema import (
     KERNEL_STORE_MIGRATIONS,
 )
 from superbrain.storage.layout import DataRoot
-from superbrain.storage.runtime import open_runtime
 from superbrain.storage.schema import read_schema_info
 from tests.support.clock import FakeClock
 from tests.support.inc2_cli import (
@@ -59,7 +58,7 @@ from tests.support.inc2_cli import (
     write_credential_file,
     write_daemon_config_file,
 )
-from tests.support.inc2_fixture import InstalledEnv, open_kernel_job_runtime
+from tests.support.inc2_fixture import InstalledEnv, open_cloned_runtime, open_kernel_job_runtime
 from tests.support.inc2_transport import (
     TransportTemplate,
     clone_owner_only_tree,
@@ -394,9 +393,10 @@ def test_installed_migrate_respects_offline_lease(
 
     # 1. Create a legacy Increment 1 data root at (store=2, policy=2) with durable CAS content.
     legacy_root = case_dir / "legacy-root"
-    rt = open_runtime(
+    rt = open_cloned_runtime(
         legacy_root,
         adapters,
+        role="kcli-v2",
         store_migrations=KERNEL_STORE_MIGRATIONS[:2],
         policy_migrations=KERNEL_POLICY_MIGRATIONS[:2],
     )

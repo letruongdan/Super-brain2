@@ -28,6 +28,7 @@ from tests.storage.conftest import StaticPolicy, StoreFactory, maintenance_lease
 from tests.support.bounded_worker import BoundedJsonWorker
 from tests.support.clock import FakeClock
 from tests.support.fs import digest_tree
+from tests.support.inc2_fixture import open_cloned_runtime
 from tests.support.kernel_auth import make_bootstrap_auth, seed_principal_and_credential
 
 
@@ -35,9 +36,10 @@ def test_revoked_credential_stays_revoked_after_store_restore(
     trusted_tmp: Path, os_: OsAdapters, clock: FakeClock
 ) -> None:
     root_path = trusted_tmp / "revoke-restore"
-    rt = open_runtime(
+    rt = open_cloned_runtime(
         root_path,
         os_,
+        role="krev-cur",
         store_migrations=KERNEL_STORE_MIGRATIONS,
         policy_migrations=KERNEL_POLICY_MIGRATIONS,
     )
@@ -149,9 +151,10 @@ def test_unknown_intent_kind_is_typed_integrity_failure(
 ) -> None:
     # 1. Corrupt/unknown intent kind persisted in policy.db fails closed with INTEGRITY_FAILURE.
     root_path = trusted_tmp / "unknown-intent"
-    rt = open_runtime(
+    rt = open_cloned_runtime(
         root_path,
         os_,
+        role="krev-cur",
         store_migrations=KERNEL_STORE_MIGRATIONS,
         policy_migrations=KERNEL_POLICY_MIGRATIONS,
     )
@@ -193,9 +196,10 @@ def test_unknown_intent_kind_is_typed_integrity_failure(
 
 
 def test_direct_record_intent_bypass_is_refused(trusted_tmp: Path, os_: OsAdapters) -> None:
-    rt = open_runtime(
+    rt = open_cloned_runtime(
         trusted_tmp / "bypass-guard",
         os_,
+        role="krev-cur",
         store_migrations=KERNEL_STORE_MIGRATIONS,
         policy_migrations=KERNEL_POLICY_MIGRATIONS,
     )
@@ -233,9 +237,10 @@ def test_authorized_intents_validation_idempotency_conflict_and_retained_replay(
     trusted_tmp: Path, os_: OsAdapters, clock: FakeClock
 ) -> None:
     root_path = trusted_tmp / "auth-intents"
-    rt = open_runtime(
+    rt = open_cloned_runtime(
         root_path,
         os_,
+        role="krev-cur",
         store_migrations=KERNEL_STORE_MIGRATIONS,
         policy_migrations=KERNEL_POLICY_MIGRATIONS,
     )
@@ -403,9 +408,10 @@ def test_authorized_intents_validation_idempotency_conflict_and_retained_replay(
 def test_workspace_register_enforces_egress_and_locator_consistency(
     trusted_tmp: Path, os_: OsAdapters, clock: FakeClock
 ) -> None:
-    rt = open_runtime(
+    rt = open_cloned_runtime(
         trusted_tmp / "ws-consistency",
         os_,
+        role="krev-cur",
         store_migrations=KERNEL_STORE_MIGRATIONS,
         policy_migrations=KERNEL_POLICY_MIGRATIONS,
     )
@@ -567,9 +573,10 @@ def test_workspace_register_replay_binds_immutable_original_subject_after_move(
     from superbrain.core.canonical import canonical_json
 
     root_path = trusted_tmp / "ws-replay-after-move"
-    rt = open_runtime(
+    rt = open_cloned_runtime(
         root_path,
         os_,
+        role="krev-cur",
         store_migrations=KERNEL_STORE_MIGRATIONS,
         policy_migrations=KERNEL_POLICY_MIGRATIONS,
     )
@@ -753,9 +760,10 @@ def test_workspace_register_replay_binds_immutable_original_subject_after_move(
     from superbrain.core.jsonvalue import JsonValue
 
     legacy_root = trusted_tmp / "ws-missing-subject-proof"
-    rt_legacy = open_runtime(
+    rt_legacy = open_cloned_runtime(
         legacy_root,
         os_,
+        role="krev-cur-b",
         store_migrations=KERNEL_STORE_MIGRATIONS,
         policy_migrations=KERNEL_POLICY_MIGRATIONS,
     )
@@ -930,9 +938,10 @@ def test_opaque_principal_id_revocation_blocks_credential_and_survives_restore(
     trusted_tmp: Path, os_: OsAdapters, clock: FakeClock
 ) -> None:
     root_path = trusted_tmp / "opaque-principal-revoke"
-    rt = open_runtime(
+    rt = open_cloned_runtime(
         root_path,
         os_,
+        role="krev-cur",
         store_migrations=KERNEL_STORE_MIGRATIONS,
         policy_migrations=KERNEL_POLICY_MIGRATIONS,
     )
@@ -1106,9 +1115,10 @@ def test_cross_revision_v1_workspace_register_root_reopens_reconciles_and_blocks
 
     # --- Root A: already-reconciled v1 (store=2, policy=2) root with 6-key intent + handler_version=1 ledger row ---
     root_a = trusted_tmp / "v1-reconciled-root-a"
-    rt_seed_a = open_runtime(
+    rt_seed_a = open_cloned_runtime(
         root_a,
         os_,
+        role="krev-v2-a",
         store_migrations=v2_store_migrations,
         policy_migrations=v2_policy_migrations,
     )
@@ -1344,9 +1354,10 @@ def test_cross_revision_v1_workspace_register_root_reopens_reconciles_and_blocks
 
     # --- Root B: unreconciled v1 (store=2, policy=2) root + restore_store reconciliation ---
     root_b = trusted_tmp / "v1-unreconciled-root-b"
-    rt_seed_b = open_runtime(
+    rt_seed_b = open_cloned_runtime(
         root_b,
         os_,
+        role="krev-v2-b",
         store_migrations=v2_store_migrations,
         policy_migrations=v2_policy_migrations,
     )
@@ -1932,9 +1943,10 @@ def test_historical_v2_writer_is_fenced_before_policy_mutation_across_migrate_an
             # 0b. Root created directly by Current Code (with 7-key intent) and reconciled at handler_version=2 MUST
             # also fence 6a67b38 with UNSUPPORTED_VERSION (never INTEGRITY_FAILURE) before PolicyStore opens.
             root_cur_created = part_a_base / "current-created-root"
-            rt_cur_init = open_runtime(
+            rt_cur_init = open_cloned_runtime(
                 root_cur_created,
                 os_,
+                role="krev-cur",
                 store_migrations=KERNEL_STORE_MIGRATIONS,
                 policy_migrations=KERNEL_POLICY_MIGRATIONS,
             )
@@ -2200,9 +2212,10 @@ def test_historical_v2_writer_is_fenced_before_policy_mutation_across_migrate_an
     # B1 & B2: Create a root at v1, take v1 policy backup, upgrade to (store=2, policy=2), take v2 policy backup,
     # then upgrade via migrate_offline to (store=4, policy=3).
     b1_root = trusted_tmp / "part-b-upgraded-root"
-    rt_b1_v1 = open_runtime(
+    rt_b1_v1 = open_cloned_runtime(
         b1_root,
         os_,
+        role="krev-v1",
         store_migrations=STORE_MIGRATIONS,
         policy_migrations=POLICY_MIGRATIONS,
     )
@@ -3254,7 +3267,13 @@ def test_historical_restore_policy_cannot_strip_main_store_fence_before_authorit
 
     # B1. Build (store=4, policy=3) root from v1 -> v2 -> (4, 3) with v1/v2/v4 backups and handler_version=2 history.
     pb_root = trusted_tmp / "part-b-r4-root"
-    rt_pb_v1 = open_runtime(pb_root, os_, store_migrations=STORE_MIGRATIONS, policy_migrations=POLICY_MIGRATIONS)
+    rt_pb_v1 = open_cloned_runtime(
+        pb_root,
+        os_,
+        role="krev-v1",
+        store_migrations=STORE_MIGRATIONS,
+        policy_migrations=POLICY_MIGRATIONS,
+    )
     try:
         pb_store_id = rt_pb_v1.policy.store_id
         pb_blob_digest = rt_pb_v1.store.store_content(b"pb-v1-blob", "evidence", new_id(), RetentionClass.DURABLE, None)
@@ -3533,7 +3552,13 @@ def test_historical_restore_policy_cannot_strip_main_store_fence_before_authorit
     # and open_runtime with UNSUPPORTED_VERSION before returning Runtime (zero policy logical mutations), while
     # Current Code migrate_offline upgrades (policy=2, store=3) -> (policy=3, store=3) cleanly!
     sim_root = trusted_tmp / "part-b-sim-p2-s3"
-    rt_sim_v2 = open_runtime(sim_root, os_, store_migrations=v2_store, policy_migrations=v2_policy)
+    rt_sim_v2 = open_cloned_runtime(
+        sim_root,
+        os_,
+        role="krev-v2-a",
+        store_migrations=v2_store,
+        policy_migrations=v2_policy,
+    )
     try:
         sim_sid = rt_sim_v2.policy.store_id
         sim_cred = seed_principal_and_credential(

@@ -33,6 +33,7 @@ from superbrain.storage.identity import authorize_direct_ref, verify_caller_iden
 from superbrain.storage.kernel_schema import KERNEL_POLICY_MIGRATIONS, KERNEL_STORE_MIGRATIONS
 from superbrain.storage.runtime import open_runtime
 from tests.support.clock import FakeClock
+from tests.support.inc2_fixture import open_cloned_runtime
 from tests.support.kernel_auth import (
     generate_bearer_token,
     make_bootstrap_auth,
@@ -53,9 +54,10 @@ def _loosen_file(path: Path) -> None:
 def test_wrong_owner_and_cross_scope_ref_are_refused(
     trusted_tmp: Path, os_: OsAdapters, clock: FakeClock
 ) -> None:
-    rt = open_runtime(
+    rt = open_cloned_runtime(
         trusted_tmp / "identity-root",
         os_,
+        role="kid",
         store_migrations=KERNEL_STORE_MIGRATIONS,
         policy_migrations=KERNEL_POLICY_MIGRATIONS,
     )
@@ -284,15 +286,17 @@ def test_wrong_owner_and_cross_scope_ref_are_refused(
 def test_bearer_credential_resolution_snapshot_and_digest_key(
     trusted_tmp: Path, os_: OsAdapters
 ) -> None:
-    rt1 = open_runtime(
+    rt1 = open_cloned_runtime(
         trusted_tmp / "store-one",
         os_,
+        role="kid",
         store_migrations=KERNEL_STORE_MIGRATIONS,
         policy_migrations=KERNEL_POLICY_MIGRATIONS,
     )
-    rt2 = open_runtime(
+    rt2 = open_cloned_runtime(
         trusted_tmp / "store-two",
         os_,
+        role="kid-b",
         store_migrations=KERNEL_STORE_MIGRATIONS,
         policy_migrations=KERNEL_POLICY_MIGRATIONS,
     )
@@ -571,9 +575,10 @@ def test_unauthorized_or_existing_key_is_not_overwritten(
 def test_corrupt_policy_db_raises_policy_unavailable_across_kernel_port(
     trusted_tmp: Path, os_: OsAdapters, clock: FakeClock
 ) -> None:
-    rt = open_runtime(
+    rt = open_cloned_runtime(
         trusted_tmp / "corrupt-policy",
         os_,
+        role="kid",
         store_migrations=KERNEL_STORE_MIGRATIONS,
         policy_migrations=KERNEL_POLICY_MIGRATIONS,
     )
@@ -746,9 +751,10 @@ def test_missing_or_corrupt_trust_authority_fails_closed_across_all_kernel_polic
     from collections.abc import Callable
 
     def verify_corrupt_case(case_name: str, sql_stmt: str) -> None:
-        rt = open_runtime(
+        rt = open_cloned_runtime(
             trusted_tmp / f"trust-authority-{case_name}",
             os_,
+            role="kid",
             store_migrations=KERNEL_STORE_MIGRATIONS,
             policy_migrations=KERNEL_POLICY_MIGRATIONS,
         )
@@ -854,9 +860,10 @@ def test_missing_or_corrupt_trust_authority_fails_closed_across_all_kernel_polic
             rt.close()
 
     def verify_first_read_after_trust_loss(first_read_name: str) -> None:
-        rt_first = open_runtime(
+        rt_first = open_cloned_runtime(
             trusted_tmp / f"trust-first-read-{first_read_name}",
             os_,
+            role="kid",
             store_migrations=KERNEL_STORE_MIGRATIONS,
             policy_migrations=KERNEL_POLICY_MIGRATIONS,
         )
@@ -944,9 +951,10 @@ def test_overlong_and_unsupported_policy_version_metadata_fails_closed_without_w
     # Seed a single canonical template runtime once, then clone for each metadata variation to avoid
     # redundant migrations and filesystem sync overhead.
     tpl_root = trusted_tmp / "policy-meta-template"
-    rt_tpl = open_runtime(
+    rt_tpl = open_cloned_runtime(
         tpl_root,
         os_,
+        role="kid",
         store_migrations=KERNEL_STORE_MIGRATIONS,
         policy_migrations=KERNEL_POLICY_MIGRATIONS,
     )

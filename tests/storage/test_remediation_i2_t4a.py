@@ -40,13 +40,14 @@ from superbrain.core.wire import normalize_call
 from superbrain.ports.os import OsAdapters
 from superbrain.ports.policy import IntentKind
 from superbrain.storage.kernel_schema import KERNEL_POLICY_MIGRATIONS, KERNEL_STORE_MIGRATIONS
-from superbrain.storage.runtime import Runtime, admit_existing_pair, open_runtime, open_runtime_under_lease
+from superbrain.storage.runtime import Runtime, admit_existing_pair, open_runtime_under_lease
 from superbrain.storage.store import Store
 from tests.support.clock import FakeClock
 from tests.support.inc2_fixture import (
     FixtureDeliveryRefSpec,
     FixtureKernelDomain,
     fixture_store_extensions,
+    open_cloned_runtime,
     validate_response_envelope,
 )
 from tests.support.kernel_auth import SeededCredential, make_bootstrap_auth, seed_principal_and_credential
@@ -89,9 +90,10 @@ def _desc(tree: str = TREE_A) -> SnapshotDescriptor:
 
 def _open_fixture_runtime(root: Path, os_: OsAdapters) -> Runtime:
     handlers, kinds = fixture_store_extensions()
-    return open_runtime(
+    return open_cloned_runtime(
         root,
         os_,
+        role="kernel-b" if root.name in {"root-b", "foreign-root", "other", "b"} else "kernel",
         handlers=handlers,
         kinds=kinds,
         store_migrations=KERNEL_STORE_MIGRATIONS,
