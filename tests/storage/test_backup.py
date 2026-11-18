@@ -71,7 +71,13 @@ def store_id_of(data_root: Path) -> str:
 
 
 def seed_held_blob(data_root: Path) -> str:
-    runtime = open_runtime(data_root, os_adapters())
+    runtime = open_cloned_runtime(
+        data_root,
+        os_adapters(),
+        role="bak-v1",
+        store_migrations=STORE_MIGRATIONS,
+        policy_migrations=POLICY_MIGRATIONS,
+    )
     try:
         return put_and_hold(runtime.store, HELD)
     finally:
@@ -425,7 +431,13 @@ def test_trust_generation_must_suit_the_kind(env: Env, clock: FakeClock, kind: s
 
 
 def test_policy_backup_of_a_db_without_trust_is_refused(trusted_tmp: Path, clock: FakeClock) -> None:
-    open_runtime(trusted_tmp, os_adapters()).close()
+    open_cloned_runtime(
+        trusted_tmp,
+        os_adapters(),
+        role="bak-v1",
+        store_migrations=STORE_MIGRATIONS,
+        policy_migrations=POLICY_MIGRATIONS,
+    ).close()
     db = sqlite3.connect(trusted_tmp / "policy" / "policy.db", isolation_level=None)
     try:
         db.execute("DROP TABLE trust")
@@ -460,7 +472,13 @@ def test_kind_mismatch_is_rejected(env: Env, clock: FakeClock) -> None:
 
 
 def test_policy_backup_by_path_round_trips(trusted_tmp: Path, clock: FakeClock) -> None:  # R2-07
-    open_runtime(trusted_tmp, os_adapters()).close()
+    open_cloned_runtime(
+        trusted_tmp,
+        os_adapters(),
+        role="bak-v1",
+        store_migrations=STORE_MIGRATIONS,
+        policy_migrations=POLICY_MIGRATIONS,
+    ).close()
     with maintenance_lease(trusted_tmp) as (root, lease):
         path = create_maintenance_backup(root, lease, os_adapters(), target="policy", now=clock.now())
     m = verify_backup(

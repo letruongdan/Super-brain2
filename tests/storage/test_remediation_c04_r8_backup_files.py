@@ -38,6 +38,7 @@ from superbrain.storage.runtime import open_runtime
 from superbrain.storage.schema import POLICY_MIGRATIONS, STORE_MIGRATIONS
 from tests.storage.conftest import maintenance_lease
 from tests.support.fs import digest_tree
+from tests.support.inc2_fixture import open_cloned_runtime
 from tests.support.platform import posix_only, windows_only
 
 PAYLOAD = b"c04 round 8: a held blob"
@@ -62,7 +63,13 @@ LINK_KINDS = [
 
 def make_backup(data_root: Path, kind: str) -> tuple[Path, str]:
     """A verified ``store`` or ``policy`` backup of a root holding one blob; returns ``(backup, store_id)``."""
-    rt = open_runtime(data_root, os_adapters())
+    rt = open_cloned_runtime(
+        data_root,
+        os_adapters(),
+        role="c04-r8",
+        store_migrations=STORE_MIGRATIONS,
+        policy_migrations=POLICY_MIGRATIONS,
+    )
     try:
         rt.store.store_content(PAYLOAD, "event", HOLDER, RetentionClass.EVENT_PAYLOAD, None)
         if kind == "store":

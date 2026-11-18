@@ -13,6 +13,7 @@ import hashlib
 import ipaddress
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -35,13 +36,14 @@ from superbrain.adapters.os import os_adapters
 from superbrain.application.jobs import JobService
 from superbrain.composition.kernel_projections import kernel_store_extensions
 from superbrain.core.canonical import digest_bytes
+from superbrain.core.errors import BrainError
 from superbrain.core.kernel import JobRef, JobSpec, ObjectRef, UsageRecord
 from superbrain.ports.clock import Clock
 from superbrain.ports.os import OsAdapters
 from superbrain.storage.idempotency import StagedKernelStore
 from superbrain.storage.kernel_schema import KERNEL_POLICY_MIGRATIONS, KERNEL_STORE_MIGRATIONS
 from superbrain.storage.kinds import KindRegistry
-from superbrain.storage.layout import prepare_data_root
+from superbrain.storage.layout import DataRoot, prepare_data_root, secure_subdirectories
 from superbrain.storage.ledger import ProjectionHandler
 from superbrain.storage.policy_store import PolicyStore
 from superbrain.storage.runtime import Runtime, admit_existing_pair, open_runtime, open_runtime_under_lease
@@ -408,12 +410,53 @@ def _ensure_runtime_template_base() -> Path:
     return base
 
 
-def _uses_real_adapters(os_: OsAdapters) -> bool:
+def ensure_template_base() -> Path:
+    """Return the trusted session-scoped directory holding cached setup templates."""
+    return _ensure_runtime_template_base()
+
+
+def uses_real_adapters(os_: OsAdapters) -> bool:
     """Return True when all OS/platform ports are real ``superbrain.*`` adapters (not test doubles)."""
     return all(
         type(adapter).__module__.startswith("superbrain.")
         for adapter in (os_.paths, os_.publisher, os_.locks, os_.permissions, os_.traits)
     )
+
+
+_uses_real_adapters = uses_real_adapters
+
+
+def kind_registry_signature(kinds_obj: KindRegistry) -> tuple[object, ...]:
+    """Return a lossless hashable signature for ``KindRegistry`` definitions."""
+    items: list[object] = []
+    for name in sorted(kinds_obj.kinds()):
+        spec = kinds_obj.get(name)
+        items.append(
+            (
+                spec.kind,
+                spec.handler_version,
+                tuple(sorted((f, ft.value) for f, ft in spec.fields.items())),
+                tuple(sorted((k, tuple(sorted(vs))) for k, vs in spec.enums.items())),
+                tuple(sorted(spec.nullable)),
+                spec.reserved,
+            )
+        )
+    return tuple(items)
+
+
+def _is_fresh_root(root: Path) -> bool:
+    """Return True when ``root`` does not exist or is a real empty directory (never a symlink or junction)."""
+    try:
+        if not os.path.lexists(root):
+            return True
+        st = os.lstat(root)
+        if not stat.S_ISDIR(st.st_mode) or stat.S_ISLNK(st.st_mode):
+            return False
+        if getattr(st, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400):
+            return False
+        return not any(root.iterdir())
+    except OSError:
+        return False
 
 
 def open_cloned_runtime(
@@ -426,14 +469,17 @@ def open_cloned_runtime(
     store_migrations: Sequence[Migration] = KERNEL_STORE_MIGRATIONS,
     policy_migrations: Sequence[Migration] = KERNEL_POLICY_MIGRATIONS,
 ) -> Runtime:
-    """Instantiate a fresh empty ``Runtime`` by cloning a cached closed schema template for ``role``.
+    """Instantiate a fresh empty ``Runtime`` by cloning cached closed schema DBs for ``role``.
 
-    Preserves full per-test writable root isolation, owner-only permissions, and distinct ``store_id``s
+    Preserves full per-test writable root isolation, ancestor/link/root-permission admission checks,
+    owner-only directory and file permissions, ``writer_epoch == 1``, and distinct ``store_id``s
     across ``role`` values while eliminating repeated SQLite ``CREATE TABLE`` / migration ``fsync``s in setup.
-    Falls back to direct ``open_runtime`` if ``root`` already exists or uses a non-default ``OsAdapters`` double.
+    Falls back to direct ``open_runtime`` if ``root`` is non-fresh, uses non-default ``OsAdapters``/``KindRegistry``
+    types, or has unhashable migration/handler keys.
     """
     global _RUNTIME_TEMPLATE_COUNTER
-    if os.path.lexists(root) or not _uses_real_adapters(os_):
+    kinds_obj = kinds if kinds is not None else KindRegistry(())
+    if not _is_fresh_root(root) or not uses_real_adapters(os_) or type(kinds_obj) is not KindRegistry:
         return open_runtime(
             root,
             os_,
@@ -443,14 +489,24 @@ def open_cloned_runtime(
             policy_migrations=policy_migrations,
         )
 
-    kinds_obj = kinds if kinds is not None else KindRegistry(())
     key: tuple[object, ...] = (
         role,
-        tuple((m.to_version, m.min_reader_version) for m in store_migrations),
-        tuple((m.to_version, m.min_reader_version) for m in policy_migrations),
-        tuple(sorted(kinds_obj.kinds())),
-        tuple((type(h).__module__, type(h).__qualname__, h.name, h.handler_version) for h in handlers),
+        tuple((m.to_version, m.min_reader_version, getattr(m, "apply", None)) for m in store_migrations),
+        tuple((m.to_version, m.min_reader_version, getattr(m, "apply", None)) for m in policy_migrations),
+        kind_registry_signature(kinds_obj),
+        tuple((type(h), h.name, h.handler_version, tuple(sorted(h.kinds))) for h in handlers),
     )
+    try:
+        hash(key)
+    except TypeError:
+        return open_runtime(
+            root,
+            os_,
+            handlers=handlers,
+            kinds=kinds,
+            store_migrations=store_migrations,
+            policy_migrations=policy_migrations,
+        )
 
     with _RUNTIME_TEMPLATE_LOCK:
         tpl_dir = _RUNTIME_TEMPLATE_CACHE.get(key)
@@ -480,30 +536,36 @@ def open_cloned_runtime(
             rt_tpl.close()
             _RUNTIME_TEMPLATE_CACHE[key] = tpl_dir
 
-    shutil.copytree(tpl_dir, root)
-    if sys.platform != "win32":
-        os.chmod(root, 0o700)
-        for cur_dir, dirnames, filenames in os.walk(root):
-            cur_path = Path(cur_dir)
-            for dname in dirnames:
-                os.chmod(cur_path / dname, 0o700)
-            for fname in filenames:
-                os.chmod(cur_path / fname, 0o600)
-
+    tpl_root = DataRoot.at(tpl_dir)
     data_root = prepare_data_root(root, os_)
     lease = acquire_writer(data_root, os_)
     policy: PolicyStore | None = None
     store: Store | None = None
     try:
+        secure_subdirectories(data_root, lease, os_)
+        shutil.copyfile(tpl_root.policy_db, data_root.policy_db)
+        os_.permissions.secure_file(data_root.policy_db)
+        shutil.copyfile(tpl_root.store_db, data_root.store_db)
+        os_.permissions.secure_file(data_root.store_db)
         policy = PolicyStore.open(data_root, lease, os_, migrations=policy_migrations)
         store = Store.open(data_root, lease, os_, policy, handlers, kinds_obj, migrations=store_migrations)
         policy.mark_store_published()
-    except BaseException:
-        if store is not None and not store.closed:
-            store.close()
-        if policy is not None and not policy.closed:
-            policy.close()
-        lease.release()
+    except BaseException as err:
+        try:
+            if store is not None and not store.closed:
+                store.close()
+        except BrainError as cleanup:
+            err.add_note(f"closing the store after the failure also failed: {cleanup}")
+        try:
+            if policy is not None and not policy.closed:
+                policy.close()
+        except BrainError as cleanup:
+            err.add_note(f"closing the policy store after the failure also failed: {cleanup}")
+        finally:
+            if lease.open_handles():
+                err.add_note(f"the writer lock stays held: {sorted(lease.open_handles())} could not be closed")
+            else:
+                lease.release()
         raise
     return Runtime(root=data_root, lease=lease, policy=policy, store=store, os_=os_)
 

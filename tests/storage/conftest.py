@@ -2,7 +2,10 @@
 the ``env`` runtime fixture and ``maintenance_lease``."""
 
 import contextlib
+import os
+import shutil
 import sqlite3
+import threading
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -24,7 +27,12 @@ from superbrain.storage.swap import recover_interrupted_swaps
 from superbrain.storage.writer import WriterLease, acquire_writer
 from tests.support.clock import FakeClock
 from tests.support.crash import run_child
-from tests.support.inc2_fixture import open_cloned_runtime
+from tests.support.inc2_fixture import (
+    ensure_template_base,
+    kind_registry_signature,
+    open_cloned_runtime,
+    uses_real_adapters,
+)
 
 STORE_ID = "store-test-0001"
 CLOCK_START = datetime(2026, 10, 30, 12, 0, tzinfo=UTC)
@@ -104,6 +112,44 @@ def _opened() -> Iterator[_Opened]:
     opened.close_all()
 
 
+_STORE_DB_LOCK = threading.Lock()
+_STORE_DB_CACHE: dict[tuple[object, ...], Path] = {}
+_STORE_DB_COUNTER = 0
+
+
+def _cached_store_db_template(policy_obj: StaticPolicy, kinds_obj: KindRegistry) -> Path | None:
+    """Return a closed pristine ``brain.db`` template path for ``(policy_obj.store_id, kinds_obj)``."""
+    global _STORE_DB_COUNTER
+    key: tuple[object, ...] = (policy_obj.store_id, kind_registry_signature(kinds_obj))
+    with _STORE_DB_LOCK:
+        tpl_db = _STORE_DB_CACHE.get(key)
+        if tpl_db is not None and tpl_db.is_file():
+            return tpl_db
+        if len(_STORE_DB_CACHE) >= 16:
+            return None
+        base = ensure_template_base()
+        _STORE_DB_COUNTER += 1
+        seed_os = os_adapters(clock=FakeClock(CLOCK_START))
+        tpl_root = prepare_data_root(base / f"store-tpl-{_STORE_DB_COUNTER}", seed_os)
+        tpl_lease = acquire_writer(tpl_root, seed_os)
+        try:
+            secure_subdirectories(tpl_root, tpl_lease, seed_os)
+            tpl_store = Store.create(
+                tpl_root,
+                tpl_lease,
+                seed_os,
+                StaticPolicy(store_id=policy_obj.store_id),
+                (),
+                kinds_obj,
+            )
+            tpl_store.close()
+        finally:
+            tpl_lease.release()
+        tpl_db = tpl_root.store_db
+        _STORE_DB_CACHE[key] = tpl_db
+        return tpl_db
+
+
 StoreFactory = Callable[..., Store]
 
 
@@ -123,7 +169,23 @@ def store_factory(trusted_tmp: Path, os_: OsAdapters, _opened: _Opened) -> Store
         lease = acquire_writer(root, os_)
         _opened.leases.append(lease)
         secure_subdirectories(root, lease, os_)
-        store = Store.create(root, lease, os_, policy or StaticPolicy(), handlers, kinds or KindRegistry(DEMO_KINDS))
+        policy_obj = policy or StaticPolicy()
+        kinds_obj = kinds or KindRegistry(DEMO_KINDS)
+        tpl_db: Path | None = None
+        if (
+            not handlers
+            and type(policy_obj) is StaticPolicy
+            and type(kinds_obj) is KindRegistry
+            and uses_real_adapters(os_)
+            and not os.path.lexists(root.store_db)
+        ):
+            tpl_db = _cached_store_db_template(policy_obj, kinds_obj)
+        if tpl_db is not None:
+            shutil.copyfile(tpl_db, root.store_db)
+            os_.permissions.secure_file(root.store_db)
+            store = Store.open(root, lease, os_, policy_obj, (), kinds_obj)
+        else:
+            store = Store.create(root, lease, os_, policy_obj, handlers, kinds_obj)
         _opened.stores.append(store)
         return store
 

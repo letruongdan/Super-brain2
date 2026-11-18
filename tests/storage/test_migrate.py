@@ -22,6 +22,7 @@ from superbrain.storage.schema import POLICY_MIGRATIONS, STORE_MIGRATIONS, Migra
 from tests.storage.conftest import Env, maintenance_lease
 from tests.support.crash import run_until_crash
 from tests.support.fs import digest_tree
+from tests.support.inc2_fixture import open_cloned_runtime
 
 NOW = datetime(2026, 10, 30, 12, 0, tzinfo=UTC)
 EVENT_ID = "0192f3a4-5b6c-7d8e-9f01-000000000e01"
@@ -52,7 +53,13 @@ def store_id_of(data_root: Path) -> str:
 
 
 def test_new_binary_meets_old_store_then_migrates(trusted_tmp: Path) -> None:
-    rt = open_runtime(trusted_tmp, os_adapters())
+    rt = open_cloned_runtime(
+        trusted_tmp,
+        os_adapters(),
+        role="mig-v1",
+        store_migrations=STORE_MIGRATIONS,
+        policy_migrations=POLICY_MIGRATIONS,
+    )
     digest = rt.store.store_content(b"blob one", "event", EVENT_ID, RetentionClass.EVENT_PAYLOAD, None)
     rt.close()
     with pytest.raises(BrainError) as e:
@@ -79,7 +86,13 @@ def test_new_binary_meets_old_store_then_migrates(trusted_tmp: Path) -> None:
 
 
 def test_new_binary_meets_old_policy_then_migrates(trusted_tmp: Path) -> None:
-    open_runtime(trusted_tmp, os_adapters()).close()
+    open_cloned_runtime(
+        trusted_tmp,
+        os_adapters(),
+        role="mig-v1",
+        store_migrations=STORE_MIGRATIONS,
+        policy_migrations=POLICY_MIGRATIONS,
+    ).close()
     with pytest.raises(BrainError) as e:
         open_runtime(trusted_tmp, os_adapters(), policy_migrations=POLICY_V2)
     assert e.value.code == ErrorCode.MIGRATION_REQUIRED
@@ -101,7 +114,13 @@ def test_new_binary_meets_old_policy_then_migrates(trusted_tmp: Path) -> None:
 
 
 def test_failed_policy_backup_leaves_policy_untouched(trusted_tmp: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    open_runtime(trusted_tmp, os_adapters()).close()
+    open_cloned_runtime(
+        trusted_tmp,
+        os_adapters(),
+        role="mig-v1",
+        store_migrations=STORE_MIGRATIONS,
+        policy_migrations=POLICY_MIGRATIONS,
+    ).close()
     policy_dir = DataRoot.at(trusted_tmp).policy_dir
     before = digest_tree(policy_dir)
     calls: list[Path] = []
@@ -131,7 +150,13 @@ def test_migration_with_only_the_policy_open_is_refused(env: Env) -> None:
 
 
 def test_nothing_to_migrate_and_newer_schema(trusted_tmp: Path) -> None:
-    open_runtime(trusted_tmp, os_adapters()).close()
+    open_cloned_runtime(
+        trusted_tmp,
+        os_adapters(),
+        role="mig-v1",
+        store_migrations=STORE_MIGRATIONS,
+        policy_migrations=POLICY_MIGRATIONS,
+    ).close()
     with maintenance_lease(trusted_tmp) as (root, lease):
         with pytest.raises(BrainError) as e:
             migrate_database(root, lease, os_adapters(), target="store", migrations=STORE_MIGRATIONS, now=NOW)
@@ -145,7 +170,13 @@ def test_nothing_to_migrate_and_newer_schema(trusted_tmp: Path) -> None:
 @pytest.mark.parametrize("target", ["store", "policy"])
 def test_failed_migration_leaves_target_untouched(trusted_tmp: Path, target: Literal["store", "policy"]) -> None:
     bad = Migration(to_version=2, min_reader_version=1, apply=raise_runtime_error)
-    open_runtime(trusted_tmp, os_adapters()).close()
+    open_cloned_runtime(
+        trusted_tmp,
+        os_adapters(),
+        role="mig-v1",
+        store_migrations=STORE_MIGRATIONS,
+        policy_migrations=POLICY_MIGRATIONS,
+    ).close()
     layout = DataRoot.at(trusted_tmp)
     directory = layout.store_dir if target == "store" else layout.policy_dir
     base = STORE_MIGRATIONS if target == "store" else POLICY_MIGRATIONS
@@ -160,7 +191,13 @@ def test_failed_migration_leaves_target_untouched(trusted_tmp: Path, target: Lit
     ("point", "expected_version"), [("migrating.store.after_stage", 1), ("migrating.store.between_renames", 2)]
 )
 def test_interrupted_migration_recovers(trusted_tmp: Path, point: str, expected_version: int) -> None:
-    open_runtime(trusted_tmp, os_adapters()).close()
+    open_cloned_runtime(
+        trusted_tmp,
+        os_adapters(),
+        role="mig-v1",
+        store_migrations=STORE_MIGRATIONS,
+        policy_migrations=POLICY_MIGRATIONS,
+    ).close()
     run_until_crash("migrate_store_to_v2", point, trusted_tmp)
     with maintenance_lease(trusted_tmp) as (root, _lease):
         info = read_schema_info(root.store_db)
@@ -177,7 +214,13 @@ def meta_of(path: Path) -> tuple[str, str]:
 
 
 def test_failed_backup_verification_stops_before_staging(trusted_tmp: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    open_runtime(trusted_tmp, os_adapters()).close()
+    open_cloned_runtime(
+        trusted_tmp,
+        os_adapters(),
+        role="mig-v1",
+        store_migrations=STORE_MIGRATIONS,
+        policy_migrations=POLICY_MIGRATIONS,
+    ).close()
     store_dir = DataRoot.at(trusted_tmp).store_dir
     before = digest_tree(store_dir)
     boom = BrainError(ErrorCode.INTEGRITY_FAILURE, "injected verification failure")
@@ -194,7 +237,13 @@ def test_failed_backup_verification_stops_before_staging(trusted_tmp: Path, monk
 
 
 def test_backup_is_verified_against_the_old_schema(trusted_tmp: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    open_runtime(trusted_tmp, os_adapters()).close()
+    open_cloned_runtime(
+        trusted_tmp,
+        os_adapters(),
+        role="mig-v1",
+        store_migrations=STORE_MIGRATIONS,
+        policy_migrations=POLICY_MIGRATIONS,
+    ).close()
     seen: list[tuple[Migration, ...]] = []
     original = verify_backup
 
@@ -212,7 +261,13 @@ def test_migrating_across_versions_sets_min_reader_version(trusted_tmp: Path) ->
     v2 = Migration(to_version=2, min_reader_version=1, apply=add_table)
     v3 = Migration(to_version=3, min_reader_version=2, apply=add_table_v3)
     all_three = (*STORE_MIGRATIONS, v2, v3)
-    open_runtime(trusted_tmp, os_adapters()).close()
+    open_cloned_runtime(
+        trusted_tmp,
+        os_adapters(),
+        role="mig-v1",
+        store_migrations=STORE_MIGRATIONS,
+        policy_migrations=POLICY_MIGRATIONS,
+    ).close()
     with maintenance_lease(trusted_tmp) as (root, lease):
         report = migrate_database(root, lease, os_adapters(), target="store", migrations=all_three, now=NOW)
     assert (report.from_version, report.to_version) == (1, 3)
@@ -235,7 +290,13 @@ def test_migration_connection_has_the_global_pragmas(tmp_path: Path) -> None:
 
 
 def test_default_migrations_follow_the_target(trusted_tmp: Path) -> None:
-    open_runtime(trusted_tmp, os_adapters()).close()
+    open_cloned_runtime(
+        trusted_tmp,
+        os_adapters(),
+        role="mig-v1",
+        store_migrations=STORE_MIGRATIONS,
+        policy_migrations=POLICY_MIGRATIONS,
+    ).close()
     with maintenance_lease(trusted_tmp) as (root, lease), pytest.raises(BrainError) as e:
         migrate_database(root, lease, os_adapters(), target="policy", now=NOW)
     assert e.value.code == ErrorCode.INVALID_INPUT and "nothing to migrate" in e.value.message
@@ -246,7 +307,13 @@ def test_sqlite_error_in_a_migration_is_an_integrity_failure(trusted_tmp: Path) 
         db.execute("CREATE TABLE ledger(a)")  # already exists in v1
 
     bad = Migration(to_version=2, min_reader_version=1, apply=bad_sql)
-    open_runtime(trusted_tmp, os_adapters()).close()
+    open_cloned_runtime(
+        trusted_tmp,
+        os_adapters(),
+        role="mig-v1",
+        store_migrations=STORE_MIGRATIONS,
+        policy_migrations=POLICY_MIGRATIONS,
+    ).close()
     before = digest_tree(DataRoot.at(trusted_tmp).store_dir)
     with maintenance_lease(trusted_tmp) as (root, lease), pytest.raises(BrainError) as e:
         migrate_database(root, lease, os_adapters(), target="store", migrations=(*STORE_MIGRATIONS, bad), now=NOW)
@@ -284,7 +351,13 @@ def test_failed_rollback_does_not_mask_the_original_error(tmp_path: Path) -> Non
 
 
 def test_failed_integrity_check_is_caught(trusted_tmp: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    open_runtime(trusted_tmp, os_adapters()).close()
+    open_cloned_runtime(
+        trusted_tmp,
+        os_adapters(),
+        role="mig-v1",
+        store_migrations=STORE_MIGRATIONS,
+        policy_migrations=POLICY_MIGRATIONS,
+    ).close()
     before = digest_tree(DataRoot.at(trusted_tmp).store_dir)
     monkeypatch.setattr(migrate_module, "_integrity_report", lambda db: "not ok")
     with maintenance_lease(trusted_tmp) as (root, lease), pytest.raises(BrainError) as e:
@@ -294,7 +367,13 @@ def test_failed_integrity_check_is_caught(trusted_tmp: Path, monkeypatch: pytest
 
 
 def test_replaced_dir_is_byte_identical_to_the_old_store(trusted_tmp: Path) -> None:
-    rt = open_runtime(trusted_tmp, os_adapters())
+    rt = open_cloned_runtime(
+        trusted_tmp,
+        os_adapters(),
+        role="mig-v1",
+        store_migrations=STORE_MIGRATIONS,
+        policy_migrations=POLICY_MIGRATIONS,
+    )
     rt.store.store_content(b"blob one", "event", EVENT_ID, RetentionClass.EVENT_PAYLOAD, None)
     rt.close()
     before = digest_tree(DataRoot.at(trusted_tmp).store_dir)
