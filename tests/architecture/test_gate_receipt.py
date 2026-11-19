@@ -1812,7 +1812,7 @@ def test_unknown_junit_encoding_keeps_its_raw_bytes_and_later_shard_evidence(
     ), receipt["reasons"]
 
 
-def test_shard_files_colocates_wheel_fixture_files_into_shard_zero() -> None:
+def test_shard_files_colocates_wheel_fixture_files_into_shard_zero(monkeypatch: pytest.MonkeyPatch) -> None:
     expected_wheel_files = sorted(
         {
             "tests/contract/test_mcp_v2_schema.py",
@@ -1837,12 +1837,16 @@ def test_shard_files_colocates_wheel_fixture_files_into_shard_zero() -> None:
         "tests/core/test_faults.py",
     ]
     inventory = [f"{path}::test_case_{idx}" for path in (*expected_wheel_files, *non_wheel_files) for idx in range(3)]
+
+    # Regime 1 (low wheel share): wheel_total + setup <= (total + setup) // shards -> all wheel files co-locate on 0.
+    low_weights = dict.fromkeys(expected_wheel_files, 1_000)
+    low_weights.update(dict.fromkeys(non_wheel_files, 15_000))
+    monkeypatch.setattr(gate, "_HEAVY_FILE_COST_MS", low_weights)
     for shards in (2, 4, 8):
         groups = gate.shard_files(inventory, shards)
-        assert len(groups) == shards
-        assert all(groups)
+        assert len(groups) == shards and all(groups)
         assert set(expected_wheel_files) <= set(groups[0]), (
-            f"all wheel fixture files must co-locate into shard 0 when size > 1: {groups[0]}"
+            f"low wheel share must co-locate all wheel files onto shard 0: {groups[0]}"
         )
         for other_shard in groups[1:]:
             assert not (set(expected_wheel_files) & set(other_shard)), groups
@@ -1851,16 +1855,41 @@ def test_shard_files_colocates_wheel_fixture_files_into_shard_zero() -> None:
                 f"shard 0 must accept non-wheel overflow when lighter than other shards: {groups[0]}"
             )
 
-    # Degenerate subsets with fewer non-wheel files than (shards - 1) never emit empty shard groups.
+    # Degenerate subsets never emit empty shard groups.
     wheel_only = [f"{path}::test_case" for path in expected_wheel_files]
-    assert gate.shard_files(wheel_only, 4) == [expected_wheel_files]
+    wheel_only_groups = gate.shard_files(wheel_only, 4)
+    assert wheel_only_groups and all(wheel_only_groups)
+    assert sorted(f for g in wheel_only_groups for f in g) == expected_wheel_files
     assert gate.shard_files([], 4) == []
-    assert gate.shard_files(
+    small_groups = gate.shard_files(
         [f"{expected_wheel_files[0]}::test_a", f"{expected_wheel_files[1]}::test_b", "tests/core/test_x.py::test_c"], 4
-    ) == [
-        sorted([expected_wheel_files[0], expected_wheel_files[1]]),
-        ["tests/core/test_x.py"],
-    ]
+    )
+    assert small_groups and all(small_groups)
+    assert sorted(f for g in small_groups for f in g) == sorted(
+        [expected_wheel_files[0], expected_wheel_files[1], "tests/core/test_x.py"]
+    )
+
+    # Regime 2 (high wheel share): distribute wheel files across prefix 0..needed-1, leaving needed..3 wheel-free.
+    high_wheel = expected_wheel_files[:4]
+    high_non_wheel = non_wheel_files[:8]
+    high_weights = dict.fromkeys(high_wheel, 8_000)
+    high_weights.update(dict.fromkeys(high_non_wheel, 10_000))
+    monkeypatch.setattr(gate, "_HEAVY_FILE_COST_MS", high_weights)
+    high_inv = [f"{path}::test_case" for path in (*high_wheel, *high_non_wheel)]
+    wheel_total = len(high_wheel) * 8_000
+    total_cost = wheel_total + len(high_non_wheel) * 10_000
+    needed = min(
+        4,
+        len(high_wheel),
+        math.ceil((wheel_total + gate._WHEEL_SETUP_COST_MS) / max(1, (total_cost + gate._WHEEL_SETUP_COST_MS) // 4)),
+    )
+    assert needed == 2
+    high_groups = gate.shard_files(high_inv, 4)
+    assert len(high_groups) == 4 and all(high_groups)
+    wheel_shards = [idx for idx, g in enumerate(high_groups) if set(high_wheel) & set(g)]
+    assert wheel_shards == list(range(needed)), (needed, high_groups)
+    for idx in range(needed, 4):
+        assert not (set(high_wheel) & set(high_groups[idx])), high_groups[idx]
 
 
 def test_shard_files_balances_heavy_low_case_storage_files_by_millisecond_cost(
@@ -1891,21 +1920,30 @@ def test_shard_files_balances_heavy_low_case_storage_files_by_millisecond_cost(
     assert gate.shard_files(ALL_SHARD_IDS, 2) == [["t/test_a.py"], ["t/test_b.py"]]
 
 
-def test_shard_files_staggers_storage_vs_non_storage_io() -> None:
+def test_shard_files_staggers_storage_vs_non_storage_io(monkeypatch: pytest.MonkeyPatch) -> None:
     wheel_files = sorted(gate._WHEEL_FIXTURE_FILES)[:2]
     storage_files = [
         "tests/storage/test_remediation_i2_t3_lineage.py",
         "tests/storage/test_crash_matrix.py",
         "tests/storage/test_kernel_migration.py",
         "tests/storage/test_ledger.py",
+        "tests/storage/test_backup.py",
+        "tests/storage/test_cas.py",
     ]
     non_storage_files = [
         "tests/architecture/test_gate_receipt.py",
         "tests/application/test_kernel_send_attempts.py",
         "tests/application/test_kernel_deadlines.py",
         "tests/application/test_t8_review_p01_wrapped_paths.py",
+        "tests/application/test_doctor.py",
+        "tests/application/test_bootstrap.py",
     ]
     inventory = [f"{path}::test_case" for path in (*wheel_files, *storage_files, *non_storage_files)]
+
+    # 1. Single-wheel-shard (needed == 1): 0 wheel->non-storage->storage; 1 storage-first; 2/3 non-storage-first.
+    w1 = dict.fromkeys(wheel_files, 500)
+    w1.update(dict.fromkeys((*storage_files, *non_storage_files), 5_000))
+    monkeypatch.setattr(gate, "_HEAVY_FILE_COST_MS", w1)
     groups = gate.shard_files(inventory, 4)
     assert len(groups) == 4
     assert [f for f in groups[0] if f in set(wheel_files)] == wheel_files
@@ -1913,8 +1951,6 @@ def test_shard_files_staggers_storage_vs_non_storage_io() -> None:
     assert groups[1][0].startswith("tests/storage/"), groups[1]
     assert not groups[2][0].startswith("tests/storage/"), groups[2]
     assert not groups[3][0].startswith("tests/storage/"), groups[3]
-    # Full partition invariant: shard 0 runs wheel -> non-storage -> storage;
-    # shard 1 runs storage-first; shards 2/3 run non-storage-first.
     g0_non_wheel = [f for f in groups[0] if f not in set(wheel_files)]
     assert [f.startswith("tests/storage/") for f in g0_non_wheel] == sorted(
         f.startswith("tests/storage/") for f in g0_non_wheel
@@ -1923,9 +1959,33 @@ def test_shard_files_staggers_storage_vs_non_storage_io() -> None:
         not f.startswith("tests/storage/") for f in groups[1]
     ), groups[1]
     for shard_idx in (2, 3):
+        assert not (set(wheel_files) & set(groups[shard_idx])), groups[shard_idx]
         assert [f.startswith("tests/storage/") for f in groups[shard_idx]] == sorted(
             f.startswith("tests/storage/") for f in groups[shard_idx]
         ), groups[shard_idx]
+
+    # 2. Two-wheel-shard (needed == 2): 0 wheel first; 1 storage->non-storage->wheel LAST; 2/3 non-wheel.
+    w2: dict[str, int] = {wheel_files[0]: 16_000, wheel_files[1]: 14_000}
+    w2.update(dict.fromkeys(storage_files, 9_000))
+    w2.update(dict.fromkeys(non_storage_files, 5_000))
+    monkeypatch.setattr(gate, "_HEAVY_FILE_COST_MS", w2)
+    groups2 = gate.shard_files(inventory, 4)
+    assert len(groups2) == 4
+    wheel_set = set(wheel_files)
+    assert wheel_set & set(groups2[0]) and groups2[0][0] in wheel_set, groups2[0]
+    g2_0_nw = [f for f in groups2[0] if f not in wheel_set]
+    assert [f.startswith("tests/storage/") for f in g2_0_nw] == sorted(
+        f.startswith("tests/storage/") for f in g2_0_nw
+    ), groups2[0]
+    assert wheel_set & set(groups2[1]) and groups2[1][-1] in wheel_set, groups2[1]
+    assert groups2[1][0].startswith("tests/storage/"), groups2[1]
+    cats1 = [2 if f in wheel_set else (0 if f.startswith("tests/storage/") else 1) for f in groups2[1]]
+    assert cats1 == sorted(cats1) and {0, 1, 2} <= set(cats1), (cats1, groups2[1])
+    for shard_idx in (2, 3):
+        assert not (wheel_set & set(groups2[shard_idx])), groups2[shard_idx]
+        assert [f.startswith("tests/storage/") for f in groups2[shard_idx]] == sorted(
+            f.startswith("tests/storage/") for f in groups2[shard_idx]
+        ), groups2[shard_idx]
 
 
 def test_gate_wheel_fixture_files_and_weights_stay_aligned_with_tests() -> None:
@@ -1961,33 +2021,38 @@ def test_gate_wheel_fixture_files_and_weights_stay_aligned_with_tests() -> None:
     for rel_path in configured | set(heavy_cfg):
         assert (repo_root / rel_path).is_file(), f"stale gate shard config entry: {rel_path}"
 
-    # Verify full-repository 4-shard LPT plan places all wheel suites on Shard 0, balances overflow onto Shard 0,
-    # spreads top heavy non-wheel files, and stays tightly balanced within 5_000 ms across all 4 shards.
+    # Verify full-repository 4-shard adaptive LPT plan distributes wheel suites onto Shards [0, 1], spreads
+    # top-2 wheel & top-2 non-wheel files, accepts overflow on 0 & 1, staggers IO, and stays within 5_000 ms.
     all_inventory = [
         f"{path.relative_to(repo_root).as_posix()}::test_case" for path in sorted(tests_root.rglob("test_*.py"))
     ]
     four_groups = gate.shard_files(all_inventory, 4)
-    assert len(four_groups) == 4
-    assert all(four_groups)
-    assert configured <= set(four_groups[0]), four_groups[0]
-    for worker_group in four_groups[1:]:
-        assert not (configured & set(worker_group)), worker_group
+    assert len(four_groups) == 4 and all(four_groups)
+    wheel_shard_indices = [idx for idx, g in enumerate(four_groups) if configured & set(g)]
+    assert wheel_shard_indices == [0, 1], wheel_shard_indices
     assert set(four_groups[0]) - configured, "shard 0 must accept non-wheel overflow on full 4-shard LPT plan"
+    assert set(four_groups[1]) - configured, "shard 1 must accept non-wheel overflow on full 4-shard LPT plan"
+    ranked_wheel = sorted(
+        ((rel_path, heavy_cfg.get(rel_path, 0)) for rel_path in configured),
+        key=lambda item: (-item[1], item[0]),
+    )
+    top_two_wheel = {rel_path for rel_path, _cost in ranked_wheel[:2]}
     ranked_non_wheel = sorted(
         ((rel_path, cost) for rel_path, cost in heavy_cfg.items() if rel_path not in configured),
         key=lambda item: (-item[1], item[0]),
     )
-    top_three_non_wheel = {rel_path for rel_path, _cost in ranked_non_wheel[:3]}
-    assert len(top_three_non_wheel) == 3
+    top_two_non_wheel = {rel_path for rel_path, _cost in ranked_non_wheel[:2]}
     for worker_group in four_groups:
-        assert len(set(worker_group) & top_three_non_wheel) <= 1, f"top-3 heavy non-wheel stacked: {worker_group}"
+        assert len(set(worker_group) & top_two_wheel) <= 1, f"top-2 heavy wheel stacked: {worker_group}"
+        assert len(set(worker_group) & top_two_non_wheel) <= 1, f"top-2 heavy non-wheel stacked: {worker_group}"
     loads = [
         sum(gate._estimated_file_cost_ms(rel_path, 1) for rel_path in group)
-        + (gate._WHEEL_SETUP_COST_MS if idx == 0 else 0)
+        + (gate._WHEEL_SETUP_COST_MS if idx in wheel_shard_indices else 0)
         for idx, group in enumerate(four_groups)
     ]
     assert max(loads) - min(loads) <= 5_000, f"4-shard LPT load imbalance > 5_000 ms: loads={loads}"
-    assert four_groups[1][0].startswith("tests/storage/"), four_groups[1][:3]
+    assert four_groups[0][0] in configured, four_groups[0][:3]
+    assert four_groups[1][0].startswith("tests/storage/") and four_groups[1][-1] in configured, four_groups[1]
     assert not four_groups[2][0].startswith("tests/storage/"), four_groups[2][:3]
     assert not four_groups[3][0].startswith("tests/storage/"), four_groups[3][:3]
     assert gate.shard_files(ALL_SHARD_IDS, 2) == [["t/test_a.py"], ["t/test_b.py"]]
