@@ -76,7 +76,20 @@ def verify_request_hmac(
     """Constant-time verification of ``call`` against stored ``expected_digest`` under ``key_bytes``."""
     require_sha256_digest(expected_digest)
     actual = compute_request_hmac(key_bytes, call, canonical_payload)
-    return hmac.compare_digest(actual.encode("ascii"), expected_digest.encode("ascii"))
+    if hmac.compare_digest(actual.encode("ascii"), expected_digest.encode("ascii")):
+        return True
+    # Preserve replay compatibility with pre-SP2-1 prepare_task(work) idempotency rows lacking defaulted "mode".
+    if call.tool == "prepare_task" and call.arguments.get("mode") == "work":
+        legacy_payload = canonical_json(
+            {
+                "tool": call.tool,
+                "selected_scope": call.selected_scope.to_dict() if call.selected_scope is not None else None,
+                "arguments": {k: v for k, v in call.arguments.items() if k != "mode"},
+            }
+        )
+        legacy_actual = compute_canonical_payload_hmac(key_bytes, legacy_payload)
+        return hmac.compare_digest(legacy_actual.encode("ascii"), expected_digest.encode("ascii"))
+    return False
 
 
 def is_idempotency_expired(committed_at: str | datetime, now: datetime) -> bool:

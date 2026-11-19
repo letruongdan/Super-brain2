@@ -282,6 +282,7 @@ _WHEEL_FIXTURE_FILES: frozenset[str] = frozenset(
         "tests/integration/test_kernel_privacy_persistence.py",
         "tests/integration/test_kernel_receipts.py",
         "tests/integration/test_kernel_shim.py",
+        "tests/integration/test_sp2_i2_wheel_compat.py",
         "tests/integration/test_t9_benchmark_scratch.py",
     }
 )
