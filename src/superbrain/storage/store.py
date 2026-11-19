@@ -18,6 +18,7 @@ from superbrain.core.ids import new_id
 from superbrain.ports.os import OsAdapters
 from superbrain.ports.policy import PolicySource, PolicyView
 from superbrain.storage import backup
+from superbrain.storage._proposal_schema import with_proposal_defaults
 from superbrain.storage.cas import (
     ContentStore,
     RetentionClass,
@@ -216,8 +217,8 @@ class Store:
         ``HolderProjection`` and ``CORE_KINDS`` are always registered, in addition to ``handlers`` and ``kinds``.
         """
         _check_lease(root, lease)
-        extra = KERNEL_POLICY_KINDS if code_version(migrations) >= 2 else ()
-        handlers, kinds = with_defaults(handlers, kinds, extra_kinds=extra)
+        base_handlers, extra = with_proposal_defaults(handlers, code_version(migrations), KERNEL_POLICY_KINDS)
+        handlers, kinds = with_defaults(base_handlers, kinds, extra_kinds=extra)
         check_handlers(handlers, kinds)
         path = root.store_db
         if any(os.path.lexists(p) for p in db_files(path)):
@@ -259,8 +260,8 @@ class Store:
         unfinished ``put``s are removed. Both end with ``reconcile_policy``, so every pending intent is applied.
         """
         _check_lease(root, lease)
-        extra = KERNEL_POLICY_KINDS if code_version(migrations) >= 2 else ()
-        handlers, kinds = with_defaults(handlers, kinds, extra_kinds=extra)
+        base_handlers, extra = with_proposal_defaults(handlers, code_version(migrations), KERNEL_POLICY_KINDS)
+        handlers, kinds = with_defaults(base_handlers, kinds, extra_kinds=extra)
         check_handlers(handlers, kinds)
         lease.register_handle(_HANDLE)
         try:

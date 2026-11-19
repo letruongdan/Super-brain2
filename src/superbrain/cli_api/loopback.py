@@ -23,6 +23,7 @@ from superbrain.cli_api._loopback_wire import (
     decode_identity_response,
     decode_result,
     encode_call,
+    validate_request_path,
 )
 from superbrain.core.errors import (
     SAFE_WIRE_MESSAGES_BY_CODE,
@@ -170,7 +171,11 @@ class PinnedConnection:
         return self._call(lambda: _prepare_tool_request(command), deadline_ns=deadline_ns)
 
     def _call(
-        self, prepare: Callable[[], tuple[str, bytes]], *, deadline_ns: int | None,
+        self,
+        prepare: Callable[[], tuple[str, bytes]],
+        *,
+        deadline_ns: int | None,
+        path: str = TOOL_CALL_PATH,
     ) -> CallResult:
         with self._lock:
             if self._claimed or self._closed or self._sock is None or self._reader is None:
@@ -202,8 +207,9 @@ class PinnedConnection:
                 )
 
             ep = self._endpoint
+            validate_request_path(path)
             post_head = (
-                f"POST {TOOL_CALL_PATH} HTTP/1.1\r\n"
+                f"POST {path} HTTP/1.1\r\n"
                 f"Host: 127.0.0.1:{ep.port}\r\n"
                 f"Authorization: Bearer {token}\r\n"
                 f"{HEADER_STORE_ID}: {ep.store_id}\r\n"
@@ -560,13 +566,7 @@ class LoopbackClient:
                 _quiet_close(ssl_sock)
                 _quiet_close(raw_sock)
 
-    def call(
-        self,
-        target: LoopbackTarget,
-        command: ToolCommand,
-        *,
-        deadline_ns: int | None = None,
-    ) -> CallResult:
+    def call(self, target: LoopbackTarget, command: ToolCommand, *, deadline_ns: int | None = None) -> CallResult:
         deadline_ns = _validate_optional_deadline(deadline_ns, request_may_have_run=False)
         if deadline_ns is not None:
             _remaining_budget_s(self._monotonic_ns, deadline_ns, request_may_have_run=False)
@@ -576,5 +576,15 @@ class LoopbackClient:
         conn = self.connect(target, deadline_ns=deadline_ns)
         try:
             return conn._call(lambda: prepared, deadline_ns=deadline_ns)
+        finally:
+            conn.close()
+
+    def call_operator(
+        self, target: LoopbackTarget, path: str, body_bytes: bytes, token: str, *, deadline_ns: int | None = None
+    ) -> CallResult:
+        validate_request_path(path, operator_only=True)
+        conn = self.connect(target, deadline_ns=deadline_ns)
+        try:
+            return conn._call(lambda: (token, body_bytes), deadline_ns=deadline_ns, path=path)
         finally:
             conn.close()

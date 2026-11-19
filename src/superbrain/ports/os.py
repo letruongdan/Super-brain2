@@ -64,6 +64,20 @@ class FsInfo:
     remote: bool
 
 
+@dataclass(frozen=True)
+class PhysicalObjectId:
+    """Non-following filesystem object identity used to detect replacement and link swaps."""
+
+    volume_id: str
+    object_id: str
+    is_link: bool
+    is_dir: bool
+
+    def token(self) -> str:
+        """Stable serialized identity combining volume and object identifiers."""
+        return f"{self.volume_id}:{self.object_id}"
+
+
 class DurablePublisher(Protocol):
     def write_new(self, path: Path, data: bytes) -> None:
         """Create ``path`` exclusively, write all of ``data`` and make the content durable."""
@@ -87,6 +101,22 @@ class DurablePublisher(Protocol):
 
     def durability(self, directory: Path, env: Mapping[str, str]) -> DurabilityReport:
         """Report the tier ``directory`` can honestly claim, with reasons for anything below power-loss."""
+        ...
+
+
+class NoReplacePublisher(DurablePublisher, Protocol):
+    def publish_no_replace(self, staging: Path, final: Path) -> None:
+        """Atomically move ``staging`` to ``final`` without replacing an existing target (``FileExistsError``)."""
+        ...
+
+
+class PhysicalFsPort(Protocol):
+    def stat_physical_identity(self, path: Path) -> PhysicalObjectId | None:
+        """Inspect ``path`` without following links; ``None`` if absent."""
+        ...
+
+    def same_volume(self, first: Path, second: Path) -> bool:
+        """Whether ``first`` and ``second`` reside on the same filesystem/volume."""
         ...
 
 
@@ -144,3 +174,4 @@ class OsAdapters:
     clock: Clock
     traits: PlatformTraits
     monotonic: MonotonicClock
+    physical: PhysicalFsPort | None = None

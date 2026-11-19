@@ -16,7 +16,7 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 
 from superbrain.core.errors import BrainError, ErrorCode
-from superbrain.ports.os import DurabilityReport, DurabilityTier, DurablePublisher, FsInfo
+from superbrain.ports.os import DurabilityReport, DurabilityTier, FsInfo, NoReplacePublisher
 
 _ERROR_SHARING_VIOLATION = 32
 _ERROR_ACCESS_DENIED = 5
@@ -258,6 +258,35 @@ def _detect_darwin(path: Path) -> FsInfo:
     return FsInfo(fs_type, not buffer.f_flags & mnt_local)
 
 
+def _rename_noreplace(src: Path, dst: Path) -> None:
+    """Invoke kernel atomic no-replace rename (`renameat2` / `renamex_np`), or raise ``ENOSYS``/``ENOTSUP``."""
+    import ctypes
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    rc: int
+    if sys.platform == "darwin":
+        fn = getattr(libc, "renamex_np", None)
+        if fn is None:
+            raise OSError(errno.ENOSYS, "renamex_np unavailable")
+        fn.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        fn.restype = ctypes.c_int
+        rc = fn(os.fsencode(src), os.fsencode(dst), 0x4)  # RENAME_EXCL
+    elif sys.platform.startswith("linux"):
+        fn = getattr(libc, "renameat2", None)
+        if fn is None:
+            raise OSError(errno.ENOSYS, "renameat2 unavailable")
+        fn.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+        fn.restype = ctypes.c_int
+        rc = fn(-100, os.fsencode(src), -100, os.fsencode(dst), 0x1)  # AT_FDCWD, RENAME_NOREPLACE
+    else:
+        raise OSError(errno.ENOSYS, "no-replace rename unavailable")
+    if rc != 0:
+        err = ctypes.get_errno()
+        if err == errno.EEXIST:
+            raise FileExistsError(errno.EEXIST, os.strerror(err), str(dst))
+        raise OSError(err, os.strerror(err))
+
+
 def detect_fs(path: Path) -> FsInfo:
     """Best-effort filesystem identity of ``path``; ``FsInfo("unknown", False)`` if detection fails."""
     try:
@@ -336,6 +365,32 @@ class _BasePublisher:
     def publish(self, staging: Path, final: Path) -> None:
         self._guard(lambda: self._replace(staging, final), f"publishing {staging} to {final}")
         self.sync_directory(final.parent)
+
+    def _noreplace(self, src: Path, dst: Path) -> None:
+        try:
+            _rename_noreplace(src, dst)
+        except FileExistsError:
+            raise
+        except (OSError, AttributeError) as err:
+            err_no = getattr(err, "errno", None)
+            if isinstance(err, OSError) and err_no not in (
+                errno.ENOSYS,
+                errno.EINVAL,
+                errno.ENOTSUP,
+                errno.EOPNOTSUPP,
+                95,
+            ):
+                raise
+            os.link(src, dst)
+            self.sync_directory(dst.parent)
+            os.unlink(src)
+            self.sync_directory(src.parent)
+            return
+        self.sync_directory(dst.parent)
+        self.sync_directory(src.parent)
+
+    def publish_no_replace(self, staging: Path, final: Path) -> None:
+        self._guard(lambda: self._noreplace(staging, final), f"publishing {staging} to {final}")
 
     def rename_dir(self, src: Path, dst: Path) -> None:
         self._guard(lambda: self._rename_dir(src, dst), f"renaming directory {src} to {dst}")
@@ -458,6 +513,14 @@ class WindowsPublisher(_BasePublisher):
     def _replace(self, src: Path, dst: Path) -> None:
         self._move(src, dst, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)
 
+    def _noreplace(self, src: Path, dst: Path) -> None:
+        try:
+            self._move(src, dst, MOVEFILE_WRITE_THROUGH)
+        except OSError as err:
+            if _winerror(err) in (_ERROR_ALREADY_EXISTS, _ERROR_FILE_EXISTS):
+                raise FileExistsError(errno.EEXIST, "target exists", str(dst)) from err
+            raise
+
     def _rename_dir(self, src: Path, dst: Path) -> None:
         try:
             self._move(src, dst, MOVEFILE_WRITE_THROUGH)
@@ -486,7 +549,7 @@ class WindowsPublisher(_BasePublisher):
                 self._sleep(_RETRY_DELAYS[attempt])
 
 
-def publisher_for(platform: str, *, fs_info: Callable[[Path], FsInfo] = detect_fs) -> DurablePublisher:
+def publisher_for(platform: str, *, fs_info: Callable[[Path], FsInfo] = detect_fs) -> NoReplacePublisher:
     if platform == "win32":
         return WindowsPublisher(fs_info=fs_info)
     if platform == "darwin":

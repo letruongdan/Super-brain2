@@ -30,7 +30,67 @@ def _is_valid_abs_path(raw: str) -> bool:
     return Path(raw).is_absolute()
 
 
+def _parse_review_args(args: list[str]) -> tuple[str, list[str]] | None:
+    if args[0] == "review":
+        if len(args) < 2:
+            return None
+        sub = args[1]
+        if sub == "list":
+            rest = args[2:]
+            needs_id = False
+        elif sub in ("show", "approve", "reject"):
+            rest = args[2:]
+            needs_id = True
+        else:
+            return None
+    elif args[0] in ("apply", "rollback"):
+        rest = args[1:]
+        needs_id = True
+    else:
+        return None
+
+    has_profile = False
+    has_approval = False
+    has_json = False
+    pos: list[str] = []
+    i = 0
+    while i < len(rest):
+        tok = rest[i]
+        if tok == "--json":
+            if has_json:
+                return None
+            has_json = True
+            i += 1
+        elif tok == "--profile":
+            if has_profile or i + 1 >= len(rest) or not _is_valid_abs_path(rest[i + 1]):
+                return None
+            has_profile = True
+            i += 2
+        elif tok == "--approval-file":
+            if has_approval or i + 1 >= len(rest) or not _is_valid_abs_path(rest[i + 1]):
+                return None
+            has_approval = True
+            i += 2
+        elif tok.startswith("-"):
+            return None
+        else:
+            pos.append(tok)
+            i += 1
+
+    if not has_profile:
+        return None
+    if has_approval and args[0] == "review" and args[1] in ("list", "show"):
+        return None
+    if needs_id and (len(pos) != 1 or not pos[0] or "\x00" in pos[0]):
+        return None
+    if not needs_id and pos:
+        return None
+    return ("superbrain.composition.review_cli_entry", args)
+
+
 def _parse_cli_args(args: list[str]) -> tuple[str, list[str]] | None:
+    if not args:
+        return None
     if len(args) == 3 and args[0] == "serve" and args[1] == "--config":
         if _is_valid_abs_path(args[2]):
             return ("superbrain.composition.owner_entry", ["serve", "--config", args[2]])
@@ -59,6 +119,8 @@ def _parse_cli_args(args: list[str]) -> tuple[str, list[str]] | None:
             return None
         forwarded = ["init", *(["--reset-signers"] if reset else []), "--config", remaining[1]]
         return ("superbrain.composition.init_entry", forwarded)
+    if args[0] in ("review", "apply", "rollback"):
+        return _parse_review_args(args)
     return None
 
 

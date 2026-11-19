@@ -14,6 +14,7 @@ import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
+from superbrain.application.review_apply import ReviewApplyService
 from superbrain.core._kernel_approval import (
     CLI_HARNESS_ID,
     ApprovalAction,
@@ -29,10 +30,18 @@ from superbrain.core._kernel_approval import (
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.jsonvalue import JsonValue
 from superbrain.core.kernel import Principal
+from superbrain.core.proposals import ApplyJournal, ChangeProposal
 from superbrain.ports.approval import ApprovalPolicyPort, SshApprovalVerifierPort, WebAuthnApprovalVerifierPort
 
 __all__ = ["OperatorHandle", "OperatorService", "PendingApprovalCall", "PreparedOperatorCall"]
 
+_PROPOSAL_PATH_ACTIONS: dict[str, ApprovalAction] = {
+    "/v2/operator/proposal/approve": ApprovalAction.APPROVE,
+    "/v2/operator/proposal/reject": ApprovalAction.REJECT,
+    "/v2/operator/proposal/apply": ApprovalAction.APPLY,
+    "/v2/operator/proposal/rollback": ApprovalAction.ROLLBACK,
+}
+_PROPOSAL_MUTATING_PATHS = frozenset(_PROPOSAL_PATH_ACTIONS)
 _DEFERRED_PATHS = frozenset(
     {
         "/v2/operator/credential/revoke",
@@ -76,6 +85,43 @@ def _signer_json(record: SignerRecord) -> dict[str, JsonValue]:
     }
 
 
+def _proposal_json(prop: ChangeProposal) -> dict[str, JsonValue]:
+    return {
+        "proposal_id": prop.proposal_id,
+        "owner_id": prop.owner_id,
+        "kind": prop.kind,
+        "reason": prop.reason,
+        "status": prop.status.value,
+        "subject_revision": prop.subject_revision,
+        "risk_level": prop.risk_level.value,
+        "active_journal_id": prop.active_journal_id,
+        "created_at": prop.created_at,
+        "updated_at": prop.updated_at,
+        "targets": [
+            {
+                "rel_path": t.rel_path,
+                "normalized_rel_path": t.normalized_rel_path,
+                "managed_format": t.managed_format.value,
+                "slice_id": t.slice_id,
+                "base_present": t.base_present,
+            }
+            for t in prop.targets
+        ],
+    }
+
+
+def _journal_json(journal: ApplyJournal) -> dict[str, JsonValue]:
+    return {
+        "journal_id": journal.journal_id,
+        "proposal_id": journal.proposal_id,
+        "direction": journal.direction.value,
+        "status": journal.status.value,
+        "grant_id": journal.grant_id,
+        "created_at": journal.created_at,
+        "updated_at": journal.updated_at,
+    }
+
+
 @dataclass(frozen=True)
 class PendingApprovalCall:
     """Validated approval-gated operator mutation awaiting off-owner-thread crypto verification."""
@@ -89,6 +135,7 @@ class PendingApprovalCall:
     channel: ApprovalChannel
     signer: SignerRecord | None
     raw_approval: Mapping[str, JsonValue]
+    proposal_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -106,10 +153,12 @@ class OperatorService:
         *,
         ssh_verifier: Callable[[], SshApprovalVerifierPort | None],
         webauthn_verifier: WebAuthnApprovalVerifierPort | None = None,
+        review_apply: ReviewApplyService | None = None,
     ) -> None:
         self._policy = policy
         self._ssh_verifier = ssh_verifier
         self._webauthn = webauthn_verifier
+        self._review_apply = review_apply
 
     def handle(
         self,
@@ -144,6 +193,24 @@ class OperatorService:
             return self._prepare_enroll(principal, token, body)
         if path == "/v2/operator/signer/revoke":
             return self._prepare_revoke(principal, token, body)
+        if path == "/v2/operator/proposal/list":
+            if body:
+                raise _invalid()
+            if self._review_apply is None:
+                raise BrainError(ErrorCode.CAPABILITY_UNAVAILABLE, "capability unavailable")
+            owned = [p for p in self._review_apply.list_proposals() if p.owner_id == principal.owner_id]
+            return PreparedOperatorCall(immediate={"proposals": [_proposal_json(p) for p in owned]})
+        if path == "/v2/operator/proposal/show":
+            if set(body) != {"proposal_id"} or not isinstance(body.get("proposal_id"), str) or not body["proposal_id"]:
+                raise _invalid()
+            if self._review_apply is None:
+                raise BrainError(ErrorCode.CAPABILITY_UNAVAILABLE, "capability unavailable")
+            prop = self._review_apply.get_proposal(str(body["proposal_id"]))
+            if prop.owner_id != principal.owner_id:
+                raise BrainError(ErrorCode.NOT_FOUND, "not found")
+            return PreparedOperatorCall(immediate={"proposal": _proposal_json(prop)})
+        if path in _PROPOSAL_MUTATING_PATHS:
+            return self._prepare_proposal_action(path, principal, token, body)
         if path in _DEFERRED_PATHS:
             raise BrainError(ErrorCode.CAPABILITY_UNAVAILABLE, "capability unavailable")
         raise BrainError(ErrorCode.NOT_FOUND, "not found")
@@ -198,6 +265,8 @@ class OperatorService:
                 new_sign_count=new_sign_count,
             )
             return {"signer": _signer_json(record)}
+        if pending.proposal_id is not None:
+            return self._commit_proposal_action(pending, signer_id=signer_id, new_sign_count=new_sign_count)
         assert pending.revoke_signer_id is not None
         record = self._policy.revoke_signer(
             pending.revoke_signer_id,
@@ -283,6 +352,83 @@ class OperatorService:
                 raw_approval=raw_approval,
             )
         )
+
+    def _prepare_proposal_action(
+        self, path: str, principal: Principal, token: str | None, body: Mapping[str, JsonValue]
+    ) -> PreparedOperatorCall:
+        pid = body.get("proposal_id")
+        if not set(body) <= {"proposal_id", "approval"} or not isinstance(pid, str) or not pid:
+            raise _invalid()
+        if "approval" not in body:
+            raise _invalid()
+        if self._review_apply is None:
+            raise BrainError(ErrorCode.CAPABILITY_UNAVAILABLE, "capability unavailable")
+        prop = self._review_apply.get_proposal(pid)
+        if prop.owner_id != principal.owner_id:
+            raise BrainError(ErrorCode.NOT_FOUND, "not found")
+        message, channel_used, signer, raw_approval = self._parse_approval(principal, body["approval"])
+        if message.action is not _PROPOSAL_PATH_ACTIONS[path]:
+            raise _invalid()
+        if message.subject_id != pid or message.subject_revision != prop.subject_revision:
+            raise BrainError(ErrorCode.REVISION_CONFLICT, "revision conflict")
+        return PreparedOperatorCall(
+            pending=PendingApprovalCall(
+                path=path,
+                principal=principal,
+                token=token,
+                enrollment=None,
+                revoke_signer_id=None,
+                message=message,
+                channel=channel_used,
+                signer=signer,
+                raw_approval=raw_approval,
+                proposal_id=pid,
+            )
+        )
+
+    def _commit_proposal_action(
+        self, pending: PendingApprovalCall, *, signer_id: str | None, new_sign_count: int | None
+    ) -> dict[str, JsonValue]:
+        if self._review_apply is None or pending.proposal_id is None:
+            raise BrainError(ErrorCode.CAPABILITY_UNAVAILABLE, "capability unavailable")
+        pid = pending.proposal_id
+        if pending.path == "/v2/operator/proposal/approve":
+            prop = self._review_apply.approve_proposal(
+                pid,
+                approval=pending.message,
+                signer_id=signer_id,
+                channel=pending.channel,
+                new_sign_count=new_sign_count,
+            )
+            return {"proposal": _proposal_json(prop)}
+        if pending.path == "/v2/operator/proposal/reject":
+            prop = self._review_apply.reject_proposal(
+                pid,
+                approval=pending.message,
+                signer_id=signer_id,
+                channel=pending.channel,
+                new_sign_count=new_sign_count,
+            )
+            return {"proposal": _proposal_json(prop)}
+        if pending.path == "/v2/operator/proposal/apply":
+            journal = self._review_apply.apply_proposal(
+                pid,
+                approval=pending.message,
+                signer_id=signer_id,
+                channel=pending.channel,
+                new_sign_count=new_sign_count,
+            )
+            return {"journal": _journal_json(journal)}
+        plan = self._review_apply.plan_rollback_targets(pid)
+        journal = self._review_apply.rollback_applied_proposal(
+            pid,
+            approval=pending.message,
+            signer_id=signer_id,
+            channel=pending.channel,
+            plan=plan,
+            new_sign_count=new_sign_count,
+        )
+        return {"journal": _journal_json(journal)}
 
     def _challenge(self, action: ApprovalAction, subject_id: str) -> dict[str, JsonValue]:
         issued = self._policy.issue_nonce(action=action, subject_id=subject_id, risk_level=RiskLevel.HIGH)

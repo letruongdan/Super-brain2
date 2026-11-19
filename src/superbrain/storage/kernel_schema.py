@@ -7,6 +7,9 @@ import sqlite3
 from datetime import UTC, datetime
 
 from superbrain.core.ids import new_id
+from superbrain.storage._proposal_schema import (
+    KERNEL_PROPOSAL_KINDS as KERNEL_PROPOSAL_KINDS,
+)
 from superbrain.storage.kinds import EntryKind, FieldType
 from superbrain.storage.ledger import utc_timestamp
 from superbrain.storage.schema import POLICY_MIGRATIONS, STORE_MIGRATIONS, Migration
@@ -526,8 +529,8 @@ def _policy_v4(db: sqlite3.Connection) -> None:
 
 
 def _store_v5(db: sqlite3.Connection) -> None:
-    """Main store v5 capability fence (``schema_version=5, min_reader_version=5``): the I3 reserved ``policy.*``
-    ledger kinds (``KERNEL_POLICY_KINDS``) need a binary that registers them; no DDL.
+    """Main store v5 capability fence (``schema_version=5, min_reader_version=5``): reserved ``policy.*``
+    and ``proposal.*`` ledger kinds plus ``ProposalProjectionHandler`` tables (``p_proposals_*``).
     """
     _ = db
 

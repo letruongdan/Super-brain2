@@ -9,6 +9,7 @@ from superbrain.adapters.os.clock import SystemClock, SystemMonotonicClock
 from superbrain.adapters.os.durable import publisher_for
 from superbrain.adapters.os.locks import OsLockFactory
 from superbrain.adapters.os.paths import OsPathSafety
+from superbrain.adapters.os.physical_fs import OsPhysicalFs
 from superbrain.ports.clock import Clock, MonotonicClock
 from superbrain.ports.os import OsAdapters, PermissionGuard, PlatformTraits
 
@@ -105,4 +106,5 @@ def os_adapters(clock: Clock | None = None, *, monotonic: MonotonicClock | None 
         clock=clock if clock is not None else SystemClock(),
         traits=platform_traits(sys.platform),
         monotonic=monotonic if monotonic is not None else SystemMonotonicClock(),
+        physical=OsPhysicalFs(),
     )

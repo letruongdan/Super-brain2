@@ -13,6 +13,7 @@ from superbrain.adapters.auth.ssh_sig import SshSigVerifier
 from superbrain.adapters.os import find_ssh_keygen, os_adapters
 from superbrain.application.approvals import OperatorHandle, OperatorService, PreparedOperatorCall
 from superbrain.application.owner_loop import OwnerLoop
+from superbrain.application.review_apply import ReviewApplyService
 from superbrain.cli_api.operator import OperatorExecutor, OperatorRequest
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.jsonvalue import JsonValue
@@ -71,7 +72,12 @@ def _verified_ssh_scratch_dir(adapters: OsAdapters) -> Path:
     return scratch
 
 
-def build_operator_service(policy: ApprovalPolicyPort, *, os_: OsAdapters | None = None) -> OperatorService:
+def build_operator_service(
+    policy: ApprovalPolicyPort,
+    *,
+    os_: OsAdapters | None = None,
+    review_apply: ReviewApplyService | None = None,
+) -> OperatorService:
     """The operator service over ``policy`` with the real ``ssh-keygen`` verifier and verified scratch dir."""
 
     def _lazy_ssh_verifier() -> SshApprovalVerifierPort | None:
@@ -82,7 +88,7 @@ def build_operator_service(policy: ApprovalPolicyPort, *, os_: OsAdapters | None
         scratch = _verified_ssh_scratch_dir(adapters)
         return SshSigVerifier(ssh_keygen=keygen, scratch_dir=scratch, os_=adapters)
 
-    return OperatorService(policy, ssh_verifier=_lazy_ssh_verifier)
+    return OperatorService(policy, ssh_verifier=_lazy_ssh_verifier, review_apply=review_apply)
 
 
 def _check_live_budget(owner: OwnerLoop, monotonic_ns: Callable[[], int], deadline_ns: int) -> None:

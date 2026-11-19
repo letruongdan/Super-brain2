@@ -215,6 +215,16 @@ class PolicyAuthorityMixin:
     def recovery_grant(self, grant_id: str) -> RecoveryGrant:
         return layer2.read_recovery_grant(self._read(), grant_id)
 
+    def end_recovery_grant(self, *, grant_id: str, reason: str = "journal_closed") -> RecoveryGrant:
+        with self._authority_tx() as db:
+            return layer2.end_recovery_grant(
+                db,
+                grant_id=grant_id,
+                reason=reason,
+                trust_generation=self.trust_generation(),
+                now=self._now(),
+            )
+
     def reset_signers_offline(self) -> int:
         """``brain init --reset-signers``: the new generation commits in ``policy.db`` first, then ``writer.lock``.
 

@@ -14,6 +14,7 @@ from datetime import datetime
 from pathlib import Path
 from types import FrameType
 
+from superbrain.adapters.harness_config.merger import SharedConfigMergerAdapter
 from superbrain.adapters.os import os_adapters
 from superbrain.adapters.os.daemon_config import read_daemon_config
 from superbrain.adapters.os.tls_material import verify_server_tls_files
@@ -22,6 +23,7 @@ from superbrain.application.deadlines import Reservation
 from superbrain.application.dispatch import KernelToolDomain
 from superbrain.application.jobs import JobService
 from superbrain.application.owner_loop import AuthGate, OwnerLoop, OwnerSession
+from superbrain.application.review_apply import ReviewApplyService
 from superbrain.cli_api._loopback_server import LoopbackServer
 from superbrain.composition._daemon_session import (
     DaemonTestHooks,
@@ -60,6 +62,7 @@ from superbrain.ports.clock import Clock, MonotonicClock
 from superbrain.ports.os import OsAdapters
 from superbrain.storage.idempotency import StagedKernelStore
 from superbrain.storage.jobs import has_legacy_incomplete_settled_projections
+from superbrain.storage.proposals import PolicyApplyAuthority, StoreProposalAdapter
 from superbrain.storage.runtime import admit_existing_pair, open_runtime_under_lease
 from superbrain.workers.executor import PRODUCTION_JOB_HANDLERS, JobExecutor, JobHandler
 
@@ -274,7 +277,17 @@ def _open_owner_session(
         )
         session_box.append(session)
         if operator is not None:
-            operator.bind(build_operator_service(rt.policy, os_=adapters))
+            review_apply: ReviewApplyService | None = None
+            if rt.store.schema_version >= 5:
+                review_apply = ReviewApplyService(
+                    StoreProposalAdapter(rt.store, adapters),
+                    PolicyApplyAuthority(rt.policy),
+                    adapters,
+                    data_root=rt.root.root,
+                    home_dir=Path.home(),
+                    config_merger=SharedConfigMergerAdapter(),
+                )
+            operator.bind(build_operator_service(rt.policy, os_=adapters, review_apply=review_apply))
         return session
     except BaseException:
         if operator is not None:

@@ -107,6 +107,37 @@ def read_recovery_grant(db: sqlite3.Connection, grant_id: str) -> RecoveryGrant:
     return _decode_grant(tuple(row))
 
 
+def end_recovery_grant(
+    db: sqlite3.Connection,
+    *,
+    grant_id: str,
+    reason: str = "journal_closed",
+    trust_generation: int,
+    now: datetime,
+) -> RecoveryGrant:
+    """Close an active ``recovery_grant`` and record ``RECOVERY_GRANT_ENDED`` in one transaction."""
+    if not isinstance(grant_id, str) or not is_uuid(grant_id) or reason not in ("trust_reset", "journal_closed"):
+        raise _invalid()
+    current = read_recovery_grant(db, grant_id)
+    if current.state != "active":
+        raise BrainError(ErrorCode.REVISION_CONFLICT, "revision conflict")
+    stamp = utc_timestamp(now)
+    intent = record_intent_row(
+        db,
+        IntentKind.RECOVERY_GRANT_ENDED,
+        {"grant_id": grant_id, "reason": reason, "trust_generation": trust_generation},
+        now,
+    )
+    cursor = db.execute(
+        "UPDATE recovery_grant SET state = 'ended', end_reason = ?, ended_intent_id = ?, ended_at = ? "
+        "WHERE grant_id = ? AND state = 'active'",
+        (reason, intent.intent_id, stamp, grant_id),
+    )
+    if cursor.rowcount != 1:
+        raise BrainError(ErrorCode.REVISION_CONFLICT, "revision conflict")
+    return read_recovery_grant(db, grant_id)
+
+
 def open_recovery_grant(
     db: sqlite3.Connection, *, approval_id: str, journal_id: str, trust_generation: int, now: datetime
 ) -> RecoveryGrant:
@@ -205,6 +236,7 @@ def signer_reset_recorded(db: sqlite3.Connection) -> bool:
 __all__ = [
     "OWNER_META_KEY",
     "SIGNER_RESET_META_KEY",
+    "end_recovery_grant",
     "open_recovery_grant",
     "read_recovery_grant",
     "reset_signers",
