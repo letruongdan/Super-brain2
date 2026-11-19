@@ -21,7 +21,6 @@ from superbrain.core.wire import canonical_request_payload
 
 _ALWAYS_IDEMPOTENT_TOOLS: frozenset[str] = frozenset(
     {
-        "prepare_task",
         "get_artifact",
         "submit_episode",
         "record_outcome",
@@ -97,6 +96,13 @@ def tool_uses_idempotency(call: Call) -> bool:
         return True
     if call.tool in _READONLY_TOOLS:
         return False
+    if call.tool == "prepare_task":
+        mode = call.arguments.get("mode", "work")
+        if mode == "work":
+            return True
+        if mode == "discover":
+            return False
+        raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
     if call.tool == "get_health":
         deep = call.arguments.get("deep", False)
         if type(deep) is not bool:

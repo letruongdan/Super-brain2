@@ -59,7 +59,7 @@ from superbrain.core.kernel import (
     Scope,
     ToolCommand,
 )
-from superbrain.core.wire import encode_envelope
+from superbrain.core.wire import encode_envelope, load_catalog
 from tests.support.inc2_fixture import SampleTlsMaterial
 
 
@@ -902,28 +902,99 @@ def test_wire_call_preserves_scope_and_arguments() -> None:
         assert dec_tool.tool == tool_name
 
     # 4. Invalid decode_call payloads rejected with INVALID_INPUT.
+    schema_digest = load_catalog().schema_digest
     # Missing required keys
     with pytest.raises(BrainError) as exc_missing_tool:
-        decode_call(canonical_json({"arguments": {}, "correlation_id": None, "selected_scope": None}), token="t")
+        decode_call(
+            canonical_json(
+                {
+                    "arguments": {},
+                    "correlation_id": None,
+                    "selected_scope": None,
+                    "schema_digest": schema_digest,
+                }
+            ),
+            token="t",
+        )
     assert exc_missing_tool.value.code is ErrorCode.INVALID_INPUT
 
     with pytest.raises(BrainError) as exc_missing_args:
-        decode_call(canonical_json({"tool": "get_health", "correlation_id": None, "selected_scope": None}), token="t")
+        decode_call(
+            canonical_json(
+                {
+                    "tool": "get_health",
+                    "correlation_id": None,
+                    "selected_scope": None,
+                    "schema_digest": schema_digest,
+                }
+            ),
+            token="t",
+        )
     assert exc_missing_args.value.code is ErrorCode.INVALID_INPUT
 
     with pytest.raises(BrainError) as exc_missing_cid:
-        decode_call(canonical_json({"tool": "get_health", "arguments": {}, "selected_scope": None}), token="t")
+        decode_call(
+            canonical_json(
+                {
+                    "tool": "get_health",
+                    "arguments": {},
+                    "selected_scope": None,
+                    "schema_digest": schema_digest,
+                }
+            ),
+            token="t",
+        )
     assert exc_missing_cid.value.code is ErrorCode.INVALID_INPUT
 
     with pytest.raises(BrainError) as exc_missing_scope:
-        decode_call(canonical_json({"tool": "get_health", "arguments": {}, "correlation_id": None}), token="t")
+        decode_call(
+            canonical_json(
+                {
+                    "tool": "get_health",
+                    "arguments": {},
+                    "correlation_id": None,
+                    "schema_digest": schema_digest,
+                }
+            ),
+            token="t",
+        )
     assert exc_missing_scope.value.code is ErrorCode.INVALID_INPUT
+
+    # Missing or mismatched schema_digest in decode_call -> UNSUPPORTED_VERSION
+    with pytest.raises(BrainError) as exc_call_no_digest:
+        decode_call(
+            canonical_json({"tool": "get_health", "arguments": {}, "correlation_id": None, "selected_scope": None}),
+            token="t",
+        )
+    assert exc_call_no_digest.value.code is ErrorCode.UNSUPPORTED_VERSION
+
+    with pytest.raises(BrainError) as exc_call_bad_digest:
+        decode_call(
+            canonical_json(
+                {
+                    "tool": "get_health",
+                    "arguments": {},
+                    "correlation_id": None,
+                    "selected_scope": None,
+                    "schema_digest": "sha256:" + ("0" * 64),
+                }
+            ),
+            token="t",
+        )
+    assert exc_call_bad_digest.value.code is ErrorCode.UNSUPPORTED_VERSION
 
     # Extra keys
     with pytest.raises(BrainError) as exc_extra_key:
         decode_call(
             canonical_json(
-                {"tool": "get_health", "arguments": {}, "correlation_id": None, "selected_scope": None, "extra": 1}
+                {
+                    "tool": "get_health",
+                    "arguments": {},
+                    "correlation_id": None,
+                    "selected_scope": None,
+                    "schema_digest": schema_digest,
+                    "extra": 1,
+                }
             ),
             token="t",
         )
@@ -932,7 +1003,15 @@ def test_wire_call_preserves_scope_and_arguments() -> None:
     # Unknown tool
     with pytest.raises(BrainError) as exc_bad_tool:
         decode_call(
-            canonical_json({"tool": "bad_tool", "arguments": {}, "correlation_id": None, "selected_scope": None}),
+            canonical_json(
+                {
+                    "tool": "bad_tool",
+                    "arguments": {},
+                    "correlation_id": None,
+                    "selected_scope": None,
+                    "schema_digest": schema_digest,
+                }
+            ),
             token="t",
         )
     assert exc_bad_tool.value.code is ErrorCode.INVALID_INPUT
@@ -943,14 +1022,25 @@ def test_wire_call_preserves_scope_and_arguments() -> None:
         with pytest.raises(BrainError) as exc_bad_args:
             decode_call(
                 canonical_json(
-                    {"tool": "get_health", "arguments": bad_args, "correlation_id": None, "selected_scope": None}
+                    {
+                        "tool": "get_health",
+                        "arguments": bad_args,
+                        "correlation_id": None,
+                        "selected_scope": None,
+                        "schema_digest": schema_digest,
+                    }
                 ),
                 token="t",
             )
         assert exc_bad_args.value.code is ErrorCode.INVALID_INPUT
 
     # Duplicate JSON keys
-    dup_json = b'{"tool":"get_health","tool":"get_health","arguments":{},"correlation_id":null,"selected_scope":null}'
+    dup_json = (
+        b'{"tool":"get_health","tool":"get_health","arguments":{},'
+        b'"correlation_id":null,"selected_scope":null,"schema_digest":"'
+        + schema_digest.encode("ascii")
+        + b'"}'
+    )
     with pytest.raises(BrainError) as exc_dup_keys:
         decode_call(dup_json, token="t")
     assert exc_dup_keys.value.code is ErrorCode.INVALID_INPUT
@@ -958,7 +1048,15 @@ def test_wire_call_preserves_scope_and_arguments() -> None:
     # correlation_id edge cases: empty string, > 128 bytes, unpaired surrogate
     with pytest.raises(BrainError) as exc_empty_cid:
         decode_call(
-            canonical_json({"tool": "get_health", "arguments": {}, "correlation_id": "", "selected_scope": None}),
+            canonical_json(
+                {
+                    "tool": "get_health",
+                    "arguments": {},
+                    "correlation_id": "",
+                    "selected_scope": None,
+                    "schema_digest": schema_digest,
+                }
+            ),
             token="t",
         )
     assert exc_empty_cid.value.code is ErrorCode.INVALID_INPUT
@@ -972,7 +1070,13 @@ def test_wire_call_preserves_scope_and_arguments() -> None:
     with pytest.raises(BrainError) as exc_cid_129:
         decode_call(
             canonical_json(
-                {"tool": "get_health", "arguments": {}, "correlation_id": "a" * 129, "selected_scope": None}
+                {
+                    "tool": "get_health",
+                    "arguments": {},
+                    "correlation_id": "a" * 129,
+                    "selected_scope": None,
+                    "schema_digest": schema_digest,
+                }
             ),
             token="t",
         )
@@ -984,14 +1088,25 @@ def test_wire_call_preserves_scope_and_arguments() -> None:
     with pytest.raises(BrainError) as exc_cid_utf8:
         decode_call(
             canonical_json(
-                {"tool": "get_health", "arguments": {}, "correlation_id": cid_130_bytes, "selected_scope": None}
+                {
+                    "tool": "get_health",
+                    "arguments": {},
+                    "correlation_id": cid_130_bytes,
+                    "selected_scope": None,
+                    "schema_digest": schema_digest,
+                }
             ),
             token="t",
         )
     assert exc_cid_utf8.value.code is ErrorCode.INVALID_INPUT
 
     # Unpaired UTF-16 surrogate
-    unpaired_json = b'{"tool":"get_health","arguments":{},"correlation_id":"\\ud800","selected_scope":null}'
+    unpaired_json = (
+        b'{"tool":"get_health","arguments":{},"correlation_id":"\\ud800",'
+        b'"selected_scope":null,"schema_digest":"'
+        + schema_digest.encode("ascii")
+        + b'"}'
+    )
     with pytest.raises(BrainError) as exc_unpaired:
         decode_call(unpaired_json, token="t")
     assert exc_unpaired.value.code is ErrorCode.INVALID_INPUT
@@ -1012,7 +1127,13 @@ def test_wire_call_preserves_scope_and_arguments() -> None:
         with pytest.raises(BrainError) as exc_scope:
             decode_call(
                 canonical_json(
-                    {"tool": "get_health", "arguments": {}, "correlation_id": None, "selected_scope": bad_scope}
+                    {
+                        "tool": "get_health",
+                        "arguments": {},
+                        "correlation_id": None,
+                        "selected_scope": bad_scope,
+                        "schema_digest": schema_digest,
+                    }
                 ),
                 token="t",
             )
@@ -1043,26 +1164,110 @@ def test_wire_call_preserves_scope_and_arguments() -> None:
     # 6. encode_identity_response / decode_identity_response round-trip and validation.
     ident = Identity(store_id="store-alpha", writer_epoch=42, instance_id="inst-beta")
     enc_ident = encode_identity_response(ident)
-    dec_ident, contract = decode_identity_response(enc_ident)
+    dec_ident, contract, dec_digest = decode_identity_response(enc_ident)
     assert dec_ident == ident
     assert contract == ENDPOINT_CONTRACT
+    assert dec_digest == schema_digest
 
     # Reject missing/extra fields, bool writer_epoch, writer_epoch <= 0, wrong contract.
     for bad_ident_payload in (
-        canonical_json({"store_id": "s1", "writer_epoch": 1, "contract": "mcp-tools-v2"}),  # missing instance_id
         canonical_json(
-            {"store_id": "s1", "writer_epoch": 1, "instance_id": "i1", "contract": "mcp-tools-v2", "extra": 1}
+            {"store_id": "s1", "writer_epoch": 1, "contract": "mcp-tools-v2", "schema_digest": schema_digest}
+        ),  # missing instance_id
+        canonical_json(
+            {
+                "store_id": "s1",
+                "writer_epoch": 1,
+                "instance_id": "i1",
+                "contract": "mcp-tools-v2",
+                "schema_digest": schema_digest,
+                "extra": 1,
+            }
         ),
-        canonical_json({"store_id": "s1", "writer_epoch": True, "instance_id": "i1", "contract": "mcp-tools-v2"}),
-        canonical_json({"store_id": "s1", "writer_epoch": 0, "instance_id": "i1", "contract": "mcp-tools-v2"}),
-        canonical_json({"store_id": "s1", "writer_epoch": -5, "instance_id": "i1", "contract": "mcp-tools-v2"}),
-        canonical_json({"store_id": "s1", "writer_epoch": 1, "instance_id": "i1", "contract": "mcp-v1"}),
-        canonical_json({"store_id": "", "writer_epoch": 1, "instance_id": "i1", "contract": "mcp-tools-v2"}),
-        canonical_json({"store_id": "s1", "writer_epoch": 1, "instance_id": "bad inst", "contract": "mcp-tools-v2"}),
+        canonical_json(
+            {
+                "store_id": "s1",
+                "writer_epoch": True,
+                "instance_id": "i1",
+                "contract": "mcp-tools-v2",
+                "schema_digest": schema_digest,
+            }
+        ),
+        canonical_json(
+            {
+                "store_id": "s1",
+                "writer_epoch": 0,
+                "instance_id": "i1",
+                "contract": "mcp-tools-v2",
+                "schema_digest": schema_digest,
+            }
+        ),
+        canonical_json(
+            {
+                "store_id": "s1",
+                "writer_epoch": -5,
+                "instance_id": "i1",
+                "contract": "mcp-tools-v2",
+                "schema_digest": schema_digest,
+            }
+        ),
+        canonical_json(
+            {
+                "store_id": "s1",
+                "writer_epoch": 1,
+                "instance_id": "i1",
+                "contract": "mcp-v1",
+                "schema_digest": schema_digest,
+            }
+        ),
+        canonical_json(
+            {
+                "store_id": "",
+                "writer_epoch": 1,
+                "instance_id": "i1",
+                "contract": "mcp-tools-v2",
+                "schema_digest": schema_digest,
+            }
+        ),
+        canonical_json(
+            {
+                "store_id": "s1",
+                "writer_epoch": 1,
+                "instance_id": "bad inst",
+                "contract": "mcp-tools-v2",
+                "schema_digest": schema_digest,
+            }
+        ),
     ):
         with pytest.raises(BrainError) as exc_ident:
             decode_identity_response(bad_ident_payload)
         assert exc_ident.value.code is ErrorCode.INVALID_INPUT
+
+    # Missing or mismatched schema_digest on identity response -> UNSUPPORTED_VERSION
+    for unsupported_ident_payload in (
+        canonical_json({"store_id": "s1", "writer_epoch": 1, "instance_id": "i1", "contract": "mcp-tools-v2"}),
+        canonical_json(
+            {
+                "store_id": "s1",
+                "writer_epoch": 1,
+                "instance_id": "i1",
+                "contract": "mcp-tools-v2",
+                "schema_digest": "sha256:" + ("0" * 64),
+            }
+        ),
+        canonical_json(
+            {
+                "store_id": "s1",
+                "writer_epoch": 1,
+                "instance_id": "i1",
+                "contract": "mcp-tools-v2",
+                "schema_digest": "not-a-digest",
+            }
+        ),
+    ):
+        with pytest.raises(BrainError) as exc_ident_ver:
+            decode_identity_response(unsupported_ident_payload)
+        assert exc_ident_ver.value.code is ErrorCode.UNSUPPORTED_VERSION
 
 
 def test_loopback_server_and_client_keep_separate_handshake_connect_budgets() -> None:

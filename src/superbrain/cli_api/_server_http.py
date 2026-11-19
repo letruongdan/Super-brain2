@@ -17,12 +17,14 @@ from superbrain.cli_api._http_frames import (
     write_all,
 )
 from superbrain.cli_api._loopback_wire import (
+    CAPTURE_EVENTS_PATH,
     HEADER_INSTANCE_ID,
     HEADER_STORE_ID,
     HEADER_WRITER_EPOCH,
     IDENTITY_PATH,
     TOOL_CALL_PATH,
     decode_call,
+    decode_capture_batch,
     encode_identity_response,
 )
 from superbrain.core.errors import (
@@ -30,7 +32,7 @@ from superbrain.core.errors import (
     ErrorCode,
     is_safe_wire_message,
 )
-from superbrain.core.kernel import CallResult, Ready, ToolCommand
+from superbrain.core.kernel import CallResult, CaptureBatchCommand, Ready, ToolCommand
 from superbrain.core.wire import encode_envelope, make_error_envelope
 
 _STATUS_REASON: dict[int, str] = {
@@ -40,6 +42,7 @@ _STATUS_REASON: dict[int, str] = {
     403: "Forbidden",
     409: "Conflict",
     413: "Content Too Large",
+    426: "Upgrade Required",
 }
 
 
@@ -212,12 +215,12 @@ def read_admitted_tool_command(
     *,
     deadline_ns: int,
     monotonic_ns: Callable[[], int],
-) -> ToolCommand | None:
-    """Validate and read State 1 (``POST /v2/tools/call``) before ``OwnerLoop`` handoff."""
+) -> ToolCommand | CaptureBatchCommand | None:
+    """Validate and read State 1 (``POST /v2/tools/call`` or ``/v2/capture/events``)."""
     try:
         head = reader.read_request_head(deadline_ns)
         _validate_common_headers(head, expected_port=ready.endpoint.port)
-        if head.method != "POST" or head.target != TOOL_CALL_PATH:
+        if head.method != "POST" or head.target not in (TOOL_CALL_PATH, CAPTURE_EVENTS_PATH):
             raise _AdmissionRejectedError(400, ErrorCode.INVALID_INPUT, "invalid input")
         if head.content_length is None:
             raise _AdmissionRejectedError(400, ErrorCode.INVALID_INPUT, "invalid input")
@@ -227,8 +230,16 @@ def read_admitted_tool_command(
         if reader.has_pipelined_bytes(deadline_ns):
             raise _AdmissionRejectedError(400, ErrorCode.INVALID_INPUT, "invalid input")
         try:
+            if head.target == CAPTURE_EVENTS_PATH:
+                return decode_capture_batch(body, token)
             return decode_call(body, token)
         except BrainError as err:
+            if err.code is ErrorCode.UNSUPPORTED_VERSION:
+                raise _AdmissionRejectedError(
+                    426,
+                    ErrorCode.UNSUPPORTED_VERSION,
+                    "unsupported version",
+                ) from err
             raise _AdmissionRejectedError(400, ErrorCode.INVALID_INPUT, err.message) from err
     except _AdmissionRejectedError as rej:
         write_error_response(

@@ -447,6 +447,8 @@ def test_manual_submission_disabled_persists_metadata_only_through_shim(
                 "read_acks": [{
                     "served_receipt_id": receipt_id,
                     "task_id": task_id,
+                    "artifact_id": ART_ALLOWED,
+                    "revision_epoch": 0,
                     "revision": 1,
                     "resource_digests": [{"name": r["name"], "digest": r["digest"]} for r in resources],
                 }],

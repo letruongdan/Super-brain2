@@ -389,7 +389,13 @@ def _call_at_bytes(target_bytes: int, *, del_count: int, with_unicode: bool) -> 
     args: dict[str, JsonValue] = {"schema_version": "2.0", "pad": pad}
     if with_unicode:
         args["u"] = "é"
-    body: dict[str, object] = {"tool": "get_health", "arguments": args, "correlation_id": None, "selected_scope": None}
+    body: dict[str, object] = {
+        "tool": "get_health",
+        "arguments": args,
+        "correlation_id": None,
+        "selected_scope": None,
+        "schema_digest": wire.load_catalog().schema_digest,
+    }
     return k.ToolCommand("get_health", args, token="cred.secret"), _fill_pad_to_bytes(
         pad, lambda: body, target_bytes=target_bytes, del_count=del_count
     )

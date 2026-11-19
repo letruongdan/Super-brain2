@@ -267,6 +267,168 @@
           "job_id": null
         }
       }
+    },
+    {
+      "name": "prepare_task_discover_ok",
+      "tool": "prepare_task",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "workspace_id": "repo-01",
+          "checkout_id": "chk-a",
+          "continuity": [
+            {
+              "kind": "handoff",
+              "id": "hand-019a5390-0001",
+              "revision_epoch": 2,
+              "revision": 3,
+              "digest": "sha256:abababababababababababababababababababababababababababababababab",
+              "summary": "Goal: finish SP2-1 schema and handshake | Status: open | Pending changes: 1",
+              "status": "ok"
+            }
+          ],
+          "degraded_codes": []
+        }
+      }
+    },
+    {
+      "name": "prepare_task_work_with_handoff_live",
+      "tool": "prepare_task",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "workspace_id": "repo-01",
+          "checkout_id": "chk-a",
+          "source_snapshot_id": "snap-019a5390-abcd",
+          "snapshot_status": "available",
+          "degraded_codes": [
+            "observed_newer"
+          ],
+          "task_id": "task-019a5390-0001",
+          "delivery_id": "deliv-019a5390-0023",
+          "assignment_id": null,
+          "handoff_live": {
+            "revision": 3,
+            "revision_epoch": 2,
+            "handoff_revision": 1,
+            "fence": {
+              "restore_epoch": 2,
+              "writer_generation": 1
+            }
+          },
+          "skills": [],
+          "lessons": [],
+          "continuity": [
+            {
+              "kind": "handoff",
+              "id": "hand-019a5390-0001",
+              "revision_epoch": 2,
+              "revision": 3,
+              "digest": "sha256:abababababababababababababababababababababababababababababababab",
+              "summary": "Goal: finish SP2-1 schema and handshake | Status: open"
+            }
+          ],
+          "context": [],
+          "finishing_gates": []
+        }
+      }
+    },
+    {
+      "name": "get_artifact_handoff_ok",
+      "tool": "get_artifact",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "artifact_id": "hand-019a5390-0001",
+          "revision_epoch": 2,
+          "revision": 3,
+          "level": "L1",
+          "status": "ok",
+          "resources": [
+            {
+              "name": "handoff_header",
+              "digest": "sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+              "encoding": "utf-8",
+              "content": "{\"artifact_id\":\"hand-019a5390-0001\",\"revision\":3,\"handoff_revision\":1}"
+            },
+            {
+              "name": "handoff_required",
+              "digest": "sha256:efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef",
+              "encoding": "utf-8",
+              "content": "{\"working_goal\":\"Complete SP2-1\"}"
+            }
+          ],
+          "served_receipt_id": "rcpt-019a5390-0011",
+          "handoff_live": {
+            "revision": 3,
+            "revision_epoch": 2,
+            "handoff_revision": 1,
+            "fence": {
+              "restore_epoch": 2,
+              "writer_generation": 1
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "submit_episode_handoff_stored_ok",
+      "tool": "submit_episode",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "episode_id": "ep-019a5390-0041",
+          "evidence_ids": [],
+          "candidate_lesson_id": null,
+          "handoff_revision": 2,
+          "handoff_status": "stored",
+          "fence": {
+            "restore_epoch": 2,
+            "writer_generation": 2
+          },
+          "writer_status": "holder"
+        }
+      }
+    },
+    {
+      "name": "submit_episode_takeover_only_ok",
+      "tool": "submit_episode",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "episode_id": "ep-019a5390-0042",
+          "evidence_ids": [],
+          "candidate_lesson_id": null,
+          "handoff_revision": 2,
+          "handoff_status": "stored",
+          "fence": {
+            "restore_epoch": 2,
+            "writer_generation": 3
+          },
+          "writer_status": "holder"
+        }
+      }
+    },
+    {
+      "name": "submit_episode_handoff_not_stored_policy_ok",
+      "tool": "submit_episode",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "episode_id": "ep-019a5390-0043",
+          "evidence_ids": [
+            "ev-019a5390-0044"
+          ],
+          "candidate_lesson_id": null,
+          "handoff_revision": null,
+          "handoff_status": "not_stored_policy",
+          "fence": {
+            "restore_epoch": 2,
+            "writer_generation": 2
+          },
+          "writer_status": "not_holder"
+        }
+      }
     }
   ]
 }

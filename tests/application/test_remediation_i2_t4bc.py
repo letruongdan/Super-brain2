@@ -707,24 +707,32 @@ def test_t4c_r01_manual_submission_false_discards_read_acks_across_served_pendin
         served_ack = ReadAckInput(
             served_receipt_id=served,
             task_id=task_id,
+            artifact_id="art-t4c-1",
+            revision_epoch=0,
             revision=1,
             resource_digests=(ResourceDigest(name="L1.md", digest=res_digest),),
         )
         pending_ack = ReadAckInput(
             served_receipt_id=pending,
             task_id=task_id,
+            artifact_id="art-t4c-1",
+            revision_epoch=0,
             revision=1,
             resource_digests=(ResourceDigest(name="L1.md", digest=res_digest),),
         )
         unknown_ack = ReadAckInput(
             served_receipt_id=unknown,
             task_id=task_id,
+            artifact_id="art-t4c-1",
+            revision_epoch=0,
             revision=1,
             resource_digests=(ResourceDigest(name="L1.md", digest=res_digest),),
         )
         foreign_ack = ReadAckInput(
             served_receipt_id=foreign,
             task_id=task_id,
+            artifact_id="art-t4c-1",
+            revision_epoch=0,
             revision=1,
             resource_digests=(ResourceDigest(name="L1.md", digest=res_digest),),
         )
@@ -868,6 +876,8 @@ def test_t4c_r01_manual_submission_false_discards_read_acks_across_served_pendin
                     ReadAckInput(
                         served_receipt_id=served,
                         task_id=task_id,
+                        artifact_id="art-t4c-1",
+                        revision_epoch=0,
                         revision=1,
                         resource_digests=(ResourceDigest(name="L1.md", digest="sha256:" + "0" * 64),),
                     ).to_dict()
@@ -919,6 +929,8 @@ def test_t4c_r01_manual_submission_false_discards_read_acks_across_served_pendin
                 ReadAckInput(
                     served_receipt_id=unknown,
                     task_id=task_id,
+                    artifact_id="art-t4c-1",
+                    revision_epoch=0,
                     revision=99,
                     resource_digests=redacted_pair,
                 ),
@@ -929,6 +941,8 @@ def test_t4c_r01_manual_submission_false_discards_read_acks_across_served_pendin
                 ReadAckInput(
                     served_receipt_id=foreign,
                     task_id=task_id,
+                    artifact_id="art-t4c-1",
+                    revision_epoch=0,
                     revision=99,
                     resource_digests=redacted_pair,
                 ),
@@ -961,6 +975,8 @@ def test_t4c_r01_manual_submission_false_discards_read_acks_across_served_pendin
         pending2_ack = ReadAckInput(
             served_receipt_id=pending2,
             task_id=task_id,
+            artifact_id="art-t4c-1",
+            revision_epoch=0,
             revision=1,
             resource_digests=(ResourceDigest(name="L1.md", digest=res_digest),),
         )
@@ -998,6 +1014,8 @@ def test_t4c_r01_manual_submission_false_discards_read_acks_across_served_pendin
                         ReadAckInput(
                             served_receipt_id=pending2,
                             task_id=other_task_id,
+                            artifact_id="art-t4c-1",
+                            revision_epoch=0,
                             revision=99,
                             resource_digests=redacted_pair,
                         ).to_dict()

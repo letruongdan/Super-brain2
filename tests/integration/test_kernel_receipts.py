@@ -159,10 +159,20 @@ def outcome_args(
     }
 
 
-def ack(receipt_id: str, task_id: str, *, revision: int = 1, digests: list[JsonValue] | None = None) -> dict[str, Any]:
+def ack(
+    receipt_id: str,
+    task_id: str,
+    *,
+    artifact_id: str = ART_ALLOWED,
+    revision_epoch: int = 0,
+    revision: int = 1,
+    digests: list[JsonValue] | None = None,
+) -> dict[str, Any]:
     return {
         "served_receipt_id": receipt_id,
         "task_id": task_id,
+        "artifact_id": artifact_id,
+        "revision_epoch": revision_epoch,
         "revision": revision,
         "resource_digests": digests if digests is not None else list(SERVED_DIGESTS),
     }

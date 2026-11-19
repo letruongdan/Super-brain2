@@ -497,6 +497,8 @@ class KernelBridge(KernelBlobStagePort):
             revision=attempt.revision,
             resource_digests=attempt.resource_digests,
             identity=self._owner_identity,
+            level=attempt.level,
+            revision_epoch=attempt.revision_epoch,
         )
 
     def finalize_send_attempt(self, completion: SendAttemptCompletion) -> ArtifactSendAttempt:

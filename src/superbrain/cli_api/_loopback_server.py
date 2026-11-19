@@ -22,15 +22,19 @@ from superbrain.cli_api._server_http import (
     _validate_stop_deadline,
     handle_identity_request,
     read_admitted_tool_command,
+    write_error_response,
     write_json_response,
 )
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.kernel import (
+    CAPABILITY_MCP_TOOL,
     TOTAL_REQUEST_BUDGET_NS,
     ArtifactSendAttempt,
     CallResult,
+    CaptureBatchCommand,
     OwnerReply,
     Ready,
+    RequestAuthView,
     SendAttemptCompletion,
 )
 from superbrain.core.wire import encode_envelope, make_error_envelope
@@ -541,6 +545,15 @@ class LoopbackServer:
                 self._write_200_best_effort(ssl_sock, encode_envelope(unavail), tool_deadline_ns)
                 return
 
+            if isinstance(command, CaptureBatchCommand):
+                self._handle_capture_batch(ssl_sock, command, tool_deadline_ns)
+                clean_done = True
+                return
+
+            if self._reject_non_mcp_tool_token(ssl_sock, command.token, tool_deadline_ns):
+                clean_done = True
+                return
+
             try:
                 reply_fut = self._owner.submit_reply(command, tool_deadline_ns)
                 reply = self._await_owner_reply(reply_fut, tool_deadline_ns)
@@ -564,6 +577,81 @@ class LoopbackServer:
             )
         finally:
             self._release_conn(conn_id, raw_sock, ssl_sock, drain=handshake_completed and not clean_done)
+
+    def _handle_capture_batch(
+        self,
+        ssl_sock: ssl.SSLSocket,
+        command: CaptureBatchCommand,
+        deadline_ns: int,
+    ) -> None:
+        try:
+            view = self._owner.auth_gate.current()
+        except BrainError as err:
+            self._write_200_best_effort(ssl_sock, encode_envelope(make_error_envelope(err)), deadline_ns)
+            return
+        if view is None:
+            policy_err: CallResult = make_error_envelope(
+                BrainError(ErrorCode.POLICY_UNAVAILABLE, "policy unavailable")
+            )
+            self._write_200_best_effort(ssl_sock, encode_envelope(policy_err), deadline_ns)
+            return
+        try:
+            view.auth.authorize_capture_producer(
+                command.token,
+                producer_stream=command.producer_stream,
+                repo_id=command.repo_id,
+                checkout_id=command.checkout_id,
+            )
+        except BrainError as err:
+            status = (
+                401
+                if err.code is ErrorCode.UNAUTHENTICATED
+                else 409
+                if err.code is ErrorCode.IDENTITY_MISMATCH
+                else 400
+            )
+            write_error_response(
+                ssl_sock,
+                status=status,
+                code=err.code,
+                message=err.message,
+                deadline_ns=deadline_ns,
+                monotonic_ns=self._monotonic_ns,
+            )
+            return
+        stub_err: CallResult = make_error_envelope(
+            BrainError(ErrorCode.CAPABILITY_UNAVAILABLE, "capability unavailable")
+        )
+        self._write_200_best_effort(ssl_sock, encode_envelope(stub_err), deadline_ns)
+
+    def _reject_non_mcp_tool_token(
+        self,
+        ssl_sock: ssl.SSLSocket,
+        token: str,
+        deadline_ns: int,
+    ) -> bool:
+        view: RequestAuthView | None = None
+        with contextlib.suppress(BrainError):
+            view = self._owner.auth_gate.current()
+        if view is None:
+            return False
+        try:
+            rec = view.auth.resolve_credential_record(token)
+        except BrainError as err:
+            if err.code is ErrorCode.UNAUTHENTICATED:
+                return False
+            raise
+        if CAPABILITY_MCP_TOOL in rec.capabilities:
+            return False
+        write_error_response(
+            ssl_sock,
+            status=409,
+            code=ErrorCode.IDENTITY_MISMATCH,
+            message="identity mismatch",
+            deadline_ns=deadline_ns,
+            monotonic_ns=self._monotonic_ns,
+        )
+        return True
 
     def _release_conn(
         self,

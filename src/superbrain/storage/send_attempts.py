@@ -98,20 +98,23 @@ def read_read_ack_by_receipt_row(db: sqlite3.Connection, served_receipt_id: str)
     require_opaque_id(served_receipt_id, label="served_receipt_id")
     try:
         row = db.execute(
-            "SELECT id, served_receipt_id, principal_id, task_id, revision, digests_json "
-            "FROM artifact_read_ack WHERE served_receipt_id = ?",
+            "SELECT a.id, a.served_receipt_id, a.principal_id, a.task_id, s.artifact_id, a.revision, a.digests_json "
+            "FROM artifact_read_ack AS a "
+            "LEFT JOIN artifact_send_attempt AS s ON s.id = a.served_receipt_id "
+            "WHERE a.served_receipt_id = ?",
             (served_receipt_id,),
         ).fetchone()
     except sqlite3.Error as exc:
         raise sqlite_error("cannot read artifact_read_ack row", exc) from exc
     if row is None:
         return None
-    raw_id, raw_receipt, raw_principal, raw_task, raw_rev, raw_digests_json = row
+    raw_id, raw_receipt, raw_principal, raw_task, raw_artifact, raw_rev, raw_digests_json = row
     if (
         not isinstance(raw_id, str)
         or not isinstance(raw_receipt, str)
         or not isinstance(raw_principal, str)
         or not isinstance(raw_task, str)
+        or not isinstance(raw_artifact, str)
         or not is_strict_int(raw_rev)
         or not isinstance(raw_digests_json, str)
     ):
@@ -123,6 +126,8 @@ def read_read_ack_by_receipt_row(db: sqlite3.Connection, served_receipt_id: str)
             served_receipt_id=raw_receipt,
             principal_id=raw_principal,
             task_id=raw_task,
+            artifact_id=raw_artifact,
+            revision_epoch=0,
             revision=raw_rev,
             resource_digests=digests,
         )
@@ -226,6 +231,8 @@ class KernelSendAttemptStore(KernelSendAttemptPort):
                 existing.principal_id,
                 existing.task_id,
                 existing.artifact_id,
+                existing.level,
+                existing.revision_epoch,
                 existing.revision,
                 existing.resource_digests,
             ) != (
@@ -233,6 +240,8 @@ class KernelSendAttemptStore(KernelSendAttemptPort):
                 completion.principal_id,
                 completion.task_id,
                 completion.artifact_id,
+                completion.level,
+                completion.revision_epoch,
                 completion.revision,
                 completion.resource_digests,
             ):

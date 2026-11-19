@@ -436,6 +436,8 @@ def test_partial_flush_has_no_served_receipt(trusted_tmp: Path, os_: OsAdapters,
         ack = ReadAckInput(
             served_receipt_id=receipt_id,
             task_id=task_id,
+            artifact_id="art-partial-1",
+            revision_epoch=0,
             revision=1,
             resource_digests=(ResourceDigest(name="L1.md", digest=res_digest),),
         )
@@ -514,6 +516,8 @@ def test_ack_for_pending_attempt_is_in_progress(trusted_tmp: Path, os_: OsAdapte
         ack = ReadAckInput(
             served_receipt_id=receipt_id,
             task_id=task_id,
+            artifact_id="art-pend-1",
+            revision_epoch=0,
             revision=2,
             resource_digests=(ResourceDigest(name="lesson.md", digest=res_digest),),
         )
@@ -649,6 +653,8 @@ def test_wrong_principal_revision_or_digest_ack_is_refused(
                                 {
                                     "served_receipt_id": target_receipt,
                                     "task_id": target_tid,
+                                    "artifact_id": "art-multi-1",
+                                    "revision_epoch": 0,
                                     "revision": 999,
                                     "resource_digests": [{"name": "alpha.md", "digest": "sha256:" + "0" * 64}],
                                 }
@@ -678,6 +684,8 @@ def test_wrong_principal_revision_or_digest_ack_is_refused(
                             {
                                 "served_receipt_id": missing_id,
                                 "task_id": task_a1,
+                                "artifact_id": "art-multi-1",
+                                "revision_epoch": 0,
                                 "revision": 3,
                                 "resource_digests": [
                                     {"name": "alpha.md", "digest": dig_alpha},
@@ -711,6 +719,8 @@ def test_wrong_principal_revision_or_digest_ack_is_refused(
                             {
                                 "served_receipt_id": receipt_pend_a1,
                                 "task_id": ack_tid,
+                                "artifact_id": "art-multi-1",
+                                "revision_epoch": 0,
                                 "revision": 3,
                                 "resource_digests": [
                                     {"name": "alpha.md", "digest": dig_alpha},
@@ -769,6 +779,8 @@ def test_wrong_principal_revision_or_digest_ack_is_refused(
                         {
                             "served_receipt_id": receipt_served_a1,
                             "task_id": task_a1,
+                            "artifact_id": "art-multi-1",
+                            "revision_epoch": 0,
                             "revision": rev,
                             "resource_digests": cast(JsonValue, dig_list),
                         }
@@ -802,6 +814,8 @@ def test_wrong_principal_revision_or_digest_ack_is_refused(
                         {
                             "served_receipt_id": receipt_served_a1,
                             "task_id": task_a1,
+                            "artifact_id": "art-multi-1",
+                            "revision_epoch": 0,
                             "revision": 3,
                             "resource_digests": [
                                 {"name": "beta.md", "digest": dig_beta},
@@ -991,6 +1005,8 @@ def test_matching_ack_is_client_declaration_only(trusted_tmp: Path, os_: OsAdapt
         ack = ReadAckInput(
             served_receipt_id=receipt_id,
             task_id=task_id,
+            artifact_id="art-decl-1",
+            revision_epoch=0,
             revision=1,
             resource_digests=(ResourceDigest(name="L1.md", digest=res_digest),),
         )
@@ -1133,6 +1149,8 @@ def test_reserved_receipt_id_is_attempt_id_across_reopen_and_pending_finalize(
         ack_1 = ReadAckInput(
             served_receipt_id=receipt_1,
             task_id=task_id,
+            artifact_id="art-reopen-1",
+            revision_epoch=0,
             revision=1,
             resource_digests=(ResourceDigest(name="L1.md", digest=res_digest),),
         )
@@ -1203,6 +1221,8 @@ def test_reserved_receipt_id_is_attempt_id_across_reopen_and_pending_finalize(
         ack_2 = ReadAckInput(
             served_receipt_id=receipt_2,
             task_id=task_id,
+            artifact_id="art-reopen-1",
+            revision_epoch=0,
             revision=1,
             resource_digests=(ResourceDigest(name="L1.md", digest=res_digest),),
         )
@@ -1447,6 +1467,8 @@ def test_repeated_identical_read_ack_reuses_ack_id(trusted_tmp: Path, os_: OsAda
         ack_a = ReadAckInput(
             served_receipt_id=receipt_a,
             task_id=task_id,
+            artifact_id="art-dup-a",
+            revision_epoch=0,
             revision=1,
             resource_digests=(ResourceDigest(name="a.md", digest=dig_a),),
         )
@@ -1506,12 +1528,16 @@ def test_repeated_identical_read_ack_reuses_ack_id(trusted_tmp: Path, os_: OsAda
         ack_b_valid = ReadAckInput(
             served_receipt_id=receipt_b,
             task_id=task_id,
+            artifact_id="art-dup-b",
+            revision_epoch=0,
             revision=1,
             resource_digests=(ResourceDigest(name="b.md", digest=dig_b),),
         )
         ack_b_bad = ReadAckInput(
             served_receipt_id=receipt_b,
             task_id=task_id,
+            artifact_id="art-dup-b",
+            revision_epoch=0,
             revision=2,
             resource_digests=(ResourceDigest(name="b.md", digest=dig_b),),
         )
@@ -1822,6 +1848,8 @@ def test_r1_post_insert_cutoff_race_interrupts_pending_send_attempt_to_unknown(
         ack = ReadAckInput(
             served_receipt_id=raced_id,
             task_id=task_id,
+            artifact_id="art-postcut-1",
+            revision_epoch=0,
             revision=1,
             resource_digests=(ResourceDigest(name="L1.md", digest=res_digest),),
         )
@@ -1884,6 +1912,8 @@ def test_r1_post_insert_cutoff_race_interrupts_pending_send_attempt_to_unknown(
         valid_ack = ReadAckInput(
             served_receipt_id=ok_receipt,
             task_id=task_id,
+            artifact_id="art-postcut-1",
+            revision_epoch=0,
             revision=1,
             resource_digests=(ResourceDigest(name="L1.md", digest=res_digest),),
         )

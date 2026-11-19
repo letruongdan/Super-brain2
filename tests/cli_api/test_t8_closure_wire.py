@@ -15,6 +15,7 @@ import pytest
 from superbrain.cli_api._loopback_wire import decode_call, encode_call
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.kernel import ToolCommand
+from superbrain.core.wire import load_catalog
 
 MAX_BODY = 1_048_576
 MAX_TEXT = 65_536
@@ -27,7 +28,13 @@ def _command(arguments: object) -> ToolCommand:
 
 
 def _body_len(arguments: dict[str, object]) -> int:
-    body = {"arguments": arguments, "correlation_id": None, "selected_scope": None, "tool": "get_health"}
+    body = {
+        "arguments": arguments,
+        "correlation_id": None,
+        "schema_digest": load_catalog().schema_digest,
+        "selected_scope": None,
+        "tool": "get_health",
+    }
     return len(json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode())
 
 

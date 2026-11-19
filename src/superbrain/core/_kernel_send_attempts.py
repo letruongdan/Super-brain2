@@ -10,12 +10,21 @@ from superbrain.core._json_parse import parse_json
 from superbrain.core._kernel_base import (
     Identity,
     ResourceDigest,
+    require_non_negative_int,
     require_opaque_id,
     require_positive_int,
 )
 from superbrain.core._kernel_workspace import require_uuid
 from superbrain.core.canonical import canonical_json
 from superbrain.core.errors import BrainError, ErrorCode
+
+_VALID_ARTIFACT_LEVELS: frozenset[str] = frozenset({"L0", "L1", "L2"})
+
+
+def _require_artifact_level(value: object) -> str:
+    if not isinstance(value, str) or value not in _VALID_ARTIFACT_LEVELS:
+        raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+    return value
 
 
 class SendAttemptState(StrEnum):
@@ -85,6 +94,8 @@ class ArtifactSendSpec:
     artifact_id: str
     revision: int
     resource_digests: tuple[ResourceDigest, ...]
+    level: str = "L1"
+    revision_epoch: int = 0
 
     def __post_init__(self) -> None:
         require_opaque_id(self.logical_result_id, label="logical_result_id")
@@ -96,6 +107,8 @@ class ArtifactSendSpec:
             raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
         ordered, _ = canonicalize_resource_digests(self.resource_digests)
         object.__setattr__(self, "resource_digests", ordered)
+        _require_artifact_level(self.level)
+        require_non_negative_int(self.revision_epoch)
 
 
 @dataclass(frozen=True)
@@ -110,6 +123,8 @@ class ArtifactSendAttempt:
     revision: int
     resource_digests: tuple[ResourceDigest, ...]
     state: SendAttemptState
+    level: str = "L1"
+    revision_epoch: int = 0
 
     def __post_init__(self) -> None:
         require_uuid(self.send_attempt_id)
@@ -124,6 +139,8 @@ class ArtifactSendAttempt:
         object.__setattr__(self, "resource_digests", ordered)
         if not isinstance(self.state, SendAttemptState):
             raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+        _require_artifact_level(self.level)
+        require_non_negative_int(self.revision_epoch)
 
     @property
     def served_receipt_id(self) -> str:
@@ -143,6 +160,8 @@ class SendAttemptCompletion:
     revision: int
     resource_digests: tuple[ResourceDigest, ...]
     identity: Identity
+    level: str = "L1"
+    revision_epoch: int = 0
 
     def __post_init__(self) -> None:
         require_uuid(self.send_attempt_id)
@@ -157,6 +176,8 @@ class SendAttemptCompletion:
         object.__setattr__(self, "resource_digests", ordered)
         if not isinstance(self.identity, Identity):
             raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+        _require_artifact_level(self.level)
+        require_non_negative_int(self.revision_epoch)
 
 
 @dataclass(frozen=True)
@@ -167,8 +188,10 @@ class ArtifactReadAck:
     served_receipt_id: str
     principal_id: str
     task_id: str
+    artifact_id: str
     revision: int
     resource_digests: tuple[ResourceDigest, ...]
+    revision_epoch: int = 0
 
     def __post_init__(self) -> None:
         require_uuid(self.ack_id)
@@ -177,8 +200,10 @@ class ArtifactReadAck:
             raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
         require_opaque_id(self.principal_id, label="principal_id")
         require_opaque_id(self.task_id, label="task_id")
+        require_opaque_id(self.artifact_id, label="artifact_id")
         require_positive_int(self.revision)
         if not isinstance(self.resource_digests, tuple):
             raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
         ordered, _ = canonicalize_resource_digests(self.resource_digests)
         object.__setattr__(self, "resource_digests", ordered)
+        require_non_negative_int(self.revision_epoch)

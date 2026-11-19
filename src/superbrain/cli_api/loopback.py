@@ -15,14 +15,16 @@ from dataclasses import dataclass
 
 from superbrain.cli_api._http_frames import FramedReader, HttpFramingError, write_all
 from superbrain.cli_api._loopback_wire import (
+    CAPTURE_EVENTS_PATH,
     HEADER_INSTANCE_ID,
     HEADER_STORE_ID,
     HEADER_WRITER_EPOCH,
     IDENTITY_PATH,
     TOOL_CALL_PATH,
-    decode_identity_response,
     decode_result,
     encode_call,
+    encode_capture_batch,
+    parse_identity_response,
 )
 from superbrain.core.errors import (
     SAFE_WIRE_MESSAGES_BY_CODE,
@@ -30,7 +32,15 @@ from superbrain.core.errors import (
     ErrorCode,
     is_safe_wire_message,
 )
-from superbrain.core.kernel import CallResult, Endpoint, ToolCommand, require_opaque_id
+from superbrain.core.kernel import (
+    SHA256_DIGEST_RE,
+    CallResult,
+    CaptureBatchCommand,
+    Endpoint,
+    ToolCommand,
+    require_opaque_id,
+)
+from superbrain.core.wire import load_catalog
 
 CLIENT_CONNECT_BUDGET_NS = 2_000_000_000
 CLIENT_TOOL_BUDGET_NS = 2_000_000_000
@@ -42,6 +52,7 @@ _ERROR_STATUS_EXPECTED_CODE: dict[int, str] = {
     403: ErrorCode.INVALID_INPUT.value,
     409: ErrorCode.IDENTITY_MISMATCH.value,
     413: ErrorCode.INVALID_INPUT.value,
+    426: ErrorCode.UNSUPPORTED_VERSION.value,
 }
 
 
@@ -127,21 +138,32 @@ def _has_connection_close(headers: tuple[str, ...]) -> bool:
     return False
 
 
-def _prepare_tool_request(command: ToolCommand) -> tuple[str, bytes]:
+def _prepare_post_payload(token: object, encoder: Callable[[], bytes]) -> tuple[str, bytes]:
     if (
-        not isinstance(command, ToolCommand)
-        or not isinstance(command.token, str)
-        or not command.token
-        or any(ord(ch) <= 0x20 or ord(ch) >= 0x7F for ch in command.token)
+        not isinstance(token, str)
+        or not token
+        or any(ord(ch) <= 0x20 or ord(ch) >= 0x7F for ch in token)
     ):
         raise LoopbackTransportError(ErrorCode.INVALID_INPUT, "invalid input", request_may_have_run=False)
     try:
-        return command.token, encode_call(command)
+        return token, encoder()
     except BrainError as err:
         msg = err.message if is_safe_wire_message(err.message) else SAFE_WIRE_MESSAGES_BY_CODE[err.code]
         raise LoopbackTransportError(err.code, msg, request_may_have_run=False) from err
     except (TypeError, ValueError, UnicodeError) as err:
         raise LoopbackTransportError(ErrorCode.INVALID_INPUT, "invalid input", request_may_have_run=False) from err
+
+
+def _prepare_tool_request(command: ToolCommand) -> tuple[str, bytes]:
+    if not isinstance(command, ToolCommand):
+        raise LoopbackTransportError(ErrorCode.INVALID_INPUT, "invalid input", request_may_have_run=False)
+    return _prepare_post_payload(command.token, lambda: encode_call(command))
+
+
+def _prepare_capture_request(command: CaptureBatchCommand) -> tuple[str, bytes]:
+    if not isinstance(command, CaptureBatchCommand):
+        raise LoopbackTransportError(ErrorCode.INVALID_INPUT, "invalid input", request_may_have_run=False)
+    return _prepare_post_payload(command.token, lambda: encode_capture_batch(command))
 
 
 class PinnedConnection:
@@ -167,10 +189,17 @@ class PinnedConnection:
         self._closed = False
 
     def call(self, command: ToolCommand, *, deadline_ns: int | None = None) -> CallResult:
-        return self._call(lambda: _prepare_tool_request(command), deadline_ns=deadline_ns)
+        return self._call(lambda: _prepare_tool_request(command), path=TOOL_CALL_PATH, deadline_ns=deadline_ns)
+
+    def post_capture(self, command: CaptureBatchCommand, *, deadline_ns: int | None = None) -> CallResult:
+        return self._call(lambda: _prepare_capture_request(command), path=CAPTURE_EVENTS_PATH, deadline_ns=deadline_ns)
 
     def _call(
-        self, prepare: Callable[[], tuple[str, bytes]], *, deadline_ns: int | None,
+        self,
+        prepare: Callable[[], tuple[str, bytes]],
+        *,
+        path: str = TOOL_CALL_PATH,
+        deadline_ns: int | None,
     ) -> CallResult:
         with self._lock:
             if self._claimed or self._closed or self._sock is None or self._reader is None:
@@ -203,7 +232,7 @@ class PinnedConnection:
 
             ep = self._endpoint
             post_head = (
-                f"POST {TOOL_CALL_PATH} HTTP/1.1\r\n"
+                f"POST {path} HTTP/1.1\r\n"
                 f"Host: 127.0.0.1:{ep.port}\r\n"
                 f"Authorization: Bearer {token}\r\n"
                 f"{HEADER_STORE_ID}: {ep.store_id}\r\n"
@@ -264,7 +293,11 @@ class PinnedConnection:
                         request_may_have_run=True,
                     )
 
-            _remaining_budget_s(self._monotonic_ns, eff_deadline_ns, request_may_have_run=True)
+            _remaining_budget_s(
+                self._monotonic_ns,
+                eff_deadline_ns,
+                request_may_have_run=(resp_head.status == 200),
+            )
             return envelope
         except LoopbackTransportError:
             raise
@@ -464,7 +497,7 @@ class LoopbackClient:
                 ) from err
 
             try:
-                actual_ident, actual_contract = decode_identity_response(ident_body)
+                actual_ident, actual_contract, actual_digest = parse_identity_response(ident_body)
             except BrainError as err:
                 raise LoopbackTransportError(
                     ErrorCode.IDENTITY_MISMATCH,
@@ -497,6 +530,18 @@ class LoopbackClient:
                 raise LoopbackTransportError(
                     ErrorCode.IDENTITY_MISMATCH,
                     "identity mismatch",
+                    request_may_have_run=False,
+                )
+
+            expected_digest = load_catalog().schema_digest
+            if (
+                actual_digest is None
+                or not SHA256_DIGEST_RE.fullmatch(actual_digest)
+                or not hmac.compare_digest(actual_digest, expected_digest)
+            ):
+                raise LoopbackTransportError(
+                    ErrorCode.UNSUPPORTED_VERSION,
+                    "unsupported version",
                     request_may_have_run=False,
                 )
 
@@ -560,6 +605,22 @@ class LoopbackClient:
                 _quiet_close(ssl_sock)
                 _quiet_close(raw_sock)
 
+    def _dispatch_post(
+        self,
+        target: LoopbackTarget,
+        *,
+        prepared: tuple[str, bytes],
+        path: str,
+        deadline_ns: int | None,
+    ) -> CallResult:
+        # Prepare the body before the identity response starts the server's
+        # POST budget. The pinned connection is still required to send it.
+        conn = self.connect(target, deadline_ns=deadline_ns)
+        try:
+            return conn._call(lambda: prepared, path=path, deadline_ns=deadline_ns)
+        finally:
+            conn.close()
+
     def call(
         self,
         target: LoopbackTarget,
@@ -570,11 +631,26 @@ class LoopbackClient:
         deadline_ns = _validate_optional_deadline(deadline_ns, request_may_have_run=False)
         if deadline_ns is not None:
             _remaining_budget_s(self._monotonic_ns, deadline_ns, request_may_have_run=False)
-        # Prepare the body before the identity response starts the server's
-        # POST budget. The pinned connection is still required to send it.
-        prepared = _prepare_tool_request(command)
-        conn = self.connect(target, deadline_ns=deadline_ns)
-        try:
-            return conn._call(lambda: prepared, deadline_ns=deadline_ns)
-        finally:
-            conn.close()
+        return self._dispatch_post(
+            target,
+            prepared=_prepare_tool_request(command),
+            path=TOOL_CALL_PATH,
+            deadline_ns=deadline_ns,
+        )
+
+    def post_capture(
+        self,
+        target: LoopbackTarget,
+        command: CaptureBatchCommand,
+        *,
+        deadline_ns: int | None = None,
+    ) -> CallResult:
+        deadline_ns = _validate_optional_deadline(deadline_ns, request_may_have_run=False)
+        if deadline_ns is not None:
+            _remaining_budget_s(self._monotonic_ns, deadline_ns, request_may_have_run=False)
+        return self._dispatch_post(
+            target,
+            prepared=_prepare_capture_request(command),
+            path=CAPTURE_EVENTS_PATH,
+            deadline_ns=deadline_ns,
+        )

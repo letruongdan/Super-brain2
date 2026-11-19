@@ -74,6 +74,7 @@ from superbrain.core.kernel import (
     StoredResult,
     ToolCommand,
 )
+from superbrain.core.wire import load_catalog
 from superbrain.ports.kernel import KernelTx
 from superbrain.storage.runtime import admit_existing_pair
 from tests.support.inc2_child import spawn_serve_child
@@ -257,6 +258,7 @@ class TestTransportAdmission:
                     "writer_epoch": writer_epoch,
                     "instance_id": instance_id,
                     "contract": "mcp-tools-v2",
+                    "schema_digest": load_catalog().schema_digest,
                 }
 
                 # Request 2: POST /v2/tools/call
@@ -661,6 +663,8 @@ class FinalizeFlushDomain(TransportTestDomain):
                                 served_receipt_id=rec_id,
                                 principal_id=ctx.principal.principal_id,
                                 task_id=attempt.task_id,
+                                artifact_id=attempt.artifact_id,
+                                revision_epoch=attempt.revision_epoch,
                                 revision=attempt.revision,
                                 resource_digests=attempt.resource_digests,
                             )
@@ -737,6 +741,7 @@ class TestTransportLifecycleAndRelease:
                             "writer_epoch": ep.writer_epoch,
                             "instance_id": ep.instance_id,
                             "contract": "mcp-tools-v2",
+                            "schema_digest": load_catalog().schema_digest,
                         }
 
                         # POST /v2/tools/call on that SAME socket
@@ -2058,6 +2063,8 @@ class TestTransportLifecycleAndRelease:
                             {
                                 "served_receipt_id": receipt_id,
                                 "task_id": "task-art-1",
+                                "artifact_id": "art-skill-1",
+                                "revision_epoch": 0,
                                 "revision": 1,
                                 "resource_digests": [{"name": "L1.md", "digest": content_digest}],
                             }
@@ -2099,6 +2106,8 @@ class TestTransportLifecycleAndRelease:
                             {
                                 "served_receipt_id": receipt_id,
                                 "task_id": "task-art-1",
+                                "artifact_id": "art-skill-1",
+                                "revision_epoch": 0,
                                 "revision": 1,
                                 "resource_digests": [{"name": "L1.md", "digest": content_digest}],
                             }

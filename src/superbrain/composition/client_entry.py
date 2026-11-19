@@ -135,6 +135,8 @@ def read_status(profile_path: Path, os_: OsAdapters) -> dict[str, Any]:
             selected_scope=None,
         )
         return LoopbackClient(monotonic_ns=os_.monotonic.monotonic_ns).call(target, command)
+    except LoopbackTransportError as err:
+        return make_error_envelope(BrainError(err.code, err.message))
     except BrainError as err:
         return make_error_envelope(BrainError(err.code, err.message))
 

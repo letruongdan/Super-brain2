@@ -34,6 +34,17 @@ _BASE64URL_SECRET_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")
 _HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 _DUMMY_SECRET_DIGEST = "sha256:" + ("0" * 64)
 
+CAPABILITY_MCP_TOOL = "mcp_tool"
+CAPABILITY_CAPTURE_PRODUCER = "capture_producer"
+CAPABILITY_OPERATOR_CLI = "operator_cli"
+VALID_CREDENTIAL_CAPABILITIES: frozenset[str] = frozenset(
+    {
+        CAPABILITY_MCP_TOOL,
+        CAPABILITY_CAPTURE_PRODUCER,
+        CAPABILITY_OPERATOR_CLI,
+    }
+)
+
 
 def _require_uuid_str(value: object) -> str:
     if not isinstance(value, str):
@@ -279,11 +290,27 @@ class WorkspaceBinding:
 
 
 @dataclass(frozen=True)
+class CaptureProducerBinding:
+    """Credential-pinned capture producer identity binding a stream to one repo/checkout."""
+
+    producer_stream: str
+    repo_id: str
+    checkout_id: str
+
+    def __post_init__(self) -> None:
+        require_opaque_id(self.producer_stream, label="producer_stream")
+        require_opaque_id(self.repo_id, label="repo_id")
+        require_opaque_id(self.checkout_id, label="checkout_id")
+
+
+@dataclass(frozen=True)
 class CredentialRecord:
     credential_id: str
     principal: Principal
     secret_digest: str
     revoked: bool = False
+    capabilities: frozenset[str] = frozenset({CAPABILITY_MCP_TOOL})
+    capture_binding: CaptureProducerBinding | None = None
 
     def __post_init__(self) -> None:
         _require_uuid_str(self.credential_id)
@@ -292,6 +319,17 @@ class CredentialRecord:
         require_sha256_digest(self.secret_digest)
         if not isinstance(self.revoked, bool):
             raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+        if (
+            not isinstance(self.capabilities, frozenset)
+            or not self.capabilities
+            or any(not isinstance(cap, str) or cap not in VALID_CREDENTIAL_CAPABILITIES for cap in self.capabilities)
+        ):
+            raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+        if self.capture_binding is not None:
+            if not isinstance(self.capture_binding, CaptureProducerBinding):
+                raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+            if CAPABILITY_CAPTURE_PRODUCER not in self.capabilities:
+                raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
 
 
 @dataclass(frozen=True)
@@ -339,12 +377,41 @@ class AuthSnapshot:
         object.__setattr__(self, "grants", frozenset(self.grants))
         object.__setattr__(self, "checkouts", MappingProxyType(dict(self.checkouts)))
 
-    def resolve_credential(self, token: str) -> Principal:
+    def resolve_credential_record(self, token: str) -> CredentialRecord:
         cred_id, candidate_digest = parse_bearer_token(token)
         rec = self.credentials.get(cred_id)
         expected = rec.secret_digest if (rec is not None and not rec.revoked) else None
         if not verify_secret_digest(candidate_digest, expected) or rec is None:
             raise BrainError(ErrorCode.UNAUTHENTICATED, "unauthenticated")
+        return rec
+
+    def resolve_credential(self, token: str) -> Principal:
+        rec = self.resolve_credential_record(token)
+        if CAPABILITY_MCP_TOOL not in rec.capabilities:
+            raise BrainError(ErrorCode.IDENTITY_MISMATCH, "identity mismatch")
+        return rec.principal
+
+    def authorize_capture_producer(
+        self,
+        token: str,
+        *,
+        producer_stream: str,
+        repo_id: str,
+        checkout_id: str,
+    ) -> Principal:
+        require_opaque_id(producer_stream, label="producer_stream")
+        require_opaque_id(repo_id, label="repo_id")
+        require_opaque_id(checkout_id, label="checkout_id")
+        rec = self.resolve_credential_record(token)
+        if CAPABILITY_CAPTURE_PRODUCER not in rec.capabilities or rec.capture_binding is None:
+            raise BrainError(ErrorCode.IDENTITY_MISMATCH, "identity mismatch")
+        expected = CaptureProducerBinding(
+            producer_stream=producer_stream,
+            repo_id=repo_id,
+            checkout_id=checkout_id,
+        )
+        if rec.capture_binding != expected:
+            raise BrainError(ErrorCode.IDENTITY_MISMATCH, "identity mismatch")
         return rec.principal
 
     def allows(self, principal: Principal, scope: Scope | None, *, action: str) -> bool:
@@ -353,10 +420,25 @@ class AuthSnapshot:
         stored_principal = self.principals.get(principal.principal_id)
         if stored_principal != principal:
             return False
-        has_active_cred = any(
-            not cred.revoked and cred.principal.principal_id == principal.principal_id
-            for cred in self.credentials.values()
-        )
+        if action == "capture_events":
+            if scope is None or scope.checkout_id is None:
+                return False
+            has_active_cred = any(
+                not cred.revoked
+                and cred.principal.principal_id == principal.principal_id
+                and CAPABILITY_CAPTURE_PRODUCER in cred.capabilities
+                and cred.capture_binding is not None
+                and cred.capture_binding.repo_id == scope.repo_id
+                and cred.capture_binding.checkout_id == scope.checkout_id
+                for cred in self.credentials.values()
+            )
+        else:
+            has_active_cred = any(
+                not cred.revoked
+                and cred.principal.principal_id == principal.principal_id
+                and CAPABILITY_MCP_TOOL in cred.capabilities
+                for cred in self.credentials.values()
+            )
         if not has_active_cred:
             return False
         if scope is None:

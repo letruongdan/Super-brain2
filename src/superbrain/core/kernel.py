@@ -8,8 +8,13 @@ from dataclasses import dataclass, field
 
 from superbrain.core._json_parse import parse_json
 from superbrain.core._kernel_auth import (
+    CAPABILITY_CAPTURE_PRODUCER,
+    CAPABILITY_MCP_TOOL,
+    CAPABILITY_OPERATOR_CLI,
+    VALID_CREDENTIAL_CAPABILITIES,
     AuthSnapshot,
     BootstrapAuthorization,
+    CaptureProducerBinding,
     CredentialRecord,
     DaemonConfig,
     DirectRefRecord,
@@ -47,6 +52,7 @@ from superbrain.core._kernel_base import (
     SnapshotStatus,
     is_registrable_alias,
     is_strict_int,
+    require_non_negative_int,
     require_object_kind,
     require_opaque_id,
     require_positive_int,
@@ -65,6 +71,7 @@ from superbrain.core._kernel_daemon import (
     TLS_EXPIRING_CODE,
     TLS_EXPIRING_WINDOW,
     AuthGrantStamp,
+    CaptureBatchCommand,
     Endpoint,
     OwnerReply,
     Ready,
@@ -286,12 +293,16 @@ class StoredResult:
 class ReadAckInput:
     served_receipt_id: str
     task_id: str
+    artifact_id: str
+    revision_epoch: int
     revision: int
     resource_digests: tuple[ResourceDigest, ...]
 
     def __post_init__(self) -> None:
         require_opaque_id(self.served_receipt_id, label="served_receipt_id")
         require_opaque_id(self.task_id, label="task_id")
+        require_opaque_id(self.artifact_id, label="artifact_id")
+        require_non_negative_int(self.revision_epoch)
         require_positive_int(self.revision)
         if (
             not isinstance(self.resource_digests, tuple)
@@ -308,13 +319,15 @@ class ReadAckInput:
         return {
             "served_receipt_id": self.served_receipt_id,
             "task_id": self.task_id,
+            "artifact_id": self.artifact_id,
+            "revision_epoch": self.revision_epoch,
             "revision": self.revision,
             "resource_digests": [d.to_dict() for d in self.resource_digests],
         }
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, JsonValue]) -> ReadAckInput:
-        expected = {"served_receipt_id", "task_id", "revision", "resource_digests"}
+        expected = {"served_receipt_id", "task_id", "artifact_id", "revision_epoch", "revision", "resource_digests"}
         if not isinstance(raw, Mapping) or set(raw) != expected:
             raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
         raw_digests = raw["resource_digests"]
@@ -328,6 +341,8 @@ class ReadAckInput:
         return cls(
             served_receipt_id=require_opaque_id(raw["served_receipt_id"]),
             task_id=require_opaque_id(raw["task_id"]),
+            artifact_id=require_opaque_id(raw["artifact_id"], label="artifact_id"),
+            revision_epoch=require_non_negative_int(raw["revision_epoch"]),
             revision=require_positive_int(raw["revision"]),
             resource_digests=tuple(digests),
         )
@@ -411,10 +426,15 @@ __all__ = [
     "AuthGrantStamp",
     "AuthSnapshot",
     "BootstrapAuthorization",
+    "CAPABILITY_CAPTURE_PRODUCER",
+    "CAPABILITY_MCP_TOOL",
+    "CAPABILITY_OPERATOR_CLI",
     "COMMIT_RESERVE_NS",
     "Call",
     "CallContext",
     "CallResult",
+    "CaptureBatchCommand",
+    "CaptureProducerBinding",
     "CredentialRecord",
     "DAEMON_LISTEN_BACKLOG",
     "DAEMON_QUEUE_DEPTH",
@@ -513,6 +533,7 @@ __all__ = [
     "TrustedLocator",
     "UsageRecord",
     "UsageReservation",
+    "VALID_CREDENTIAL_CAPABILITIES",
     "VerifiedServerTls",
     "WORKSPACE_HINT_PATTERN",
     "WORKSPACE_HINT_RE",
@@ -540,6 +561,7 @@ __all__ = [
     "require_aware_utc",
     "require_canonical_timestamp",
     "require_decimal",
+    "require_non_negative_int",
     "require_object_kind",
     "require_opaque_id",
     "require_positive_int",

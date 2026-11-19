@@ -889,6 +889,7 @@ def test_shim_refuses_binding_response_mismatch(
                 "writer_epoch": writer_epoch,
                 "instance_id": instance_id,
                 "contract": "mcp-tools-v2",
+                "schema_digest": load_catalog().schema_digest,
             },
             close=False,
         )
@@ -1521,6 +1522,7 @@ def test_shim_pins_before_bearer_and_never_reconnects(
                 "writer_epoch": 999,
                 "instance_id": inst3,
                 "contract": "mcp-tools-v2",
+                "schema_digest": load_catalog().schema_digest,
             },
             close=False,
         )
@@ -1575,6 +1577,7 @@ def test_shim_pins_before_bearer_and_never_reconnects(
                 "writer_epoch": 1,
                 "instance_id": inst4,
                 "contract": "mcp-tools-v2",
+                "schema_digest": load_catalog().schema_digest,
             },
             close=True,
         )

@@ -14,9 +14,9 @@
       "result_ref": "#/$defs/PrepareTaskResult",
       "x-contract": "mcp-tools-v2",
       "x-tokenizer": "utf8-byte-v1",
-      "x-side-effects": "mutation",
+      "x-side-effects": "conditional_work_mutation",
       "x-async": false,
-      "x-implemented-in": "sp4/sp5 (fixture-in-i2)"
+      "x-implemented-in": "sp2-4 (discover+work-narrow) / sp4/sp5 (full) (fixture-in-i2)"
     },
     "search_knowledge": {
       "description": "Search workspace-eligible knowledge artifacts without invoking external providers.",
@@ -38,7 +38,7 @@
       "x-tokenizer": "utf8-byte-v1",
       "x-side-effects": "mutation",
       "x-async": false,
-      "x-implemented-in": "sp4/sp5 (fixture-in-i2)"
+      "x-implemented-in": "sp2-4 (handoff) / sp4/sp5 (full) (fixture-in-i2)"
     },
     "submit_episode": {
       "description": "Record agent-reported task evidence, optional candidate lesson, and declared read acknowledgments.",
@@ -49,7 +49,7 @@
       "x-tokenizer": "utf8-byte-v1",
       "x-side-effects": "mutation",
       "x-async": false,
-      "x-implemented-in": "sp2/sp3"
+      "x-implemented-in": "sp2-4 (handoff) / sp3 (skills+lessons)"
     },
     "record_outcome": {
       "description": "Record a declared task delivery outcome together with applied refs and declared read acknowledgments.",
@@ -136,6 +136,10 @@
       "type": "integer",
       "minimum": 1
     },
+    "NonNegativeInt": {
+      "type": "integer",
+      "minimum": 0
+    },
     "BoundedText": {
       "type": "string",
       "maxLength": 65536
@@ -144,6 +148,269 @@
       "type": "string",
       "minLength": 1,
       "maxLength": 65536
+    },
+    "HandoffFence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["restore_epoch", "writer_generation"],
+      "properties": {
+        "restore_epoch": {"$ref": "#/$defs/NonNegativeInt"},
+        "writer_generation": {"$ref": "#/$defs/NonNegativeInt"}
+      }
+    },
+    "HandoffLive": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["revision", "revision_epoch", "handoff_revision", "fence"],
+      "properties": {
+        "revision": {
+          "anyOf": [
+            {"$ref": "#/$defs/PositiveInt"},
+            {"type": "null"}
+          ]
+        },
+        "revision_epoch": {
+          "anyOf": [
+            {"$ref": "#/$defs/NonNegativeInt"},
+            {"type": "null"}
+          ]
+        },
+        "handoff_revision": {"$ref": "#/$defs/NonNegativeInt"},
+        "fence": {"$ref": "#/$defs/HandoffFence"}
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "revision": {"type": "null"},
+            "revision_epoch": {"type": "null"},
+            "handoff_revision": {"const": 0},
+            "fence": {
+              "type": "object",
+              "properties": {
+                "writer_generation": {"const": 0}
+              }
+            }
+          }
+        },
+        {
+          "properties": {
+            "revision": {"$ref": "#/$defs/PositiveInt"},
+            "revision_epoch": {"$ref": "#/$defs/NonNegativeInt"}
+          }
+        }
+      ]
+    },
+    "ResumeRefInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact_id", "revision", "handoff_revision", "fence"],
+      "properties": {
+        "served_receipt_id": {"$ref": "#/$defs/OpaqueId"},
+        "artifact_id": {"$ref": "#/$defs/OpaqueId"},
+        "revision": {"$ref": "#/$defs/PositiveInt"},
+        "handoff_revision": {"$ref": "#/$defs/NonNegativeInt"},
+        "fence": {"$ref": "#/$defs/HandoffFence"}
+      }
+    },
+    "SeenHandoffRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact_id", "revision_epoch", "revision", "digest"],
+      "properties": {
+        "artifact_id": {"$ref": "#/$defs/OpaqueId"},
+        "revision_epoch": {"$ref": "#/$defs/NonNegativeInt"},
+        "revision": {"$ref": "#/$defs/PositiveInt"},
+        "digest": {"$ref": "#/$defs/Sha256Digest"}
+      }
+    },
+    "HandoffTakeoverInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "acknowledge_active": {"type": "boolean"},
+        "reason": {"$ref": "#/$defs/NonEmptyBoundedText"}
+      }
+    },
+    "HandoffPlanStepInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "summary", "status"],
+      "properties": {
+        "id": {"$ref": "#/$defs/OpaqueId"},
+        "summary": {"$ref": "#/$defs/NonEmptyBoundedText"},
+        "status": {
+          "type": "string",
+          "enum": ["pending", "in_progress", "done", "blocked"]
+        },
+        "depends_on_change": {"$ref": "#/$defs/OpaqueId"}
+      }
+    },
+    "HandoffNextActionInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["summary"],
+      "properties": {
+        "summary": {"$ref": "#/$defs/NonEmptyBoundedText"},
+        "depends_on_change": {"$ref": "#/$defs/OpaqueId"}
+      }
+    },
+    "HandoffDecisionInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "decision", "reason"],
+      "properties": {
+        "id": {"$ref": "#/$defs/OpaqueId"},
+        "decision": {"$ref": "#/$defs/NonEmptyBoundedText"},
+        "reason": {"$ref": "#/$defs/NonEmptyBoundedText"},
+        "evidence_refs": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/OpaqueId"}
+        },
+        "supersedes": {"$ref": "#/$defs/OpaqueId"},
+        "reopens": {"$ref": "#/$defs/OpaqueId"}
+      },
+      "not": {
+        "required": ["supersedes", "reopens"]
+      }
+    },
+    "HandoffRejectedInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "option", "reason"],
+      "properties": {
+        "id": {"$ref": "#/$defs/OpaqueId"},
+        "option": {"$ref": "#/$defs/NonEmptyBoundedText"},
+        "reason": {"$ref": "#/$defs/NonEmptyBoundedText"},
+        "merges": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/OpaqueId"}
+        }
+      }
+    },
+    "HandoffConstraintInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "constraint"],
+      "properties": {
+        "id": {"$ref": "#/$defs/OpaqueId"},
+        "constraint": {"$ref": "#/$defs/NonEmptyBoundedText"}
+      }
+    },
+    "HandoffConstraintChangeInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "target_constraint_id", "proposed_constraint", "reason"],
+      "properties": {
+        "id": {"$ref": "#/$defs/OpaqueId"},
+        "target_constraint_id": {"$ref": "#/$defs/OpaqueId"},
+        "proposed_constraint": {"$ref": "#/$defs/NonEmptyBoundedText"},
+        "reason": {"$ref": "#/$defs/NonEmptyBoundedText"}
+      }
+    },
+    "HandoffClosedChangeInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["change_id", "resolution"],
+      "properties": {
+        "change_id": {"$ref": "#/$defs/OpaqueId"},
+        "resolution": {
+          "type": "string",
+          "enum": ["rejected", "withdrawn"]
+        },
+        "reason": {"$ref": "#/$defs/NonEmptyBoundedText"}
+      }
+    },
+    "HandoffToolingInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["purpose", "command"],
+      "properties": {
+        "purpose": {"$ref": "#/$defs/NonEmptyBoundedText"},
+        "command": {"$ref": "#/$defs/NonEmptyBoundedText"}
+      }
+    },
+    "HandoffLongRunningInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["command", "cwd", "source_revision", "log_or_receipt_path", "next_action"],
+      "properties": {
+        "pid": {"$ref": "#/$defs/PositiveInt"},
+        "started_at": {"$ref": "#/$defs/NonEmptyBoundedText"},
+        "command": {"$ref": "#/$defs/NonEmptyBoundedText"},
+        "cwd": {"$ref": "#/$defs/NonEmptyBoundedText"},
+        "source_revision": {"$ref": "#/$defs/NonEmptyBoundedText"},
+        "log_or_receipt_path": {"$ref": "#/$defs/NonEmptyBoundedText"},
+        "next_action": {"$ref": "#/$defs/NonEmptyBoundedText"}
+      }
+    },
+    "HandoffPatchInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "working_goal": {"$ref": "#/$defs/NonEmptyBoundedText"},
+        "plan": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {"$ref": "#/$defs/HandoffPlanStepInput"}
+        },
+        "decisions": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {"$ref": "#/$defs/HandoffDecisionInput"}
+        },
+        "rejected": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {"$ref": "#/$defs/HandoffRejectedInput"}
+        },
+        "user_constraints": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {"$ref": "#/$defs/HandoffConstraintInput"}
+        },
+        "constraint_changes": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {"$ref": "#/$defs/HandoffConstraintChangeInput"}
+        },
+        "closed_changes": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {"$ref": "#/$defs/HandoffClosedChangeInput"}
+        },
+        "tooling": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {"$ref": "#/$defs/HandoffToolingInput"}
+        },
+        "hypotheses": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {"$ref": "#/$defs/NonEmptyBoundedText"}
+        },
+        "next_action": {
+          "anyOf": [
+            {"$ref": "#/$defs/HandoffNextActionInput"},
+            {"type": "null"}
+          ]
+        },
+        "long_running": {
+          "anyOf": [
+            {"$ref": "#/$defs/HandoffLongRunningInput"},
+            {"type": "null"}
+          ]
+        },
+        "task_state": {
+          "type": "string",
+          "enum": ["open", "done", "abandoned"]
+        }
+      }
     },
     "Scope": {
       "type": "object",
@@ -186,10 +453,19 @@
     "ReadAckInput": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["served_receipt_id", "task_id", "revision", "resource_digests"],
+      "required": [
+        "served_receipt_id",
+        "task_id",
+        "artifact_id",
+        "revision_epoch",
+        "revision",
+        "resource_digests"
+      ],
       "properties": {
         "served_receipt_id": {"$ref": "#/$defs/OpaqueId"},
         "task_id": {"$ref": "#/$defs/OpaqueId"},
+        "artifact_id": {"$ref": "#/$defs/OpaqueId"},
+        "revision_epoch": {"$ref": "#/$defs/NonNegativeInt"},
         "revision": {"$ref": "#/$defs/PositiveInt"},
         "resource_digests": {
           "type": "array",
@@ -236,6 +512,7 @@
       "properties": {
         "kind": {"$ref": "#/$defs/ObjectKind"},
         "id": {"$ref": "#/$defs/OpaqueId"},
+        "revision_epoch": {"$ref": "#/$defs/NonNegativeInt"},
         "revision": {"$ref": "#/$defs/PositiveInt"},
         "digest": {"$ref": "#/$defs/Sha256Digest"},
         "summary": {"$ref": "#/$defs/BoundedText"},
@@ -243,6 +520,13 @@
           "type": "string",
           "const": "ok"
         }
+      },
+      "if": {
+        "properties": {"kind": {"const": "handoff"}},
+        "required": ["kind"]
+      },
+      "then": {
+        "required": ["revision_epoch"]
       }
     },
     "RedactedItem": {
@@ -452,17 +736,28 @@
         "error": {"$ref": "#/$defs/ErrorDetail"}
       }
     },
-    "PrepareTaskClientArgs": {
+    "PrepareTaskWorkClientArgs": {
       "type": "object",
       "additionalProperties": false,
       "required": ["schema_version", "description", "idempotency_key"],
       "properties": {
         "schema_version": {"$ref": "#/$defs/SchemaVersion"},
+        "mode": {
+          "type": "string",
+          "const": "work",
+          "default": "work"
+        },
         "workspace_hint": {"$ref": "#/$defs/WorkspaceHint"},
         "workspace_id": {"$ref": "#/$defs/OpaqueId"},
         "checkout_id": {"$ref": "#/$defs/OpaqueId"},
         "source_snapshot_id": {"$ref": "#/$defs/OpaqueId"},
         "task_id": {"$ref": "#/$defs/OpaqueId"},
+        "resume_ref": {"$ref": "#/$defs/ResumeRefInput"},
+        "seen_handoff_refs": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {"$ref": "#/$defs/SeenHandoffRef"}
+        },
         "description": {"$ref": "#/$defs/NonEmptyBoundedText"},
         "context_budget_tokens": {
           "type": "integer",
@@ -471,6 +766,61 @@
           "default": 4000
         },
         "idempotency_key": {"$ref": "#/$defs/IdempotencyKey"},
+        "principal_id": {"$ref": "#/$defs/OpaqueId"},
+        "owner_id": {"$ref": "#/$defs/OpaqueId"},
+        "harness_id": {"$ref": "#/$defs/OpaqueId"},
+        "machine_id": {"$ref": "#/$defs/OpaqueId"}
+      },
+      "dependentRequired": {
+        "resume_ref": ["task_id"]
+      },
+      "oneOf": [
+        {
+          "not": {
+            "anyOf": [
+              {"required": ["workspace_hint"]},
+              {"required": ["workspace_id"]},
+              {"required": ["checkout_id"]}
+            ]
+          }
+        },
+        {
+          "required": ["workspace_hint"],
+          "not": {
+            "anyOf": [
+              {"required": ["workspace_id"]},
+              {"required": ["checkout_id"]}
+            ]
+          }
+        },
+        {
+          "required": ["workspace_id", "checkout_id"],
+          "not": {
+            "required": ["workspace_hint"]
+          }
+        }
+      ]
+    },
+    "PrepareTaskDiscoverClientArgs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "mode"],
+      "properties": {
+        "schema_version": {"$ref": "#/$defs/SchemaVersion"},
+        "mode": {
+          "type": "string",
+          "const": "discover"
+        },
+        "workspace_hint": {"$ref": "#/$defs/WorkspaceHint"},
+        "workspace_id": {"$ref": "#/$defs/OpaqueId"},
+        "checkout_id": {"$ref": "#/$defs/OpaqueId"},
+        "task_id": {"$ref": "#/$defs/OpaqueId"},
+        "context_budget_tokens": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4000,
+          "default": 4000
+        },
         "principal_id": {"$ref": "#/$defs/OpaqueId"},
         "owner_id": {"$ref": "#/$defs/OpaqueId"},
         "harness_id": {"$ref": "#/$defs/OpaqueId"},
@@ -503,22 +853,40 @@
         }
       ]
     },
-    "PrepareTaskDaemonArgs": {
+    "PrepareTaskClientArgs": {
+      "type": "object",
+      "oneOf": [
+        {"$ref": "#/$defs/PrepareTaskWorkClientArgs"},
+        {"$ref": "#/$defs/PrepareTaskDiscoverClientArgs"}
+      ]
+    },
+    "PrepareTaskWorkDaemonArgs": {
       "type": "object",
       "additionalProperties": false,
       "required": [
         "schema_version",
+        "mode",
         "description",
         "context_budget_tokens",
         "idempotency_key"
       ],
       "properties": {
         "schema_version": {"$ref": "#/$defs/SchemaVersion"},
+        "mode": {
+          "type": "string",
+          "const": "work"
+        },
         "workspace_hint": {"$ref": "#/$defs/WorkspaceHint"},
         "workspace_id": {"$ref": "#/$defs/OpaqueId"},
         "checkout_id": {"$ref": "#/$defs/OpaqueId"},
         "source_snapshot_id": {"$ref": "#/$defs/OpaqueId"},
         "task_id": {"$ref": "#/$defs/OpaqueId"},
+        "resume_ref": {"$ref": "#/$defs/ResumeRefInput"},
+        "seen_handoff_refs": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {"$ref": "#/$defs/SeenHandoffRef"}
+        },
         "description": {"$ref": "#/$defs/NonEmptyBoundedText"},
         "context_budget_tokens": {
           "type": "integer",
@@ -526,6 +894,9 @@
           "maximum": 4000
         },
         "idempotency_key": {"$ref": "#/$defs/IdempotencyKey"}
+      },
+      "dependentRequired": {
+        "resume_ref": ["task_id"]
       },
       "oneOf": [
         {
@@ -545,7 +916,76 @@
         }
       ]
     },
-    "PrepareTaskResult": {
+    "PrepareTaskDiscoverDaemonArgs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "mode",
+        "context_budget_tokens"
+      ],
+      "properties": {
+        "schema_version": {"$ref": "#/$defs/SchemaVersion"},
+        "mode": {
+          "type": "string",
+          "const": "discover"
+        },
+        "workspace_hint": {"$ref": "#/$defs/WorkspaceHint"},
+        "workspace_id": {"$ref": "#/$defs/OpaqueId"},
+        "checkout_id": {"$ref": "#/$defs/OpaqueId"},
+        "task_id": {"$ref": "#/$defs/OpaqueId"},
+        "context_budget_tokens": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4000
+        }
+      },
+      "oneOf": [
+        {
+          "required": ["workspace_hint"],
+          "not": {
+            "anyOf": [
+              {"required": ["workspace_id"]},
+              {"required": ["checkout_id"]}
+            ]
+          }
+        },
+        {
+          "required": ["workspace_id", "checkout_id"],
+          "not": {
+            "required": ["workspace_hint"]
+          }
+        }
+      ]
+    },
+    "PrepareTaskDaemonArgs": {
+      "type": "object",
+      "oneOf": [
+        {"$ref": "#/$defs/PrepareTaskWorkDaemonArgs"},
+        {"$ref": "#/$defs/PrepareTaskDiscoverDaemonArgs"}
+      ]
+    },
+    "PrepareTaskDiscoverResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["workspace_id", "checkout_id", "continuity", "degraded_codes"],
+      "properties": {
+        "workspace_id": {"$ref": "#/$defs/OpaqueId"},
+        "checkout_id": {"$ref": "#/$defs/OpaqueId"},
+        "continuity": {
+          "type": "array",
+          "maxItems": 1024,
+          "items": {"$ref": "#/$defs/DeliveryItem"}
+        },
+        "degraded_codes": {
+          "type": "array",
+          "maxItems": 1024,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/OpaqueId"}
+        }
+      }
+    },
+    "PrepareTaskWorkResult": {
       "type": "object",
       "additionalProperties": false,
       "required": [
@@ -586,6 +1026,7 @@
             {"type": "null"}
           ]
         },
+        "handoff_live": {"$ref": "#/$defs/HandoffLive"},
         "skills": {
           "type": "array",
           "maxItems": 1024,
@@ -652,6 +1093,12 @@
         }
       ]
     },
+    "PrepareTaskResult": {
+      "oneOf": [
+        {"$ref": "#/$defs/PrepareTaskWorkResult"},
+        {"$ref": "#/$defs/PrepareTaskDiscoverResult"}
+      ]
+    },
     "SearchKnowledgeClientArgs": {
       "type": "object",
       "additionalProperties": false,
@@ -716,6 +1163,7 @@
         "workspace_id": {"$ref": "#/$defs/OpaqueId"},
         "task_id": {"$ref": "#/$defs/OpaqueId"},
         "artifact_id": {"$ref": "#/$defs/OpaqueId"},
+        "revision_epoch": {"$ref": "#/$defs/NonNegativeInt"},
         "revision": {"$ref": "#/$defs/PositiveInt"},
         "level": {
           "type": "string",
@@ -745,6 +1193,7 @@
         "workspace_id": {"$ref": "#/$defs/OpaqueId"},
         "task_id": {"$ref": "#/$defs/OpaqueId"},
         "artifact_id": {"$ref": "#/$defs/OpaqueId"},
+        "revision_epoch": {"$ref": "#/$defs/NonNegativeInt"},
         "revision": {"$ref": "#/$defs/PositiveInt"},
         "level": {
           "type": "string",
@@ -759,6 +1208,7 @@
       "required": ["artifact_id", "revision", "level", "status", "resources"],
       "properties": {
         "artifact_id": {"$ref": "#/$defs/OpaqueId"},
+        "revision_epoch": {"$ref": "#/$defs/NonNegativeInt"},
         "revision": {"$ref": "#/$defs/PositiveInt"},
         "level": {
           "type": "string",
@@ -774,7 +1224,8 @@
           "maxItems": 1024,
           "items": {"$ref": "#/$defs/ArtifactResource"}
         },
-        "served_receipt_id": {"$ref": "#/$defs/OpaqueId"}
+        "served_receipt_id": {"$ref": "#/$defs/OpaqueId"},
+        "handoff_live": {"$ref": "#/$defs/HandoffLive"}
       }
     },
     "GetArtifactRedactedResult": {
@@ -783,6 +1234,7 @@
       "required": ["artifact_id", "revision", "level", "status", "reason", "resources"],
       "properties": {
         "artifact_id": {"$ref": "#/$defs/OpaqueId"},
+        "revision_epoch": {"$ref": "#/$defs/NonNegativeInt"},
         "revision": {"$ref": "#/$defs/PositiveInt"},
         "level": {
           "type": "string",
@@ -826,12 +1278,43 @@
           "maxItems": 1024,
           "items": {"$ref": "#/$defs/ReadAckInput"}
         },
+        "handoff": {"$ref": "#/$defs/HandoffPatchInput"},
+        "base_revision": {"$ref": "#/$defs/NonNegativeInt"},
+        "fence": {"$ref": "#/$defs/HandoffFence"},
+        "takeover": {"$ref": "#/$defs/HandoffTakeoverInput"},
         "idempotency_key": {"$ref": "#/$defs/IdempotencyKey"},
         "principal_id": {"$ref": "#/$defs/OpaqueId"},
         "owner_id": {"$ref": "#/$defs/OpaqueId"},
         "harness_id": {"$ref": "#/$defs/OpaqueId"},
         "machine_id": {"$ref": "#/$defs/OpaqueId"}
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "anyOf": [
+              {"required": ["handoff"]},
+              {"required": ["takeover"]}
+            ]
+          },
+          "then": {
+            "required": ["base_revision", "fence"]
+          }
+        },
+        {
+          "if": {
+            "anyOf": [
+              {"required": ["base_revision"]},
+              {"required": ["fence"]}
+            ]
+          },
+          "then": {
+            "anyOf": [
+              {"required": ["handoff"]},
+              {"required": ["takeover"]}
+            ]
+          }
+        }
+      ]
     },
     "SubmitEpisodeDaemonArgs": {
       "type": "object",
@@ -854,10 +1337,41 @@
           "maxItems": 1024,
           "items": {"$ref": "#/$defs/ReadAckInput"}
         },
+        "handoff": {"$ref": "#/$defs/HandoffPatchInput"},
+        "base_revision": {"$ref": "#/$defs/NonNegativeInt"},
+        "fence": {"$ref": "#/$defs/HandoffFence"},
+        "takeover": {"$ref": "#/$defs/HandoffTakeoverInput"},
         "idempotency_key": {"$ref": "#/$defs/IdempotencyKey"}
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "anyOf": [
+              {"required": ["handoff"]},
+              {"required": ["takeover"]}
+            ]
+          },
+          "then": {
+            "required": ["base_revision", "fence"]
+          }
+        },
+        {
+          "if": {
+            "anyOf": [
+              {"required": ["base_revision"]},
+              {"required": ["fence"]}
+            ]
+          },
+          "then": {
+            "anyOf": [
+              {"required": ["handoff"]},
+              {"required": ["takeover"]}
+            ]
+          }
+        }
+      ]
     },
-    "SubmitEpisodeResult": {
+    "SubmitEpisodePlainResult": {
       "type": "object",
       "additionalProperties": false,
       "required": ["episode_id", "evidence_ids"],
@@ -875,6 +1389,67 @@
           ]
         }
       }
+    },
+    "SubmitEpisodeHandoffResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "episode_id",
+        "evidence_ids",
+        "handoff_revision",
+        "handoff_status",
+        "fence",
+        "writer_status"
+      ],
+      "properties": {
+        "episode_id": {"$ref": "#/$defs/OpaqueId"},
+        "evidence_ids": {
+          "type": "array",
+          "maxItems": 1024,
+          "items": {"$ref": "#/$defs/OpaqueId"}
+        },
+        "candidate_lesson_id": {
+          "anyOf": [
+            {"$ref": "#/$defs/OpaqueId"},
+            {"type": "null"}
+          ]
+        },
+        "handoff_revision": {
+          "anyOf": [
+            {"$ref": "#/$defs/NonNegativeInt"},
+            {"type": "null"}
+          ]
+        },
+        "handoff_status": {
+          "type": "string",
+          "enum": ["stored", "not_stored_policy"]
+        },
+        "fence": {"$ref": "#/$defs/HandoffFence"},
+        "writer_status": {
+          "type": "string",
+          "enum": ["holder", "not_holder"]
+        }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "handoff_status": {"const": "stored"},
+            "handoff_revision": {"$ref": "#/$defs/NonNegativeInt"}
+          }
+        },
+        {
+          "properties": {
+            "handoff_status": {"const": "not_stored_policy"},
+            "handoff_revision": {"type": "null"}
+          }
+        }
+      ]
+    },
+    "SubmitEpisodeResult": {
+      "oneOf": [
+        {"$ref": "#/$defs/SubmitEpisodePlainResult"},
+        {"$ref": "#/$defs/SubmitEpisodeHandoffResult"}
+      ]
     },
     "RecordOutcomeClientArgs": {
       "type": "object",
@@ -1120,7 +1695,7 @@
     "KernelHttpCall": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["tool", "arguments", "correlation_id", "selected_scope"],
+      "required": ["tool", "arguments", "correlation_id", "selected_scope", "schema_digest"],
       "properties": {
         "tool": {
           "type": "string",
@@ -1147,7 +1722,8 @@
             {"$ref": "#/$defs/Scope"},
             {"type": "null"}
           ]
-        }
+        },
+        "schema_digest": {"$ref": "#/$defs/Sha256Digest"}
       },
       "allOf": [
         {

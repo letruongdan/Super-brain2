@@ -90,6 +90,14 @@ def require_positive_int(value: object) -> int:
     return value
 
 
+def require_non_negative_int(value: object) -> int:
+    if isinstance(value, bool):
+        raise BrainError(ErrorCode.INVALID_INPUT, "boolean not allowed for integer")
+    if type(value) is not int or value < 0:
+        raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+    return value
+
+
 @dataclass(frozen=True)
 class Principal:
     principal_id: str

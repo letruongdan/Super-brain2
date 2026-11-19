@@ -36,11 +36,16 @@ class ProjectedReadAck:
 
     served_receipt_id: str
     task_id: str
+    artifact_id: str
+    revision_epoch: int
     revision: int
     resource_digests: tuple[tuple[str, str], ...]
 
     def __post_init__(self) -> None:
         if not isinstance(self.served_receipt_id, str) or not isinstance(self.task_id, str):
+            raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+        require_opaque_id(self.artifact_id, label="artifact_id")
+        if not is_strict_int(self.revision_epoch) or self.revision_epoch < 0:
             raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
         if not is_strict_int(self.revision) or self.revision < 1:
             raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
@@ -65,19 +70,28 @@ def extract_projected_read_acks(safe_payload: Mapping[str, JsonValue]) -> tuple[
         if not isinstance(raw_ack, Mapping) or set(raw_ack) != {
             "served_receipt_id",
             "task_id",
+            "artifact_id",
+            "revision_epoch",
             "revision",
             "resource_digests",
         }:
             raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
         receipt_id = raw_ack["served_receipt_id"]
         task_id = raw_ack["task_id"]
+        artifact_id = raw_ack["artifact_id"]
+        rev_epoch = raw_ack["revision_epoch"]
         rev = raw_ack["revision"]
         raw_digests = raw_ack["resource_digests"]
         if (
             not isinstance(receipt_id, str)
             or not isinstance(task_id, str)
+            or not isinstance(artifact_id, str)
+            or OPAQUE_ID_RE.fullmatch(artifact_id) is None
+            or type(rev_epoch) is not int
+            or not is_strict_int(rev_epoch)
+            or rev_epoch < 0
             or type(rev) is not int
-            or not isinstance(rev, int)
+            or not is_strict_int(rev)
             or rev < 1
             or not isinstance(raw_digests, list)
         ):
@@ -95,6 +109,8 @@ def extract_projected_read_acks(safe_payload: Mapping[str, JsonValue]) -> tuple[
             ProjectedReadAck(
                 served_receipt_id=receipt_id,
                 task_id=task_id,
+                artifact_id=artifact_id,
+                revision_epoch=rev_epoch,
                 revision=rev,
                 resource_digests=tuple(pairs),
             )
@@ -177,7 +193,12 @@ def record_projected_read_acks(
                 raise BrainError(ErrorCode.INVALID_INPUT, "invalid input") from err
             raise
 
-        if ack.revision != attempt.revision or ordered_digests != attempt.resource_digests:
+        if (
+            ack.artifact_id != attempt.artifact_id
+            or ack.revision_epoch != attempt.revision_epoch
+            or ack.revision != attempt.revision
+            or ordered_digests != attempt.resource_digests
+        ):
             raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
 
         existing_ack = tx.read_read_ack_by_receipt(ack.served_receipt_id)
@@ -185,11 +206,15 @@ def record_projected_read_acks(
             if (
                 existing_ack.principal_id,
                 existing_ack.task_id,
+                existing_ack.artifact_id,
+                existing_ack.revision_epoch,
                 existing_ack.revision,
                 existing_ack.resource_digests,
             ) != (
                 principal.principal_id,
                 attempt.task_id,
+                attempt.artifact_id,
+                attempt.revision_epoch,
                 attempt.revision,
                 attempt.resource_digests,
             ):
@@ -202,6 +227,8 @@ def record_projected_read_acks(
             served_receipt_id=ack.served_receipt_id,
             principal_id=principal.principal_id,
             task_id=attempt.task_id,
+            artifact_id=attempt.artifact_id,
+            revision_epoch=attempt.revision_epoch,
             revision=attempt.revision,
             resource_digests=ordered_digests,
         )
@@ -232,6 +259,8 @@ def record_read_acks(
             ProjectedReadAck(
                 served_receipt_id=ack.served_receipt_id,
                 task_id=ack.task_id,
+                artifact_id=ack.artifact_id,
+                revision_epoch=ack.revision_epoch,
                 revision=ack.revision,
                 resource_digests=tuple((rd.name, rd.digest) for rd in ack.resource_digests),
             )

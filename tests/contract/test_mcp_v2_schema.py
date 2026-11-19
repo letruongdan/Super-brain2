@@ -25,10 +25,14 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 FIXTURES_DIR = REPO_ROOT / "tests" / "fixtures" / "mcp_v2"
 
 EXPECTED_TOOLS: dict[str, tuple[str, bool, str]] = {
-    "prepare_task": ("mutation", False, "sp4/sp5 (fixture-in-i2)"),
+    "prepare_task": (
+        "conditional_work_mutation",
+        False,
+        "sp2-4 (discover+work-narrow) / sp4/sp5 (full) (fixture-in-i2)",
+    ),
     "search_knowledge": ("read_only", False, "sp4"),
-    "get_artifact": ("mutation", False, "sp4/sp5 (fixture-in-i2)"),
-    "submit_episode": ("mutation", False, "sp2/sp3"),
+    "get_artifact": ("mutation", False, "sp2-4 (handoff) / sp4/sp5 (full) (fixture-in-i2)"),
+    "submit_episode": ("mutation", False, "sp2-4 (handoff) / sp3 (skills+lessons)"),
     "record_outcome": ("mutation", False, "sp3/sp6 (fixture-in-i2)"),
     "request_improvement": ("mutation", True, "sp6"),
     "get_job": ("read_only", False, "sp1-i2"),
@@ -418,6 +422,8 @@ def test_strict_wire_bad_inputs() -> None:
                     {
                         "served_receipt_id": "rcpt-01",
                         "task_id": "task-01",
+                        "artifact_id": "art-01",
+                        "revision_epoch": 0,
                         "revision": 1,
                         "resource_digests": [
                             {"name": "L1.md", "digest": "sha256:" + ("a" * 64)},
@@ -583,6 +589,8 @@ def test_strict_wire_bad_inputs() -> None:
         ReadAckInput(
             served_receipt_id="r-1",
             task_id="t-1",
+            artifact_id="art-01",
+            revision_epoch=0,
             revision=1,
             resource_digests=(
                 ResourceDigest("L0.md", "sha256:" + ("1" * 64)),
@@ -967,6 +975,7 @@ def test_schema_roundtrip_and_packaged_digest(
                 "selected_scope": (
                     {"repo_id": scope.repo_id, "checkout_id": scope.checkout_id} if scope is not None else None
                 ),
+                "schema_digest": catalog.schema_digest,
             }
             http_call_validator.validate(http_payload)
 
@@ -1133,3 +1142,483 @@ def test_installed_wheel_env_excludes_dev_dependencies_and_editable_pth(
         norm_body = os.path.normcase(str(pth_body))
         for marker in forbidden_markers:
             assert marker not in norm_body, f".pth file {pth_name!r} references REPO_ROOT: {pth_body!r}"
+
+
+def test_sp2_1_schema_and_normalizer_extensions() -> None:
+    """Verify SP2-1 discover/work split, handoff fields, ReadAck, and HTTP digest contracts."""
+    from superbrain.core.kernel import Principal, ReadAckInput, ResourceDigest, Scope
+    from superbrain.core.wire import load_catalog, normalize_call
+
+    catalog = load_catalog()
+    expected_sha256 = hashlib.sha256((REPO_ROOT / "schemas" / "mcp-tools-v2.json").read_bytes()).hexdigest()
+    assert catalog.schema_sha256 == expected_sha256
+    assert catalog.schema_digest == f"sha256:{expected_sha256}"
+
+    root_defs = catalog.schema["$defs"]
+    assert isinstance(root_defs, dict)
+
+    def _sub_validator(def_name: str) -> jsonschema.Draft202012Validator:
+        return jsonschema.Draft202012Validator(
+            {
+                "$schema": catalog.schema["$schema"],
+                "$defs": root_defs,
+                "$ref": f"#/$defs/{def_name}",
+            }
+        )
+
+    prep_in = jsonschema.Draft202012Validator(catalog.tools["prepare_task"].input_schema)
+    prep_daemon = _sub_validator("PrepareTaskDaemonArgs")
+    prep_out = jsonschema.Draft202012Validator(catalog.tools["prepare_task"].output_schema)
+    get_art_in = jsonschema.Draft202012Validator(catalog.tools["get_artifact"].input_schema)
+    get_art_out = jsonschema.Draft202012Validator(catalog.tools["get_artifact"].output_schema)
+    submit_in = jsonschema.Draft202012Validator(catalog.tools["submit_episode"].input_schema)
+    submit_out = jsonschema.Draft202012Validator(catalog.tools["submit_episode"].output_schema)
+    delivered_ref_v = _sub_validator("DeliveredRefItem")
+    http_call_v = _sub_validator("KernelHttpCall")
+
+    principal = Principal(
+        principal_id="princ-01",
+        owner_id="owner-01",
+        harness_id="codex-desktop",
+        machine_id="mach-01",
+    )
+    scope = Scope(repo_id="repo-01", checkout_id="chk-a")
+
+    # 1. prepare_task discover vs work normalization & validation
+    assert prep_in.is_valid({"schema_version": "2.0", "mode": "discover"})
+    assert not prep_daemon.is_valid(
+        {"schema_version": "2.0", "mode": "discover", "context_budget_tokens": 4000}
+    )
+
+    disc_call = normalize_call(
+        "prepare_task",
+        {"schema_version": "2.0", "mode": "discover", "workspace_hint": "sb2"},
+        principal,
+        selected_scope=scope,
+    )
+    assert disc_call.arguments == {
+        "schema_version": "2.0",
+        "mode": "discover",
+        "workspace_hint": "sb2",
+        "context_budget_tokens": 4000,
+    }
+    assert prep_daemon.is_valid(disc_call.arguments)
+
+    for forbidden_key, forbidden_val in (
+        ("idempotency_key", "idem_disc_bad_0001"),
+        ("description", "should be forbidden in discover"),
+        (
+            "resume_ref",
+            {
+                "artifact_id": "hand-1",
+                "revision": 1,
+                "handoff_revision": 0,
+                "fence": {"restore_epoch": 0, "writer_generation": 0},
+            },
+        ),
+        (
+            "seen_handoff_refs",
+            [
+                {
+                    "artifact_id": "hand-2",
+                    "revision_epoch": 0,
+                    "revision": 1,
+                    "digest": "sha256:" + ("a" * 64),
+                }
+            ],
+        ),
+        ("source_snapshot_id", "snap-1"),
+    ):
+        bad_disc: dict[str, Any] = {
+            "schema_version": "2.0",
+            "mode": "discover",
+            "workspace_hint": "sb2",
+            forbidden_key: forbidden_val,
+        }
+        assert not prep_in.is_valid(bad_disc)
+        with pytest.raises(BrainError) as exc_disc:
+            normalize_call("prepare_task", bad_disc, principal, selected_scope=scope)
+        assert exc_disc.value.code is ErrorCode.INVALID_INPUT
+
+    # mode defaults to "work"; resume_ref requires task_id
+    work_default = normalize_call(
+        "prepare_task",
+        {
+            "schema_version": "2.0",
+            "workspace_hint": "sb2",
+            "description": "default mode check",
+            "idempotency_key": "idem_work_def_0001",
+        },
+        principal,
+        selected_scope=scope,
+    )
+    assert work_default.arguments["mode"] == "work"
+    assert prep_daemon.is_valid(work_default.arguments)
+
+    no_task_resume: dict[str, Any] = {
+        "schema_version": "2.0",
+        "mode": "work",
+        "workspace_id": "repo-01",
+        "checkout_id": "chk-a",
+        "description": "missing task_id for resume_ref",
+        "resume_ref": {
+            "artifact_id": "hand-1",
+            "revision": 2,
+            "handoff_revision": 1,
+            "fence": {"restore_epoch": 1, "writer_generation": 1},
+        },
+        "idempotency_key": "idem_work_no_task_01",
+    }
+    assert not prep_in.is_valid(no_task_resume)
+    with pytest.raises(BrainError) as exc_res:
+        normalize_call("prepare_task", no_task_resume, principal, selected_scope=scope)
+    assert exc_res.value.code is ErrorCode.INVALID_INPUT
+
+    seen_64 = [
+        {
+            "artifact_id": f"hand-{i:03d}",
+            "revision_epoch": 1,
+            "revision": 1,
+            "digest": "sha256:" + ("a" * 64),
+        }
+        for i in range(64)
+    ]
+    valid_work_resume = {**no_task_resume, "task_id": "task-1", "seen_handoff_refs": seen_64}
+    assert prep_in.is_valid(valid_work_resume)
+    assert not prep_in.is_valid({**valid_work_resume, "seen_handoff_refs": seen_64 + [seen_64[0]]})
+
+    # 2. PrepareTaskResult & HandoffLive oneOf + DeliveredRefItem handoff rule
+    assert prep_out.is_valid(
+        {
+            "ok": True,
+            "data": {
+                "workspace_id": "repo-01",
+                "checkout_id": "chk-a",
+                "continuity": [
+                    {
+                        "kind": "handoff",
+                        "id": "hand-1",
+                        "revision_epoch": 0,
+                        "revision": 1,
+                        "digest": "sha256:" + ("a" * 64),
+                        "summary": "goal",
+                    }
+                ],
+                "degraded_codes": [],
+            },
+        }
+    )
+    assert not prep_out.is_valid(
+        {
+            "ok": True,
+            "data": {
+                "workspace_id": "repo-01",
+                "checkout_id": "chk-a",
+                "continuity": [],
+                "degraded_codes": [],
+                "snapshot_status": "available",
+            },
+        }
+    )
+
+    assert delivered_ref_v.is_valid(
+        {
+            "kind": "handoff",
+            "id": "hand-1",
+            "revision_epoch": 0,
+            "revision": 1,
+            "digest": "sha256:" + ("b" * 64),
+        }
+    )
+    assert not delivered_ref_v.is_valid(
+        {
+            "kind": "handoff",
+            "id": "hand-1",
+            "revision": 1,
+            "digest": "sha256:" + ("b" * 64),
+        }
+    )
+    assert not delivered_ref_v.is_valid(
+        {
+            "kind": "handoff",
+            "id": "hand-1",
+            "revision_epoch": -1,
+            "revision": 1,
+            "digest": "sha256:" + ("b" * 64),
+        }
+    )
+    assert delivered_ref_v.is_valid(
+        {
+            "kind": "skill",
+            "id": "skill-1",
+            "revision": 1,
+            "digest": "sha256:" + ("b" * 64),
+        }
+    )
+
+    def _work_envelope(live: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "data": {
+                "workspace_id": "repo-01",
+                "checkout_id": "chk-a",
+                "source_snapshot_id": "snap-1",
+                "snapshot_status": "available",
+                "degraded_codes": [],
+                "task_id": "task-1",
+                "delivery_id": "deliv-1",
+                "handoff_live": live,
+                "skills": [],
+                "lessons": [],
+                "continuity": [],
+                "context": [],
+                "finishing_gates": [],
+            },
+        }
+
+    assert prep_out.is_valid(
+        {
+            "ok": True,
+            "data": {
+                "workspace_id": "repo-01",
+                "checkout_id": "chk-a",
+                "source_snapshot_id": "snap-1",
+                "snapshot_status": "available",
+                "degraded_codes": [],
+                "task_id": "task-1",
+                "delivery_id": "deliv-1",
+                "skills": [],
+                "lessons": [],
+                "continuity": [],
+                "context": [],
+                "finishing_gates": [],
+            },
+        }
+    )
+    assert prep_out.is_valid(
+        _work_envelope(
+            {
+                "revision": None,
+                "revision_epoch": None,
+                "handoff_revision": 0,
+                "fence": {"restore_epoch": 2, "writer_generation": 0},
+            }
+        )
+    )
+    assert prep_out.is_valid(
+        _work_envelope(
+            {
+                "revision": 1,
+                "revision_epoch": 0,
+                "handoff_revision": 0,
+                "fence": {"restore_epoch": 0, "writer_generation": 0},
+            }
+        )
+    )
+    for bad_live in (
+        {
+            "revision": None,
+            "revision_epoch": 0,
+            "handoff_revision": 0,
+            "fence": {"restore_epoch": 0, "writer_generation": 0},
+        },
+        {
+            "revision": None,
+            "revision_epoch": None,
+            "handoff_revision": 1,
+            "fence": {"restore_epoch": 0, "writer_generation": 0},
+        },
+        {
+            "revision": None,
+            "revision_epoch": None,
+            "handoff_revision": 0,
+            "fence": {"restore_epoch": 0, "writer_generation": 1},
+        },
+        {
+            "revision": 1,
+            "revision_epoch": None,
+            "handoff_revision": 0,
+            "fence": {"restore_epoch": 0, "writer_generation": 0},
+        },
+    ):
+        assert not prep_out.is_valid(_work_envelope(bad_live))
+
+    # 3. ReadAckInput artifact_id + revision_epoch
+    ack_good = ReadAckInput(
+        served_receipt_id="rcpt-1",
+        task_id="task-1",
+        artifact_id="hand-1",
+        revision_epoch=0,
+        revision=1,
+        resource_digests=(ResourceDigest("handoff_header", "sha256:" + ("c" * 64)),),
+    )
+    assert ack_good.artifact_id == "hand-1"
+    assert ack_good.revision_epoch == 0
+    for bad_epoch in (-1, True):
+        with pytest.raises(BrainError):
+            ReadAckInput(
+                served_receipt_id="rcpt-1",
+                task_id="task-1",
+                artifact_id="hand-1",
+                revision_epoch=bad_epoch,
+                revision=1,
+                resource_digests=(ResourceDigest("L0.md", "sha256:" + ("c" * 64)),),
+            )
+
+    # 4. get_artifact optional revision_epoch & handoff_live
+    get_art_args: dict[str, JsonValue] = {
+        "schema_version": "2.0",
+        "workspace_id": "repo-01",
+        "task_id": "task-1",
+        "artifact_id": "hand-1",
+        "revision_epoch": 0,
+        "revision": 2,
+        "level": "L1",
+        "idempotency_key": "idem_get_art_epoch_01",
+    }
+    assert get_art_in.is_valid(get_art_args)
+    norm_art = normalize_call("get_artifact", get_art_args, principal, selected_scope=scope)
+    assert norm_art.arguments["revision_epoch"] == 0
+    bad_art_epoch: int
+    for bad_art_epoch in (-1, True):
+        bad_art_call: dict[str, JsonValue] = {**get_art_args, "revision_epoch": bad_art_epoch}
+        assert not get_art_in.is_valid(bad_art_call)
+        with pytest.raises(BrainError) as exc_art:
+            normalize_call(
+                "get_artifact",
+                bad_art_call,
+                principal,
+                selected_scope=scope,
+            )
+        assert exc_art.value.code is ErrorCode.INVALID_INPUT
+    assert get_art_out.is_valid(
+        {
+            "ok": True,
+            "data": {
+                "artifact_id": "hand-1",
+                "revision_epoch": 0,
+                "revision": 1,
+                "level": "L1",
+                "status": "redacted",
+                "reason": "quarantined",
+                "resources": [],
+            },
+        }
+    )
+
+    # 5. submit_episode handoff/takeover/fence bidirectional coupling & SubmitEpisodeResult oneOf
+    base_ep: dict[str, JsonValue] = {
+        "schema_version": "2.0",
+        "task_id": "task-1",
+        "session_id": "sess-1",
+        "workspace_id": "repo-01",
+        "checkout_id": "chk-a",
+        "evidence": [],
+        "idempotency_key": "idem_submit_couple_01",
+    }
+    good_patch: dict[str, JsonValue] = {"working_goal": "Keep invariants strict."}
+    good_fence: dict[str, JsonValue] = {"restore_epoch": 0, "writer_generation": 0}
+    good_takeover: dict[str, JsonValue] = {"acknowledge_active": False, "reason": "First write"}
+
+    valid_subs: tuple[dict[str, JsonValue], ...] = (
+        base_ep,
+        {**base_ep, "handoff": good_patch, "base_revision": 0, "fence": good_fence},
+        {**base_ep, "takeover": good_takeover, "base_revision": 0, "fence": good_fence},
+        {**base_ep, "handoff": good_patch, "takeover": good_takeover, "base_revision": 1, "fence": good_fence},
+    )
+    for valid_sub in valid_subs:
+        assert submit_in.is_valid(valid_sub)
+        normalize_call("submit_episode", valid_sub, principal, selected_scope=scope)
+
+    bad_sub_patches: tuple[dict[str, JsonValue], ...] = (
+        {"handoff": good_patch},
+        {"takeover": good_takeover},
+        {"handoff": good_patch, "base_revision": 0},
+        {"takeover": good_takeover, "fence": good_fence},
+        {"base_revision": 0, "fence": good_fence},
+        {"handoff": {}},
+        {
+            "handoff": {
+                "decisions": [
+                    {"id": "d1", "decision": "x", "reason": "y", "supersedes": "d0", "reopens": "r0"}
+                ]
+            },
+            "base_revision": 0,
+            "fence": good_fence,
+        },
+        {
+            "handoff": {"rejected": [{"id": "r1", "option": "x", "reason": "y", "merges": []}]},
+            "base_revision": 0,
+            "fence": good_fence,
+        },
+        {
+            "handoff": {"closed_changes": [{"change_id": "c1", "resolution": "approved"}]},
+            "base_revision": 0,
+            "fence": good_fence,
+        },
+        {
+            "handoff": {
+                "plan": [{"id": f"s-{i}", "summary": "step", "status": "pending"} for i in range(65)],
+            },
+            "base_revision": 0,
+            "fence": good_fence,
+        },
+    )
+    bad_sub_patch: dict[str, JsonValue]
+    for bad_sub_patch in bad_sub_patches:
+        bad_sub: dict[str, JsonValue] = {**base_ep, **bad_sub_patch}
+        assert not submit_in.is_valid(bad_sub)
+        with pytest.raises(BrainError) as exc_sub:
+            normalize_call("submit_episode", bad_sub, principal, selected_scope=scope)
+        assert exc_sub.value.code is ErrorCode.INVALID_INPUT
+
+    # SubmitEpisodeResult oneOf checks
+    assert not submit_out.is_valid(
+        {
+            "ok": True,
+            "data": {
+                "episode_id": "ep-1",
+                "evidence_ids": [],
+                "handoff_status": "stored",
+            },
+        }
+    )
+    assert not submit_out.is_valid(
+        {
+            "ok": True,
+            "data": {
+                "episode_id": "ep-1",
+                "evidence_ids": [],
+                "handoff_revision": None,
+                "handoff_status": "stored",
+                "fence": good_fence,
+                "writer_status": "holder",
+            },
+        }
+    )
+    assert not submit_out.is_valid(
+        {
+            "ok": True,
+            "data": {
+                "episode_id": "ep-1",
+                "evidence_ids": [],
+                "handoff_revision": 0,
+                "handoff_status": "not_stored_policy",
+                "fence": good_fence,
+                "writer_status": "not_holder",
+            },
+        }
+    )
+
+    # 6. KernelHttpCall requires valid schema_digest
+    valid_http = {
+        "tool": "prepare_task",
+        "arguments": disc_call.arguments,
+        "correlation_id": None,
+        "selected_scope": {"repo_id": "repo-01", "checkout_id": "chk-a"},
+        "schema_digest": catalog.schema_digest,
+    }
+    assert http_call_v.is_valid(valid_http)
+    assert not http_call_v.is_valid({k: v for k, v in valid_http.items() if k != "schema_digest"})
+    assert not http_call_v.is_valid({**valid_http, "schema_digest": "sha256:bad"})
+

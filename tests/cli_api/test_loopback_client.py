@@ -44,7 +44,7 @@ from superbrain.cli_api.loopback import (
 )
 from superbrain.core.errors import SAFE_WIRE_MESSAGES_BY_CODE, BrainError, ErrorCode
 from superbrain.core.kernel import Endpoint, ToolCommand
-from superbrain.core.wire import encode_envelope
+from superbrain.core.wire import encode_envelope, load_catalog
 from tests.support.inc2_fixture import SampleTlsMaterial
 
 # -----------------------------------------------------------------------------
@@ -390,6 +390,7 @@ class MockTlsServer:
                     "writer_epoch": self.writer_epoch,
                     "instance_id": self.instance_id,
                     "contract": "mcp-tools-v2",
+                    "schema_digest": load_catalog().schema_digest,
                 }
             ).encode("utf-8")
             return (
@@ -839,7 +840,11 @@ def test_call_prepares_body_before_connect_and_sends_only_after_identity(
             assert "authorization" not in probe.headers and probe.body == b""
             assert post.headers["authorization"] == f"Bearer {token}"
             assert json.loads(post.body) == {
-                "tool": "submit_episode", "arguments": arguments, "correlation_id": None, "selected_scope": None,
+                "tool": "submit_episode",
+                "arguments": arguments,
+                "correlation_id": None,
+                "selected_scope": None,
+                "schema_digest": load_catalog().schema_digest,
             }
             assert events == ["encoded", "connect"]
         else:
@@ -892,37 +897,72 @@ def test_wrong_identity_receives_only_probe(inc2_tls_material: SampleTlsMaterial
         assert server.accept_count == 0
 
     # Negative identity probe subcases
+    schema_digest = load_catalog().schema_digest
     test_cases: list[tuple[str, bytes]] = [
         # 1. Wrong store_id
         (
             "wrong_store",
             json.dumps(
-                {"store_id": "other-store", "writer_epoch": 1, "instance_id": "inst-1", "contract": "mcp-tools-v2"}
+                {
+                    "store_id": "other-store",
+                    "writer_epoch": 1,
+                    "instance_id": "inst-1",
+                    "contract": "mcp-tools-v2",
+                    "schema_digest": schema_digest,
+                }
             ).encode(),
         ),
         # 2. Wrong writer_epoch
         (
             "wrong_epoch",
             json.dumps(
-                {"store_id": "store-1", "writer_epoch": 999, "instance_id": "inst-1", "contract": "mcp-tools-v2"}
+                {
+                    "store_id": "store-1",
+                    "writer_epoch": 999,
+                    "instance_id": "inst-1",
+                    "contract": "mcp-tools-v2",
+                    "schema_digest": schema_digest,
+                }
             ).encode(),
         ),
         # 3. Wrong instance_id
         (
             "wrong_instance",
             json.dumps(
-                {"store_id": "store-1", "writer_epoch": 1, "instance_id": "other-inst", "contract": "mcp-tools-v2"}
+                {
+                    "store_id": "store-1",
+                    "writer_epoch": 1,
+                    "instance_id": "other-inst",
+                    "contract": "mcp-tools-v2",
+                    "schema_digest": schema_digest,
+                }
             ).encode(),
         ),
         # 4. Wrong contract
         (
             "wrong_contract",
             json.dumps(
-                {"store_id": "store-1", "writer_epoch": 1, "instance_id": "inst-1", "contract": "mcp-tools-v1"}
+                {
+                    "store_id": "store-1",
+                    "writer_epoch": 1,
+                    "instance_id": "inst-1",
+                    "contract": "mcp-tools-v1",
+                    "schema_digest": schema_digest,
+                }
             ).encode(),
         ),
         # 5. Missing field
-        ("missing_field", json.dumps({"store_id": "store-1", "writer_epoch": 1, "contract": "mcp-tools-v2"}).encode()),
+        (
+            "missing_field",
+            json.dumps(
+                {
+                    "store_id": "store-1",
+                    "writer_epoch": 1,
+                    "contract": "mcp-tools-v2",
+                    "schema_digest": schema_digest,
+                }
+            ).encode(),
+        ),
         # 6. Extra field
         (
             "extra_field",
@@ -932,12 +972,24 @@ def test_wrong_identity_receives_only_probe(inc2_tls_material: SampleTlsMaterial
                     "writer_epoch": 1,
                     "instance_id": "inst-1",
                     "contract": "mcp-tools-v2",
+                    "schema_digest": schema_digest,
                     "port": 8080,
                 }
             ).encode(),
         ),
         # 7. Boolean writer_epoch (JSON true instead of strict integer)
-        ("bool_epoch", b'{"store_id":"store-1","writer_epoch":true,"instance_id":"inst-1","contract":"mcp-tools-v2"}'),
+        (
+            "bool_epoch",
+            json.dumps(
+                {
+                    "store_id": "store-1",
+                    "writer_epoch": True,
+                    "instance_id": "inst-1",
+                    "contract": "mcp-tools-v2",
+                    "schema_digest": schema_digest,
+                }
+            ).encode(),
+        ),
         # 8. HTTP 404 status
         ("http_404", b"HTTP_STATUS_404"),
         # 9. HTTP 503 status
@@ -962,6 +1014,7 @@ def test_wrong_identity_receives_only_probe(inc2_tls_material: SampleTlsMaterial
                                 "writer_epoch": 1,
                                 "instance_id": "inst-1",
                                 "contract": "mcp-tools-v2",
+                                "schema_digest": schema_digest,
                             }
                         ).encode()
                         # Send valid response immediately followed by pipelined trailing bytes
@@ -1078,6 +1131,7 @@ def test_connection_budget_includes_slow_handshake_without_consuming_tool_budget
                     "writer_epoch": 1,
                     "instance_id": "inst-1",
                     "contract": "mcp-tools-v2",
+                    "schema_digest": load_catalog().schema_digest,
                 }
             ).encode()
             return (
@@ -1130,6 +1184,7 @@ def test_connection_budget_includes_slow_handshake_without_consuming_tool_budget
                     "writer_epoch": 1,
                     "instance_id": "inst-1",
                     "contract": "mcp-tools-v2",
+                    "schema_digest": load_catalog().schema_digest,
                 }
             ).encode()
             return (
@@ -1194,6 +1249,7 @@ def test_connection_budget_includes_slow_handshake_without_consuming_tool_budget
                     "writer_epoch": 1,
                     "instance_id": "inst-1",
                     "contract": "mcp-tools-v2",
+                    "schema_digest": load_catalog().schema_digest,
                 }
             ).encode()
             return (
@@ -1248,7 +1304,13 @@ def test_response_loss_after_post_is_transport_uncertain(inc2_tls_material: Samp
     def mid_eof_handler(req: MockHttpRequest, sock: ssl.SSLSocket) -> bytes | None:
         if req.method == "GET":
             body = json.dumps(
-                {"store_id": "store-1", "writer_epoch": 1, "instance_id": "inst-1", "contract": "mcp-tools-v2"}
+                {
+                    "store_id": "store-1",
+                    "writer_epoch": 1,
+                    "instance_id": "inst-1",
+                    "contract": "mcp-tools-v2",
+                    "schema_digest": load_catalog().schema_digest,
+                }
             ).encode()
             return (
                 b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
@@ -1289,7 +1351,13 @@ def test_response_loss_after_post_is_transport_uncertain(inc2_tls_material: Samp
     def hang_handler(req: MockHttpRequest, sock: ssl.SSLSocket) -> bytes | None:
         if req.method == "GET":
             body = json.dumps(
-                {"store_id": "store-1", "writer_epoch": 1, "instance_id": "inst-1", "contract": "mcp-tools-v2"}
+                {
+                    "store_id": "store-1",
+                    "writer_epoch": 1,
+                    "instance_id": "inst-1",
+                    "contract": "mcp-tools-v2",
+                    "schema_digest": load_catalog().schema_digest,
+                }
             ).encode()
             return (
                 b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
@@ -1328,7 +1396,13 @@ def test_response_loss_after_post_is_transport_uncertain(inc2_tls_material: Samp
     def redirect_handler(req: MockHttpRequest, sock: ssl.SSLSocket) -> bytes | None:
         if req.method == "GET":
             body = json.dumps(
-                {"store_id": "store-1", "writer_epoch": 1, "instance_id": "inst-1", "contract": "mcp-tools-v2"}
+                {
+                    "store_id": "store-1",
+                    "writer_epoch": 1,
+                    "instance_id": "inst-1",
+                    "contract": "mcp-tools-v2",
+                    "schema_digest": load_catalog().schema_digest,
+                }
             ).encode()
             return (
                 b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
@@ -1364,7 +1438,13 @@ def test_response_loss_after_post_is_transport_uncertain(inc2_tls_material: Samp
     def bad_gw_handler(req: MockHttpRequest, sock: ssl.SSLSocket) -> bytes | None:
         if req.method == "GET":
             body = json.dumps(
-                {"store_id": "store-1", "writer_epoch": 1, "instance_id": "inst-1", "contract": "mcp-tools-v2"}
+                {
+                    "store_id": "store-1",
+                    "writer_epoch": 1,
+                    "instance_id": "inst-1",
+                    "contract": "mcp-tools-v2",
+                    "schema_digest": load_catalog().schema_digest,
+                }
             ).encode()
             return (
                 b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
@@ -1401,7 +1481,13 @@ def test_response_loss_after_post_is_transport_uncertain(inc2_tls_material: Samp
     def overlong_cl_post_handler(req: MockHttpRequest, sock: ssl.SSLSocket) -> bytes | None:
         if req.method == "GET":
             body = json.dumps(
-                {"store_id": "store-1", "writer_epoch": 1, "instance_id": "inst-1", "contract": "mcp-tools-v2"}
+                {
+                    "store_id": "store-1",
+                    "writer_epoch": 1,
+                    "instance_id": "inst-1",
+                    "contract": "mcp-tools-v2",
+                    "schema_digest": load_catalog().schema_digest,
+                }
             ).encode()
             return (
                 b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
@@ -1458,7 +1544,13 @@ def test_response_loss_after_post_is_transport_uncertain(inc2_tls_material: Samp
         def _handler(req: MockHttpRequest, sock: ssl.SSLSocket) -> bytes | None:
             if req.method == "GET":
                 body = json.dumps(
-                    {"store_id": "store-1", "writer_epoch": 1, "instance_id": "inst-1", "contract": "mcp-tools-v2"}
+                    {
+                        "store_id": "store-1",
+                        "writer_epoch": 1,
+                        "instance_id": "inst-1",
+                        "contract": "mcp-tools-v2",
+                        "schema_digest": load_catalog().schema_digest,
+                    }
                 ).encode()
                 return (
                     b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
@@ -1564,7 +1656,13 @@ def test_pinned_connection_sends_at_most_one_post(inc2_tls_material: SampleTlsMa
     def concurrent_barrier_handler(req: MockHttpRequest, sock: ssl.SSLSocket) -> bytes | None:
         if req.method == "GET":
             body = json.dumps(
-                {"store_id": "store-1", "writer_epoch": 1, "instance_id": "inst-1", "contract": "mcp-tools-v2"}
+                {
+                    "store_id": "store-1",
+                    "writer_epoch": 1,
+                    "instance_id": "inst-1",
+                    "contract": "mcp-tools-v2",
+                    "schema_digest": load_catalog().schema_digest,
+                }
             ).encode()
             return (
                 b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "

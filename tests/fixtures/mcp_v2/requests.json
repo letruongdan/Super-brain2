@@ -37,6 +37,7 @@
       },
       "daemon_args": {
         "schema_version": "2.0",
+        "mode": "work",
         "workspace_hint": "super-brain2.main",
         "description": "Prepare task with workspace alias and matching principal fields.",
         "context_budget_tokens": 4000,
@@ -64,6 +65,7 @@
       },
       "daemon_args": {
         "schema_version": "2.0",
+        "mode": "work",
         "workspace_id": "repo-01",
         "checkout_id": "chk-a",
         "source_snapshot_id": "snap-019a5390-abcd",
@@ -181,6 +183,8 @@
           {
             "served_receipt_id": "rcpt-019a5390-0010",
             "task_id": "task-019a5390-0001",
+            "artifact_id": "art-skill-tdd",
+            "revision_epoch": 0,
             "revision": 3,
             "resource_digests": [
               {
@@ -223,6 +227,8 @@
           {
             "served_receipt_id": "rcpt-019a5390-0010",
             "task_id": "task-019a5390-0001",
+            "artifact_id": "art-skill-tdd",
+            "revision_epoch": 0,
             "revision": 3,
             "resource_digests": [
               {
@@ -265,6 +271,8 @@
           {
             "served_receipt_id": "rcpt-019a5390-0010",
             "task_id": "task-019a5390-0001",
+            "artifact_id": "art-skill-tdd",
+            "revision_epoch": 0,
             "revision": 3,
             "resource_digests": [
               {
@@ -293,6 +301,8 @@
           {
             "served_receipt_id": "rcpt-019a5390-0010",
             "task_id": "task-019a5390-0001",
+            "artifact_id": "art-skill-tdd",
+            "revision_epoch": 0,
             "revision": 3,
             "resource_digests": [
               {
@@ -371,6 +381,418 @@
         "schema_version": "2.0",
         "deep": true,
         "idempotency_key": "idem_health_deep_0008"
+      }
+    },
+    {
+      "name": "prepare_task_discover_default",
+      "tool": "prepare_task",
+      "client_only": false,
+      "selected_scope": {
+        "repo_id": "repo-01",
+        "checkout_id": "chk-a"
+      },
+      "correlation_id": "req-prep-disc-01",
+      "client_args": {
+        "schema_version": "2.0",
+        "mode": "discover",
+        "workspace_hint": "super-brain2.main",
+        "owner_id": "owner-01"
+      },
+      "daemon_args": {
+        "schema_version": "2.0",
+        "mode": "discover",
+        "workspace_hint": "super-brain2.main",
+        "context_budget_tokens": 4000
+      }
+    },
+    {
+      "name": "prepare_task_discover_by_task_id",
+      "tool": "prepare_task",
+      "client_only": false,
+      "selected_scope": {
+        "repo_id": "repo-01",
+        "checkout_id": "chk-a"
+      },
+      "correlation_id": "req-prep-disc-02",
+      "client_args": {
+        "schema_version": "2.0",
+        "mode": "discover",
+        "workspace_id": "repo-01",
+        "checkout_id": "chk-a",
+        "task_id": "task-019a5390-0001",
+        "context_budget_tokens": 1024
+      },
+      "daemon_args": {
+        "schema_version": "2.0",
+        "mode": "discover",
+        "workspace_id": "repo-01",
+        "checkout_id": "chk-a",
+        "task_id": "task-019a5390-0001",
+        "context_budget_tokens": 1024
+      }
+    },
+    {
+      "name": "prepare_task_work_with_resume_and_seen_handoffs",
+      "tool": "prepare_task",
+      "client_only": false,
+      "selected_scope": {
+        "repo_id": "repo-01",
+        "checkout_id": "chk-a"
+      },
+      "correlation_id": "req-prep-res-03",
+      "client_args": {
+        "schema_version": "2.0",
+        "mode": "work",
+        "workspace_id": "repo-01",
+        "checkout_id": "chk-a",
+        "task_id": "task-019a5390-0001",
+        "resume_ref": {
+          "served_receipt_id": "rcpt-019a5390-0011",
+          "artifact_id": "hand-019a5390-0001",
+          "revision": 3,
+          "handoff_revision": 1,
+          "fence": {
+            "restore_epoch": 2,
+            "writer_generation": 1
+          }
+        },
+        "seen_handoff_refs": [
+          {
+            "artifact_id": "hand-019a5390-0002",
+            "revision_epoch": 2,
+            "revision": 4,
+            "digest": "sha256:9999999999999999999999999999999999999999999999999999999999999999"
+          }
+        ],
+        "description": "Resume handoff task after viewing candidate continuity notebooks.",
+        "context_budget_tokens": 3000,
+        "idempotency_key": "idem_prep_resume_0009"
+      },
+      "daemon_args": {
+        "schema_version": "2.0",
+        "mode": "work",
+        "workspace_id": "repo-01",
+        "checkout_id": "chk-a",
+        "task_id": "task-019a5390-0001",
+        "resume_ref": {
+          "served_receipt_id": "rcpt-019a5390-0011",
+          "artifact_id": "hand-019a5390-0001",
+          "revision": 3,
+          "handoff_revision": 1,
+          "fence": {
+            "restore_epoch": 2,
+            "writer_generation": 1
+          }
+        },
+        "seen_handoff_refs": [
+          {
+            "artifact_id": "hand-019a5390-0002",
+            "revision_epoch": 2,
+            "revision": 4,
+            "digest": "sha256:9999999999999999999999999999999999999999999999999999999999999999"
+          }
+        ],
+        "description": "Resume handoff task after viewing candidate continuity notebooks.",
+        "context_budget_tokens": 3000,
+        "idempotency_key": "idem_prep_resume_0009"
+      }
+    },
+    {
+      "name": "get_artifact_handoff_l1_with_epoch",
+      "tool": "get_artifact",
+      "client_only": false,
+      "selected_scope": {
+        "repo_id": "repo-01",
+        "checkout_id": "chk-a"
+      },
+      "correlation_id": "req-art-hand-01",
+      "client_args": {
+        "schema_version": "2.0",
+        "workspace_id": "repo-01",
+        "task_id": "task-019a5390-0001",
+        "artifact_id": "hand-019a5390-0001",
+        "revision_epoch": 2,
+        "revision": 3,
+        "level": "L1",
+        "idempotency_key": "idem_art_handoff_0010"
+      },
+      "daemon_args": {
+        "schema_version": "2.0",
+        "workspace_id": "repo-01",
+        "task_id": "task-019a5390-0001",
+        "artifact_id": "hand-019a5390-0001",
+        "revision_epoch": 2,
+        "revision": 3,
+        "level": "L1",
+        "idempotency_key": "idem_art_handoff_0010"
+      }
+    },
+    {
+      "name": "submit_episode_with_handoff_patch",
+      "tool": "submit_episode",
+      "client_only": false,
+      "selected_scope": {
+        "repo_id": "repo-01",
+        "checkout_id": "chk-a"
+      },
+      "correlation_id": "req-ep-hand-01",
+      "client_args": {
+        "schema_version": "2.0",
+        "task_id": "task-019a5390-0001",
+        "session_id": "sess-019a5390-0009",
+        "workspace_id": "repo-01",
+        "checkout_id": "chk-a",
+        "evidence": [],
+        "handoff": {
+          "working_goal": "Complete SP2-1 wire handshake and handoff notebook contract.",
+          "plan": [
+            {
+              "id": "step-1",
+              "summary": "Update canonical v2 schema and fixtures.",
+              "status": "done"
+            },
+            {
+              "id": "step-2",
+              "summary": "Verify pending constraint exception behavior.",
+              "status": "in_progress",
+              "depends_on_change": "chg-1"
+            }
+          ],
+          "decisions": [
+            {
+              "id": "dec-2",
+              "decision": "Enforce bidirectional schema_digest validation.",
+              "reason": "Prevent mixed-version state skew across SP2 components.",
+              "evidence_refs": [
+                "ev-019a5390-0041"
+              ],
+              "supersedes": "dec-1"
+            },
+            {
+              "id": "dec-3",
+              "decision": "Revisit offline wheel cache layout.",
+              "reason": "New build verification benchmark suggests retry is faster.",
+              "reopens": "rej-0"
+            }
+          ],
+          "rejected": [
+            {
+              "id": "rej-merged-1",
+              "option": "Consolidate legacy fallback paths.",
+              "reason": "Superseded by strict fail-closed handshake.",
+              "merges": [
+                "rej-1",
+                "rej-2"
+              ]
+            }
+          ],
+          "user_constraints": [
+            {
+              "id": "con-1",
+              "constraint": "Never bypass failing tests or weaken assertions."
+            }
+          ],
+          "constraint_changes": [
+            {
+              "id": "chg-1",
+              "target_constraint_id": "con-1",
+              "proposed_constraint": "Allow temporary exception for standalone harness dry-run.",
+              "reason": "User asked whether local dry-run can skip external host checks."
+            }
+          ],
+          "closed_changes": [
+            {
+              "change_id": "chg-0",
+              "resolution": "withdrawn",
+              "reason": "No longer needed after offline wheel build fix."
+            }
+          ],
+          "tooling": [
+            {
+              "purpose": "Run contract suite",
+              "command": "uv run --locked pytest -q tests/contract/test_mcp_v2_schema.py"
+            }
+          ],
+          "hypotheses": [
+            "Frozen I2 client lacks schema_digest in GET /v2/identity."
+          ],
+          "next_action": {
+            "summary": "Confirm exception scope with user before proceeding.",
+            "depends_on_change": "chg-1"
+          },
+          "long_running": {
+            "pid": 4242,
+            "started_at": "2026-11-19T04:00:00Z",
+            "command": "uv run --locked pytest -q tests/",
+            "cwd": "C:/repo",
+            "source_revision": "035a4cd",
+            "log_or_receipt_path": "receipts/gate.json",
+            "next_action": "Inspect failing RED node IDs once complete."
+          },
+          "task_state": "open"
+        },
+        "base_revision": 1,
+        "fence": {
+          "restore_epoch": 2,
+          "writer_generation": 1
+        },
+        "takeover": {
+          "acknowledge_active": false,
+          "reason": "Acquire writer lease on open handoff notebook."
+        },
+        "idempotency_key": "idem_submit_hand_0011"
+      },
+      "daemon_args": {
+        "schema_version": "2.0",
+        "task_id": "task-019a5390-0001",
+        "session_id": "sess-019a5390-0009",
+        "workspace_id": "repo-01",
+        "checkout_id": "chk-a",
+        "evidence": [],
+        "handoff": {
+          "working_goal": "Complete SP2-1 wire handshake and handoff notebook contract.",
+          "plan": [
+            {
+              "id": "step-1",
+              "summary": "Update canonical v2 schema and fixtures.",
+              "status": "done"
+            },
+            {
+              "id": "step-2",
+              "summary": "Verify pending constraint exception behavior.",
+              "status": "in_progress",
+              "depends_on_change": "chg-1"
+            }
+          ],
+          "decisions": [
+            {
+              "id": "dec-2",
+              "decision": "Enforce bidirectional schema_digest validation.",
+              "reason": "Prevent mixed-version state skew across SP2 components.",
+              "evidence_refs": [
+                "ev-019a5390-0041"
+              ],
+              "supersedes": "dec-1"
+            },
+            {
+              "id": "dec-3",
+              "decision": "Revisit offline wheel cache layout.",
+              "reason": "New build verification benchmark suggests retry is faster.",
+              "reopens": "rej-0"
+            }
+          ],
+          "rejected": [
+            {
+              "id": "rej-merged-1",
+              "option": "Consolidate legacy fallback paths.",
+              "reason": "Superseded by strict fail-closed handshake.",
+              "merges": [
+                "rej-1",
+                "rej-2"
+              ]
+            }
+          ],
+          "user_constraints": [
+            {
+              "id": "con-1",
+              "constraint": "Never bypass failing tests or weaken assertions."
+            }
+          ],
+          "constraint_changes": [
+            {
+              "id": "chg-1",
+              "target_constraint_id": "con-1",
+              "proposed_constraint": "Allow temporary exception for standalone harness dry-run.",
+              "reason": "User asked whether local dry-run can skip external host checks."
+            }
+          ],
+          "closed_changes": [
+            {
+              "change_id": "chg-0",
+              "resolution": "withdrawn",
+              "reason": "No longer needed after offline wheel build fix."
+            }
+          ],
+          "tooling": [
+            {
+              "purpose": "Run contract suite",
+              "command": "uv run --locked pytest -q tests/contract/test_mcp_v2_schema.py"
+            }
+          ],
+          "hypotheses": [
+            "Frozen I2 client lacks schema_digest in GET /v2/identity."
+          ],
+          "next_action": {
+            "summary": "Confirm exception scope with user before proceeding.",
+            "depends_on_change": "chg-1"
+          },
+          "long_running": {
+            "pid": 4242,
+            "started_at": "2026-11-19T04:00:00Z",
+            "command": "uv run --locked pytest -q tests/",
+            "cwd": "C:/repo",
+            "source_revision": "035a4cd",
+            "log_or_receipt_path": "receipts/gate.json",
+            "next_action": "Inspect failing RED node IDs once complete."
+          },
+          "task_state": "open"
+        },
+        "base_revision": 1,
+        "fence": {
+          "restore_epoch": 2,
+          "writer_generation": 1
+        },
+        "takeover": {
+          "acknowledge_active": false,
+          "reason": "Acquire writer lease on open handoff notebook."
+        },
+        "idempotency_key": "idem_submit_hand_0011"
+      }
+    },
+    {
+      "name": "submit_episode_takeover_only",
+      "tool": "submit_episode",
+      "client_only": false,
+      "selected_scope": {
+        "repo_id": "repo-01",
+        "checkout_id": "chk-a"
+      },
+      "correlation_id": "req-ep-take-02",
+      "client_args": {
+        "schema_version": "2.0",
+        "task_id": "task-019a5390-0001",
+        "session_id": "sess-019a5390-0010",
+        "workspace_id": "repo-01",
+        "checkout_id": "chk-a",
+        "evidence": [],
+        "base_revision": 2,
+        "fence": {
+          "restore_epoch": 2,
+          "writer_generation": 2
+        },
+        "takeover": {
+          "acknowledge_active": true,
+          "reason": "Take over lease after notifying user of previous active session."
+        },
+        "idempotency_key": "idem_submit_takeover_0012"
+      },
+      "daemon_args": {
+        "schema_version": "2.0",
+        "task_id": "task-019a5390-0001",
+        "session_id": "sess-019a5390-0010",
+        "workspace_id": "repo-01",
+        "checkout_id": "chk-a",
+        "evidence": [],
+        "base_revision": 2,
+        "fence": {
+          "restore_epoch": 2,
+          "writer_generation": 2
+        },
+        "takeover": {
+          "acknowledge_active": true,
+          "reason": "Take over lease after notifying user of previous active session."
+        },
+        "idempotency_key": "idem_submit_takeover_0012"
       }
     }
   ]

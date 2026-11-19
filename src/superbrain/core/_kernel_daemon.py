@@ -171,6 +171,55 @@ class ToolCommand:
 
 
 @dataclass(frozen=True)
+class CaptureBatchCommand:
+    """Decoded internal ``POST /v2/capture/events`` submission for bounded capture ingestion.
+
+    ``token`` and ``events`` are omitted from ``__repr__`` so bearer secrets and raw
+    unredacted payloads never enter logs or tracebacks.
+    """
+
+    producer_stream: str
+    repo_id: str
+    checkout_id: str
+    events: tuple[Mapping[str, JsonValue], ...]
+    token: str
+    correlation_id: str | None = None
+
+    def __post_init__(self) -> None:
+        require_opaque_id(self.producer_stream, label="producer_stream")
+        require_opaque_id(self.repo_id, label="repo_id")
+        require_opaque_id(self.checkout_id, label="checkout_id")
+        if (
+            not isinstance(self.events, tuple)
+            or not self.events
+            or len(self.events) > 1024
+            or not all(isinstance(ev, Mapping) for ev in self.events)
+        ):
+            raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+        if not isinstance(self.token, str) or not self.token:
+            raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+        if self.correlation_id is not None:
+            if not isinstance(self.correlation_id, str):
+                raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+            try:
+                encoded = self.correlation_id.encode("utf-8", errors="strict")
+            except UnicodeEncodeError as err:
+                raise BrainError(ErrorCode.INVALID_INPUT, "unpaired surrogate") from err
+            if not (1 <= len(encoded) <= 128):
+                raise BrainError(ErrorCode.INVALID_INPUT, "string exceeds size limit")
+        for ev in self.events:
+            validate_json(dict(ev))
+
+    def __repr__(self) -> str:
+        return (
+            f"CaptureBatchCommand(producer_stream={self.producer_stream!r}, "
+            f"repo_id={self.repo_id!r}, "
+            f"checkout_id={self.checkout_id!r}, "
+            f"correlation_id={self.correlation_id!r})"
+        )
+
+
+@dataclass(frozen=True)
 class AuthGrantStamp:
     """Internal Task 6b release-grant stamp bound to the exact owner auth view used at live-auth/render."""
 

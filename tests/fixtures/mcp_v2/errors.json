@@ -131,6 +131,17 @@
           "message": "unsupported schema version"
         }
       }
+    },
+    {
+      "name": "unsupported_version_digest_mismatch",
+      "tool": "prepare_task",
+      "envelope": {
+        "ok": false,
+        "error": {
+          "code": "unsupported_version",
+          "message": "unsupported version"
+        }
+      }
     }
   ]
 }

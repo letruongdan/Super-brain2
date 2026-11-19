@@ -207,6 +207,7 @@ def test_loopback_daemon_pre_r41_replay_and_near_cap_framing(
                     "arguments": over_args,
                     "correlation_id": None,
                     "selected_scope": scope.to_dict(),
+                    "schema_digest": wire.load_catalog().schema_digest,
                 }
             )
             post_head = (
