@@ -134,6 +134,7 @@ from superbrain.core._kernel_jobs import (
     usage_descriptor,
 )
 from superbrain.core._kernel_send_attempts import (
+    ARTIFACT_LEVEL_UNKNOWN,
     ArtifactReadAck,
     ArtifactSendAttempt,
     ArtifactSendSpec,
@@ -141,6 +142,7 @@ from superbrain.core._kernel_send_attempts import (
     SendAttemptState,
     canonicalize_resource_digests,
     decode_resource_digests_json,
+    is_verified_l1_send,
 )
 from superbrain.core._kernel_workspace import (
     COMMIT_RESERVE_NS,
@@ -419,6 +421,7 @@ class ToolCatalog:
 
 
 __all__ = [
+    "ARTIFACT_LEVEL_UNKNOWN",
     "AccountingStatus",
     "ArtifactReadAck",
     "ArtifactSendAttempt",
@@ -556,6 +559,7 @@ __all__ = [
     "is_registrable_alias",
     "is_strict_int",
     "is_trusted_bootstrap_issuer",
+    "is_verified_l1_send",
     "parse_bearer_token",
     "parse_canonical_utc",
     "require_aware_utc",

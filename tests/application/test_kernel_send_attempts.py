@@ -13,7 +13,12 @@ import pytest
 from superbrain.adapters.os import os_adapters
 from superbrain.adapters.os.workspaces import build_registration
 from superbrain.application.dispatch import KernelDispatcher, KernelToolDomain, PreparedEffect, dispatch
-from superbrain.application.idempotency import is_idempotency_expired
+from superbrain.application.idempotency import (
+    compute_canonical_payload_hmac,
+    compute_idempotency_key_hash,
+    is_idempotency_expired,
+    verify_request_hmac,
+)
 from superbrain.composition.kernel_bridge import KernelBridge
 from superbrain.core import kernel as _kernel
 from superbrain.core.canonical import canonical_json, digest_bytes
@@ -24,6 +29,7 @@ from superbrain.core.kernel import (
     ArtifactReadAck,
     CallResult,
     Identity,
+    ObjectRef,
     ReadAckInput,
     ResourceDigest,
     Scope,
@@ -39,6 +45,8 @@ from superbrain.core.wire import normalize_call
 from superbrain.ports.kernel import KernelTx
 from superbrain.ports.os import OsAdapters
 from superbrain.ports.policy import IntentKind
+from superbrain.storage import ledger
+from superbrain.storage._idempotency_sql import advance_c4_hwm, write_idempotency_row
 from superbrain.storage.idempotency import KernelBlobStager, KernelIdempotencyStore
 from superbrain.storage.kernel_schema import KERNEL_POLICY_MIGRATIONS, KERNEL_STORE_MIGRATIONS
 from superbrain.storage.kinds import is_uuid
@@ -2213,6 +2221,8 @@ def test_sp2_1_store4_fail_closed_for_non_default_send_attempt_and_read_ack(
                 revision=parent.revision,
                 resource_digests=parent.resource_digests,
                 identity=Identity(rt.store.store_id, rt.lease.epoch, "inst-s4-neg"),
+                level=parent.level,
+                revision_epoch=parent.revision_epoch,
             ),
             expected_identity=Identity(rt.store.store_id, rt.lease.epoch, "inst-s4-neg"),
         )
@@ -2377,13 +2387,15 @@ def test_sp2_1_half_migrated_schema_fails_closed_with_integrity_failure(
 def test_sp2_1_positive_twins_store4_and_extended_schema_round_trip(
     trusted_tmp: Path, os_: OsAdapters, clock: FakeClock
 ) -> None:
-    """Defaults ('L1', 0) succeed on store4, and extended tables round-trip non-default level/epoch/artifact_id."""
+    """Store4 decodes 'unknown' level (not L1); extended tables round-trip L0/L1/L2/unknown & epoch/artifact_id."""
     from superbrain.application.send_attempts import record_read_acks
     from superbrain.core.errors import BrainError
+    from superbrain.core.kernel import ARTIFACT_LEVEL_UNKNOWN, is_verified_l1_send
 
+    assert ARTIFACT_LEVEL_UNKNOWN == "unknown"
     mono = FakeMonotonicClock()
 
-    # Twin A: unmodified store4 end-to-end with defaults ("L1", 0)
+    # Twin A: unmodified store4 end-to-end with defaults (decoded level="unknown", epoch=0)
     rt_s4 = _open_fixture_runtime(trusted_tmp / "root-twin-s4", os_)
     try:
         seeded_s4 = seed_principal_and_credential(rt_s4.policy)
@@ -2401,17 +2413,19 @@ def test_sp2_1_positive_twins_store4_and_extended_schema_round_trip(
             resource_digests=(rd_s4,),
         )
         attempt_s4 = send_store_s4.record_pending_attempt(spec_s4)
-        assert attempt_s4.level == "L1"
+        assert attempt_s4.level == ARTIFACT_LEVEL_UNKNOWN
         assert attempt_s4.revision_epoch == 0
+        assert is_verified_l1_send(attempt_s4) is False
         assert send_store_s4.read_attempt(attempt_s4.served_receipt_id) == attempt_s4
 
         comp_s4: SendAttemptCompletion = bridge_s4.build_send_completion(attempt_s4.served_receipt_id)
-        assert comp_s4.level == "L1"
+        assert comp_s4.level == ARTIFACT_LEVEL_UNKNOWN
         assert comp_s4.revision_epoch == 0
         finalized_s4 = bridge_s4.finalize_send_attempt(comp_s4)
         assert finalized_s4.state is SendAttemptState.SERVED_ONLY
-        assert finalized_s4.level == "L1"
+        assert finalized_s4.level == ARTIFACT_LEVEL_UNKNOWN
         assert finalized_s4.revision_epoch == 0
+        assert is_verified_l1_send(finalized_s4) is False
 
         ack_s4 = ArtifactReadAck(
             ack_id=new_id(),
@@ -2427,10 +2441,29 @@ def test_sp2_1_positive_twins_store4_and_extended_schema_round_trip(
             insert_read_ack_row(txn.db, ack_s4)
             read_ack_s4 = read_read_ack_by_receipt_row(txn.db, attempt_s4.served_receipt_id)
         assert read_ack_s4 == ack_s4
+
+        # Direct insert_send_attempt_row also accepts explicit level="unknown" with revision_epoch=0 on store4.
+        unknown_direct = _kernel.ArtifactSendAttempt(
+            send_attempt_id=new_id(),
+            logical_result_id=new_id(),
+            principal_id=seeded_s4.principal.principal_id,
+            task_id="task-twin-s4-direct",
+            artifact_id="art-twin-s4-direct",
+            revision=1,
+            resource_digests=(rd_s4,),
+            state=SendAttemptState.SERVED_ONLY,
+            level=ARTIFACT_LEVEL_UNKNOWN,
+            revision_epoch=0,
+        )
+        with rt_s4.store.transaction() as txn:
+            insert_send_attempt_row(txn.db, unknown_direct)
+            read_unknown_s4 = read_send_attempt_row(txn.db, unknown_direct.send_attempt_id)
+        assert read_unknown_s4 == unknown_direct
+        assert read_unknown_s4 is not None and is_verified_l1_send(read_unknown_s4) is False
     finally:
         rt_s4.close()
 
-    # Twin B: extended store6-like schema with non-default level & revision_epoch > 0
+    # Twin B: extended store6-like schema with L1, L2, L0, and backfilled "unknown"
     rt_ext = _open_fixture_runtime(trusted_tmp / "root-twin-ext", os_)
     try:
         seeded_ext = seed_principal_and_credential(rt_ext.policy)
@@ -2444,7 +2477,7 @@ def test_sp2_1_positive_twins_store4_and_extended_schema_round_trip(
         def _save_ack(ack: ArtifactReadAck) -> None:
             bridge_ext.strict_store().transact(lambda ktx: ktx.save_read_ack(ack))
 
-        for ext_idx, (ext_level, ext_epoch) in enumerate((("L2", 3), ("L0", 5)), start=1):
+        for ext_idx, (ext_level, ext_epoch) in enumerate((("L1", 1), ("L2", 3), ("L0", 5)), start=1):
             art_id = f"art-twin-ext-{ext_idx}"
             spec_ext = _kernel.ArtifactSendSpec(
                 logical_result_id=new_id(),
@@ -2459,6 +2492,7 @@ def test_sp2_1_positive_twins_store4_and_extended_schema_round_trip(
             attempt_ext = send_store_ext.record_pending_attempt(spec_ext)
             assert attempt_ext.level == ext_level
             assert attempt_ext.revision_epoch == ext_epoch
+            assert is_verified_l1_send(attempt_ext) is False
 
             with rt_ext.store.transaction() as txn:
                 row_attempt = read_send_attempt_row(txn.db, attempt_ext.served_receipt_id)
@@ -2474,7 +2508,8 @@ def test_sp2_1_positive_twins_store4_and_extended_schema_round_trip(
             assert comp_ext.revision_epoch == ext_epoch
 
             # Mismatched completion level or revision_epoch still fails closed on extended schema.
-            for bad_comp in (replace(comp_ext, level="L1"), replace(comp_ext, revision_epoch=ext_epoch + 1)):
+            alt_level = "L0" if ext_level == "L1" else "L1"
+            for bad_comp in (replace(comp_ext, level=alt_level), replace(comp_ext, revision_epoch=ext_epoch + 1)):
                 with pytest.raises(BrainError) as exc_fin:
                     bridge_ext.finalize_send_attempt(bad_comp)
                 assert exc_fin.value.code is ErrorCode.INTEGRITY_FAILURE
@@ -2483,6 +2518,7 @@ def test_sp2_1_positive_twins_store4_and_extended_schema_round_trip(
             assert finalized_ext.state is SendAttemptState.SERVED_ONLY
             assert finalized_ext.level == ext_level
             assert finalized_ext.revision_epoch == ext_epoch
+            assert is_verified_l1_send(finalized_ext) is (ext_level == "L1")
 
             ack_ext = ArtifactReadAck(
                 ack_id=new_id(),
@@ -2508,6 +2544,51 @@ def test_sp2_1_positive_twins_store4_and_extended_schema_round_trip(
                 ).fetchone()
             assert read_ack_ext == ack_ext
             assert raw_ack_cols == (art_id, ext_epoch)
+
+        # Backfilled "unknown" attempt persists on extended schema with is_verified_l1_send == False;
+        # SendAttemptState.UNKNOWN + level="L1" is also False; ArtifactSendSpec refuses "unknown".
+        unknown_ext = _kernel.ArtifactSendAttempt(
+            send_attempt_id=new_id(),
+            logical_result_id=new_id(),
+            principal_id=seeded_ext.principal.principal_id,
+            task_id="task-twin-ext-unk",
+            artifact_id="art-twin-ext-unk",
+            revision=1,
+            resource_digests=(rd_ext,),
+            state=SendAttemptState.SERVED_ONLY,
+            level=ARTIFACT_LEVEL_UNKNOWN,
+            revision_epoch=0,
+        )
+        l1_unknown_state = _kernel.ArtifactSendAttempt(
+            send_attempt_id=new_id(),
+            logical_result_id=new_id(),
+            principal_id=seeded_ext.principal.principal_id,
+            task_id="task-twin-ext-l1-unk",
+            artifact_id="art-twin-ext-l1-unk",
+            revision=1,
+            resource_digests=(rd_ext,),
+            state=SendAttemptState.UNKNOWN,
+            level="L1",
+            revision_epoch=1,
+        )
+        with rt_ext.store.transaction() as txn:
+            insert_send_attempt_row(txn.db, unknown_ext)
+            insert_send_attempt_row(txn.db, l1_unknown_state)
+            assert read_send_attempt_row(txn.db, unknown_ext.send_attempt_id) == unknown_ext
+            assert read_send_attempt_row(txn.db, l1_unknown_state.send_attempt_id) == l1_unknown_state
+        assert is_verified_l1_send(unknown_ext) is False
+        assert is_verified_l1_send(l1_unknown_state) is False
+        with pytest.raises(BrainError) as exc_spec_unk:
+            _kernel.ArtifactSendSpec(
+                logical_result_id=new_id(),
+                principal_id=seeded_ext.principal.principal_id,
+                task_id="task-spec-unk",
+                artifact_id="art-spec-unk",
+                revision=1,
+                resource_digests=(rd_ext,),
+                level=ARTIFACT_LEVEL_UNKNOWN,
+            )
+        assert exc_spec_unk.value.code is ErrorCode.INVALID_INPUT
 
         # Tampered artifact_read_ack.revision_epoch or artifact_id fails closed on read_read_ack_by_receipt_row.
         with rt_ext.store.transaction() as txn:
@@ -2626,3 +2707,473 @@ def test_sp2_1_positive_twins_store4_and_extended_schema_round_trip(
             assert read_read_ack_by_receipt_row(txn.db, disp_receipt) == saved[0]
     finally:
         rt_ext.close()
+
+
+def test_sp2_1_r2_unknown_store4_legacy_level_and_fixture_domain_level_oracle(
+    trusted_tmp: Path, os_: OsAdapters, clock: FakeClock
+) -> None:
+    """R2 oracle: raw I2 store4 rows decode as 'unknown' (not L1), and FixtureKernelDomain emits exact request level."""
+    from superbrain.core.kernel import ARTIFACT_LEVEL_UNKNOWN, is_verified_l1_send
+
+    mono = FakeMonotonicClock()
+
+    # Part A: bare SQLite I2-shape store4 rows for L0, L1, L2 requests all decode as 'unknown' & ineligible for L1.
+    rt_s4 = _open_fixture_runtime(trusted_tmp / "root-r2-i2-rows", os_)
+    try:
+        seeded_s4 = seed_principal_and_credential(rt_s4.policy)
+        _register_ws(rt_s4, clock, seeded_s4, alias="ws-main", checkout_dir=trusted_tmp / "chk-r2-i2-rows")
+        bridge_s4, _ = _make_bridge_and_domain(rt_s4, clock, mono)
+        seeded_rows: list[tuple[str, str, str]] = []
+        with rt_s4.store.transaction() as txn:
+            for req_lvl, state_val in (("L0", "served_only"), ("L1", "served_only"), ("L2", "pending")):
+                row_id = new_id()
+                dig = digest_bytes(f"legacy-{req_lvl}\n".encode())
+                dig_json = canonical_json([{"name": f"{req_lvl}.md", "digest": dig}]).decode("utf-8")
+                txn.db.execute(
+                    "INSERT INTO artifact_send_attempt "
+                    "(id, logical_result_id, principal_id, task_id, artifact_id, revision, digests_json, state) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        row_id,
+                        new_id(),
+                        seeded_s4.principal.principal_id,
+                        "task-r2-i2",
+                        f"art-r2-i2-{req_lvl.lower()}",
+                        1,
+                        dig_json,
+                        state_val,
+                    ),
+                )
+                seeded_rows.append((row_id, req_lvl, state_val))
+
+            for row_id, _req_lvl, _state_val in seeded_rows:
+                attempt = read_send_attempt_row(txn.db, row_id)
+                assert attempt is not None
+                assert attempt.level == ARTIFACT_LEVEL_UNKNOWN
+                assert attempt.revision_epoch == 0
+                assert is_verified_l1_send(attempt) is False
+
+        pending_id = seeded_rows[2][0]
+        comp = bridge_s4.build_send_completion(pending_id)
+        assert comp.level == ARTIFACT_LEVEL_UNKNOWN
+        fin = bridge_s4.finalize_send_attempt(comp)
+        assert fin.state is SendAttemptState.SERVED_ONLY
+        assert fin.level == ARTIFACT_LEVEL_UNKNOWN
+        assert is_verified_l1_send(fin) is False
+    finally:
+        rt_s4.close()
+
+    # Part B: FixtureKernelDomain.describe_artifact_send preserves L0/L1/L2, and only finalized L1 passes L1 check.
+    rt_ext = _open_fixture_runtime(trusted_tmp / "root-r2-domain-levels", os_)
+    try:
+        seeded_ext = seed_principal_and_credential(rt_ext.policy)
+        ws_ext = _register_ws(rt_ext, clock, seeded_ext, alias="ws-main", checkout_dir=trusted_tmp / "chk-r2-domain")
+        scope_ext = Scope(ws_ext.repo_id, ws_ext.checkout_id)
+        _upgrade_store_tables_to_extended(rt_ext.store)
+        bridge_ext, domain_ext = _make_bridge_and_domain(rt_ext, clock, mono)
+        task_id, _deliv = _prepare_task_on(
+            bridge_ext, token=seeded_ext.token, scope=scope_ext, idem_key="idem_r2_dom_prep_01"
+        )
+
+        for req_lvl in ("L0", "L1", "L2"):
+            art_id = f"art-r2-dom-{req_lvl.lower()}"
+            payload = f"# Content for {req_lvl}\n".encode()
+            domain_ext.seed_artifact(
+                bridge_ext,
+                artifact_id=art_id,
+                revision=1,
+                kind="skill",
+                owner_id=seeded_ext.principal.owner_id,
+                repo_id=ws_ext.repo_id,
+                checkout_id=ws_ext.checkout_id,
+                resources=(FixtureResourceSpec(name=f"{req_lvl}.md", content=payload, level=req_lvl),),
+            )
+            art_ok = _expect_ok(
+                "get_artifact",
+                _run_tool(
+                    bridge_ext,
+                    "get_artifact",
+                    {
+                        "schema_version": "2.0",
+                        "workspace_id": ws_ext.repo_id,
+                        "task_id": task_id,
+                        "artifact_id": art_id,
+                        "revision": 1,
+                        "level": req_lvl,
+                        "idempotency_key": f"idem_r2_dom_art_{req_lvl}",
+                    },
+                    token=seeded_ext.token,
+                    selected_scope=scope_ext,
+                ),
+            )
+            receipt_id = str(art_ok["served_receipt_id"])
+            with rt_ext.store.transaction() as txn:
+                attempt = read_send_attempt_row(txn.db, receipt_id)
+            assert attempt is not None
+            assert attempt.level == req_lvl
+
+            direct_spec = domain_ext.describe_artifact_send(
+                StoredResult(
+                    result_id=attempt.logical_result_id,
+                    assignment_id=None,
+                    refs=(ObjectRef(kind="artifact_result", id=attempt.logical_result_id, revision=1, digest=TREE_A),),
+                ),
+                art_ok,
+                seeded_ext.principal,
+                selected_scope=scope_ext,
+            )
+            assert direct_spec is not None
+            assert direct_spec.level == req_lvl
+
+            # Before finalize -> ineligible even for L1; after finalize -> eligible iff req_lvl == "L1".
+            assert is_verified_l1_send(attempt) is False
+            fin = bridge_ext.finalize_send_attempt(bridge_ext.build_send_completion(receipt_id))
+            assert is_verified_l1_send(fin) is (req_lvl == "L1")
+    finally:
+        rt_ext.close()
+
+
+class _R1ReplayProbeDomain(FixtureKernelDomain):
+    """Fixture domain supporting ``submit_episode`` & ``record_outcome`` while counting ``prepare_mutation``."""
+
+    def supports_tool(self, tool: str, *, deep: bool = False) -> bool:
+        if tool == "submit_episode":
+            return True
+        return super().supports_tool(tool, deep=deep)
+
+    def prepare_mutation(self, call: _kernel.Call, ctx: _kernel.CallContext, *, now: dt.datetime) -> PreparedEffect:
+        self.prepare_calls += 1
+        return super().prepare_mutation(call, ctx, now=now)
+
+    def render_stored(
+        self, result: StoredResult, principal: _kernel.Principal, *, selected_scope: Scope | None
+    ) -> dict[str, JsonValue]:
+        if result.refs and result.refs[0].kind == "episode_result":
+            return {"episode_id": result.result_id, "evidence_ids": [], "candidate_lesson_id": None}
+        if result.refs and result.refs[0].kind == "outcome_result":
+            return {"outcome_id": result.result_id, "status": "declared"}
+        return super().render_stored(result, principal, selected_scope=selected_scope)
+
+
+def test_sp2_1_r1_historical_i2_read_ack_hmac_replay_and_tamper_rejection(
+    trusted_tmp: Path, os_: OsAdapters, clock: FakeClock
+) -> None:
+    """R1 oracle: I2 4-key ReadAck HMAC rows replay cleanly on SP2 6-key ReadAcks iff bound attempt matches."""
+    mono = FakeMonotonicClock()
+    rt = _open_fixture_runtime(trusted_tmp / "root-r1-replay", os_)
+    try:
+        seeded = seed_principal_and_credential(rt.policy)
+        foreign = seed_principal_and_credential(rt.policy, harness_id="foreign-harness")
+        ws = _register_ws(rt, clock, seeded, alias="ws-main", checkout_dir=trusted_tmp / "chk-r1-replay")
+        scope = Scope(ws.repo_id, ws.checkout_id)
+        _upgrade_store_tables_to_extended(rt.store)
+
+        probe_domain = _R1ReplayProbeDomain(
+            store=rt.store,
+            policy=rt.policy,
+            clock=clock,
+            observer=RecordingObserver(descriptor=_desc()),
+            monotonic_ns=mono.monotonic_ns,
+        )
+        dispatcher = _make_dispatcher_for_domain(rt, clock, mono, probe_domain)
+        send_store = KernelSendAttemptStore(rt.store, rt.policy, writer_epoch=rt.lease.epoch)
+        rd_l1 = ResourceDigest(name="L1.md", digest=digest_bytes(b"# Verified L1 bytes\n"))
+        rd_alt = ResourceDigest(name="L1.md", digest=digest_bytes(b"# Tampered L1 bytes\n"))
+
+        attempt_main = _kernel.ArtifactSendAttempt(
+            send_attempt_id=new_id(),
+            logical_result_id=new_id(),
+            principal_id=seeded.principal.principal_id,
+            task_id="task-r1-01",
+            artifact_id="art-r1-01",
+            revision=1,
+            resource_digests=(rd_l1,),
+            state=SendAttemptState.SERVED_ONLY,
+            level="L1",
+            revision_epoch=0,
+        )
+        attempt_foreign = _kernel.ArtifactSendAttempt(
+            send_attempt_id=new_id(),
+            logical_result_id=new_id(),
+            principal_id=foreign.principal.principal_id,
+            task_id="task-r1-01",
+            artifact_id="art-r1-01",
+            revision=1,
+            resource_digests=(rd_l1,),
+            state=SendAttemptState.SERVED_ONLY,
+            level="L1",
+            revision_epoch=0,
+        )
+        attempt_epoch2 = _kernel.ArtifactSendAttempt(
+            send_attempt_id=new_id(),
+            logical_result_id=new_id(),
+            principal_id=seeded.principal.principal_id,
+            task_id="task-r1-01",
+            artifact_id="art-r1-ep2",
+            revision=1,
+            resource_digests=(rd_l1,),
+            state=SendAttemptState.SERVED_ONLY,
+            level="L1",
+            revision_epoch=2,
+        )
+        with rt.store.transaction() as txn:
+            for att in (attempt_main, attempt_foreign, attempt_epoch2):
+                insert_send_attempt_row(txn.db, att)
+
+        key_id, key_bytes = rt.policy.request_digest_key()
+        committed_at = ledger.utc_timestamp(clock.now())
+
+        def _seed_legacy_row(
+            tool: str,
+            idem_key: str,
+            legacy_args: dict[str, JsonValue],
+            result_id: str,
+            assignment_id: str | None,
+            ref: ObjectRef,
+        ) -> str:
+            legacy_payload = canonical_json(
+                {"tool": tool, "selected_scope": scope.to_dict(), "arguments": legacy_args}
+            )
+            legacy_hmac = compute_canonical_payload_hmac(key_bytes, legacy_payload)
+            row = _kernel.IdempotencyRow(
+                seeded.principal.principal_id,
+                tool,
+                compute_idempotency_key_hash(seeded.principal.principal_id, tool, idem_key),
+                key_id,
+                legacy_hmac,
+                result_id,
+                assignment_id,
+                (ref,),
+                committed_at,
+            )
+            with rt.store.transaction() as txn:
+                write_idempotency_row(txn.db, row)
+            return legacy_hmac
+
+        legacy_ack_main: dict[str, JsonValue] = {
+            "served_receipt_id": attempt_main.served_receipt_id,
+            "task_id": "task-r1-01",
+            "revision": 1,
+            "resource_digests": [rd_l1.to_dict()],
+        }
+        legacy_ack_foreign: dict[str, JsonValue] = {
+            "served_receipt_id": attempt_foreign.served_receipt_id,
+            "task_id": "task-r1-01",
+            "revision": 1,
+            "resource_digests": [rd_l1.to_dict()],
+        }
+        legacy_ack_ep2: dict[str, JsonValue] = {
+            "served_receipt_id": attempt_epoch2.served_receipt_id,
+            "task_id": "task-r1-01",
+            "revision": 1,
+            "resource_digests": [rd_l1.to_dict()],
+        }
+
+        ep_idem = "idem_r1_ep_hist_01"
+        base_ep_args: dict[str, JsonValue] = {
+            "schema_version": "2.0",
+            "workspace_id": ws.repo_id,
+            "checkout_id": ws.checkout_id,
+            "task_id": "task-r1-01",
+            "session_id": "sess-r1-01",
+            "evidence": [{"kind": "context", "data": {"msg": "i2-pre-upgrade"}}],
+            "read_acks": [legacy_ack_main],
+            "idempotency_key": ep_idem,
+        }
+        ep_hmac = _seed_legacy_row(
+            "submit_episode",
+            ep_idem,
+            base_ep_args,
+            "res-r1-ep-01",
+            None,
+            ObjectRef(kind="episode_result", id="res-r1-ep-01", revision=1, digest=TREE_A),
+        )
+
+        out_idem = "idem_r1_out_hist_1"
+        base_out_args: dict[str, JsonValue] = {
+            "schema_version": "2.0",
+            "workspace_id": ws.repo_id,
+            "delivery_id": "deliv-r1-01",
+            "outcome": "success",
+            "applied_refs": [{"kind": "skill", "id": "art-r1-01", "revision": 1, "digest": rd_l1.digest}],
+            "read_acks": [legacy_ack_main],
+            "idempotency_key": out_idem,
+        }
+        out_hmac = _seed_legacy_row(
+            "record_outcome",
+            out_idem,
+            base_out_args,
+            "res-r1-out-01",
+            "assign-r1-01",
+            ObjectRef(kind="outcome_result", id="res-r1-out-01", revision=1, digest=TREE_A),
+        )
+
+        # Also sign rows pointing to foreign receipt & epoch=2 receipt so stripped HMAC passes cleanly.
+        foreign_idem = "idem_r1_ep_foreign"
+        _seed_legacy_row(
+            "submit_episode",
+            foreign_idem,
+            {**base_ep_args, "idempotency_key": foreign_idem, "read_acks": [legacy_ack_foreign]},
+            "res-r1-ep-for",
+            None,
+            ObjectRef(kind="episode_result", id="res-r1-ep-for", revision=1, digest=TREE_A),
+        )
+        ep2_idem = "idem_r1_ep_epoch2_"
+        _seed_legacy_row(
+            "submit_episode",
+            ep2_idem,
+            {**base_ep_args, "idempotency_key": ep2_idem, "read_acks": [legacy_ack_ep2]},
+            "res-r1-ep-ep2",
+            None,
+            ObjectRef(kind="episode_result", id="res-r1-ep-ep2", revision=1, digest=TREE_A),
+        )
+        with rt.store.transaction() as txn:
+            advance_c4_hwm(txn.db, committed_at, current_hwm=None)
+        clock.advance(dt.timedelta(minutes=1))
+
+        auth = _kernel.PrivateRequestAuth(
+            credential_id=seeded.credential_id, principal=seeded.principal, token=seeded.token
+        )
+
+        def _ctx() -> _kernel.CallContext:
+            return _kernel.CallContext(
+                principal=seeded.principal,
+                identity=Identity(rt.store.store_id, rt.lease.epoch, "inst-r1"),
+                deadline_ns=mono.monotonic_ns() + 5_000 * MS,
+                selected_scope=scope,
+            )
+
+        sp2_ack_main: dict[str, JsonValue] = {**legacy_ack_main, "artifact_id": "art-r1-01", "revision_epoch": 0}
+        sp2_ep_args: dict[str, JsonValue] = {**base_ep_args, "read_acks": [sp2_ack_main]}
+        sp2_out_args: dict[str, JsonValue] = {**base_out_args, "read_acks": [sp2_ack_main]}
+
+        # Direct verify_request_hmac: fails without resolver or principal_id, succeeds with both.
+        sp2_ep_call = normalize_call("submit_episode", sp2_ep_args, seeded.principal, selected_scope=scope)
+        sp2_out_call = normalize_call("record_outcome", sp2_out_args, seeded.principal, selected_scope=scope)
+        assert verify_request_hmac(key_bytes, sp2_ep_call, ep_hmac) is False
+        assert verify_request_hmac(
+            key_bytes, sp2_ep_call, ep_hmac, principal_id=seeded.principal.principal_id, resolve_send_attempt=None
+        ) is False
+        assert verify_request_hmac(
+            key_bytes, sp2_ep_call, ep_hmac, principal_id=None, resolve_send_attempt=send_store.read_attempt
+        ) is False
+        assert verify_request_hmac(
+            key_bytes,
+            sp2_ep_call,
+            ep_hmac,
+            principal_id=seeded.principal.principal_id,
+            resolve_send_attempt=send_store.read_attempt,
+        ) is True
+        assert verify_request_hmac(key_bytes, sp2_out_call, out_hmac) is False
+        assert verify_request_hmac(
+            key_bytes,
+            sp2_out_call,
+            out_hmac,
+            principal_id=seeded.principal.principal_id,
+            resolve_send_attempt=send_store.read_attempt,
+        ) is True
+
+        # Positive KernelDispatcher replays with 0 prepare_calls
+        ep_ok = _expect_ok("submit_episode", dispatch(sp2_ep_call, _ctx(), auth=auth, dispatcher=dispatcher))
+        assert ep_ok == {"episode_id": "res-r1-ep-01", "evidence_ids": [], "candidate_lesson_id": None}
+        out_ok = _expect_ok("record_outcome", dispatch(sp2_out_call, _ctx(), auth=auth, dispatcher=dispatcher))
+        assert out_ok == {"outcome_id": "res-r1-out-01", "status": "declared"}
+        assert probe_domain.prepare_calls == 0
+
+        # Extended non-zero revision_epoch: wrong epoch=0 fails IDEMPOTENCY_CONFLICT, matching epoch=2 replays!
+        bad_ep2_args: dict[str, JsonValue] = {
+            **base_ep_args,
+            "idempotency_key": ep2_idem,
+            "read_acks": [{**legacy_ack_ep2, "artifact_id": "art-r1-ep2", "revision_epoch": 0}],
+        }
+        _expect_err(
+            "submit_episode",
+            dispatch(
+                normalize_call("submit_episode", bad_ep2_args, seeded.principal, selected_scope=scope),
+                _ctx(),
+                auth=auth,
+                dispatcher=dispatcher,
+            ),
+            ErrorCode.IDEMPOTENCY_CONFLICT,
+        )
+        ok_ep2_args: dict[str, JsonValue] = {
+            **base_ep_args,
+            "idempotency_key": ep2_idem,
+            "read_acks": [{**legacy_ack_ep2, "artifact_id": "art-r1-ep2", "revision_epoch": 2}],
+        }
+        ok_ep2 = _expect_ok(
+            "submit_episode",
+            dispatch(
+                normalize_call("submit_episode", ok_ep2_args, seeded.principal, selected_scope=scope),
+                _ctx(),
+                auth=auth,
+                dispatcher=dispatcher,
+            ),
+        )
+        assert ok_ep2 == {"episode_id": "res-r1-ep-ep2", "evidence_ids": [], "candidate_lesson_id": None}
+
+        # Negative variants for submit_episode & record_outcome -> IDEMPOTENCY_CONFLICT + 0 prepare_calls
+        bad_ep_variants: tuple[dict[str, JsonValue], ...] = (
+            {**base_ep_args, "read_acks": [{**sp2_ack_main, "artifact_id": "art-wrong"}]},
+            {**base_ep_args, "read_acks": [{**sp2_ack_main, "revision_epoch": 1}]},
+            {**base_ep_args, "read_acks": [{**sp2_ack_main, "resource_digests": [rd_alt.to_dict()]}]},
+            {**sp2_ep_args, "evidence": [{"kind": "context", "data": {"msg": "tampered"}}]},
+            {**base_ep_args, "read_acks": [{**sp2_ack_main, "task_id": "task-wrong"}]},
+            {**base_ep_args, "read_acks": [{**sp2_ack_main, "revision": 2}]},
+            {**base_ep_args, "read_acks": [{**sp2_ack_main, "served_receipt_id": new_id()}]},
+            {
+                **base_ep_args,
+                "idempotency_key": foreign_idem,
+                "read_acks": [{**legacy_ack_foreign, "artifact_id": "art-r1-01", "revision_epoch": 0}],
+            },
+        )
+        for bad_ep in bad_ep_variants:
+            bad_ep_call = normalize_call("submit_episode", bad_ep, seeded.principal, selected_scope=scope)
+            if bad_ep.get("idempotency_key") == ep_idem:
+                assert (
+                    verify_request_hmac(
+                        key_bytes,
+                        bad_ep_call,
+                        ep_hmac,
+                        principal_id=seeded.principal.principal_id,
+                        resolve_send_attempt=send_store.read_attempt,
+                    )
+                    is False
+                )
+            _expect_err(
+                "submit_episode",
+                dispatch(bad_ep_call, _ctx(), auth=auth, dispatcher=dispatcher),
+                ErrorCode.IDEMPOTENCY_CONFLICT,
+            )
+
+        bad_out_variants: tuple[dict[str, JsonValue], ...] = (
+            {**base_out_args, "read_acks": [{**sp2_ack_main, "artifact_id": "art-wrong"}]},
+            {**base_out_args, "read_acks": [{**sp2_ack_main, "revision_epoch": 1}]},
+            {**base_out_args, "read_acks": [{**sp2_ack_main, "resource_digests": [rd_alt.to_dict()]}]},
+            {**sp2_out_args, "outcome": "failure"},
+            {**sp2_out_args, "applied_refs": []},
+            {**base_out_args, "read_acks": [{**sp2_ack_main, "task_id": "task-wrong"}]},
+            {**base_out_args, "read_acks": [{**sp2_ack_main, "revision": 2}]},
+            {**base_out_args, "read_acks": [{**sp2_ack_main, "served_receipt_id": new_id()}]},
+        )
+        for bad_out in bad_out_variants:
+            bad_out_call = normalize_call("record_outcome", bad_out, seeded.principal, selected_scope=scope)
+            assert (
+                verify_request_hmac(
+                    key_bytes,
+                    bad_out_call,
+                    out_hmac,
+                    principal_id=seeded.principal.principal_id,
+                    resolve_send_attempt=send_store.read_attempt,
+                )
+                is False
+            )
+            _expect_err(
+                "record_outcome",
+                dispatch(bad_out_call, _ctx(), auth=auth, dispatcher=dispatcher),
+                ErrorCode.IDEMPOTENCY_CONFLICT,
+            )
+
+        assert probe_domain.prepare_calls == 0
+    finally:
+        rt.close()

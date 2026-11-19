@@ -1101,12 +1101,13 @@ class FixtureKernelDomain(KernelToolDomain):
             return None
         with self.store.transaction() as read_txn:
             r_row = read_txn.db.execute(
-                "SELECT task_id, artifact_id, revision FROM p_fixture_domain_artifact_results WHERE result_id = ?",
+                "SELECT task_id, artifact_id, revision, level "
+                "FROM p_fixture_domain_artifact_results WHERE result_id = ?",
                 (result.result_id,),
             ).fetchone()
         if r_row is None:
             raise BrainError(ErrorCode.NOT_FOUND, "not found")
-        task_id, artifact_id, revision = str(r_row[0]), str(r_row[1]), int(r_row[2])
+        task_id, artifact_id, revision, level = str(r_row[0]), str(r_row[1]), int(r_row[2]), str(r_row[3])
         digests: list[ResourceDigest] = []
         for item in raw_resources:
             if not isinstance(item, Mapping):
@@ -1123,6 +1124,7 @@ class FixtureKernelDomain(KernelToolDomain):
             artifact_id=artifact_id,
             revision=revision,
             resource_digests=tuple(digests),
+            level=level,
         )
 
     def _render_delivery_result(

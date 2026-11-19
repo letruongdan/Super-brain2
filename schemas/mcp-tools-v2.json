@@ -549,6 +549,49 @@
         {"$ref": "#/$defs/RedactedItem"}
       ]
     },
+    "DiscoverHandoffItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "id", "revision_epoch", "revision", "digest", "summary"],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "handoff"
+        },
+        "id": {"$ref": "#/$defs/OpaqueId"},
+        "revision_epoch": {"$ref": "#/$defs/NonNegativeInt"},
+        "revision": {"$ref": "#/$defs/PositiveInt"},
+        "digest": {"$ref": "#/$defs/Sha256Digest"},
+        "summary": {"$ref": "#/$defs/NonEmptyBoundedText"},
+        "status": {
+          "type": "string",
+          "const": "ok"
+        }
+      }
+    },
+    "DiscoverRedactedItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "status", "reason"],
+      "properties": {
+        "id": {"$ref": "#/$defs/OpaqueId"},
+        "kind": {
+          "type": "string",
+          "const": "handoff"
+        },
+        "status": {
+          "type": "string",
+          "const": "redacted"
+        },
+        "reason": {"$ref": "#/$defs/OpaqueId"}
+      }
+    },
+    "DiscoverContinuityItem": {
+      "oneOf": [
+        {"$ref": "#/$defs/DiscoverHandoffItem"},
+        {"$ref": "#/$defs/DiscoverRedactedItem"}
+      ]
+    },
     "SafeEvidenceObject": {
       "type": "object",
       "propertyNames": {
@@ -974,8 +1017,8 @@
         "checkout_id": {"$ref": "#/$defs/OpaqueId"},
         "continuity": {
           "type": "array",
-          "maxItems": 1024,
-          "items": {"$ref": "#/$defs/DeliveryItem"}
+          "maxItems": 3,
+          "items": {"$ref": "#/$defs/DiscoverContinuityItem"}
         },
         "degraded_codes": {
           "type": "array",

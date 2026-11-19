@@ -1842,6 +1842,7 @@ class ShimTestDomain(KernelToolDomain):
             artifact_id=artifact_id,
             revision=revision,
             resource_digests=(ResourceDigest(name=f"{level}.md", digest=digest_bytes(content.encode("utf-8"))),),
+            level=level,
         )
 
 

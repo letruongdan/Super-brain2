@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+from collections.abc import Callable, Mapping
 from datetime import datetime
 
 from superbrain.core.canonical import canonical_json, digest_bytes
@@ -11,7 +12,10 @@ from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.kernel import (
     IDEMPOTENCY_KEY_RE,
     IDEMPOTENCY_TTL,
+    ArtifactSendAttempt,
     Call,
+    ResourceDigest,
+    canonicalize_resource_digests,
     parse_canonical_utc,
     require_aware_utc,
     require_opaque_id,
@@ -70,8 +74,95 @@ def compute_request_hmac(key_bytes: bytes, call: Call, canonical_payload: bytes 
     return compute_canonical_payload_hmac(key_bytes, payload)
 
 
+def _verify_legacy_read_ack_hmac(
+    key_bytes: bytes,
+    call: Call,
+    expected_digest: str,
+    *,
+    principal_id: str | None,
+    resolve_send_attempt: Callable[[str], ArtifactSendAttempt | None] | None,
+) -> bool:
+    if call.tool not in {"submit_episode", "record_outcome"}:
+        return False
+    raw_acks = call.arguments.get("read_acks")
+    if not isinstance(raw_acks, list) or not raw_acks:
+        return False
+    if principal_id is None or resolve_send_attempt is None:
+        return False
+    legacy_acks: list[dict[str, object]] = []
+    for raw_ack in raw_acks:
+        if not isinstance(raw_ack, dict) or "artifact_id" not in raw_ack or "revision_epoch" not in raw_ack:
+            return False
+        legacy_acks.append({k: v for k, v in raw_ack.items() if k not in {"artifact_id", "revision_epoch"}})
+    legacy_payload = canonical_json(
+        {
+            "tool": call.tool,
+            "selected_scope": call.selected_scope.to_dict() if call.selected_scope is not None else None,
+            "arguments": {**call.arguments, "read_acks": legacy_acks},
+        }
+    )
+    legacy_actual = compute_canonical_payload_hmac(key_bytes, legacy_payload)
+    if not hmac.compare_digest(legacy_actual.encode("ascii"), expected_digest.encode("ascii")):
+        return False
+    for raw_ack in raw_acks:
+        assert isinstance(raw_ack, dict)
+        receipt_id = raw_ack.get("served_receipt_id")
+        task_id = raw_ack.get("task_id")
+        artifact_id = raw_ack.get("artifact_id")
+        rev_epoch = raw_ack.get("revision_epoch")
+        rev = raw_ack.get("revision")
+        raw_digests = raw_ack.get("resource_digests")
+        if (
+            not isinstance(receipt_id, str)
+            or not isinstance(task_id, str)
+            or not isinstance(artifact_id, str)
+            or isinstance(rev_epoch, bool)
+            or not isinstance(rev_epoch, int)
+            or rev_epoch < 0
+            or isinstance(rev, bool)
+            or not isinstance(rev, int)
+            or rev < 1
+            or not isinstance(raw_digests, list)
+            or not raw_digests
+        ):
+            return False
+        try:
+            typed_digests: list[ResourceDigest] = []
+            for entry in raw_digests:
+                if not isinstance(entry, Mapping):
+                    return False
+                typed_digests.append(ResourceDigest.from_dict(entry))
+            ordered_digests, _ = canonicalize_resource_digests(tuple(typed_digests))
+            attempt = resolve_send_attempt(receipt_id)
+        except BrainError:
+            return False
+        if attempt is None or (
+            attempt.principal_id,
+            attempt.task_id,
+            attempt.artifact_id,
+            attempt.revision_epoch,
+            attempt.revision,
+            attempt.resource_digests,
+        ) != (
+            principal_id,
+            task_id,
+            artifact_id,
+            rev_epoch,
+            rev,
+            ordered_digests,
+        ):
+            return False
+    return True
+
+
 def verify_request_hmac(
-    key_bytes: bytes, call: Call, expected_digest: str, canonical_payload: bytes | None = None
+    key_bytes: bytes,
+    call: Call,
+    expected_digest: str,
+    canonical_payload: bytes | None = None,
+    *,
+    principal_id: str | None = None,
+    resolve_send_attempt: Callable[[str], ArtifactSendAttempt | None] | None = None,
 ) -> bool:
     """Constant-time verification of ``call`` against stored ``expected_digest`` under ``key_bytes``."""
     require_sha256_digest(expected_digest)
@@ -89,7 +180,13 @@ def verify_request_hmac(
         )
         legacy_actual = compute_canonical_payload_hmac(key_bytes, legacy_payload)
         return hmac.compare_digest(legacy_actual.encode("ascii"), expected_digest.encode("ascii"))
-    return False
+    return _verify_legacy_read_ack_hmac(
+        key_bytes,
+        call,
+        expected_digest,
+        principal_id=principal_id,
+        resolve_send_attempt=resolve_send_attempt,
+    )
 
 
 def is_idempotency_expired(committed_at: str | datetime, now: datetime) -> bool:

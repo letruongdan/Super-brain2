@@ -258,7 +258,15 @@ class KernelDispatcher:
         if stored_key is None:
             raise BrainError(ErrorCode.POLICY_UNAVAILABLE, "policy unavailable")
         if not is_idempotency_expired(row.committed_at, now):
-            if not verify_request_hmac(stored_key, call, row.request_digest, canonical_payload):
+            resolver = self._send_attempts.read_attempt if self._send_attempts is not None else None
+            if not verify_request_hmac(
+                stored_key,
+                call,
+                row.request_digest,
+                canonical_payload,
+                principal_id=row.principal_id,
+                resolve_send_attempt=resolver,
+            ):
                 raise BrainError(ErrorCode.IDEMPOTENCY_CONFLICT, "idempotency conflict")
             return True
         return False

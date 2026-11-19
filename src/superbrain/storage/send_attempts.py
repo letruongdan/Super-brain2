@@ -8,6 +8,7 @@ from dataclasses import replace
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.ids import new_id
 from superbrain.core.kernel import (
+    ARTIFACT_LEVEL_UNKNOWN,
     ArtifactReadAck,
     ArtifactSendAttempt,
     ArtifactSendSpec,
@@ -84,7 +85,7 @@ def read_send_attempt_row(db: sqlite3.Connection, send_attempt_id: str) -> Artif
         ) = row
     else:
         raw_id, raw_res_id, raw_principal, raw_task, raw_artifact, raw_rev, raw_digests_json, raw_state = row
-        raw_level = "L1"
+        raw_level = ARTIFACT_LEVEL_UNKNOWN
         raw_epoch = 0
     if (
         not isinstance(raw_id, str)
@@ -123,7 +124,7 @@ def insert_send_attempt_row(db: sqlite3.Connection, attempt: ArtifactSendAttempt
     if not isinstance(attempt, ArtifactSendAttempt):
         raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
     has_ext = _has_extended_columns(db, "artifact_send_attempt", _SEND_ATTEMPT_EXT_COLS)
-    if not has_ext and (attempt.level != "L1" or attempt.revision_epoch != 0):
+    if not has_ext and (attempt.level not in ("L1", ARTIFACT_LEVEL_UNKNOWN) or attempt.revision_epoch != 0):
         raise BrainError(ErrorCode.CAPABILITY_UNAVAILABLE, "capability unavailable")
     _, digests_json = canonicalize_resource_digests(attempt.resource_digests)
     try:
@@ -341,7 +342,10 @@ class KernelSendAttemptStore(KernelSendAttemptPort):
         )
         with self._store.transaction() as txn:
             insert_send_attempt_row(txn.db, attempt)
-        return attempt
+            persisted = read_send_attempt_row(txn.db, attempt.send_attempt_id)
+        if persisted is None:
+            raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
+        return persisted
 
     def read_attempt(self, send_attempt_id: str) -> ArtifactSendAttempt | None:
         self._check_live()

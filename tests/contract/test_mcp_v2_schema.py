@@ -1287,7 +1287,15 @@ def test_sp2_1_schema_and_normalizer_extensions() -> None:
     assert prep_in.is_valid(valid_work_resume)
     assert not prep_in.is_valid({**valid_work_resume, "seen_handoff_refs": seen_64 + [seen_64[0]]})
 
-    # 2. PrepareTaskResult & HandoffLive oneOf + DeliveredRefItem handoff rule
+    # 2. PrepareTaskResult & HandoffLive oneOf + DiscoverContinuityItem + DeliveredRefItem handoff rule
+    discover_l0_item: dict[str, JsonValue] = {
+        "kind": "handoff",
+        "id": "hand-1",
+        "revision_epoch": 0,
+        "revision": 1,
+        "digest": "sha256:" + ("a" * 64),
+        "summary": "goal",
+    }
     assert prep_out.is_valid(
         {
             "ok": True,
@@ -1295,19 +1303,47 @@ def test_sp2_1_schema_and_normalizer_extensions() -> None:
                 "workspace_id": "repo-01",
                 "checkout_id": "chk-a",
                 "continuity": [
-                    {
-                        "kind": "handoff",
-                        "id": "hand-1",
-                        "revision_epoch": 0,
-                        "revision": 1,
-                        "digest": "sha256:" + ("a" * 64),
-                        "summary": "goal",
-                    }
+                    discover_l0_item,
+                    {"kind": "handoff", "id": "hand-2", "status": "redacted", "reason": "expired"},
+                    {"id": "hand-3", "status": "redacted", "reason": "quarantined"},
                 ],
                 "degraded_codes": [],
             },
         }
     )
+    assert prep_out.is_valid(
+        {
+            "ok": True,
+            "data": {
+                "workspace_id": "repo-01",
+                "checkout_id": "chk-a",
+                "continuity": [{**discover_l0_item, "status": "ok"}],
+                "degraded_codes": [],
+            },
+        }
+    )
+    bad_discover_continuities: tuple[list[dict[str, JsonValue]], ...] = (
+        [{**discover_l0_item, "id": f"hand-{i}"} for i in range(4)],
+        [{**discover_l0_item, "kind": "skill"}],
+        [{"kind": "skill", "id": "skill-1", "status": "redacted", "reason": "expired"}],
+        [{k: v for k, v in discover_l0_item.items() if k != "summary"}],
+        [{**discover_l0_item, "summary": ""}],
+        [{k: v for k, v in discover_l0_item.items() if k != "revision_epoch"}],
+        [{**discover_l0_item, "revision_epoch": -1}],
+        [{**discover_l0_item, "status": "stale"}],
+    )
+    for bad_cont in bad_discover_continuities:
+        assert not prep_out.is_valid(
+            {
+                "ok": True,
+                "data": {
+                    "workspace_id": "repo-01",
+                    "checkout_id": "chk-a",
+                    "continuity": bad_cont,
+                    "degraded_codes": [],
+                },
+            }
+        )
     assert not prep_out.is_valid(
         {
             "ok": True,

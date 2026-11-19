@@ -18,11 +18,19 @@ from superbrain.core._kernel_workspace import require_uuid
 from superbrain.core.canonical import canonical_json
 from superbrain.core.errors import BrainError, ErrorCode
 
+ARTIFACT_LEVEL_UNKNOWN = "unknown"
 _VALID_ARTIFACT_LEVELS: frozenset[str] = frozenset({"L0", "L1", "L2"})
+_VALID_STORED_ARTIFACT_LEVELS: frozenset[str] = _VALID_ARTIFACT_LEVELS | {ARTIFACT_LEVEL_UNKNOWN}
 
 
 def _require_artifact_level(value: object) -> str:
     if not isinstance(value, str) or value not in _VALID_ARTIFACT_LEVELS:
+        raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+    return value
+
+
+def _require_stored_artifact_level(value: object) -> str:
+    if not isinstance(value, str) or value not in _VALID_STORED_ARTIFACT_LEVELS:
         raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
     return value
 
@@ -139,13 +147,22 @@ class ArtifactSendAttempt:
         object.__setattr__(self, "resource_digests", ordered)
         if not isinstance(self.state, SendAttemptState):
             raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
-        _require_artifact_level(self.level)
+        _require_stored_artifact_level(self.level)
         require_non_negative_int(self.revision_epoch)
 
     @property
     def served_receipt_id(self) -> str:
         """Selected identity (C5:111): ``served_receipt_id == send_attempt_id == artifact_send_attempt.id``."""
         return self.send_attempt_id
+
+
+def is_verified_l1_send(attempt: ArtifactSendAttempt) -> bool:
+    """Return True iff ``attempt`` is a flushed ``SERVED_ONLY`` receipt durably recorded as ``L1``."""
+    return (
+        isinstance(attempt, ArtifactSendAttempt)
+        and attempt.state is SendAttemptState.SERVED_ONLY
+        and attempt.level == "L1"
+    )
 
 
 @dataclass(frozen=True)
@@ -176,7 +193,7 @@ class SendAttemptCompletion:
         object.__setattr__(self, "resource_digests", ordered)
         if not isinstance(self.identity, Identity):
             raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
-        _require_artifact_level(self.level)
+        _require_stored_artifact_level(self.level)
         require_non_negative_int(self.revision_epoch)
 
 

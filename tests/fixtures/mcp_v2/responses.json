@@ -292,6 +292,40 @@
       }
     },
     {
+      "name": "prepare_task_discover_redacted",
+      "tool": "prepare_task",
+      "envelope": {
+        "ok": true,
+        "data": {
+          "workspace_id": "repo-01",
+          "checkout_id": "chk-a",
+          "continuity": [
+            {
+              "kind": "handoff",
+              "id": "hand-019a5390-0001",
+              "revision_epoch": 2,
+              "revision": 3,
+              "digest": "sha256:abababababababababababababababababababababababababababababababab",
+              "summary": "Goal: finish SP2-1 schema and handshake | Status: open | Pending changes: 1",
+              "status": "ok"
+            },
+            {
+              "kind": "handoff",
+              "id": "hand-019a5390-0002",
+              "status": "redacted",
+              "reason": "expired"
+            },
+            {
+              "id": "hand-019a5390-0003",
+              "status": "redacted",
+              "reason": "quarantined"
+            }
+          ],
+          "degraded_codes": []
+        }
+      }
+    },
+    {
       "name": "prepare_task_work_with_handoff_live",
       "tool": "prepare_task",
       "envelope": {

@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tarfile
 import threading
+import time
 from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any, cast
@@ -22,7 +23,7 @@ import pytest
 
 from superbrain.adapters.os import os_adapters
 from superbrain.adapters.os.tls_material import create_store_tls
-from superbrain.core.canonical import canonical_json
+from superbrain.core.canonical import canonical_json, digest_bytes
 from superbrain.core.errors import ErrorCode
 from superbrain.core.kernel import Endpoint
 from superbrain.core.wire import load_catalog, parse_json
@@ -31,6 +32,7 @@ from tests.support.inc2_cli import (
     InstalledServeProcess,
     decode_stdio_frames,
     encode_stdio_frames,
+    get_shared_t7_transport_template,
     mcp_call_frame,
     mcp_init_frames,
     run_installed_command,
@@ -51,7 +53,7 @@ from tests.support.inc2_fixture import (
     _make_trusted_session_dir,
     open_kernel_job_runtime,
 )
-from tests.support.inc2_transport import read_raw_http_response
+from tests.support.inc2_transport import clone_owner_only_tree, read_raw_http_response
 from tests.support.kernel_auth import (
     generate_bearer_token,
     make_bootstrap_auth,
@@ -413,10 +415,11 @@ def _call_installed_mcp(
     prefix_args: list[str],
     profile_path: Path,
     cwd: Path,
+    tool: str = "get_health",
+    arguments: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    stdin_bytes = encode_stdio_frames(
-        [*mcp_init_frames(1), mcp_call_frame(2, "get_health", {"schema_version": "2.0"})]
-    )
+    tool_args = dict(arguments) if arguments is not None else {"schema_version": "2.0"}
+    stdin_bytes = encode_stdio_frames([*mcp_init_frames(1), mcp_call_frame(2, tool, tool_args)])
     proc = run_installed_command(
         env,
         script_name,
@@ -760,3 +763,608 @@ def test_cross_wheel_compatibility_matrix_and_raw_tls_probes(
                 "error": {"code": "unsupported_version", "message": "unsupported version"},
             }
     assert _read_ledger_seq(sp2_d.data_root) == sp2_seq_before
+
+
+_UPGRADE_DOMAIN_SCRIPT = '''
+from __future__ import annotations
+
+import dataclasses
+import json
+import sys
+import threading
+from pathlib import Path
+from typing import Any
+
+from superbrain.application.send_attempts import extract_projected_read_acks, record_projected_read_acks
+from superbrain.application.dispatch import PreparedEffect
+from superbrain.composition.daemon_entry import serve_config_path
+from superbrain.core.canonical import canonical_json, digest_bytes
+from superbrain.core.errors import BrainError, ErrorCode
+from superbrain.core.ids import new_id
+from superbrain.core.kernel import (
+    ArtifactSendSpec,
+    Call,
+    CallContext,
+    KernelRecord,
+    ObjectRef,
+    Principal,
+    ResourceDigest,
+    Scope,
+    StoredResult,
+    require_opaque_id,
+)
+from superbrain.ports.kernel import KernelTx
+
+
+class _AllowPolicy:
+    def allows(self, _p: object, _s: object, *, action: str) -> bool:
+        del action
+        return True
+
+
+class _PersistentUpgradeDomain:
+    def __init__(self, state_path: Path, prep_log_path: Path) -> None:
+        self._state_path = state_path
+        self._prep_log_path = prep_log_path
+        self._lock = threading.Lock()
+        if state_path.is_file():
+            raw = json.loads(state_path.read_text(encoding="utf-8"))
+            self._task_scopes: dict[str, list[str]] = dict(raw["task_scopes"])
+            self._deliveries: dict[str, list[str]] = dict(raw["deliveries"])
+            self._stored_meta: dict[str, dict[str, Any]] = dict(raw["stored_meta"])
+        else:
+            self._task_scopes = {}
+            self._deliveries = {}
+            self._stored_meta = {}
+
+    def _persist_locked(self) -> None:
+        snap = {
+            "task_scopes": self._task_scopes,
+            "deliveries": self._deliveries,
+            "stored_meta": self._stored_meta,
+        }
+        self._state_path.write_text(json.dumps(snap, sort_keys=True), encoding="utf-8")
+
+    def supports_tool(self, tool: str, *, deep: bool = False) -> bool:
+        return False if deep else tool in {"prepare_task", "get_artifact", "record_outcome", "submit_episode"}
+
+    def execute_readonly(self, call: Call, ctx: CallContext) -> dict[str, Any]:
+        del call, ctx
+        raise BrainError(ErrorCode.CAPABILITY_UNAVAILABLE, "capability unavailable")
+
+    def prepare_mutation(self, call: Call, ctx: CallContext, *, now: Any) -> PreparedEffect:
+        del now
+        with self._lock:
+            entry = json.dumps({"tool": call.tool, "idem": call.arguments.get("idempotency_key")}) + "\\n"
+            with self._prep_log_path.open("a", encoding="utf-8") as fh:
+                fh.write(entry)
+        scope = call.selected_scope
+        if scope is None or scope.checkout_id is None:
+            raise BrainError(ErrorCode.CAPABILITY_UNAVAILABLE, "capability unavailable")
+        if call.tool == "prepare_task":
+            task_id = new_id()
+            delivery_id = new_id()
+            assignment_id = new_id()
+            res_id = new_id()
+            meta = {
+                "kind": "delivery_result",
+                "result_id": res_id,
+                "task_id": task_id,
+                "delivery_id": delivery_id,
+                "assignment_id": assignment_id,
+                "owner_id": ctx.principal.owner_id,
+                "repo_id": scope.repo_id,
+                "checkout_id": scope.checkout_id,
+            }
+            blob = canonical_json(meta)
+            ref = ObjectRef(kind="delivery_result", id=res_id, revision=1, digest=digest_bytes(blob))
+
+            def _apply_prep(tx: KernelTx) -> StoredResult:
+                tx.hold_blob(blob, holder_id=res_id)
+                tx.append_record(
+                    KernelRecord(
+                        "lineage.task_bound",
+                        {
+                            "task_id": task_id,
+                            "owner_id": ctx.principal.owner_id,
+                            "repo_id": scope.repo_id,
+                            "checkout_id": scope.checkout_id,
+                            "delivery_id": delivery_id,
+                            "assignment_id": assignment_id,
+                            "source_snapshot_id": None,
+                            "snapshot_status": "unavailable",
+                            "selector_path": "rules",
+                            "selector_reason": "provider_unavailable",
+                        },
+                    )
+                )
+                with self._lock:
+                    self._task_scopes[task_id] = [ctx.principal.owner_id, scope.repo_id, scope.checkout_id]
+                    self._deliveries[delivery_id] = [
+                        ctx.principal.owner_id,
+                        scope.repo_id,
+                        scope.checkout_id,
+                        assignment_id,
+                        task_id,
+                    ]
+                    self._stored_meta[res_id] = meta
+                    self._persist_locked()
+                return StoredResult(result_id=res_id, assignment_id=assignment_id, refs=(ref,))
+
+            return PreparedEffect(blobs=(blob,), apply=_apply_prep)
+
+        if call.tool == "get_artifact":
+            task_id = require_opaque_id(call.arguments["task_id"], label="task_id")
+            artifact_id = require_opaque_id(call.arguments["artifact_id"], label="artifact_id")
+            revision = int(call.arguments["revision"])
+            level = str(call.arguments["level"])
+            res_id = new_id()
+            meta = {
+                "kind": "artifact_result",
+                "result_id": res_id,
+                "task_id": task_id,
+                "artifact_id": artifact_id,
+                "revision": revision,
+                "level": level,
+                "owner_id": ctx.principal.owner_id,
+                "repo_id": scope.repo_id,
+                "checkout_id": scope.checkout_id,
+            }
+            blob = canonical_json(meta)
+            ref = ObjectRef(kind="artifact_result", id=res_id, revision=1, digest=digest_bytes(blob))
+
+            def _apply_art(tx: KernelTx) -> StoredResult:
+                tx.hold_blob(blob, holder_id=res_id)
+                with self._lock:
+                    self._stored_meta[res_id] = meta
+                    self._persist_locked()
+                return StoredResult(result_id=res_id, assignment_id=None, refs=(ref,))
+
+            return PreparedEffect(blobs=(blob,), apply=_apply_art)
+
+        if call.tool == "record_outcome":
+            delivery_id = require_opaque_id(call.arguments["delivery_id"], label="delivery_id")
+            with self._lock:
+                deliv = self._deliveries.get(delivery_id)
+            if deliv is None:
+                raise BrainError(ErrorCode.NOT_FOUND, "not found")
+            assignment_id, task_id = deliv[3], deliv[4]
+            projected_acks = extract_projected_read_acks(dict(call.arguments))
+            outcome_id = new_id()
+            meta = {
+                "kind": "outcome_result",
+                "result_id": outcome_id,
+                "owner_id": ctx.principal.owner_id,
+                "repo_id": scope.repo_id,
+                "checkout_id": scope.checkout_id,
+            }
+            blob = canonical_json(meta)
+            ref = ObjectRef(kind="outcome_result", id=outcome_id, revision=1, digest=digest_bytes(blob))
+
+            def _apply_out(tx: KernelTx) -> StoredResult:
+                if projected_acks:
+                    record_projected_read_acks(
+                        tx,
+                        policy=_AllowPolicy(),
+                        principal=ctx.principal,
+                        effective_scope=scope,
+                        expected_task_id=task_id,
+                        acks=projected_acks,
+                        action="record_outcome",
+                    )
+                tx.hold_blob(blob, holder_id=outcome_id)
+                with self._lock:
+                    self._stored_meta[outcome_id] = meta
+                    self._persist_locked()
+                return StoredResult(result_id=outcome_id, assignment_id=assignment_id, refs=(ref,))
+
+            return PreparedEffect(blobs=(blob,), apply=_apply_out)
+
+        if call.tool == "submit_episode":
+            task_id = require_opaque_id(call.arguments["task_id"], label="task_id")
+            projected_acks = extract_projected_read_acks(dict(call.arguments))
+            episode_id = new_id()
+            meta = {
+                "kind": "episode_result",
+                "result_id": episode_id,
+                "owner_id": ctx.principal.owner_id,
+                "repo_id": scope.repo_id,
+                "checkout_id": scope.checkout_id,
+            }
+            blob = canonical_json(meta)
+            ref = ObjectRef(kind="episode_result", id=episode_id, revision=1, digest=digest_bytes(blob))
+
+            def _apply_ep(tx: KernelTx) -> StoredResult:
+                if projected_acks:
+                    record_projected_read_acks(
+                        tx,
+                        policy=_AllowPolicy(),
+                        principal=ctx.principal,
+                        effective_scope=scope,
+                        expected_task_id=task_id,
+                        acks=projected_acks,
+                        action="submit_episode",
+                    )
+                tx.hold_blob(blob, holder_id=episode_id)
+                with self._lock:
+                    self._stored_meta[episode_id] = meta
+                    self._persist_locked()
+                return StoredResult(result_id=episode_id, assignment_id=None, refs=(ref,))
+
+            return PreparedEffect(blobs=(blob,), apply=_apply_ep)
+
+        raise BrainError(ErrorCode.CAPABILITY_UNAVAILABLE, "capability unavailable")
+
+    def render_stored(
+        self, result: StoredResult, principal: Principal, *, selected_scope: Scope | None
+    ) -> dict[str, Any]:
+        with self._lock:
+            meta = self._stored_meta.get(result.result_id)
+        if meta is None:
+            raise BrainError(ErrorCode.NOT_FOUND, "not found")
+        expected_scope = Scope(repo_id=str(meta["repo_id"]), checkout_id=str(meta["checkout_id"]))
+        if principal.owner_id != str(meta["owner_id"]) or selected_scope != expected_scope:
+            raise BrainError(ErrorCode.NOT_FOUND, "not found")
+        kind = str(meta["kind"])
+        if kind == "delivery_result":
+            return {
+                "workspace_id": str(meta["repo_id"]),
+                "checkout_id": str(meta["checkout_id"]),
+                "source_snapshot_id": None,
+                "snapshot_status": "unavailable",
+                "degraded_codes": ["snapshot_unavailable"],
+                "task_id": str(meta["task_id"]),
+                "delivery_id": str(meta["delivery_id"]),
+                "assignment_id": str(meta["assignment_id"]),
+                "skills": [],
+                "lessons": [],
+                "continuity": [],
+                "context": {"summary_md": "upgrade-domain", "sources": [], "unknown_source": False},
+                "finishing_gates": [],
+            }
+        if kind == "artifact_result":
+            art_id = str(meta["artifact_id"])
+            rev = int(meta["revision"])
+            lvl = str(meta["level"])
+            content = f"# Upgrade {art_id}@{rev} ({lvl})\\n"
+            return {
+                "artifact_id": art_id,
+                "revision": rev,
+                "level": lvl,
+                "status": "ok",
+                "resources": [
+                    {
+                        "name": f"{lvl}.md",
+                        "digest": digest_bytes(content.encode("utf-8")),
+                        "encoding": "utf-8",
+                        "content": content,
+                    }
+                ],
+            }
+        if kind == "outcome_result":
+            return {"outcome_id": str(meta["result_id"]), "status": "declared"}
+        if kind == "episode_result":
+            return {"episode_id": str(meta["result_id"]), "evidence_ids": [], "candidate_lesson_id": None}
+        raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
+
+    def describe_artifact_send(
+        self,
+        result: StoredResult,
+        rendered: Mapping[str, Any],
+        principal: Principal,
+        *,
+        selected_scope: Scope | None,
+    ) -> ArtifactSendSpec | None:
+        del rendered, selected_scope
+        if not result.refs or result.refs[0].kind != "artifact_result":
+            return None
+        with self._lock:
+            meta = self._stored_meta.get(result.result_id)
+        if meta is None:
+            return None
+        art_id = str(meta["artifact_id"])
+        rev = int(meta["revision"])
+        lvl = str(meta["level"])
+        content = f"# Upgrade {art_id}@{rev} ({lvl})\\n"
+        spec_kwargs: dict[str, Any] = {
+            "logical_result_id": result.result_id,
+            "principal_id": principal.principal_id,
+            "task_id": str(meta["task_id"]),
+            "artifact_id": art_id,
+            "revision": rev,
+            "resource_digests": (ResourceDigest(name=f"{lvl}.md", digest=digest_bytes(content.encode("utf-8"))),),
+        }
+        if "level" in {f.name for f in dataclasses.fields(ArtifactSendSpec)}:
+            spec_kwargs["level"] = lvl
+        return ArtifactSendSpec(**spec_kwargs)
+
+
+if __name__ == "__main__":
+    cfg_p, state_p, log_p = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3])
+    raise SystemExit(serve_config_path(cfg_p, domain=_PersistentUpgradeDomain(state_p, log_p)))
+'''
+
+
+def _wait_send_attempt_served(db_path: Path, receipt_id: str, *, timeout_s: float = 3.0) -> None:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+            row = conn.execute("SELECT state FROM artifact_send_attempt WHERE id = ?", (receipt_id,)).fetchone()
+        if row is not None and row[0] == "served_only":
+            return
+        threading.Event().wait(0.01)
+    raise AssertionError(f"send_attempt {receipt_id} did not settle to served_only within {timeout_s}s")
+
+
+def test_i2_to_sp2_daemon_upgrade_replays_read_acks_and_marks_store4_attempts_unknown(
+    frozen_i2_installed_env: InstalledEnv,
+    inc2_installed_env: InstalledEnv,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """R1+R2 live two-daemon upgrade: I2 wheel commits -> SP2 wheel replays 6-key ReadAcks & decodes unknown level."""
+    from superbrain.core.kernel import ARTIFACT_LEVEL_UNKNOWN, is_verified_l1_send
+    from superbrain.storage.send_attempts import read_send_attempt_row
+
+    tpl = get_shared_t7_transport_template()
+    assert tpl.ws_a is not None
+    ws_a = tpl.ws_a
+    upg_dir = _make_trusted_session_dir("i2-sp2-upgrade-", tmp_path_factory)
+    try:
+        data_root = upg_dir / "data"
+        clone_owner_only_tree(tpl.root, data_root)
+        os_adapters().permissions.secure_directory(data_root)
+
+        cfg_path = write_daemon_config_file(
+            upg_dir / "daemon-config.json",
+            data_root=data_root,
+            expected_store_id=tpl.store_id,
+            cert_path=tpl.tls.cert_path,
+            key_path=tpl.tls.key_path,
+        )
+        ca_path = write_ca_file(upg_dir / "ca.pem", tpl.tls.ca_cert_path.read_bytes())
+        cred_path = write_credential_file(upg_dir / "cred.txt", tpl.cred.token)
+        profile_path, _ = write_client_profile_file(
+            upg_dir / "profile.json",
+            endpoint_path=data_root / "endpoint.json",
+            expected_store_id=tpl.store_id,
+            ca_file=ca_path,
+            leaf_cert_sha256=tpl.tls.leaf_cert_sha256,
+            credential_file=cred_path,
+            workspace={
+                "alias": ws_a.alias,
+                "checkout_path": str(ws_a.checkout_path),
+                "expected_workspace_id": ws_a.repo_id,
+                "expected_checkout_id": ws_a.checkout_id,
+            },
+        )
+        runner_script = upg_dir / "upgrade_domain_runner.py"
+        runner_script.write_text(_UPGRADE_DOMAIN_SCRIPT.lstrip(), encoding="utf-8")
+        state_path = upg_dir / "domain-state.json"
+        i2_prep_log = upg_dir / "i2-prep.jsonl"
+        sp2_prep_log = upg_dir / "sp2-prep.jsonl"
+        client_cwd = Path(ws_a.checkout_path)
+        db_path = data_root / "store" / "brain.db"
+
+        # Phase 1: Real frozen I2 (035a4cd) daemon commits L0/L1/L2 get_artifact + I2 4-key ReadAck episode & outcome.
+        i2_proc = InstalledServeProcess(
+            [str(frozen_i2_installed_env.venv_python), "-I", str(runner_script),
+             str(cfg_path), str(state_path), str(i2_prep_log)],
+            data_root=data_root,
+            cwd=upg_dir,
+        )
+        try:
+            i2_proc.wait_ready(timeout=15.0)
+            prep_res = _call_installed_mcp(
+                frozen_i2_installed_env,
+                script_name="brain-mcp",
+                prefix_args=[],
+                profile_path=profile_path,
+                cwd=client_cwd,
+                tool="prepare_task",
+                arguments={
+                    "schema_version": "2.0",
+                    "workspace_hint": ws_a.alias,
+                    "description": "I2 pre-upgrade commit",
+                    "idempotency_key": "idem-upg-prep-0001",
+                },
+            )
+            assert prep_res["ok"] is True
+            prep_data = cast(dict[str, Any], prep_res["data"])
+            task_id = str(prep_data["task_id"])
+            delivery_id = str(prep_data["delivery_id"])
+
+            receipts: list[tuple[str, str, str, str]] = []
+            for idx, (art_id, lvl) in enumerate(
+                (("art-upg-l1-ep", "L1"), ("art-upg-l1-out", "L1"), ("art-upg-l0", "L0"), ("art-upg-l2", "L2")),
+                start=1,
+            ):
+                art_res = _call_installed_mcp(
+                    frozen_i2_installed_env,
+                    script_name="brain-mcp",
+                    prefix_args=[],
+                    profile_path=profile_path,
+                    cwd=client_cwd,
+                    tool="get_artifact",
+                    arguments={
+                        "schema_version": "2.0",
+                        "workspace_id": ws_a.repo_id,
+                        "task_id": task_id,
+                        "artifact_id": art_id,
+                        "revision": 1,
+                        "level": lvl,
+                        "idempotency_key": f"idem-upg-art-{idx:04d}",
+                    },
+                )
+                assert art_res["ok"] is True
+                art_data = cast(dict[str, Any], art_res["data"])
+                rcpt = str(art_data["served_receipt_id"])
+                dig = str(cast(list[dict[str, Any]], art_data["resources"])[0]["digest"])
+                _wait_send_attempt_served(db_path, rcpt)
+                receipts.append((art_id, lvl, rcpt, dig))
+
+            receipt_ep, digest_ep = receipts[0][2], receipts[0][3]
+            receipt_out, digest_out = receipts[1][2], receipts[1][3]
+
+            legacy_ack_ep: dict[str, Any] = {
+                "served_receipt_id": receipt_ep,
+                "task_id": task_id,
+                "revision": 1,
+                "resource_digests": [{"name": "L1.md", "digest": digest_ep}],
+            }
+            ep_args_i2: dict[str, Any] = {
+                "schema_version": "2.0",
+                "workspace_id": ws_a.repo_id,
+                "checkout_id": ws_a.checkout_id,
+                "task_id": task_id,
+                "session_id": "sess-upg-0001",
+                "evidence": [{"kind": "context", "data": {"step": "i2-commit"}}],
+                "read_acks": [legacy_ack_ep],
+                "idempotency_key": "idem-upg-ep-00001",
+            }
+            ep_res_i2 = _call_installed_mcp(
+                frozen_i2_installed_env,
+                script_name="brain-mcp",
+                prefix_args=[],
+                profile_path=profile_path,
+                cwd=client_cwd,
+                tool="submit_episode",
+                arguments=ep_args_i2,
+            )
+            assert ep_res_i2["ok"] is True
+            i2_ep_data = cast(dict[str, Any], ep_res_i2["data"])
+
+            legacy_ack_out: dict[str, Any] = {
+                "served_receipt_id": receipt_out,
+                "task_id": task_id,
+                "revision": 1,
+                "resource_digests": [{"name": "L1.md", "digest": digest_out}],
+            }
+            out_args_i2: dict[str, Any] = {
+                "schema_version": "2.0",
+                "workspace_id": ws_a.repo_id,
+                "delivery_id": delivery_id,
+                "outcome": "success",
+                "applied_refs": [{"kind": "skill", "id": "art-upg-l1-out", "revision": 1, "digest": digest_out}],
+                "read_acks": [legacy_ack_out],
+                "idempotency_key": "idem-upg-out-0001",
+            }
+            out_res_i2 = _call_installed_mcp(
+                frozen_i2_installed_env,
+                script_name="brain-mcp",
+                prefix_args=[],
+                profile_path=profile_path,
+                cwd=client_cwd,
+                tool="record_outcome",
+                arguments=out_args_i2,
+            )
+            assert out_res_i2["ok"] is True
+            i2_out_data = cast(dict[str, Any], out_res_i2["data"])
+        finally:
+            i2_proc.close()
+
+        # Verify pre-upgrade I2 store4 send attempts all read on SP2 as level='unknown' (NOT 'L1') & ineligible.
+        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+            for _art_id, _lvl, rcpt, _dig in receipts:
+                att = read_send_attempt_row(conn, rcpt)
+                assert att is not None
+                assert att.level == ARTIFACT_LEVEL_UNKNOWN
+                assert is_verified_l1_send(att) is False
+            counts_before = {
+                tbl: int(conn.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0])
+                for tbl in ("idempotency", "ledger", "artifact_read_ack")
+            }
+        assert counts_before["artifact_read_ack"] == 2
+
+        # Phase 2: Boot SP2 wheel daemon on SAME data_root; lost-ACK SP2 6-key replays succeed with 0 mutations.
+        sp2_proc = InstalledServeProcess(
+            [str(inc2_installed_env.venv_python), "-I", str(runner_script),
+             str(cfg_path), str(state_path), str(sp2_prep_log)],
+            data_root=data_root,
+            cwd=upg_dir,
+        )
+        try:
+            sp2_proc.wait_ready(timeout=15.0)
+            sp2_ack_ep = {**legacy_ack_ep, "artifact_id": "art-upg-l1-ep", "revision_epoch": 0}
+            sp2_ep_args = {**ep_args_i2, "read_acks": [sp2_ack_ep]}
+            ep_replay = _call_installed_mcp(
+                inc2_installed_env,
+                script_name="brain-mcp",
+                prefix_args=[],
+                profile_path=profile_path,
+                cwd=client_cwd,
+                tool="submit_episode",
+                arguments=sp2_ep_args,
+            )
+            assert ep_replay["ok"] is True
+            assert ep_replay["data"] == i2_ep_data
+
+            sp2_ack_out = {**legacy_ack_out, "artifact_id": "art-upg-l1-out", "revision_epoch": 0}
+            sp2_out_args = {**out_args_i2, "read_acks": [sp2_ack_out]}
+            out_replay = _call_installed_mcp(
+                inc2_installed_env,
+                script_name="brain-mcp",
+                prefix_args=[],
+                profile_path=profile_path,
+                cwd=client_cwd,
+                tool="record_outcome",
+                arguments=sp2_out_args,
+            )
+            assert out_replay["ok"] is True
+            assert out_replay["data"] == i2_out_data
+
+            tamper_dig = digest_bytes(b"tampered upgrade payload\n")
+            ep_tampers = (
+                {**ep_args_i2, "read_acks": [{**sp2_ack_ep, "artifact_id": "art-wrong"}]},
+                {**ep_args_i2, "read_acks": [{**sp2_ack_ep, "revision_epoch": 1}]},
+                {
+                    **ep_args_i2,
+                    "read_acks": [{**sp2_ack_ep, "resource_digests": [{"name": "L1.md", "digest": tamper_dig}]}],
+                },
+                {**sp2_ep_args, "evidence": [{"kind": "context", "data": {"step": "tampered"}}]},
+            )
+            for bad_ep in ep_tampers:
+                err_ep = _call_installed_mcp(
+                    inc2_installed_env,
+                    script_name="brain-mcp",
+                    prefix_args=[],
+                    profile_path=profile_path,
+                    cwd=client_cwd,
+                    tool="submit_episode",
+                    arguments=bad_ep,
+                )
+                assert err_ep["ok"] is False
+                assert cast(dict[str, Any], err_ep["error"])["code"] == ErrorCode.IDEMPOTENCY_CONFLICT.value
+
+            out_tampers = (
+                {**out_args_i2, "read_acks": [{**sp2_ack_out, "artifact_id": "art-wrong"}]},
+                {**out_args_i2, "read_acks": [{**sp2_ack_out, "revision_epoch": 1}]},
+                {
+                    **out_args_i2,
+                    "read_acks": [{**sp2_ack_out, "resource_digests": [{"name": "L1.md", "digest": tamper_dig}]}],
+                },
+                {**sp2_out_args, "outcome": "failure"},
+            )
+            for bad_out in out_tampers:
+                err_out = _call_installed_mcp(
+                    inc2_installed_env,
+                    script_name="brain-mcp",
+                    prefix_args=[],
+                    profile_path=profile_path,
+                    cwd=client_cwd,
+                    tool="record_outcome",
+                    arguments=bad_out,
+                )
+                assert err_out["ok"] is False
+                assert cast(dict[str, Any], err_out["error"])["code"] == ErrorCode.IDEMPOTENCY_CONFLICT.value
+        finally:
+            sp2_proc.close()
+
+        assert not sp2_prep_log.exists() or sp2_prep_log.read_text(encoding="utf-8").strip() == ""
+        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+            counts_after = {
+                tbl: int(conn.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0])
+                for tbl in ("idempotency", "ledger", "artifact_read_ack")
+            }
+        assert counts_after == counts_before
+    finally:
+        _cleanup_dir(upg_dir)
