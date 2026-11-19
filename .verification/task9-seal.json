@@ -9,7 +9,7 @@
     ".github/workflows/ci.yml": "sha256:7d4f9d4f4ac15a290ac8581819bdb1517e1f00790e1a2e87d02327d201c84c04",
     ".verification/test_lock.py": "sha256:159b7d88c846f3e0ddbdaff67fb041c71150069e4ee5fd807dea061cf54f620d",
     "docs/design/sp1-crash-table.md": "sha256:c85f0c7b7dccbaf612d38d1718473988e5e53b39a2928f62ff6393f7b7d8fc64",
-    "pyproject.toml": "sha256:4f54cc75470b21bb44257e9f434d4f043c8ad979c08c0a804eb956fece8a87a3",
+    "pyproject.toml": "sha256:5f98be772da9a8370c1339446fbb8565851a0b496f357d25d96d0a63b14bfab0",
     "schemas/mcp-tools-v2.json": "sha256:a8d2317c2a56191a5c08510a6c3c26b7141ebfd43943385507bfc60bc8df65a1",
     "scripts/__init__.py": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     "scripts/gate.py": "sha256:97550ea6db23c749dd8306080d25eb113c7de04cf441dd33a1ad0ef4d17df930",
@@ -197,7 +197,7 @@
     "tests/support/test_fs.py": "sha256:0072c36e7f25b50994984874df5c81206edbf50660d8388594f9fabfe1f9097f",
     "tests/support/test_inc2_process_cleanup.py": "sha256:97a94bc7f96cb2a2eae74b1a025b50798bea86ec6012aa4e8f273f391c32751b",
     "tests/support/winacl.py": "sha256:efd2eb5331480549d2094f7587c6a97c19e50dfc13f3a4d50db9d560d17c6263",
-    "uv.lock": "sha256:b0431c4a5ad311ce1d1e25edc1698d0eea6fbad9b5f1b7d2fe16e2983cc4b419"
+    "uv.lock": "sha256:febc7807b116dfca4da05b9d4ee3e6464c675057f547a7d9c6716859093b1e5b"
   },
   "schema_version": "1.0",
   "selectors": [
