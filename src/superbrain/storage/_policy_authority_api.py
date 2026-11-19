@@ -25,8 +25,10 @@ from superbrain.core._kernel_approval import (
 )
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.kernel import Principal
+from superbrain.core.proposals import ApplyTurnIntent, JournalDirection
 from superbrain.ports.os import OsAdapters
 from superbrain.storage import _policy_approvals as approvals
+from superbrain.storage import _policy_grants as grants
 from superbrain.storage import _policy_layer2 as layer2
 from superbrain.storage.errors import sqlite_error
 from superbrain.storage.writer import WriterLease
@@ -215,12 +217,56 @@ class PolicyAuthorityMixin:
     def recovery_grant(self, grant_id: str) -> RecoveryGrant:
         return layer2.read_recovery_grant(self._read(), grant_id)
 
-    def end_recovery_grant(self, *, grant_id: str, reason: str = "journal_closed") -> RecoveryGrant:
+    def find_recovery_grant_for_journal(self, journal_id: str) -> RecoveryGrant | None:
+        return grants.find_recovery_grant_for_journal(self._read(), journal_id)
+
+    def approval_message(self, approval_id: str) -> ApprovalMessage | None:
+        return grants.approval_message(self._read(), approval_id)
+
+    def list_recovery_grants(self) -> tuple[RecoveryGrant, ...]:
+        return grants.list_recovery_grants(self._read())
+
+    def open_turn_intent(
+        self, *, journal_id: str, approval_id: str, direction: JournalDirection
+    ) -> ApplyTurnIntent:
         with self._authority_tx() as db:
-            return layer2.end_recovery_grant(
+            return grants.open_turn_intent(
+                db,
+                journal_id=journal_id,
+                approval_id=approval_id,
+                direction=direction,
+                trust_generation=self.trust_generation(),
+                now=self._now(),
+            )
+
+    def begin_journal_turn(
+        self, *, approval_id: str, journal_id: str, direction: JournalDirection
+    ) -> tuple[RecoveryGrant, ApplyTurnIntent]:
+        with self._authority_tx() as db:
+            return grants.begin_journal_turn(
+                db,
+                approval_id=approval_id,
+                journal_id=journal_id,
+                direction=direction,
+                trust_generation=self.trust_generation(),
+                now=self._now(),
+            )
+
+    def turn_intent_for_journal(self, journal_id: str) -> ApplyTurnIntent | None:
+        return grants.turn_intent_for_journal(self._read(), journal_id)
+
+    def list_turn_intents(self) -> tuple[ApplyTurnIntent, ...]:
+        return grants.list_turn_intents(self._read())
+
+    def end_recovery_grant(
+        self, *, grant_id: str, reason: str = "journal_closed", final_status: str | None = None
+    ) -> RecoveryGrant:
+        with self._authority_tx() as db:
+            return grants.end_recovery_grant_with_turn(
                 db,
                 grant_id=grant_id,
                 reason=reason,
+                final_status=final_status,
                 trust_generation=self.trust_generation(),
                 now=self._now(),
             )

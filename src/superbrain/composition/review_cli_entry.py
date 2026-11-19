@@ -49,7 +49,7 @@ def _parse_args(args: list[str]) -> _ParsedReviewCli | None:
             endpoint = "/v2/operator/proposal/list"
             rest = args[2:]
             needs_id = False
-        elif sub in ("show", "approve", "reject"):
+        elif sub in ("show", "approve", "reject", "continue"):
             endpoint = f"/v2/operator/proposal/{sub}"
             rest = args[2:]
             needs_id = True
@@ -100,7 +100,11 @@ def _parse_args(args: list[str]) -> _ParsedReviewCli | None:
         if pos:
             return None
         proposal_id = None
-    if approval_raw is not None and endpoint in ("/v2/operator/proposal/list", "/v2/operator/proposal/show"):
+    if approval_raw is not None and endpoint in (
+        "/v2/operator/proposal/list",
+        "/v2/operator/proposal/show",
+        "/v2/operator/proposal/continue",
+    ):
         return None
     return _ParsedReviewCli(
         endpoint_path=endpoint,

@@ -38,7 +38,7 @@ def _parse_review_args(args: list[str]) -> tuple[str, list[str]] | None:
         if sub == "list":
             rest = args[2:]
             needs_id = False
-        elif sub in ("show", "approve", "reject"):
+        elif sub in ("show", "approve", "reject", "continue"):
             rest = args[2:]
             needs_id = True
         else:
@@ -79,7 +79,7 @@ def _parse_review_args(args: list[str]) -> tuple[str, list[str]] | None:
 
     if not has_profile:
         return None
-    if has_approval and args[0] == "review" and args[1] in ("list", "show"):
+    if has_approval and args[0] == "review" and args[1] in ("list", "show", "continue"):
         return None
     if needs_id and (len(pos) != 1 or not pos[0] or "\x00" in pos[0]):
         return None

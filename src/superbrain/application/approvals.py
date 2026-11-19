@@ -209,6 +209,18 @@ class OperatorService:
             if prop.owner_id != principal.owner_id:
                 raise BrainError(ErrorCode.NOT_FOUND, "not found")
             return PreparedOperatorCall(immediate={"proposal": _proposal_json(prop)})
+        if path == "/v2/operator/proposal/continue":
+            if set(body) != {"proposal_id"} or not isinstance(body.get("proposal_id"), str) or not body["proposal_id"]:
+                raise _invalid()
+            if self._review_apply is None:
+                raise BrainError(ErrorCode.CAPABILITY_UNAVAILABLE, "capability unavailable")
+            prop = self._review_apply.get_proposal(str(body["proposal_id"]))
+            if prop.owner_id != principal.owner_id:
+                raise BrainError(ErrorCode.NOT_FOUND, "not found")
+            if prop.active_journal_id is None:
+                raise BrainError(ErrorCode.REVISION_CONFLICT, "no active journal to continue")
+            journal = self._review_apply.continue_interrupted_journal(prop.active_journal_id)
+            return PreparedOperatorCall(immediate={"journal": _journal_json(journal)})
         if path in _PROPOSAL_MUTATING_PATHS:
             return self._prepare_proposal_action(path, principal, token, body)
         if path in _DEFERRED_PATHS:

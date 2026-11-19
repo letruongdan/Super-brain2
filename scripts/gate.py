@@ -276,6 +276,7 @@ _DEFAULT_CASE_COST_MS = 20
 _WHEEL_FIXTURE_FILES: frozenset[str] = frozenset(
     {
         "tests/contract/test_mcp_v2_schema.py",
+        "tests/integration/test_apply_journal_crash_matrix.py",
         "tests/integration/test_kernel_cli.py",
         "tests/integration/test_kernel_crash_recovery.py",
         "tests/integration/test_kernel_native_receipt_contract.py",
@@ -292,6 +293,7 @@ _HEAVY_FILE_COST_MS: dict[str, int] = {
     "tests/integration/test_kernel_daemon.py": 48864,
     "tests/storage/test_kernel_revocation.py": 45672,
     "tests/integration/test_kernel_crash_recovery.py": 39346,
+    "tests/integration/test_apply_journal_crash_matrix.py": 37300,
     "tests/storage/test_backup.py": 33528,
     "tests/storage/test_cas.py": 24444,
     "tests/storage/test_remediation_i2_t5.py": 23717,

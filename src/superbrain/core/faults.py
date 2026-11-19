@@ -34,6 +34,17 @@ KNOWN_CRASHPOINTS: frozenset[str] = frozenset({
     "jobs.after_invocation_reserve",
     "jobs.after_cancel_commit",
     "jobs.after_usage_settle_commit",
+    # I3-3: ApplyJournal & recovery_grant crashpoints
+    "apply.after_policy_turn_intent",
+    "apply.before_move_original",
+    "apply.after_move_before_phase",
+    "apply.before_publish_replacement",
+    "apply.after_publish_before_phase",
+    "rollback.after_policy_turn_intent",
+    "rollback.before_first_move",
+    "rollback.after_move_replacement",
+    "rollback.after_restore_last_original",
+    "apply.after_policy_grant_ended",
 })
 
 KNOWN_PAUSEPOINTS: frozenset[str] = KNOWN_CRASHPOINTS | {"writer.held"}

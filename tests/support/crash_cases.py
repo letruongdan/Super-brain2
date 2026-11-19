@@ -1531,3 +1531,5 @@ KERNEL_CRASH_CASES: tuple[KernelCrashCase, ...] = (
     KernelCrashCase("job-operation", "jobs.after_cancel_commit", seed_job, expect_cancel, args=cancel_args),
     KernelCrashCase("job-operation", "jobs.after_usage_settle_commit", seed_usage, expect_settle, args=settle_args),
 )
+
+from tests.support.inc3_crash_cases import I3_3_CRASH_CASES as I3_3_CRASH_CASES  # noqa: E402, F401

@@ -22,6 +22,7 @@ from superbrain.application.approvals import OperatorHandle
 from superbrain.application.deadlines import Reservation
 from superbrain.application.dispatch import KernelToolDomain
 from superbrain.application.jobs import JobService
+from superbrain.application.journal_recovery import reconcile_and_classify_journals
 from superbrain.application.owner_loop import AuthGate, OwnerLoop, OwnerSession
 from superbrain.application.review_apply import ReviewApplyService
 from superbrain.cli_api._loopback_server import LoopbackServer
@@ -40,6 +41,7 @@ from superbrain.composition._endpoint import (
 from superbrain.composition.kernel_bridge import KernelBridge
 from superbrain.composition.kernel_projections import kernel_store_extensions
 from superbrain.composition.operator_entry import build_operator_service, make_operator_executor
+from superbrain.core._kernel_approval import canonical_utc
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.faults import crashpoint
 from superbrain.core.ids import new_id
@@ -148,6 +150,16 @@ def _open_owner_session(
         if hooks.before_job_recover is not None:
             hooks.before_job_recover(rt)
         job_service.recover(rt.lease.epoch)
+        if rt.store.schema_version >= 5 and rt.policy.schema_version >= 4:
+            reconcile_and_classify_journals(
+                StoreProposalAdapter(rt.store, adapters),
+                PolicyApplyAuthority(rt.policy),
+                adapters,
+                data_root=rt.root.root,
+                home_dir=Path.home(),
+                config_merger=SharedConfigMergerAdapter(),
+                now_utc_fn=lambda: canonical_utc(resolved_clock.now()),
+            )
 
         instance_id = new_id()
         auth_gate = AuthGate(rt.store.store_id, rt.lease.epoch, instance_id)
@@ -278,7 +290,7 @@ def _open_owner_session(
         session_box.append(session)
         if operator is not None:
             review_apply: ReviewApplyService | None = None
-            if rt.store.schema_version >= 5:
+            if rt.store.schema_version >= 5 and rt.policy.schema_version >= 4:
                 review_apply = ReviewApplyService(
                     StoreProposalAdapter(rt.store, adapters),
                     PolicyApplyAuthority(rt.policy),

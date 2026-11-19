@@ -1,7 +1,9 @@
-"""Rollback planning, applied rollback, and interrupted-journal recovery helpers for ``ReviewApplyService``."""
+"""Rollback planning and applied rollback execution for ``ReviewApplyService`` (I3-2, I3-3)."""
 
 from __future__ import annotations
 
+import os
+from collections.abc import Callable
 from pathlib import Path
 
 from superbrain.application._review_apply_ops import (
@@ -18,19 +20,23 @@ from superbrain.application._review_apply_ops import (
     verify_target,
     with_journal_entry,
 )
+from superbrain.application._review_apply_rollback_int import execute_interrupted_rollback
 from superbrain.core._kernel_approval import (
     ApprovalAction,
     ApprovalChannel,
     ApprovalMessage,
+    RecoveryGrant,
     RecoveryScope,
     TargetFile,
 )
 from superbrain.core._kernel_base import ResourceDigest
 from superbrain.core.canonical import digest_bytes
 from superbrain.core.errors import BrainError, ErrorCode
+from superbrain.core.faults import crashpoint
 from superbrain.core.ids import new_id
 from superbrain.core.proposals import (
     ApplyJournal,
+    ChangeProposal,
     FileJournalEntry,
     FileJournalPhase,
     FileOriginalState,
@@ -51,6 +57,8 @@ __all__ = [
     "execute_applied_rollback",
     "execute_interrupted_rollback",
     "plan_rollback_targets_impl",
+    "run_applied_rollback_entries",
+    "stage_applied_rollback_journal",
 ]
 
 
@@ -62,11 +70,31 @@ def _conflict(message: str = "revision conflict") -> BrainError:
     return BrainError(ErrorCode.REVISION_CONFLICT, message)
 
 
+def _save_rolling_back(
+    proposals: ProposalStorePort, journal: ApplyJournal, entries: list[FileJournalEntry], now: str
+) -> ApplyJournal:
+    return proposals.update_journal(
+        ApplyJournal(
+            journal_id=journal.journal_id,
+            proposal_id=journal.proposal_id,
+            direction=journal.direction,
+            status=ProposalStatus.ROLLING_BACK,
+            grant_id=journal.grant_id,
+            staging_dir=journal.staging_dir,
+            files=tuple(entries),
+            created_at=journal.created_at,
+            updated_at=now,
+        )
+    )
+
+
 def plan_rollback_targets_impl(
     proposals: ProposalStorePort,
     os_: OsAdapters,
     config_merger: ConfigMergerPort | None,
     proposal_id: str,
+    *,
+    check_q25_fn: Callable[[Path, str], str] | None = None,
 ) -> RollbackPlan:
     prop = proposals.get_proposal(proposal_id)
     if prop.status is not ProposalStatus.APPLIED:
@@ -83,7 +111,11 @@ def plan_rollback_targets_impl(
     res_digests: list[ResourceDigest] = []
     for idx, entry in enumerate(applied_j.files):
         root = Path(entry.target_root)
+        if check_q25_fn is not None:
+            check_q25_fn(root, entry.normalized_rel_path)
         parent_id, curr_id, _ = verify_target(root, entry.normalized_rel_path, os_)
+        if entry.parent_physical_id is not None and parent_id.token() != entry.parent_physical_id:
+            raise BrainError(ErrorCode.UNSAFE_PATH, "target parent identity changed")
         tgt = target_path(root, entry.normalized_rel_path)
         if curr_id is None or curr_id.is_link or curr_id.is_dir:
             raise _conflict()
@@ -149,64 +181,46 @@ def plan_rollback_targets_impl(
     )
 
 
-def execute_applied_rollback(
+def stage_applied_rollback_journal(
     proposals: ProposalStorePort,
-    authority: ApplyAuthorityPort,
     os_: OsAdapters,
     *,
+    prop: ChangeProposal,
+    plan: RollbackPlan,
+    journal_id: str,
+    grant: RecoveryGrant,
     data_root: Path,
     now_utc: str,
-    done_utc_fn: object,
-    validate_fn: object,
-    proposal_id: str,
-    approval: ApprovalMessage,
-    signer_id: str | None,
-    channel: ApprovalChannel,
-    plan: RollbackPlan,
-    new_sign_count: int | None = None,
+    check_q25_fn: Callable[[Path, str], str] | None = None,
 ) -> ApplyJournal:
-    prop = proposals.get_proposal(proposal_id)
-    if prop.status is not ProposalStatus.APPLIED or plan.proposal_id != proposal_id:
-        raise _conflict()
-    validate_fn(  # type: ignore[operator]
-        prop,
-        approval,
-        expected_action=ApprovalAction.ROLLBACK,
-        expected_targets=plan.target_files,
-        expected_digests=plan.resource_digests,
-    )
-    if approval.recovery_scope is not RecoveryScope.ROLLBACK:
-        raise _invalid()
-
+    """Stage ``rb-rep-*`` files per volume, pin IDs, and save ``ROLLING_BACK`` journal + proposal."""
     phys = require_physical_fs(os_)
     staging_by_root: dict[str, Path] = {}
-    for pt in plan.targets:
-        root = Path(pt.target_root)
-        _, curr_id, _ = verify_target(root, pt.normalized_rel_path, os_)
-        tgt = target_path(root, pt.normalized_rel_path)
-        if curr_id is None or curr_id.token() != pt.base_physical_id or file_digest(tgt) != pt.base_digest:
-            raise _conflict()
-
-    journal_id = new_id()
     for pt in plan.targets:
         if pt.target_root not in staging_by_root:
             staging_by_root[pt.target_root] = select_staging_dir(
                 Path(pt.target_root), data_root, journal_id, prop.owner_id, os_
             )
     staging_dir = staging_by_root[plan.targets[0].target_root]
-    receipt = authority.consume_approval(
-        approval, signer_id=signer_id, channel=channel, new_sign_count=new_sign_count
-    )
-    grant = authority.open_recovery_grant(approval_id=receipt.approval_id, journal_id=journal_id)
 
     entries: list[FileJournalEntry] = []
     for idx, pt in enumerate(plan.targets):
+        if check_q25_fn is not None:
+            check_q25_fn(Path(pt.target_root), pt.normalized_rel_path)
+        p_id, _, p_existed = verify_target(Path(pt.target_root), pt.normalized_rel_path, os_)
+        if not p_existed:
+            raise _conflict()
+        expected_parent_id = plan.target_files[idx].parent_physical_id if idx < len(plan.target_files) else None
+        if expected_parent_id and p_id.token() != expected_parent_id:
+            raise BrainError(ErrorCode.UNSAFE_PATH, "target parent identity changed")
         entry_staging = staging_by_root[pt.target_root]
         staged_path = ""
         rep_phys_id: str | None = None
         if pt.replacement_bytes is not None:
             staged = entry_staging / f"rb-rep-{idx}"
-            os_.publisher.write_new(staged, pt.replacement_bytes)
+            os_.paths.reject_links(staged)
+            if not os.path.lexists(staged):
+                os_.publisher.write_new(staged, pt.replacement_bytes)
             os_.permissions.secure_file(staged)
             staged_id = phys.stat_physical_identity(staged)
             if (
@@ -218,9 +232,6 @@ def execute_applied_rollback(
                 raise BrainError(ErrorCode.INTEGRITY_FAILURE, "staged rollback replacement verification failed")
             staged_path = str(staged)
             rep_phys_id = staged_id.token()
-        p_id, _, p_existed = verify_target(Path(pt.target_root), pt.normalized_rel_path, os_)
-        if not p_existed:
-            raise _conflict()
         entries.append(
             FileJournalEntry(
                 normalized_rel_path=pt.normalized_rel_path,
@@ -249,52 +260,184 @@ def execute_applied_rollback(
         created_at=now_utc,
         updated_at=now_utc,
     )
-    journal = proposals.save_journal(journal)
+    saved = proposals.save_journal(journal)
     proposals.update_proposal_status(
         prop.proposal_id, ProposalStatus.ROLLING_BACK, active_journal_id=journal_id, updated_at=now_utc
     )
+    return saved
 
+
+def _plan_applied_rb_entry(
+    entry: FileJournalEntry, idx: int, journal_staging_dir: str, os_: OsAdapters, phys: PhysicalFsPort
+) -> tuple[str, Path]:
+    root = Path(entry.target_root)
+    tgt = target_path(root, entry.normalized_rel_path)
+    p_id, curr_id, p_existed = verify_target(root, entry.normalized_rel_path, os_)
+    if entry.parent_physical_id is not None and (not p_existed or p_id.token() != entry.parent_physical_id):
+        raise BrainError(ErrorCode.UNSAFE_PATH, "rollback parent identity changed")
+
+    entry_staging = (
+        Path(entry.replacement_staging_path).parent
+        if entry.replacement_staging_path
+        else Path(journal_staging_dir)
+    )
+    bak = Path(entry.backup_path) if entry.backup_path is not None else (entry_staging / f"rb-bak-{idx}")
+
+    if entry.phase is FileJournalPhase.REPLACEMENT_PUBLISHED:
+        if (
+            not entry.replacement_staging_path
+            or curr_id is None
+            or curr_id.token() != entry.replacement_physical_id
+            or file_digest(tgt) != entry.replacement_digest
+        ):
+            raise _conflict()
+        return "done", bak
+    if entry.phase is FileJournalPhase.DELETED:
+        if entry.replacement_staging_path or curr_id is not None:
+            raise _conflict()
+        return "done", bak
+
+    if (
+        entry.phase in (FileJournalPhase.PLANNED, FileJournalPhase.ORIGINAL_MOVED)
+        and entry.replacement_staging_path
+        and curr_id is not None
+        and not curr_id.is_link
+        and not curr_id.is_dir
+        and entry.replacement_physical_id is not None
+        and curr_id.token() == entry.replacement_physical_id
+        and file_digest(tgt) == entry.replacement_digest
+        and verify_backup_file(
+            bak, os_, expected_digest=entry.original_digest, expected_physical_id=entry.original_physical_id
+        )
+    ):
+        return "mark_published", bak
+
+    if entry.replacement_staging_path:
+        staged = Path(entry.replacement_staging_path)
+        if not verify_backup_file(
+            staged,
+            os_,
+            expected_digest=entry.replacement_digest,
+            expected_physical_id=entry.replacement_physical_id,
+        ):
+            raise _conflict()
+
+    if entry.phase is FileJournalPhase.PLANNED:
+        if curr_id is not None:
+            if curr_id.token() != entry.original_physical_id or file_digest(tgt) != entry.original_digest:
+                raise _conflict()
+            return "move_and_publish", bak
+        if verify_backup_file(
+            bak, os_, expected_digest=entry.original_digest, expected_physical_id=entry.original_physical_id
+        ):
+            return "publish_only", bak
+        raise _conflict()
+
+    if entry.phase is FileJournalPhase.ORIGINAL_MOVED:
+        if curr_id is not None or not verify_backup_file(
+            bak, os_, expected_digest=entry.original_digest, expected_physical_id=entry.original_physical_id
+        ):
+            raise _conflict()
+        return "publish_only", bak
+
+    raise _conflict()
+
+
+def run_applied_rollback_entries(
+    proposals: ProposalStorePort,
+    authority: ApplyAuthorityPort,
+    os_: OsAdapters,
+    *,
+    prop: ChangeProposal,
+    journal: ApplyJournal,
+    grant: RecoveryGrant,
+    done_utc_fn: Callable[[], str],
+    check_q25_fn: Callable[[Path, str], str] | None = None,
+    emit_crashpoints: bool,
+    resume: bool,
+) -> ApplyJournal:
+    """Verify and execute ``ROLLING_BACK`` entries through policy-before-store closure."""
+    phys = require_physical_fs(os_)
     mut_entries = list(journal.files)
-    for idx, pt in enumerate(plan.targets):
-        entry = mut_entries[idx]
-        root = Path(pt.target_root)
-        tgt = target_path(root, pt.normalized_rel_path)
+    actions: list[tuple[str, Path]] = []
+    if resume:
+        for idx, entry in enumerate(mut_entries):
+            try:
+                actions.append(_plan_applied_rb_entry(entry, idx, journal.staging_dir, os_, phys))
+            except BrainError:
+                mut_entries[idx] = with_journal_entry(entry, phase=FileJournalPhase.CONFLICT)
+                mark_recovery_required_state(proposals, authority, journal, mut_entries, done_utc_fn())
+                raise
+    else:
+        for idx, entry in enumerate(mut_entries):
+            entry_staging = (
+                Path(entry.replacement_staging_path).parent
+                if entry.replacement_staging_path
+                else Path(journal.staging_dir)
+            )
+            actions.append(("move_and_publish", entry_staging / f"rb-bak-{idx}"))
+
+    if emit_crashpoints:
+        crashpoint("rollback.before_first_move")
+
+    for idx, entry in enumerate(mut_entries):
+        action, bak = actions[idx]
+        if action == "done":
+            continue
+        root = Path(entry.target_root)
+        tgt = target_path(root, entry.normalized_rel_path)
         try:
             verify_active_grant(authority, grant.grant_id)
-            p_id, _, p_existed = verify_target(root, pt.normalized_rel_path, os_)
+            if check_q25_fn is not None:
+                check_q25_fn(root, entry.normalized_rel_path)
+            p_id, _, p_existed = verify_target(root, entry.normalized_rel_path, os_)
             if entry.parent_physical_id is not None and (not p_existed or p_id.token() != entry.parent_physical_id):
                 raise BrainError(ErrorCode.UNSAFE_PATH, "rollback parent identity changed")
         except BrainError:
             mut_entries[idx] = with_journal_entry(entry, phase=FileJournalPhase.CONFLICT)
-            mark_recovery_required_state(proposals, authority, journal, mut_entries, done_utc_fn())  # type: ignore[operator]
+            mark_recovery_required_state(proposals, authority, journal, mut_entries, done_utc_fn())
             raise
+        if action == "mark_published":
+            mut_entries[idx] = with_journal_entry(
+                entry, phase=FileJournalPhase.REPLACEMENT_PUBLISHED, backup_path=str(bak)
+            )
+            journal = _save_rolling_back(proposals, journal, mut_entries, done_utc_fn())
+            continue
 
-        entry_staging = staging_by_root[pt.target_root]
-        bak = entry_staging / f"rb-bak-{idx}"
-        ok, bak_kept = verified_move_to_backup(
-            os_,
-            tgt=tgt,
-            bak=bak,
-            expected_digest=entry.original_digest,
-            expected_physical_id=entry.original_physical_id,
-        )
-        if not ok:
-            mut_entries[idx] = with_journal_entry(entry, phase=FileJournalPhase.CONFLICT, backup_path=bak_kept)
-            mark_recovery_required_state(proposals, authority, journal, mut_entries, done_utc_fn())  # type: ignore[operator]
-            if bak_kept is not None:
-                raise _conflict("rollback backup verification failed")
-            raise BrainError(ErrorCode.INTEGRITY_FAILURE, "rollback backup verification failed")
+        if action == "move_and_publish":
+            ok, bak_kept = verified_move_to_backup(
+                os_,
+                tgt=tgt,
+                bak=bak,
+                expected_digest=entry.original_digest,
+                expected_physical_id=entry.original_physical_id,
+            )
+            if not ok:
+                mut_entries[idx] = with_journal_entry(entry, phase=FileJournalPhase.CONFLICT, backup_path=bak_kept)
+                mark_recovery_required_state(proposals, authority, journal, mut_entries, done_utc_fn())
+                if bak_kept is not None:
+                    raise _conflict("rollback backup verification failed")
+                raise BrainError(ErrorCode.INTEGRITY_FAILURE, "rollback backup verification failed")
+            if emit_crashpoints:
+                crashpoint("rollback.after_move_replacement")
+            mut_entries[idx] = with_journal_entry(
+                entry, phase=FileJournalPhase.ORIGINAL_MOVED, backup_path=str(bak)
+            )
+            entry = mut_entries[idx]
+            journal = _save_rolling_back(proposals, journal, mut_entries, done_utc_fn())
+        elif entry.phase is FileJournalPhase.PLANNED:
+            mut_entries[idx] = with_journal_entry(
+                entry, phase=FileJournalPhase.ORIGINAL_MOVED, backup_path=str(bak)
+            )
+            entry = mut_entries[idx]
+            journal = _save_rolling_back(proposals, journal, mut_entries, done_utc_fn())
 
-        mut_entries[idx] = with_journal_entry(entry, phase=FileJournalPhase.ORIGINAL_MOVED, backup_path=str(bak))
-        entry = mut_entries[idx]
-        journal = _save_rolling_back(proposals, journal, mut_entries, done_utc_fn())  # type: ignore[operator]
-
-        if pt.replacement_bytes is not None:
+        if entry.replacement_staging_path:
             try:
                 publish_no_replace(os_, Path(entry.replacement_staging_path), tgt)
             except FileExistsError as err:
                 mut_entries[idx] = with_journal_entry(entry, phase=FileJournalPhase.CONFLICT)
-                mark_recovery_required_state(proposals, authority, journal, mut_entries, done_utc_fn())  # type: ignore[operator]
+                mark_recovery_required_state(proposals, authority, journal, mut_entries, done_utc_fn())
                 raise _conflict() from err
             pub_id = phys.stat_physical_identity(tgt)
             if (
@@ -305,15 +448,17 @@ def execute_applied_rollback(
                 or file_digest(tgt) != entry.replacement_digest
             ):
                 mut_entries[idx] = with_journal_entry(entry, phase=FileJournalPhase.CONFLICT)
-                mark_recovery_required_state(proposals, authority, journal, mut_entries, done_utc_fn())  # type: ignore[operator]
+                mark_recovery_required_state(proposals, authority, journal, mut_entries, done_utc_fn())
                 raise BrainError(ErrorCode.INTEGRITY_FAILURE, "published rollback verification failed")
             phase = FileJournalPhase.REPLACEMENT_PUBLISHED
         else:
             phase = FileJournalPhase.DELETED
         mut_entries[idx] = with_journal_entry(entry, phase=phase)
-        journal = _save_rolling_back(proposals, journal, mut_entries, done_utc_fn())  # type: ignore[operator]
+        journal = _save_rolling_back(proposals, journal, mut_entries, done_utc_fn())
 
-    done_at: str = done_utc_fn()  # type: ignore[operator]
+    if emit_crashpoints:
+        crashpoint("rollback.after_restore_last_original")
+    done_at = done_utc_fn()
     authority.end_recovery_grant(grant_id=grant.grant_id, reason="journal_closed", final_status="rolled_back")
     final_j = ApplyJournal(
         journal_id=journal.journal_id,
@@ -333,208 +478,76 @@ def execute_applied_rollback(
     return final_j
 
 
-def _save_rolling_back(
-    proposals: ProposalStorePort, journal: ApplyJournal, entries: list[FileJournalEntry], now: str
-) -> ApplyJournal:
-    return proposals.update_journal(
-        ApplyJournal(
-            journal_id=journal.journal_id,
-            proposal_id=journal.proposal_id,
-            direction=journal.direction,
-            status=ProposalStatus.ROLLING_BACK,
-            grant_id=journal.grant_id,
-            staging_dir=journal.staging_dir,
-            files=tuple(entries),
-            created_at=journal.created_at,
-            updated_at=now,
-        )
-    )
-
-
-def _plan_interrupted_entry(
-    entry: FileJournalEntry, idx: int, journal_staging_dir: str, os_: OsAdapters, phys: PhysicalFsPort
-) -> tuple[str, Path | None]:
-    if entry.phase in (FileJournalPhase.RESTORED, FileJournalPhase.DELETED):
-        return "done", None
-    root = Path(entry.target_root)
-    tgt = target_path(root, entry.normalized_rel_path)
-    p_id, curr_id, p_existed = verify_target(root, entry.normalized_rel_path, os_, allow_missing_parent=True)
-    if entry.parent_physical_id is not None and (not p_existed or p_id.token() != entry.parent_physical_id):
-        raise _conflict("target parent identity changed")
-
-    entry_staging = (
-        Path(entry.replacement_staging_path).parent
-        if entry.replacement_staging_path
-        else Path(journal_staging_dir)
-    )
-    bak_path = Path(entry.backup_path) if entry.backup_path is not None else (entry_staging / f"bak-{idx}")
-
-    if entry.phase is FileJournalPhase.PLANNED:
-        if entry.original is FileOriginalState.PRESENT:
-            if curr_id is not None:
-                if (
-                    curr_id.token() != entry.original_physical_id
-                    or file_digest(tgt) != entry.original_digest
-                    or phys.stat_physical_identity(bak_path) is not None
-                ):
-                    raise _conflict()
-                return "noop_restored", None
-            if verify_backup_file(
-                bak_path, os_, expected_digest=entry.original_digest, expected_physical_id=entry.original_physical_id
-            ):
-                return "restore_bak", bak_path
-            raise _conflict()
-        if curr_id is None:
-            return "noop_deleted", None
-        if curr_id.token() == entry.replacement_physical_id and file_digest(tgt) == entry.replacement_digest:
-            return "hold_only", None
-        raise _conflict()
-
-    if entry.phase is FileJournalPhase.ORIGINAL_MOVED:
-        if entry.original is not FileOriginalState.PRESENT or entry.backup_path is None:
-            raise _conflict()
-        if not verify_backup_file(
-            bak_path, os_, expected_digest=entry.original_digest, expected_physical_id=entry.original_physical_id
-        ):
-            raise _conflict()
-        if curr_id is None:
-            return "restore_bak", bak_path
-        if curr_id.token() == entry.replacement_physical_id and file_digest(tgt) == entry.replacement_digest:
-            return "hold_then_restore", bak_path
-        raise _conflict()
-
-    if entry.phase is FileJournalPhase.REPLACEMENT_PUBLISHED:
-        if (
-            curr_id is None
-            or curr_id.token() != entry.replacement_physical_id
-            or file_digest(tgt) != entry.replacement_digest
-        ):
-            raise _conflict()
-        if entry.original is FileOriginalState.PRESENT:
-            if entry.backup_path is None or not verify_backup_file(
-                bak_path, os_, expected_digest=entry.original_digest, expected_physical_id=entry.original_physical_id
-            ):
-                raise _conflict()
-            return "hold_then_restore", bak_path
-        return "hold_only", None
-
-    raise _conflict()
-
-
-def execute_interrupted_rollback(
+def execute_applied_rollback(
     proposals: ProposalStorePort,
     authority: ApplyAuthorityPort,
     os_: OsAdapters,
     *,
+    data_root: Path,
     now_utc: str,
-    done_utc_fn: object,
-    journal_id: str,
+    done_utc_fn: Callable[[], str],
+    validate_fn: Callable[..., None],
+    proposal_id: str,
+    approval: ApprovalMessage,
+    signer_id: str | None,
+    channel: ApprovalChannel,
+    plan: RollbackPlan,
+    new_sign_count: int | None = None,
+    check_q25_fn: Callable[[Path, str], str] | None = None,
+    emit_crashpoints: bool = False,
 ) -> ApplyJournal:
-    journal = proposals.get_journal(journal_id)
-    if journal.direction is not JournalDirection.APPLY or journal.status not in (
-        ProposalStatus.APPLYING,
-        ProposalStatus.PARTIALLY_APPLIED,
-    ):
+    prop = proposals.get_proposal(proposal_id)
+    if prop.status is not ProposalStatus.APPLIED or plan.proposal_id != proposal_id:
         raise _conflict()
-    mut_entries = list(journal.files)
-    try:
-        grant = verify_active_grant(authority, journal.grant_id)
-    except BrainError:
-        mark_recovery_required_state(proposals, authority, journal, mut_entries, now_utc)
-        raise
-    if grant.recovery_scope not in (RecoveryScope.ROLLBACK, RecoveryScope.CONTINUE_OR_ROLLBACK):
-        mark_recovery_required_state(proposals, authority, journal, mut_entries, now_utc)
+    validate_fn(
+        prop,
+        approval,
+        expected_action=ApprovalAction.ROLLBACK,
+        expected_targets=plan.target_files,
+        expected_digests=plan.resource_digests,
+    )
+    if approval.recovery_scope is not RecoveryScope.ROLLBACK:
         raise _invalid()
 
-    phys = require_physical_fs(os_)
-    planned_actions: list[tuple[str, Path | None]] = []
-    for idx, entry in enumerate(mut_entries):
-        try:
-            planned_actions.append(_plan_interrupted_entry(entry, idx, journal.staging_dir, os_, phys))
-        except BrainError:
-            mut_entries[idx] = with_journal_entry(entry, phase=FileJournalPhase.CONFLICT)
-            mark_recovery_required_state(proposals, authority, journal, mut_entries, now_utc)
-            raise
+    for pt in plan.targets:
+        root = Path(pt.target_root)
+        if check_q25_fn is not None:
+            check_q25_fn(root, pt.normalized_rel_path)
+        _, curr_id, _ = verify_target(root, pt.normalized_rel_path, os_)
+        tgt = target_path(root, pt.normalized_rel_path)
+        if curr_id is None or curr_id.token() != pt.base_physical_id or file_digest(tgt) != pt.base_digest:
+            raise _conflict()
 
-    for idx in range(len(mut_entries) - 1, -1, -1):
-        entry = mut_entries[idx]
-        action, bak_path = planned_actions[idx]
-        if action == "done":
-            continue
-        root = Path(entry.target_root)
-        tgt = target_path(root, entry.normalized_rel_path)
-        entry_staging = (
-            Path(entry.replacement_staging_path).parent
-            if entry.replacement_staging_path
-            else Path(journal.staging_dir)
-        )
-        try:
-            verify_active_grant(authority, grant.grant_id)
-            p_id, _, p_existed = verify_target(root, entry.normalized_rel_path, os_, allow_missing_parent=True)
-            if entry.parent_physical_id is not None and (not p_existed or p_id.token() != entry.parent_physical_id):
-                raise _conflict("target parent identity changed")
-        except BrainError:
-            mut_entries[idx] = with_journal_entry(entry, phase=FileJournalPhase.CONFLICT)
-            mark_recovery_required_state(proposals, authority, journal, mut_entries, done_utc_fn())  # type: ignore[operator]
-            raise
-
-        if action in ("hold_then_restore", "hold_only"):
-            holding = entry_staging / f"rb-hold-{idx}"
-            ok, _ = verified_move_to_backup(
-                os_,
-                tgt=tgt,
-                bak=holding,
-                expected_digest=entry.replacement_digest,
-                expected_physical_id=entry.replacement_physical_id,
-            )
-            if not ok:
-                mut_entries[idx] = with_journal_entry(entry, phase=FileJournalPhase.CONFLICT)
-                mark_recovery_required_state(proposals, authority, journal, mut_entries, done_utc_fn())  # type: ignore[operator]
-                raise _conflict()
-
-        if action in ("restore_bak", "hold_then_restore"):
-            assert bak_path is not None
-            try:
-                publish_no_replace(os_, bak_path, tgt)
-            except FileExistsError as err:
-                mut_entries[idx] = with_journal_entry(
-                    entry, phase=FileJournalPhase.CONFLICT, backup_path=str(bak_path)
-                )
-                mark_recovery_required_state(proposals, authority, journal, mut_entries, done_utc_fn())  # type: ignore[operator]
-                raise _conflict() from err
-            restored_id = phys.stat_physical_identity(tgt)
-            if (
-                restored_id is None
-                or restored_id.is_link
-                or restored_id.is_dir
-                or (entry.original_physical_id is not None and restored_id.token() != entry.original_physical_id)
-                or file_digest(tgt) != entry.original_digest
-            ):
-                mut_entries[idx] = with_journal_entry(entry, phase=FileJournalPhase.CONFLICT)
-                mark_recovery_required_state(proposals, authority, journal, mut_entries, done_utc_fn())  # type: ignore[operator]
-                raise BrainError(ErrorCode.INTEGRITY_FAILURE, "restored target verification failed")
-            mut_entries[idx] = with_journal_entry(entry, phase=FileJournalPhase.RESTORED)
-        elif action == "noop_restored":
-            mut_entries[idx] = with_journal_entry(entry, phase=FileJournalPhase.RESTORED)
-        else:
-            mut_entries[idx] = with_journal_entry(entry, phase=FileJournalPhase.DELETED)
-        journal = _save_rolling_back(proposals, journal, mut_entries, done_utc_fn())  # type: ignore[operator]
-
-    done_at: str = done_utc_fn()  # type: ignore[operator]
-    authority.end_recovery_grant(grant_id=grant.grant_id, reason="journal_closed", final_status="rolled_back")
-    final_j = ApplyJournal(
-        journal_id=journal.journal_id,
-        proposal_id=journal.proposal_id,
-        direction=journal.direction,
-        status=ProposalStatus.ROLLED_BACK,
-        grant_id=journal.grant_id,
-        staging_dir=journal.staging_dir,
-        files=tuple(mut_entries),
-        created_at=journal.created_at,
-        updated_at=done_at,
+    journal_id = new_id()
+    receipt = authority.consume_approval(
+        approval, signer_id=signer_id, channel=channel, new_sign_count=new_sign_count
     )
-    final_j = proposals.update_journal(final_j)
-    proposals.update_proposal_status(
-        journal.proposal_id, ProposalStatus.ROLLED_BACK, active_journal_id=None, updated_at=done_at
+    grant, _ = authority.begin_journal_turn(
+        approval_id=receipt.approval_id, journal_id=journal_id, direction=JournalDirection.ROLLBACK
     )
-    return final_j
+    if emit_crashpoints:
+        crashpoint("rollback.after_policy_turn_intent")
+
+    journal = stage_applied_rollback_journal(
+        proposals,
+        os_,
+        prop=prop,
+        plan=plan,
+        journal_id=journal_id,
+        grant=grant,
+        data_root=data_root,
+        now_utc=now_utc,
+        check_q25_fn=check_q25_fn,
+    )
+    return run_applied_rollback_entries(
+        proposals,
+        authority,
+        os_,
+        prop=prop,
+        journal=journal,
+        grant=grant,
+        done_utc_fn=done_utc_fn,
+        check_q25_fn=check_q25_fn,
+        emit_crashpoints=emit_crashpoints,
+        resume=False,
+    )

@@ -158,6 +158,8 @@ def verify_physical_target(
 ) -> tuple[PhysicalObjectId, PhysicalObjectId | None]:
     """Validate ``root / rel_path`` safety/links/ancestors and return ``(parent_id, target_id_or_None)``."""
     _reject_path_spelling(str(root), os_)
+    if not root.is_absolute():
+        raise BrainError(ErrorCode.UNSAFE_PATH, "unsafe path")
     norm_rel = normalize_proposal_rel_path(rel_path)
     target = root.joinpath(*norm_rel.split("/"))
     os_.paths.reject_links(target)

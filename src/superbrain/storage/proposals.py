@@ -17,7 +17,9 @@ from superbrain.core.canonical import canonical_json, digest_bytes
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.proposals import (
     ApplyJournal,
+    ApplyTurnIntent,
     ChangeProposal,
+    JournalDirection,
     ManagedSliceManifest,
     ProposalStatus,
 )
@@ -245,6 +247,14 @@ class StoreProposalAdapter(ProposalStorePort):
             raise BrainError(ErrorCode.NOT_FOUND, "not found")
         return decode_journal(self._store.cas.read(str(rows[0][0])))
 
+    def list_incomplete_journals(self) -> tuple[ApplyJournal, ...]:
+        rows = self._query(
+            "SELECT journal_digest FROM p_proposals_journals "
+            "WHERE status IN ('applying', 'partially_applied', 'rolling_back') ORDER BY sequence",
+            (),
+        )
+        return tuple(decode_journal(self._store.cas.read(str(row[0]))) for row in rows)
+
     def save_manifests(self, manifests: Sequence[ManagedSliceManifest]) -> None:
         if not manifests:
             return
@@ -314,17 +324,47 @@ class PolicyApplyAuthority(ApplyAuthorityPort):
             new_sign_count=new_sign_count,
         )
 
+    def approval_message(self, approval_id: str) -> ApprovalMessage | None:
+        return self._policy.approval_message(approval_id)
+
     def open_recovery_grant(self, *, approval_id: str, journal_id: str) -> RecoveryGrant:
         return self._policy.open_recovery_grant(approval_id=approval_id, journal_id=journal_id)
 
     def recovery_grant(self, grant_id: str) -> RecoveryGrant:
         return self._policy.recovery_grant(grant_id)
 
+    def find_recovery_grant_for_journal(self, journal_id: str) -> RecoveryGrant | None:
+        return self._policy.find_recovery_grant_for_journal(journal_id)
+
+    def list_recovery_grants(self) -> tuple[RecoveryGrant, ...]:
+        return self._policy.list_recovery_grants()
+
+    def open_turn_intent(
+        self, *, journal_id: str, approval_id: str, direction: JournalDirection
+    ) -> ApplyTurnIntent:
+        return self._policy.open_turn_intent(
+            journal_id=journal_id, approval_id=approval_id, direction=direction
+        )
+
+    def begin_journal_turn(
+        self, *, approval_id: str, journal_id: str, direction: JournalDirection
+    ) -> tuple[RecoveryGrant, ApplyTurnIntent]:
+        return self._policy.begin_journal_turn(
+            approval_id=approval_id, journal_id=journal_id, direction=direction
+        )
+
+    def turn_intent_for_journal(self, journal_id: str) -> ApplyTurnIntent | None:
+        return self._policy.turn_intent_for_journal(journal_id)
+
+    def list_turn_intents(self) -> tuple[ApplyTurnIntent, ...]:
+        return self._policy.list_turn_intents()
+
     def end_recovery_grant(
-        self, *, grant_id: str, reason: str = "journal_closed", final_status: str
+        self, *, grant_id: str, reason: str = "journal_closed", final_status: str | None = None
     ) -> RecoveryGrant:
-        _ = final_status
-        return self._policy.end_recovery_grant(grant_id=grant_id, reason=reason)
+        return self._policy.end_recovery_grant(
+            grant_id=grant_id, reason=reason, final_status=final_status
+        )
 
 
 _ = Path

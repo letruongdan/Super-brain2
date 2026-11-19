@@ -214,6 +214,7 @@ def reset_signers(db: sqlite3.Connection, *, previous_generation: int, new_gener
             (intent.intent_id, stamp, grant_id),
         )
     db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, '1')", (SIGNER_RESET_META_KEY,))
+    db.execute("UPDATE apply_turn_intent SET state = 'recovery_required' WHERE state = 'active'")
     record_intent_row(
         db,
         IntentKind.SIGNER_RESET,

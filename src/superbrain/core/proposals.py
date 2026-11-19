@@ -19,6 +19,7 @@ from superbrain.core.errors import BrainError, ErrorCode
 
 __all__ = [
     "ApplyJournal",
+    "ApplyTurnIntent",
     "ChangeProposal",
     "FileJournalEntry",
     "FileJournalPhase",
@@ -342,6 +343,30 @@ class FileJournalEntry:
     backup_path: str | None
     replacement_physical_id: str | None = None
     parent_physical_id: str | None = None
+
+
+_TURN_STATES: frozenset[str] = frozenset({"active", "applied", "rolled_back", "recovery_required", "ended"})
+
+
+@dataclass(frozen=True)
+class ApplyTurnIntent:
+    turn_id: str
+    journal_id: str
+    approval_id: str
+    direction: JournalDirection
+    state: str
+    created_at: str
+
+    def __post_init__(self) -> None:
+        require_opaque_id(self.turn_id)
+        require_opaque_id(self.journal_id)
+        require_opaque_id(self.approval_id)
+        if not isinstance(self.direction, JournalDirection):
+            raise _invalid()
+        if not isinstance(self.state, str) or self.state not in _TURN_STATES:
+            raise _invalid()
+        if not isinstance(self.created_at, str) or not self.created_at:
+            raise _invalid()
 
 
 @dataclass(frozen=True)

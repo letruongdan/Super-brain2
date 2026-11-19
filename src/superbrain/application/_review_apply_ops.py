@@ -76,6 +76,8 @@ def verify_target(
 ) -> tuple[PhysicalObjectId, PhysicalObjectId | None, bool]:
     """Verify target & ancestor safety and return ``(parent_or_ancestor_id, target_id_or_None, parent_existed)``."""
     reject_path_spelling(str(root), os_)
+    if not root.is_absolute():
+        raise BrainError(ErrorCode.UNSAFE_PATH, "unsafe path")
     norm_rel = normalize_proposal_rel_path(rel_path)
     tgt = target_path(root, norm_rel)
     os_.paths.reject_links(tgt)
@@ -235,7 +237,7 @@ def mark_recovery_required_state(
             g = authority.recovery_grant(journal.grant_id)
             if g.state == "active":
                 authority.end_recovery_grant(
-                    grant_id=journal.grant_id, reason="recovery_required", final_status="recovery_required"
+                    grant_id=journal.grant_id, reason="journal_closed", final_status="recovery_required"
                 )
         except BrainError:
             pass
