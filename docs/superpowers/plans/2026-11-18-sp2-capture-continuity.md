@@ -1,0 +1,253 @@
+# SP2 · Capture và liên tục phiên giữa Claude Code và Codex — Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Cho phép Claude Code và Codex ghi `Event` chuẩn hóa theo đúng checkout qua hàng đợi outbox bền vững, dùng chung sổ bàn giao có hàng rào thế hệ sống (`(restore_epoch, writer_generation)`), và phát hành biên nhận chính xác cho phần đã lưu, đã phục vụ và đã quan sát để đạt diễn tập M1 khi tiến trình gửi bị kill đột ngột.
+
+**Architecture:** Mở rộng cặp kho từ nền `(store=5, policy=4)` của I3 lên **`(store=6, policy=5)`**. Giữ nguyên 8 MCP tools cố định cho agent (`source=agent_reported` ở `submit_episode`) và tách riêng kênh đẩy capture nội bộ `POST /v2/capture/events` trên `LoopbackServer` với quyền `capture_producer` tách biệt khỏi credential MCP của shim. Tiến trình hook đồng bộ chạy fast-path chỉ dùng stdlib + `core` để lọc bí mật và fsync vào outbox cục bộ trong mục tiêu `< 100 ms` (trần cứng `2 s`); bộ xả nền đẩy lô theo `producer_stream + sequence` và chỉ xóa mục đã nhận commit ACK. Danh tính phiên `session_ref = HMAC(session_hmac_key, session_id)` được gắn nguyên tử trên cả hai kho để sống qua mọi tổ hợp restore. Worker làm mới phần quan sát chạy ngoài DB trên `JobExecutor`, trong khi `OwnerLoop` kiểm lại policy ở hai đầu, giữ nguyên `agent_ref` sống lúc commit, tiến watermark đơn điệu và gom `dirty_flag` thành tối đa một job kế tiếp.
+
+**Tech Stack:** Python ≥ 3.11, `uv`, SQLite WAL (`synchronous=FULL`, `secure_delete=ON`), CAS content-addressed blobs, `cryptography>=44,<51` (TLS leaf-pin D2, HMAC-SHA256), `pywin32>=311` (Windows ACL/handles), stdlib HTTP/TLS loopback, pytest, mypy `--strict`, ruff, import-linter.
+
+**Spec:** [Thiết kế hệ thống rev 22 (§5.2–5.9, §6–7, §8.2, §11.3, §12.2, §14.2, §15, §17, §19, §20)](../specs/2026-10-30-super-brain2-system-design.md) · [Plan SP1 đợt 3](2026-11-18-sp1-increment3-review-apply.md) · [Plan SP1 đợt 2](2026-11-04-sp1-increment2-daemon-mcp-kernel.md) · [Báo cáo review kế hoạch SP2](../../reviews/2026-11-18-sp2-plan-review.md) · [Ghi chú xử lý review I3/SP2](../../reviews/2026-11-18-sp1-i3-sp2-plan-fix-notes.md).
+
+---
+
+## Điểm chốt trước triển khai
+
+| Quyết định | Hồ sơ và điều kiện khóa baseline |
+| --- | --- |
+| **Baseline & tích hợp với I3** | Task 9 đã đóng tại `5d00a88280d06d6ac5b0e8d5804285cb9c1fcf1b`; bản vá code và seal của `I2-CLOSE-01` đã có tại `972ae5a42ddd2f00a2116be7a3968cd031cc1e2b`. `SP2-0` dùng cùng SHA triển khai với `I3-0` sau khi hoàn tất re-review độc lập, ma trận gate/benchmark, đối chiếu `T9-P01` trên `972ae5a` và chủ dự án xác nhận spec rev 22. Một điều phối viên giữ wire schema, thứ tự migration append-only (`I3: (5, 4) → SP2: (6, 5)`), bảng crash và reseal theo thứ tự: **I3-0 + SP2-0 → SP2-1 trên transport I2 → I3-4/SP2-4 tích hợp fence và restore → 2 host native**. |
+| **Diễn giải §7.4 & §20 ca 62** | Wheel I2 đã phát hành (`5d00a88`/`972ae5a`) kiểm đúng 4 khóa ở `decode_identity_response` và ánh xạ sang `identity_mismatch` trước khi gửi bearer/tool. Trước khi reseal `SP2-1`, trình chủ dự án và reviewer chốt 1 câu làm rõ ở đặc tả: yêu cầu trả `unsupported_version` của §7.4/ca 62 áp cho mọi thành phần từ SP2 trở đi ở cả hai chiều (shim SP2 gặp daemon I2 thiếu digest, shim SP2 gặp digest lệch, daemon SP2 gặp envelope thiếu/lệch digest), còn ca đối chiếu với wheel lịch sử I2 nguyên bản giữ nguyên kết quả quan sát `(code="identity_mismatch", bearer_sent=0, dispatches=0)`. |
+| **Trích xuất hàng đợi cũ (§17.4, §19)** | Khóa ngay ở `SP2-0` danh sách file rút từ repo cũ tại commit `f83271d` cho hàng đợi outbox (đường dẫn gốc, SHA-256 từng blob, bộ test nguồn đi kèm) và lưu biên nhận chạy pass bộ test gốc trước khi chỉnh sửa cho schema `Event` v2. |
+| **O2, O9 (phần capture) và phụ thuộc Đợt 4** | Khảo sát O2 và phần capture của O9 chỉ dùng tài liệu chính thức, fixture đã lọc hoặc kênh được chủ dự án duyệt; trường chưa chứng minh được ghi `unknown`, sự kiện host không phát ghi `unavailable`. Các task `SP2-1`..`SP2-4` và phần adapter/xác minh lớp 2 ở đầu `SP2-5` chạy độc lập, **không chờ** SP1 đợt 4; riêng diễn tập M1 ở cuối `SP2-5` chỉ yêu cầu mặt kiểm tra tối thiểu của `doctor` đợt 4 (`get_health(deep=true)`, kiểm quyền owner-only, báo cáo `CaptureGap`/outbox, trạng thái lớp 2 và bootstrap `applied`). |
+| **Reseal & phê duyệt thử thật** | Mọi thay đổi chạm `.verification/task9-seal.json` (`schemas/mcp-tools-v2.json`, `tests/fixtures/mcp_v2/*`, `docs/design/sp1-crash-table.md`, `scripts/gate.py`, `tests/**`) phải có reviewer độc lập duyệt reseal. Chỉ chạy hook/transcript/kill-process trên Claude Code và Codex thật sau khi chủ dự án duyệt phạm vi, cô lập trên hai checkout nháp `A`/`B` và không lưu transcript thật chứa dữ liệu người dùng vào repo. |
+
+## Global Constraints
+
+- **Kiến trúc, phân tầng & ranh giới I/O (§4.2):** Giữ `ruff`, `mypy --strict`, `import-linter` và `tests/architecture/test_imports.py`. `domain.capture` và `domain.continuity` là miền thuần luật, chỉ import `core`, `ports` và miền được phép — không bao giờ chạm SQLite, filesystem hay socket. Bổ sung `composition/hook_entry.py` và `composition/capture_drain_entry.py` vào `FAULT_FREE_ENTRIES` (cấm tuyệt đối import `superbrain.core.faults` ở mọi entrypoint phía client/hook). Tiến trình `hook_entry` chỉ được nạp stdlib + `superbrain.core` + `domain.capture` nhẹ để giữ thời gian thực thi đồng bộ `< 100 ms` mục tiêu (`< 2 s` trần cứng, quá hạn thoát êm không chặn harness và chỉ ghi mã pha vào log).
+- **Tách kênh MCP của agent với kênh capture nội bộ (§6.1, §8.2, Q17):** Giữ nguyên đúng 8 MCP tools trong `schemas/mcp-tools-v2.json`; `submit_episode` luôn đóng cứng `source="agent_reported"`. Kênh đẩy outbox đi qua route nội bộ riêng `POST /v2/capture/events` trên `LoopbackServer` (dùng cùng TLS leaf-pin D2 và kiểm `schema_digest`), chỉ chấp nhận credential mang capability `capture_producer` khớp `(principal_id, producer_stream, repo_id, checkout_id)` (từ chối bearer của MCP shim và `user:cli` bằng `IDENTITY_MISMATCH`). Daemon chỉ gắn `source="tool_observed"` khi host của producer đang có `NativeHostReceipt` hợp lệ khớp `(harness_id, host_version, config_digest)`; nếu lớp 2/capture ở `unknown` thì ghi `source_verification="unverified"` để không bao giờ nâng bài học lên `verified` (§8.2, ca 11, 42).
+- **Độ bền, `C2` CAS staging & quyền riêng tư (§5.3–5.7, §14.2):** Mọi nội dung có TTL (`Event`, `Evidence`, `task_goal`, `agent_ref`, `observed_ref`, trích đoạn hội thoại L2) nằm trong CAS ngoài ledger và được stage ra ngoài SQLite transaction theo bất biến `C2` (`StrictKernelTx`). Privacy filter chạy trước cả lần ghi vào outbox cục bộ lẫn trước khi nhận ở daemon; thất bại lọc thì từ chối trọn lần ghi, không lưu một phần. `session_id` thô không bao giờ xuất hiện trong L0/L1/L2, SQLite, CAS, outbox hay log.
+- **Ngân sách gate mặc định F4 (`< 300 s`, §17.2):** Toàn bộ ngưỡng thời gian `60 s`, `5 phút`, `30 phút`, `14 ngày` trong unit/integration test phải đi qua `FakeClock` tiêm vào `OwnerLoop`/domain (0 `sleep` cố định). Gom các ca crash/fsync của outbox, session bind, worker và handoff vào chung một driver subprocess trên wheel venv theo session; giữ mốc kiểm soát local Windows `< 275 s` và toàn bộ 10 ô ma trận `< 300 s`. Kịch bản diễn tập native M1 với Claude Code và Codex thật chạy qua script/gate riêng có chủ dự án duyệt, không nằm trong vòng pytest mặc định của `scripts/gate.py`.
+
+## Review Focus
+
+1. **Giả mạo `tool_observed` qua MCP shim, hoặc `unsupported_version` non-200 bị `loopback.py` biến thành `DAEMON_UNAVAILABLE (request_may_have_run=True)` / làm crash `brain status` (`SP2-1`, `SP2-2`):** `test_capture_endpoint_rejects_mcp_shim_tokens_and_preserves_eight_mcp_tools` và `test_schema_digest_mismatch_returns_deterministic_unsupported_version_across_all_entrypoints`.
+2. **Chiếm đoạt `session_ref` hoặc đổi ngầm khóa HMAC sau `restore_policy` / `restore_store` độc lập (`SP2-3`, `SP2-4`):** `test_dual_store_session_binding_and_hmac_key_survive_independent_store_and_policy_restores`.
+3. **Worker cập nhật phần quan sát làm mất patch `agent_ref` vừa commit của agent, hoặc lùi watermark khi có `Event` đến muộn (`SP2-3`, `SP2-4`):** `test_worker_three_phase_commit_preserves_concurrent_agent_patch_and_monotonic_watermarks`.
+4. **Sau restore số `revision` lặp lại khiến `ReadAck`/`ServedReceipt`/`resume_ref` trỏ nhầm nội dung mới, hoặc replay `not_stored_policy`/takeover-only mất metadata đã commit (`SP2-1`, `SP2-4`):** `test_epoch_bound_receipts_and_read_acks_never_alias_post_restore_revisions` và `test_submit_episode_replay_reconstructs_stored_takeover_only_and_not_stored_policy`.
+5. **Sổ chạm trần `32 KB` bị kẹt không thể gộp/thay thế, hoặc lộ nội dung sang checkout `B` qua đường replay / sau khi Event nguồn bị quarantine (`SP2-4`):** `test_full_handoff_allows_non_growing_supersedes_and_merges_only` và `test_cross_checkout_and_revoked_event_blocked_across_discover_read_resume_write_and_replay`.
+
+---
+
+## Bản đồ file và hợp đồng dùng chung
+
+### Phân công module theo task
+
+| Task | Module sản xuất tạo mới / mở rộng (`src/superbrain/`) | Schema, bảng thiết kế và kiểm thử |
+| --- | --- | --- |
+| **SP2-0** | — (khóa hợp đồng wire, bảng O2/O9, manifest `f83271d`, bảng crash `SP2`, quyết định ca 62) | `docs/design/sp2-host-capture-matrix.md`, `docs/design/sp1-crash-table.md` (thiết kế dòng mới) |
+| **SP2-1** | `core/{wire.py,_wire_catalog.py,_kernel_send_attempts.py}`, `cli_api/{_loopback_wire.py,loopback.py,_server_http.py}`, `application/{idempotency.py,dispatch.py}`, `composition/{client_entry.py,shim_entry.py}` | `schemas/mcp-tools-v2.json`, `tests/fixtures/mcp_v2/{requests.json,responses.json,errors.json}`, `tests/contract/test_mcp_v2_schema.py`, `tests/cli_api/test_schema_digest_handshake.py`, `tests/integration/test_sp2_i2_wheel_compat.py` |
+| **SP2-2** | `domain/capture/{envelope.py,privacy_gate.py,outbox_rules.py}`, `ports/capture.py`, `storage/{outbox.py,capture_events.py,kernel_schema.py}` (`store v6` phần capture), `cli_api/capture_client.py`, `application/capture_ingest.py`, `composition/{hook_entry.py,capture_drain_entry.py}` | `tests/domain/test_capture_envelope_and_privacy.py`, `tests/storage/test_outbox_durability_and_limits.py`, `tests/integration/test_capture_ack_and_crash_matrix.py` |
+| **SP2-3** | `domain/capture/exposure.py`, `domain/continuity/{sessions.py,worker_rules.py}`, `ports/continuity.py`, `storage/{_policy_sessions.py,sessions.py,kernel_schema.py}` (`policy v5` + `store v6` phần session/watermark), `application/{continuity_worker.py,owner_loop.py}`, `workers/executor.py` | `tests/domain/test_exposure_and_worker_rules.py`, `tests/storage/test_dual_store_session_binding.py`, `tests/application/test_continuity_worker_scheduling.py` |
+| **SP2-4** | `domain/continuity/{handoff_model.py,merge_rules.py,budget.py,rendering.py}`, `storage/{handoffs.py,send_attempts.py,restore.py}`, `application/{handoff_service.py,dispatch.py}`, `cli_api/_server_http.py` (hoàn tất `C5` flush) | `tests/domain/test_handoff_limits_and_budget.py`, `tests/storage/test_handoff_restore_and_epochs.py`, `tests/integration/test_handoff_lifecycle_and_takeover.py` |
+| **SP2-5** | `adapters/harness/{claude_code.py,codex.py,layer2_probe.py}`, `storage/_policy_approvals.py` (nối `NativeHostReceipt`), `composition/doctor_probes_sp2.py` | `tests/adapters/test_claude_and_codex_capture_adapters.py`, `tests/integration/test_layer2_invalidation.py`, `scripts/rehearse_m1.py` |
+
+### Hợp đồng dùng chung xuyên suốt `SP2-1`..`SP2-5`
+
+- **Cặp schema `(store=6, policy=5)` trên nền `(5, 4)` của I3:**
+  - `policy v5` (`min_reader_version=5`): thêm `session_hmac_key` (khóa 32 byte gắn cố định với `store_id`, kiểm mismatch và carry-forward nguyên vẹn qua `PolicyRestoreStageHook` của `I3-4` khi chạy `restore_policy`), bảng `session_ref_bindings(session_ref PRIMARY KEY, principal_id, bound_at)` chỉ-thêm không bao giờ xóa/ghi đè qua restore, và metadata `NativeHostReceipt` gắn với `(harness_id, host_version, config_digest)` cùng capability `capture_producer` trên credential của adapter.
+  - `store v6` (`min_reader_version=6`): thêm các bảng `capture_events`, `producer_watermarks(producer_stream PRIMARY KEY, high_seq, updated_at)`, `capture_gaps`, `sessions(session_ref PRIMARY KEY, principal_id, repo_id, checkout_id, state, last_event_at, ended_at)`, `session_segments`, `tasks(task_id PRIMARY KEY, owner_id, repo_id, checkout_id, goal_ref, task_state, task_state_source, created_at, updated_at)`, `episodes` (lưu kèm metadata kết quả handoff đã commit: `has_handoff_op`, `handoff_status`, `handoff_artifact_id`, `committed_handoff_revision`, `committed_restore_epoch`, `committed_writer_generation`), `handoffs`, `handoff_revisions(artifact_id, revision_epoch, revision, handoff_revision, agent_ref, observed_ref, writer_generation, holder_principal, holder_session_ref, holder_restore_epoch, agent_updated_at, observed_through, PRIMARY KEY(artifact_id, revision_epoch, revision))`, và mở rộng cả `artifact_send_attempt` (`level`, `revision_epoch`) lẫn `artifact_read_ack` (`artifact_id`, `revision_epoch`).
+- **Handshake `schema_digest` và 4 mối nối wire/client (`SP2-R2`, `SP2-R8`):**
+  - `GET /v2/identity` trả 5 khóa `{protocol_version, store_id, instance_id, writer_epoch, schema_digest}`. Decoder của SP2 kiểm hợp lệ 4 khóa danh tính trước (`-> IDENTITY_MISMATCH`), sau đó mới kiểm sự có mặt và giá trị của `schema_digest` (`-> UNSUPPORTED_VERSION`) trước khi gửi bearer hay payload.
+  - Private envelope của `POST /v2/tools/call` và `POST /v2/capture/events` mang `schema_digest`; daemon kiểm trước dispatch và trả HTTP `426` (hoặc cặp status cố định đã đăng ký trong `_ERROR_STATUS_EXPECTED_CODE` của `cli_api/loopback.py`) với `ErrorCode.UNSUPPORTED_VERSION` và `request_may_have_run=False`. `composition/client_entry.py::read_status` bắt cả `LoopbackTransportError` lẫn `BrainError`.
+  - `application/idempotency.py::tool_uses_idempotency` chỉ bật idempotency cho `prepare_task` khi `mode != "discover"`. `DiscoverResult` giữ `workspace_id` và `checkout_id` để thỏa hậu kiểm checkout của `client_entry.py`.
+- **Gắn kép `session_ref`, giao thức 3 pha `OwnerLoop` ↔ `JobExecutor` và vòng đời `ServedReceipt` (`C5`):**
+  - *Lần dùng đầu của `session_id`:* tính `session_ref = HMAC(session_hmac_key, session_id)`, ghi bền binding `(session_ref, principal_id)` vào `policy.db` trước rồi chiếu sang `sessions` ở `brain.db`; mọi lần đọc/ghi đối chiếu cả hai kho, bất kỳ bên nào gắn với principal khác đều trả `IDENTITY_MISMATCH`.
+  - *Ba pha của worker làm mới sổ:* (1) **Claim trên `OwnerLoop`:** kiểm `automatic_capture` trên `PolicyStore`, chụp các `Event` mới + watermark hiện hành ra blob `payload_ref` ngoài transaction rồi đẩy `WorkItem` vào `JobExecutor`; (2) **Chạy trên `JobExecutor`:** hàm thuần luật của `domain.continuity` dựng dữ liệu quan sát mới và stage blob `observed_ref` ngoài DB; (3) **Commit trên `OwnerLoop` (`WorkerCompleted`):** kiểm lại `PolicyStore` và trạng thái quarantine/tombstone của Event nguồn, mở **một** owner transaction đọc lại `agent_ref` **đang sống** của sổ (không bao giờ đè bằng bản chụp lúc claim), ghi `revision` mới giữ nguyên `handoff_revision`, nâng watermark từng `producer_stream` theo `max`, đóng `Job` và nếu `dirty_flag=1` thì tạo đúng một job chờ kế tiếp rồi xóa cờ.
+  - *Vòng đời `ServedReceipt` (`C5`) và replay:* trước khi ghi bytes HTTP của `get_artifact`, owner ghi `ArtifactSendAttempt(state=PENDING)` gắn `(logical_result_id, principal_id, task_id, artifact_id, revision_epoch, revision, level, resource_digests)` (mỗi lần truyền vật lý, kể cả retry cùng `idempotency_key`, sinh `send_attempt_id = served_receipt_id` mới và tính động `handoff_live`). `_LoopbackHandler._send` flush xong trên cùng `(store_id, instance_id, writer_epoch)` thì gọi `finalize_attempt -> SERVED_ONLY`; lỗi socket gọi `interrupt_attempt -> UNKNOWN`; mở lại kho gọi `recover_pending_attempts()`.
+- **Bảng phân công đủ 44 ca nghiệm thu §20 thuộc SP2 (`ca 2, 36, 37–78`):**
+  - `SP2-1`: `55` (phần wire `discover` vs `work`), `62`.
+  - `SP2-2`: `11` (phần tách `tool_observed` vs `agent_reported`), `41` (phần capture/outbox/log), `59` (phần `automatic_capture` ở đường thu).
+  - `SP2-3`: `2` (phần cô lập session/task hai checkout cùng remote), `39`, `40`, `46`, `53`, `54`, `59` (worker recheck cờ lúc bắt đầu & commit).
+  - `SP2-4`: `2`, `36`, `37`, `38`, `39`, `41`–`45`, `47`–`53`, `55`–`61`, `63`–`78`.
+  - `SP2-5`: `2`, `20` (cùng I3-1 cho lớp 2 `unknown`), `40`, `41`, `48`, `56`, `67`–`68` trên hai host thật ở bài diễn tập M1.
+
+---
+
+## SP2-0 · Khóa hợp đồng wire, bảng khảo sát O2/O9, manifest `f83271d` và bảng điểm crash
+
+**Files:**
+- Create: `docs/design/sp2-host-capture-matrix.md`
+- Modify: `docs/design/sp1-crash-table.md` (thiết kế các dòng crashpoint của SP2 nối tiếp sau các dòng `ApplyJournal`/restore của I3)
+- Artifact đối chiếu: `.superpowers/sdd/2026-11-18-sp2-capture-continuity/ledger.md`
+
+**Interfaces:**
+- Consumes: kết quả đóng `972ae5a`, quyết định `O12` và spec rev 22 của chủ dự án, nền `(store=5, policy=4)` của [Plan I3](2026-11-18-sp1-increment3-review-apply.md).
+- Produces: hồ sơ chốt câu chữ §7.4/ca 62, bảng O2/O9 theo từng trường dữ liệu cho Claude Code và Codex, manifest trích xuất queue từ commit `f83271d` kèm receipt test gốc (§17.4), và danh sách tên crashpoint cố định cho `SP2-2`..`SP2-4`.
+
+- [ ] **Step 1: Xác nhận baseline sau `972ae5a`, khóa diễn giải §7.4/ca 62 và manifest trích xuất `f83271d`**
+  Đối chiếu hồ sơ re-review độc lập và gate trên `972ae5a` cùng `I3-0`. Trình chủ dự án và reviewer ký nhận biên bản diễn giải §7.4 / §20 ca 62 (cập nhật câu làm rõ đặc tả trước khi reseal `SP2-1`, giữ nguyên wheel I2 lịch sử làm chuẩn tương thích chéo). Lập manifest các file hàng đợi rút từ repo cũ ở commit `f83271d` (đường dẫn, SHA-256, giấy phép nội bộ) và chạy nguyên vẹn bộ test gốc của chúng, lưu receipt trước khi sửa bất kỳ dòng nào (§17.4, §19).
+- [ ] **Step 2: Pin bảng khảo sát O2/O9 và ngân sách đo lường theo từng host**
+  Viết `docs/design/sp2-host-capture-matrix.md` cho Claude Code và Codex: phiên bản khảo sát, vòng đời tiến trình, vị trí/quyền đọc hook và transcript, nguồn xác định checkout scope, quy tắc suy ra **hồ sơ người nhận theo đoạn phiên** (`provider`, `model`, `account/config_digest`) và **bằng chứng tiếp xúc từng mục** (`sent_to_recipient` chỉ khi khớp digest trong model call hoàn tất của đúng đoạn phiên; `local_only` khi có căn cứ chỉ thu cục bộ; còn lại `unknown`), sự kiện host không phát (`unavailable`), mẫu lệnh lớp 2 và đường thu `NativeHostReceipt`. Ghim rõ công thức và oracle cho: hook mục tiêu `< 100 ms` / trần hợp đồng `2 s`, trần outbox `100 MB`, lịch worker `20 event` hoặc `60 s`, trạng thái `active` `5 phút` / `in_progress_unknown` `30 phút`, cửa sổ `discover` `14 ngày`, ước lượng `utf8-byte-v1 = ceil(total_utf8_bytes / 4)` và mọi trần byte của §7.4.
+- [ ] **Step 3: Khóa thứ tự schema `(store=6, policy=5)` và danh mục điểm crash SP2 với điều phối viên I3**
+  Thống nhất với điều phối viên I3 các tên crashpoint mới của SP2 trong `docs/design/sp1-crash-table.md` (`capture.outbox.after_write_before_fsync`, `capture.daemon.after_commit_before_ack`, `session.after_policy_bind_before_store_project`, `continuity.worker.before_owner_commit`, `handoff.after_commit_before_ack`, `artifact_send.after_pending_before_flush`) để không đụng độ tên hay thứ tự migration.
+
+---
+
+## SP2-1 · Hợp đồng `mcp-tools-v2`, handshake `schema_digest` và kênh wire nội bộ
+
+**Files:**
+- Modify: `schemas/mcp-tools-v2.json`, `src/superbrain/core/wire.py`, `src/superbrain/core/_wire_catalog.py`, `src/superbrain/core/_kernel_send_attempts.py`, `src/superbrain/cli_api/_loopback_wire.py`, `src/superbrain/cli_api/loopback.py`, `src/superbrain/cli_api/_server_http.py`, `src/superbrain/application/idempotency.py`, `src/superbrain/application/dispatch.py`, `src/superbrain/composition/client_entry.py`, `src/superbrain/composition/shim_entry.py`, `tests/fixtures/mcp_v2/{requests.json,responses.json,errors.json}`
+- Create: `tests/cli_api/test_schema_digest_handshake.py`, `tests/integration/test_sp2_i2_wheel_compat.py`
+- Test: `tests/contract/test_mcp_v2_schema.py`, `tests/cli_api/test_schema_digest_handshake.py`, `tests/integration/test_sp2_i2_wheel_compat.py`
+
+**Interfaces:**
+- Consumes: `schemas/mcp-tools-v2.json` của I2, `LoopbackClient`/`LoopbackServer` (TLS D2), wheel I2 đã phát hành.
+- Produces: `schema_digest` hai chiều trên `GET /v2/identity` và private envelope, tách nhánh `prepare_task` (`discover` vs `work`), schema mở rộng cho `submit_episode`/`get_artifact`/`ArtifactSendAttempt`/`ArtifactReadAck`/`ReadAckInput`, và khung route nội bộ `POST /v2/capture/events`.
+
+- [ ] **Step 1: Viết bộ test RED cho schema v2 mở rộng, 4 mối nối wire/idempotency và ma trận bắt tay hai chiều**
+  Kiểm `schemas/mcp-tools-v2.json` vẫn giữ đúng **8 MCP tools** (cấm thêm tool thứ 9):
+  - `prepare_task` tách `mode="discover"` (bắt buộc `schema_version`, `mode`, workspace selector; tùy chọn `task_id`, `context_budget_tokens`; cấm `idempotency_key`, `description`, `resume_ref`, `seen_handoff_refs`; trả `{workspace_id, checkout_id, continuity, degraded_codes}`, 0 side effect) và `mode="work"` (mặc định, có `idempotency_key`, thêm tùy chọn `resume_ref` bắt buộc đi kèm `task_id` và `seen_handoff_refs`, trả thêm `handoff_live`).
+  - `submit_episode` thêm `handoff` (gồm cả `constraint_changes`, `closed_changes`, `merges`, `reopens`, `depends_on_change`), `base_revision`, `fence`, `takeover` (`base_revision` và `fence` bắt buộc khi có `handoff` hoặc `takeover`; hỗ trợ takeover-only không kèm `handoff`); `SubmitEpisodeResult` chỉ phát `handoff_revision`, `handoff_status`, `fence`, `writer_status` khi request có `handoff` hoặc `takeover`.
+  - `get_artifact` thêm `revision_epoch` (bắt buộc với `kind="handoff"`) và trả `handoff_live`; cả `ArtifactSendAttempt`, `ArtifactReadAck` và `ReadAckInput` đều mang đủ `(artifact_id, revision_epoch, revision)` (thêm `level` ở `ArtifactSendAttempt`).
+  - Pin `x-implemented-in` / `x-side-effects` trung thực theo trạng thái triển khai thật ở từng mốc.
+  - Viết test cho đủ 4 dòng ma trận bắt tay qua cả 3 CLI entrypoints (`brain-mcp`, `brain mcp`, `brain status`) và probe envelope riêng:
+
+  | Shim / daemon hoặc probe | Kết quả bắt buộc ở biên quan sát |
+  | --- | --- |
+  | SP2 / SP2, `schema_digest` hai chiều khớp | Gọi tool thành công và nhận kết quả của handler (`request_may_have_run` không bật). |
+  | SP2 / daemon I2 thật (identity 4 khóa thiếu digest), hoặc identity SP2 trả digest lệch | Shim SP2 trả `unsupported_version` (`bearer_sent=0`, `dispatches=0`); nếu payload sai `store_id`/4 khóa danh tính thì vẫn trả `identity_mismatch`. |
+  | Wheel I2 đóng băng (`5d00a88`/`972ae5a`) / daemon SP2 thật | Decoder I2 đòi đúng 4 khóa nên trả `identity_mismatch` (`bearer_sent=0`, `dispatches=0`); đối chiếu cùng wheel I2 với daemon I2 thành công. |
+  | Probe đã qua identity/auth, gửi private envelope thiếu hoặc lệch `schema_digest` vào `POST /v2/tools/call` hoặc `POST /v2/capture/events` | Daemon SP2 trả `unsupported_version` với `request_may_have_run=False`, `dispatches=0`, `mutations=0` (không bao giờ bị `loopback.py` đổi thành `daemon_unavailable`). |
+
+  Run: `uv run --locked pytest -q tests/contract/test_mcp_v2_schema.py tests/cli_api/test_schema_digest_handshake.py tests/integration/test_sp2_i2_wheel_compat.py`
+  Expected: `FAIL` (schema/wire chưa mở rộng).
+- [ ] **Step 2: Reviewer độc lập duyệt reseal cho schema/fixtures/tests, rồi triển khai wire, normalizer và stub an toàn**
+  Cập nhật `_IDENTITY_KEYS` / `decode_identity_response`, `_CALL_KEYS` + `_ERROR_STATUS_EXPECTED_CODE` trong `cli_api/loopback.py`, bắt `LoopbackTransportError` trong `client_entry.py::read_status`, sửa `tool_uses_idempotency` rẽ nhánh theo `mode != "discover"`, và gắn khung xác thực `capture_producer` cho `POST /v2/capture/events` (trả `capability_unavailable` cho tới khi nối `SP2-2`).
+- [ ] **Step 3: Chạy GREEN, kiểm tra mutations và commit**
+  Mutation bắt buộc: xóa ánh xạ `unsupported_version` khỏi `_ERROR_STATUS_EXPECTED_CODE`, gộp lỗi sai `store_id` vào `unsupported_version`, bật `tool_uses_idempotency` cho `mode="discover"`, bỏ `workspace_id`/`checkout_id` khỏi `DiscoverResult`, và cho phép bearer của MCP shim đi qua `POST /v2/capture/events`. §20 ca 55 (phần wire), 62.
+  Run: `uv run --locked pytest -q tests/contract/test_mcp_v2_schema.py tests/cli_api/test_schema_digest_handshake.py tests/integration/test_sp2_i2_wheel_compat.py tests/cli_api/test_loopback_client.py tests/mcp/test_stdio.py`
+  Expected: `PASS`.
+
+---
+
+## SP2-2 · Envelope `Event`, privacy filter trước ghi bền, hàng đợi outbox và ACK
+
+**Files:**
+- Create: `src/superbrain/domain/capture/__init__.py`, `src/superbrain/domain/capture/envelope.py`, `src/superbrain/domain/capture/privacy_gate.py`, `src/superbrain/domain/capture/outbox_rules.py`, `src/superbrain/ports/capture.py`, `src/superbrain/storage/outbox.py`, `src/superbrain/storage/capture_events.py`, `src/superbrain/cli_api/capture_client.py`, `src/superbrain/application/capture_ingest.py`, `src/superbrain/composition/hook_entry.py`, `src/superbrain/composition/capture_drain_entry.py`
+- Modify: `src/superbrain/storage/kernel_schema.py` (`store v6` phần `capture_events`, `capture_gaps`), `src/superbrain/cli_api/_server_http.py`, `src/superbrain/application/dispatch.py` (`get_health` báo `CaptureGap`), `tests/architecture/test_imports.py` (`FAULT_FREE_ENTRIES`)
+- Test: `tests/domain/test_capture_envelope_and_privacy.py`, `tests/storage/test_outbox_durability_and_limits.py`, `tests/integration/test_capture_ack_and_crash_matrix.py`
+
+**Interfaces:**
+- Consumes: hàng đợi gốc đã pin từ `f83271d`, privacy scanner của kernel I2, `DurablePublisher`, `POST /v2/capture/events`.
+- Produces: `CaptureEventEnvelope`, `OutboxSpool` (giới hạn `100 MB`, owner-only, fsync mỗi lô), `hook_entry` (`< 100 ms` mục tiêu / `2 s` trần cứng), `CaptureIngestService` (dedup theo `(producer_stream, sequence)`, phát hiện khoảng trống sequence và ghi `CaptureGap`), báo cáo gap qua `get_health`.
+
+- [ ] **Step 1: Viết bộ test RED cho lọc bí mật trước outbox, trần `100 MB` / đầy đĩa, dedup sequence và điểm crash fsync/ACK**
+  Kiểm privacy filter chặn secret mồi trước cả khi chạm đĩa outbox lẫn khi nhận ở daemon (không để lại bytes nhạy cảm trong outbox, CAS, SQLite hay log; log của hook chỉ chứa mã lỗi và tên pha — ca 41). Kiểm `automatic_capture=false` dừng nhận mục mới mà không chặn harness (ca 59). Kiểm `hook_entry` chạy bằng `python -I` đạt mục tiêu `< 100 ms` trên workload chuẩn và thoát an toàn ở trần `2 s` khi I/O bị treo giả lập. Kiểm đầy đĩa (`ENOSPC`), vượt trần `100 MB` của outbox và nhảy cóc `sequence`: phân biệt rõ mục đã bền trước fsync, mục rách sau crash trước fsync, và ca đĩa đầy không thể ghi gap cục bộ ngay thì phát hiện khoảng trống `sequence` ở lần kết nối kế tiếp và phơi bày qua `get_health` (nói rõ khi filesystem chỉ đạt `process_crash_durable`). Kiểm crash tại `capture.outbox.after_write_before_fsync`, `capture.daemon.after_commit_before_ack`, mất ACK trên đường về, reconnect, duplicate batch, `Event` đến muộn, payload quá giới hạn và producer gửi sai checkout scope (`-> IDENTITY_MISMATCH`).
+  Run: `uv run --locked pytest -q tests/domain/test_capture_envelope_and_privacy.py tests/storage/test_outbox_durability_and_limits.py tests/integration/test_capture_ack_and_crash_matrix.py`
+  Expected: `FAIL`.
+- [ ] **Step 2: Niêm phong test + dòng crash table mới, rồi triển khai `domain.capture`, `storage/outbox.py`, `hook_entry` và `CaptureIngestService`**
+  Giữ `domain.capture` thuần luật không import `storage`/`adapters`. `CaptureIngestService` stage payload `Event` vào CAS ngoài transaction (`C2`), sau đó trong một owner transaction kiểm lại policy `automatic_capture`, dedup theo `(producer_stream, sequence)`, ghi `CaptureGap` nếu hụt sequence, lưu holder với hạn gốc, và chỉ trả commit ACK sau khi SQLite WAL đã `COMMIT` bền; `OutboxSpool` chỉ xóa đúng các sequence `<= acked_through_sequence`.
+- [ ] **Step 3: Chạy GREEN, kiểm tra `test_imports.py`, mutations và commit**
+  Mutation bắt buộc: xóa mục trong outbox trước khi nhận ACK, ghi outbox trước khi chạy privacy filter, bỏ kiểm `(repo_id, checkout_id)` của `producer_stream`, gắn `source="tool_observed"` khi chưa có `NativeHostReceipt` hợp lệ (ca 11), và bỏ dedup `(producer_stream, sequence)`. §20 ca 11, 41, 59.
+  Run: `uv run --locked pytest -q tests/domain/test_capture_envelope_and_privacy.py tests/storage/test_outbox_durability_and_limits.py tests/integration/test_capture_ack_and_crash_matrix.py tests/architecture/test_imports.py tests/storage/test_crash_matrix.py`
+  Expected: `PASS`.
+
+---
+
+## SP2-3 · Danh tính phiên gắn kép hai kho, bằng chứng tiếp xúc theo đoạn phiên và worker làm mới sổ
+
+**Files:**
+- Create: `src/superbrain/domain/capture/exposure.py`, `src/superbrain/domain/continuity/__init__.py`, `src/superbrain/domain/continuity/sessions.py`, `src/superbrain/domain/continuity/worker_rules.py`, `src/superbrain/ports/continuity.py`, `src/superbrain/storage/_policy_sessions.py`, `src/superbrain/storage/sessions.py`, `src/superbrain/application/continuity_worker.py`
+- Modify: `src/superbrain/storage/kernel_schema.py` (`policy v5` + `store v6` phần session/segment/watermark), `src/superbrain/storage/policy_store.py`, `src/superbrain/storage/restore.py` (đăng ký `PolicyRestoreStageHook` bảo toàn `session_hmac_key` + `session_ref_bindings`), `src/superbrain/application/owner_loop.py`, `src/superbrain/workers/executor.py`
+- Test: `tests/domain/test_exposure_and_worker_rules.py`, `tests/storage/test_dual_store_session_binding.py`, `tests/application/test_continuity_worker_scheduling.py`
+
+**Interfaces:**
+- Consumes: `PolicyStore` v5, `Store` v6, `CaptureIngestService`, `JobExecutor`, `OwnerLoop`.
+- Produces: `bind_or_verify_session_ref(...)` gắn kép hai kho, bộ phân loại `ExposureEvidence` (`sent_to_recipient` | `local_only` | `unknown`) theo `SessionSegment`, và job `continuity.refresh` chạy theo giao thức 3 pha trên `OwnerLoop` ↔ `JobExecutor`.
+
+- [ ] **Step 1: Viết bộ test RED cho `session_ref` gắn kép hai kho (gồm mọi tổ hợp restore), đoạn phiên và bằng chứng tiếp xúc**
+  Kiểm §20 ca 46 mở rộng: hai principal gửi cùng `session_id` tuần tự và đồng thời qua mọi đường nhận `session_id` (`capture`, `submit_episode`, retry) — đúng một bên thắng binding, bên kia nhận `IDENTITY_MISMATCH`; khởi động lại daemon, chạy **restore riêng `store/`**, **restore riêng `policy/`** (kể cả từ backup `policy v4` của I3 nâng lên `policy v5`), và **restore cả hai kho theo hai thứ tự** đều giữ nguyên `session_hmac_key` và không cho principal khác chiếm `session_ref` đã ghi; crash tại `session.after_policy_bind_before_store_project` được reconcile đúng một lần; quét toàn bộ L0/L1/L2, SQLite, CAS, outbox và log xác nhận không có `session_id` gốc nhưng có bản ghi hợp lệ mang `session_ref` đúng. Kiểm đổi `provider`/`model`/`account`/`config_digest` mở `SessionSegment` mới trên cùng `session_ref`, không lan truyền bằng chứng giữa các mục; chỉ gán `sent_to_recipient` khi xác minh đúng digest mục nằm trong model call hoàn tất của đúng đoạn phiên (model call lỗi/treo → `unknown`; chỉ có hook cục bộ → `local_only`).
+- [ ] **Step 2: Viết bộ test RED cho lập lịch worker (`20 event` / `60 s` với `FakeClock`), giao thức 3 pha và trạng thái phiên**
+  Kiểm worker hoàn toàn không gọi model, chỉ dùng luật trích xuất; lên lịch khi đủ `20 Event` hoặc sau `60 s` kể từ event đầu tiên chưa làm mới (phiên chết khi mới có `< 20` event vẫn được làm mới nhờ mốc `60 s` — ca 54); tối đa `1` job chờ cho mỗi task, có event mới trong lúc job đang chạy thì bật `dirty_flag` và chỉ xếp đúng `1` job kế tiếp sau khi lượt hiện hành kết thúc. Kiểm giao thức 3 pha ở `OwnerLoop` (`continuity.worker.before_owner_commit`): worker chụp dữ liệu cũ trong lúc agent commit patch mới → khi worker về sau, `agent_ref` mới của agent vẫn còn nguyên, `handoff_revision` không tăng và agent không bị `revision_conflict` (ca 39, 53); sổ mới chỉ do worker tạo (`revision > 0, handoff_revision = 0, task_state_source = "inferred"`) cho phép agent đầu tiên cập nhật bằng `base_revision = 0` (ca 53). Kiểm recheck `automatic_capture` ở cả lúc claim lẫn lúc commit trên `OwnerLoop` cùng đủ 4 tổ hợp `automatic_capture × manual_submission` (ca 59). Kiểm `active` (`≤ 5 phút`), `in_progress_unknown` (`> 30 phút` hoặc kill tiến trình không có event kết thúc — ca 40), `ended` và quy tắc event muộn không làm lùi watermark của `producer_stream`, event đến sau `ended` được gộp vào phần quan sát nhưng không đổi trạng thái trừ sự kiện `session_resumed` (ca 54). Kiểm checkpoint việc chạy dài lưu đủ `command`, `cwd`, `source_revision`, `pid`/`started_at`, `log_or_receipt_path`, `next_action`.
+  Run: `uv run --locked pytest -q tests/domain/test_exposure_and_worker_rules.py tests/storage/test_dual_store_session_binding.py tests/application/test_continuity_worker_scheduling.py`
+  Expected: `FAIL`.
+- [ ] **Step 3: Niêm phong test, triển khai `domain.continuity`, `_policy_sessions.py`, `sessions.py` và nối `OwnerLoop` ↔ `JobExecutor`**
+  Đăng ký handler `continuity.refresh` vào `PRODUCTION_JOB_HANDLERS` (chỉ nhận dữ liệu đã stage qua `payload_ref` và stage kết quả `observed_ref` ngoài DB), nối hook hoàn tất trên `OwnerLoop` để áp kết quả trong cùng transaction với `JobService.complete_attempt`.
+- [ ] **Step 4: Chạy GREEN, kiểm tra mutations và commit**
+  Mutation bắt buộc: lưu binding `session_ref` chỉ ở một kho (bắt bằng ca `restore_policy` / `restore_store` độc lập), sinh `session_hmac_key` mới khi migrate stage lúc `restore_policy`, ghi đè `agent_ref` bằng bản chụp lúc claim ở bước commit worker, cho phép watermark lùi khi gặp `Event` đến muộn, đổi trạng thái `ended -> active` trên event thường không phải `session_resumed`, và bỏ recheck policy lúc commit. §20 ca 2, 39, 40, 46, 53, 54, 59.
+  Run: `uv run --locked pytest -q tests/domain/test_exposure_and_worker_rules.py tests/storage/test_dual_store_session_binding.py tests/application/test_continuity_worker_scheduling.py tests/storage/test_crash_matrix.py`
+  Expected: `PASS`.
+
+---
+
+## SP2-4 · Sổ bàn giao, giới hạn/ngân sách UTF-8, `ServedReceipt` (`C5`), read/resume, replay và khôi phục
+
+**Files:**
+- Create: `src/superbrain/domain/continuity/handoff_model.py`, `src/superbrain/domain/continuity/merge_rules.py`, `src/superbrain/domain/continuity/budget.py`, `src/superbrain/domain/continuity/rendering.py`, `src/superbrain/storage/handoffs.py`, `src/superbrain/application/handoff_service.py`, `tests/domain/test_handoff_limits_and_budget.py`, `tests/storage/test_handoff_restore_and_epochs.py`, `tests/integration/test_handoff_lifecycle_and_takeover.py`
+- Modify: `src/superbrain/storage/kernel_schema.py` (`store v6` phần handoffs/episodes/receipts), `src/superbrain/storage/send_attempts.py`, `src/superbrain/storage/restore.py`, `src/superbrain/application/dispatch.py`, `src/superbrain/application/owner_loop.py`, `src/superbrain/cli_api/_server_http.py`
+- Test: `tests/domain/test_handoff_limits_and_budget.py`, `tests/storage/test_handoff_restore_and_epochs.py`, `tests/integration/test_handoff_lifecycle_and_takeover.py`
+
+**Interfaces:**
+- Consumes: `store/restore_epoch.json` (từ `I3-4`), `KernelSendAttemptStore`, `PolicyStore` v5, `Store` v6, rule tiếp quản của `I3-5`.
+- Produces: toàn bộ nghiệp vụ `prepare_task` (`discover` & `work` bản hẹp SP2), `get_artifact` (`L0`/`L1`/`L2` kèm vòng đời `C5` của `ServedReceipt`), `submit_episode` (patch, takeover, takeover-only, `not_stored_policy`, `ReadAck`) và cô lập đa checkout/restore/quarantine.
+
+- [ ] **Step 1: Viết bộ test RED cho mô hình sổ bàn giao, giới hạn UTF-8, miễn trừ rút gọn `32 KB`, `constraint_changes` và ngân sách `utf8-byte-v1`**
+  Kiểm đầy đủ quy tắc §7.4 & §6.2:
+  - Partial update giữ nguyên mục không gửi; `decisions`, `rejected`, `user_constraints`, `constraint_changes` là chỉ-thêm không xóa được; `supersedes` chỉ trỏ quyết định đang hiệu lực kèm lý do; `reopens` mở lại mục `rejected` kèm lý do; `merges` chỉ trỏ các mục `rejected` đang hiệu lực (mục nguồn rời tập hiệu lực ở L1 nhưng còn ở L2); sai loại/trỏ mục không còn hiệu lực/thiếu lý do đều trả `INVALID_INPUT` (ca 37, 50, 71).
+  - Ràng buộc mới mâu thuẫn không tự thay mục cũ (ca 66). Đề xuất đổi ràng buộc nằm ở vùng riêng `≤ 4 KB`, giữ trạng thái `proposed` qua cả 4 biến thể câu trả lời người dùng (đồng ý, phủ định có đoạn trùng, đồng ý việc khác, không trả lời — ca 49) cho tới khi người giữ đóng bằng `closed_changes` (`rejected`/`withdrawn`, rời vùng chờ sang L2 — ca 64); `depends_on_change` trỏ đề xuất không tồn tại trả `INVALID_INPUT` và hiện đúng ở L1 cho phiên sau (ca 72); trích đoạn câu trả lời ở L1/report `≤ 512 B`.
+  - Biên byte UTF-8 đa byte (`limit` đạt, `limit + 1` trả `INVALID_INPUT`): `1` mục `≤ 2 KB`, `1` patch `≤ 16 KB`, tổng phần bắt buộc `≤ 32 KB`, ràng buộc đang hiệu lực `≤ 16 KB`, vùng đề xuất chờ `≤ 4 KB`; `task_goal` cắt đúng ranh giới ký tự UTF-8 ở L0 (`≤ 200 B`, có dấu cắt) và L1 (`≤ 2 KB`, đầy đủ ở L2); L1 chia nhiều resource `≤ 8 KB` để mục bắt buộc thứ `31+` không bao giờ bị mất, mục tùy chọn thiếu chỗ trả `incomplete_optional=true` (ca 57); L2 `≤ 256 KB`. **Miễn trừ trần tổng `32 KB`** cho patch dùng `supersedes`/`merges` không làm tăng dung lượng phần bắt buộc (nhưng vẫn kiểm trần `1` mục, `1` patch, vùng chờ `4 KB` và quyền ghi — ca 64, 71).
+  - `mode="discover"` trả tối đa `3` sổ `task_state="open"` cập nhật trong `14 ngày` (ngoài top 3, `!= open` hoặc `> 14 ngày` vẫn tìm được khi truyền đúng `task_id` — ca 44), không cắt đôi L0 (`≤ 600 B`), áp `ceil(total_utf8_bytes / 4)` đúng một lần trên tổng theo `context_budget_tokens` và trả `continuity_truncated=true` khi không đủ chỗ (ca 58). `prepare_task` của SP2 luôn liệt kê trung thực `skills_unavailable`, `lessons_unavailable`, `context_unavailable`, `finishing_gates_unavailable` trong `degraded_codes`, thêm `open_handoffs_present` khi `mode="work"` không kèm `task_id` trên checkout có sổ mở (ca 43, 55), kiểm `seen_handoff_refs` nối vào lineage khi mở task mới, và cảnh báo trên L0 khi có hai task mở từ hai phiên trên cùng checkout. Sổ không bao giờ đi vào payload Jev và không giúp bài học đạt `verified` (ca 30 phần continuity, ca 42).
+- [ ] **Step 2: Viết bộ test RED cho hàng rào thế hệ `(restore_epoch, writer_generation)`, `ServedReceipt` (`C5`), `ReadAck`, resume, replay, quarantine/expiry và restore**
+  Kiểm trọn chuỗi §20 về quyền giữ sổ, đọc/resume và khôi phục:
+  - Tra idempotency **trước** khi so `base_revision`/`fence` (ca 38); mọi lần ghi không tiếp quản phải khớp cả holder hiện hành lẫn `fence` sống `(restore_epoch, writer_generation)` (A ghi sau khi B tiếp quản bị từ chối bằng `REVISION_CONFLICT`; A → B → A patch muộn mang fence cũ của A vẫn bị từ chối; tiếp quản thiếu `base_revision` hoặc `fence` trả `INVALID_INPUT`; hai bên tiếp quản đồng thời chỉ một bên thắng; phiên cũ còn `active` mà thiếu `acknowledge_active=true` trả `INVALID_INPUT` — ca 45, 47, 60).
+  - Nối `KernelSendAttemptStore` xuyên `dispatch.py` ↔ `owner_loop.py` ↔ `_server_http.py` (kèm crashpoint `artifact_send.after_pending_before_flush` và `handoff.after_commit_before_ack`): `Delivery` chỉ có `ServedReceipt` ghi `exposure_evidence="served_only"`, chỉ khi có `ReadAck` khớp đủ `(artifact_id, revision_epoch, revision, resource_digests)` thực tế mới ghi `"read_ack"`, không có receipt ghi `"unknown"` (ca 36, 63, 69). Receipt mức `L0`, sai principal/task/artifact/epoch hoặc đang `pending` (`-> IN_PROGRESS`) bị từ chối khi dùng trong `resume_ref`; receipt cũ ở `revision` 12 kèm counter của `revision` 13 trả `REVISION_CONFLICT`; chỉ `revision` tăng do phần quan sát mới hơn thì cho qua kèm `observed_newer` (ca 63, 69).
+  - Cô lập checkout tuyệt đối: principal cùng repo nhưng khác checkout (kể cả hai checkout cùng remote có đường dẫn tương đối giống nhau — ca 2) nhận `NOT_FOUND` ở cả **5 đường**: `discover`, `get_artifact`, `resume`, `submit_episode` **và idempotent replay** dù biết đúng ID, `revision_epoch` và `revision` (ca 41, 48).
+  - Thu hồi/quarantine/hết hạn nguồn sau khi vào sổ: L0, L1, L2, report, replay và bản đọc sau restore đều thay bằng `redacted`/`expired`, không còn bytes cấm kể cả ở revision cũ và `task_goal`/`description`, giữ nguyên trạng thái đề xuất ràng buộc và giữ nguyên digest lịch sử trong `ServedReceipt` đã cấp (ca 51, 52, 65).
+  - Restore & lặp số revision: phục vụ sổ X ở `revision 5`, restore kho về `4` (`restore_epoch` tăng ở `store/restore_epoch.json`, giữ nguyên qua `migrate`, mất/hỏng file ở `store >= 5` trả `INTEGRITY_FAILURE`), rồi ghi Y ở `revision 5` — ref cũ `(id, epoch_cũ, 5)` không bao giờ trỏ sang Y ở cả đọc trực tiếp, `ServedReceipt`, `ReadAck` lẫn lineage; `discover` sau restore trả `revision_epoch` đã commit của bản trên đĩa trong khi `handoff_live` phát fence sống `(restore_epoch_mới, writer_generation)` để client tiếp quản lại, còn mọi patch/request mang epoch trước restore đều bị từ chối kể cả khi counter trùng lại (ca 61, 70, 73, 75–78).
+  - Tương tác ACK tiếp quản với rule `I3-5`: thử đủ `stored` mất ACK rồi B tiếp quản trước khi A retry (`writer_status="not_holder"`), A → B → A replay ACK tiếp quản cũ mang fence `(5, 9)` khi fence sống là `(5, 11)` (`writer_status="not_holder"` dù A đang giữ sổ), takeover-only thành công và khi `manual_submission=false` (`handoff_status="not_stored_policy"`, không tạo revision, không đổi người giữ, retry cùng khóa giữ nguyên kết quả kể cả sau khi bật lại policy), cùng `commit_outcome_unknown` rồi retry cùng khóa (ca 56, 59, 67–68, 74).
+  Run: `uv run --locked pytest -q tests/domain/test_handoff_limits_and_budget.py tests/storage/test_handoff_restore_and_epochs.py tests/integration/test_handoff_lifecycle_and_takeover.py`
+  Expected: `FAIL`.
+- [ ] **Step 3: Niêm phong test, triển khai `domain.continuity`, `storage/handoffs.py`, `HandoffService` và nối hoàn chỉnh `dispatch.py` / `_server_http.py`**
+  Bảo đảm mọi blob (`task_goal`, `agent_ref`, `observed_ref`, L0 summary) được stage ngoài SQLite transaction theo `C2`, và `episodes` lưu đủ metadata kết quả handoff đã commit để `render_stored` dựng lại không cần lưu raw body.
+- [ ] **Step 4: Chạy GREEN, kiểm tra mutations và commit**
+  Mutation bắt buộc: kiểm `base_revision` trước khi tra idempotency, lưu cứng `writer_status` hoặc `handoff_live` vào idempotency, bỏ `revision_epoch` khỏi kiểm `ReadAck`/`ServedReceipt`, bỏ kiểm checkout scope trên nhánh `render_stored` (replay), bỏ miễn trừ `32 KB` khi gộp/thay thế không tăng dung lượng, và không gọi `interrupt_attempt` khi socket đứt giữa lúc gửi `get_artifact`. §20 ca 2, 36–39, 41–45, 47–53, 55–61, 63–78.
+  Run: `uv run --locked pytest -q tests/domain/test_handoff_limits_and_budget.py tests/storage/test_handoff_restore_and_epochs.py tests/integration/test_handoff_lifecycle_and_takeover.py tests/storage/test_crash_matrix.py`
+  Expected: `PASS`.
+
+---
+
+## SP2-5 · Adapter Claude Code & Codex, xác minh lớp 2 (`NativeHostReceipt`) và diễn tập M1
+
+**Files:**
+- Create: `src/superbrain/adapters/harness/__init__.py`, `src/superbrain/adapters/harness/claude_code.py`, `src/superbrain/adapters/harness/codex.py`, `src/superbrain/adapters/harness/layer2_probe.py`, `src/superbrain/composition/doctor_probes_sp2.py`, `scripts/rehearse_m1.py`, `tests/adapters/test_claude_and_codex_capture_adapters.py`, `tests/integration/test_layer2_invalidation.py`
+- Modify: `src/superbrain/storage/_policy_approvals.py`, `src/superbrain/adapters/harness_config/bootstrap_templates.py` (khớp tham số hook/profile với I3-2/I3-5), `scripts/gate.py` (cân bằng 4 shard pytest nếu cần, có reseal)
+- Test: `tests/adapters/test_claude_and_codex_capture_adapters.py`, `tests/integration/test_layer2_invalidation.py`
+
+**Interfaces:**
+- Consumes: bộ cài bootstrap của `I3-2`/`I3-5`, toàn bộ đường capture/continuity của `SP2-1`..`SP2-4`, và mặt kiểm `doctor` tối thiểu khi chạy bài diễn tập M1 cuối.
+- Produces: adapter thu hook/transcript cho Claude Code và Codex, bộ thu/kiểm `NativeHostReceipt` tự hạ cấp về `unknown` khi đổi `(host_version, config_digest)`, hàm probe bàn giao cho `doctor`, full gate tự động `< 300 s` và biên bản diễn tập M1.
+
+- [ ] **Step 1: Viết bộ test RED trên fixture đã lọc cho hai adapter, đổi workspace/đoạn phiên và vòng đời `NativeHostReceipt`**
+  Kiểm parser/adapter của Claude Code và Codex theo đúng bảng `sp2-host-capture-matrix.md`: nhận diện tác nhân, cấu hình, checkout scope, đổi workspace giữa chừng và giới hạn vùng đọc transcript đúng phiên/checkout được phép; kênh/trường không chứng minh được phải ghi `unknown`/`unavailable`, không suy đoán. Kiểm `NativeHostReceipt` chỉ nâng lớp 2 lên `verified` khi chứng minh host thật hỏi và chặn đúng mẫu lệnh cấp authority; ngay khi `host_version` hoặc `config_digest` của file quyền thay đổi, trạng thái tự động hạ về `unknown` ở lần kiểm kế tiếp và kênh `terminal` lập tức từ chối (§11.3, ca 20), đồng thời `CaptureIngestService` ngừng gắn `source="tool_observed"`.
+  Run: `uv run --locked pytest -q tests/adapters/test_claude_and_codex_capture_adapters.py tests/integration/test_layer2_invalidation.py`
+  Expected: `FAIL`.
+- [ ] **Step 2: Niêm phong test, triển khai hai adapter, `layer2_probe.py`, `doctor_probes_sp2.py` và chạy full gate tự động `< 300 s`**
+  Triển khai các hàm đọc trạng thái outbox/gap/session/layer2 để nối vào `get_health(deep=true)` / `doctor`. Cân bằng shard trong `scripts/gate.py` (nếu cần, có reseal) và xác minh toàn bộ bộ test tự động đạt 0 fail/error/XPASS với `test_job_seconds < 300 s` (local Windows `< 275 s`).
+  Run: `uv run --locked python scripts/gate.py --python 3.11 && uv run --locked python scripts/gate.py --python 3.14`
+  Expected: `accepted: true` trên cả hai interpreter, `test_job_seconds < 300.0`, 0 fail/error/XPASS.
+- [ ] **Step 3: Dựng và chạy bài diễn tập M1 có chủ dự án duyệt trên hai checkout nháp `A` và `B`**
+  Sau khi có bootstrap của I3, mặt kiểm `doctor` tích hợp và chủ dự án phê duyệt lượt chạy native:
+  1. Pin commit, wheel, `uv.lock`, `schema_digest` và `(host_version, config_digest)` của cả Claude Code và Codex; kiểm cả hai bootstrap rủi ro cao đã `applied` qua `ApplyJournal`, `doctor` xanh, và hai principal khác nhau (`claude-code`, `codex` + hai credential `capture_producer` tương ứng) cùng dùng một kho thật.
+  2. Tạo hai checkout `A` và `B` của cùng một repo nháp; ghim trước `task_goal`, bước hiện hành trong `plan`, `decisions`, `user_constraints`, phương án `rejected`, hành động cấm và `next_action` có hiệu ứng file kiểm chứng được.
+  3. Mở Claude Code trên `A`: thực hiện bước đầu, ghi nhận ACK cuối cùng, digest các ref, `revision`, `handoff_revision`, source snapshot, PID/`started_at` và `CaptureGap` (nếu có); **kill cứng tiến trình Claude Code giữa chừng** và đối chiếu bảng tiến trình + luồng `Event` để xác nhận không có event kết thúc phiên sạch (`state != "ended"`, ca 40).
+  4. Mở ngay Codex trên `A`: ghi nhận `prepare_task(mode="discover")`, `get_artifact(level="L1")`, `prepare_task(mode="work", resume_ref=...)`, `Delivery`, `ServedReceipt`, `ReadAck` (nếu gửi), `handoff_live`, ACK tiếp quản (`handoff_status="stored"` và `writer_status="holder"` **trước** lệnh sửa file đầu tiên) và chi phí ghi sổ nếu host cung cấp.
+  5. **Điều kiện đạt M1:** Codex nêu đúng mục tiêu và bước đang làm, giữ đúng quyết định và ràng buộc, không thử lại phương án đã loại, không thực hiện hành động cấm, và chỉ sửa file theo đúng `next_action` sau ACK tiếp quản hợp lệ; mọi phần đã ACK đọc lại được với độ mới tách riêng giữa `agent_updated_at` và `observed_through`; từ checkout `B`, cả `discover`, `get_artifact`, `resume`, `submit_episode` và replay đều bị từ chối (`NOT_FOUND`, ca 2, 48); mỗi host có `NativeHostReceipt` gắn đúng lượt chạy đã quan sát (dùng receipt D8 của I2 làm baseline kết nối và thu receipt hành vi SP2 mới trên đúng wheel M1). Chiều ngược `Codex → Claude Code` chạy khi capture của Codex trên mode đã khảo sát cho phép, trường hợp chưa hỗ trợ thì ghi rõ `not_run` kèm căn cứ kỹ thuật trong biên bản M1.
+- [ ] **Step 4: Review độc lập toàn nhánh theo 11 lens và đóng hồ sơ bàn giao M1**
+  Lưu toàn bộ receipt M1 đã lọc bí mật ra ngoài cây source đã seal, đối chiếu lại `git status --porcelain` và `.verification/task9-seal.json` sạch tuyệt đối trước khi ký biên bản hoàn thành SP2 / M1.
+
+---
+
+## Quy trình nghiệm thu mỗi task
+
+Mỗi task tuân thủ nghiêm ngặt: tác giả test viết oracle độc lập từ đặc tả, thu bằng chứng RED đúng nguyên nhân và niêm phong bằng `.verification/test_lock.py` trước khi sửa code sản xuất; implementer đạt GREEN qua shim/loopback/SQLite/filesystem/wheel thật đúng phạm vi và chứng minh từng guard mới bằng ít nhất một mutation hành vi bị bắt; reviewer độc lập kiểm tra đủ 11 lens của `skills/review-lens/SKILL.md` trên mọi đường đọc/ghi (`fresh`, `replay`, `read-by-ref`, `discover`, `resume`, `worker`, `rebuild`, `restore_store`, `restore_policy`). Không lưu transcript hay bí mật thật vào fixture; tiến trình chạy dài ghi checkpoint gồm PID, `started_at`, lệnh đã lọc bí mật, `cwd`, commit nguồn và đường dẫn log/receipt trước khi dừng chờ.

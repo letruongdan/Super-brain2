@@ -1,0 +1,67 @@
+{
+  "schema": "sp2-baseline-and-ca62-decisions-v1",
+  "source": "ask_question tool responses in Antigravity conversation (capture_method: manual)",
+  "conversation_id": "8381d0e3-cb40-4170-a5ee-93a9b2b9e8ba",
+  "occurred_at": "2026-11-19T10:25:21+07:00",
+  "recorded_at_utc": "2026-11-19T03:25:21Z",
+  "baseline_source_commit": "035a4cdc5936155982e5172602213353d4bbb6c4",
+  "i2_close_01_commit": "972ae5a42ddd2f00a2116be7a3968cd031cc1e2b",
+  "task9_closure_commit": "5d00a88280d06d6ac5b0e8d5804285cb9c1fcf1b",
+  "approved_pins": {
+    "spec_path": "docs/superpowers/specs/2026-10-30-super-brain2-system-design.md",
+    "spec_rev22_pre_clarification_sha256": "sha256:560eea11f23d75a677cc684ae33f85c79c3e3291ac4a1ca77a8778f0f24e8ff4",
+    "spec_rev22_post_clarification_sha256": "sha256:46dc446fc0b7427ea2e14751ab10340e2a872400ee1f82753276cb12091dd344",
+    "sp2_plan_path": "docs/superpowers/plans/2026-11-18-sp2-capture-continuity.md",
+    "sp2_plan_sha256": "sha256:7bb58e6db1eb5998fd8316625dbd451955642dfd7998d0d5b0cf1ce80a914985",
+    "i2_schema_path": "schemas/mcp-tools-v2.json",
+    "i2_schema_sha256": "sha256:a8d2317c2a56191a5c08510a6c3c26b7141ebfd43943385507bfc60bc8df65a1",
+    "i2_baseline_seal_path": ".verification/task9-seal.json",
+    "i2_baseline_seal_sha256": "sha256:a0b96499fbd075f384f97e1a0ce9f2ab11816c7d6c8bae8dedc82d9e2d0263c2"
+  },
+  "remediation_r47_evidence": {
+    "evidence_dir": ".superpowers/sdd/2026-11-04-sp1-increment2-daemon-mcp-kernel/remediation-r47",
+    "ci_run_id": "44346189573",
+    "gate_cells_accepted": 10,
+    "perf_cells_accepted": 10,
+    "windows_f4_s": {
+      "local_3_11_9": 205.0,
+      "local_3_14_3": 207.46783320000395,
+      "ci_2022_3_11": 231.031,
+      "ci_2022_3_14": 232.3195399
+    },
+    "d8_live_native": {
+      "claude_receipt": "d8-035a4cd/claude-native-receipt.json",
+      "codex_gui_receipt": "d8-035a4cd/d8-codex-gui-receipt.json",
+      "epoch4_receipt": "d8-035a4cd/d8-epoch4-receipt.json",
+      "codex_gui_version": "26.1111.2228.0",
+      "win32_py311_wheel_digest": "sha256:b8d2d17a4d7d138f416c28cc1fa6a81dcfb84e5d7193b1c6ab0fd3cd8374316b",
+      "all_passed": true
+    }
+  },
+  "ca62_clarification": {
+    "spec_sections": ["7.4", "20.62"],
+    "sp2_onward_rule": "Every SP2+ component (shim and daemon) returns unsupported_version in both directions when schema_digest is missing or mismatched before dispatching tools or sending bearer credentials.",
+    "historical_i2_wheel_rule": "The frozen historical I2 wheel (5d00a88 / 972ae5a / 035a4cd) enforces the 4-key /v2/identity contract and therefore emits (code='identity_mismatch', bearer_sent=0, dispatches=0) against an SP2 daemon; this observed cross-version baseline is preserved verbatim."
+  },
+  "scope_and_survey_rulings": {
+    "sp2_execution_scope": "Execute SP2-0 and SP2-1 on I2 transport (035a4cd) with independent test author, RED receipt, reseal review, implementation, GREEN + full gate, isolated behavioral mutation verification, and independent 11-lens review; pause cleanly after SP2-1 waiting for SP1 Increment 3 (store=5, policy=4) merge before SP2-2..5.",
+    "o2_o9_survey_sources": "Official documentation, verified repo records (T0/R56/D8 035a4cd), and read-only CLI --version/--help outputs only; zero access to live user transcripts or live ~/.claude/~/.codex configurations; unverified fields recorded as unknown and unemitted events as unavailable."
+  },
+  "owner_decision_records": [
+    {
+      "id": "A1",
+      "question": "Baseline, spec rev 22, §7.4/ca 62 clarification, and sync untracked plan/review/skill files",
+      "answer": "(Recommended) Xác nhận baseline 035a4cd + spec rev 22 + câu làm rõ §7.4/ca 62 (SP2 trở đi trả unsupported_version cả 2 chiều; wheel I2 đóng băng giữ identity_mismatch, bearer_sent=0, dispatches=0), lưu biên bản quyết định vào docs/reviews/ và đồng bộ các file plan/review/skill chưa commit từ repo chính vào nhánh này"
+    },
+    {
+      "id": "A2",
+      "question": "SP2 execution boundary prior to I3 (store=5, policy=4) merge",
+      "answer": "(Recommended) Chạy trọn SP2-0 → SP2-1 trên nền transport I2 (035a4cd) theo đúng thứ tự plan (có test author độc lập, RED/GREEN/mutation, reseal và independent review 11 lens), sau đó dừng sạch chờ I3 merge (store=5, policy=4) trước khi mở store v6/policy v5 ở SP2-2..5"
+    },
+    {
+      "id": "A3",
+      "question": "Allowed O2/O9 survey sources for docs/design/sp2-host-capture-matrix.md",
+      "answer": "(Recommended) Chỉ dùng tài liệu chính thức + hồ sơ đã xác minh trong repo (T0/R56/D8 035a4cd) và CLI --help/version chỉ-đọc của claude/codex; tuyệt đối không đọc transcript hay cấu hình người dùng, trường chưa chứng minh ghi unknown/unavailable"
+    }
+  ]
+}

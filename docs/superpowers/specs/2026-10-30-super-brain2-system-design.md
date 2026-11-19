@@ -2,7 +2,7 @@
 
 - **Ngày:** 2026-10-30
 - **Phiên bản:** rev 22. Rev 16 tới rev 21 chỉ tồn tại trong working tree, SHA-256 lần lượt `331bf0d9…ad91`, `e3802cbc…799a`, `86f85b64…7ccc`, `95c755d0…a405`, `797903dd…5b5f` và `57a3c323…905d`.
-- **Trạng thái:** rev 22 đã cập nhật theo review rev 21, chờ chủ dự án duyệt làm baseline. Rev 10 đã được duyệt ngày 2026-11-09. Hướng của rev 17 đã được chủ dự án duyệt ngày 2026-11-10. Rev 22 gồm cả các thay đổi tích lũy của rev 16 tới rev 21.
+- **Trạng thái:** rev 22 đã được chủ dự án duyệt làm baseline ngày 2026-11-19 trên commit `035a4cd` kèm làm rõ §7.4 / §20 ca 62 ([biên bản quyết định](../../reviews/2026-11-19-sp2-baseline-and-ca62-decisions.json)). Rev 10 đã được duyệt ngày 2026-11-09. Hướng của rev 17 đã được chủ dự án duyệt ngày 2026-11-10. Rev 22 gồm cả các thay đổi tích lũy của rev 16 tới rev 21.
 - **Quy trình:** superpowers:brainstorming, nhánh kiến trúc.
   - Các phần thiết kế 1–12 đã được duyệt lần lượt trong hội thoại ngày 2026-10-29/30.
   - Rev 2 xử lý review `docs/reviews/2026-10-30-system-design-review.md` (SB2-S01…S18) và thêm Q17–Q19.
@@ -679,7 +679,7 @@ Không có sổ phù hợp thì agent gọi `mode=work` như thường. `mode=wo
 - `GetArtifactOkResult` (với sổ bàn giao) và `PrepareTaskResult` (`mode=work`): thêm `handoff_live`.
 - `writer.lock` **không đổi định dạng**: `restore_epoch` nằm trong file metadata bên trong `store/` (mục 5.7).
 - Item trong `continuity` có `kind=handoff`, dùng `summary` cho L0, và thêm `revision_epoch`. Thêm các `degraded_codes` `open_handoffs_present`, `continuity_truncated`, `observed_newer`.
-- **Nhận diện schema.** `GET /v2/identity` trả thêm `schema_digest`; shim so với digest catalog của mình trên socket đã pin trước khi gửi tool call. Shim cũng gửi `schema_digest` trong private envelope để daemon kiểm tra chiều ngược lại. Thiếu hoặc khác ở bất kỳ chiều nào đều trả `unsupported_version` và không chạy tool. Không có chế độ tương thích; nâng cấp bằng cách dừng daemon, cài bản mới, khởi động daemon, rồi khởi động lại các shim.
+- **Nhận diện schema.** `GET /v2/identity` trả thêm `schema_digest`; shim so với digest catalog của mình trên socket đã pin trước khi gửi tool call. Shim cũng gửi `schema_digest` trong private envelope để daemon kiểm tra chiều ngược lại. Thiếu hoặc khác ở bất kỳ chiều nào đều trả `unsupported_version` và không chạy tool. Không có chế độ tương thích; nâng cấp bằng cách dừng daemon, cài bản mới, khởi động daemon, rồi khởi động lại các shim. Yêu cầu trả `unsupported_version` áp cho mọi thành phần từ SP2 trở đi ở cả hai chiều (shim SP2 gặp daemon I2 thiếu `schema_digest`, shim SP2 gặp `schema_digest` lệch, daemon SP2 gặp private envelope thiếu/lệch `schema_digest`); ca đối chiếu với wheel lịch sử I2 nguyên bản (`5d00a88`/`972ae5a`/`035a4cd`) giữ nguyên kết quả quan sát `(code="identity_mismatch", bearer_sent=0, dispatches=0)` do decoder I2 chỉ nhận đúng 4 khóa danh tính.
 - Đổi `x-implemented-in` và `x-side-effects` của `prepare_task`, `get_artifact`, cùng fixture request, response, error, mismatch và replay, phải sửa các file đang nằm trong seal, nên cần reviewer độc lập duyệt reseal.
 
 **Giới hạn được công bố:**
@@ -1670,7 +1670,7 @@ Plan SP1 phải biến mỗi tình huống dưới đây thành test, hoặc ghi
 
 60. Chuỗi A → B → A bằng tiếp quản: patch đến muộn của A mang fence cũ bị từ chối dù đúng người giữ và đúng `base_revision`. Tiếp quản thiếu `base_revision` hoặc `fence` trả `invalid_input`.
 61. Restore kho về snapshot cũ: người giữ cũ mất hiệu lực và patch cũ bị từ chối; phiên phải tiếp quản lại. Sau khi đã tiếp quản lại và `writer_generation`, `handoff_revision` trùng với request từ trước restore, request cũ đó vẫn bị từ chối.
-62. `schema_digest` thiếu hoặc khác ở từng chiều trên socket đã pin: trả `unsupported_version` và không chạy tool.
+62. `schema_digest` thiếu hoặc khác ở từng chiều trên socket đã pin: trả `unsupported_version` và không chạy tool (đối chiếu với wheel I2 lịch sử giữ kết quả quan sát `identity_mismatch` với `bearer_sent=0`, `dispatches=0` theo §7.4).
 63. Resume: receipt sai principal hoặc task trả `not_found`; không có receipt ghi `exposure_evidence=unknown`; ReadAck khớp digest thực tế của bản đã render; đổi người giữ hoặc `handoff_revision` giữa lúc đọc và resume trả `revision_conflict`; chỉ phần quan sát mới hơn thì đi tiếp với `observed_newer`.
 64. Sổ đầy: patch không làm tăng dung lượng vẫn được nhận; đề xuất đổi ràng buộc vào được vùng riêng; đề xuất bị từ chối rời vùng đang chờ; ràng buộc cũ vẫn còn.
 65. Câu trả lời gắn với đề xuất bị quarantine hoặc hết hạn: L0 không có trích đoạn; L1, report, replay và restore trả `redacted` hoặc `expired`; trạng thái đề xuất không đổi. `task_goal` hết hạn thì tìm đúng theo `task_id` trả RedactedItem.
