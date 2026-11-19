@@ -37,6 +37,7 @@ OPERATOR_PATHS: frozenset[str] = frozenset(
         "/v2/operator/proposal/apply",
         "/v2/operator/proposal/rollback",
         "/v2/operator/proposal/continue",
+        "/v2/operator/proposal/bootstrap",
         "/v2/operator/credential/revoke",
         "/v2/operator/policy/set",
         "/v2/operator/workspace/link",

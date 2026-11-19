@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Literal
 
 from superbrain.application._approvals_types import (
+    BootstrapProposalHandler,
     PendingApprovalCall,
     PreparedOperatorCall,
     RestoreHandler,
@@ -22,6 +23,8 @@ from superbrain.application._approvals_types import (
     _proposal_json,
     _signer_json,
     _unauthenticated,
+    prepare_bootstrap_call,
+    prepare_proposal_challenge,
 )
 from superbrain.application._approvals_types import (
     _b64 as _b64,
@@ -44,6 +47,7 @@ from superbrain.core.kernel import Principal
 from superbrain.ports.approval import ApprovalPolicyPort, SshApprovalVerifierPort, WebAuthnApprovalVerifierPort
 
 __all__ = [
+    "BootstrapProposalHandler",
     "OperatorHandle",
     "OperatorService",
     "PendingApprovalCall",
@@ -84,12 +88,14 @@ class OperatorService:
         webauthn_verifier: WebAuthnApprovalVerifierPort | None = None,
         review_apply: ReviewApplyService | None = None,
         restore_handler: RestoreHandler | None = None,
+        bootstrap_handler: BootstrapProposalHandler | None = None,
     ) -> None:
         self._policy = policy
         self._ssh_verifier = ssh_verifier
         self._webauthn = webauthn_verifier
         self._review_apply = review_apply
         self._restore_handler = restore_handler
+        self._bootstrap_handler = bootstrap_handler
 
     def rebind_authorities(self, policy: ApprovalPolicyPort, review_apply: ReviewApplyService | None) -> None:
         """Update the live policy authority and review-apply service after an online restore."""
@@ -159,6 +165,8 @@ class OperatorService:
             return PreparedOperatorCall(immediate={"journal": _journal_json(journal)})
         if path in _PROPOSAL_MUTATING_PATHS:
             return self._prepare_proposal_action(path, principal, token, body)
+        if path == "/v2/operator/proposal/bootstrap":
+            return prepare_bootstrap_call(principal, body, self._review_apply, self._bootstrap_handler)
         if path == "/v2/operator/restore":
             return self._prepare_restore(principal, token, body)
         if path in _DEFERRED_PATHS:
@@ -363,17 +371,21 @@ class OperatorService:
         self, path: str, principal: Principal, token: str | None, body: Mapping[str, JsonValue]
     ) -> PreparedOperatorCall:
         pid = body.get("proposal_id")
-        if not set(body) <= {"proposal_id", "approval"} or not isinstance(pid, str) or not pid:
+        if not isinstance(pid, str) or not pid:
             raise _invalid()
-        if "approval" not in body:
+        allowed_keys = {"proposal_id", "approval"} if "approval" in body else {"proposal_id", "recovery_scope"}
+        if not set(body) <= allowed_keys:
             raise _invalid()
         if self._review_apply is None:
             raise BrainError(ErrorCode.CAPABILITY_UNAVAILABLE, "capability unavailable")
         prop = self._review_apply.get_proposal(pid)
         if prop.owner_id != principal.owner_id:
             raise BrainError(ErrorCode.NOT_FOUND, "not found")
+        action = _PROPOSAL_PATH_ACTIONS[path]
+        if "approval" not in body:
+            return prepare_proposal_challenge(self._policy, self._review_apply, prop, action=action, body=body)
         message, channel_used, signer, raw_approval = self._parse_approval(principal, body["approval"])
-        if message.action is not _PROPOSAL_PATH_ACTIONS[path]:
+        if message.action is not action:
             raise _invalid()
         if message.subject_id != pid or message.subject_revision != prop.subject_revision:
             raise BrainError(ErrorCode.REVISION_CONFLICT, "revision conflict")

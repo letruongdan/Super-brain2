@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import os
+import re
 from collections.abc import Callable
 from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FuturesTimeoutError
@@ -10,16 +12,27 @@ from pathlib import Path
 from typing import TypeVar
 
 from superbrain.adapters.auth.ssh_sig import SshSigVerifier
+from superbrain.adapters.auth.webauthn_verifier import WebAuthnApprovalVerifier, WebAuthnResult
+from superbrain.adapters.harness_config.bootstrap_templates import AdapterBootstrapPlanner
 from superbrain.adapters.os import find_ssh_keygen, os_adapters
-from superbrain.application.approvals import OperatorHandle, OperatorService, PreparedOperatorCall, RestoreHandler
+from superbrain.application.approvals import (
+    BootstrapProposalHandler,
+    OperatorHandle,
+    OperatorService,
+    PreparedOperatorCall,
+    RestoreHandler,
+)
+from superbrain.application.bootstrap import create_bootstrap_proposal
 from superbrain.application.owner_loop import OwnerLoop
 from superbrain.application.review_apply import ReviewApplyService
 from superbrain.cli_api.operator import OperatorExecutor, OperatorRequest
+from superbrain.core._kernel_approval import ApprovalMessage, strict_b64url_decode
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.jsonvalue import JsonValue
 from superbrain.core.kernel import CallResult
+from superbrain.core.proposals import ChangeProposal
 from superbrain.core.wire import make_error_envelope, make_success_envelope
-from superbrain.ports.approval import ApprovalPolicyPort, SshApprovalVerifierPort
+from superbrain.ports.approval import ApprovalPolicyPort, SshApprovalVerifierPort, WebAuthnApprovalVerifierPort
 from superbrain.ports.os import OsAdapters
 
 __all__ = ["build_operator_service", "make_operator_executor"]
@@ -86,19 +99,113 @@ def make_lazy_ssh_verifier(os_: OsAdapters | None = None) -> Callable[[], SshApp
     return _lazy_ssh_verifier
 
 
+_LOCALHOST_ORIGIN_RE = re.compile(r"\Ahttp://localhost:([1-9]\d{0,4})\Z")
+
+
+class _LocalhostWebAuthnVerifier(WebAuthnApprovalVerifierPort):
+    """WebAuthn verifier enforcing RP ID ``localhost`` and a valid ``http://localhost:<port>`` origin."""
+
+    def verify(
+        self,
+        message: ApprovalMessage,
+        *,
+        response_json: str,
+        credential_id: bytes,
+        credential_public_key: bytes,
+        stored_sign_count: int,
+    ) -> WebAuthnResult:
+        if not isinstance(response_json, str) or len(response_json) > 64 * 1024:
+            raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+        try:
+            payload = json.loads(response_json)
+            if not isinstance(payload, dict):
+                raise BrainError(ErrorCode.UNAUTHENTICATED, "unauthenticated")
+            resp = payload.get("response")
+            if not isinstance(resp, dict):
+                raise BrainError(ErrorCode.UNAUTHENTICATED, "unauthenticated")
+            raw_cdj = resp.get("clientDataJSON")
+            if not isinstance(raw_cdj, str):
+                raise BrainError(ErrorCode.UNAUTHENTICATED, "unauthenticated")
+            cdj = json.loads(strict_b64url_decode(raw_cdj).decode("utf-8"))
+            if not isinstance(cdj, dict):
+                raise BrainError(ErrorCode.UNAUTHENTICATED, "unauthenticated")
+            origin = cdj.get("origin")
+        except BrainError:
+            raise
+        except Exception as err:
+            raise BrainError(ErrorCode.UNAUTHENTICATED, "unauthenticated") from err
+        if not isinstance(origin, str):
+            raise BrainError(ErrorCode.UNAUTHENTICATED, "unauthenticated")
+        match = _LOCALHOST_ORIGIN_RE.match(origin)
+        if match is None or not 1 <= int(match.group(1)) <= 65535:
+            raise BrainError(ErrorCode.UNAUTHENTICATED, "unauthenticated")
+        return WebAuthnApprovalVerifier(rp_id="localhost", origin=origin).verify(
+            message,
+            response_json=response_json,
+            credential_id=credential_id,
+            credential_public_key=credential_public_key,
+            stored_sign_count=stored_sign_count,
+        )
+
+
+def make_default_bootstrap_handler(os_: OsAdapters | None = None) -> BootstrapProposalHandler:
+    """Return a default checkout-scoped bootstrap handler wired to ``AdapterBootstrapPlanner``."""
+    adapters = os_ if os_ is not None else os_adapters()
+    planner = AdapterBootstrapPlanner()
+
+    def _handle(
+        review_apply: ReviewApplyService,
+        *,
+        owner_id: str,
+        harness_id: str,
+        checkout_root: Path,
+        profile_path: Path,
+        reason: str | None = None,
+    ) -> ChangeProposal:
+        if harness_id == "claude-code":
+            return create_bootstrap_proposal(
+                review_apply,
+                owner_id=owner_id,
+                harness_id="claude-code",
+                checkout_root=checkout_root,
+                profile_path=profile_path,
+                planner=planner,
+                os_=adapters,
+                reason=reason,
+            )
+        if harness_id == "codex":
+            return create_bootstrap_proposal(
+                review_apply,
+                owner_id=owner_id,
+                harness_id="codex",
+                checkout_root=checkout_root,
+                profile_path=profile_path,
+                planner=planner,
+                os_=adapters,
+                reason=reason,
+            )
+        raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+
+    return _handle
+
+
 def build_operator_service(
     policy: ApprovalPolicyPort,
     *,
     os_: OsAdapters | None = None,
+    webauthn_verifier: WebAuthnApprovalVerifierPort | None = None,
     review_apply: ReviewApplyService | None = None,
     restore_handler: RestoreHandler | None = None,
+    bootstrap_handler: BootstrapProposalHandler | None = None,
 ) -> OperatorService:
-    """The operator service over ``policy`` with the real ``ssh-keygen`` verifier and verified scratch dir."""
+    """The operator service over ``policy`` with real SSH, localhost WebAuthn, and bootstrap wiring."""
     return OperatorService(
         policy,
         ssh_verifier=make_lazy_ssh_verifier(os_),
+        webauthn_verifier=webauthn_verifier if webauthn_verifier is not None else _LocalhostWebAuthnVerifier(),
         review_apply=review_apply,
         restore_handler=restore_handler,
+        bootstrap_handler=bootstrap_handler if bootstrap_handler is not None else make_default_bootstrap_handler(os_),
     )
 
 

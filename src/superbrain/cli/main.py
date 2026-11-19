@@ -25,13 +25,124 @@ def _write_stderr(code: str) -> None:
 
 
 def _is_valid_abs_path(raw: str) -> bool:
-    if not raw or "\x00" in raw:
+    if not raw or "\x00" in raw or ".." in Path(raw).parts:
         return False
     return Path(raw).is_absolute()
 
 
+def _parse_bootstrap_args(args: list[str]) -> tuple[str, list[str]] | None:
+    harness: str | None = None
+    checkout: str | None = None
+    profile: str | None = None
+    as_json = False
+    i = 1
+    while i < len(args):
+        tok = args[i]
+        if tok == "--json":
+            if as_json:
+                return None
+            as_json = True
+            i += 1
+        elif tok == "--harness":
+            if harness is not None or i + 1 >= len(args) or args[i + 1] not in ("claude-code", "codex"):
+                return None
+            harness = args[i + 1]
+            i += 2
+        elif tok == "--checkout":
+            if checkout is not None or i + 1 >= len(args) or not _is_valid_abs_path(args[i + 1]):
+                return None
+            checkout = args[i + 1]
+            i += 2
+        elif tok == "--profile":
+            if profile is not None or i + 1 >= len(args) or not _is_valid_abs_path(args[i + 1]):
+                return None
+            profile = args[i + 1]
+            i += 2
+        else:
+            return None
+    if harness is None or checkout is None or profile is None:
+        return None
+    return ("superbrain.composition.bootstrap_entry", args)
+
+
+def _parse_doctor_args(args: list[str]) -> tuple[str, list[str]] | None:
+    has_config = False
+    has_profile = False
+    has_checkout = False
+    has_json = False
+    i = 1
+    while i < len(args):
+        tok = args[i]
+        if tok == "--json":
+            if has_json:
+                return None
+            has_json = True
+            i += 1
+        elif tok == "--config":
+            if has_config or has_profile or i + 1 >= len(args) or not _is_valid_abs_path(args[i + 1]):
+                return None
+            has_config = True
+            i += 2
+        elif tok == "--profile":
+            if has_profile or has_config or i + 1 >= len(args) or not _is_valid_abs_path(args[i + 1]):
+                return None
+            has_profile = True
+            i += 2
+        elif tok == "--checkout":
+            if has_checkout or i + 1 >= len(args) or not _is_valid_abs_path(args[i + 1]):
+                return None
+            has_checkout = True
+            i += 2
+        else:
+            return None
+    if not has_config and not has_profile:
+        return None
+    return ("superbrain.composition.doctor_entry", args)
+
+
+def _parse_review_web_args(args: list[str]) -> tuple[str, list[str]] | None:
+    has_profile = False
+    has_web = False
+    has_action = False
+    has_print_url = False
+    pos: list[str] = []
+    i = 1
+    while i < len(args):
+        tok = args[i]
+        if tok == "--web":
+            if has_web:
+                return None
+            has_web = True
+            i += 1
+        elif tok == "--print-url-only":
+            if has_print_url:
+                return None
+            has_print_url = True
+            i += 1
+        elif tok == "--profile":
+            if has_profile or i + 1 >= len(args) or not _is_valid_abs_path(args[i + 1]):
+                return None
+            has_profile = True
+            i += 2
+        elif tok == "--action":
+            if has_action or i + 1 >= len(args) or args[i + 1] not in ("approve", "reject", "apply", "rollback"):
+                return None
+            has_action = True
+            i += 2
+        elif tok.startswith("-"):
+            return None
+        else:
+            pos.append(tok)
+            i += 1
+    if not has_web or not has_profile or len(pos) != 1 or not pos[0] or "\x00" in pos[0]:
+        return None
+    return ("superbrain.composition.review_web_entry", args)
+
+
 def _parse_review_args(args: list[str]) -> tuple[str, list[str]] | None:
     if args[0] == "review":
+        if "--web" in args[1:]:
+            return _parse_review_web_args(args)
         if len(args) < 2:
             return None
         sub = args[1]
@@ -171,6 +282,10 @@ def _parse_cli_args(args: list[str]) -> tuple[str, list[str]] | None:
             return None
         forwarded = ["init", *(["--reset-signers"] if reset else []), "--config", remaining[1]]
         return ("superbrain.composition.init_entry", forwarded)
+    if args[0] == "bootstrap":
+        return _parse_bootstrap_args(args)
+    if args[0] == "doctor":
+        return _parse_doctor_args(args)
     if args[0] in ("review", "apply", "rollback"):
         return _parse_review_args(args)
     return None

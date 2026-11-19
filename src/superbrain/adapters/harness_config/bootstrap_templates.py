@@ -7,17 +7,23 @@ import stat
 from dataclasses import dataclass
 from pathlib import Path
 
+from superbrain.adapters.harness_config._common import digest_json_value
 from superbrain.adapters.harness_config.json_keys import merge_json_keys
 from superbrain.adapters.harness_config.markdown_blocks import merge_markdown_block
 from superbrain.adapters.harness_config.toml_tables import merge_toml_table
 from superbrain.core._kernel_approval import RiskResource
 from superbrain.core.errors import BrainError, ErrorCode
+from superbrain.core.jsonvalue import JsonValue
 from superbrain.core.proposals import ManagedFormat
+from superbrain.ports.bootstrap import BootstrapPlannerPort, BootstrapPlanSpec, BootstrapTargetSpec
 
 __all__ = [
     "AUTHORITY_ASK_COMMANDS",
+    "AdapterBootstrapPlanner",
     "BootstrapPlan",
     "BootstrapTargetPlan",
+    "HANDOFF_RULE_TEXT",
+    "HANDOFF_UPDATE_MOMENTS",
     "LAYER1_RULE_TEXT",
     "plan_claude_bootstrap",
     "plan_codex_bootstrap",
@@ -27,6 +33,25 @@ LAYER1_RULE_TEXT = (
     "Không tự duyệt, không thay người dùng chạy lệnh phê duyệt hoặc thay đổi signer/policy/restore. "
     "Mọi hành động review/apply/rollback/signer/policy/credential/restore/workspace link đều phải trình "
     "người dùng xem và xác nhận qua cổng duyệt."
+)
+
+HANDOFF_UPDATE_MOMENTS: tuple[str, ...] = (
+    "task_start_or_takeover",
+    "decision_or_plan_changed",
+    "milestone_completed",
+    "blocked_or_recovery_needed",
+    "session_handoff_or_pause",
+    "task_completed_or_abandoned",
+)
+
+HANDOFF_RULE_TEXT = (
+    "Session Handoff Protocol (7.4): update handoff at 6 moments "
+    "(task_start_or_takeover, decision_or_plan_changed, milestone_completed, "
+    "blocked_or_recovery_needed, session_handoff_or_pause, task_completed_or_abandoned). "
+    "Require explicit takeover ACK before taking ownership when task_state is active. "
+    "Inspect handoff_status (`stored`, `not_stored_policy`) and writer_status (`holder`, `not_holder`); "
+    "if writer_status is not_holder, prepare manual_submission instead of claiming an automatic write. "
+    "If commit_outcome_unknown is reported, reconcile before retrying writes."
 )
 
 AUTHORITY_ASK_COMMANDS: tuple[str, ...] = (
@@ -72,48 +97,125 @@ def _mcp_server_entry(profile_path: Path) -> dict[str, object]:
 
 
 _REPARSE_POINT = 0x400
+_MAX_BOOTSTRAP_TARGET_BYTES = 1_048_576
 
 
-def _read_existing(path: Path) -> str | None:
+def _is_link_stat(st: os.stat_result) -> bool:
+    return stat.S_ISLNK(st.st_mode) or bool(getattr(st, "st_file_attributes", 0) & _REPARSE_POINT)
+
+
+def _check_chain_no_links(checkout_root: Path, rel_parts: tuple[str, ...]) -> Path | None:
+    """Walk every path segment from ``checkout_root`` down to leaf checking lstat for links/reparse points."""
+    for anc in (checkout_root, *checkout_root.parents):
+        if os.path.lexists(anc):
+            try:
+                if _is_link_stat(os.lstat(anc)):
+                    raise BrainError(ErrorCode.UNSAFE_PATH, "unsafe link in bootstrap path")
+            except OSError as err:
+                raise BrainError(ErrorCode.IO_ERROR, f"cannot stat bootstrap path: {err}") from err
+    cur = checkout_root
+    for idx, seg in enumerate(rel_parts):
+        cur = cur / seg
+        try:
+            st = os.lstat(cur)
+        except FileNotFoundError:
+            return None
+        except OSError as err:
+            raise BrainError(ErrorCode.IO_ERROR, f"cannot stat bootstrap target: {err}") from err
+        if _is_link_stat(st):
+            raise BrainError(ErrorCode.UNSAFE_PATH, "unsafe link in bootstrap path")
+        if idx < len(rel_parts) - 1 and not stat.S_ISDIR(st.st_mode):
+            raise BrainError(ErrorCode.INVALID_INPUT, "bootstrap parent is not a directory")
+    return cur
+
+
+def _read_existing(checkout_root: Path, *rel_parts: str) -> str | None:
+    leaf = _check_chain_no_links(checkout_root, rel_parts)
+    if leaf is None:
+        return None
     try:
-        st = os.lstat(path)
+        st = os.lstat(leaf)
     except FileNotFoundError:
         return None
     except OSError as err:
-        raise BrainError(ErrorCode.IO_ERROR, f"cannot stat {path}: {err}") from err
-    if stat.S_ISLNK(st.st_mode) or bool(getattr(st, "st_file_attributes", 0) & _REPARSE_POINT):
+        raise BrainError(ErrorCode.IO_ERROR, f"cannot stat bootstrap target: {err}") from err
+    if _is_link_stat(st):
         raise BrainError(ErrorCode.UNSAFE_PATH, "unsafe link in bootstrap target")
     if not stat.S_ISREG(st.st_mode):
         raise BrainError(ErrorCode.INVALID_INPUT, "bootstrap target is not a regular file")
+    if st.st_size > _MAX_BOOTSTRAP_TARGET_BYTES:
+        raise BrainError(ErrorCode.INVALID_INPUT, "bootstrap target exceeds size limit")
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
-        return path.read_bytes().decode("utf-8", errors="strict")
+        fd = os.open(leaf, flags)
+    except FileNotFoundError:
+        return None
+    except OSError as err:
+        raise BrainError(ErrorCode.IO_ERROR, f"cannot open bootstrap target: {err}") from err
+    try:
+        fst = os.fstat(fd)
+        if not stat.S_ISREG(fst.st_mode) or fst.st_size > _MAX_BOOTSTRAP_TARGET_BYTES:
+            raise BrainError(ErrorCode.INVALID_INPUT, "bootstrap target exceeds size limit")
+        raw = os.read(fd, _MAX_BOOTSTRAP_TARGET_BYTES + 1)
+        if len(raw) > _MAX_BOOTSTRAP_TARGET_BYTES:
+            raise BrainError(ErrorCode.INVALID_INPUT, "bootstrap target exceeds size limit")
+        return raw.decode("utf-8", errors="strict")
     except UnicodeDecodeError as err:
         raise BrainError(ErrorCode.INVALID_INPUT, "invalid UTF-8 encoding") from err
     except OSError as err:
-        raise BrainError(ErrorCode.IO_ERROR, f"cannot read {path}: {err}") from err
+        raise BrainError(ErrorCode.IO_ERROR, f"cannot read bootstrap target: {err}") from err
+    finally:
+        os.close(fd)
+
+
+def _guidance_body(profile_path: Path) -> str:
+    return f"{LAYER1_RULE_TEXT}\n\n{HANDOFF_RULE_TEXT}\n\nProfile: {profile_path}"
+
+
+def _nonblocking_hooks_payload(profile_path: Path) -> dict[str, JsonValue]:
+    ask_cmds: list[JsonValue] = list(AUTHORITY_ASK_COMMANDS)
+    return {
+        "super_brain": {
+            "mode": "remind",
+            "non_blocking": True,
+            "profile": str(profile_path),
+            "authority_ask_commands": ask_cmds,
+        }
+    }
 
 
 def plan_claude_bootstrap(*, checkout_root: Path, profile_path: Path) -> BootstrapPlan:
     """Build checkout-scoped D3 bootstrap plan for Claude Code (`.mcp.json`, `CLAUDE.md`, `settings.local.json`)."""
     mcp_merge = merge_json_keys(
-        _read_existing(checkout_root / ".mcp.json"),
+        _read_existing(checkout_root, ".mcp.json"),
         key_path=("mcpServers", "super-brain"),
         value=_mcp_server_entry(profile_path),
         expected_slice_digest=None,
     )
     md_merge = merge_markdown_block(
-        _read_existing(checkout_root / "CLAUDE.md"),
+        _read_existing(checkout_root, "CLAUDE.md"),
         slice_id="super-brain-layer1",
-        block_body=f"{LAYER1_RULE_TEXT}\nProfile: {profile_path}",
+        block_body=_guidance_body(profile_path),
         expected_slice_digest=None,
     )
     ask_rules = [f"Bash({cmd} *)" for cmd in AUTHORITY_ASK_COMMANDS]
-    settings_merge = merge_json_keys(
-        _read_existing(checkout_root / ".claude" / "settings.local.json"),
+    hooks_val = _nonblocking_hooks_payload(profile_path)
+    settings_existing = _read_existing(checkout_root, ".claude", "settings.local.json")
+    settings_ask = merge_json_keys(
+        settings_existing,
         key_path=("permissions", "ask"),
         value=ask_rules,
         expected_slice_digest=None,
     )
+    settings_with_hooks = merge_json_keys(
+        settings_ask.updated_text,
+        key_path=("hooks", "PreToolUse"),
+        value=hooks_val,
+        expected_slice_digest=None,
+    )
+    ask_rules_json: list[JsonValue] = list(ask_rules)
+    combined_slice: dict[str, JsonValue] = {"permissions.ask": ask_rules_json, "hooks.PreToolUse": hooks_val}
+    combined_digest = digest_json_value(combined_slice)
     return BootstrapPlan(
         harness_id="claude-code",
         checkout_root=checkout_root,
@@ -137,9 +239,9 @@ def plan_claude_bootstrap(*, checkout_root: Path, profile_path: Path) -> Bootstr
             BootstrapTargetPlan(
                 rel_path=".claude/settings.local.json",
                 managed_format=ManagedFormat.JSON,
-                slice_id="permissions.ask",
-                slice_digest=settings_merge.slice_digest,
-                preview_text=settings_merge.updated_text,
+                slice_id="permissions.ask,hooks.PreToolUse",
+                slice_digest=combined_digest,
+                preview_text=settings_with_hooks.updated_text,
             ),
         ),
     )
@@ -148,27 +250,21 @@ def plan_claude_bootstrap(*, checkout_root: Path, profile_path: Path) -> Bootstr
 def plan_codex_bootstrap(*, checkout_root: Path, profile_path: Path) -> BootstrapPlan:
     """Build checkout-scoped D3 bootstrap plan for Codex (`AGENTS.md`, `.codex/config.toml`, `.codex/hooks.json`)."""
     md_merge = merge_markdown_block(
-        _read_existing(checkout_root / "AGENTS.md"),
+        _read_existing(checkout_root, "AGENTS.md"),
         slice_id="super-brain-layer1",
-        block_body=f"{LAYER1_RULE_TEXT}\nProfile: {profile_path}",
+        block_body=_guidance_body(profile_path),
         expected_slice_digest=None,
     )
     toml_merge = merge_toml_table(
-        _read_existing(checkout_root / ".codex" / "config.toml"),
+        _read_existing(checkout_root, ".codex", "config.toml"),
         table_path=("mcp_servers", "super-brain"),
         values=_mcp_server_entry(profile_path),
         expected_slice_digest=None,
     )
-    hooks_value = {
-        "super_brain": {
-            "profile": str(profile_path),
-            "authority_ask_commands": list(AUTHORITY_ASK_COMMANDS),
-        }
-    }
     hooks_merge = merge_json_keys(
-        _read_existing(checkout_root / ".codex" / "hooks.json"),
+        _read_existing(checkout_root, ".codex", "hooks.json"),
         key_path=("hooks", "PreToolUse"),
-        value=hooks_value,
+        value=_nonblocking_hooks_payload(profile_path),
         expected_slice_digest=None,
     )
     return BootstrapPlan(
@@ -200,3 +296,37 @@ def plan_codex_bootstrap(*, checkout_root: Path, profile_path: Path) -> Bootstra
             ),
         ),
     )
+
+
+class AdapterBootstrapPlanner(BootstrapPlannerPort):
+    """Adapter implementing ``BootstrapPlannerPort`` for Claude Code and Codex."""
+
+    def plan_bootstrap(
+        self,
+        *,
+        harness_id: str,
+        checkout_root: Path,
+        profile_path: Path,
+    ) -> BootstrapPlanSpec:
+        if harness_id == "claude-code":
+            plan = plan_claude_bootstrap(checkout_root=checkout_root, profile_path=profile_path)
+        elif harness_id == "codex":
+            plan = plan_codex_bootstrap(checkout_root=checkout_root, profile_path=profile_path)
+        else:
+            raise BrainError(ErrorCode.INVALID_INPUT, "unsupported bootstrap harness")
+        return BootstrapPlanSpec(
+            harness_id=plan.harness_id,
+            checkout_root=plan.checkout_root,
+            profile_path=plan.profile_path,
+            resources=plan.resources,
+            targets=tuple(
+                BootstrapTargetSpec(
+                    rel_path=t.rel_path,
+                    managed_format=t.managed_format,
+                    slice_id=t.slice_id,
+                    slice_digest=t.slice_digest,
+                    preview_text=t.preview_text,
+                )
+                for t in plan.targets
+            ),
+        )

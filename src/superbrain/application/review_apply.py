@@ -229,13 +229,17 @@ class ReviewApplyService:
             raise _invalid()
         if approval.risk_policy_version != RISK_POLICY_VERSION:
             raise _conflict()
+        expected_sorted_digests = sorted(expected_digests, key=lambda d: d.name)
+        actual_sorted_digests = sorted(approval.resource_digests, key=lambda d: d.name)
+        expected_sorted_targets = sorted(expected_targets, key=lambda f: (f.root_path, f.normalized_rel_path))
+        actual_sorted_targets = sorted(approval.target_files, key=lambda f: (f.root_path, f.normalized_rel_path))
         if (
             approval.owner_id != prop.owner_id
             or approval.subject_id != prop.proposal_id
             or approval.subject_revision != prop.subject_revision
             or approval.risk_level is not prop.risk_level
-            or tuple(approval.resource_digests) != expected_digests
-            or tuple(approval.target_files) != expected_targets
+            or actual_sorted_digests != expected_sorted_digests
+            or actual_sorted_targets != expected_sorted_targets
         ):
             raise _conflict()
 
