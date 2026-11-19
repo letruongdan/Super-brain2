@@ -472,3 +472,45 @@ def test_r05_default_action_reflected_in_html_select_and_initial_api_state() -> 
             data = json.loads(raw_api)["data"]
             assert data["action"] == act.value
             assert data["subject_summary"]["action"] == act.value
+
+
+def test_review_web_maps_deadline_unavailable_and_io_errors_to_5xx() -> None:
+    """Budget regression: ReviewWebServer maps DEADLINE_EXCEEDED->504, DAEMON_UNAVAILABLE->503, IO_ERROR->500."""
+
+    class _FailingBackend(_StubBackend):
+        def __init__(self) -> None:
+            super().__init__(proposal_id="prop-5xx")
+            self.err: BrainError | None = None
+
+        def request_challenge(
+            self,
+            *,
+            proposal_id: str,
+            action: ApprovalAction,
+            recovery_scope: RecoveryScope,
+        ) -> tuple[ApprovalMessage, Mapping[str, JsonValue]]:
+            if self.err is not None:
+                raise self.err
+            return super().request_challenge(
+                proposal_id=proposal_id, action=action, recovery_scope=recovery_scope
+            )
+
+    backend = _FailingBackend()
+    session = ReviewSession(backend=backend, proposal_id=backend.proposal_id, expected_origin="http://localhost:0")
+    with ReviewWebServer(session, host="127.0.0.1", port=0) as srv:
+        session.bind_origin(srv.origin)
+        cookie, _ = _redeem_session(srv.port, srv.origin, session.bootstrap_token)
+        for code, expected_http in (
+            (ErrorCode.DEADLINE_EXCEEDED, 504),
+            (ErrorCode.DAEMON_UNAVAILABLE, 503),
+            (ErrorCode.IO_ERROR, 500),
+        ):
+            backend.err = BrainError(code, code.value)
+            st, r_hdrs, _, raw_err = _raw_http(
+                srv.port,
+                target="/api/state",
+                headers=[("Host", f"localhost:{srv.port}"), ("Cookie", cookie)],
+            )
+            assert st == expected_http, (code, st, raw_err)
+            assert r_hdrs.get("x-content-type-options") == "nosniff"
+            assert json.loads(raw_err)["error"]["code"] == code.value

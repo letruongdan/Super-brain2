@@ -102,18 +102,11 @@ def _ssh_sign(priv: Ed25519PrivateKey, data: bytes) -> str:
 
 def _msg_from_challenge(ch: dict[str, Any]) -> ApprovalMessage:
     return ApprovalMessage(
-        store_id=str(ch["store_id"]),
-        owner_id=OWNER,
-        trust_generation=int(ch["trust_generation"]),
-        action=ApprovalAction(str(ch["action"])),
-        subject_id=str(ch["subject_id"]),
-        subject_revision=1,
-        resource_digests=(ResourceDigest("CLAUDE.md", "sha256:" + "a" * 64),),
-        target_files=(),
-        risk_level=RiskLevel(str(ch["risk_level"])),
-        risk_policy_version=RISK_POLICY_VERSION,
-        recovery_scope=RecoveryScope.NONE,
-        nonce=str(ch["nonce"]),
+        store_id=str(ch["store_id"]), owner_id=OWNER, trust_generation=int(ch["trust_generation"]),
+        action=ApprovalAction(str(ch["action"])), subject_id=str(ch["subject_id"]), subject_revision=1,
+        resource_digests=(ResourceDigest("CLAUDE.md", "sha256:" + "a" * 64),), target_files=(),
+        risk_level=RiskLevel(str(ch["risk_level"])), risk_policy_version=RISK_POLICY_VERSION,
+        recovery_scope=RecoveryScope.NONE, nonce=str(ch["nonce"]),
         expires_at=datetime.fromisoformat(str(ch["expires_at"]).replace("Z", "+00:00")),
     )
 
@@ -147,6 +140,23 @@ def _enroll_body(public_line: str) -> dict[str, object]:
     return {"enrollment": {"channel": ApprovalChannel.SSH_KEY.value, "public_key": public_line}}
 
 
+def _post_behind_blocked_owner(
+    loop: OwnerLoop,
+    arm_evt: Callable[[], threading.Event], post_fn: Callable[[], bytes], after_queue: Callable[[], Any],
+) -> list[bytes]:
+    _ent, blk_release, blk_fut = _hold_owner(loop)
+    wait_evt, out = arm_evt(), list[bytes]()
+    client_thr = _run_bg(post_fn, out)
+    try:
+        assert wait_evt.wait(timeout=2.0)
+        after_queue()
+    finally:
+        blk_release.set()
+    blk_fut.result(timeout=2.0)
+    client_thr.join(timeout=2.0)
+    return out
+
+
 def _run_bg(fn: Callable[[], bytes] | Any, out: list[bytes] | None = None) -> threading.Thread:
     def _target() -> None:
         res = fn()
@@ -161,34 +171,23 @@ def _run_bg(fn: Callable[[], bytes] | Any, out: list[bytes] | None = None) -> th
 def _init_fixture(
     trusted_tmp: Path, clock: FakeClock, mono: FakeMonotonicClock, *, owner_id: str = OWNER
 ) -> tuple[InitRequest, InitReport, Ed25519PrivateKey, DaemonConfig, str, str, OsAdapters]:
-    os_ = os_adapters(clock=clock, monotonic=mono)
-    cfg_dir = trusted_tmp / "config"
+    os_, cfg_dir = os_adapters(clock=clock, monotonic=mono), trusted_tmp / "config"
     cfg_dir.mkdir()
     os_.permissions.secure_directory(cfg_dir)
     priv, enrollment, _line = _ssh_enrollment(owner_id)
-    req = InitRequest(
-        data_root=trusted_tmp / "data", config_dir=cfg_dir, owner_id=owner_id, machine_id=MACHINE, signer=enrollment
-    )
+    req = InitRequest(trusted_tmp / "data", cfg_dir, owner_id, MACHINE, enrollment)
     report = init_store(req, os_)
     cfg = read_daemon_config(report.daemon_config_path, os_)
-    return (
-        req,
-        report,
-        priv,
-        cfg,
-        (cfg_dir / "tls" / "ca.pem").read_text(encoding="utf-8"),
-        report.cli_credential_path.read_text(encoding="ascii").strip(),
-        os_,
-    )
+    ca = (cfg_dir / "tls" / "ca.pem").read_text(encoding="utf-8")
+    tok = report.cli_credential_path.read_text(encoding="ascii").strip()
+    return req, report, priv, cfg, ca, tok, os_
 
 
 @contextmanager
 def _running_daemon(
     cfg: DaemonConfig, *, os_: OsAdapters, clock: FakeClock, mono: FakeMonotonicClock, shutdown_grace_s: float = 1.0
 ) -> Iterator[tuple[Ready, OwnerLoop, threading.Event, threading.Thread]]:
-    ready_evt, stop_evt = threading.Event(), threading.Event()
-    box: dict[str, Any] = {}
-    exits: list[int] = []
+    ready_evt, stop_evt, box, exits = threading.Event(), threading.Event(), dict[str, Any](), list[int]()
 
     def _on_ready(rdy: Ready, lp: OwnerLoop) -> None:
         box.update(ready=rdy, loop=lp)
@@ -197,13 +196,8 @@ def _running_daemon(
     def _run() -> None:
         exits.append(
             daemon_entry.serve(
-                cfg,
-                os_=os_,
-                clock=clock,
-                monotonic_clock=mono,
-                stop_event=stop_evt,
-                shutdown_grace_s=shutdown_grace_s,
-                on_ready=_on_ready,
+                cfg, os_=os_, clock=clock, monotonic_clock=mono,
+                stop_event=stop_evt, shutdown_grace_s=shutdown_grace_s, on_ready=_on_ready,
             )
         )
 
@@ -301,10 +295,8 @@ def test_slow_ssh_verify_does_not_block_owner_loop(trusted_tmp: Path, monkeypatc
         assert ch_env["ok"] is True
         msg = _msg_from_challenge(ch_env["data"]["challenge"])
         approval = {
-            "message": msg.to_dict(),
-            "channel": ApprovalChannel.SSH_KEY.value,
-            "signer_id": report.signer.signer_id,
-            "signature": _ssh_sign(priv_s1, msg.canonical_bytes()),
+            "message": msg.to_dict(), "channel": ApprovalChannel.SSH_KEY.value,
+            "signer_id": report.signer.signer_id, "signature": _ssh_sign(priv_s1, msg.canonical_bytes()),
         }
         signed_payload = {**enroll_payload, "approval": approval}
         monkeypatch.setattr(SshSigVerifier, "verify", _blocked_verify)
@@ -316,14 +308,10 @@ def test_slow_ssh_verify_does_not_block_owner_loop(trusted_tmp: Path, monkeypatc
             assert verify_entered.wait(timeout=2.0)
             # While ssh-keygen is parked, OwnerLoop must still service deep health calls without timing out.
             health_probe = {
-                "tool": "get_health",
+                "tool": "get_health", "correlation_id": None, "selected_scope": None,
                 "arguments": {"schema_version": "2.0", "deep": True, "idempotency_key": "idem-deep-health-0001"},
-                "correlation_id": None,
-                "selected_scope": None,
             }
-            health_raw = _post_loopback(
-                ready, ca_pem, "/v2/tools/call", harness.token, health_probe, read_timeout=0.7
-            )
+            health_raw = _post_loopback(ready, ca_pem, "/v2/tools/call", harness.token, health_probe, read_timeout=0.7)
             assert b"\r\n\r\n" in health_raw, "OwnerLoop was blocked while ssh-keygen verification waited"
             health_env = _envelope(health_raw)
             assert _error_code(health_env) != ErrorCode.INVALID_INPUT.value
@@ -341,9 +329,17 @@ def test_slow_ssh_verify_does_not_block_owner_loop(trusted_tmp: Path, monkeypatc
 def test_expired_and_queued_past_deadline_operator_requests_do_not_mutate_policy(
     trusted_tmp: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from superbrain.core.kernel import OPERATOR_REQUEST_BUDGET_NS
+
+    assert OPERATOR_REQUEST_BUDGET_NS == 15_000_000_000 and TOTAL_REQUEST_BUDGET_NS == 1_500_000_000
     clock = FakeClock(datetime.now(UTC).replace(microsecond=0))
     mono = FakeMonotonicClock(1_000_000_000)
-    req, _rep, _priv, cfg, ca_pem, cli_token, os_ = _init_fixture(trusted_tmp, clock, mono)
+    req, rep, _priv, cfg, ca_pem, cli_token, os_ = _init_fixture(trusted_tmp, clock, mono)
+    rt = reopen_kernel_job_runtime(req.data_root, rep.store_id, os_)
+    try:
+        harness = seed_principal_and_credential(rt.policy, owner_id=OWNER, harness_id="claude-code", machine_id=MACHINE)
+    finally:
+        rt.close()
     _priv2, _enr2, s2_line = _ssh_enrollment(OWNER)
     body = _enroll_body(s2_line)
 
@@ -363,34 +359,57 @@ def test_expired_and_queued_past_deadline_operator_requests_do_not_mutate_policy
         loop_direct.stop(grace_s=1.0)
     assert _count_nonces(req.data_root) == 0
 
-    # 2. HTTP pre-expired before OwnerLoop queue and queued-past-deadline behind OwnerLoop work.
-    expire_on_parse = [False]
+    # 2. Operator uses 15s budget (2.0s passes) while /v2/tools/call keeps 1.5s; >15s refuses with 0 nonces.
+    advance_on_parse_ns = [0]
 
     def _spy_parse(raw: bytes) -> dict[str, Any]:
         parsed = parse_operator_body(raw)
-        if expire_on_parse[0]:
-            mono.advance(TOTAL_REQUEST_BUDGET_NS + 1_000_000)
+        if advance_on_parse_ns[0]:
+            mono.advance(advance_on_parse_ns[0])
         return parsed
 
     monkeypatch.setattr(_server_http, "parse_operator_body", _spy_parse)
     with _running_daemon(cfg, os_=os_, clock=clock, mono=mono) as (ready, loop, _stop, _thr):
-        expire_on_parse[0] = True
+        advance_on_parse_ns[0] = TOTAL_REQUEST_BUDGET_NS + 500_000_000  # 2.0s < 15.0s
+        op_2s = _post_loopback(ready, ca_pem, "/v2/operator/signer/list", cli_token, {}, read_timeout=2.0)
+        assert _envelope(op_2s)["ok"] is True
+
+        # Confirm /v2/tools/call keeps strict 1.5s budget when delayed by 2.0s behind OwnerLoop.
+        tool_queued, orig_submit, tool_dl = threading.Event(), loop.submit_reply, list[tuple[int, int]]()
+
+        def _spy_submit(cmd: Any, dl: int) -> Any:
+            tool_dl.append((mono.monotonic_ns(), dl))
+            tool_queued.set()
+            return orig_submit(cmd, dl)
+
+        monkeypatch.setattr(loop, "submit_reply", _spy_submit)
+        health_arg = {
+            "tool": "get_health", "correlation_id": None, "selected_scope": None,
+            "arguments": {"schema_version": "2.0", "deep": True, "idempotency_key": "idem-deep-health-0002"},
+        }
+        tool_out = _post_behind_blocked_owner(
+            loop, lambda: tool_queued,
+            lambda: _post_loopback(ready, ca_pem, "/v2/tools/call", harness.token, health_arg),
+            lambda: mono.advance(TOTAL_REQUEST_BUDGET_NS + 500_000_000),
+        )
+        assert len(tool_dl) == 1 and 0 < (tool_dl[0][1] - tool_dl[0][0]) <= TOTAL_REQUEST_BUDGET_NS
+        assert tool_out and (
+            not tool_out[0] or _error_code(_envelope(tool_out[0])) == ErrorCode.DEADLINE_EXCEEDED.value
+        )
+        monkeypatch.setattr(loop, "submit_reply", orig_submit)
+
+        advance_on_parse_ns[0] = OPERATOR_REQUEST_BUDGET_NS + 1_000_000
         pre_exp = _post_loopback(ready, ca_pem, "/v2/operator/signer/enroll", cli_token, body, read_timeout=2.0)
-        expire_on_parse[0] = False
+        advance_on_parse_ns[0] = 0
         if pre_exp:
             assert _error_code(_envelope(pre_exp)) == ErrorCode.DEADLINE_EXCEEDED.value
 
-        _ent, blk_release, blk_fut = _hold_owner(loop)
-        queued_evt = _arm_run_owner_spy(loop, monkeypatch)
-        queued_out: list[bytes] = []
-        client_thr = _run_bg(lambda: _post_loopback(ready, ca_pem, ENROLL, cli_token, body), queued_out)
-        try:
-            assert queued_evt.wait(timeout=2.0)
-            mono.advance(TOTAL_REQUEST_BUDGET_NS + 1_000_000)
-        finally:
-            blk_release.set()
-        blk_fut.result(timeout=2.0)
-        client_thr.join(timeout=2.0)
+        queued_out = _post_behind_blocked_owner(
+            loop,
+            lambda: _arm_run_owner_spy(loop, monkeypatch),
+            lambda: _post_loopback(ready, ca_pem, ENROLL, cli_token, body),
+            lambda: mono.advance(OPERATOR_REQUEST_BUDGET_NS + 1_000_000),
+        )
         if queued_out and queued_out[0]:
             assert _error_code(_envelope(queued_out[0])) == ErrorCode.DEADLINE_EXCEEDED.value
 
@@ -518,17 +537,11 @@ def test_revoked_user_cli_credential_rechecked_live_on_owner_thread(
 
     with _running_daemon(cfg, os_=os_, clock=clock, mono=mono) as (ready, loop, _stop, _thr):
         _ent, blk_release, blk_fut = _hold_owner(loop)
-
-        # Queue credential revocation ahead of the admitted operator request on OwnerLoop's FIFO queue.
         rev_auth = make_bootstrap_auth(
-            store_id=ready.identity.store_id,
-            owner_id=OWNER,
-            action="credential_revoke",
-            subject_id=cli_cred_id,
-            expires_at=clock.now() + timedelta(hours=1),
+            store_id=ready.identity.store_id, owner_id=OWNER,
+            action="credential_revoke", subject_id=cli_cred_id, expires_at=clock.now() + timedelta(hours=1),
         )
         rev_fut = loop.revoke_credential(cli_cred_id, rev_auth)
-
         op_queued = _arm_run_owner_spy(loop, monkeypatch)
         out: list[bytes] = []
         client_thr = _run_bg(lambda: _post_loopback(ready, ca_pem, ENROLL, cli_token, enroll_body), out)
@@ -536,54 +549,43 @@ def test_revoked_user_cli_credential_rechecked_live_on_owner_thread(
             assert op_queued.wait(timeout=2.0)
         finally:
             blk_release.set()
-
         blk_fut.result(timeout=2.0)
         rev_fut.result(timeout=2.0)
         client_thr.join(timeout=2.0)
         assert len(out) == 1 and _error_code(_envelope(out[0])) == ErrorCode.UNAUTHENTICATED.value
-
     assert _count_nonces(req.data_root) == 0
-
-
-# --- I3-1-R04: reset_signers owner_id mismatch & init_store config_dir pre-check -----------------------------------
 
 
 def test_reset_signers_owner_mismatch_and_init_store_preflight_do_not_mutate_fs(trusted_tmp: Path) -> None:
     clock = FakeClock(datetime.now(UTC).replace(microsecond=0))
     mono = FakeMonotonicClock(1_000_000_000)
     req, rep, _priv, _cfg, _ca, _tok, os_ = _init_fixture(trusted_tmp, clock, mono, owner_id=OWNER)
-
     rt = reopen_kernel_job_runtime(req.data_root, rep.store_id, os_)
     try:
         rt.policy.issue_nonce(action=ApprovalAction.APPROVE, subject_id="proposal-keep", risk_level=RiskLevel.HIGH)
     finally:
         rt.close()
     before_bytes = digest_tree(req.data_root)
-
     _bad_priv, wrong_owner_signer, _line = _ssh_enrollment(owner_id="mallory")
     with pytest.raises(BrainError) as mismatch_exc:
         reset_signers(rep.daemon_config_path, wrong_owner_signer, os_)
-    assert mismatch_exc.value.code is ErrorCode.IDENTITY_MISMATCH
-    assert digest_tree(req.data_root) == before_bytes
-
+    assert mismatch_exc.value.code is ErrorCode.IDENTITY_MISMATCH and digest_tree(req.data_root) == before_bytes
     rt2 = reopen_kernel_job_runtime(req.data_root, rep.store_id, os_)
     try:
         assert [s.signer_id for s in rt2.policy.active_signers()] == [rep.signer.signer_id]
         assert rt2.policy.trust_generation() == 1 and rt2.policy.signer_reset_recorded() is False
     finally:
         rt2.close()
-
-    # init_store must validate data_root state and safety BEFORE creating a missing config_dir.
-    existing_data = trusted_tmp / "existing-data"
+    existing_data, cfg_a, cfg_b = (
+        trusted_tmp / "existing-data", trusted_tmp / "nonexistent-cfg-a", trusted_tmp / "nonexistent-cfg-b"
+    )
     existing_data.mkdir()
     os_.permissions.secure_directory(existing_data)
     (existing_data / "writer.lock").write_bytes(b"")
-    cfg_a, cfg_b = trusted_tmp / "nonexistent-cfg-a", trusted_tmp / "nonexistent-cfg-b"
     _p1, enr_a, _l1 = _ssh_enrollment(OWNER)
     with pytest.raises(BrainError) as exists_exc:
         init_store(InitRequest(existing_data, cfg_a, OWNER, MACHINE, enr_a), os_)
     assert exists_exc.value.code is ErrorCode.INVALID_INPUT and not cfg_a.exists()
-
     target_data, sym_data = trusted_tmp / "symlink-target", trusted_tmp / "symlink-data"
     target_data.mkdir()
     if sys.platform == "win32":

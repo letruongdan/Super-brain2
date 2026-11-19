@@ -36,7 +36,10 @@ _ERROR_HTTP_STATUS: dict[ErrorCode, int] = {
     ErrorCode.IDENTITY_MISMATCH: 401,
     ErrorCode.NOT_FOUND: 404,
     ErrorCode.REVISION_CONFLICT: 409,
+    ErrorCode.IO_ERROR: 500,
+    ErrorCode.DAEMON_UNAVAILABLE: 503,
     ErrorCode.CAPABILITY_UNAVAILABLE: 503,
+    ErrorCode.DEADLINE_EXCEEDED: 504,
 }
 
 _STATUS_REASONS: dict[int, str] = {
@@ -52,6 +55,7 @@ _STATUS_REASONS: dict[int, str] = {
     431: "Request Header Fields Too Large",
     500: "Internal Server Error",
     503: "Service Unavailable",
+    504: "Gateway Timeout",
 }
 
 

@@ -29,6 +29,7 @@ from superbrain.cli_api._server_http import (
 from superbrain.cli_api.operator import OperatorExecutor
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.kernel import (
+    OPERATOR_REQUEST_BUDGET_NS,
     TOTAL_REQUEST_BUDGET_NS,
     ArtifactSendAttempt,
     CallResult,
@@ -525,6 +526,7 @@ class LoopbackServer:
                 auth_gate=lambda: self._owner.auth_gate,
                 operator=self._operator,
                 deadline_ns=tool_deadline_ns,
+                operator_deadline_ns=t0_tool + OPERATOR_REQUEST_BUDGET_NS,
                 monotonic_ns=self._monotonic_ns,
                 is_quiesced=self._is_quiesced,
                 past_stop_deadline=self._past_stop_deadline,

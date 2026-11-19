@@ -133,10 +133,10 @@ def _web_http(
         lines.append(f"{k}: {v}".encode("latin-1"))
     if body:
         lines.append(f"Content-Length: {len(body)}".encode("ascii"))
-    with socket.create_connection(("127.0.0.1", port), timeout=3.0) as sock:
-        sock.settimeout(3.0)
+    with socket.create_connection(("127.0.0.1", port), timeout=15.0) as sock:
+        sock.settimeout(15.0)
         sock.sendall(b"\r\n".join(lines) + b"\r\n\r\n" + body)
-        resp = read_raw_http_response(sock, timeout=5.0)
+        resp = read_raw_http_response(sock, timeout=15.0)
     head_raw, _, payload = resp.partition(b"\r\n\r\n")
     head_lines = head_raw.decode("iso-8859-1").split("\r\n")
     status = int(head_lines[0].split(" ", 2)[1])
@@ -381,7 +381,7 @@ def test_i3_wheel_synthetic_lifecycle_e2e(inc2_installed_env: InstalledEnv, trus
                         }
                     ).encode("utf-8"),
                 )
-                assert st_sub == 200 and sub_env["ok"] is True
+                assert st_sub == 200 and sub_env["ok"] is True, sub_env
 
         # 5. Out-of-band U1 edit -> `brain rollback` preserves U1 byte-for-byte!
         toml_u1 = (co_b / ".codex" / "config.toml").read_text(encoding="utf-8") + (

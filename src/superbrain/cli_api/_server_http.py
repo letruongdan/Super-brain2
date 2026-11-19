@@ -348,6 +348,7 @@ def try_handle_operator_request(
     auth_gate: Callable[[], AuthGate],
     operator: OperatorExecutor | None,
     deadline_ns: int,
+    operator_deadline_ns: int | None = None,
     monotonic_ns: Callable[[], int],
     is_quiesced: Callable[[], bool] | None = None,
     past_stop_deadline: Callable[[], bool] | None = None,
@@ -360,12 +361,13 @@ def try_handle_operator_request(
         return True, False
     if target not in OPERATOR_PATHS:
         return False, False
+    op_deadline_ns = deadline_ns if operator_deadline_ns is None else operator_deadline_ns
     op_req = read_admitted_operator_request(
         ssl_sock,
         reader,
         ready,
         auth_gate=auth_gate,
-        deadline_ns=deadline_ns,
+        deadline_ns=op_deadline_ns,
         monotonic_ns=monotonic_ns,
     )
     if op_req is None:
@@ -379,7 +381,7 @@ def try_handle_operator_request(
                     status=200,
                     body=encode_envelope(unavail),
                     close_conn=True,
-                    deadline_ns=deadline_ns,
+                    deadline_ns=op_deadline_ns,
                     monotonic_ns=monotonic_ns,
                 )
         return True, True
@@ -387,7 +389,7 @@ def try_handle_operator_request(
         ssl_sock,
         op_req,
         operator,
-        deadline_ns,
+        op_deadline_ns,
         monotonic_ns,
         past_stop_deadline=past_stop_deadline,
     )
