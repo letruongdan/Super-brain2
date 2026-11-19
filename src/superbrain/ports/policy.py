@@ -16,6 +16,11 @@ class IntentKind(StrEnum):
     QUARANTINE = "quarantine"
     CREDENTIAL_REVOKE = "credential_revoke"
     WORKSPACE_REGISTER = "workspace_register"
+    SIGNER_RESET = "signer_reset"
+    REPO_POLICY_SET = "repo_policy_set"
+    LAYER2_STATE_SET = "layer2_state_set"
+    RECOVERY_GRANT_OPENED = "recovery_grant_opened"
+    RECOVERY_GRANT_ENDED = "recovery_grant_ended"
 
 
 @dataclass(frozen=True)

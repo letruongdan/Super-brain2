@@ -17,6 +17,7 @@ from types import FrameType
 from superbrain.adapters.os import os_adapters
 from superbrain.adapters.os.daemon_config import read_daemon_config
 from superbrain.adapters.os.tls_material import verify_server_tls_files
+from superbrain.application.approvals import OperatorHandle
 from superbrain.application.deadlines import Reservation
 from superbrain.application.dispatch import KernelToolDomain
 from superbrain.application.jobs import JobService
@@ -36,6 +37,7 @@ from superbrain.composition._endpoint import (
 )
 from superbrain.composition.kernel_bridge import KernelBridge
 from superbrain.composition.kernel_projections import kernel_store_extensions
+from superbrain.composition.operator_entry import build_operator_service, make_operator_executor
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.faults import crashpoint
 from superbrain.core.ids import new_id
@@ -96,6 +98,7 @@ def _open_owner_session(
     job_handlers: Mapping[str, JobHandler] | None,
     hooks: DaemonTestHooks,
     on_listener_bound: Callable[[BoundLoopbackListener], None] | None,
+    operator: OperatorHandle | None = None,
 ) -> _AdmittedOwnerSession:
     adapters = os_ if os_ is not None else os_adapters(clock=clock, monotonic=monotonic_clock)
     resolved_clock = clock if clock is not None else adapters.clock
@@ -267,10 +270,15 @@ def _open_owner_session(
             hooks=hooks,
             reply_meta_lock=reply_meta_lock,
             reply_meta=reply_meta,
+            operator=operator,
         )
         session_box.append(session)
+        if operator is not None:
+            operator.bind(build_operator_service(rt.policy, os_=adapters))
         return session
     except BaseException:
+        if operator is not None:
+            operator.unbind()
         if auth_gate is not None:
             auth_gate.close()
         if endpoint is not None:
@@ -295,6 +303,7 @@ def create_daemon_owner_loop(
     job_handlers: Mapping[str, JobHandler] | None = None,
     hooks: DaemonTestHooks | None = None,
     on_listener_bound: Callable[[BoundLoopbackListener], None] | None = None,
+    operator: OperatorHandle | None = None,
 ) -> OwnerLoop:
     """Construct an ``OwnerLoop`` wired to real admission, recovery, bridge, worker, and listener ports."""
     resolved_hooks = hooks if hooks is not None else DaemonTestHooks()
@@ -317,6 +326,7 @@ def create_daemon_owner_loop(
             job_handlers=job_handlers,
             hooks=resolved_hooks,
             on_listener_bound=on_listener_bound,
+            operator=operator,
         )
 
     return OwnerLoop(_factory)
@@ -395,6 +405,7 @@ def serve(
     resolved_clock = clock if clock is not None else adapters.clock
     resolved_mono = monotonic_clock if monotonic_clock is not None else adapters.monotonic
     bound_listeners: list[BoundLoopbackListener] = []
+    operator_handle = OperatorHandle()
 
     loop = create_daemon_owner_loop(
         os_=adapters,
@@ -404,6 +415,7 @@ def serve(
         job_handlers=job_handlers,
         hooks=hooks,
         on_listener_bound=bound_listeners.append,
+        operator=operator_handle,
     )
     effective_stop = stop_event if stop_event is not None else threading.Event()
     with _signal_stop_guard(effective_stop) as signalled:
@@ -420,6 +432,7 @@ def serve(
                 owner=loop,
                 monotonic_ns=resolved_mono.monotonic_ns,
                 stop_event=effective_stop,
+                operator=make_operator_executor(loop, operator_handle, resolved_mono.monotonic_ns),
             )
             # The synchronous signal latch is authoritative during startup;
             # the background Event conversion may not have run yet.

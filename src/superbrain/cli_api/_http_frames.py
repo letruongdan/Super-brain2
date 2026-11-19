@@ -262,6 +262,21 @@ class FramedReader:
 
         return start_line, b"".join(header_lines)
 
+    def peek_request_target(self, deadline_ns: int) -> str | None:
+        """Non-destructively read up to the first request-line LF and return its target, or ``None``."""
+        while True:
+            self._require_deadline(deadline_ns)
+            nl_idx = self._buf.find(b"\n")
+            if nl_idx != -1:
+                line = bytes(self._buf[: nl_idx + 1])
+                parts = line.rstrip(b"\r\n").split(b" ")
+                if len(parts) != 3:
+                    return None
+                return parts[1].decode("ascii", errors="replace")
+            if len(self._buf) >= MAX_REQUEST_LINE_BYTES or self._eof:
+                return None
+            self._fill_once(deadline_ns)
+
     def read_request_head(self, deadline_ns: int) -> RequestHead:
         start_line, raw_header_block = self._read_raw_head(deadline_ns)
         start_body = start_line[:-2]

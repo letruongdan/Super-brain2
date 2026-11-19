@@ -49,6 +49,16 @@ def _parse_cli_args(args: list[str]) -> tuple[str, list[str]] | None:
         if _is_valid_abs_path(args[2]):
             return ("superbrain.composition.shim_entry", ["--profile", args[2]])
         return None
+    if len(args) >= 3 and args[0] == "init":
+        rest = args[1:]
+        reset = "--reset-signers" in rest
+        remaining = [a for a in rest if a != "--reset-signers"]
+        if len(rest) - len(remaining) > 1 or len(remaining) != 2 or remaining[0] != "--config":
+            return None
+        if not _is_valid_abs_path(remaining[1]):
+            return None
+        forwarded = ["init", *(["--reset-signers"] if reset else []), "--config", remaining[1]]
+        return ("superbrain.composition.init_entry", forwarded)
     return None
 
 

@@ -42,6 +42,7 @@ from superbrain.storage._policy_authority import (
     read_policy_request_digest_key_by_id,
     resolve_policy_credential,
 )
+from superbrain.storage._policy_authority_api import PolicyAuthorityMixin
 from superbrain.storage._policy_mutations import (
     record_policy_authorized_revocation,
     register_policy_authorized_workspace,
@@ -114,7 +115,7 @@ def _decode_intent(row: Sequence[object]) -> Intent:
     return Intent(intent_id=intent_id, kind=intent_kind, payload=checked, created_at=created_at)
 
 
-class PolicyStore:
+class PolicyStore(PolicyAuthorityMixin):
     """Implements ``PolicySource``. Obtain it with ``create`` or ``open``; ``close`` it when done."""
 
     def __init__(

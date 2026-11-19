@@ -166,6 +166,14 @@ def read_daemon_config(path: Path, os_: OsAdapters) -> DaemonConfig:
     )
 
 
+def read_owner_json_object(path: Path, os_: OsAdapters) -> dict[str, Any]:
+    """Strictly read an owner-only JSON object file (same path, permission and size rules as the daemon config)."""
+    parsed = parse_json(_read_checked_file_bytes(path, os_, max_bytes=MAX_DAEMON_CONFIG_BYTES))
+    if not isinstance(parsed, dict):
+        raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+    return parsed
+
+
 def read_client_profile(path: Path, os_: OsAdapters) -> Any:
     """Validate owner-only ``ClientProfile`` file and parse its typed fields without opening trust/endpoint targets."""
     raw = _read_checked_file_bytes(path, os_, max_bytes=MAX_CLIENT_PROFILE_BYTES)

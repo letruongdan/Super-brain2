@@ -271,18 +271,19 @@ def test_exact_007_v1_register_entry_with_subject_opens_with_current_mirror(trus
     clock = FakeClock(dt.datetime(2026, 11, 6, 10, 0, tzinfo=dt.UTC))
     adapters = os_adapters(clock=clock)
 
-    # Current kernel targets (store=4, policy=3): serve refuses (3, 3) until migrate_offline upgrades store 3 -> 4.
+    # Current kernel targets (store=5, policy=4): serve refuses (3, 3) until migrate_offline upgrades (3,3)->(5,4).
     try:
         unexpected_admit = admit_existing_pair(root, store_id, adapters, purpose="serve")
         unexpected_admit.release()
-        raise AssertionError("expected MIGRATION_REQUIRED before store 3 -> 4 offline migration")
+        raise AssertionError("expected MIGRATION_REQUIRED before offline migration")
     except BrainError as pre_mig_err:
         assert pre_mig_err.code is ErrorCode.MIGRATION_REQUIRED
 
     mig_cur = migrate_offline(DaemonConfig(1, root, store_id, base / "unused.pem", base / "unused.key"), adapters)
-    assert mig_cur.policy_report.status == "skipped" and mig_cur.policy_report.to_version == 3
+    assert mig_cur.policy_report.status == "migrated"
+    assert mig_cur.policy_report.from_version == 3 and mig_cur.policy_report.to_version == 4
     assert mig_cur.store_report.status == "migrated"
-    assert mig_cur.store_report.from_version == 3 and mig_cur.store_report.to_version == 4
+    assert mig_cur.store_report.from_version == 3 and mig_cur.store_report.to_version == 5
 
     for attempt in ("first open", "reopen after rebuild"):
         handlers, kinds = kernel_store_extensions()

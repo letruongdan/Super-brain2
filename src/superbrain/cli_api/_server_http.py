@@ -10,6 +10,7 @@ import threading
 import time
 from collections.abc import Callable
 
+from superbrain.application.owner_loop import AuthGate
 from superbrain.cli_api._http_frames import (
     FramedReader,
     HttpFramingError,
@@ -25,12 +26,19 @@ from superbrain.cli_api._loopback_wire import (
     decode_call,
     encode_identity_response,
 )
+from superbrain.cli_api.operator import (
+    OPERATOR_PATHS,
+    OperatorExecutor,
+    OperatorRequest,
+    admit_operator_principal,
+    parse_operator_body,
+)
 from superbrain.core.errors import (
     BrainError,
     ErrorCode,
     is_safe_wire_message,
 )
-from superbrain.core.kernel import CallResult, Ready, ToolCommand
+from superbrain.core.kernel import CallResult, Principal, Ready, ToolCommand
 from superbrain.core.wire import encode_envelope, make_error_envelope
 
 _STATUS_REASON: dict[int, str] = {
@@ -205,6 +213,28 @@ def handle_identity_request(
         return False
 
 
+def _read_admitted_common(
+    reader: FramedReader,
+    ready: Ready,
+    *,
+    is_operator: bool,
+    auth_gate: Callable[[], AuthGate] | None,
+    deadline_ns: int,
+) -> tuple[RequestHead, str, Principal | None, bytes]:
+    head = reader.read_request_head(deadline_ns)
+    _validate_common_headers(head, expected_port=ready.endpoint.port)
+    target_ok = (head.target in OPERATOR_PATHS) if is_operator else (head.target == TOOL_CALL_PATH)
+    if head.method != "POST" or not target_ok or head.content_length is None:
+        raise _AdmissionRejectedError(400, ErrorCode.INVALID_INPUT, "invalid input")
+    token = _extract_bearer_token(head)
+    _validate_identity_headers(head, ready)
+    principal = _admit_operator(token, auth_gate) if (is_operator and auth_gate is not None) else None
+    body = reader.read_exact(head.content_length, deadline_ns)
+    if reader.has_pipelined_bytes(deadline_ns):
+        raise _AdmissionRejectedError(400, ErrorCode.INVALID_INPUT, "invalid input")
+    return head, token, principal, body
+
+
 def read_admitted_tool_command(
     sock: socket.socket,
     reader: FramedReader,
@@ -215,17 +245,9 @@ def read_admitted_tool_command(
 ) -> ToolCommand | None:
     """Validate and read State 1 (``POST /v2/tools/call``) before ``OwnerLoop`` handoff."""
     try:
-        head = reader.read_request_head(deadline_ns)
-        _validate_common_headers(head, expected_port=ready.endpoint.port)
-        if head.method != "POST" or head.target != TOOL_CALL_PATH:
-            raise _AdmissionRejectedError(400, ErrorCode.INVALID_INPUT, "invalid input")
-        if head.content_length is None:
-            raise _AdmissionRejectedError(400, ErrorCode.INVALID_INPUT, "invalid input")
-        token = _extract_bearer_token(head)
-        _validate_identity_headers(head, ready)
-        body = reader.read_exact(head.content_length, deadline_ns)
-        if reader.has_pipelined_bytes(deadline_ns):
-            raise _AdmissionRejectedError(400, ErrorCode.INVALID_INPUT, "invalid input")
+        _head, token, _principal, body = _read_admitted_common(
+            reader, ready, is_operator=False, auth_gate=None, deadline_ns=deadline_ns
+        )
         try:
             return decode_call(body, token)
         except BrainError as err:
@@ -243,6 +265,144 @@ def read_admitted_tool_command(
     except HttpFramingError as err:
         handle_framing_failure(sock, err, deadline_ns=deadline_ns, monotonic_ns=monotonic_ns)
         return None
+
+
+def read_admitted_operator_request(
+    sock: socket.socket,
+    reader: FramedReader,
+    ready: Ready,
+    *,
+    auth_gate: Callable[[], AuthGate],
+    deadline_ns: int,
+    monotonic_ns: Callable[[], int],
+) -> OperatorRequest | None:
+    """Validate and read State 1 (``POST /v2/operator/*``), admitting ``user:cli`` before body parsing."""
+    try:
+        head, token, principal, body = _read_admitted_common(
+            reader, ready, is_operator=True, auth_gate=auth_gate, deadline_ns=deadline_ns
+        )
+        assert principal is not None
+        try:
+            return OperatorRequest(path=head.target, principal=principal, body=parse_operator_body(body), token=token)
+        except BrainError as err:
+            raise _AdmissionRejectedError(400, ErrorCode.INVALID_INPUT, err.message) from err
+    except _AdmissionRejectedError as rej:
+        write_error_response(
+            sock,
+            status=rej.status,
+            code=rej.code,
+            message=rej.message,
+            deadline_ns=deadline_ns,
+            monotonic_ns=monotonic_ns,
+        )
+        return None
+    except HttpFramingError as err:
+        handle_framing_failure(sock, err, deadline_ns=deadline_ns, monotonic_ns=monotonic_ns)
+        return None
+
+
+def _admit_operator(token: str, auth_gate: Callable[[], AuthGate]) -> Principal:
+    try:
+        return admit_operator_principal(token, auth_gate())
+    except BrainError as err:
+        status = {ErrorCode.UNAUTHENTICATED: 401, ErrorCode.IDENTITY_MISMATCH: 409}.get(err.code, 400)
+        raise _AdmissionRejectedError(status, err.code, err.message) from err
+
+
+def serve_operator(
+    ssl_sock: ssl.SSLSocket,
+    request: OperatorRequest,
+    operator: OperatorExecutor | None,
+    deadline_ns: int,
+    monotonic_ns: Callable[[], int],
+    *,
+    past_stop_deadline: Callable[[], bool] | None = None,
+) -> None:
+    """Run one admitted operator request and write its envelope (``CAPABILITY_UNAVAILABLE`` if none is wired)."""
+    if operator is None:
+        unavailable = BrainError(ErrorCode.CAPABILITY_UNAVAILABLE, "capability unavailable")
+        envelope: CallResult = make_error_envelope(unavailable)
+    else:
+        try:
+            envelope = operator(request, deadline_ns)
+        except BrainError as err:
+            envelope = make_error_envelope(err)
+    if int(monotonic_ns()) >= deadline_ns or (past_stop_deadline is not None and past_stop_deadline()):
+        return
+    with contextlib.suppress(HttpFramingError, TimeoutError, ssl.SSLError, OSError):
+        write_json_response(
+            ssl_sock,
+            status=200,
+            body=encode_envelope(envelope),
+            close_conn=True,
+            deadline_ns=deadline_ns,
+            monotonic_ns=monotonic_ns,
+        )
+
+
+def try_handle_operator_request(
+    ssl_sock: ssl.SSLSocket,
+    reader: FramedReader,
+    ready: Ready,
+    *,
+    auth_gate: Callable[[], AuthGate],
+    operator: OperatorExecutor | None,
+    deadline_ns: int,
+    monotonic_ns: Callable[[], int],
+    is_quiesced: Callable[[], bool] | None = None,
+    past_stop_deadline: Callable[[], bool] | None = None,
+) -> tuple[bool, bool]:
+    """Peek request target; handle operator path or framing error and return ``(handled, clean_done)``."""
+    try:
+        target = reader.peek_request_target(deadline_ns)
+    except HttpFramingError as err:
+        handle_framing_failure(ssl_sock, err, deadline_ns=deadline_ns, monotonic_ns=monotonic_ns)
+        return True, False
+    if target not in OPERATOR_PATHS:
+        return False, False
+    op_req = read_admitted_operator_request(
+        ssl_sock,
+        reader,
+        ready,
+        auth_gate=auth_gate,
+        deadline_ns=deadline_ns,
+        monotonic_ns=monotonic_ns,
+    )
+    if op_req is None:
+        return True, False
+    if is_quiesced is not None and is_quiesced():
+        if not (past_stop_deadline is not None and past_stop_deadline()):
+            unavail: CallResult = make_error_envelope(BrainError(ErrorCode.DAEMON_UNAVAILABLE, "daemon unavailable"))
+            with contextlib.suppress(HttpFramingError, TimeoutError, ssl.SSLError, OSError):
+                write_json_response(
+                    ssl_sock,
+                    status=200,
+                    body=encode_envelope(unavail),
+                    close_conn=True,
+                    deadline_ns=deadline_ns,
+                    monotonic_ns=monotonic_ns,
+                )
+        return True, True
+    serve_operator(
+        ssl_sock,
+        op_req,
+        operator,
+        deadline_ns,
+        monotonic_ns,
+        past_stop_deadline=past_stop_deadline,
+    )
+    return True, True
+
+
+def join_before_cutoff(thread: threading.Thread | None, deadline: float, slice_s: float = 0.001) -> None:
+    """Join ``thread`` in short slices until ``deadline``."""
+    if thread is None or thread is threading.current_thread():
+        return
+    while thread.is_alive():
+        remaining = deadline - time.perf_counter()
+        if remaining <= 0:
+            return
+        _safe_join(thread, min(remaining, slice_s))
 
 
 def _graceful_reject_socket(sock: socket.socket) -> None:

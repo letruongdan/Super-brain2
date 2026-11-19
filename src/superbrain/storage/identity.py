@@ -47,6 +47,32 @@ _INTENT_PAYLOAD_FIELDS: dict[IntentKind, tuple[str, ...]] = {
     IntentKind.QUARANTINE: ("digest",),
     IntentKind.CREDENTIAL_REVOKE: ("principal_id", "credential_id", "owner_id"),
     IntentKind.WORKSPACE_REGISTER: _WORKSPACE_REGISTER_V2_FIELDS,
+    IntentKind.SIGNER_RESET: (
+        "previous_generation",
+        "new_generation",
+        "signers_revoked",
+        "nonces_cancelled",
+        "grants_ended",
+    ),
+    IntentKind.REPO_POLICY_SET: (
+        "repo_id",
+        "owner_id",
+        "automatic_capture_enabled",
+        "manual_submission_enabled",
+        "indexing_enabled",
+        "provider_egress_enabled",
+        "post_session_review_enabled",
+    ),
+    IntentKind.LAYER2_STATE_SET: ("harness_id", "host_version", "config_digest", "state"),
+    IntentKind.RECOVERY_GRANT_OPENED: (
+        "grant_id",
+        "approval_id",
+        "journal_id",
+        "subject_digest",
+        "recovery_scope",
+        "trust_generation",
+    ),
+    IntentKind.RECOVERY_GRANT_ENDED: ("grant_id", "reason", "trust_generation"),
 }
 
 _INTENT_EFFECT_KIND: dict[IntentKind, str] = {
@@ -54,6 +80,11 @@ _INTENT_EFFECT_KIND: dict[IntentKind, str] = {
     IntentKind.QUARANTINE: "policy.quarantine",
     IntentKind.CREDENTIAL_REVOKE: "policy.credential_revoke",
     IntentKind.WORKSPACE_REGISTER: "policy.workspace_register",
+    IntentKind.SIGNER_RESET: "policy.signer_reset",
+    IntentKind.REPO_POLICY_SET: "policy.repo_policy_set",
+    IntentKind.LAYER2_STATE_SET: "policy.layer2_state_set",
+    IntentKind.RECOVERY_GRANT_OPENED: "policy.recovery_grant_opened",
+    IntentKind.RECOVERY_GRANT_ENDED: "policy.recovery_grant_ended",
 }
 
 _POLICY_EFFECT_REGISTRY = KindRegistry((*CORE_KINDS, *KERNEL_POLICY_KINDS))
@@ -137,7 +168,7 @@ def classify_reconcile_intent(
         return ("policy.quarantine", meta, None)
     if intent.kind is IntentKind.CREDENTIAL_REVOKE:
         return ("policy.credential_revoke", meta, None)
-    raise BrainError(ErrorCode.INTEGRITY_FAILURE, f"unhandled policy intent kind {intent.kind!r}")
+    return (_INTENT_EFFECT_KIND[intent.kind], meta, None)
 
 
 def verify_caller_identity(

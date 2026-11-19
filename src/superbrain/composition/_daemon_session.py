@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from superbrain.application._future_notify import safe_set_result
+from superbrain.application.approvals import OperatorHandle
 from superbrain.application.deadlines import Reservation
 from superbrain.application.dispatch import KernelToolDomain, PreparedEffect
 from superbrain.application.jobs import JobService
@@ -157,6 +158,7 @@ class _AdmittedOwnerSession(OwnerSession):
         hooks: DaemonTestHooks,
         reply_meta_lock: threading.Lock,
         reply_meta: dict[str, tuple[AuthGrantStamp | None, SendAttemptCompletion | None]],
+        operator: OperatorHandle | None = None,
     ) -> None:
         self._rt = rt
         self._ready = ready
@@ -171,6 +173,7 @@ class _AdmittedOwnerSession(OwnerSession):
         self._hooks = hooks
         self._reply_meta_lock = reply_meta_lock
         self._reply_meta = reply_meta
+        self._operator = operator
         self._claim_lock = threading.Lock()
         self._claim_closed = False
         self._metrics_lock = threading.Lock()
@@ -408,6 +411,8 @@ class _AdmittedOwnerSession(OwnerSession):
     def teardown_on_owner(self, *, overrun: bool, cancelled_requests: int = 0) -> ShutdownReport:
         self._listener.close()
         self._auth_gate.close()
+        if self._operator is not None:
+            self._operator.unbind()
         self._close_claim_gate()
         drained, worker_drained = self.shutdown_metrics()
         removed = False
