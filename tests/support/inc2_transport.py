@@ -527,21 +527,21 @@ class TransportHarness:
     def ledger_sequence(self) -> int:
         """Inspect the current highest ledger sequence number in SQLite."""
         db_path = self.data_root / "store" / "brain.db"
-        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+        with contextlib.closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)) as conn:
             row = conn.execute("SELECT COALESCE(MAX(sequence), 0) FROM ledger").fetchone()
             return int(row[0]) if row is not None else 0
 
     def idempotency_count(self) -> int:
         """Inspect the current idempotency record count in SQLite."""
         db_path = self.data_root / "store" / "brain.db"
-        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+        with contextlib.closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)) as conn:
             row = conn.execute("SELECT COUNT(*) FROM idempotency").fetchone()
             return int(row[0]) if row is not None else 0
 
     def count_send_attempts(self, state: str | None = None) -> int:
         """Count rows in SQLite artifact_send_attempt table, optionally filtered by state."""
         db_path = self.data_root / "store" / "brain.db"
-        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+        with contextlib.closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)) as conn:
             if state is not None:
                 row = conn.execute("SELECT COUNT(*) FROM artifact_send_attempt WHERE state = ?", (state,)).fetchone()
             else:
@@ -551,14 +551,14 @@ class TransportHarness:
     def count_read_acks(self) -> int:
         """Count rows in SQLite artifact_read_ack table."""
         db_path = self.data_root / "store" / "brain.db"
-        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+        with contextlib.closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)) as conn:
             row = conn.execute("SELECT COUNT(*) FROM artifact_read_ack").fetchone()
             return int(row[0]) if row is not None else 0
 
     def get_send_attempt_state(self, attempt_id: str) -> str | None:
         """Query state of a specific artifact_send_attempt row."""
         db_path = self.data_root / "store" / "brain.db"
-        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+        with contextlib.closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)) as conn:
             row = conn.execute("SELECT state FROM artifact_send_attempt WHERE id = ?", (attempt_id,)).fetchone()
             return str(row[0]) if row is not None else None
 

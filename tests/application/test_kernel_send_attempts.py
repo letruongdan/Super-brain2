@@ -42,7 +42,7 @@ from superbrain.core.kernel import (
     WorkspaceBinding,
 )
 from superbrain.core.wire import normalize_call
-from superbrain.ports.kernel import KernelTx
+from superbrain.ports.kernel import KernelSendAttemptPort, KernelTx
 from superbrain.ports.os import OsAdapters
 from superbrain.ports.policy import IntentKind
 from superbrain.storage import ledger
@@ -2037,7 +2037,14 @@ def _make_dispatcher_for_domain(
     clock: FakeClock,
     mono: FakeMonotonicClock,
     domain: KernelToolDomain,
+    *,
+    send_attempts: KernelSendAttemptPort | None = None,
 ) -> KernelDispatcher:
+    resolved_attempts = (
+        send_attempts
+        if send_attempts is not None
+        else KernelSendAttemptStore(rt.store, rt.policy, writer_epoch=rt.lease.epoch)
+    )
     return KernelDispatcher(
         store_id=rt.store.store_id,
         policy=rt.policy,
@@ -2054,7 +2061,7 @@ def _make_dispatcher_for_domain(
         store_schema_version=lambda: rt.store.schema_version,
         policy_schema_version=lambda: rt.policy.schema_version,
         domain=domain,
-        send_attempts=KernelSendAttemptStore(rt.store, rt.policy, writer_epoch=rt.lease.epoch),
+        send_attempts=resolved_attempts,
     )
 
 
@@ -3172,6 +3179,379 @@ def test_sp2_1_r1_historical_i2_read_ack_hmac_replay_and_tamper_rejection(
                 "record_outcome",
                 dispatch(bad_out_call, _ctx(), auth=auth, dispatcher=dispatcher),
                 ErrorCode.IDEMPOTENCY_CONFLICT,
+            )
+
+        assert probe_domain.prepare_calls == 0
+    finally:
+        rt.close()
+
+
+class _FailingReadAttemptPort:
+    """Delegate ``KernelSendAttemptPort`` while raising injected storage/policy errors on ``read_attempt``."""
+
+    def __init__(self, inner: KernelSendAttemptStore, *, error_code: ErrorCode, error_message: str) -> None:
+        self._inner = inner
+        self.error_code = error_code
+        self.error_message = error_message
+
+    def record_pending_attempt(self, spec: _kernel.ArtifactSendSpec) -> _kernel.ArtifactSendAttempt:
+        return self._inner.record_pending_attempt(spec)
+
+    def read_attempt(self, send_attempt_id: str) -> _kernel.ArtifactSendAttempt | None:
+        del send_attempt_id
+        from superbrain.core.errors import BrainError
+
+        raise BrainError(self.error_code, self.error_message)
+
+    def finalize_attempt(
+        self,
+        completion: SendAttemptCompletion,
+        *,
+        expected_identity: Identity,
+    ) -> _kernel.ArtifactSendAttempt:
+        return self._inner.finalize_attempt(completion, expected_identity=expected_identity)
+
+    def interrupt_attempt(self, send_attempt_id: str) -> _kernel.ArtifactSendAttempt:
+        return self._inner.interrupt_attempt(send_attempt_id)
+
+    def recover_pending_attempts(self) -> int:
+        return self._inner.recover_pending_attempts()
+
+
+def test_sp2_1_r1_receipt_lookup_errors_propagate_and_malformed_acks_conflict(
+    trusted_tmp: Path, os_: OsAdapters, clock: FakeClock
+) -> None:
+    """R1 Finding 1: store/policy errors on receipt lookup propagate; malformed/missing/mismatched return False."""
+    from superbrain.core.errors import BrainError
+
+    mono = FakeMonotonicClock()
+    rt = _open_fixture_runtime(trusted_tmp / "root-r1-f1", os_)
+    try:
+        seeded = seed_principal_and_credential(rt.policy)
+        ws = _register_ws(rt, clock, seeded, alias="ws-main", checkout_dir=trusted_tmp / "chk-r1-f1")
+        scope = Scope(ws.repo_id, ws.checkout_id)
+        probe_domain = _R1ReplayProbeDomain(
+            store=rt.store,
+            policy=rt.policy,
+            clock=clock,
+            observer=RecordingObserver(descriptor=_desc()),
+            monotonic_ns=mono.monotonic_ns,
+        )
+        send_store = KernelSendAttemptStore(rt.store, rt.policy, writer_epoch=rt.lease.epoch)
+        normal_dispatcher = _make_dispatcher_for_domain(rt, clock, mono, probe_domain, send_attempts=send_store)
+
+        rd_l1 = ResourceDigest(name="L1.md", digest=digest_bytes(b"# F1 verified L1\n"))
+        attempt_main = send_store.record_pending_attempt(
+            _kernel.ArtifactSendSpec(
+                logical_result_id=new_id(),
+                principal_id=seeded.principal.principal_id,
+                task_id="task-f1-01",
+                artifact_id="art-f1-01",
+                revision=1,
+                resource_digests=(rd_l1,),
+            )
+        )
+        attempt_main = send_store.finalize_attempt(
+            SendAttemptCompletion(
+                send_attempt_id=attempt_main.send_attempt_id,
+                logical_result_id=attempt_main.logical_result_id,
+                principal_id=attempt_main.principal_id,
+                task_id=attempt_main.task_id,
+                artifact_id=attempt_main.artifact_id,
+                revision=attempt_main.revision,
+                resource_digests=attempt_main.resource_digests,
+                identity=Identity(rt.store.store_id, rt.lease.epoch, "inst-r1-f1"),
+                level=attempt_main.level,
+                revision_epoch=attempt_main.revision_epoch,
+            ),
+            expected_identity=Identity(rt.store.store_id, rt.lease.epoch, "inst-r1-f1"),
+        )
+
+        key_id, key_bytes = rt.policy.request_digest_key()
+        committed_at = ledger.utc_timestamp(clock.now())
+
+        def _seed_legacy_row(
+            tool: str,
+            idem_key: str,
+            legacy_args: dict[str, JsonValue],
+            result_id: str,
+            assignment_id: str | None,
+            ref: ObjectRef,
+        ) -> str:
+            legacy_payload = canonical_json(
+                {"tool": tool, "selected_scope": scope.to_dict(), "arguments": legacy_args}
+            )
+            legacy_hmac = compute_canonical_payload_hmac(key_bytes, legacy_payload)
+            row = _kernel.IdempotencyRow(
+                seeded.principal.principal_id,
+                tool,
+                compute_idempotency_key_hash(seeded.principal.principal_id, tool, idem_key),
+                key_id,
+                legacy_hmac,
+                result_id,
+                assignment_id,
+                (ref,),
+                committed_at,
+            )
+            with rt.store.transaction() as txn:
+                write_idempotency_row(txn.db, row)
+            return legacy_hmac
+
+        legacy_ack: dict[str, JsonValue] = {
+            "served_receipt_id": attempt_main.served_receipt_id,
+            "task_id": "task-f1-01",
+            "revision": 1,
+            "resource_digests": [rd_l1.to_dict()],
+        }
+        sp2_ack: dict[str, JsonValue] = {**legacy_ack, "artifact_id": "art-f1-01", "revision_epoch": 0}
+
+        ep_idem = "idem_r1_f1_ep_0001"
+        base_ep_args: dict[str, JsonValue] = {
+            "schema_version": "2.0",
+            "workspace_id": ws.repo_id,
+            "checkout_id": ws.checkout_id,
+            "task_id": "task-f1-01",
+            "session_id": "sess-f1-01",
+            "evidence": [{"kind": "context", "data": {"msg": "f1-pre-upgrade"}}],
+            "read_acks": [legacy_ack],
+            "idempotency_key": ep_idem,
+        }
+        ep_hmac = _seed_legacy_row(
+            "submit_episode",
+            ep_idem,
+            base_ep_args,
+            "res-f1-ep-01",
+            None,
+            ObjectRef(kind="episode_result", id="res-f1-ep-01", revision=1, digest=TREE_A),
+        )
+
+        out_idem = "idem_r1_f1_out_001"
+        base_out_args: dict[str, JsonValue] = {
+            "schema_version": "2.0",
+            "workspace_id": ws.repo_id,
+            "delivery_id": "deliv-f1-01",
+            "outcome": "success",
+            "applied_refs": [{"kind": "skill", "id": "art-f1-01", "revision": 1, "digest": rd_l1.digest}],
+            "read_acks": [legacy_ack],
+            "idempotency_key": out_idem,
+        }
+        out_hmac = _seed_legacy_row(
+            "record_outcome",
+            out_idem,
+            base_out_args,
+            "res-f1-out-01",
+            "assign-f1-01",
+            ObjectRef(kind="outcome_result", id="res-f1-out-01", revision=1, digest=TREE_A),
+        )
+
+        sp2_ep_call = normalize_call(
+            "submit_episode", {**base_ep_args, "read_acks": [sp2_ack]}, seeded.principal, selected_scope=scope
+        )
+        sp2_out_call = normalize_call(
+            "record_outcome", {**base_out_args, "read_acks": [sp2_ack]}, seeded.principal, selected_scope=scope
+        )
+
+        # Malformed request read_acks with matching stripped I2 HMACs must still return False / IDEMPOTENCY_CONFLICT.
+        malformed_ack_cases: tuple[tuple[str, dict[str, JsonValue]], ...] = (
+            ("bad_id", {**sp2_ack, "served_receipt_id": "bad receipt id"}),
+            ("bad_dig", {**sp2_ack, "resource_digests": [{"name": "L1.md", "digest": "sha256:not-hex"}]}),
+            ("dup_dig", {**sp2_ack, "resource_digests": [rd_l1.to_dict(), rd_l1.to_dict()]}),
+        )
+        malformed_checks: list[tuple[str, _kernel.Call, str]] = []
+        for idx, (tag, bad_ack) in enumerate(malformed_ack_cases, start=1):
+            bad_legacy_ack: dict[str, JsonValue] = {
+                k: v for k, v in bad_ack.items() if k not in {"artifact_id", "revision_epoch"}
+            }
+            m_ep_idem = f"idem_f1_mal_ep_{idx:02d}_{tag}"
+            m_ep_legacy: dict[str, JsonValue] = {
+                **base_ep_args,
+                "idempotency_key": m_ep_idem,
+                "read_acks": [bad_legacy_ack],
+            }
+            m_ep_hmac = _seed_legacy_row(
+                "submit_episode",
+                m_ep_idem,
+                m_ep_legacy,
+                f"res-f1-mep-{idx}",
+                None,
+                ObjectRef(kind="episode_result", id=f"res-f1-mep-{idx}", revision=1, digest=TREE_A),
+            )
+            m_ep_sp2_args: dict[str, JsonValue] = {**m_ep_legacy, "read_acks": [bad_ack]}
+            malformed_checks.append(
+                (
+                    "submit_episode",
+                    _kernel.Call(
+                        tool="submit_episode",
+                        arguments=m_ep_sp2_args,
+                        correlation_id=None,
+                        selected_scope=scope,
+                    ),
+                    m_ep_hmac,
+                )
+            )
+            m_out_idem = f"idem_f1_mal_out_{idx:02d}_{tag}"
+            m_out_legacy: dict[str, JsonValue] = {
+                **base_out_args,
+                "idempotency_key": m_out_idem,
+                "read_acks": [bad_legacy_ack],
+            }
+            m_out_hmac = _seed_legacy_row(
+                "record_outcome",
+                m_out_idem,
+                m_out_legacy,
+                f"res-f1-mout-{idx}",
+                f"assign-f1-m-{idx}",
+                ObjectRef(kind="outcome_result", id=f"res-f1-mout-{idx}", revision=1, digest=TREE_A),
+            )
+            m_out_sp2_args: dict[str, JsonValue] = {**m_out_legacy, "read_acks": [bad_ack]}
+            malformed_checks.append(
+                (
+                    "record_outcome",
+                    _kernel.Call(
+                        tool="record_outcome",
+                        arguments=m_out_sp2_args,
+                        correlation_id=None,
+                        selected_scope=scope,
+                    ),
+                    m_out_hmac,
+                )
+            )
+
+        with rt.store.transaction() as txn:
+            advance_c4_hwm(txn.db, committed_at, current_hwm=None)
+        clock.advance(dt.timedelta(minutes=1))
+
+        auth = _kernel.PrivateRequestAuth(
+            credential_id=seeded.credential_id, principal=seeded.principal, token=seeded.token
+        )
+
+        def _ctx() -> _kernel.CallContext:
+            return _kernel.CallContext(
+                principal=seeded.principal,
+                identity=Identity(rt.store.store_id, rt.lease.epoch, "inst-r1-f1"),
+                deadline_ns=mono.monotonic_ns() + 5_000 * MS,
+                selected_scope=scope,
+            )
+
+        for tool_name, m_call, m_hmac in malformed_checks:
+            assert (
+                verify_request_hmac(
+                    key_bytes,
+                    m_call,
+                    m_hmac,
+                    principal_id=seeded.principal.principal_id,
+                    resolve_send_attempt=send_store.read_attempt,
+                )
+                is False
+            )
+            _expect_err(
+                tool_name,
+                dispatch(m_call, _ctx(), auth=auth, dispatcher=normal_dispatcher),
+                ErrorCode.IDEMPOTENCY_CONFLICT,
+            )
+
+        # Missing attempt (None) and mismatched subject still return False / IDEMPOTENCY_CONFLICT.
+        missing_mismatched_cases: tuple[tuple[str, dict[str, JsonValue], str], ...] = (
+            ("submit_episode", {**base_ep_args, "read_acks": [{**sp2_ack, "served_receipt_id": new_id()}]}, ep_hmac),
+            ("submit_episode", {**base_ep_args, "read_acks": [{**sp2_ack, "artifact_id": "art-wrong"}]}, ep_hmac),
+            ("record_outcome", {**base_out_args, "read_acks": [{**sp2_ack, "served_receipt_id": new_id()}]}, out_hmac),
+            ("record_outcome", {**base_out_args, "read_acks": [{**sp2_ack, "revision_epoch": 1}]}, out_hmac),
+        )
+        for tool_name, bad_args, stored_hmac in missing_mismatched_cases:
+            bad_call = normalize_call(tool_name, bad_args, seeded.principal, selected_scope=scope)
+            assert (
+                verify_request_hmac(
+                    key_bytes,
+                    bad_call,
+                    stored_hmac,
+                    principal_id=seeded.principal.principal_id,
+                    resolve_send_attempt=send_store.read_attempt,
+                )
+                is False
+            )
+            _expect_err(
+                tool_name,
+                dispatch(bad_call, _ctx(), auth=auth, dispatcher=normal_dispatcher),
+                ErrorCode.IDEMPOTENCY_CONFLICT,
+            )
+
+        tool_cases: tuple[tuple[str, _kernel.Call, str], ...] = (
+            ("submit_episode", sp2_ep_call, ep_hmac),
+            ("record_outcome", sp2_out_call, out_hmac),
+        )
+
+        # A. Injected store/policy errors on receipt lookup MUST propagate cleanly in both verifier and dispatcher.
+        for err_code, err_msg in (
+            (ErrorCode.INTEGRITY_FAILURE, "integrity failure"),
+            (ErrorCode.POLICY_UNAVAILABLE, "policy unavailable"),
+        ):
+            failing_port = _FailingReadAttemptPort(send_store, error_code=err_code, error_message=err_msg)
+            failing_dispatcher = _make_dispatcher_for_domain(rt, clock, mono, probe_domain, send_attempts=failing_port)
+            for tool_name, sp2_call, stored_hmac in tool_cases:
+                with pytest.raises(BrainError) as exc_ver:
+                    verify_request_hmac(
+                        key_bytes,
+                        sp2_call,
+                        stored_hmac,
+                        principal_id=seeded.principal.principal_id,
+                        resolve_send_attempt=failing_port.read_attempt,
+                    )
+                assert exc_ver.value.code is err_code
+                _expect_err(
+                    tool_name,
+                    dispatch(sp2_call, _ctx(), auth=auth, dispatcher=failing_dispatcher),
+                    err_code,
+                )
+
+        # B1. Real corrupted digests_json in SQLite propagates ErrorCode.INTEGRITY_FAILURE (never IDEMPOTENCY_CONFLICT).
+        with rt.store.transaction() as txn:
+            orig_row = txn.db.execute(
+                "SELECT digests_json FROM artifact_send_attempt WHERE id = ?",
+                (attempt_main.served_receipt_id,),
+            ).fetchone()
+            assert orig_row is not None
+            orig_digests_json = str(orig_row[0])
+            txn.db.execute(
+                "UPDATE artifact_send_attempt SET digests_json = ? WHERE id = ?",
+                ("{corrupt-json", attempt_main.served_receipt_id),
+            )
+        for tool_name, sp2_call, stored_hmac in tool_cases:
+            with pytest.raises(BrainError) as exc_corrupt:
+                verify_request_hmac(
+                    key_bytes,
+                    sp2_call,
+                    stored_hmac,
+                    principal_id=seeded.principal.principal_id,
+                    resolve_send_attempt=send_store.read_attempt,
+                )
+            assert exc_corrupt.value.code is ErrorCode.INTEGRITY_FAILURE
+            _expect_err(
+                tool_name,
+                dispatch(sp2_call, _ctx(), auth=auth, dispatcher=normal_dispatcher),
+                ErrorCode.INTEGRITY_FAILURE,
+            )
+
+        # B2. Real half-migrated schema (only 'level' column on artifact_send_attempt) propagates INTEGRITY_FAILURE.
+        with rt.store.transaction() as txn:
+            txn.db.execute(
+                "UPDATE artifact_send_attempt SET digests_json = ? WHERE id = ?",
+                (orig_digests_json, attempt_main.served_receipt_id),
+            )
+        _upgrade_store_tables_to_extended(rt.store, send_cols=("level",), ack_cols=())
+        for tool_name, sp2_call, stored_hmac in tool_cases:
+            with pytest.raises(BrainError) as exc_half:
+                verify_request_hmac(
+                    key_bytes,
+                    sp2_call,
+                    stored_hmac,
+                    principal_id=seeded.principal.principal_id,
+                    resolve_send_attempt=send_store.read_attempt,
+                )
+            assert exc_half.value.code is ErrorCode.INTEGRITY_FAILURE
+            _expect_err(
+                tool_name,
+                dispatch(sp2_call, _ctx(), auth=auth, dispatcher=normal_dispatcher),
+                ErrorCode.INTEGRITY_FAILURE,
             )
 
         assert probe_domain.prepare_calls == 0

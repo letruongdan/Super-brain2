@@ -300,7 +300,7 @@ def _fetch_identity_raw(endpoint: Endpoint, ca_path: Path) -> bytes:
 
 def _read_ledger_seq(data_root: Path) -> int:
     db_path = data_root / "store" / "brain.db"
-    with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+    with contextlib.closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)) as conn:
         row = conn.execute("SELECT COALESCE(MAX(sequence), 0) FROM ledger").fetchone()
         return int(row[0]) if row is not None else 0
 
@@ -1088,7 +1088,7 @@ if __name__ == "__main__":
 def _wait_send_attempt_served(db_path: Path, receipt_id: str, *, timeout_s: float = 3.0) -> None:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
-        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+        with contextlib.closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)) as conn:
             row = conn.execute("SELECT state FROM artifact_send_attempt WHERE id = ?", (receipt_id,)).fetchone()
         if row is not None and row[0] == "served_only":
             return
@@ -1263,7 +1263,7 @@ def test_i2_to_sp2_daemon_upgrade_replays_read_acks_and_marks_store4_attempts_un
             i2_proc.close()
 
         # Verify pre-upgrade I2 store4 send attempts all read on SP2 as level='unknown' (NOT 'L1') & ineligible.
-        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+        with contextlib.closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)) as conn:
             for _art_id, _lvl, rcpt, _dig in receipts:
                 att = read_send_attempt_row(conn, rcpt)
                 assert att is not None
@@ -1360,7 +1360,7 @@ def test_i2_to_sp2_daemon_upgrade_replays_read_acks_and_marks_store4_attempts_un
             sp2_proc.close()
 
         assert not sp2_prep_log.exists() or sp2_prep_log.read_text(encoding="utf-8").strip() == ""
-        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+        with contextlib.closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)) as conn:
             counts_after = {
                 tbl: int(conn.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0])
                 for tbl in ("idempotency", "ledger", "artifact_read_ack")
@@ -1368,3 +1368,4 @@ def test_i2_to_sp2_daemon_upgrade_replays_read_acks_and_marks_store4_attempts_un
         assert counts_after == counts_before
     finally:
         _cleanup_dir(upg_dir)
+    assert not upg_dir.exists()

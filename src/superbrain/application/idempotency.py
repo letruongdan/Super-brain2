@@ -104,6 +104,7 @@ def _verify_legacy_read_ack_hmac(
     legacy_actual = compute_canonical_payload_hmac(key_bytes, legacy_payload)
     if not hmac.compare_digest(legacy_actual.encode("ascii"), expected_digest.encode("ascii")):
         return False
+    parsed_acks: list[tuple[str, str, str, int, int, tuple[ResourceDigest, ...]]] = []
     for raw_ack in raw_acks:
         assert isinstance(raw_ack, dict)
         receipt_id = raw_ack.get("served_receipt_id")
@@ -127,15 +128,23 @@ def _verify_legacy_read_ack_hmac(
         ):
             return False
         try:
+            require_opaque_id(receipt_id, label="served_receipt_id")
+            require_opaque_id(task_id, label="task_id")
+            require_opaque_id(artifact_id, label="artifact_id")
             typed_digests: list[ResourceDigest] = []
             for entry in raw_digests:
                 if not isinstance(entry, Mapping):
                     return False
                 typed_digests.append(ResourceDigest.from_dict(entry))
             ordered_digests, _ = canonicalize_resource_digests(tuple(typed_digests))
-            attempt = resolve_send_attempt(receipt_id)
-        except BrainError:
-            return False
+        except BrainError as err:
+            if err.code is ErrorCode.INVALID_INPUT:
+                return False
+            raise
+        parsed_acks.append((receipt_id, task_id, artifact_id, rev_epoch, rev, ordered_digests))
+    for receipt_id, task_id, artifact_id, rev_epoch, rev, ordered_digests in parsed_acks:
+        # Store/policy lookup errors must propagate untouched instead of masquerading as payload conflicts.
+        attempt = resolve_send_attempt(receipt_id)
         if attempt is None or (
             attempt.principal_id,
             attempt.task_id,
