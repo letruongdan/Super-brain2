@@ -12,28 +12,44 @@ import pytest
 
 from superbrain.adapters.os import os_adapters
 from superbrain.adapters.os.workspaces import build_registration
+from superbrain.application.dispatch import KernelDispatcher, KernelToolDomain, PreparedEffect, dispatch
+from superbrain.application.idempotency import is_idempotency_expired
 from superbrain.composition.kernel_bridge import KernelBridge
+from superbrain.core import kernel as _kernel
 from superbrain.core.canonical import canonical_json, digest_bytes
 from superbrain.core.errors import ErrorCode
 from superbrain.core.ids import new_id
 from superbrain.core.jsonvalue import JsonValue
 from superbrain.core.kernel import (
+    ArtifactReadAck,
     CallResult,
+    Identity,
     ReadAckInput,
     ResourceDigest,
     Scope,
+    SendAttemptCompletion,
+    SendAttemptState,
     SnapshotDescriptor,
     SnapshotObservation,
     SnapshotStatus,
     StoredResult,
     WorkspaceBinding,
 )
+from superbrain.core.wire import normalize_call
 from superbrain.ports.kernel import KernelTx
 from superbrain.ports.os import OsAdapters
 from superbrain.ports.policy import IntentKind
+from superbrain.storage.idempotency import KernelBlobStager, KernelIdempotencyStore
 from superbrain.storage.kernel_schema import KERNEL_POLICY_MIGRATIONS, KERNEL_STORE_MIGRATIONS
 from superbrain.storage.kinds import is_uuid
 from superbrain.storage.runtime import Runtime
+from superbrain.storage.send_attempts import (
+    KernelSendAttemptStore,
+    insert_read_ack_row,
+    insert_send_attempt_row,
+    read_read_ack_by_receipt_row,
+    read_send_attempt_row,
+)
 from superbrain.storage.store import Store
 from tests.support.clock import FakeClock
 from tests.support.inc2_fixture import (
@@ -1945,3 +1961,668 @@ def test_r1_post_insert_cutoff_race_interrupts_pending_send_attempt_to_unknown(
         assert seen_actions == ["record_outcome", "submit_episode"]
     finally:
         rt.close()
+
+
+# --- 10. SP2-1 Finding 1: store4 fail-closed & extended-schema send_attempts / read_ack twins ----------------------
+
+
+class _OverrideSendSpecDomain:
+    """Wrap ``FixtureKernelDomain`` to override ``describe_artifact_send`` level/revision_epoch in tests."""
+
+    def __init__(self, inner: FixtureKernelDomain, *, level: str, revision_epoch: int) -> None:
+        self._inner = inner
+        self._level = level
+        self._revision_epoch = revision_epoch
+
+    def supports_tool(self, tool: str, *, deep: bool = False) -> bool:
+        return self._inner.supports_tool(tool, deep=deep)
+
+    def prepare_mutation(self, call: _kernel.Call, ctx: _kernel.CallContext, *, now: dt.datetime) -> PreparedEffect:
+        return self._inner.prepare_mutation(call, ctx, now=now)
+
+    def execute_readonly(self, call: _kernel.Call, ctx: _kernel.CallContext) -> dict[str, JsonValue]:
+        return self._inner.execute_readonly(call, ctx)
+
+    def render_stored(
+        self, result: StoredResult, principal: _kernel.Principal, *, selected_scope: Scope | None
+    ) -> dict[str, JsonValue]:
+        return self._inner.render_stored(result, principal, selected_scope=selected_scope)
+
+    def describe_artifact_send(
+        self,
+        result: StoredResult,
+        rendered: Mapping[str, JsonValue],
+        principal: _kernel.Principal,
+        *,
+        selected_scope: Scope | None,
+    ) -> _kernel.ArtifactSendSpec | None:
+        base = self._inner.describe_artifact_send(result, rendered, principal, selected_scope=selected_scope)
+        if base is None:
+            return None
+        return replace(base, level=self._level, revision_epoch=self._revision_epoch)
+
+
+def _upgrade_store_tables_to_extended(
+    store: Store,
+    *,
+    send_cols: tuple[str, ...] = ("level", "revision_epoch"),
+    ack_cols: tuple[str, ...] = ("artifact_id", "revision_epoch"),
+) -> None:
+    """Add extended SP2-2-like columns onto ``artifact_send_attempt`` / ``artifact_read_ack`` in SQLite."""
+    with store.transaction() as txn:
+        if "level" in send_cols:
+            txn.db.execute("ALTER TABLE artifact_send_attempt ADD COLUMN level TEXT NOT NULL DEFAULT 'L1'")
+        if "revision_epoch" in send_cols:
+            txn.db.execute(
+                "ALTER TABLE artifact_send_attempt ADD COLUMN revision_epoch INTEGER NOT NULL DEFAULT 0"
+            )
+        if "artifact_id" in ack_cols:
+            txn.db.execute("ALTER TABLE artifact_read_ack ADD COLUMN artifact_id TEXT NOT NULL DEFAULT ''")
+        if "revision_epoch" in ack_cols:
+            txn.db.execute(
+                "ALTER TABLE artifact_read_ack ADD COLUMN revision_epoch INTEGER NOT NULL DEFAULT 0"
+            )
+
+
+def _make_dispatcher_for_domain(
+    rt: Runtime,
+    clock: FakeClock,
+    mono: FakeMonotonicClock,
+    domain: KernelToolDomain,
+) -> KernelDispatcher:
+    return KernelDispatcher(
+        store_id=rt.store.store_id,
+        policy=rt.policy,
+        idempotency=KernelIdempotencyStore(
+            rt.store,
+            rt.policy,
+            policy_view=rt.policy,
+            writer_epoch=rt.lease.epoch,
+            is_expired=is_idempotency_expired,
+        ),
+        blob_stager=KernelBlobStager(rt.store),
+        clock=clock,
+        monotonic_clock=mono,
+        store_schema_version=lambda: rt.store.schema_version,
+        policy_schema_version=lambda: rt.policy.schema_version,
+        domain=domain,
+        send_attempts=KernelSendAttemptStore(rt.store, rt.policy, writer_epoch=rt.lease.epoch),
+    )
+
+
+def test_sp2_1_store4_fail_closed_for_non_default_send_attempt_and_read_ack(
+    trusted_tmp: Path, os_: OsAdapters, clock: FakeClock
+) -> None:
+    """Reject non-default level/revision_epoch and missing/mismatched parents on store4 with zero rows written."""
+    from superbrain.core.errors import BrainError
+
+    mono = FakeMonotonicClock()
+    rt = _open_fixture_runtime(trusted_tmp / "root-s4-neg", os_)
+    try:
+        seeded = seed_principal_and_credential(rt.policy)
+        ws = _register_ws(rt, clock, seeded, alias="ws-main", checkout_dir=trusted_tmp / "chk-s4-neg")
+        scope = Scope(ws.repo_id, ws.checkout_id)
+        send_store = KernelSendAttemptStore(rt.store, rt.policy, writer_epoch=rt.lease.epoch)
+        res_l1 = b"# Store4 fail-closed resource\n"
+        rd_l1 = ResourceDigest(name="L1.md", digest=digest_bytes(res_l1))
+
+        # 1) KernelSendAttemptStore.record_pending_attempt refuses non-default level or epoch > 0 on store4.
+        for bad_level, bad_epoch in (("L0", 0), ("L2", 0), ("L1", 2), ("L2", 3)):
+            bad_spec = _kernel.ArtifactSendSpec(
+                logical_result_id=new_id(),
+                principal_id=seeded.principal.principal_id,
+                task_id="task-s4-neg",
+                artifact_id="art-s4-neg",
+                revision=1,
+                resource_digests=(rd_l1,),
+                level=bad_level,
+                revision_epoch=bad_epoch,
+            )
+            with pytest.raises(BrainError) as exc_rec:
+                send_store.record_pending_attempt(bad_spec)
+            assert exc_rec.value.code is ErrorCode.CAPABILITY_UNAVAILABLE
+            assert _count_rows(rt.store, "artifact_send_attempt") == 0
+
+        # 2) Direct insert_send_attempt_row refuses non-default level or epoch > 0 on store4 before INSERT.
+        for bad_level, bad_epoch in (("L0", 0), ("L2", 0), ("L1", 1)):
+            bad_attempt = _kernel.ArtifactSendAttempt(
+                send_attempt_id=new_id(),
+                logical_result_id=new_id(),
+                principal_id=seeded.principal.principal_id,
+                task_id="task-s4-neg",
+                artifact_id="art-s4-neg",
+                revision=1,
+                resource_digests=(rd_l1,),
+                state=SendAttemptState.PENDING,
+                level=bad_level,
+                revision_epoch=bad_epoch,
+            )
+            with pytest.raises(BrainError) as exc_ins_s:
+                with rt.store.transaction() as txn:
+                    insert_send_attempt_row(txn.db, bad_attempt)
+            assert exc_ins_s.value.code is ErrorCode.CAPABILITY_UNAVAILABLE
+            assert _count_rows(rt.store, "artifact_send_attempt") == 0
+
+        # 3) KernelDispatcher (dispatch) + record_pending_attempt fails closed without writing ("L1", 0) fallback row.
+        inner_domain = FixtureKernelDomain(
+            store=rt.store,
+            policy=rt.policy,
+            clock=clock,
+            observer=RecordingObserver(descriptor=_desc()),
+            monotonic_ns=mono.monotonic_ns,
+        )
+        stager = KernelBlobStager(rt.store)
+        auth = _kernel.PrivateRequestAuth(
+            credential_id=seeded.credential_id,
+            principal=seeded.principal,
+            token=seeded.token,
+        )
+        prep_dispatcher = _make_dispatcher_for_domain(rt, clock, mono, inner_domain)
+        prep_call = normalize_call(
+            "prepare_task",
+            {
+                "schema_version": "2.0",
+                "workspace_hint": "ws-main",
+                "description": "store4 fail-closed dispatch",
+                "idempotency_key": "idem_s4_prep_neg",
+            },
+            seeded.principal,
+            selected_scope=scope,
+        )
+        prep_ctx = _kernel.CallContext(
+            principal=seeded.principal,
+            identity=Identity(rt.store.store_id, rt.lease.epoch, "inst-s4-neg"),
+            deadline_ns=mono.monotonic_ns() + 5_000 * MS,
+            selected_scope=scope,
+        )
+        prep_res = _expect_ok("prepare_task", dispatch(prep_call, prep_ctx, auth=auth, dispatcher=prep_dispatcher))
+        task_id = str(prep_res["task_id"])
+
+        for idx, (bad_level, bad_epoch) in enumerate((("L2", 0), ("L1", 1)), start=1):
+            art_id = f"art-disp-neg-{idx}"
+            inner_domain.seed_artifact(
+                stager,
+                artifact_id=art_id,
+                revision=1,
+                kind="skill",
+                owner_id=seeded.principal.owner_id,
+                repo_id=ws.repo_id,
+                checkout_id=ws.checkout_id,
+                resources=(FixtureResourceSpec(name="L1.md", content=res_l1, level="L1"),),
+            )
+            bad_domain = _OverrideSendSpecDomain(inner_domain, level=bad_level, revision_epoch=bad_epoch)
+            bad_dispatcher = _make_dispatcher_for_domain(rt, clock, mono, bad_domain)
+            art_call = normalize_call(
+                "get_artifact",
+                {
+                    "schema_version": "2.0",
+                    "workspace_id": ws.repo_id,
+                    "task_id": task_id,
+                    "artifact_id": art_id,
+                    "revision": 1,
+                    "level": "L1",
+                    "idempotency_key": f"idem_s4_art_neg_{idx}",
+                },
+                seeded.principal,
+                selected_scope=scope,
+            )
+            art_ctx = _kernel.CallContext(
+                principal=seeded.principal,
+                identity=Identity(rt.store.store_id, rt.lease.epoch, "inst-s4-neg"),
+                deadline_ns=mono.monotonic_ns() + 5_000 * MS,
+                selected_scope=scope,
+            )
+            res = dispatch(art_call, art_ctx, auth=auth, dispatcher=bad_dispatcher)
+            _expect_err("get_artifact", res, ErrorCode.CAPABILITY_UNAVAILABLE)
+            assert _count_rows(rt.store, "artifact_send_attempt") == 0
+
+        # 4) Direct insert_read_ack_row on store4:
+        #    epoch != 0 -> CAPABILITY_UNAVAILABLE; missing or mismatched parent -> INTEGRITY_FAILURE.
+        ack_no_parent_epoch = ArtifactReadAck(
+            ack_id=new_id(),
+            served_receipt_id=new_id(),
+            principal_id=seeded.principal.principal_id,
+            task_id=task_id,
+            artifact_id="art-ack-s4",
+            revision_epoch=1,
+            revision=1,
+            resource_digests=(rd_l1,),
+        )
+        with pytest.raises(BrainError) as exc_ack_ep0:
+            with rt.store.transaction() as txn:
+                insert_read_ack_row(txn.db, ack_no_parent_epoch)
+        assert exc_ack_ep0.value.code is ErrorCode.CAPABILITY_UNAVAILABLE
+        assert _count_rows(rt.store, "artifact_read_ack") == 0
+
+        parent_spec = _kernel.ArtifactSendSpec(
+            logical_result_id=new_id(),
+            principal_id=seeded.principal.principal_id,
+            task_id=task_id,
+            artifact_id="art-ack-s4",
+            revision=1,
+            resource_digests=(rd_l1,),
+        )
+        parent = send_store.record_pending_attempt(parent_spec)
+        parent_done = send_store.finalize_attempt(
+            SendAttemptCompletion(
+                send_attempt_id=parent.send_attempt_id,
+                logical_result_id=parent.logical_result_id,
+                principal_id=parent.principal_id,
+                task_id=parent.task_id,
+                artifact_id=parent.artifact_id,
+                revision=parent.revision,
+                resource_digests=parent.resource_digests,
+                identity=Identity(rt.store.store_id, rt.lease.epoch, "inst-s4-neg"),
+            ),
+            expected_identity=Identity(rt.store.store_id, rt.lease.epoch, "inst-s4-neg"),
+        )
+        assert parent_done.state is SendAttemptState.SERVED_ONLY
+
+        with pytest.raises(BrainError) as exc_ack_ep1:
+            with rt.store.transaction() as txn:
+                insert_read_ack_row(txn.db, replace(ack_no_parent_epoch, served_receipt_id=parent.served_receipt_id))
+        assert exc_ack_ep1.value.code is ErrorCode.CAPABILITY_UNAVAILABLE
+        assert _count_rows(rt.store, "artifact_read_ack") == 0
+
+        bad_acks = (
+            ArtifactReadAck(
+                ack_id=new_id(),
+                served_receipt_id=new_id(),
+                principal_id=seeded.principal.principal_id,
+                task_id=task_id,
+                artifact_id="art-ack-s4",
+                revision_epoch=0,
+                revision=1,
+                resource_digests=(rd_l1,),
+            ),
+            ArtifactReadAck(
+                ack_id=new_id(),
+                served_receipt_id=parent.served_receipt_id,
+                principal_id=seeded.principal.principal_id,
+                task_id=task_id,
+                artifact_id="art-ack-wrong",
+                revision_epoch=0,
+                revision=1,
+                resource_digests=(rd_l1,),
+            ),
+            ArtifactReadAck(
+                ack_id=new_id(),
+                served_receipt_id=parent.served_receipt_id,
+                principal_id="other-principal",
+                task_id=task_id,
+                artifact_id="art-ack-s4",
+                revision_epoch=0,
+                revision=1,
+                resource_digests=(rd_l1,),
+            ),
+            ArtifactReadAck(
+                ack_id=new_id(),
+                served_receipt_id=parent.served_receipt_id,
+                principal_id=seeded.principal.principal_id,
+                task_id="other-task",
+                artifact_id="art-ack-s4",
+                revision_epoch=0,
+                revision=1,
+                resource_digests=(rd_l1,),
+            ),
+            ArtifactReadAck(
+                ack_id=new_id(),
+                served_receipt_id=parent.served_receipt_id,
+                principal_id=seeded.principal.principal_id,
+                task_id=task_id,
+                artifact_id="art-ack-s4",
+                revision_epoch=0,
+                revision=2,
+                resource_digests=(rd_l1,),
+            ),
+        )
+        for bad_ack in bad_acks:
+            with pytest.raises(BrainError) as exc_ack_int:
+                with rt.store.transaction() as txn:
+                    insert_read_ack_row(txn.db, bad_ack)
+            assert exc_ack_int.value.code is ErrorCode.INTEGRITY_FAILURE
+            assert _count_rows(rt.store, "artifact_read_ack") == 0
+    finally:
+        rt.close()
+
+
+@pytest.mark.parametrize(
+    ("table", "partial_cols"),
+    [
+        ("artifact_send_attempt", ("level",)),
+        ("artifact_send_attempt", ("revision_epoch",)),
+        ("artifact_read_ack", ("artifact_id",)),
+        ("artifact_read_ack", ("revision_epoch",)),
+    ],
+    ids=[
+        "send_attempt-only-level",
+        "send_attempt-only-revision_epoch",
+        "read_ack-only-artifact_id",
+        "read_ack-only-revision_epoch",
+    ],
+)
+def test_sp2_1_half_migrated_schema_fails_closed_with_integrity_failure(
+    trusted_tmp: Path, os_: OsAdapters, table: str, partial_cols: tuple[str, ...]
+) -> None:
+    """Partial/half-migrated schema on either table must fail closed with INTEGRITY_FAILURE."""
+    from superbrain.core.errors import BrainError
+
+    rt = _open_fixture_runtime(trusted_tmp / f"root-half-{table}-{partial_cols[0]}", os_)
+    try:
+        seeded = seed_principal_and_credential(rt.policy)
+        send_store = KernelSendAttemptStore(rt.store, rt.policy, writer_epoch=rt.lease.epoch)
+        rd = ResourceDigest(name="L1.md", digest=digest_bytes(b"half schema probe\n"))
+        default_spec = _kernel.ArtifactSendSpec(
+            logical_result_id=new_id(),
+            principal_id=seeded.principal.principal_id,
+            task_id="task-half",
+            artifact_id="art-half",
+            revision=1,
+            resource_digests=(rd,),
+        )
+
+        if table == "artifact_send_attempt":
+            _upgrade_store_tables_to_extended(rt.store, send_cols=partial_cols, ack_cols=())
+            with pytest.raises(BrainError) as exc_read:
+                with rt.store.transaction() as txn:
+                    read_send_attempt_row(txn.db, new_id())
+            assert exc_read.value.code is ErrorCode.INTEGRITY_FAILURE
+
+            default_attempt = _kernel.ArtifactSendAttempt(
+                send_attempt_id=new_id(),
+                logical_result_id=default_spec.logical_result_id,
+                principal_id=default_spec.principal_id,
+                task_id=default_spec.task_id,
+                artifact_id=default_spec.artifact_id,
+                revision=default_spec.revision,
+                resource_digests=default_spec.resource_digests,
+                state=SendAttemptState.PENDING,
+            )
+            with pytest.raises(BrainError) as exc_ins:
+                with rt.store.transaction() as txn:
+                    insert_send_attempt_row(txn.db, default_attempt)
+            assert exc_ins.value.code is ErrorCode.INTEGRITY_FAILURE
+
+            with pytest.raises(BrainError) as exc_store:
+                send_store.record_pending_attempt(default_spec)
+            assert exc_store.value.code is ErrorCode.INTEGRITY_FAILURE
+            assert _count_rows(rt.store, "artifact_send_attempt") == 0
+        else:
+            parent = send_store.record_pending_attempt(default_spec)
+            _upgrade_store_tables_to_extended(rt.store, send_cols=(), ack_cols=partial_cols)
+            with pytest.raises(BrainError) as exc_read_ack:
+                with rt.store.transaction() as txn:
+                    read_read_ack_by_receipt_row(txn.db, parent.served_receipt_id)
+            assert exc_read_ack.value.code is ErrorCode.INTEGRITY_FAILURE
+
+            default_ack = ArtifactReadAck(
+                ack_id=new_id(),
+                served_receipt_id=parent.served_receipt_id,
+                principal_id=parent.principal_id,
+                task_id=parent.task_id,
+                artifact_id=parent.artifact_id,
+                revision_epoch=0,
+                revision=parent.revision,
+                resource_digests=parent.resource_digests,
+            )
+            with pytest.raises(BrainError) as exc_ins_ack:
+                with rt.store.transaction() as txn:
+                    insert_read_ack_row(txn.db, default_ack)
+            assert exc_ins_ack.value.code is ErrorCode.INTEGRITY_FAILURE
+            assert _count_rows(rt.store, "artifact_read_ack") == 0
+    finally:
+        rt.close()
+
+
+def test_sp2_1_positive_twins_store4_and_extended_schema_round_trip(
+    trusted_tmp: Path, os_: OsAdapters, clock: FakeClock
+) -> None:
+    """Defaults ('L1', 0) succeed on store4, and extended tables round-trip non-default level/epoch/artifact_id."""
+    from superbrain.application.send_attempts import record_read_acks
+    from superbrain.core.errors import BrainError
+
+    mono = FakeMonotonicClock()
+
+    # Twin A: unmodified store4 end-to-end with defaults ("L1", 0)
+    rt_s4 = _open_fixture_runtime(trusted_tmp / "root-twin-s4", os_)
+    try:
+        seeded_s4 = seed_principal_and_credential(rt_s4.policy)
+        _register_ws(rt_s4, clock, seeded_s4, alias="ws-main", checkout_dir=trusted_tmp / "chk-twin-s4")
+        bridge_s4, _ = _make_bridge_and_domain(rt_s4, clock, mono)
+        send_store_s4 = KernelSendAttemptStore(rt_s4.store, rt_s4.policy, writer_epoch=rt_s4.lease.epoch)
+        rd_s4 = ResourceDigest(name="handoff_header", digest=digest_bytes(b"twin-s4-header\n"))
+
+        spec_s4 = _kernel.ArtifactSendSpec(
+            logical_result_id=new_id(),
+            principal_id=seeded_s4.principal.principal_id,
+            task_id="task-twin-s4",
+            artifact_id="art-twin-s4",
+            revision=2,
+            resource_digests=(rd_s4,),
+        )
+        attempt_s4 = send_store_s4.record_pending_attempt(spec_s4)
+        assert attempt_s4.level == "L1"
+        assert attempt_s4.revision_epoch == 0
+        assert send_store_s4.read_attempt(attempt_s4.served_receipt_id) == attempt_s4
+
+        comp_s4: SendAttemptCompletion = bridge_s4.build_send_completion(attempt_s4.served_receipt_id)
+        assert comp_s4.level == "L1"
+        assert comp_s4.revision_epoch == 0
+        finalized_s4 = bridge_s4.finalize_send_attempt(comp_s4)
+        assert finalized_s4.state is SendAttemptState.SERVED_ONLY
+        assert finalized_s4.level == "L1"
+        assert finalized_s4.revision_epoch == 0
+
+        ack_s4 = ArtifactReadAck(
+            ack_id=new_id(),
+            served_receipt_id=attempt_s4.served_receipt_id,
+            principal_id=seeded_s4.principal.principal_id,
+            task_id="task-twin-s4",
+            artifact_id="art-twin-s4",
+            revision_epoch=0,
+            revision=2,
+            resource_digests=(rd_s4,),
+        )
+        with rt_s4.store.transaction() as txn:
+            insert_read_ack_row(txn.db, ack_s4)
+            read_ack_s4 = read_read_ack_by_receipt_row(txn.db, attempt_s4.served_receipt_id)
+        assert read_ack_s4 == ack_s4
+    finally:
+        rt_s4.close()
+
+    # Twin B: extended store6-like schema with non-default level & revision_epoch > 0
+    rt_ext = _open_fixture_runtime(trusted_tmp / "root-twin-ext", os_)
+    try:
+        seeded_ext = seed_principal_and_credential(rt_ext.policy)
+        ws_ext = _register_ws(rt_ext, clock, seeded_ext, alias="ws-main", checkout_dir=trusted_tmp / "chk-twin-ext")
+        scope_ext = Scope(ws_ext.repo_id, ws_ext.checkout_id)
+        _upgrade_store_tables_to_extended(rt_ext.store)
+        bridge_ext, inner_domain_ext = _make_bridge_and_domain(rt_ext, clock, mono)
+        send_store_ext = KernelSendAttemptStore(rt_ext.store, rt_ext.policy, writer_epoch=rt_ext.lease.epoch)
+        rd_ext = ResourceDigest(name="handoff_header", digest=digest_bytes(b"twin-ext-header\n"))
+
+        def _save_ack(ack: ArtifactReadAck) -> None:
+            bridge_ext.strict_store().transact(lambda ktx: ktx.save_read_ack(ack))
+
+        for ext_idx, (ext_level, ext_epoch) in enumerate((("L2", 3), ("L0", 5)), start=1):
+            art_id = f"art-twin-ext-{ext_idx}"
+            spec_ext = _kernel.ArtifactSendSpec(
+                logical_result_id=new_id(),
+                principal_id=seeded_ext.principal.principal_id,
+                task_id=f"task-twin-ext-{ext_idx}",
+                artifact_id=art_id,
+                revision=ext_idx + 1,
+                resource_digests=(rd_ext,),
+                level=ext_level,
+                revision_epoch=ext_epoch,
+            )
+            attempt_ext = send_store_ext.record_pending_attempt(spec_ext)
+            assert attempt_ext.level == ext_level
+            assert attempt_ext.revision_epoch == ext_epoch
+
+            with rt_ext.store.transaction() as txn:
+                row_attempt = read_send_attempt_row(txn.db, attempt_ext.served_receipt_id)
+                raw_cols = txn.db.execute(
+                    "SELECT level, revision_epoch FROM artifact_send_attempt WHERE id = ?",
+                    (attempt_ext.served_receipt_id,),
+                ).fetchone()
+            assert row_attempt == attempt_ext
+            assert raw_cols == (ext_level, ext_epoch)
+
+            comp_ext: SendAttemptCompletion = bridge_ext.build_send_completion(attempt_ext.served_receipt_id)
+            assert comp_ext.level == ext_level
+            assert comp_ext.revision_epoch == ext_epoch
+
+            # Mismatched completion level or revision_epoch still fails closed on extended schema.
+            for bad_comp in (replace(comp_ext, level="L1"), replace(comp_ext, revision_epoch=ext_epoch + 1)):
+                with pytest.raises(BrainError) as exc_fin:
+                    bridge_ext.finalize_send_attempt(bad_comp)
+                assert exc_fin.value.code is ErrorCode.INTEGRITY_FAILURE
+
+            finalized_ext = bridge_ext.finalize_send_attempt(comp_ext)
+            assert finalized_ext.state is SendAttemptState.SERVED_ONLY
+            assert finalized_ext.level == ext_level
+            assert finalized_ext.revision_epoch == ext_epoch
+
+            ack_ext = ArtifactReadAck(
+                ack_id=new_id(),
+                served_receipt_id=attempt_ext.served_receipt_id,
+                principal_id=seeded_ext.principal.principal_id,
+                task_id=spec_ext.task_id,
+                artifact_id=art_id,
+                revision_epoch=ext_epoch,
+                revision=spec_ext.revision,
+                resource_digests=(rd_ext,),
+            )
+            for bad_ack in (replace(ack_ext, revision_epoch=0), replace(ack_ext, artifact_id="art-wrong")):
+                with pytest.raises(BrainError) as exc_save_bad:
+                    _save_ack(bad_ack)
+                assert exc_save_bad.value.code is ErrorCode.INTEGRITY_FAILURE
+
+            _save_ack(ack_ext)
+            with rt_ext.store.transaction() as txn:
+                read_ack_ext = read_read_ack_by_receipt_row(txn.db, attempt_ext.served_receipt_id)
+                raw_ack_cols = txn.db.execute(
+                    "SELECT artifact_id, revision_epoch FROM artifact_read_ack WHERE served_receipt_id = ?",
+                    (attempt_ext.served_receipt_id,),
+                ).fetchone()
+            assert read_ack_ext == ack_ext
+            assert raw_ack_cols == (art_id, ext_epoch)
+
+        # Tampered artifact_read_ack.revision_epoch or artifact_id fails closed on read_read_ack_by_receipt_row.
+        with rt_ext.store.transaction() as txn:
+            target_receipt = attempt_ext.served_receipt_id
+            txn.db.execute(
+                "UPDATE artifact_read_ack SET revision_epoch = ? WHERE served_receipt_id = ?",
+                (99, target_receipt),
+            )
+            with pytest.raises(BrainError) as exc_tamper:
+                read_read_ack_by_receipt_row(txn.db, target_receipt)
+            assert exc_tamper.value.code is ErrorCode.INTEGRITY_FAILURE
+
+        # End-to-end KernelDispatcher dispatch -> finalize -> record_read_acks on extended schema with ("L2", 7).
+        res_l2 = b"# Extended L2 dispatch payload\n"
+        inner_domain_ext.seed_artifact(
+            KernelBlobStager(rt_ext.store),
+            artifact_id="art-disp-ext",
+            revision=1,
+            kind="skill",
+            owner_id=seeded_ext.principal.owner_id,
+            repo_id=ws_ext.repo_id,
+            checkout_id=ws_ext.checkout_id,
+            resources=(FixtureResourceSpec(name="L1.md", content=res_l2, level="L1"),),
+        )
+        ext_domain = _OverrideSendSpecDomain(inner_domain_ext, level="L2", revision_epoch=7)
+        ext_dispatcher = _make_dispatcher_for_domain(rt_ext, clock, mono, ext_domain)
+        auth_ext = _kernel.PrivateRequestAuth(
+            credential_id=seeded_ext.credential_id,
+            principal=seeded_ext.principal,
+            token=seeded_ext.token,
+        )
+        ctx_prep = _kernel.CallContext(
+            principal=seeded_ext.principal,
+            identity=Identity(rt_ext.store.store_id, rt_ext.lease.epoch, "inst-twin-ext"),
+            deadline_ns=mono.monotonic_ns() + 5_000 * MS,
+            selected_scope=scope_ext,
+        )
+        prep_ok = _expect_ok(
+            "prepare_task",
+            dispatch(
+                normalize_call(
+                    "prepare_task",
+                    {
+                        "schema_version": "2.0",
+                        "workspace_hint": "ws-main",
+                        "description": "extended twin dispatch",
+                        "idempotency_key": "idem_ext_prep_01",
+                    },
+                    seeded_ext.principal,
+                    selected_scope=scope_ext,
+                ),
+                ctx_prep,
+                auth=auth_ext,
+                dispatcher=ext_dispatcher,
+            ),
+        )
+        task_ext = str(prep_ok["task_id"])
+        ctx_art = _kernel.CallContext(
+            principal=seeded_ext.principal,
+            identity=Identity(rt_ext.store.store_id, rt_ext.lease.epoch, "inst-twin-ext"),
+            deadline_ns=mono.monotonic_ns() + 5_000 * MS,
+            selected_scope=scope_ext,
+        )
+        art_ok = _expect_ok(
+            "get_artifact",
+            dispatch(
+                normalize_call(
+                    "get_artifact",
+                    {
+                        "schema_version": "2.0",
+                        "workspace_id": ws_ext.repo_id,
+                        "task_id": task_ext,
+                        "artifact_id": "art-disp-ext",
+                        "revision": 1,
+                        "level": "L1",
+                        "idempotency_key": "idem_ext_art_001",
+                    },
+                    seeded_ext.principal,
+                    selected_scope=scope_ext,
+                ),
+                ctx_art,
+                auth=auth_ext,
+                dispatcher=ext_dispatcher,
+            ),
+        )
+        disp_receipt = str(art_ok["served_receipt_id"])
+        with rt_ext.store.transaction() as txn:
+            disp_attempt = read_send_attempt_row(txn.db, disp_receipt)
+        assert disp_attempt is not None
+        assert disp_attempt.level == "L2"
+        assert disp_attempt.revision_epoch == 7
+
+        bridge_ext.finalize_send_attempt(bridge_ext.build_send_completion(disp_receipt))
+        ack_in = ReadAckInput(
+            served_receipt_id=disp_receipt,
+            task_id=task_ext,
+            artifact_id="art-disp-ext",
+            revision_epoch=7,
+            revision=1,
+            resource_digests=(ResourceDigest(name="L1.md", digest=digest_bytes(res_l2)),),
+        )
+        saved = bridge_ext.strict_store().transact(
+            lambda ktx: record_read_acks(
+                ktx,
+                policy=rt_ext.policy,
+                principal=seeded_ext.principal,
+                effective_scope=scope_ext,
+                expected_task_id=task_ext,
+                acks=(ack_in,),
+            )
+        )
+        assert len(saved) == 1
+        assert saved[0].artifact_id == "art-disp-ext"
+        assert saved[0].revision_epoch == 7
+        with rt_ext.store.transaction() as txn:
+            assert read_read_ack_by_receipt_row(txn.db, disp_receipt) == saved[0]
+    finally:
+        rt_ext.close()
