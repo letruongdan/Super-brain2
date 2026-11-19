@@ -7,13 +7,25 @@ thread) so ``ssh-keygen`` subprocess verification never blocks ``OwnerLoop``.
 
 from __future__ import annotations
 
-import base64
-import binascii
 import inspect
 import threading
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from pathlib import Path
+from typing import Literal
 
+from superbrain.application._approvals_types import (
+    PendingApprovalCall,
+    PreparedOperatorCall,
+    RestoreHandler,
+    _invalid,
+    _journal_json,
+    _proposal_json,
+    _signer_json,
+    _unauthenticated,
+)
+from superbrain.application._approvals_types import (
+    _b64 as _b64,
+)
 from superbrain.application.review_apply import ReviewApplyService
 from superbrain.core._kernel_approval import (
     CLI_HARNESS_ID,
@@ -25,15 +37,19 @@ from superbrain.core._kernel_approval import (
     SignerRecord,
     assurance_for,
     canonical_utc,
-    strict_b64url_decode,
 )
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.jsonvalue import JsonValue
 from superbrain.core.kernel import Principal
-from superbrain.core.proposals import ApplyJournal, ChangeProposal
 from superbrain.ports.approval import ApprovalPolicyPort, SshApprovalVerifierPort, WebAuthnApprovalVerifierPort
 
-__all__ = ["OperatorHandle", "OperatorService", "PendingApprovalCall", "PreparedOperatorCall"]
+__all__ = [
+    "OperatorHandle",
+    "OperatorService",
+    "PendingApprovalCall",
+    "PreparedOperatorCall",
+    "RestoreHandler",
+]
 
 _PROPOSAL_PATH_ACTIONS: dict[str, ApprovalAction] = {
     "/v2/operator/proposal/approve": ApprovalAction.APPROVE,
@@ -57,93 +73,6 @@ _PASSKEY_APPROVAL_KEYS = frozenset({"message", "channel", "signer_id", "response
 _SSH_APPROVAL_KEYS = frozenset({"message", "channel", "signer_id", "signature"})
 
 
-def _invalid() -> BrainError:
-    return BrainError(ErrorCode.INVALID_INPUT, "invalid input")
-
-
-def _unauthenticated() -> BrainError:
-    return BrainError(ErrorCode.UNAUTHENTICATED, "unauthenticated")
-
-
-def _b64(value: object, *, urlsafe: bool) -> bytes:
-    if urlsafe:
-        return strict_b64url_decode(value)
-    if not isinstance(value, str) or not value:
-        raise _invalid()
-    try:
-        return base64.b64decode(value, validate=True)
-    except (binascii.Error, ValueError) as err:
-        raise _invalid() from err
-
-
-def _signer_json(record: SignerRecord) -> dict[str, JsonValue]:
-    return {
-        "signer_id": record.signer_id,
-        "channel": record.channel.value,
-        "key_digest": record.key_digest,
-        "tofu": record.tofu,
-    }
-
-
-def _proposal_json(prop: ChangeProposal) -> dict[str, JsonValue]:
-    return {
-        "proposal_id": prop.proposal_id,
-        "owner_id": prop.owner_id,
-        "kind": prop.kind,
-        "reason": prop.reason,
-        "status": prop.status.value,
-        "subject_revision": prop.subject_revision,
-        "risk_level": prop.risk_level.value,
-        "active_journal_id": prop.active_journal_id,
-        "created_at": prop.created_at,
-        "updated_at": prop.updated_at,
-        "targets": [
-            {
-                "rel_path": t.rel_path,
-                "normalized_rel_path": t.normalized_rel_path,
-                "managed_format": t.managed_format.value,
-                "slice_id": t.slice_id,
-                "base_present": t.base_present,
-            }
-            for t in prop.targets
-        ],
-    }
-
-
-def _journal_json(journal: ApplyJournal) -> dict[str, JsonValue]:
-    return {
-        "journal_id": journal.journal_id,
-        "proposal_id": journal.proposal_id,
-        "direction": journal.direction.value,
-        "status": journal.status.value,
-        "grant_id": journal.grant_id,
-        "created_at": journal.created_at,
-        "updated_at": journal.updated_at,
-    }
-
-
-@dataclass(frozen=True)
-class PendingApprovalCall:
-    """Validated approval-gated operator mutation awaiting off-owner-thread crypto verification."""
-
-    path: str
-    principal: Principal
-    token: str | None
-    enrollment: SignerEnrollment | None
-    revoke_signer_id: str | None
-    message: ApprovalMessage
-    channel: ApprovalChannel
-    signer: SignerRecord | None
-    raw_approval: Mapping[str, JsonValue]
-    proposal_id: str | None = None
-
-
-@dataclass(frozen=True)
-class PreparedOperatorCall:
-    immediate: dict[str, JsonValue] | None = None
-    pending: PendingApprovalCall | None = None
-
-
 class OperatorService:
     """Handles the admitted ``user:cli`` operator calls against the live policy store."""
 
@@ -154,10 +83,17 @@ class OperatorService:
         ssh_verifier: Callable[[], SshApprovalVerifierPort | None],
         webauthn_verifier: WebAuthnApprovalVerifierPort | None = None,
         review_apply: ReviewApplyService | None = None,
+        restore_handler: RestoreHandler | None = None,
     ) -> None:
         self._policy = policy
         self._ssh_verifier = ssh_verifier
         self._webauthn = webauthn_verifier
+        self._review_apply = review_apply
+        self._restore_handler = restore_handler
+
+    def rebind_authorities(self, policy: ApprovalPolicyPort, review_apply: ReviewApplyService | None) -> None:
+        """Update the live policy authority and review-apply service after an online restore."""
+        self._policy = policy
         self._review_apply = review_apply
 
     def handle(
@@ -223,6 +159,8 @@ class OperatorService:
             return PreparedOperatorCall(immediate={"journal": _journal_json(journal)})
         if path in _PROPOSAL_MUTATING_PATHS:
             return self._prepare_proposal_action(path, principal, token, body)
+        if path == "/v2/operator/restore":
+            return self._prepare_restore(principal, token, body)
         if path in _DEFERRED_PATHS:
             raise BrainError(ErrorCode.CAPABILITY_UNAVAILABLE, "capability unavailable")
         raise BrainError(ErrorCode.NOT_FOUND, "not found")
@@ -279,6 +217,16 @@ class OperatorService:
             return {"signer": _signer_json(record)}
         if pending.proposal_id is not None:
             return self._commit_proposal_action(pending, signer_id=signer_id, new_sign_count=new_sign_count)
+        if pending.restore_target is not None:
+            assert pending.restore_backup is not None and self._restore_handler is not None
+            return self._restore_handler.execute(
+                pending.restore_target,
+                pending.restore_backup,
+                pending.message,
+                signer_id=signer_id,
+                channel=pending.channel,
+                new_sign_count=new_sign_count,
+            )
         assert pending.revoke_signer_id is not None
         record = self._policy.revoke_signer(
             pending.revoke_signer_id,
@@ -290,6 +238,52 @@ class OperatorService:
         return {"signer": _signer_json(record)}
 
     # --- internals -----------------------------------------------------------------------------------------------
+
+    def _prepare_restore(
+        self, principal: Principal, token: str | None, body: Mapping[str, JsonValue]
+    ) -> PreparedOperatorCall:
+        if not set(body) <= {"target", "backup", "approval"}:
+            raise _invalid()
+        raw_target = body.get("target")
+        raw_backup = body.get("backup")
+        if (
+            raw_target not in ("store", "policy")
+            or not isinstance(raw_backup, str)
+            or not raw_backup
+            or "\x00" in raw_backup
+        ):
+            raise _invalid()
+        backup_path = Path(raw_backup)
+        if ".." in backup_path.parts:
+            raise BrainError(ErrorCode.UNSAFE_PATH, "unsafe path")
+        if not backup_path.is_absolute():
+            raise _invalid()
+        if self._restore_handler is None:
+            raise BrainError(ErrorCode.CAPABILITY_UNAVAILABLE, "capability unavailable")
+        target_kind: Literal["store", "policy"] = "store" if raw_target == "store" else "policy"
+        if "approval" not in body:
+            return PreparedOperatorCall(immediate=self._restore_handler.preview(target_kind, backup_path))
+        message, channel_used, signer, raw_approval = self._parse_approval(principal, body["approval"])
+        if channel_used is ApprovalChannel.TERMINAL:
+            raise BrainError(ErrorCode.CAPABILITY_UNAVAILABLE, "capability unavailable")
+        if message.action is not ApprovalAction.RESTORE or message.risk_level is not RiskLevel.HIGH:
+            raise _invalid()
+        self._restore_handler.validate_execute(target_kind, backup_path, message)
+        return PreparedOperatorCall(
+            pending=PendingApprovalCall(
+                path="/v2/operator/restore",
+                principal=principal,
+                token=token,
+                enrollment=None,
+                revoke_signer_id=None,
+                message=message,
+                channel=channel_used,
+                signer=signer,
+                raw_approval=raw_approval,
+                restore_target=target_kind,
+                restore_backup=backup_path,
+            )
+        )
 
     def _verify_caller(self, principal: Principal, token: str | None) -> None:
         if principal.harness_id != CLI_HARNESS_ID:

@@ -283,6 +283,7 @@ _WHEEL_FIXTURE_FILES: frozenset[str] = frozenset(
         "tests/integration/test_kernel_privacy_persistence.py",
         "tests/integration/test_kernel_receipts.py",
         "tests/integration/test_kernel_shim.py",
+        "tests/integration/test_restore_and_migration_i3.py",
         "tests/integration/test_t9_benchmark_scratch.py",
     }
 )
@@ -320,6 +321,7 @@ _HEAVY_FILE_COST_MS: dict[str, int] = {
     "tests/storage/test_remediation_c02_r6_restore_marker.py": 10302,
     "tests/storage/test_kernel_identity.py": 9530,
     "tests/integration/test_kernel_shim.py": 9517,
+    "tests/integration/test_restore_and_migration_i3.py": 9000,
     "tests/integration/test_kernel_transport.py": 8813,
     "tests/storage/test_remediation_c04_r9_imported_backup_ancestors.py": 8653,
     "tests/integration/test_kernel_privacy_persistence.py": 7587,

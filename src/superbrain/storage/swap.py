@@ -26,8 +26,10 @@ from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.faults import crashpoint
 from superbrain.core.ids import new_id
 from superbrain.ports.os import OsAdapters
+from superbrain.storage._restore_epoch import read_restore_epoch
 from superbrain.storage.layout import DataRoot
 from superbrain.storage.prune import STAMP_FORMAT
+from superbrain.storage.schema import read_schema_info
 from superbrain.storage.writer import WriterLease
 
 Target = Literal["store", "policy"]
@@ -169,6 +171,10 @@ def recover_interrupted_swaps(root: DataRoot, lease: WriterLease, os_: OsAdapter
         if os.path.lexists(_target_dir(root, target)):
             plan.append((target, stage, False))
         elif os.path.isfile(stage / READY):
+            if target == "store":
+                stage_info = read_schema_info(stage / "brain.db")
+                if stage_info is not None and stage_info.schema_version >= 5:
+                    read_restore_epoch(stage, schema_version=stage_info.schema_version, os_=os_)
             plan.append((target, stage, True))
         else:
             raise BrainError(

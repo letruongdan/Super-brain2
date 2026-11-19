@@ -24,6 +24,21 @@ from superbrain.core.canonical import digest_bytes
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.faults import crashpoint
 from superbrain.ports.os import OsAdapters
+from superbrain.storage._policy_restore import (
+    PolicyRestoreAuthorityDiff,
+    PolicyRestoreStageHook,
+    preview_policy_restore,
+    stage_policy_restore_effects,
+)
+from superbrain.storage._restore_epoch import (
+    PENDING_RESTORE_TOMBSTONES_FILE,
+    RESTORE_EPOCH_FILE,
+    RestoreStageHook,
+    drain_published_restore_effects,
+    read_restore_epoch,
+    stage_store_restore_effects,
+    write_restore_epoch,
+)
 from superbrain.storage.backup import BackupManifest, copy_blobs, new_directory, verify_backup, write_new_file
 from superbrain.storage.errors import sqlite_error
 from superbrain.storage.layout import DataRoot
@@ -33,6 +48,21 @@ from superbrain.storage.schema import POLICY_MIGRATIONS, STORE_MIGRATIONS, Migra
 from superbrain.storage.sqlite import apply_durability_pragmas, db_files, open_immutable, open_readonly
 from superbrain.storage.swap import stage_and_swap
 from superbrain.storage.writer import WriterLease
+
+__all__ = [
+    "PENDING_RESTORE_TOMBSTONES_FILE",
+    "RESTORE_EPOCH_FILE",
+    "PolicyRestoreAuthorityDiff",
+    "PolicyRestoreStageHook",
+    "RestoreReport",
+    "RestoreStageHook",
+    "drain_published_restore_effects",
+    "preview_policy_restore",
+    "read_restore_epoch",
+    "restore_policy",
+    "restore_store",
+    "write_restore_epoch",
+]
 
 
 @dataclass(frozen=True)
@@ -154,6 +184,7 @@ def restore_store(
     now: datetime,
     *,
     migrations: Sequence[Migration] = STORE_MIGRATIONS,
+    stage_hooks: Sequence[RestoreStageHook] = (),
 ) -> RestoreReport:
     """Replace ``store/`` with the ``store`` or ``store_full`` backup at ``backup``.
 
@@ -184,6 +215,7 @@ def restore_store(
         raise BrainError(ErrorCode.STORE_BUSY, "the store is open; close it before restoring it")
     _check_store_restore_fences(root, backup, policy, target=target)
     pending = [m for m in migrations if m.to_version > manifest.schema_version]
+    new_restore_epoch = lease.epoch + 1
 
     def build(stage: Path) -> None:
         staged = stage / "brain.db"
@@ -195,8 +227,25 @@ def restore_store(
                 raise sqlite_error("cannot migrate the staged data store", exc) from exc
         copy_blobs(backup / "cas", stage / "cas", manifest.blobs, os_)
         new_directory(stage / "staging", os_)
+        if target >= 5:
+            write_restore_epoch(stage, new_restore_epoch, os_)
+            stage_store_restore_effects(
+                stage,
+                staged,
+                policy=policy,
+                restore_epoch=new_restore_epoch,
+                target_schema=target,
+                now=now,
+                os_=os_,
+                stage_hooks=stage_hooks,
+            )
 
     replaced = stage_and_swap(root, lease, os_, target="store", purpose="restoring", build=build, now=now)
+    crashpoint("restoring.store.after_swap_before_effect_drain")
+    if target >= 5:
+        drain_published_restore_effects(
+            root, lease, os_, policy, now=now, target_schema=target, stage_hooks=stage_hooks
+        )
     return RestoreReport(restored_from=backup, replaced_dir=replaced, new_epoch=lease.epoch, trust_generation=None)
 
 
@@ -323,6 +372,9 @@ def restore_policy(
     store_id: str,
     now: datetime,
     migrations: Sequence[Migration] = POLICY_MIGRATIONS,
+    live_carry_forward: bool = True,
+    stage_hooks: Sequence[PolicyRestoreStageHook] = (),
+    allow_corrupt_live: bool = False,
 ) -> RestoreReport:
     """Replace ``policy/`` with the ``policy`` backup at ``backup``, under a trust generation above every earlier one.
 
@@ -347,8 +399,17 @@ def restore_policy(
         )
     if manifest.trust_generation is None:  # verify_backup requires it for a policy backup
         raise AssertionError("a verified policy backup has a trust generation")
-    live_generation, live_history = _live_policy(root, store_id=store_id, target=target)
-    _check_live_store_fence(root, store_id=store_id, target=target)
+    try:
+        live_generation, live_history = _live_policy(root, store_id=store_id, target=target)
+    except BrainError as err:
+        if not allow_corrupt_live or err.code is not ErrorCode.INTEGRITY_FAILURE:
+            raise
+        live_generation, live_history = 0, os.path.lexists(root.store_db)
+    try:
+        _check_live_store_fence(root, store_id=store_id, target=target)
+    except BrainError as err:
+        if not allow_corrupt_live or err.code is not ErrorCode.INTEGRITY_FAILURE:
+            raise
     generation = max(lease.state().trust_generation_hwm, manifest.trust_generation, live_generation) + 1
     # C02: never roll a store-history signal back. The backup's own marker is copied with it; the live policy's marker
     # or intents, or a published brain.db, set it in the stage, so it is atomic with the swap.
@@ -364,6 +425,17 @@ def restore_policy(
             except sqlite3.Error as exc:
                 raise sqlite_error("cannot migrate the staged policy store", exc) from exc
         _write_generation(staged, generation, os_, published=published)
+        if target >= 4:
+            stage_policy_restore_effects(
+                root,
+                staged,
+                manifest=manifest,
+                generation=generation,
+                now=now,
+                os_=os_,
+                live_carry_forward=live_carry_forward and not allow_corrupt_live,
+                stage_hooks=stage_hooks,
+            )
         crashpoint("restoring.policy.after_generation_persist")
 
     replaced = stage_and_swap(root, lease, os_, target="policy", purpose="restoring", build=build, now=now)

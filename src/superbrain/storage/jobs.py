@@ -26,7 +26,7 @@ from superbrain.core.kernel import (
     is_strict_int,
 )
 from superbrain.ports.policy import PolicyView
-from superbrain.storage.cas import ContentStore, held_digests
+from superbrain.storage.cas import ContentStore, held_digests, read_held_blob_or_none
 from superbrain.storage.errors import sqlite_error
 from superbrain.storage.kernel_schema import KERNEL_JOB_KINDS
 from superbrain.storage.kinds import KindRegistry, is_uuid
@@ -382,16 +382,24 @@ class JobKernelTxReads:
         if digest in held_digests(self._txn.db, _HOLDER_KIND, holder_id):
             self._txn.release(digest, _HOLDER_KIND, holder_id, reason)
 
-    def read_held_blob(self, digest: str, *, holder_id: str) -> bytes | None:
-        if not is_uuid(holder_id):
-            return None
-        if self._policy.is_tombstoned(_HOLDER_KIND, holder_id):
-            return None
-        if digest not in held_digests(self._txn.db, _HOLDER_KIND, holder_id):
-            return None
-        if self._policy.is_quarantined(digest) or not self._cas.blob_intact(digest):
-            return None
-        return self._cas.read(digest)
+    def read_held_blob(
+        self,
+        digest: str,
+        *,
+        holder_id: str,
+        holder_kind: str = "event",
+        now: datetime | None = None,
+    ) -> bytes | None:
+        check_now = self._txn._clock.now() if now is None else now
+        return read_held_blob_or_none(
+            self._txn.db,
+            self._cas,
+            self._policy,
+            digest,
+            holder_kind=holder_kind,
+            holder_id=holder_id,
+            now=check_now,
+        )
 
     def read_job(self, job_id: str) -> JobRecord | None:
         found = self._jobs("job_id = ?", (job_id,))

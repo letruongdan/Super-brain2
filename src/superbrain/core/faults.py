@@ -45,6 +45,8 @@ KNOWN_CRASHPOINTS: frozenset[str] = frozenset({
     "rollback.after_move_replacement",
     "rollback.after_restore_last_original",
     "apply.after_policy_grant_ended",
+    # I3-4: restore post-swap before effect drain crashpoint
+    "restoring.store.after_swap_before_effect_drain",
 })
 
 KNOWN_PAUSEPOINTS: frozenset[str] = KNOWN_CRASHPOINTS | {"writer.held"}

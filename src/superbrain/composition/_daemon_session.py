@@ -79,6 +79,10 @@ class _DaemonCompositeDomain:
         self._job_service = job_service
         self._delegate = delegate
 
+    def rebind_job_service(self, job_service: JobService) -> None:
+        """Point subsequent job queries at the post-restore ``JobService``."""
+        self._job_service = job_service
+
     @property
     def store(self) -> object:
         return getattr(self._delegate, "store", None) if self._delegate is not None else None
@@ -188,8 +192,36 @@ class _AdmittedOwnerSession(OwnerSession):
         return self._ready
 
     @property
+    def rt(self) -> Runtime:
+        return self._rt
+
+    @property
+    def listener(self) -> BoundLoopbackListener:
+        return self._listener
+
+    @property
     def auth_gate(self) -> AuthGate:
         return self._auth_gate
+
+    def bridge_clock_untrusted(self) -> bool:
+        return self._bridge.clock_untrusted()
+
+    def rebind_after_restore(
+        self,
+        *,
+        rt: Runtime,
+        job_store: StagedKernelStore,
+        job_service: JobService,
+        ready: Ready | None = None,
+    ) -> None:
+        """Atomically rebind owner-thread session handles after an online store/policy restore."""
+        self._rt = rt
+        self._job_store = job_store
+        self._job_service = job_service
+        self._job_service.set_claim_commit_guard(self._admit_claim_commit)
+        if ready is not None:
+            self._ready = ready
+        self._bridge.rebind_stores(store=rt.store, policy=rt.policy, writer_epoch=rt.lease.epoch)
 
     @property
     def clock(self) -> Clock:

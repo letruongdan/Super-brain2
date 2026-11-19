@@ -55,7 +55,13 @@ from superbrain.core.kernel import (
     usage_descriptor,
 )
 from superbrain.ports.clock import Clock
-from superbrain.ports.kernel import KernelBlobStagePort, KernelPolicyPort, KernelStorePort, KernelTx
+from superbrain.ports.kernel import (
+    KernelBlobStagePort,
+    KernelPolicyPort,
+    KernelStorePort,
+    KernelTx,
+    PolicyAccountingPort,
+)
 
 __all__ = ["RECOVERY_BATCH", "JobService"]
 
@@ -100,6 +106,7 @@ class JobService:
         writer_epoch: int,
         cancel_signal: Callable[[str], None] | None = None,
         claim_commit_guard: Callable[[], bool] | None = None,
+        accounting: PolicyAccountingPort | None = None,
     ) -> None:
         self._store = store
         self._stager = stager
@@ -107,8 +114,20 @@ class JobService:
         self._clock = clock
         self._writer_epoch = require_positive_int(writer_epoch)
         self._cancel_signal = cancel_signal
+        self._accounting: PolicyAccountingPort | None = (
+            accounting
+            if accounting is not None
+            else (policy if hasattr(policy, "reserve_accounting_invocation") else None)  # type: ignore[assignment]
+        )
         self._claim_commit_guard: Callable[[], bool] | None = None
         self.set_claim_commit_guard(claim_commit_guard)
+
+    def _accounting_active(self) -> PolicyAccountingPort | None:
+        if self._accounting is None:
+            return None
+        if getattr(self._policy, "schema_version", 4) < 4:
+            return None
+        return self._accounting
 
     def set_claim_commit_guard(self, guard: Callable[[], bool] | None) -> None:
         """Install or clear the zero-argument RAM predicate guarding ``job.leased`` record append."""
@@ -246,7 +265,18 @@ class JobService:
         self._require_current(lease)
         if not isinstance(reservation, UsageReservation):
             raise _invalid()
+        row = self._store.transact(lambda tx: self._fenced(tx, lease, JobState.RUNNING))
         invocation_id = new_id()
+        acct = self._accounting_active()
+        if acct is not None:
+            acct.reserve_accounting_invocation(
+                invocation_id=invocation_id,
+                job_id=lease.job_id,
+                owner_id=row.owner_id,
+                writer_epoch=lease.writer_epoch,
+                max_amount=reservation.max_amount,
+                now=self._clock.now(),
+            )
         descriptor = reservation_descriptor(invocation_id, lease.job_id, reservation)
         self._stager.stage_blob(descriptor)
 
@@ -264,6 +294,35 @@ class JobService:
         """Record nonfinal unknown usage or commit the first final usage of an invocation; identical retry no-op."""
         descriptor = usage_descriptor(invocation_id, usage)
         usage_digest = digest_bytes(descriptor)
+
+        def _precheck(tx: KernelTx) -> bool:
+            invocation = tx.read_invocation(invocation_id)
+            if invocation is None:
+                raise _not_found()
+            if invocation.state is InvocationState.SETTLED:
+                if usage.complete and invocation.usage_digest == usage_digest:
+                    return False
+                raise BrainError(ErrorCode.IDEMPOTENCY_CONFLICT, "idempotency conflict")
+            if (
+                not usage.complete
+                and invocation.state is InvocationState.OUTCOME_UNKNOWN
+                and invocation.usage_complete is False
+            ):
+                if invocation.usage_digest == usage_digest:
+                    return False
+                raise BrainError(ErrorCode.IDEMPOTENCY_CONFLICT, "idempotency conflict")
+            return True
+
+        if not self._store.transact(_precheck):
+            return
+        acct = self._accounting_active()
+        if acct is not None:
+            acct.settle_accounting_invocation(
+                invocation_id=invocation_id,
+                amount=usage.amount,
+                complete=usage.complete,
+                now=self._clock.now(),
+            )
         self._stager.stage_blob(descriptor)
 
         def settle(tx: KernelTx) -> bool:
@@ -343,6 +402,9 @@ class JobService:
         A repeated recovery of the same epoch finds nothing and writes nothing.
         """
         self._require_epoch(epoch)
+        acct = self._accounting_active()
+        if acct is not None:
+            acct.recover_accounting_epochs(current_epoch=epoch, now=self._clock.now())
         unknown = requeued = dead = 0
         while True:
             marked = self._store.transact(lambda tx: self._mark_unknown_batch(tx, epoch))

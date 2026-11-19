@@ -34,6 +34,7 @@ from superbrain.core.kernel import (
 from superbrain.ports.os import OsAdapters
 from superbrain.ports.policy import Intent, IntentKind
 from superbrain.storage import backup
+from superbrain.storage._policy_accounting import PolicyAccountingMixin, ensure_accounting_schema
 from superbrain.storage._policy_authority import (
     build_policy_snapshot,
     ensure_v2_tables,
@@ -115,7 +116,7 @@ def _decode_intent(row: Sequence[object]) -> Intent:
     return Intent(intent_id=intent_id, kind=intent_kind, payload=checked, created_at=created_at)
 
 
-class PolicyStore(PolicyAuthorityMixin):
+class PolicyStore(PolicyAuthorityMixin, PolicyAccountingMixin):
     """Implements ``PolicySource``. Obtain it with ``create`` or ``open``; ``close`` it when done."""
 
     def __init__(
@@ -232,6 +233,9 @@ class PolicyStore(PolicyAuthorityMixin):
             for file in db_files(path):
                 if file.exists():
                     os_.permissions.secure_file(file)
+            if policy._schema_version >= 4:
+                with policy._authority_tx() as txdb:
+                    ensure_accounting_schema(txdb)
             policy._align_trust_generation()
         except BaseException:
             db.close()

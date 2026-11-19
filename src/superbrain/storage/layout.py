@@ -84,6 +84,14 @@ class DataRoot:
     def endpoint_path(self) -> Path:
         return self.root / ENDPOINT_NAME
 
+    @property
+    def restore_epoch_path(self) -> Path:
+        return self.store_dir / "restore_epoch.json"
+
+    @property
+    def pending_restore_tombstones_path(self) -> Path:
+        return self.store_dir / "pending_restore_tombstones.json"
+
     def subdirectories(self) -> tuple[Path, ...]:
         """The directories ``secure_subdirectories`` creates, parents first."""
         return (

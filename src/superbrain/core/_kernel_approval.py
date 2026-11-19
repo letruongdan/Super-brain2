@@ -12,6 +12,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
+from typing import Literal
 
 from superbrain.core._kernel_approval_parse import (
     MAX_PASSKEY_COSE_KEY_BYTES,
@@ -366,6 +367,32 @@ def policy_change_subject_id(
             "base_trust_generation": base_trust_generation,
             "base_restore_epoch": base_restore_epoch,
             "policy_diff_digest": policy_diff_digest,
+        }
+    )
+    return "sha256:" + hashlib.sha256(body).hexdigest()
+
+
+def restore_subject_id(
+    *,
+    target_kind: Literal["store", "policy"],
+    backup_id: str,
+    backup_db_digest: str,
+    target_epoch_or_gen: int,
+) -> str:
+    """Subject of a ``restore`` approval: binds target kind, backup identity/digest, and monotonic epoch/gen."""
+    if target_kind not in ("store", "policy"):
+        raise _invalid()
+    if not isinstance(backup_id, str) or not backup_id or "\x00" in backup_id:
+        raise _invalid()
+    require_sha256_digest(backup_db_digest)
+    if not is_strict_int(target_epoch_or_gen) or target_epoch_or_gen < 0:
+        raise _invalid()
+    body = canonical_json(
+        {
+            "target_kind": target_kind,
+            "backup_id": backup_id,
+            "backup_db_digest": backup_db_digest,
+            "target_epoch_or_gen": target_epoch_or_gen,
         }
     )
     return "sha256:" + hashlib.sha256(body).hexdigest()

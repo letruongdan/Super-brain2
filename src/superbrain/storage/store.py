@@ -19,10 +19,12 @@ from superbrain.ports.os import OsAdapters
 from superbrain.ports.policy import PolicySource, PolicyView
 from superbrain.storage import backup
 from superbrain.storage._proposal_schema import with_proposal_defaults
+from superbrain.storage._restore_epoch import read_restore_epoch, write_restore_epoch
 from superbrain.storage.cas import (
     ContentStore,
     RetentionClass,
     held_digests,
+    read_held_blob_or_none,
     remove_staging_leftovers,
 )
 from superbrain.storage.errors import sqlite_error
@@ -236,6 +238,8 @@ class Store:
             if any(os.path.lexists(p) for p in db_files(staging)[1:]):
                 raise BrainError(ErrorCode.IO_ERROR, f"{staging}: the WAL was not checkpointed away on close")
             os_.permissions.secure_file(staging)
+            if code_version(migrations) >= 5 and not os.path.lexists(root.restore_epoch_path):
+                write_restore_epoch(root.store_dir, 0, os_)
             os_.publisher.publish(staging, path)
             return cls._open_registered(root, lease, os_, policy, handlers, kinds, migrations)
         except BaseException:
@@ -287,6 +291,8 @@ class Store:
         if info is None:
             raise BrainError(ErrorCode.NOT_FOUND, f"no store database at {path}")
         ensure_writable(info, migrations)
+        if info.schema_version >= 5:
+            read_restore_epoch(root, schema_version=info.schema_version, os_=os_)
         if info.store_id != policy.store_id:
             raise BrainError(ErrorCode.INTEGRITY_FAILURE, "the store belongs to a different policy store")
         db = connect(path, traits=os_.traits)
@@ -407,6 +413,9 @@ class Store:
                     check_owner=self._check,
                     blob_intact=self._cas.blob_intact,
                     history_versions=self._history_versions,
+                    read_held=lambda db_, dig, hk, hi, dt: read_held_blob_or_none(
+                        db_, self._cas, self._policy, dig, holder_kind=hk, holder_id=hi, now=dt
+                    ),
                 )
                 try:
                     yield txn

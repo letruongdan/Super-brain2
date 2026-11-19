@@ -519,10 +519,27 @@ def _policy_v4(db: sqlite3.Connection) -> None:
     )
     db.execute(
         "CREATE TABLE accounting_invocations ("
-        "invocation_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, state TEXT NOT NULL, recorded_at TEXT NOT NULL)"
+        "invocation_id TEXT PRIMARY KEY, "
+        "job_id TEXT NOT NULL, "
+        "owner_id TEXT NOT NULL, "
+        "writer_epoch INTEGER NOT NULL, "
+        "period_key TEXT NOT NULL, "
+        "reserved_amount TEXT NOT NULL, "
+        "settled_amount TEXT, "
+        "state TEXT NOT NULL CHECK (state IN ('reserved', 'outcome_unknown', 'settled')), "
+        "recorded_at TEXT NOT NULL, "
+        "updated_at TEXT NOT NULL)"
     )
     db.execute(
-        "CREATE TABLE accounting_locks (lock_key TEXT PRIMARY KEY, owner TEXT NOT NULL, acquired_at TEXT NOT NULL)"
+        "CREATE TABLE accounting_locks ("
+        "lock_key TEXT PRIMARY KEY, "
+        "owner_id TEXT NOT NULL, "
+        "period_key TEXT NOT NULL, "
+        "backup_created_at TEXT NOT NULL, "
+        "locked_at TEXT NOT NULL, "
+        "state TEXT NOT NULL CHECK (state IN ('locked', 'reconciled')), "
+        "reconciled_at TEXT, "
+        "reconciled_approval_id TEXT)"
     )
     for column in _REPO_FLAG_COLUMNS:
         db.execute(f"ALTER TABLE repo_policy ADD COLUMN {column} INTEGER NOT NULL DEFAULT 1 CHECK ({column} IN (0, 1))")

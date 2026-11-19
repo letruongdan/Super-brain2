@@ -159,12 +159,20 @@ Mười dòng này là `I33CrashCase` trong `tests/support/inc3_crash_cases.py::
 | `rollback.after_restore_last_original` | `rollback-applied` | Tệp đích cuối cùng đã khôi phục xong về `U0`/`U1` trên đĩa | Đĩa đã hoàn nguyên sạch sẽ, `recovery_grant` vẫn `active`, `brain.db` chưa ghi `rolled_back` | Chưa | Thấy toàn bộ file đã khớp trạng thái khôi phục nên đóng `recovery_grant` trong `policy.db` trước rồi cập nhật `ROLLED_BACK` | Không ghi `ROLLED_BACK` mà bỏ quên `recovery_grant` đang `active` | `rollback-applied@rollback.after_restore_last_original` | Có test từ wheel | File khôi phục đã `publish_no_replace` và sync thư mục |
 | `apply.after_policy_grant_ended` | `apply` | Mọi file đã publish xong và verified; `policy.db` vừa đóng `recovery_grant` (`journal_closed`) + ghi outcome `applied` | Grant trong `policy.db` đã `ended` với outcome `applied`; `brain.db` vẫn ghi `applying`/`partially_applied` (ca 93) | Chưa | Chiếu trạng thái `applied` + manifest còn thiếu sang `brain.db` **không** mở lại `recovery_grant` | Grant đã `ended` không bao giờ hồi sinh quyền ghi sau restart hoặc restore | `apply@apply.after_policy_grant_ended` | Có test từ wheel | Commit đóng grant + outcome ở `policy.db` đi trước `brain.db` |
 
+## Restore bước 7 và drain (SP1 đợt 3, I3-4)
+
+Một dòng này là `I34CrashCase` trong `tests/support/inc3_i34_crash_cases.py::I3_4_CRASH_CASES`, chạy từ wheel venv bởi `tests/integration/test_restore_and_migration_i3.py` qua `tests/support/inc3_i34_crash_child.py` với `python -I`.
+
+| Crashpoint | Operation | Trước | Sau crash | Đã ACK? | Phục hồi | Invariant | CrashCase | Tiến trình chết | Mất điện |
+|---|---|---|---|---|---|---|---|---|---|
+| `restoring.store.after_swap_before_effect_drain` | `restore-store` | Backup `store_full` chụp lúc Evidence `E` còn hạn; ở kho sống `E` còn được giữ (`DURABLE`), tới hiện tại `E` trong snapshot đã quá hạn; dựng xong `store/restore_epoch.json` mới và `pending_restore_tombstones.json` trong stage | `stage_and_swap` đã đổi tên `store/` -> `store.replaced-*` và công bố stage làm `store/` mới (mang `restore_epoch.json` tăng và `pending_restore_tombstones.json`); `policy.db` **chưa** nhận `TOMBSTONE` của `E` | Chưa | `open_runtime` / `open_runtime_under_lease` chạy `drain_published_restore_effects` trên đúng snapshot đã công bố **trước** khi mở đọc hay nhận Job: ghi `TOMBSTONE(E)` vào `policy.db`, reconcile vào `brain.db`, xóa file tạm; lần đọc đầu chặn `E`. Lần khởi động thứ hai với hook vẫn bật là no-op | Không bao giờ ghi tombstone trước swap (bảo vệ kho sống nếu chết trước hoán đổi), nhưng một khi đã swap thì hiệu ứng hết hạn luôn hoàn tất trước khi phục vụ | `restore-store@restoring.store.after_swap_before_effect_drain` | Có test từ wheel | Snapshot đã atomic rename + `READY` trước khi `writer.lock` tăng epoch; danh sách tombstone nằm sẵn bên trong `store/` vừa công bố nên restart đọc đúng bản đó và hoàn tất bước 7 |
+
 ## Bảo đảm của chính ma trận
 
 - `test_every_known_crashpoint_has_a_case_and_a_doc_row`: mỗi crashpoint đã đăng ký có đúng một ca (`CrashCase`, `KernelCrashCase`,
-  hoặc `I33CrashCase`) và đúng một dòng trong tài liệu này, không tên nào trùng.
-- `test_registry_is_exactly_the_increment_1_names_plus_the_task_8_and_i3_3_names`: registry bằng đúng 19 tên đợt 1 cộng
-  10 tên Task 8 cộng 10 tên I3-3 (tổng 39). 19 ca đợt 1 và 10 ca Task 8 giữ nguyên node ID.
+  `I33CrashCase`, hoặc `I34CrashCase`) và đúng một dòng trong tài liệu này, không tên nào trùng.
+- `test_registry_is_exactly_the_increment_1_names_plus_the_task_8_and_i3_names`: registry bằng đúng 19 tên đợt 1 cộng
+  10 tên Task 8 cộng 10 tên I3-3 cộng 1 tên I3-4 (tổng 40). 19 ca đợt 1 và 10 ca Task 8 giữ nguyên node ID.
 - `test_kernel_cases_keep_operation_at_crashpoint_ids_and_all_run`: node ID `operation@crashpoint`, operation thuộc
   `serve`/`serve-fixture`/`migrate`/`serve-jobs`/`job-operation`. Crashpoint trên đường request của shim có trigger sau READY.
 - `test_crash_case`: mỗi ca phải chết với mã 86 **đúng** ở crashpoint của nó (`run_until_crash`).

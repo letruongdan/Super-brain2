@@ -18,6 +18,7 @@ from typing import Any
 from superbrain.adapters.os import os_adapters
 from superbrain.adapters.os.daemon_config import read_daemon_config, read_owner_json_object
 from superbrain.adapters.os.tls_material import create_store_tls
+from superbrain.composition._maintenance_wiring import ensure_maintenance_backend
 from superbrain.composition.kernel_projections import kernel_store_extensions
 from superbrain.core._kernel_approval import CLI_HARNESS_ID, ApprovalChannel, SignerEnrollment, SignerRecord
 from superbrain.core._kernel_base import require_opaque_id
@@ -39,6 +40,8 @@ from superbrain.storage.sqlite import open_readonly
 from superbrain.storage.writer import acquire_writer_unbumped
 
 __all__ = ["InitReport", "InitRequest", "ResetReport", "init_store", "main", "reset_signers"]
+
+ensure_maintenance_backend()
 
 DAEMON_CONFIG_NAME = "daemon.json"
 CLI_CREDENTIAL_NAME = "cli.credential"

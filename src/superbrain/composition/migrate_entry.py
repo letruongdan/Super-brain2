@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Literal
 
 from superbrain.adapters.os import os_adapters
+from superbrain.composition._maintenance_wiring import ensure_maintenance_backend
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.faults import crashpoint
 from superbrain.core.kernel import DaemonConfig
@@ -16,6 +17,8 @@ from superbrain.storage.kernel_schema import KERNEL_POLICY_MIGRATIONS, KERNEL_ST
 from superbrain.storage.migrate import MigrationReport, migrate_database
 from superbrain.storage.runtime import admit_existing_pair
 from superbrain.storage.schema import Migration, code_version, read_schema_info
+
+ensure_maintenance_backend()
 
 
 @dataclass(frozen=True)

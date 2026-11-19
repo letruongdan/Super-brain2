@@ -26,6 +26,7 @@ from superbrain.application.journal_recovery import reconcile_and_classify_journ
 from superbrain.application.owner_loop import AuthGate, OwnerLoop, OwnerSession
 from superbrain.application.review_apply import ReviewApplyService
 from superbrain.cli_api._loopback_server import LoopbackServer
+from superbrain.composition._daemon_restore import DaemonRestoreHandler, build_review_apply_service
 from superbrain.composition._daemon_session import (
     DaemonTestHooks,
     _AdmittedOwnerSession,
@@ -144,6 +145,7 @@ def _open_owner_session(
             rt.policy,
             resolved_clock,
             writer_epoch=rt.lease.epoch,
+            accounting=rt.policy if rt.policy.schema_version >= 4 else None,
             cancel_signal=executor.cancel if executor is not None else None,
         )
 
@@ -289,17 +291,31 @@ def _open_owner_session(
         )
         session_box.append(session)
         if operator is not None:
-            review_apply: ReviewApplyService | None = None
-            if rt.store.schema_version >= 5 and rt.policy.schema_version >= 4:
-                review_apply = ReviewApplyService(
-                    StoreProposalAdapter(rt.store, adapters),
-                    PolicyApplyAuthority(rt.policy),
-                    adapters,
-                    data_root=rt.root.root,
-                    home_dir=Path.home(),
-                    config_merger=SharedConfigMergerAdapter(),
+            review_apply = build_review_apply_service(
+                rt.store,
+                rt.policy,
+                rt.root.root,
+                adapters,
+                service_cls=ReviewApplyService,
+            )
+            restore_handler = DaemonRestoreHandler(
+                session=session,
+                adapters=adapters,
+                clock=resolved_clock,
+                executor=executor,
+                composite_domain=composite_domain,
+                instance_id=instance_id,
+                operator=operator,
+                review_apply_cls=ReviewApplyService,
+            )
+            operator.bind(
+                build_operator_service(
+                    rt.policy,
+                    os_=adapters,
+                    review_apply=review_apply,
+                    restore_handler=restore_handler,
                 )
-            operator.bind(build_operator_service(rt.policy, os_=adapters, review_apply=review_apply))
+            )
         return session
     except BaseException:
         if operator is not None:

@@ -41,6 +41,7 @@ OPERATOR_PATHS: frozenset[str] = frozenset(
         "/v2/operator/policy/set",
         "/v2/operator/workspace/link",
         "/v2/operator/backup",
+        "/v2/operator/restore",
         "/v2/operator/job/cancel",
     }
 )

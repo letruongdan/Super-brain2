@@ -21,6 +21,7 @@ from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.ids import new_id
 from superbrain.core.kernel import require_opaque_id
 from superbrain.ports.os import OsAdapters
+from superbrain.storage._restore_epoch import drain_published_restore_effects, read_restore_epoch
 from superbrain.storage.errors import os_error, sqlite_error
 from superbrain.storage.kernel_schema import KERNEL_POLICY_MIGRATIONS, KERNEL_STORE_MIGRATIONS
 from superbrain.storage.kinds import KindRegistry
@@ -166,6 +167,15 @@ def open_runtime(
             policy = PolicyStore.open(root, lease, os_, migrations=policy_migrations)
         else:
             policy = PolicyStore.create(root, lease, os_, store_id=new_id(), migrations=policy_migrations)
+        if policy.schema_version >= 4:
+            drain_published_restore_effects(
+                root,
+                lease,
+                os_,
+                policy,
+                now=os_.clock.now(),
+                target_schema=code_version(store_migrations),
+            )
         registry = kinds if kinds is not None else KindRegistry(())
         if os.path.lexists(root.store_db):
             store = Store.open(root, lease, os_, policy, handlers, registry, migrations=store_migrations)
@@ -473,6 +483,8 @@ def admit_existing_pair(
             policy_migrations=policy_migrations,
             store_migrations=store_migrations,
         )
+        if store_info.schema_version >= 5:
+            read_restore_epoch(eff_store_db.parent, schema_version=store_info.schema_version, os_=os_)
 
         # Admission passed: now record the new writer_epoch and complete any compatible interrupted swaps.
         lease.bump_epoch()
@@ -522,6 +534,15 @@ def open_runtime_under_lease(
     store: Store | None = None
     try:
         policy = PolicyStore.open(root, lease, os_, migrations=policy_migrations)
+        if policy.schema_version >= 4:
+            drain_published_restore_effects(
+                root,
+                lease,
+                os_,
+                policy,
+                now=os_.clock.now(),
+                target_schema=code_version(store_migrations),
+            )
         registry = kinds if kinds is not None else KindRegistry(())
         store = Store.open(root, lease, os_, policy, handlers, registry, migrations=store_migrations)
         policy.mark_store_published()

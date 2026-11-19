@@ -547,6 +547,9 @@ def open_cloned_runtime(
         os_.permissions.secure_file(data_root.policy_db)
         shutil.copyfile(tpl_root.store_db, data_root.store_db)
         os_.permissions.secure_file(data_root.store_db)
+        if os.path.lexists(tpl_root.restore_epoch_path):
+            shutil.copyfile(tpl_root.restore_epoch_path, data_root.restore_epoch_path)
+            os_.permissions.secure_file(data_root.restore_epoch_path)
         policy = PolicyStore.open(data_root, lease, os_, migrations=policy_migrations)
         store = Store.open(data_root, lease, os_, policy, handlers, kinds_obj, migrations=store_migrations)
         policy.mark_store_published()

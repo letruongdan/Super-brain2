@@ -88,6 +88,56 @@ def _parse_review_args(args: list[str]) -> tuple[str, list[str]] | None:
     return ("superbrain.composition.review_cli_entry", args)
 
 
+def _parse_restore_args(args: list[str]) -> tuple[str, list[str]] | None:
+    rest = args[1:]
+    offline = False
+    preview = False
+    kind: str | None = None
+    backup: str | None = None
+    approval_file: str | None = None
+    config: str | None = None
+    i = 0
+    while i < len(rest):
+        tok = rest[i]
+        if tok == "--offline":
+            if offline:
+                return None
+            offline = True
+            i += 1
+        elif tok == "--preview":
+            if preview:
+                return None
+            preview = True
+            i += 1
+        elif tok == "--kind":
+            if kind is not None or i + 1 >= len(rest) or rest[i + 1] not in ("store", "policy"):
+                return None
+            kind = rest[i + 1]
+            i += 2
+        elif tok == "--backup":
+            if backup is not None or i + 1 >= len(rest) or not _is_valid_abs_path(rest[i + 1]):
+                return None
+            backup = rest[i + 1]
+            i += 2
+        elif tok == "--approval-file":
+            if approval_file is not None or i + 1 >= len(rest) or not _is_valid_abs_path(rest[i + 1]):
+                return None
+            approval_file = rest[i + 1]
+            i += 2
+        elif tok == "--config":
+            if config is not None or i + 1 >= len(rest) or not _is_valid_abs_path(rest[i + 1]):
+                return None
+            config = rest[i + 1]
+            i += 2
+        else:
+            return None
+    if not offline or kind is None or backup is None or config is None:
+        return None
+    if preview == (approval_file is not None):
+        return None
+    return ("superbrain.composition.owner_entry", args)
+
+
 def _parse_cli_args(args: list[str]) -> tuple[str, list[str]] | None:
     if not args:
         return None
@@ -101,6 +151,8 @@ def _parse_cli_args(args: list[str]) -> tuple[str, list[str]] | None:
         if args[1] == "--config" and args[3] == "--offline" and _is_valid_abs_path(args[2]):
             return ("superbrain.composition.owner_entry", ["migrate", "--offline", "--config", args[2]])
         return None
+    if args and args[0] == "restore":
+        return _parse_restore_args(args)
     if len(args) == 3 and args[0] == "status" and args[1] == "--profile":
         if _is_valid_abs_path(args[2]):
             return ("superbrain.composition.client_entry", ["status", "--profile", args[2]])
