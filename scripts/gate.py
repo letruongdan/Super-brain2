@@ -1267,7 +1267,7 @@ def run_gate(
         codes: list[int | None] = []
         runner_error = execution_failed
         expected: dict[str, set[str]] = {file: set() for group in groups for file in group}
-        for node in collected:
+        for node in target_ids:
             expected[node.split("::", 1)[0]].add(node)
         for index, result in enumerate(results):
             name = f"pytest-shard-{index}"

@@ -117,3 +117,39 @@ def test_ci_initial_and_gate_checkouts_use_reviewed_bytes_with_hostile_git_defau
             )
         gate_status = git(gate_checkout, "status", "--porcelain", env=job_env)
         assert not gate_status, f"Detached gate checkout in {job_name} must be clean"
+
+
+def test_ci_checkout_steps_require_full_history_fetch_depth_zero() -> None:
+    """R2: actions/checkout@v4 across all CI jobs must specify with: fetch-depth: 0."""
+    jobs = ci_jobs()
+    expected_jobs = {"gate", "gate-windows-worker", "gate-windows-aggregate"}
+    assert set(jobs.keys()) == expected_jobs, f"Expected jobs {expected_jobs}, found {set(jobs.keys())}"
+    for job_name in ("gate", "gate-windows-worker", "gate-windows-aggregate"):
+        steps = ci_steps(job_name)
+        checkout_steps = [s for s in steps if "actions/checkout@v4" in s]
+        assert len(checkout_steps) >= 1, f"Job {job_name} missing actions/checkout@v4 step"
+        for step in checkout_steps:
+            assert re.search(r"^\s+fetch-depth:\s*0\b", step, re.M), (
+                f"Job {job_name}: actions/checkout@v4 must specify with: fetch-depth: 0"
+            )
+
+
+def test_ci_forbids_pwsh_and_mandates_bash_for_test_execution_steps() -> None:
+    """R3: Shell must never be pwsh and execution steps must specify shell: bash."""
+    workflow = CI_FILE.read_text(encoding="utf-8")
+    assert "shell: pwsh" not in workflow, ".github/workflows/ci.yml must not use shell: pwsh"
+
+    required_bash_steps = {
+        "gate": ["Run the gate", "Benchmark"],
+        "gate-windows-worker": ["Run partitioned worker gate"],
+        "gate-windows-aggregate": ["Run aggregate receipt validation", "Benchmark"],
+    }
+    for job_name, step_names in required_bash_steps.items():
+        steps = ci_steps(job_name)
+        for target in step_names:
+            matching = [s for s in steps if target in s]
+            assert len(matching) >= 1, f"Job {job_name} missing required step {target!r}"
+            for step in matching:
+                assert re.search(r"^\s+shell:\s*bash\s*$", step, re.M), (
+                    f"Job {job_name} step {target!r} must specify shell: bash"
+                )

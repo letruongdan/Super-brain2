@@ -32,6 +32,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Use reviewed LF bytes in this checkout
         shell: bash
@@ -71,17 +73,18 @@ jobs:
         run: uv sync --locked --python ${{ matrix.python }}
 
       - name: Run the gate
-        shell: pwsh
+        shell: bash
         run: |
-          $ev = Join-Path "${{ runner.temp }}" "gate-evidence"
-          New-Item -ItemType Directory -Force -Path $ev | Out-Null
-          $out = Join-Path "${{ runner.temp }}" "gate.stdout.log"
-          $err = Join-Path "${{ runner.temp }}" "gate.stderr.log"
+          ev="${{ runner.temp }}/gate-evidence"
+          mkdir -p "$ev"
+          out="${{ runner.temp }}/gate.stdout.log"
+          err="${{ runner.temp }}/gate.stderr.log"
+          set +e
           uv run --locked --python ${{ matrix.python }} python scripts/gate.py --python ${{ matrix.python }} --evidence-dir "$ev" > "$out" 2> "$err"
-          $code = $LASTEXITCODE
-          Get-Content "$out"
-          if (Test-Path "$err") { Get-Content "$err" }
-          Set-Content -Path (Join-Path "${{ runner.temp }}" "gate.exit") -Value $code
+          code=$?
+          [ -f "$out" ] && cat "$out"
+          [ -f "$err" ] && cat "$err" >&2
+          echo "$code" > "${{ runner.temp }}/gate.exit"
           exit $code
 
       - name: Benchmark
@@ -149,6 +152,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Use reviewed LF bytes in this checkout
         shell: bash
@@ -188,17 +193,18 @@ jobs:
         run: uv sync --locked --python ${{ matrix.python }}
 
       - name: Run partitioned worker gate (${{ matrix.partition }}/2)
-        shell: pwsh
+        shell: bash
         run: |
-          $ev = Join-Path "${{ runner.temp }}" "gate-evidence"
-          New-Item -ItemType Directory -Force -Path $ev | Out-Null
-          $out = Join-Path "${{ runner.temp }}" "gate.stdout.log"
-          $err = Join-Path "${{ runner.temp }}" "gate.stderr.log"
+          ev="${{ runner.temp }}/gate-evidence"
+          mkdir -p "$ev"
+          out="${{ runner.temp }}/gate.stdout.log"
+          err="${{ runner.temp }}/gate.stderr.log"
+          set +e
           uv run --locked --python ${{ matrix.python }} python scripts/gate.py --python ${{ matrix.python }} --partition ${{ matrix.partition }}/2 --evidence-dir "$ev" > "$out" 2> "$err"
-          $code = $LASTEXITCODE
-          Get-Content "$out"
-          if (Test-Path "$err") { Get-Content "$err" }
-          Set-Content -Path (Join-Path "${{ runner.temp }}" "gate.exit") -Value $code
+          code=$?
+          [ -f "$out" ] && cat "$out"
+          [ -f "$err" ] && cat "$err" >&2
+          echo "$code" > "${{ runner.temp }}/gate.exit"
           exit $code
 
       - name: Verify sealed test oracle after acceptance
@@ -245,6 +251,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Use reviewed LF bytes in this checkout
         shell: bash
@@ -298,19 +306,19 @@ jobs:
           path: ${{ runner.temp }}/agg-workers-${{ matrix.python }}/part-1
 
       - name: Run aggregate receipt validation
-        shell: pwsh
+        shell: bash
         run: |
-          $ev = Join-Path "${{ runner.temp }}" "gate-evidence"
-          $workers = Join-Path "${{ runner.temp }}" "agg-workers-${{ matrix.python }}"
-          New-Item -ItemType Directory -Force -Path $ev | Out-Null
-          New-Item -ItemType Directory -Force -Path $workers | Out-Null
-          $out = Join-Path "${{ runner.temp }}" "gate-agg.stdout.log"
-          $err = Join-Path "${{ runner.temp }}" "gate-agg.stderr.log"
+          ev="${{ runner.temp }}/gate-evidence"
+          workers="${{ runner.temp }}/agg-workers-${{ matrix.python }}"
+          mkdir -p "$ev" "$workers"
+          out="${{ runner.temp }}/gate-agg.stdout.log"
+          err="${{ runner.temp }}/gate-agg.stderr.log"
+          set +e
           uv run --locked --python ${{ matrix.python }} python scripts/gate.py aggregate --python ${{ matrix.python }} --partition-count 2 --workers-dir "$workers" --expected-commit "${{ github.sha }}" --evidence-dir "$ev" > "$out" 2> "$err"
-          $code = $LASTEXITCODE
-          Get-Content "$out"
-          if (Test-Path "$err") { Get-Content "$err" }
-          Set-Content -Path (Join-Path "${{ runner.temp }}" "gate-agg.exit") -Value $code
+          code=$?
+          [ -f "$out" ] && cat "$out"
+          [ -f "$err" ] && cat "$err" >&2
+          echo "$code" > "${{ runner.temp }}/gate-agg.exit"
           exit $code
 
       - name: Benchmark

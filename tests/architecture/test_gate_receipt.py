@@ -19,7 +19,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -2623,7 +2623,6 @@ def test_gate_cli_rejects_invalid_partition(
     assert "unrecognized arguments" not in err_bad.lower()
 
 
-
 def test_partition_files_disjoint_union_and_deterministic() -> None:
     partition_files = getattr(gate, "partition_files", None)
     assert partition_files is not None, "scripts.gate must export partition_files"
@@ -3021,3 +3020,130 @@ def test_aggregate_partition_receipts_refuses_failed_worker(tmp_path: Path) -> N
     )
     assert receipt["accepted"] is False
     assert any("worker" in r.lower() or "failed" in r.lower() for r in receipt.get("reasons", []))
+
+
+def test_worker_partition_sharded_pytest_avoids_sibling_key_error_and_aggregates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R1: Both partition workers run real sharded pytest (shards=2, len(groups)>=2) without sibling KeyError."""
+    aggregate_partition_receipts = getattr(gate, "aggregate_partition_receipts", None)
+    assert aggregate_partition_receipts is not None, "scripts.gate must export aggregate_partition_receipts"
+
+    repo = tmp_path / "test_repo"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=repo, capture_output=True, check=True)
+    subprocess.run(["git", "config", "user.name", "Tester"], cwd=repo, capture_output=True, check=True)
+    subprocess.run(["git", "config", "user.email", "test@test.local"], cwd=repo, capture_output=True, check=True)
+    (repo / "pyproject.toml").write_text("[project]\nname = 'test'\nversion = '0.1.0'\n", encoding="utf-8")
+    (repo / "uv.lock").write_text("", encoding="utf-8")
+
+    test_files = ["t/test_p0_a.py", "t/test_p0_b.py", "t/test_p1_a.py", "t/test_p1_b.py"]
+    for tf in test_files:
+        p = repo / tf
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("def test_0(): pass\ndef test_1(): pass\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, capture_output=True, check=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True, check=True)
+
+    all_ids = [f"{tf}::test_{i}" for tf in test_files for i in range(2)]
+
+    class ShardedPartitionRunner(ClockRunner):
+        def _git(self, sub: list[str], seconds: float) -> tuple[int | None, str, float]:
+            res = super()._git(sub, seconds)
+            if sub[:2] == ["worktree", "add"]:
+                assert self.worktree is not None
+                for tf in test_files:
+                    target = self.worktree / tf
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.touch()
+            return res
+
+        def __call__(self, cmd: Sequence[str], *, cwd: Path, timeout_s: float) -> tuple[int | None, str, float]:
+            argv = list(cmd)
+            key = tool_key(argv)
+            if key == "collect":
+                code, _, seconds = super().__call__(cmd, cwd=cwd, timeout_s=timeout_s)
+                return code, "\n".join(all_ids) + f"\n\n{len(all_ids)} tests collected in 0.01s\n", seconds
+            if key == "pytest":
+                selected = _selected_pytest_files(argv, cwd)
+                shard_ids = [nid for nid in all_ids if nid.split("::", 1)[0] in set(selected)]
+                report = Path(next(arg.split("=", 1)[1] for arg in argv if arg.startswith("--junitxml=")))
+                report.write_bytes(_junit_for_shard(shard_ids))
+                return 0, f"OUT-{','.join(selected)}", 0.01
+            return super().__call__(cmd, cwd=cwd, timeout_s=timeout_s)
+
+    runner = ShardedPartitionRunner()
+    monkeypatch.setattr(gate, "run", runner)
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(gate, "collect_environment", clean_environment)
+
+    ev0 = tmp_path / "ev_w0"
+    ev0.mkdir()
+    receipt_0_raw, _ = gate.run_gate(repo, "3.14", shards=2, partition=(0, 2), evidence_dir=ev0)
+    receipt_0 = cast(dict[str, Any], receipt_0_raw)
+    assert not any("KeyError" in r for r in receipt_0.get("reasons", [])), (
+        f"Worker 0 raised KeyError: {receipt_0.get('reasons')}"
+    )
+    assert receipt_0["accepted"] is True, f"Worker 0 refused: {receipt_0.get('reasons')}"
+    assert receipt_0["reasons"] == []
+    assert any(p["name"] == "pytest" and p["exit_code"] == 0 for p in receipt_0["phases"])
+
+    ev1 = tmp_path / "ev_w1"
+    ev1.mkdir()
+    receipt_1_raw, _ = gate.run_gate(repo, "3.14", shards=2, partition=(1, 2), evidence_dir=ev1)
+    receipt_1 = cast(dict[str, Any], receipt_1_raw)
+    assert not any("KeyError" in r for r in receipt_1.get("reasons", [])), (
+        f"Worker 1 raised KeyError: {receipt_1.get('reasons')}"
+    )
+    assert receipt_1["accepted"] is True, f"Worker 1 refused: {receipt_1.get('reasons')}"
+    assert receipt_1["reasons"] == []
+    assert any(p["name"] == "pytest" and p["exit_code"] == 0 for p in receipt_1["phases"])
+
+    # Verify per-partition collected-partition.json and junit-shard-*.xml parity
+    attempt_0, _, _ = load_attempt(ev0)
+    part0_collected = json.loads((attempt_0 / "collected-partition.json").read_text(encoding="utf-8"))
+    part0_junit: list[str] = []
+    root_0 = repo
+    for j_path in sorted(attempt_0.glob("junit-shard-*.xml")):
+        j_ids, _ = gate._parse_junit(j_path.read_bytes(), root=root_0)
+        part0_junit.extend(j_ids)
+    assert sorted(part0_junit) == sorted(part0_collected), (
+        "Worker 0 JUnit testcases must match collected-partition.json"
+    )
+
+    attempt_1, _, _ = load_attempt(ev1)
+    part1_collected = json.loads((attempt_1 / "collected-partition.json").read_text(encoding="utf-8"))
+    part1_junit: list[str] = []
+    root_1 = repo
+    for j_path in sorted(attempt_1.glob("junit-shard-*.xml")):
+        j_ids, _ = gate._parse_junit(j_path.read_bytes(), root=root_1)
+        part1_junit.extend(j_ids)
+    assert sorted(part1_junit) == sorted(part1_collected), (
+        "Worker 1 JUnit testcases must match collected-partition.json"
+    )
+
+    # Partitions must be disjoint and form complete union of all testcases
+    assert set(part0_collected).isdisjoint(set(part1_collected))
+    assert set(part0_collected) | set(part1_collected) == set(all_ids)
+
+    # Aggregate must accept the real worker artifacts with 0 missing and 0 duplicate nodeids
+    workers_dir = tmp_path / "workers_real"
+    part0_dest = workers_dir / "part-0" / attempt_0.name
+    part1_dest = workers_dir / "part-1" / attempt_1.name
+    shutil.copytree(attempt_0, part0_dest)
+    shutil.copytree(attempt_1, part1_dest)
+
+    fake_repo = tmp_path / "fake_repo"
+    (fake_repo / "scripts").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(gate, "__file__", str(fake_repo / "scripts" / "gate.py"))
+
+    agg_ev = tmp_path / "agg_ev_real"
+    agg_ev.mkdir()
+    agg_receipt_raw, _ = aggregate_partition_receipts(
+        workers_dir, python="3.14", partition_count=2, evidence_dir=agg_ev
+    )
+    agg_receipt = cast(dict[str, Any], agg_receipt_raw)
+    assert agg_receipt["accepted"] is True, f"Aggregate refused real worker outputs: {agg_receipt.get('reasons')}"
+    assert agg_receipt["reasons"] == []
+    assert agg_receipt["counts"]["passed"] == len(all_ids)
+    assert sum(agg_receipt["counts"].values()) == len(all_ids)
