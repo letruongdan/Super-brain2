@@ -24,7 +24,7 @@
     "tests/adapters/test_permissions.py": "sha256:4cb8f0f11c9ee5f0a040914afd5f9ae0ff0288494ebe3c4a55b429b32d7fd499",
     "tests/adapters/test_physical_fs_and_no_replace.py": "sha256:0b89ab42a43c14cc843fed2fac7daf6d5f43da81ffb66ebb23024d6f45ad84be",
     "tests/adapters/test_shared_config_mergers.py": "sha256:2d8c5e7a5dc4f820600c8f8c6bde16218671c69aae3fab2d96402b13c2eefb81",
-    "tests/application/test_bootstrap_and_doctor.py": "sha256:d31267e9bf5fc8a69d17bec28acb3fb9bc663de27c17d57f14129b9551733a0d",
+    "tests/application/test_bootstrap_and_doctor.py": "sha256:7d69d767fa02ad571b27f130fe527aee6947482edccf4b9e8f50eb0c6a75f9f5",
     "tests/application/test_change_proposal_and_journal.py": "sha256:0d1ce124e715457a2590d9cb18846d8e1b829f7a02026e1f208e05da0017b9f9",
     "tests/application/test_i3_2_journal_regressions.py": "sha256:2b0a77f1044e72e659203790f026880a4139dddc2037e0a1612df838c66bba3f",
     "tests/application/test_i3_2_rollback_and_schema_regressions.py": "sha256:b4912d4339a8524589fea34c97e3fd345fc3db8daf195f1b31cee8cdb18c41ab",

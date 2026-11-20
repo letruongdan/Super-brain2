@@ -192,13 +192,10 @@ def test_bootstrap_service_and_cli_create_high_risk_proposal_without_writing_che
     trusted_tmp: Path, capfd: pytest.CaptureFixture[str]
 ) -> None:
     """I3-5: create_bootstrap_proposal & brain bootstrap emit HIGH-risk PENDING ChangeProposal with 0 file writes."""
-    from superbrain.composition._bootstrap_wiring import (
-        PolicyHarnessProfileValidator,
-    )
-
     import superbrain.composition.bootstrap_entry as bootstrap_entry
     from superbrain.adapters.harness_config.bootstrap_templates import AdapterBootstrapPlanner
     from superbrain.application.bootstrap import create_bootstrap_proposal
+    from superbrain.composition._bootstrap_wiring import PolicyHarnessProfileValidator
 
     assert hasattr(bootstrap_entry, "main")
     assert "/v2/operator/proposal/bootstrap" in OPERATOR_PATHS
