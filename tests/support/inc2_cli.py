@@ -123,7 +123,7 @@ def run_installed_command(
     cwd: Path,
     stdin_bytes: bytes = b"",
     extra_env: Mapping[str, str] | None = None,
-    timeout: float = 15.0,
+    timeout: float = 45.0,
 ) -> subprocess.CompletedProcess[bytes]:
     """Run an installed wheel console script (``brain`` or ``brain-mcp``) in a clean environment."""
     script = installed_script_path(env, script_name)

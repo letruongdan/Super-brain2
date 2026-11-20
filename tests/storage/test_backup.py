@@ -85,7 +85,7 @@ def seed_held_blob(data_root: Path) -> str:
 
 
 def seed_orphan_blob(data_root: Path) -> str:
-    runtime = open_runtime(data_root, os_adapters())
+    runtime = open_cloned_runtime(data_root, os_adapters(), role="seed-orphan")
     try:
         return runtime.store.cas.put(ORPHAN)
     finally:

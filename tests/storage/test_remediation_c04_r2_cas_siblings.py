@@ -29,6 +29,7 @@ from superbrain.storage.runtime import Runtime, open_runtime
 from superbrain.storage.schema import STORE_MIGRATIONS
 from tests.storage.conftest import maintenance_lease
 from tests.support.fs import digest_tree, set_mtime
+from tests.support.inc2_fixture import open_cloned_runtime
 from tests.support.platform import posix_only, windows_only
 
 PAYLOAD = b"c04 round 2: a blob reached through a linked shard"
@@ -84,7 +85,7 @@ def outside_blob_behind_a_linked_shard(trusted_tmp: Path, cas_dir: Path) -> tupl
 
 def held_blob_moved_behind_a_linked_shard(trusted_tmp: Path, data_root: Path) -> tuple[str, Path]:
     """Store ``PAYLOAD`` with a holder, then move its real shard outside the root and link it back in."""
-    rt = open_runtime(data_root, os_adapters())
+    rt = open_cloned_runtime(data_root, os_adapters(), role="c04r2-held")
     try:
         digest = rt.store.store_content(PAYLOAD, "event", HOLDER, RetentionClass.EVENT_PAYLOAD, None)
     finally:
@@ -112,7 +113,7 @@ def with_runtime(data_root: Path, operation: Callable[[Runtime], object]) -> tup
 
 
 def fresh_root(data_root: Path) -> DataRoot:
-    open_runtime(data_root, os_adapters()).close()
+    open_cloned_runtime(data_root, os_adapters(), role="c04r2-fresh").close()
     return DataRoot.at(data_root)
 
 
@@ -226,7 +227,7 @@ def test_copy_blobs_refuses_a_blob_that_is_a_symlink(trusted_tmp: Path) -> None:
 @pytest.mark.parametrize("kind", LINK_KINDS)
 def test_verify_backup_refuses_a_backup_whose_shard_is_a_link(trusted_tmp: Path, kind: str) -> None:
     data_root = trusted_tmp / "r"
-    rt = open_runtime(data_root, os_adapters())
+    rt = open_cloned_runtime(data_root, os_adapters(), role="c04r2-verify-bak")
     try:
         digest = rt.store.store_content(PAYLOAD, "event", HOLDER, RetentionClass.EVENT_PAYLOAD, None)
         backup = create_store_backup(rt.store, rt.os_, datetime.now(UTC))

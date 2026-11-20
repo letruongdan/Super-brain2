@@ -511,6 +511,55 @@ def _order_bucket_for_io_stagger(shard_idx: int, group: list[str]) -> list[str]:
     return [*non_storage, *storage, *wheel]
 
 
+TIMING_CONTRACT_PARALLEL_MAX = "parallel_max_per_worker_bounded_300s"
+_PARTITION_SPEC = re.compile(r"^([0-9]+)/([0-9]+)$")
+
+
+def parse_partition(spec: str) -> tuple[int, int]:
+    """Parse ``'<index>/<count>'`` into ``(index, count)`` with ``0 <= index < count`` and ``count >= 1``."""
+    match = _PARTITION_SPEC.fullmatch(spec.strip())
+    if match is None:
+        raise ValueError(f"partition must be '<index>/<count>', got {spec!r}")
+    index, count = int(match.group(1)), int(match.group(2))
+    if count < 1 or index < 0 or index >= count:
+        raise ValueError(f"partition index {index} out of range for count {count}")
+    return index, count
+
+
+def partition_files(collected_ids: Sequence[str], partition: tuple[int, int]) -> list[str]:
+    """Deterministically partition whole test files across ``count`` balanced buckets and return bucket ``index``."""
+    index, count = partition
+    if count < 1 or index < 0 or index >= count:
+        raise ValueError(f"invalid partition {partition!r}")
+    counts = Counter(node.split("::", 1)[0] for node in collected_ids)
+    if not counts:
+        return []
+    if count == 1:
+        return sorted(counts)
+    buckets: list[list[str]] = [[] for _ in range(count)]
+    loads = [0] * count
+    wheel_items: list[tuple[int, str]] = []
+    remaining: list[tuple[int, str]] = []
+    for file, case_count in counts.items():
+        cost = _estimated_file_cost_ms(file, case_count)
+        if file.replace("\\", "/") in _WHEEL_FIXTURE_FILES:
+            wheel_items.append((cost, file))
+        else:
+            remaining.append((cost, file))
+    for cost, file in sorted(wheel_items, key=lambda item: (-item[0], item[1])):
+        bucket_idx = min(range(count), key=lambda idx: (loads[idx], idx))
+        buckets[bucket_idx].append(file)
+        loads[bucket_idx] += cost
+    for idx in range(count):
+        if buckets[idx]:
+            loads[idx] += _WHEEL_SETUP_COST_MS
+    for cost, file in sorted(remaining, key=lambda item: (-item[0], item[1])):
+        bucket_idx = min(range(count), key=lambda idx: (loads[idx], idx))
+        buckets[bucket_idx].append(file)
+        loads[bucket_idx] += cost
+    return sorted(buckets[index])
+
+
 def shard_files(collected_ids: Sequence[str], shards: int) -> list[list[str]]:
     """Group whole test files by estimated millisecond cost, placing wheel suites across the minimal shard prefix."""
     counts = Counter(node.split("::", 1)[0] for node in collected_ids)
@@ -628,17 +677,28 @@ def parse_junit(path: Path, *, root: Path | None = None) -> tuple[list[str], dic
     return _parse_junit(path.read_bytes(), root=root)
 
 
+def _junit_nodeid(case: ET.Element, *, root: Path | None) -> str:
+    classname = case.get("classname") or ""
+    name = case.get("name") or ""
+    file_attr = (case.get("file") or "").replace("\\", "/")
+    if file_attr and classname:
+        mod_dotted = file_attr.replace("/", ".")
+        if classname == mod_dotted:
+            return f"{file_attr}::{name}"
+        if classname.startswith(mod_dotted + "."):
+            classes = classname[len(mod_dotted) + 1 :].split(".")
+            return "::".join([file_attr, *classes, name])
+    if classname:
+        module, classes = _split_classname(classname, root)
+        return "::".join([module, *classes, name])
+    return name
+
+
 def _parse_junit(report: bytes, *, root: Path | None) -> tuple[list[str], dict[str, str]]:
     ids: list[str] = []
     outcomes: dict[str, str] = {}
     for case in ET.fromstring(report).iter("testcase"):
-        classname = case.get("classname") or ""
-        name = case.get("name") or ""
-        if classname:
-            module, classes = _split_classname(classname, root)
-            node_id = "::".join([module, *classes, name])
-        else:
-            node_id = name
+        node_id = _junit_nodeid(case, root=root)
         if node_id in outcomes:
             raise ValueError(f"duplicate testcase in JUnit report: {node_id}")
         ids.append(node_id)
@@ -1013,7 +1073,9 @@ def receipt_name(receipt: Mapping[str, JsonValue]) -> str:
     impl, version, platform = receipt["implementation"], receipt["python"], receipt["platform"]
     if not isinstance(start, dict):  # the source could not be read: never named after a commit
         return f"receipt-unverified-{impl}{version}-{platform}-{uuid.uuid4().hex[:12]}.json"
-    commit, lock = str(start["commit"]), str(start["lock_digest"])
+    commit = str(start["commit"])
+    raw_lock = start.get("lock_digest") or start.get("tracked") or start.get("tree") or ("sha256:" + "0" * 64)
+    lock = str(raw_lock)
     return f"receipt-{commit[:12]}-{impl}{version}-{platform}-{lock[7:19]}.json"
 
 
@@ -1072,7 +1134,12 @@ class EvidenceDirError(OSError):
 
 
 def run_gate(
-    repo: Path, python: str, *, evidence_dir: Path | None = None, shards: int = PYTEST_SHARDS
+    repo: Path,
+    python: str,
+    *,
+    evidence_dir: Path | None = None,
+    shards: int = PYTEST_SHARDS,
+    partition: tuple[int, int] | None = None,
 ) -> tuple[dict[str, JsonValue], str]:
     """Run the gate in a detached worktree of the resolved HEAD. Returns the receipt and a printable log.
 
@@ -1132,6 +1199,8 @@ def run_gate(
     phases: list[PhaseResult] = []
     interpreter: InterpreterInfo | None = None
     collected: list[str] = []
+    selected_files: list[str] = []
+    target_ids: list[str] = []
     junit_ids: list[str] = []
     outcomes: dict[str, str] = {}
     start: SourceIdentity | None = None
@@ -1324,7 +1393,15 @@ def run_gate(
                     "lint-imports": _uv(worktree, python, "lint-imports"),
                     "pytest": _uv(worktree, python, "pytest", f"--junitxml={junit}", "-q", "-rfEX"),
                 }
-                groups = shard_files(collected, shards)
+                selected_files = []
+                target_ids = list(collected)
+                if partition is not None:
+                    selected_files = partition_files(collected, partition)
+                    selected_set = set(selected_files)
+                    target_ids = [nid for nid in collected if nid.split("::", 1)[0] in selected_set]
+                    ev.write("collected-full.json", canonical_json(sorted(collected)))
+                    ev.write("collected-partition.json", canonical_json(sorted(target_ids)))
+                groups = shard_files(target_ids, shards)
                 for name in REQUIRED_PHASES:
                     timeout = bounded(f"phase {name}", PHASE_TIMEOUTS_S[name])
                     if timeout is None:
@@ -1333,7 +1410,16 @@ def run_gate(
                         phase, job_ended = run_sharded_pytest(groups, deadline)
                         phases.append(phase)
                         continue
-                    code, output, seconds, error = step(name, commands[name], worktree, timeout)
+                    if name == "pytest" and partition is not None and not groups:
+                        extra.append("partition has empty test inventory")
+                        phases.append(PhaseResult("pytest", 1, 0.0))
+                        continue
+                    cmd = (
+                        [*commands[name], *groups[0]]
+                        if name == "pytest" and partition is not None and len(groups) == 1
+                        else commands[name]
+                    )
+                    code, output, seconds, error = step(name, cmd, worktree, timeout)
                     if error is not None:
                         extra.append(f"phase {name} {error}")
                         halted = "an earlier step did not complete"
@@ -1347,7 +1433,7 @@ def run_gate(
                         log.append(f"--- {name} (exit {code}) ---\n{output[-4000:]}")
                 if job_ended is None:
                     job_ended = time.monotonic()
-                    if len(groups) <= 1:
+                    if len(groups) <= 1 and not (partition is not None and not groups):
                         junit_ids, outcomes = read_report(junit, "junit.xml", pytest_output)
         if created:
             try:
@@ -1383,7 +1469,7 @@ def run_gate(
         start=start,
         end=end,
         phases=phases,
-        collected_ids=collected,
+        collected_ids=target_ids,
         junit_ids=junit_ids,
         junit_outcomes=outcomes,
         python=(interpreter.version.split()[0] if interpreter else python),
@@ -1406,6 +1492,15 @@ def run_gate(
     }
     receipt["steps"] = steps
     receipt["host"] = _host()
+    if partition is not None:
+        part_files: list[JsonValue] = list(sorted(selected_files))
+        receipt["partition"] = {
+            "index": partition[0],
+            "count": partition[1],
+            "files": part_files,
+            "full_collected_count": len(collected),
+            "full_collected_digest": digest_bytes(canonical_json(sorted(collected))),
+        }
     receipt["evidence"] = {
         "attempt_dir": str(attempt_dir) if attempt_dir is not None else None,
         "manifest": dict(ev.manifest),
@@ -1425,15 +1520,418 @@ def run_gate(
     return receipt, "\n".join(log)
 
 
+def _is_finite_non_neg_number(val: object) -> bool:
+    return (
+        isinstance(val, (int, float))
+        and not isinstance(val, bool)
+        and math.isfinite(float(val))
+        and float(val) >= 0.0
+    )
+
+
+def _worker_source_clean(identity: object) -> bool:
+    if not isinstance(identity, Mapping):
+        return False
+    flag = identity.get("tree_clean") if "tree_clean" in identity else identity.get("clean")
+    return flag is True
+
+
+def _parse_junit_items(report: bytes) -> tuple[list[tuple[str, str]], float]:
+    items: list[tuple[str, str]] = []
+    total_time = 0.0
+    for case in ET.fromstring(report).iter("testcase"):
+        node_id = _junit_nodeid(case, root=None)
+        items.append((node_id, _outcome(case)))
+        raw_t = case.get("time")
+        if raw_t is not None:
+            try:
+                total_time += float(raw_t)
+            except ValueError:
+                pass
+    return items, total_time
+
+
+def aggregate_partition_receipts(
+    workers_dir: Path,
+    *,
+    python: str,
+    partition_count: int,
+    evidence_dir: Path | None = None,
+    expected_commit: str | None = None,
+) -> tuple[dict[str, JsonValue], str]:
+    """Verify and combine all ``partition_count`` worker attempts into one F4 aggregate receipt."""
+    attempt_dir: Path | None = None
+    if evidence_dir is not None:
+        try:
+            evidence_dir.mkdir(parents=True, exist_ok=True)
+            attempt_dir = evidence_dir / f"attempt-{datetime.now(UTC):%Y%m%dT%H%M%S%fZ}-{uuid.uuid4().hex[:8]}"
+            attempt_dir.mkdir()
+        except OSError as err:
+            raise EvidenceDirError(f"{type(err).__name__}: {err}") from err
+    ev = _Evidence(attempt_dir)
+    reasons: list[str] = []
+    if partition_count < 1:
+        reasons.append(f"invalid partition_count {partition_count}")
+
+    receipt_paths = sorted(workers_dir.rglob("receipt.json")) if workers_dir.is_dir() else []
+    by_index: dict[int, tuple[Path, dict[str, object]]] = {}
+    for r_path in receipt_paths:
+        try:
+            raw_obj = json.loads(r_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as err:
+            reasons.append(f"unreadable worker receipt {r_path}: {type(err).__name__}: {err}")
+            continue
+        if not isinstance(raw_obj, dict):
+            reasons.append(f"worker receipt {r_path} is not a JSON object")
+            continue
+        stored_digest = raw_obj.get("receipt_digest")
+        computed_digest = digest_bytes(canonical_json({k: v for k, v in raw_obj.items() if k != "receipt_digest"}))
+        if not isinstance(stored_digest, str) or stored_digest != computed_digest:
+            reasons.append(f"worker receipt {r_path} has tampered or invalid receipt_digest")
+            continue
+        part = raw_obj.get("partition")
+        if not isinstance(part, dict):
+            reasons.append(f"worker receipt {r_path} missing partition metadata")
+            continue
+        idx = part.get("index")
+        cnt = part.get("count")
+        if type(idx) is not int or type(cnt) is not int or cnt != partition_count or idx < 0 or idx >= partition_count:
+            reasons.append(
+                f"worker receipt {r_path} has invalid partition ({idx}/{cnt}, expected count {partition_count})"
+            )
+            continue
+        if idx in by_index:
+            reasons.append(f"duplicate partition index {idx} among worker receipts")
+            continue
+        by_index[idx] = (r_path, raw_obj)
+
+    missing_parts = [i for i in range(partition_count) if i not in by_index]
+    if missing_parts:
+        reasons.append(f"missing partition(s): {missing_parts}")
+
+    all_outcomes: dict[str, str] = {}
+    dup_nodeids: list[str] = []
+    worker_times: list[float] = []
+    worker_summaries: list[JsonValue] = []
+    total_junit_s = 0.0
+    base_full: list[str] | None = None
+    ref_start: object = None
+    ref_end: object = None
+    ref_commit: object = None
+    ref_platform: object = None
+    ref_python: object = None
+    ref_impl: object = None
+    ref_env: object = None
+
+    for idx in sorted(by_index):
+        r_path, w = by_index[idx]
+        w_dir = r_path.parent
+        w_prefix = f"partition {idx}"
+
+        ev_sec = w.get("evidence")
+        manifest = ev_sec.get("manifest") if isinstance(ev_sec, dict) else None
+        if not isinstance(manifest, dict) or not manifest:
+            reasons.append(f"{w_prefix}: missing evidence manifest")
+        else:
+            w_root_resolved = w_dir.resolve()
+            for rel, exp_sha in manifest.items():
+                artifact = w_dir / str(rel)
+                if not artifact.resolve().is_relative_to(w_root_resolved) or not artifact.is_file():
+                    reasons.append(f"{w_prefix}: missing manifest artifact {rel}")
+                    continue
+                if digest_bytes(artifact.read_bytes()) != exp_sha:
+                    reasons.append(f"{w_prefix}: tampered artifact {rel}: manifest SHA-256 mismatch")
+            on_disk = {p.relative_to(w_dir).as_posix() for p in w_dir.rglob("*") if p.is_file()}
+            if on_disk - {r_path.name} != set(manifest):
+                reasons.append(f"{w_prefix}: unlisted or missing files relative to manifest")
+
+        if w.get("accepted") is not True:
+            w_rs = w.get("reasons")
+            reasons.append(f"{w_prefix}: worker did not pass (accepted={w.get('accepted')!r}, reasons={w_rs!r})")
+
+        phases_raw = w.get("phases")
+        phase_names = (
+            {p.get("name") for p in phases_raw if isinstance(p, dict)} if isinstance(phases_raw, list) else set()
+        )
+        if not isinstance(phases_raw, list) or phase_names != set(REQUIRED_PHASES):
+            reasons.append(f"{w_prefix}: missing required gate phases")
+        else:
+            for p_entry in phases_raw:
+                if not isinstance(p_entry, dict) or p_entry.get("exit_code") != 0:
+                    pname = p_entry.get("name") if isinstance(p_entry, dict) else "?"
+                    reasons.append(f"{w_prefix}: phase {pname} failed")
+
+        w_time = w.get("test_job_seconds")
+        if not isinstance(w_time, (int, float)) or isinstance(w_time, bool) or not math.isfinite(float(w_time)):
+            reasons.append(f"{w_prefix}: non-numeric or non-finite test_job_seconds {w_time!r}")
+            w_time_val: JsonValue = None
+        elif float(w_time) < 0.0:
+            reasons.append(f"{w_prefix}: negative test_job_seconds {w_time!r}")
+            w_time_val = None
+        else:
+            w_float = float(w_time)
+            w_time_val = w_float
+            worker_times.append(w_float)
+            if w_float >= TEST_JOB_BUDGET_S:
+                reasons.append(
+                    f"{w_prefix}: test_job_seconds {w_float:.3f}s exceeds {TEST_JOB_BUDGET_S:.1f}s budget"
+                )
+
+        w_req_py = w.get("requested_python")
+        if w_req_py != python:
+            reasons.append(f"{w_prefix}: requested_python {w_req_py!r} != {python!r}")
+        w_env = w.get("environment")
+        if not isinstance(w_env, dict) or w_env.get("accepted") is not True:
+            reasons.append(f"{w_prefix}: environment was not accepted")
+
+        w_start, w_end, w_commit = w.get("start"), w.get("end"), w.get("resolved_commit")
+        if not _worker_source_clean(w_start) or not _worker_source_clean(w_end) or w_start != w_end:
+            reasons.append(f"{w_prefix}: source identity unverified, dirty, or changed during run")
+        if ref_start is None:
+            ref_start, ref_end, ref_commit = w_start, w_end, w_commit
+            ref_platform = w.get("platform")
+            ref_python = w.get("python")
+            ref_impl = w.get("implementation")
+            ref_env = w_env
+        else:
+            if w_start != ref_start or w_end != ref_end or w_commit != ref_commit:
+                reasons.append(f"{w_prefix}: commit/source identity mismatch across partitions")
+            if (
+                w.get("platform") != ref_platform
+                or w.get("python") != ref_python
+                or w.get("implementation") != ref_impl
+            ):
+                reasons.append(f"{w_prefix}: interpreter/platform mismatch across partitions")
+        if expected_commit is not None and w_commit != expected_commit:
+            reasons.append(f"{w_prefix}: commit {w_commit!r} != expected {expected_commit!r}")
+
+        part_meta = w["partition"]
+        assert isinstance(part_meta, dict)
+        full_p = w_dir / "collected-full.json"
+        part_p = w_dir / "collected-partition.json"
+        if not isinstance(manifest, dict) or "collected-full.json" not in manifest or not full_p.is_file():
+            reasons.append(f"{w_prefix}: missing collected-full.json")
+        else:
+            try:
+                w_full = json.loads(full_p.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as err:
+                reasons.append(f"{w_prefix}: invalid collected-full.json: {err}")
+                w_full = None
+            if not isinstance(w_full, list) or not all(isinstance(x, str) for x in w_full):
+                reasons.append(f"{w_prefix}: malformed collected-full.json")
+            else:
+                sorted_full = sorted(w_full)
+                exp_full_dig = part_meta.get("full_collected_digest")
+                exp_full_cnt = part_meta.get("full_collected_count")
+                if len(set(sorted_full)) != len(sorted_full):
+                    reasons.append(f"{w_prefix}: full collected inventory contains duplicates")
+                elif digest_bytes(canonical_json(sorted_full)) != exp_full_dig or len(sorted_full) != exp_full_cnt:
+                    reasons.append(f"{w_prefix}: full_collected_digest or count mismatch")
+                elif base_full is None:
+                    base_full = sorted_full
+                elif sorted_full != base_full:
+                    reasons.append(f"{w_prefix}: full test inventory mismatch across partitions")
+
+        w_part_ids: list[str] | None = None
+        if not isinstance(manifest, dict) or "collected-partition.json" not in manifest or not part_p.is_file():
+            reasons.append(f"{w_prefix}: missing collected-partition.json")
+        else:
+            try:
+                raw_part_ids = json.loads(part_p.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as err:
+                reasons.append(f"{w_prefix}: invalid collected-partition.json: {err}")
+                raw_part_ids = None
+            if isinstance(raw_part_ids, list) and all(isinstance(x, str) for x in raw_part_ids):
+                w_part_ids = sorted(raw_part_ids)
+            else:
+                reasons.append(f"{w_prefix}: malformed collected-partition.json")
+
+        w_junit_rels = sorted(
+            str(rel) for rel in (manifest or {}) if str(rel).startswith("junit") and str(rel).endswith(".xml")
+        )
+        if not w_junit_rels:
+            reasons.append(f"{w_prefix}: missing JUnit XML report in manifest")
+        worker_junit_ids: list[str] = []
+        raw_outcomes_obj = w.get("outcomes")
+        raw_w_outcomes: dict[object, object] = raw_outcomes_obj if isinstance(raw_outcomes_obj, dict) else {}
+        for jrel in w_junit_rels:
+            try:
+                items, jtime = _parse_junit_items((w_dir / jrel).read_bytes())
+            except (OSError, ET.ParseError, ValueError) as err:
+                reasons.append(f"{w_prefix}: invalid JUnit {jrel}: {err}")
+                continue
+            total_junit_s += jtime
+            for nid, outc in items:
+                worker_junit_ids.append(nid)
+                if outc == "passed" and raw_w_outcomes.get(nid) == "xpassed":
+                    outc = "xpassed"
+                if nid in all_outcomes:
+                    dup_nodeids.append(nid)
+                else:
+                    all_outcomes[nid] = outc
+        if w_part_ids is not None and sorted(worker_junit_ids) != w_part_ids:
+            reasons.append(f"{w_prefix}: JUnit nodeids do not match partition collected inventory")
+
+        raw_digest = w.get("receipt_digest")
+        w_counts = w.get("counts")
+        worker_summaries.append({
+            "index": idx,
+            "accepted": bool(w.get("accepted")),
+            "test_job_seconds": w_time_val,
+            "receipt_digest": str(raw_digest) if isinstance(raw_digest, str) else None,
+            "counts": dict(w_counts) if isinstance(w_counts, dict) else None,
+            "attempt_dir": str(w_dir),
+        })
+
+    if dup_nodeids:
+        sample = sorted(set(dup_nodeids))[:5]
+        reasons.append(f"duplicate testcase nodeid(s) across partitions ({len(dup_nodeids)}): {sample}")
+    if base_full is not None:
+        missing_tests = sorted(set(base_full) - set(all_outcomes))
+        if missing_tests:
+            reasons.append(f"missing testcase(s) from aggregate JUnit ({len(missing_tests)}): {missing_tests[:5]}")
+        extra_tests = sorted(set(all_outcomes) - set(base_full))
+        if extra_tests:
+            reasons.append(f"unexpected testcase(s) in aggregate JUnit ({len(extra_tests)}): {extra_tests[:5]}")
+    bad = sorted(nid for nid, v in all_outcomes.items() if v not in NON_FAILING)
+    if bad:
+        reasons.append(f"{len(bad)} test(s) did not pass across partitions, first: {bad[:5]}")
+
+    counted = Counter(v for v in all_outcomes.values() if v in TERMINAL_OUTCOMES)
+    counts: dict[str, JsonValue] = {name: counted.get(name, 0) for name in sorted(TERMINAL_OUTCOMES)}
+    agg_test_job_s = max(worker_times) if worker_times else None
+    worker_sum_s = sum(worker_times) if worker_times else None
+    if agg_test_job_s is not None and agg_test_job_s >= TEST_JOB_BUDGET_S:
+        if not any("budget" in r for r in reasons):
+            reasons.append(
+                f"aggregate test_job_seconds {agg_test_job_s:.3f}s meets/exceeds {TEST_JOB_BUDGET_S:.1f}s budget"
+            )
+
+    ev.write(
+        "source.json",
+        canonical_json({
+            "resolved_commit": ref_commit if isinstance(ref_commit, str) else None,
+            "start": ref_start if isinstance(ref_start, dict) else None,
+            "end": ref_end if isinstance(ref_end, dict) else None,
+            "host": _host(),
+        }),
+    )
+    reason_items: list[JsonValue] = list(reasons)
+    time_items: list[JsonValue] = list(worker_times)
+    agg_receipt: dict[str, JsonValue] = {
+        "accepted": not reasons,
+        "reasons": reason_items,
+        "timing_contract": TIMING_CONTRACT_PARALLEL_MAX,
+        "test_job_seconds": agg_test_job_s,
+        "time_budget_s": TEST_JOB_BUDGET_S,
+        "worker_test_job_seconds": time_items,
+        "worker_sum_seconds": worker_sum_s,
+        "total_junit_seconds": total_junit_s,
+        "full_collected_count": len(base_full) if base_full is not None else 0,
+        "test_count": len(base_full) if base_full is not None else len(all_outcomes),
+        "test_inventory_digest": digest_bytes(canonical_json(base_full)) if base_full is not None else None,
+        "junit_inventory_digest": digest_bytes(canonical_json(sorted(all_outcomes))),
+        "counts": counts,
+        "workers": worker_summaries,
+        "start": dict(ref_start) if isinstance(ref_start, dict) else None,
+        "end": dict(ref_end) if isinstance(ref_end, dict) else None,
+        "resolved_commit": ref_commit if isinstance(ref_commit, str) else None,
+        "requested_python": python,
+        "python": ref_python if isinstance(ref_python, str) else python,
+        "implementation": ref_impl if isinstance(ref_impl, str) else "unknown",
+        "platform": ref_platform if isinstance(ref_platform, str) else sys.platform,
+        "environment": dict(ref_env) if isinstance(ref_env, dict) else None,
+        "host": _host(),
+        "evidence": {
+            "attempt_dir": str(attempt_dir) if attempt_dir is not None else None,
+            "manifest": dict(ev.manifest),
+        },
+    }
+    agg_digest = digest_bytes(canonical_json(agg_receipt))
+    agg_receipt["receipt_digest"] = agg_digest
+    failure = ev.write_receipt(agg_receipt)
+    if failure is not None:
+        del agg_receipt["receipt_digest"]
+        agg_receipt["accepted"] = False
+        r_list = agg_receipt["reasons"]
+        assert isinstance(r_list, list)
+        r_list.append(failure)
+        agg_digest = digest_bytes(canonical_json(agg_receipt))
+        agg_receipt["receipt_digest"] = agg_digest
+    return agg_receipt, agg_digest
+
+
+def _aggregate_main(argv: Sequence[str]) -> int:
+    parser = argparse.ArgumentParser(description="Aggregate partitioned worker receipts into one F4 cell receipt.")
+    parser.add_argument("--python", required=True, help="Expected Python version")
+    parser.add_argument("--partition-count", type=int, required=True, help="Expected number of worker partitions")
+    parser.add_argument("--workers-dir", required=True, help="Directory holding worker attempt directories")
+    parser.add_argument("--evidence-dir", help="Absolute directory for the aggregate attempt dir")
+    parser.add_argument("--expected-commit", help="Optional resolved commit SHA all workers must match")
+    args = parser.parse_args(list(argv))
+    evidence: Path | None = None
+    if args.evidence_dir is not None:
+        evidence = Path(args.evidence_dir)
+        if not evidence.is_absolute():
+            print(
+                f"gate aggregate refused: --evidence-dir must be absolute, got {args.evidence_dir!r}",
+                file=sys.stderr,
+            )
+            return 2
+        if evidence.exists() and not evidence.is_dir():
+            print(f"gate aggregate refused: the evidence dir {evidence} is not a directory", file=sys.stderr)
+            return 2
+    repo = Path(__file__).resolve().parent.parent
+    try:
+        receipt, _ = aggregate_partition_receipts(
+            Path(args.workers_dir),
+            python=args.python,
+            partition_count=args.partition_count,
+            evidence_dir=evidence,
+            expected_commit=args.expected_commit,
+        )
+    except EvidenceDirError as err:
+        print(f"gate aggregate refused: the evidence dir could not be prepared: {err}", file=sys.stderr)
+        return 2
+    out_dir = repo / ".gate"
+    path = out_dir / receipt_name(receipt)
+    try:
+        out_dir.mkdir(exist_ok=True)
+        path.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    except OSError as err:
+        print(f"gate aggregate: the legacy receipt could not be written: {err}", file=sys.stderr)
+        return 1
+    counts = receipt["counts"]
+    assert isinstance(counts, dict)
+    summary = ", ".join(f"{k}={v}" for k, v in counts.items() if v)
+    print(f"gate aggregate {'ACCEPTED' if receipt['accepted'] else 'NOT ACCEPTED'}: {summary or 'no tests'} -> {path}")
+    reasons = receipt["reasons"]
+    if isinstance(reasons, list):
+        for reason in reasons:
+            print(f"  reason: {reason}", file=sys.stderr)
+    return 0 if receipt["accepted"] else 1
+
+
 def main(argv: Sequence[str] | None = None) -> int:
+    argv_list = list(sys.argv[1:] if argv is None else argv)
+    if argv_list and argv_list[0] == "aggregate":
+        return _aggregate_main(argv_list[1:])
     parser = argparse.ArgumentParser(description="Run the default gate and write a receipt.")
     parser.add_argument("--python", required=True, help="Python version to run the gate with, e.g. 3.14")
     parser.add_argument("--evidence-dir", help="absolute directory; each run writes a new attempt dir under it")
     parser.add_argument("--shards", type=int, default=PYTEST_SHARDS, help="maximum parallel pytest processes")
-    args = parser.parse_args(argv)
+    parser.add_argument("--partition", help="optional worker partition '<index>/<count>'")
+    args = parser.parse_args(argv_list)
     if args.shards < 1:
         print("gate refused: --shards must be at least 1", file=sys.stderr)
         return 2
+    partition: tuple[int, int] | None = None
+    if args.partition is not None:
+        try:
+            partition = parse_partition(args.partition)
+        except ValueError as err:
+            print(f"gate refused: invalid partition {args.partition!r}: {err}", file=sys.stderr)
+            return 2
     evidence: Path | None = None
     if args.evidence_dir is not None:
         evidence = Path(args.evidence_dir)
@@ -1448,7 +1946,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("gate refused: the working tree has uncommitted changes to tracked files", file=sys.stderr)
         return 2
     try:
-        receipt, log = run_gate(repo, args.python, evidence_dir=evidence, shards=args.shards)
+        receipt, log = run_gate(repo, args.python, evidence_dir=evidence, shards=args.shards, partition=partition)
     except EvidenceDirError as err:  # the attempt dir could not be created; nothing ran
         print(f"gate refused: the evidence dir could not be prepared: {err}", file=sys.stderr)
         return 2

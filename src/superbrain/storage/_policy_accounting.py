@@ -36,6 +36,7 @@ __all__ = [
     "AccountingInvocationRecord",
     "AccountingLockRecord",
     "PolicyAccountingMixin",
+    "accounting_schema_ready",
     "ensure_accounting_schema",
     "sync_legacy_accounting_from_store",
 ]
@@ -86,6 +87,15 @@ def canonical_decimal(value: Decimal) -> str:
     if "." in rendered:
         rendered = rendered.rstrip("0").rstrip(".")
     return rendered
+
+
+def accounting_schema_ready(db: sqlite3.Connection) -> bool:
+    """Return True when ``accounting_invocations`` and ``accounting_locks`` already carry I3-4 columns."""
+    inv_cols = {str(r[1]) for r in db.execute("PRAGMA table_info(accounting_invocations)").fetchall()}
+    if "owner_id" not in inv_cols:
+        return False
+    lock_cols = {str(r[1]) for r in db.execute("PRAGMA table_info(accounting_locks)").fetchall()}
+    return "period_key" in lock_cols
 
 
 def ensure_accounting_schema(db: sqlite3.Connection) -> None:

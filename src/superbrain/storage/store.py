@@ -321,15 +321,15 @@ class Store:
         (a handler registered after entries of its kinds were written must not start empty), then secure the
         database files and remove staging leftovers. Handlers whose live tables exist are not replayed."""
         self._history_versions = check_history(self._db, self._handlers)
-        with self._immediate() as db:
-            try:
-                fresh = [h for h in self._handlers if not _tables_with_prefix(db, live_prefix(h))]
-                for handler in fresh:
-                    _create_tables(db, handler, live_prefix(handler))
-                if fresh:
+        try:
+            fresh = [h for h in self._handlers if not _tables_with_prefix(self._db, live_prefix(h))]
+            if fresh:
+                with self._immediate() as db:
+                    for handler in fresh:
+                        _create_tables(db, handler, live_prefix(handler))
                     _replay(db, fresh, self._policy, live_prefix)
-            except sqlite3.Error as exc:
-                raise sqlite_error("cannot create projection tables", exc) from exc
+        except sqlite3.Error as exc:
+            raise sqlite_error("cannot create projection tables", exc) from exc
         for path in db_files(self._root.store_db):
             if path.exists():
                 self._os.permissions.secure_file(path)

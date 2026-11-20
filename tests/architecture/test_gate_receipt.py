@@ -427,9 +427,7 @@ def test_run_gate_all_green_with_fakes_is_accepted_and_removes_the_worktree(
     assert len(fake.removed) == 1 and not Path(fake.removed[0]).exists()
 
 
-def test_phase_failure_is_not_accepted_and_worktree_is_removed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_phase_failure_is_not_accepted_and_worktree_is_removed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     fake = FakeRunner(tmp_path, codes={"mypy": 1})
     receipt = run_with(tmp_path, monkeypatch, fake)
     assert receipt["accepted"] is False
@@ -449,9 +447,7 @@ def test_phase_timeout_is_recorded_as_none_and_worktree_is_removed(
     assert len(fake.removed) == 1
 
 
-def test_failed_worktree_removal_is_reported_and_not_accepted(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_failed_worktree_removal_is_reported_and_not_accepted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     fake = FakeRunner(tmp_path, codes={}, remove_fails=True)
     receipt = run_with(tmp_path, monkeypatch, fake)
     assert receipt["accepted"] is False
@@ -948,9 +944,7 @@ def test_missing_or_unparseable_junit_keeps_a_reason_and_raw_bytes(
     assert bool(kept) == (junit is not None), "raw JUnit bytes must be kept exactly when pytest wrote any"
 
 
-def test_missing_and_unparseable_junit_have_different_reasons(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_missing_and_unparseable_junit_have_different_reasons(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     found: list[set[str]] = []
     for i, junit in enumerate((None, b"<testsuites><testcase")):
         root = tmp_path / str(i)
@@ -1073,32 +1067,166 @@ CI_FILE = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ci.ym
 MATRIX_PY = r"\$\{\{\s*matrix\.python\s*\}\}"
 
 
-def ci_steps() -> list[str]:
-    """Each step of the single job as raw text (the ``- `` items directly under ``steps:``)."""
-    lines = CI_FILE.read_text(encoding="utf-8").splitlines()
-    at = next(i for i, line in enumerate(lines) if line.strip() == "steps:")
-    items = [i for i in range(at + 1, len(lines)) if lines[i].lstrip().startswith("- ")]
-    indent = len(lines[items[0]]) - len(lines[items[0]].lstrip())
-    starts = [i for i in items if len(lines[i]) - len(lines[i].lstrip()) == indent]
-    ends = [*starts[1:], len(lines)]
-    return ["\n".join(lines[s:e]) for s, e in zip(starts, ends, strict=True)]
+def ci_jobs() -> dict[str, dict[str, Any]]:
+    """Parse top-level jobs from .github/workflows/ci.yml using stdlib without external yaml dependency."""
+    text = CI_FILE.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    job_starts: list[tuple[str, int]] = []
+    in_jobs = False
+    for i, line in enumerate(lines):
+        if line.strip() == "jobs:":
+            in_jobs = True
+            continue
+        if in_jobs:
+            m = re.match(r"^  ([a-zA-Z0-9_-]+):\s*$", line)
+            if m:
+                job_starts.append((m.group(1), i))
+            elif line and not line.startswith(" "):
+                in_jobs = False
+
+    jobs: dict[str, dict[str, Any]] = {}
+    for idx, (name, s_line) in enumerate(job_starts):
+        e_line = job_starts[idx + 1][1] if idx + 1 < len(job_starts) else len(lines)
+        job_lines = lines[s_line:e_line]
+        job_dict: dict[str, Any] = {}
+        for line_item in job_lines:
+            m_runs = re.match(r"^\s+runs-on:\s*(\S+)", line_item)
+            if m_runs:
+                job_dict["runs-on"] = m_runs.group(1).strip("'\"")
+            m_needs = re.match(r"^\s+needs:\s*\[(.*?)\]", line_item)
+            if m_needs:
+                job_dict["needs"] = [v.strip().strip("'\"") for v in m_needs.group(1).split(",") if v.strip()]
+            elif re.match(r"^\s+needs:\s*(\S+)", line_item):
+                m_need = re.match(r"^\s+needs:\s*(\S+)", line_item)
+                if m_need:
+                    job_dict["needs"] = [m_need.group(1).strip("'\"")]
+            m_if = re.match(r"^\s+if:\s*(.*)$", line_item)
+            if m_if and "if" not in job_dict:
+                job_dict["if"] = m_if.group(1).strip()
+        jobs[name] = job_dict
+    return jobs
 
 
-def ci_matrix_list(name: str) -> list[str]:
-    match = re.search(rf"^\s*{name}:\s*\[(.*?)\]", CI_FILE.read_text(encoding="utf-8"), re.M)
-    assert match, f"matrix.{name} is not an inline list"
+def ci_steps(job: str | None = None) -> list[str]:
+    """Each step of a job as raw text (the ``- `` items directly under ``steps:``).
+
+    If ``job`` is None, defaults to the primary ``gate`` job for backwards compatibility.
+    """
+    target_job = job if job is not None else "gate"
+    text = CI_FILE.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    job_starts: list[tuple[str, int]] = []
+    in_jobs = False
+    for i, line in enumerate(lines):
+        if line.strip() == "jobs:":
+            in_jobs = True
+            continue
+        if in_jobs:
+            m = re.match(r"^  ([a-zA-Z0-9_-]+):\s*$", line)
+            if m:
+                job_starts.append((m.group(1), i))
+            elif line and not line.startswith(" "):
+                in_jobs = False
+
+    idx = next((i for i, (name, _) in enumerate(job_starts) if name == target_job), None)
+    if idx is None:
+        raise KeyError(f"Job {target_job!r} not found in {CI_FILE}; known jobs: {[n for n, _ in job_starts]}")
+    s_line = job_starts[idx][1]
+    e_line = job_starts[idx + 1][1] if idx + 1 < len(job_starts) else len(lines)
+
+    job_lines = lines[s_line:e_line]
+    at = next((i for i, line_item in enumerate(job_lines) if line_item.strip() == "steps:"), None)
+    if at is None:
+        return []
+    items = [i for i in range(at + 1, len(job_lines)) if job_lines[i].lstrip().startswith("- ")]
+    if not items:
+        return []
+    indent = len(job_lines[items[0]]) - len(job_lines[items[0]].lstrip())
+    starts = [i for i in items if len(job_lines[i]) - len(job_lines[i].lstrip()) == indent]
+    ends = [*starts[1:], len(job_lines)]
+    return ["\n".join(job_lines[s:e]) for s, e in zip(starts, ends, strict=True)]
+
+
+def ci_matrix_list(name: str, job: str = "gate") -> list[str]:
+    text = CI_FILE.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    job_starts: list[tuple[str, int]] = []
+    in_jobs = False
+    for i, line in enumerate(lines):
+        if line.strip() == "jobs:":
+            in_jobs = True
+            continue
+        if in_jobs:
+            m = re.match(r"^  ([a-zA-Z0-9_-]+):\s*$", line)
+            if m:
+                job_starts.append((m.group(1), i))
+            elif line and not line.startswith(" "):
+                in_jobs = False
+
+    idx = next((i for i, (n, _) in enumerate(job_starts) if n == job), None)
+    if idx is None:
+        raise KeyError(f"Job {job!r} not found in {CI_FILE}")
+    s_line = job_starts[idx][1]
+    e_line = job_starts[idx + 1][1] if idx + 1 < len(job_starts) else len(lines)
+    job_text = "\n".join(lines[s_line:e_line])
+    match = re.search(rf"^\s*{name}:\s*\[(.*?)\]", job_text, re.M)
+    assert match, f"matrix.{name} is not an inline list in job {job}"
     return [v.strip().strip("'\"") for v in match.group(1).split(",")]
 
 
-def test_ci_keeps_the_six_matrix_cells() -> None:
-    text = CI_FILE.read_text(encoding="utf-8")
-    assert set(ci_matrix_list("os")) == {"windows-2022", "macos-latest", "ubuntu-latest"}
-    assert ci_matrix_list("python") == ["3.11", "3.14"]
-    assert "exclude:" not in text and "include:" not in text
+def test_ci_three_jobs_workflow_contract() -> None:
+    """The 3-job CI workflow: gate (POSIX), gate-windows-worker (sharded partitions), gate-windows-aggregate."""
+    jobs = ci_jobs()
+    expected_jobs = {"gate", "gate-windows-worker", "gate-windows-aggregate"}
+    assert set(jobs.keys()) == expected_jobs, f"Expected jobs {expected_jobs}, found {set(jobs.keys())}"
+
+    # 1. POSIX gate job
+    assert set(ci_matrix_list("os", "gate")) == {"macos-latest", "ubuntu-latest"}
+    assert ci_matrix_list("python", "gate") == ["3.11", "3.14"]
+    gate_steps = ci_steps("gate")
+    gate_at = next((i for i, s in enumerate(gate_steps) if "scripts/gate.py" in s), None)
+    assert gate_at is not None
+    gate_step = gate_steps[gate_at]
+    assert re.search(rf"uv run --locked --python {MATRIX_PY} python scripts/gate\.py --python {MATRIX_PY}", gate_step)
+    assert "--evidence-dir" in gate_step and "runner.temp" in gate_step
+    bench_at = next((i for i, s in enumerate(gate_steps) if "tests.integration.test_kernel_performance" in s), None)
+    assert bench_at is not None and bench_at > gate_at
+
+    # 2. Windows partitioned worker job
+    worker_job = jobs["gate-windows-worker"]
+    assert worker_job.get("runs-on") == "windows-2022"
+    assert ci_matrix_list("python", "gate-windows-worker") == ["3.11", "3.14"]
+    assert ci_matrix_list("partition", "gate-windows-worker") == ["0", "1"]
+    worker_steps = ci_steps("gate-windows-worker")
+    w_gate_at = next((i for i, s in enumerate(worker_steps) if "scripts/gate.py" in s), None)
+    assert w_gate_at is not None
+    w_step = worker_steps[w_gate_at]
+    assert "--partition" in w_step and "${{ matrix.partition }}/2" in w_step
+    w_uploads = [s for s in worker_steps if "upload-artifact" in s]
+    assert any("gate-worker-windows-" in s and "if: always()" in s for s in w_uploads), (
+        "Windows worker must upload partition evidence artifact unconditionally"
+    )
+
+    # 3. Windows aggregate job
+    agg_job = jobs["gate-windows-aggregate"]
+    assert agg_job.get("runs-on") == "windows-2022"
+    assert agg_job.get("needs") == ["gate-windows-worker"] or agg_job.get("needs") == "gate-windows-worker"
+    assert "always()" in str(agg_job.get("if", ""))
+    assert ci_matrix_list("python", "gate-windows-aggregate") == ["3.11", "3.14"]
+    agg_steps = ci_steps("gate-windows-aggregate")
+    agg_at = next((i for i, s in enumerate(agg_steps) if "scripts/gate.py aggregate" in s), None)
+    assert agg_at is not None
+    agg_step = agg_steps[agg_at]
+    assert "--partition-count 2" in agg_step or "--partition-count" in agg_step
+    agg_bench_at = next((i for i, s in enumerate(agg_steps) if "tests.integration.test_kernel_performance" in s), None)
+    assert agg_bench_at is not None and agg_bench_at > agg_at
+    agg_uploads = [s for s in agg_steps if "upload-artifact" in s]
+    assert any(".gate/" in s for s in agg_uploads), "Aggregate job must upload .gate/ receipt"
+    assert any("gate-evidence" in s for s in agg_uploads), "Aggregate job must upload gate-evidence"
 
 
 def test_ci_runs_the_locked_gate_with_evidence_and_uploads_it_always() -> None:
-    steps = ci_steps()
+    steps = ci_steps("gate")
     gate_at = next((i for i, s in enumerate(steps) if "scripts/gate.py" in s), None)
     assert gate_at is not None
     step = steps[gate_at]
@@ -1543,9 +1671,7 @@ class ShardRunner(ClockRunner):
         return {"failed": 1, "timed-out": None}.get(behavior, 0), f"OUT-{label}"
 
 
-def _run_shards(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, runner: ShardRunner
-) -> tuple[Path, dict[str, Any]]:
+def _run_shards(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, runner: ShardRunner) -> tuple[Path, dict[str, Any]]:
     monkeypatch.setattr(gate, "run", runner)
     monkeypatch.setattr(gate, "time", runner.clock)
     monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
@@ -1777,7 +1903,8 @@ def test_shard_thread_start_failure_preserves_every_finished_shard_report(
         expected.update(dict.fromkeys(SHARD_IDS[file], "passed"))
     assert receipt["outcomes"] == expected
     assert any(
-        "pytest" in reason.lower() and "shard" in reason.lower()
+        "pytest" in reason.lower()
+        and "shard" in reason.lower()
         and any(word in reason.lower() for word in ("launch", "start", "thread"))
         for reason in receipt["reasons"]
     ), receipt["reasons"]
@@ -2120,9 +2247,7 @@ def test_remove_gate_worktree_drops_real_owned_checkout_and_preserves_sentinels(
         timeout=20,
     )
     paths = [
-        Path(line.removeprefix("worktree ")).resolve()
-        for line in listed.splitlines()
-        if line.startswith("worktree ")
+        Path(line.removeprefix("worktree ")).resolve() for line in listed.splitlines() if line.startswith("worktree ")
     ]
     assert paths == [repo]
     for p, (content, inode) in before.items():
@@ -2465,3 +2590,434 @@ def test_win32_job_object_lifecycle_and_non_win32_graceful_noop(monkeypatch: pyt
             _handle = True
 
         assert assign_fn(_MockProcBool()) is None
+
+
+# =========================================================================================================
+# Branch B (2-runner Windows CI + aggregate receipt)
+# =========================================================================================================
+
+
+def test_parse_partition_valid_and_invalid() -> None:
+    parse_partition = getattr(gate, "parse_partition", None)
+    assert parse_partition is not None, "scripts.gate must export parse_partition"
+    assert parse_partition("0/2") == (0, 2)
+    assert parse_partition("1/2") == (1, 2)
+    assert parse_partition("0/1") == (0, 1)
+    assert parse_partition("2/5") == (2, 5)
+    for bad in ("2/2", "3/2", "-1/2", "0/0", "0/-1", "abc", "0/2/3", "", "0/", "/2", "0:2"):
+        with pytest.raises(ValueError):
+            parse_partition(bad)
+
+
+def test_gate_cli_rejects_invalid_partition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, _, err = gate_cli(tmp_path, monkeypatch, capsys, ClockRunner(), "--partition", "2/2")
+    assert code == 2, f"CLI must exit 2 on invalid partition arg; got {code}, stderr:\n{err}"
+    assert "unrecognized arguments" not in err.lower(), f"CLI must support --partition option; got: {err}"
+    assert "argument --partition" in err.lower() or "invalid partition" in err.lower(), (
+        f"CLI must report partition validation error; got: {err}"
+    )
+    code_bad, _, err_bad = gate_cli(tmp_path, monkeypatch, capsys, ClockRunner(), "--partition", "invalid")
+    assert code_bad == 2, f"CLI must exit 2 on unparseable partition arg; got {code_bad}, stderr:\n{err_bad}"
+    assert "unrecognized arguments" not in err_bad.lower()
+
+
+
+def test_partition_files_disjoint_union_and_deterministic() -> None:
+    partition_files = getattr(gate, "partition_files", None)
+    assert partition_files is not None, "scripts.gate must export partition_files"
+    file_list = [
+        "tests/core/test_canonical.py",
+        "tests/core/test_faults.py",
+        "tests/storage/test_cas.py",
+        "tests/storage/test_backup.py",
+        "tests/storage/test_restore.py",
+        "tests/integration/test_kernel_cli.py",
+        "tests/integration/test_mcp_v2_schema.py",
+        "tests/integration/test_kernel_crash_recovery.py",
+        "tests/integration/test_kernel_daemon.py",
+        "tests/application/test_kernel_deadlines.py",
+    ]
+    ids = [f"{f}::test_{i}" for f in file_list for i in range(5)]
+    # 2 partitions
+    p0 = partition_files(ids, (0, 2))
+    p1 = partition_files(ids, (1, 2))
+    assert isinstance(p0, list) and isinstance(p1, list)
+    assert set(p0).isdisjoint(set(p1)), f"Partitions must be disjoint: intersection={set(p0) & set(p1)}"
+    assert set(p0) | set(p1) == set(file_list), (
+        f"Union must match all files: missing={set(file_list) - (set(p0) | set(p1))}"
+    )
+    assert all(f in file_list for f in p0)
+    assert all(f in file_list for f in p1)
+    # Determinism
+    assert partition_files(ids, (0, 2)) == p0
+    assert partition_files(ids, (1, 2)) == p1
+
+    # 3 partitions
+    parts_3 = [partition_files(ids, (i, 3)) for i in range(3)]
+    for i in range(3):
+        for j in range(i + 1, 3):
+            assert set(parts_3[i]).isdisjoint(set(parts_3[j]))
+    assert set().union(*parts_3) == set(file_list)
+
+
+def test_partition_files_balances_wheel_suites_across_partitions() -> None:
+    partition_files = getattr(gate, "partition_files", None)
+    assert partition_files is not None, "scripts.gate must export partition_files"
+    wheel_files = [
+        "tests/contract/test_mcp_v2_schema.py",
+        "tests/integration/test_kernel_cli.py",
+        "tests/integration/test_kernel_crash_recovery.py",
+        "tests/integration/test_kernel_native_receipt_contract.py",
+    ]
+    other_files = [
+        "tests/storage/test_cas.py",
+        "tests/storage/test_restore.py",
+        "tests/storage/test_backup.py",
+        "tests/core/test_canonical.py",
+    ]
+    ids = [f"{f}::test_{i}" for f in (*wheel_files, *other_files) for i in range(4)]
+    p0 = partition_files(ids, (0, 2))
+    p1 = partition_files(ids, (1, 2))
+    w0 = set(p0) & set(wheel_files)
+    w1 = set(p1) & set(wheel_files)
+    assert w0 and w1, f"Wheel suites must be balanced across partitions, got w0={w0}, w1={w1}"
+
+
+def test_worker_partition_records_partition_evidence_and_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    evidence = tmp_path / "ev"
+    evidence.mkdir()
+    runner = ClockRunner()
+    code, _, err = gate_cli(
+        tmp_path, monkeypatch, capsys, runner, "--evidence-dir", str(evidence), "--partition", "0/2"
+    )
+    assert code == 0, f"Worker partition run failed with code {code}, stderr:\n{err}"
+    attempt, receipt_p, receipt = load_attempt(evidence)
+    assert (attempt / "collected-full.json").is_file(), "Worker must write collected-full.json"
+    assert (attempt / "collected-partition.json").is_file(), "Worker must write collected-partition.json"
+    manifest = receipt["evidence"]["manifest"]
+    assert "collected-full.json" in manifest, "collected-full.json must be in evidence manifest"
+    assert "collected-partition.json" in manifest, "collected-partition.json must be in evidence manifest"
+
+    assert "partition" in receipt, "Worker receipt must include partition payload"
+    part_data = receipt["partition"]
+    assert part_data["index"] == 0
+    assert part_data["count"] == 2
+    assert isinstance(part_data["files"], list)
+    assert isinstance(part_data["full_collected_count"], int)
+    assert isinstance(part_data["full_collected_digest"], str)
+    raw_digest = receipt.get("receipt_digest")
+    assert raw_digest is not None
+    stripped = {k: v for k, v in receipt.items() if k != "receipt_digest"}
+    assert raw_digest == digest_bytes(canonical_json(stripped))
+
+
+def _make_worker_attempt(
+    base_dir: Path,
+    part_idx: int,
+    part_count: int,
+    test_job_s: float,
+    testcases: list[str],
+    *,
+    accepted: bool = True,
+    commit: str = "c" * 40,
+    full_inventory: list[str] | None = None,
+    tamper_junit: bool = False,
+    tamper_digest: bool = False,
+) -> Path:
+    worker_part_dir = base_dir / f"part-{part_idx}"
+    attempt_dir = worker_part_dir / f"attempt-mock-{part_idx}"
+    attempt_dir.mkdir(parents=True, exist_ok=True)
+    full = sorted(full_inventory if full_inventory is not None else testcases)
+    full_digest = digest_bytes(canonical_json(full))
+    files = sorted({t.split("::")[0] for t in testcases})
+
+    (attempt_dir / "source.json").write_text(json.dumps({"commit": commit, "clean": True}), encoding="utf-8")
+    (attempt_dir / "collected-full.json").write_text(json.dumps(full), encoding="utf-8")
+    (attempt_dir / "collected-partition.json").write_text(json.dumps(sorted(testcases)), encoding="utf-8")
+
+    junit_lines = [
+        '<?xml version="1.0" encoding="utf-8"?>',
+        "<testsuites>",
+        f'  <testsuite name="part_{part_idx}" tests="{len(testcases)}" time="{test_job_s:.3f}">',
+    ]
+    for tc in testcases:
+        parts = tc.split("::")
+        name = parts[-1]
+        classname = ".".join(parts[:-1]).replace("/", ".")
+        junit_lines.append(f'    <testcase classname="{classname}" file="{parts[0]}" name="{name}" time="0.010" />')
+    junit_lines.extend(["  </testsuite>", "</testsuites>"])
+    junit_content = "\n".join(junit_lines).encode("utf-8")
+    junit_path = attempt_dir / "junit-shard-0.xml"
+    junit_path.write_bytes(junit_content)
+
+    manifest: dict[str, str] = {
+        "source.json": digest_bytes((attempt_dir / "source.json").read_bytes()),
+        "collected-full.json": digest_bytes((attempt_dir / "collected-full.json").read_bytes()),
+        "collected-partition.json": digest_bytes((attempt_dir / "collected-partition.json").read_bytes()),
+        "junit-shard-0.xml": digest_bytes(junit_content),
+    }
+
+    if tamper_junit:
+        junit_path.write_bytes(junit_content + b"<!-- tampered -->")
+
+    source_id = {
+        "commit": commit,
+        "clean": True,
+        "tree": "sha256:" + "1" * 64,
+        "tracked": "sha256:" + "2" * 64,
+        "untracked": "sha256:" + "3" * 64,
+    }
+
+    receipt: dict[str, Any] = {
+        "schema_version": "1.0",
+        "start": source_id,
+        "end": source_id,
+        "resolved_commit": commit,
+        "platform": "win32",
+        "requested_python": "3.14",
+        "python": "3.14.10",
+        "implementation": "cpython",
+        "environment": {"accepted": True, "problems": []},
+        "phases": [{"name": n, "exit_code": 0, "duration_s": 1.0} for n in REQUIRED_PHASES],
+        "accepted": accepted,
+        "test_job_seconds": test_job_s,
+        "total_junit_seconds": test_job_s * 0.9,
+        "counts": {
+            "passed": len(testcases),
+            "failed": 0,
+            "skipped": 0,
+            "error": 0,
+            "xfailed": 0,
+            "xpassed": 0,
+        },
+        "outcomes": {tc: "passed" for tc in testcases},
+        "partition": {
+            "index": part_idx,
+            "count": part_count,
+            "files": files,
+            "full_collected_count": len(full),
+            "full_collected_digest": full_digest,
+        },
+        "evidence": {
+            "attempt_dir": str(attempt_dir),
+            "manifest": manifest,
+        },
+    }
+    if not accepted:
+        receipt["reasons"] = ["worker failed under test"]
+    digest = digest_bytes(canonical_json(receipt))
+    if tamper_digest:
+        digest = "sha256:" + "0" * 64
+    receipt["receipt_digest"] = digest
+    (attempt_dir / "receipt.json").write_text(json.dumps(receipt, indent=2), encoding="utf-8")
+    return worker_part_dir
+
+
+def test_aggregate_partition_receipts_success_and_approved_timing_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    aggregate_partition_receipts = getattr(gate, "aggregate_partition_receipts", None)
+    assert aggregate_partition_receipts is not None, "scripts.gate must export aggregate_partition_receipts"
+    workers_dir = tmp_path / "workers"
+    tc_part0 = [f"tests/storage/test_cas.py::test_case_{i}" for i in range(10)]
+    tc_part1 = [f"tests/storage/test_backup.py::test_case_{i}" for i in range(10)]
+    full_inventory = tc_part0 + tc_part1
+
+    _make_worker_attempt(workers_dir, 0, 2, 120.5, tc_part0, full_inventory=full_inventory)
+    _make_worker_attempt(workers_dir, 1, 2, 145.0, tc_part1, full_inventory=full_inventory)
+
+    evidence_dir = tmp_path / "agg_evidence"
+    evidence_dir.mkdir()
+    receipt, digest = aggregate_partition_receipts(
+        workers_dir, python="3.14", partition_count=2, evidence_dir=evidence_dir
+    )
+    assert receipt["accepted"] is True
+    assert receipt["test_job_seconds"] == 145.0, "Aggregate test_job_seconds must be max(w0, w1)"
+    assert receipt["timing_contract"] == "parallel_max_per_worker_bounded_300s"
+    assert receipt["worker_test_job_seconds"] == [120.5, 145.0]
+    assert receipt["worker_sum_seconds"] == 265.5
+    assert receipt["counts"]["passed"] == 20
+    assert sum(receipt["counts"].values()) == 20
+    assert len(receipt["workers"]) == 2
+    assert digest == receipt["receipt_digest"]
+    stripped = {k: v for k, v in receipt.items() if k != "receipt_digest"}
+    assert digest == digest_bytes(canonical_json(stripped))
+
+    agg_attempt, _, on_disk_receipt = load_attempt(evidence_dir)
+    assert on_disk_receipt["receipt_digest"] == digest
+    assert (agg_attempt / "receipt.json").is_file()
+
+    # CLI positive invocation
+    fake_repo = tmp_path / "fake_repo"
+    (fake_repo / "scripts").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(gate, "__file__", str(fake_repo / "scripts" / "gate.py"))
+    cli_evidence = tmp_path / "cli_agg_ev"
+    cli_evidence.mkdir()
+    cli_code = gate.main(
+        [
+            "aggregate",
+            "--python",
+            "3.14",
+            "--partition-count",
+            "2",
+            "--workers-dir",
+            str(workers_dir),
+            "--evidence-dir",
+            str(cli_evidence),
+        ]
+    )
+    assert cli_code == 0, f"CLI aggregate must exit 0 on valid inputs; got {cli_code}"
+
+
+def test_aggregate_partition_receipts_refuses_missing_or_duplicate_partition(tmp_path: Path) -> None:
+    aggregate_partition_receipts = getattr(gate, "aggregate_partition_receipts", None)
+    assert aggregate_partition_receipts is not None, "scripts.gate must export aggregate_partition_receipts"
+    workers_dir = tmp_path / "workers_missing"
+    tc_part0 = [f"tests/storage/test_cas.py::test_case_{i}" for i in range(10)]
+    _make_worker_attempt(workers_dir, 0, 2, 100.0, tc_part0)
+
+    receipt, _ = aggregate_partition_receipts(
+        workers_dir, python="3.14", partition_count=2, evidence_dir=tmp_path / "ev1"
+    )
+    assert receipt["accepted"] is False
+    assert any("missing" in r.lower() and "partition" in r.lower() for r in receipt.get("reasons", []))
+
+    workers_dup = tmp_path / "workers_dup"
+    _make_worker_attempt(workers_dup / "a", 0, 2, 100.0, tc_part0)
+    _make_worker_attempt(workers_dup / "b", 0, 2, 105.0, tc_part0)
+    receipt_dup, _ = aggregate_partition_receipts(
+        workers_dup, python="3.14", partition_count=2, evidence_dir=tmp_path / "ev2"
+    )
+    assert receipt_dup["accepted"] is False
+    assert any("duplicate" in r.lower() and "partition" in r.lower() for r in receipt_dup.get("reasons", []))
+
+
+def test_aggregate_partition_receipts_refuses_missing_or_duplicate_testcase(tmp_path: Path) -> None:
+    aggregate_partition_receipts = getattr(gate, "aggregate_partition_receipts", None)
+    assert aggregate_partition_receipts is not None, "scripts.gate must export aggregate_partition_receipts"
+    workers_missing_tc = tmp_path / "workers_missing_tc"
+    tc0 = ["tests/test_a.py::t0"]
+    tc1 = ["tests/test_b.py::t1"]
+    full = ["tests/test_a.py::t0", "tests/test_b.py::t1", "tests/test_c.py::t_missing"]
+    _make_worker_attempt(workers_missing_tc, 0, 2, 50.0, tc0, full_inventory=full)
+    _make_worker_attempt(workers_missing_tc, 1, 2, 60.0, tc1, full_inventory=full)
+    receipt_m, _ = aggregate_partition_receipts(
+        workers_missing_tc, python="3.14", partition_count=2, evidence_dir=tmp_path / "ev_m"
+    )
+    assert receipt_m["accepted"] is False
+    assert any(
+        "missing" in r.lower() and ("testcase" in r.lower() or "node" in r.lower() or "test" in r.lower())
+        for r in receipt_m.get("reasons", [])
+    )
+
+    workers_dup_tc = tmp_path / "workers_dup_tc"
+    tc0_dup = ["tests/test_a.py::t0", "tests/test_shared.py::t_dup"]
+    tc1_dup = ["tests/test_b.py::t1", "tests/test_shared.py::t_dup"]
+    full_dup = ["tests/test_a.py::t0", "tests/test_b.py::t1", "tests/test_shared.py::t_dup"]
+    _make_worker_attempt(workers_dup_tc, 0, 2, 50.0, tc0_dup, full_inventory=full_dup)
+    _make_worker_attempt(workers_dup_tc, 1, 2, 60.0, tc1_dup, full_inventory=full_dup)
+    receipt_d, _ = aggregate_partition_receipts(
+        workers_dup_tc, python="3.14", partition_count=2, evidence_dir=tmp_path / "ev_d"
+    )
+    assert receipt_d["accepted"] is False
+    assert any(
+        "duplicate" in r.lower() and ("testcase" in r.lower() or "node" in r.lower() or "test" in r.lower())
+        for r in receipt_d.get("reasons", [])
+    )
+
+
+def test_aggregate_partition_receipts_refuses_budget_exceeded(tmp_path: Path) -> None:
+    aggregate_partition_receipts = getattr(gate, "aggregate_partition_receipts", None)
+    assert aggregate_partition_receipts is not None, "scripts.gate must export aggregate_partition_receipts"
+    workers_dir = tmp_path / "workers_budget"
+    tc0 = ["tests/test_a.py::t0"]
+    tc1 = ["tests/test_b.py::t1"]
+    full = tc0 + tc1
+    _make_worker_attempt(workers_dir, 0, 2, 150.0, tc0, full_inventory=full)
+    _make_worker_attempt(workers_dir, 1, 2, 300.5, tc1, full_inventory=full)
+    receipt, _ = aggregate_partition_receipts(
+        workers_dir, python="3.14", partition_count=2, evidence_dir=tmp_path / "ev_b"
+    )
+    assert receipt["accepted"] is False
+    assert receipt["test_job_seconds"] == 300.5
+    assert any("budget" in r.lower() or "300" in r or "time" in r.lower() for r in receipt.get("reasons", []))
+
+
+def test_aggregate_partition_receipts_refuses_mismatched_commit_or_inventory(tmp_path: Path) -> None:
+    aggregate_partition_receipts = getattr(gate, "aggregate_partition_receipts", None)
+    assert aggregate_partition_receipts is not None, "scripts.gate must export aggregate_partition_receipts"
+    workers_dir = tmp_path / "workers_mismatch_commit"
+    tc0 = ["tests/test_a.py::t0"]
+    tc1 = ["tests/test_b.py::t1"]
+    full = tc0 + tc1
+    _make_worker_attempt(workers_dir, 0, 2, 50.0, tc0, commit="1" * 40, full_inventory=full)
+    _make_worker_attempt(workers_dir, 1, 2, 50.0, tc1, commit="2" * 40, full_inventory=full)
+    receipt_c, _ = aggregate_partition_receipts(
+        workers_dir, python="3.14", partition_count=2, evidence_dir=tmp_path / "ev_c"
+    )
+    assert receipt_c["accepted"] is False
+    assert any(
+        "commit" in r.lower() or "source" in r.lower() or "mismatch" in r.lower() for r in receipt_c.get("reasons", [])
+    )
+
+    workers_inv = tmp_path / "workers_mismatch_inv"
+    _make_worker_attempt(workers_inv, 0, 2, 50.0, tc0, full_inventory=["tests/test_a.py::t0"])
+    _make_worker_attempt(workers_inv, 1, 2, 50.0, tc1, full_inventory=["tests/test_b.py::t1"])
+    receipt_i, _ = aggregate_partition_receipts(
+        workers_inv, python="3.14", partition_count=2, evidence_dir=tmp_path / "ev_i"
+    )
+    assert receipt_i["accepted"] is False
+    assert any(
+        "inventory" in r.lower() or "digest" in r.lower() or "mismatch" in r.lower()
+        for r in receipt_i.get("reasons", [])
+    )
+
+
+def test_aggregate_partition_receipts_refuses_tampered_junit_or_receipt_digest(tmp_path: Path) -> None:
+    aggregate_partition_receipts = getattr(gate, "aggregate_partition_receipts", None)
+    assert aggregate_partition_receipts is not None, "scripts.gate must export aggregate_partition_receipts"
+    workers_junit = tmp_path / "workers_tampered_junit"
+    tc0 = ["tests/test_a.py::t0"]
+    tc1 = ["tests/test_b.py::t1"]
+    full = tc0 + tc1
+    _make_worker_attempt(workers_junit, 0, 2, 50.0, tc0, full_inventory=full, tamper_junit=True)
+    _make_worker_attempt(workers_junit, 1, 2, 50.0, tc1, full_inventory=full)
+    receipt_j, _ = aggregate_partition_receipts(
+        workers_junit, python="3.14", partition_count=2, evidence_dir=tmp_path / "ev_j"
+    )
+    assert receipt_j["accepted"] is False
+    assert any(
+        "tamper" in r.lower() or "manifest" in r.lower() or "digest" in r.lower() or "sha" in r.lower()
+        for r in receipt_j.get("reasons", [])
+    )
+
+    workers_rd = tmp_path / "workers_tampered_rd"
+    _make_worker_attempt(workers_rd, 0, 2, 50.0, tc0, full_inventory=full, tamper_digest=True)
+    _make_worker_attempt(workers_rd, 1, 2, 50.0, tc1, full_inventory=full)
+    receipt_r, _ = aggregate_partition_receipts(
+        workers_rd, python="3.14", partition_count=2, evidence_dir=tmp_path / "ev_rd"
+    )
+    assert receipt_r["accepted"] is False
+    assert any(
+        "digest" in r.lower() or "tamper" in r.lower() or "invalid" in r.lower() for r in receipt_r.get("reasons", [])
+    )
+
+
+def test_aggregate_partition_receipts_refuses_failed_worker(tmp_path: Path) -> None:
+    aggregate_partition_receipts = getattr(gate, "aggregate_partition_receipts", None)
+    assert aggregate_partition_receipts is not None, "scripts.gate must export aggregate_partition_receipts"
+    workers_dir = tmp_path / "workers_failed"
+    tc0 = ["tests/test_a.py::t0"]
+    tc1 = ["tests/test_b.py::t1"]
+    full = tc0 + tc1
+    _make_worker_attempt(workers_dir, 0, 2, 50.0, tc0, accepted=False, full_inventory=full)
+    _make_worker_attempt(workers_dir, 1, 2, 50.0, tc1, accepted=True, full_inventory=full)
+    receipt, _ = aggregate_partition_receipts(
+        workers_dir, python="3.14", partition_count=2, evidence_dir=tmp_path / "ev_f"
+    )
+    assert receipt["accepted"] is False
+    assert any("worker" in r.lower() or "failed" in r.lower() for r in receipt.get("reasons", []))

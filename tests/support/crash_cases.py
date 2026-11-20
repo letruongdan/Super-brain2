@@ -175,7 +175,7 @@ def seed_named_store(data_root: Path) -> SeedState:
 
 def seed_event(data_root: Path) -> SeedState:
     """The event payload held by ``("event", EVENT_ID)``, as ``crash_child.seed_event`` does."""
-    rt = open_runtime(data_root, os_adapters())
+    rt = open_cloned_runtime(data_root, os_adapters(), role="crash-seed-event")
     try:
         rt.store.store_content(EVENT_PAYLOAD, "event", EVENT_ID, RetentionClass.EVENT_PAYLOAD, None)
     finally:
@@ -185,7 +185,7 @@ def seed_event(data_root: Path) -> SeedState:
 
 def seed_quarantined_event(data_root: Path) -> SeedState:
     """The event payload, held and then quarantined: the intent is recorded and applied to the store."""
-    rt = open_runtime(data_root, os_adapters())
+    rt = open_cloned_runtime(data_root, os_adapters(), role="crash-seed-quarantine")
     try:
         rt.store.store_content(EVENT_PAYLOAD, "event", EVENT_ID, RetentionClass.EVENT_PAYLOAD, None)
         rt.policy.record_intent(IntentKind.QUARANTINE, {"digest": EVENT_DIGEST})
@@ -196,7 +196,7 @@ def seed_quarantined_event(data_root: Path) -> SeedState:
 
 
 def seed_runtime(data_root: Path) -> SeedState:
-    open_runtime(data_root, os_adapters()).close()
+    open_cloned_runtime(data_root, os_adapters(), role="crash-seed-runtime").close()
     return capture(data_root)
 
 

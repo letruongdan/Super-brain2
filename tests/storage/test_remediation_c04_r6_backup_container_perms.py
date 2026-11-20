@@ -34,6 +34,7 @@ from superbrain.storage.restore import restore_store
 from superbrain.storage.runtime import open_runtime
 from superbrain.storage.schema import STORE_MIGRATIONS
 from tests.support.fs import digest_tree
+from tests.support.inc2_fixture import open_cloned_runtime
 from tests.support.platform import posix_only, windows_only
 
 BACKED_UP = b"c04 round 6: in the backup"
@@ -63,7 +64,7 @@ def loosen(path: Path, variant: str) -> None:
 
 def backup_with_a_later_live_blob(data_root: Path) -> tuple[Path, str, str]:
     """A verified store backup holding one blob; afterwards the live store gets another blob the backup lacks."""
-    rt = open_runtime(data_root, os_adapters())
+    rt = open_cloned_runtime(data_root, os_adapters(), role="c04r6-backup")
     try:
         rt.store.store_content(BACKED_UP, "event", HOLDER, RetentionClass.EVENT_PAYLOAD, None)
         backup = create_store_backup(rt.store, rt.os_, datetime.now(UTC))
