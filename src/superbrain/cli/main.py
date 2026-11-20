@@ -34,6 +34,7 @@ def _parse_bootstrap_args(args: list[str]) -> tuple[str, list[str]] | None:
     harness: str | None = None
     checkout: str | None = None
     profile: str | None = None
+    harness_profile: str | None = None
     as_json = False
     i = 1
     while i < len(args):
@@ -58,9 +59,14 @@ def _parse_bootstrap_args(args: list[str]) -> tuple[str, list[str]] | None:
                 return None
             profile = args[i + 1]
             i += 2
+        elif tok == "--harness-profile":
+            if harness_profile is not None or i + 1 >= len(args) or not _is_valid_abs_path(args[i + 1]):
+                return None
+            harness_profile = args[i + 1]
+            i += 2
         else:
             return None
-    if harness is None or checkout is None or profile is None:
+    if harness is None or checkout is None or profile is None or harness_profile is None:
         return None
     return ("superbrain.composition.bootstrap_entry", args)
 

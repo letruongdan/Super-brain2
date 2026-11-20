@@ -8,6 +8,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from superbrain.adapters.os import os_adapters
+from superbrain.adapters.os.daemon_config import read_client_profile
 from superbrain.composition._operator_client import call_operator_from_profile, write_error_code
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.ports.os import OsAdapters
@@ -20,6 +22,7 @@ class _ParsedBootstrapCli:
     harness: str
     checkout_root: Path
     profile_path: Path
+    harness_profile_path: Path
     as_json: bool
 
 
@@ -33,6 +36,7 @@ def _parse_args(args: list[str]) -> _ParsedBootstrapCli | None:
     harness: str | None = None
     checkout_raw: str | None = None
     profile_raw: str | None = None
+    harness_profile_raw: str | None = None
     as_json = False
     i = 1
     while i < len(args):
@@ -57,14 +61,20 @@ def _parse_args(args: list[str]) -> _ParsedBootstrapCli | None:
                 return None
             profile_raw = args[i + 1]
             i += 2
+        elif tok == "--harness-profile":
+            if harness_profile_raw is not None or i + 1 >= len(args) or not _is_abs(args[i + 1]):
+                return None
+            harness_profile_raw = args[i + 1]
+            i += 2
         else:
             return None
-    if harness is None or checkout_raw is None or profile_raw is None:
+    if harness is None or checkout_raw is None or profile_raw is None or harness_profile_raw is None:
         return None
     return _ParsedBootstrapCli(
         harness=harness,
         checkout_root=Path(checkout_raw),
         profile_path=Path(profile_raw),
+        harness_profile_path=Path(harness_profile_raw),
         as_json=as_json,
     )
 
@@ -74,16 +84,18 @@ def run_bootstrap_cli(args: list[str], *, os_: OsAdapters | None = None) -> int:
     if parsed is None:
         write_error_code(ErrorCode.INVALID_INPUT)
         return 2
+    adapters = os_ if os_ is not None else os_adapters()
     try:
+        read_client_profile(parsed.harness_profile_path, adapters)
         result = call_operator_from_profile(
             parsed.profile_path,
             "/v2/operator/proposal/bootstrap",
             {
                 "harness": parsed.harness,
                 "checkout_root": str(parsed.checkout_root),
-                "profile_path": str(parsed.profile_path),
+                "harness_profile_path": str(parsed.harness_profile_path),
             },
-            os_=os_,
+            os_=adapters,
         )
     except BrainError as err:
         write_error_code(err.code)

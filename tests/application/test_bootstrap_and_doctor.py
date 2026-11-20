@@ -6,7 +6,9 @@ Requirement sources: spec rev 22 §7.4, §11.2-§11.3, §13, §14.2, §20 cases 
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
+import ssl
 import struct
 import sys
 from datetime import UTC, datetime, timedelta
@@ -41,6 +43,7 @@ from superbrain.core._kernel_approval import (
     RiskResource,
     SignerEnrollment,
 )
+from superbrain.core.canonical import canonical_json
 from superbrain.core.errors import ErrorCode
 from superbrain.core.proposals import ManagedFormat, ProposalStatus
 from superbrain.ports.os import OsAdapters
@@ -53,7 +56,7 @@ from tests.storage.conftest import maintenance_lease
 from tests.support.clock import FakeClock
 from tests.support.fs import digest_tree
 from tests.support.inc2_fixture import reopen_kernel_job_runtime
-from tests.support.inc2_transport import FakeMonotonicClock
+from tests.support.inc2_transport import FakeMonotonicClock, register_workspace_direct
 from tests.support.kernel_auth import seed_principal_and_credential
 
 OWNER = "dan"
@@ -79,25 +82,75 @@ def _make_dir_link(link: Path, target: Path) -> None:
         link.symlink_to(target, target_is_directory=True)
 
 
+def _write_test_profile(
+    path: Path,
+    os_: OsAdapters,
+    *,
+    data_root: Path,
+    cfg_dir: Path,
+    expected_store_id: str,
+    credential_file: Path,
+    workspace: dict[str, str] | None = None,
+) -> Path:
+    leaf_sha = hashlib.sha256(
+        ssl.PEM_cert_to_DER_cert((cfg_dir / "tls" / "server.pem").read_text(encoding="utf-8"))
+    ).hexdigest()
+    payload: dict[str, Any] = {
+        "version": 1,
+        "endpoint_path": str(data_root / "endpoint.json"),
+        "expected_store_id": expected_store_id,
+        "ca_file": str(cfg_dir / "tls" / "ca.pem"),
+        "leaf_cert_sha256": leaf_sha,
+        "credential_file": str(credential_file),
+    }
+    if workspace is not None:
+        payload["workspace"] = workspace
+    path.write_bytes(canonical_json(payload))
+    os_.permissions.secure_file(path)
+    return path
+
+
 def test_bootstrap_templates_embed_section_7_4_handoff_rules_and_nonblocking_hooks(trusted_tmp: Path) -> None:
     """I3-5 §7.4 + Layer 1-2: both Claude and Codex templates cover 6 moments, takeover ACK, & non-blocking hooks."""
     from superbrain.adapters.harness_config.bootstrap_templates import HANDOFF_RULE_TEXT, HANDOFF_UPDATE_MOMENTS
 
-    assert len(HANDOFF_UPDATE_MOMENTS) == 6
+    expected_moments = (
+        "plan_created_or_changed",
+        "decision_or_rejection_recorded",
+        "user_constraint_added",
+        "step_completed",
+        "before_long_running_command",
+        "task_ended",
+    )
+    assert HANDOFF_UPDATE_MOMENTS == expected_moments
     lower_rule = HANDOFF_RULE_TEXT.lower()
-    expected_tokens = (
+    assert "task_state is active" not in lower_rule
+    assert "not_holder, prepare manual_submission" not in lower_rule
+    assert "prepare manual_submission" not in lower_rule
+    for moment in expected_moments:
+        assert moment in HANDOFF_RULE_TEXT, f"missing §7.4 update moment {moment!r}"
+    required_tokens = (
+        "takeover.acknowledge_active=true",
+        "active",
+        "user",
         "handoff_status",
         "stored",
         "writer_status",
         "holder",
         "not_holder",
-        "commit_outcome_unknown",
+        "discover",
+        "get_artifact",
+        "handoff_live",
         "not_stored_policy",
         "manual_submission",
-        "task_state",
-        "active",
+        "disabled",
+        "commit_outcome_unknown",
+        "submit_episode",
+        "idempotency_key",
+        "retry",
+        "edit",
     )
-    for token in expected_tokens:
+    for token in required_tokens:
         assert token in lower_rule, f"missing §7.4 token {token!r} in HANDOFF_RULE_TEXT"
 
     checkout = trusted_tmp / "repo"
@@ -117,8 +170,15 @@ def test_bootstrap_templates_embed_section_7_4_handoff_rules_and_nonblocking_hoo
     for plan, md_name, hook_name in plans:
         by_rel = {t.rel_path: t for t in plan.targets}
         md_text = by_rel[md_name].preview_text
+        md_lower = md_text.lower()
         assert LAYER1_RULE_TEXT in md_text
         assert HANDOFF_RULE_TEXT in md_text
+        assert "task_state is active" not in md_lower
+        assert "not_holder, prepare manual_submission" not in md_lower
+        for moment in expected_moments:
+            assert moment in md_text
+        for token in required_tokens:
+            assert token in md_lower, f"missing §7.4 token {token!r} in {md_name}"
         assert "# User Prose" in md_text or "# Agents Prose" in md_text
         hook_text = by_rel[hook_name].preview_text
         for cmd in AUTHORITY_ASK_COMMANDS:
@@ -132,6 +192,10 @@ def test_bootstrap_service_and_cli_create_high_risk_proposal_without_writing_che
     trusted_tmp: Path, capfd: pytest.CaptureFixture[str]
 ) -> None:
     """I3-5: create_bootstrap_proposal & brain bootstrap emit HIGH-risk PENDING ChangeProposal with 0 file writes."""
+    from superbrain.composition._bootstrap_wiring import (
+        PolicyHarnessProfileValidator,
+    )
+
     import superbrain.composition.bootstrap_entry as bootstrap_entry
     from superbrain.adapters.harness_config.bootstrap_templates import AdapterBootstrapPlanner
     from superbrain.application.bootstrap import create_bootstrap_proposal
@@ -151,9 +215,6 @@ def test_bootstrap_service_and_cli_create_high_risk_proposal_without_writing_che
         d.mkdir(parents=True, exist_ok=True)
         os_.permissions.secure_directory(d)
     (checkout / "CLAUDE.md").write_text("# Keep me\n", encoding="utf-8")
-    profile = cfg_dir / "cli.profile.json"
-    profile.write_text("{}", encoding="utf-8")
-    os_.permissions.secure_file(profile)
 
     rep = init_store(
         InitRequest(
@@ -161,10 +222,75 @@ def test_bootstrap_service_and_cli_create_high_risk_proposal_without_writing_che
         ),
         os_,
     )
+    cli_profile = _write_test_profile(
+        cfg_dir / "cli.profile.json",
+        os_,
+        data_root=data_root,
+        cfg_dir=cfg_dir,
+        expected_store_id=rep.store_id,
+        credential_file=rep.cli_credential_path,
+    )
     rt = reopen_kernel_job_runtime(data_root, rep.store_id, os_)
     try:
+        cred_claude = seed_principal_and_credential(
+            rt.policy, owner_id=OWNER, harness_id="claude-code", machine_id=MACHINE
+        )
+        cred_codex = seed_principal_and_credential(rt.policy, owner_id=OWNER, harness_id="codex", machine_id=MACHINE)
+        ws_claude = register_workspace_direct(
+            rt,
+            clock,
+            cred_claude.principal,
+            alias="ws-boot",
+            checkout_dir=checkout,
+            remote="https://github.example/dan/repo-boot.git",
+        )
+        ws_codex = register_workspace_direct(
+            rt,
+            clock,
+            cred_codex.principal,
+            alias="ws-boot",
+            checkout_dir=checkout,
+            remote="https://github.example/dan/repo-boot.git",
+        )
+        claude_cred_file = cfg_dir / "claude.credential"
+        claude_cred_file.write_text(f"{cred_claude.token}\n", encoding="ascii")
+        os_.permissions.secure_file(claude_cred_file)
+        codex_cred_file = cfg_dir / "codex.credential"
+        codex_cred_file.write_text(f"{cred_codex.token}\n", encoding="ascii")
+        os_.permissions.secure_file(codex_cred_file)
+
+        claude_profile = _write_test_profile(
+            cfg_dir / "claude.profile.json",
+            os_,
+            data_root=data_root,
+            cfg_dir=cfg_dir,
+            expected_store_id=rep.store_id,
+            credential_file=claude_cred_file,
+            workspace={
+                "alias": ws_claude.alias,
+                "checkout_path": str(checkout),
+                "expected_workspace_id": ws_claude.repo_id,
+                "expected_checkout_id": ws_claude.checkout_id,
+            },
+        )
+        codex_profile = _write_test_profile(
+            cfg_dir / "codex.profile.json",
+            os_,
+            data_root=data_root,
+            cfg_dir=cfg_dir,
+            expected_store_id=rep.store_id,
+            credential_file=codex_cred_file,
+            workspace={
+                "alias": ws_codex.alias,
+                "checkout_path": str(checkout),
+                "expected_workspace_id": ws_codex.repo_id,
+                "expected_checkout_id": ws_codex.checkout_id,
+            },
+        )
+
+        store_adapter = StoreProposalAdapter(rt.store, os_)
         svc = ReviewApplyService(
-            StoreProposalAdapter(rt.store, os_),
+            store_adapter,
             PolicyApplyAuthority(rt.policy),
             os_,
             data_root=data_root,
@@ -173,30 +299,97 @@ def test_bootstrap_service_and_cli_create_high_risk_proposal_without_writing_che
         )
         snap_before = digest_tree(checkout)
         planner = AdapterBootstrapPlanner()
-        for harness in ("claude-code", "codex"):
+        validator = PolicyHarnessProfileValidator(rt.policy, os_)
+        for harness, harness_prof in (("claude-code", claude_profile), ("codex", codex_profile)):
             h_typed: Any = harness
             prop = create_bootstrap_proposal(
                 svc,
                 owner_id=OWNER,
                 harness_id=h_typed,
                 checkout_root=checkout,
-                profile_path=profile,
+                harness_profile_path=harness_prof,
                 planner=planner,
+                profile_validator=validator,
                 os_=os_,
             )
             assert prop.status is ProposalStatus.PENDING
             assert prop.risk_level is RiskLevel.HIGH
             assert prop.kind == "bootstrap"
             assert len(prop.targets) == 3
+            rendered = "\n".join(
+                store_adapter.read_payload_bytes(str(t.replacement_digest)).decode("utf-8")
+                for t in prop.targets
+                if t.replacement_digest is not None
+            )
+            assert str(harness_prof) in rendered
+            assert str(cli_profile) not in rendered
         assert digest_tree(checkout) == snap_before
     finally:
         rt.close()
 
     # CLI argv validation + python -I routing.
-    rel_argv = ["bootstrap", "--harness", "claude-code", "--checkout", "rel/dir", "--profile", str(profile)]
+    missing_hp_argv = [
+        "bootstrap",
+        "--harness",
+        "claude-code",
+        "--checkout",
+        str(checkout),
+        "--profile",
+        str(cli_profile),
+    ]
+    assert brain_main(missing_hp_argv) == 2
+    assert capfd.readouterr().err.strip().splitlines()[-1] == ErrorCode.INVALID_INPUT.value
+    capfd.readouterr()
+
+    rel_argv = [
+        "bootstrap",
+        "--harness",
+        "claude-code",
+        "--checkout",
+        "rel/dir",
+        "--profile",
+        str(cli_profile),
+        "--harness-profile",
+        str(claude_profile),
+    ]
     assert brain_main(rel_argv) == 2
     assert capfd.readouterr().err.strip().splitlines()[-1] == ErrorCode.INVALID_INPUT.value
     capfd.readouterr()
+
+    rel_hp_argv = [
+        "bootstrap",
+        "--harness",
+        "claude-code",
+        "--checkout",
+        str(checkout),
+        "--profile",
+        str(cli_profile),
+        "--harness-profile",
+        "rel/harness.profile.json",
+    ]
+    assert brain_main(rel_hp_argv) == 2
+    assert capfd.readouterr().err.strip().splitlines()[-1] == ErrorCode.INVALID_INPUT.value
+    capfd.readouterr()
+
+    assert (
+        brain_main(
+            [
+                "bootstrap",
+                "--harness",
+                "claude-code",
+                "--checkout",
+                str(checkout),
+                "--profile",
+                str(cli_profile),
+                "--harness-profile",
+                str(trusted_tmp / "missing-harness-profile.json"),
+            ]
+        )
+        == 1
+    )
+    assert capfd.readouterr().err.strip().splitlines()[-1] == ErrorCode.NOT_FOUND.value
+    capfd.readouterr()
+
     assert (
         brain_main(
             [
@@ -207,6 +400,8 @@ def test_bootstrap_service_and_cli_create_high_risk_proposal_without_writing_che
                 str(checkout),
                 "--profile",
                 str(trusted_tmp / "missing-profile.json"),
+                "--harness-profile",
+                str(claude_profile),
             ]
         )
         == 1

@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import os
 import stat
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-from superbrain.adapters.harness_config._common import digest_json_value
-from superbrain.adapters.harness_config.json_keys import merge_json_keys
+from superbrain.adapters.harness_config.json_keys import merge_json_keys, merge_json_multi_keys
 from superbrain.adapters.harness_config.markdown_blocks import merge_markdown_block
 from superbrain.adapters.harness_config.toml_tables import merge_toml_table
 from superbrain.core._kernel_approval import RiskResource
@@ -24,7 +24,9 @@ __all__ = [
     "BootstrapTargetPlan",
     "HANDOFF_RULE_TEXT",
     "HANDOFF_UPDATE_MOMENTS",
+    "HandoffTakeoverEditDecision",
     "LAYER1_RULE_TEXT",
+    "evaluate_takeover_edit_gate",
     "plan_claude_bootstrap",
     "plan_codex_bootstrap",
 ]
@@ -36,23 +38,75 @@ LAYER1_RULE_TEXT = (
 )
 
 HANDOFF_UPDATE_MOMENTS: tuple[str, ...] = (
-    "task_start_or_takeover",
-    "decision_or_plan_changed",
-    "milestone_completed",
-    "blocked_or_recovery_needed",
-    "session_handoff_or_pause",
-    "task_completed_or_abandoned",
+    "plan_created_or_changed",
+    "decision_or_rejection_recorded",
+    "user_constraint_added",
+    "step_completed",
+    "before_long_running_command",
+    "task_ended",
 )
 
 HANDOFF_RULE_TEXT = (
     "Session Handoff Protocol (7.4): update handoff at 6 moments "
-    "(task_start_or_takeover, decision_or_plan_changed, milestone_completed, "
-    "blocked_or_recovery_needed, session_handoff_or_pause, task_completed_or_abandoned). "
-    "Require explicit takeover ACK before taking ownership when task_state is active. "
-    "Inspect handoff_status (`stored`, `not_stored_policy`) and writer_status (`holder`, `not_holder`); "
-    "if writer_status is not_holder, prepare manual_submission instead of claiming an automatic write. "
-    "If commit_outcome_unknown is reported, reconcile before retrying writes."
+    "(plan_created_or_changed, decision_or_rejection_recorded, user_constraint_added, "
+    "step_completed, before_long_running_command, task_ended). "
+    "When holding session state is active, notify the user and pass takeover.acknowledge_active=true "
+    "for takeover. Never edit any checkout file until takeover ACK returns BOTH "
+    "handoff_status=stored and writer_status=holder. "
+    "If writer_status=not_holder, do not edit and re-read the latest handoff via "
+    "prepare_task(mode=discover), get_artifact L1, and handoff_live. "
+    "If handoff_status=not_stored_policy, manual_submission is disabled by policy "
+    "(no holder or revision change; do not edit). "
+    "If commit_outcome_unknown is reported, retry submit_episode with the same idempotency_key "
+    "before any edit."
 )
+
+
+@dataclass(frozen=True)
+class HandoffTakeoverEditDecision:
+    """SP2 takeover edit gate decision derived from session/ACK/commit states."""
+
+    allow_edit: bool
+    action: str
+    require_acknowledge_active: bool = False
+    notify_user: bool = False
+
+
+def evaluate_takeover_edit_gate(
+    *,
+    holding_session_state: str | None,
+    acknowledge_active: bool = False,
+    handoff_status: str | None = None,
+    writer_status: str | None = None,
+    commit_outcome_unknown: bool = False,
+) -> HandoffTakeoverEditDecision:
+    """Evaluate whether checkout edits may proceed under spec §7.4 and SP2 ACK invariants."""
+    if commit_outcome_unknown:
+        return HandoffTakeoverEditDecision(
+            allow_edit=False,
+            action="retry_same_idempotency_key",
+        )
+    if holding_session_state == "active" and not acknowledge_active:
+        return HandoffTakeoverEditDecision(
+            allow_edit=False,
+            action="require_active_takeover_ack",
+            require_acknowledge_active=True,
+            notify_user=True,
+        )
+    if handoff_status == "not_stored_policy":
+        return HandoffTakeoverEditDecision(
+            allow_edit=False,
+            action="policy_disabled",
+        )
+    if handoff_status != "stored" or writer_status != "holder":
+        return HandoffTakeoverEditDecision(
+            allow_edit=False,
+            action="reread_handoff",
+        )
+    return HandoffTakeoverEditDecision(
+        allow_edit=True,
+        action="proceed_edit",
+    )
 
 AUTHORITY_ASK_COMMANDS: tuple[str, ...] = (
     "brain init",
@@ -184,38 +238,45 @@ def _nonblocking_hooks_payload(profile_path: Path) -> dict[str, JsonValue]:
     }
 
 
-def plan_claude_bootstrap(*, checkout_root: Path, profile_path: Path) -> BootstrapPlan:
+def _expected_digest(
+    expected_slice_digests: Mapping[tuple[str, str], str] | None,
+    rel_path: str,
+    slice_id: str,
+) -> str | None:
+    if expected_slice_digests is None:
+        return None
+    return expected_slice_digests.get((rel_path, slice_id))
+
+
+def plan_claude_bootstrap(
+    *,
+    checkout_root: Path,
+    profile_path: Path,
+    expected_slice_digests: Mapping[tuple[str, str], str] | None = None,
+) -> BootstrapPlan:
     """Build checkout-scoped D3 bootstrap plan for Claude Code (`.mcp.json`, `CLAUDE.md`, `settings.local.json`)."""
     mcp_merge = merge_json_keys(
         _read_existing(checkout_root, ".mcp.json"),
         key_path=("mcpServers", "super-brain"),
         value=_mcp_server_entry(profile_path),
-        expected_slice_digest=None,
+        expected_slice_digest=_expected_digest(expected_slice_digests, ".mcp.json", "mcpServers.super-brain"),
     )
     md_merge = merge_markdown_block(
         _read_existing(checkout_root, "CLAUDE.md"),
         slice_id="super-brain-layer1",
         block_body=_guidance_body(profile_path),
-        expected_slice_digest=None,
+        expected_slice_digest=_expected_digest(expected_slice_digests, "CLAUDE.md", "super-brain-layer1"),
     )
     ask_rules = [f"Bash({cmd} *)" for cmd in AUTHORITY_ASK_COMMANDS]
     hooks_val = _nonblocking_hooks_payload(profile_path)
     settings_existing = _read_existing(checkout_root, ".claude", "settings.local.json")
-    settings_ask = merge_json_keys(
+    settings_merge = merge_json_multi_keys(
         settings_existing,
-        key_path=("permissions", "ask"),
-        value=ask_rules,
-        expected_slice_digest=None,
+        entries=[(("permissions", "ask"), ask_rules), (("hooks", "PreToolUse"), hooks_val)],
+        expected_slice_digest=_expected_digest(
+            expected_slice_digests, ".claude/settings.local.json", "permissions.ask,hooks.PreToolUse"
+        ),
     )
-    settings_with_hooks = merge_json_keys(
-        settings_ask.updated_text,
-        key_path=("hooks", "PreToolUse"),
-        value=hooks_val,
-        expected_slice_digest=None,
-    )
-    ask_rules_json: list[JsonValue] = list(ask_rules)
-    combined_slice: dict[str, JsonValue] = {"permissions.ask": ask_rules_json, "hooks.PreToolUse": hooks_val}
-    combined_digest = digest_json_value(combined_slice)
     return BootstrapPlan(
         harness_id="claude-code",
         checkout_root=checkout_root,
@@ -240,32 +301,39 @@ def plan_claude_bootstrap(*, checkout_root: Path, profile_path: Path) -> Bootstr
                 rel_path=".claude/settings.local.json",
                 managed_format=ManagedFormat.JSON,
                 slice_id="permissions.ask,hooks.PreToolUse",
-                slice_digest=combined_digest,
-                preview_text=settings_with_hooks.updated_text,
+                slice_digest=settings_merge.slice_digest,
+                preview_text=settings_merge.updated_text,
             ),
         ),
     )
 
 
-def plan_codex_bootstrap(*, checkout_root: Path, profile_path: Path) -> BootstrapPlan:
+def plan_codex_bootstrap(
+    *,
+    checkout_root: Path,
+    profile_path: Path,
+    expected_slice_digests: Mapping[tuple[str, str], str] | None = None,
+) -> BootstrapPlan:
     """Build checkout-scoped D3 bootstrap plan for Codex (`AGENTS.md`, `.codex/config.toml`, `.codex/hooks.json`)."""
     md_merge = merge_markdown_block(
         _read_existing(checkout_root, "AGENTS.md"),
         slice_id="super-brain-layer1",
         block_body=_guidance_body(profile_path),
-        expected_slice_digest=None,
+        expected_slice_digest=_expected_digest(expected_slice_digests, "AGENTS.md", "super-brain-layer1"),
     )
     toml_merge = merge_toml_table(
         _read_existing(checkout_root, ".codex", "config.toml"),
         table_path=("mcp_servers", "super-brain"),
         values=_mcp_server_entry(profile_path),
-        expected_slice_digest=None,
+        expected_slice_digest=_expected_digest(
+            expected_slice_digests, ".codex/config.toml", "mcp_servers.super-brain"
+        ),
     )
     hooks_merge = merge_json_keys(
         _read_existing(checkout_root, ".codex", "hooks.json"),
         key_path=("hooks", "PreToolUse"),
         value=_nonblocking_hooks_payload(profile_path),
-        expected_slice_digest=None,
+        expected_slice_digest=_expected_digest(expected_slice_digests, ".codex/hooks.json", "hooks.PreToolUse"),
     )
     return BootstrapPlan(
         harness_id="codex",
@@ -307,11 +375,20 @@ class AdapterBootstrapPlanner(BootstrapPlannerPort):
         harness_id: str,
         checkout_root: Path,
         profile_path: Path,
+        expected_slice_digests: Mapping[tuple[str, str], str] | None = None,
     ) -> BootstrapPlanSpec:
         if harness_id == "claude-code":
-            plan = plan_claude_bootstrap(checkout_root=checkout_root, profile_path=profile_path)
+            plan = plan_claude_bootstrap(
+                checkout_root=checkout_root,
+                profile_path=profile_path,
+                expected_slice_digests=expected_slice_digests,
+            )
         elif harness_id == "codex":
-            plan = plan_codex_bootstrap(checkout_root=checkout_root, profile_path=profile_path)
+            plan = plan_codex_bootstrap(
+                checkout_root=checkout_root,
+                profile_path=profile_path,
+                expected_slice_digests=expected_slice_digests,
+            )
         else:
             raise BrainError(ErrorCode.INVALID_INPUT, "unsupported bootstrap harness")
         return BootstrapPlanSpec(

@@ -9,7 +9,7 @@ from typing import Literal
 from superbrain.application.review_apply import ReviewApplyService, TargetWriteInput
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.proposals import ChangeProposal
-from superbrain.ports.bootstrap import BootstrapPlannerPort
+from superbrain.ports.bootstrap import BootstrapPlannerPort, HarnessProfileValidatorPort
 from superbrain.ports.os import OsAdapters
 
 __all__ = ["BootstrapHarnessId", "create_bootstrap_proposal"]
@@ -35,25 +35,34 @@ def create_bootstrap_proposal(
     owner_id: str,
     harness_id: BootstrapHarnessId,
     checkout_root: Path,
-    profile_path: Path,
+    harness_profile_path: Path,
     planner: BootstrapPlannerPort,
+    profile_validator: HarnessProfileValidatorPort,
     os_: OsAdapters,
     reason: str | None = None,
 ) -> ChangeProposal:
-    """Plan checkout-scoped harness edits and store a ``HIGH``-risk ``PENDING`` ``ChangeProposal``."""
+    """Validate harness profile, plan checkout-scoped edits, and store a ``HIGH``-risk ``PENDING`` proposal."""
     if harness_id not in _SUPPORTED_HARNESSES:
         raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
     _validate_abs_path(checkout_root, os_)
-    _validate_abs_path(profile_path, os_)
+    _validate_abs_path(harness_profile_path, os_)
     if not checkout_root.is_dir():
         raise BrainError(ErrorCode.NOT_FOUND, "checkout root not found")
     if reason is not None and (not isinstance(reason, str) or not reason or "\x00" in reason):
         raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
 
+    profile_validator.validate_harness_profile(
+        owner_id=owner_id,
+        harness_id=harness_id,
+        checkout_root=checkout_root,
+        harness_profile_path=harness_profile_path,
+    )
+    expected_digests = review_apply.active_slice_digests(checkout_root, owner_id=owner_id)
     plan = planner.plan_bootstrap(
         harness_id=harness_id,
         checkout_root=checkout_root,
-        profile_path=profile_path,
+        profile_path=harness_profile_path,
+        expected_slice_digests=expected_digests,
     )
     writes = tuple(
         TargetWriteInput(

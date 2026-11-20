@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -13,6 +14,7 @@ __all__ = [
     "BootstrapPlanSpec",
     "BootstrapPlannerPort",
     "BootstrapTargetSpec",
+    "HarnessProfileValidatorPort",
 ]
 
 
@@ -38,6 +40,19 @@ class BootstrapPlanSpec:
     targets: tuple[BootstrapTargetSpec, ...]
 
 
+class HarnessProfileValidatorPort(Protocol):
+    """Port validating a checkout-scoped harness profile before bootstrap planning."""
+
+    def validate_harness_profile(
+        self,
+        *,
+        owner_id: str,
+        harness_id: str,
+        checkout_root: Path,
+        harness_profile_path: Path,
+    ) -> None: ...
+
+
 class BootstrapPlannerPort(Protocol):
     """Port implemented by harness config adapters to plan checkout-scoped bootstrap edits."""
 
@@ -47,4 +62,5 @@ class BootstrapPlannerPort(Protocol):
         harness_id: str,
         checkout_root: Path,
         profile_path: Path,
+        expected_slice_digests: Mapping[tuple[str, str], str] | None = None,
     ) -> BootstrapPlanSpec: ...

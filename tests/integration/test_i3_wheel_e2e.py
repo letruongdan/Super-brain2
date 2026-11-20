@@ -11,7 +11,7 @@ import json
 import socket
 import ssl
 import struct
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 
@@ -23,7 +23,11 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
-from superbrain.adapters.harness_config.bootstrap_templates import AUTHORITY_ASK_COMMANDS, LAYER1_RULE_TEXT
+from superbrain.adapters.harness_config.bootstrap_templates import (
+    AUTHORITY_ASK_COMMANDS,
+    HANDOFF_RULE_TEXT,
+    LAYER1_RULE_TEXT,
+)
 from superbrain.adapters.os import os_adapters
 from superbrain.adapters.os.daemon_config import read_daemon_config
 from superbrain.core._kernel_approval import (
@@ -32,6 +36,7 @@ from superbrain.core._kernel_approval import (
     ApprovalAction,
     ApprovalChannel,
     ApprovalMessage,
+    Layer2State,
     RecoveryScope,
     RiskLevel,
     SignerEnrollment,
@@ -39,15 +44,21 @@ from superbrain.core._kernel_approval import (
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.kernel import Endpoint, ResourceDigest
 from superbrain.storage.backup import create_policy_backup, create_store_backup
+from tests.support.clock import FakeClock
 from tests.support.inc2_cli import (
+    InstalledMcpPipeSession,
     is_writer_lock_held,
+    mcp_call_frame,
+    mcp_init_frames,
     run_installed_command,
-    spawn_installed_brain_serve,
+    spawn_installed_fixture_daemon,
     write_client_profile_file,
+    write_credential_file,
     write_owner_only_bytes,
 )
 from tests.support.inc2_fixture import InstalledEnv, reopen_kernel_job_runtime
-from tests.support.inc2_transport import read_raw_http_response
+from tests.support.inc2_transport import read_raw_http_response, register_workspace_direct
+from tests.support.kernel_auth import seed_principal_and_credential
 
 OWNER = "dan"
 MACHINE = "e2e-box"
@@ -230,7 +241,79 @@ def test_i3_wheel_synthetic_lifecycle_e2e(inc2_installed_env: InstalledEnv, trus
         credential_file=cfg_dir / "cli.credential",
     )
 
-    srv_proc = spawn_installed_brain_serve(inc2_installed_env, daemon_cfg_path, data_root=data_root, cwd=cwd)
+    seed_clock = FakeClock(datetime.now(UTC).replace(microsecond=0))
+    rt_seed = reopen_kernel_job_runtime(data_root, store_id, os_adapters(clock=seed_clock))
+    try:
+        cred_claude = seed_principal_and_credential(
+            rt_seed.policy, owner_id=OWNER, harness_id="claude-code", machine_id=MACHINE
+        )
+        cred_codex = seed_principal_and_credential(
+            rt_seed.policy, owner_id=OWNER, harness_id="codex", machine_id=MACHINE
+        )
+        ws_a = register_workspace_direct(
+            rt_seed,
+            seed_clock,
+            cred_claude.principal,
+            alias="ws-claude-a",
+            checkout_dir=co_a,
+            remote="https://github.example/dan/repo-a.git",
+        )
+        ws_b = register_workspace_direct(
+            rt_seed,
+            seed_clock,
+            cred_codex.principal,
+            alias="ws-codex-b",
+            checkout_dir=co_b,
+            remote="https://github.example/dan/repo-b.git",
+        )
+        rt_seed.policy.set_layer2_state(
+            harness_id="claude-code",
+            host_version="1.0.0",
+            config_digest="sha256:" + "1" * 64,
+            state=Layer2State.VERIFIED,
+        )
+        rt_seed.policy.set_layer2_state(
+            harness_id="codex",
+            host_version="1.0.0",
+            config_digest="sha256:" + "2" * 64,
+            state=Layer2State.VERIFIED,
+        )
+        rt_seed.store.reconcile_policy()
+    finally:
+        rt_seed.close()
+
+    claude_cred_path = write_credential_file(cfg_dir / "claude-a.credential", cred_claude.token)
+    codex_cred_path = write_credential_file(cfg_dir / "codex-b.credential", cred_codex.token)
+    claude_a_profile, _ = write_client_profile_file(
+        trusted_tmp / "claude-a.profile.json",
+        endpoint_path=data_root / "endpoint.json",
+        expected_store_id=store_id,
+        ca_file=cfg_dir / "tls" / "ca.pem",
+        leaf_cert_sha256=leaf_sha,
+        credential_file=claude_cred_path,
+        workspace={
+            "alias": ws_a.alias,
+            "checkout_path": str(co_a),
+            "expected_workspace_id": ws_a.repo_id,
+            "expected_checkout_id": ws_a.checkout_id,
+        },
+    )
+    codex_b_profile, _ = write_client_profile_file(
+        trusted_tmp / "codex-b.profile.json",
+        endpoint_path=data_root / "endpoint.json",
+        expected_store_id=store_id,
+        ca_file=cfg_dir / "tls" / "ca.pem",
+        leaf_cert_sha256=leaf_sha,
+        credential_file=codex_cred_path,
+        workspace={
+            "alias": ws_b.alias,
+            "checkout_path": str(co_b),
+            "expected_workspace_id": ws_b.repo_id,
+            "expected_checkout_id": ws_b.checkout_id,
+        },
+    )
+
+    srv_proc = spawn_installed_fixture_daemon(inc2_installed_env, daemon_cfg_path, data_root=data_root, cwd=cwd)
     try:
         ep = srv_proc.wait_ready()
         assert isinstance(ep, Endpoint)
@@ -278,7 +361,28 @@ def test_i3_wheel_synthetic_lifecycle_e2e(inc2_installed_env: InstalledEnv, trus
         assert enr_done["ok"] is True
         passkey_signer_id = enr_done["data"]["signer"]["signer_id"]
 
-        # 3. Installed `brain bootstrap` for Claude & Codex creates HIGH-risk proposals without touching files.
+        # 3. Installed `brain bootstrap` rejects CLI/swapped harness profiles (exit 1) & accepts dedicated ones.
+        for bad_hp in (profile_path, codex_b_profile):
+            bad_res = run_installed_command(
+                inc2_installed_env,
+                "brain",
+                [
+                    "bootstrap",
+                    "--harness",
+                    "claude-code",
+                    "--checkout",
+                    str(co_a),
+                    "--profile",
+                    str(profile_path),
+                    "--harness-profile",
+                    str(bad_hp),
+                    "--json",
+                ],
+                cwd=cwd,
+            )
+            assert bad_res.returncode == 1
+        assert not (co_a / ".mcp.json").exists()
+
         b_a = run_installed_command(
             inc2_installed_env,
             "brain",
@@ -290,6 +394,8 @@ def test_i3_wheel_synthetic_lifecycle_e2e(inc2_installed_env: InstalledEnv, trus
                 str(co_a),
                 "--profile",
                 str(profile_path),
+                "--harness-profile",
+                str(claude_a_profile),
                 "--json",
             ],
             cwd=cwd,
@@ -297,10 +403,22 @@ def test_i3_wheel_synthetic_lifecycle_e2e(inc2_installed_env: InstalledEnv, trus
         b_b = run_installed_command(
             inc2_installed_env,
             "brain",
-            ["bootstrap", "--harness", "codex", "--checkout", str(co_b), "--profile", str(profile_path), "--json"],
+            [
+                "bootstrap",
+                "--harness",
+                "codex",
+                "--checkout",
+                str(co_b),
+                "--profile",
+                str(profile_path),
+                "--harness-profile",
+                str(codex_b_profile),
+                "--json",
+            ],
             cwd=cwd,
         )
-        assert b_a.returncode == 0 and b_b.returncode == 0
+        assert b_a.returncode == 0, b_a.stderr.decode()
+        assert b_b.returncode == 0, b_b.stderr.decode()
         pid_a = json.loads(b_a.stdout)["data"]["proposal"]["proposal_id"]
         pid_b = json.loads(b_b.stdout)["data"]["proposal"]["proposal_id"]
         assert not (co_a / ".mcp.json").exists() and not (co_b / ".codex" / "hooks.json").exists()
@@ -335,6 +453,8 @@ def test_i3_wheel_synthetic_lifecycle_e2e(inc2_installed_env: InstalledEnv, trus
             assert r_cli.returncode == 0, r_cli.stderr.decode()
         claude_md = (co_a / "CLAUDE.md").read_text(encoding="utf-8")
         assert "# Claude User Header" in claude_md and LAYER1_RULE_TEXT in claude_md
+        assert HANDOFF_RULE_TEXT in claude_md and str(claude_a_profile) in claude_md
+        assert str(profile_path) not in claude_md
         for cmd in AUTHORITY_ASK_COMMANDS:
             assert cmd in (co_a / ".claude" / "settings.local.json").read_text(encoding="utf-8")
 
@@ -382,6 +502,69 @@ def test_i3_wheel_synthetic_lifecycle_e2e(inc2_installed_env: InstalledEnv, trus
                     ).encode("utf-8"),
                 )
                 assert st_sub == 200 and sub_env["ok"] is True, sub_env
+
+        agents_md = (co_b / "AGENTS.md").read_text(encoding="utf-8")
+        assert "# Codex User Header" in agents_md and LAYER1_RULE_TEXT in agents_md
+        assert HANDOFF_RULE_TEXT in agents_md and str(codex_b_profile) in agents_md
+        assert str(profile_path) not in agents_md
+
+        # 4c. Parse installed MCP configs directly, run wheel shims in co_a & co_b, and check wrong-CWD refusal!
+        mcp_json = json.loads((co_a / ".mcp.json").read_text(encoding="utf-8"))
+        entry_a = mcp_json["mcpServers"]["super-brain"]
+        assert entry_a["command"] == "brain"
+        assert str(claude_a_profile) in entry_a["args"] and str(profile_path) not in entry_a["args"]
+
+        codex_toml = tomlkit.parse((co_b / ".codex" / "config.toml").read_text(encoding="utf-8")).unwrap()
+        entry_b = codex_toml["mcp_servers"]["super-brain"]
+        assert entry_b["command"] == "brain"
+        assert str(codex_b_profile) in entry_b["args"] and str(profile_path) not in entry_b["args"]
+
+        for entry, harness_id, co_dir, expected_ws in (
+            (entry_a, "claude-code", co_a, ws_a),
+            (entry_b, "codex", co_b, ws_b),
+        ):
+            init_frames = mcp_init_frames(1)
+            prep_frame = mcp_call_frame(
+                2,
+                "prepare_task",
+                {
+                    "schema_version": "2.0",
+                    "idempotency_key": f"idem-e2e-{harness_id}-1",
+                    "task_id": f"task-e2e-{harness_id}-1",
+                    "harness_id": harness_id,
+                    "description": f"wheel e2e prepare_task for {harness_id}",
+                },
+            )
+            with InstalledMcpPipeSession(
+                inc2_installed_env,
+                str(entry["command"]),
+                [str(a) for a in entry["args"]],
+                cwd=co_dir,
+            ) as shim_sess:
+                resp_init = shim_sess.send_frames_and_expect_response([init_frames[0]])
+                assert resp_init.get("id") == 1 and "error" not in resp_init
+                resp_prep = shim_sess.send_frames_and_expect_response([init_frames[1], prep_frame])
+                assert resp_prep.get("id") == 2 and "error" not in resp_prep
+                prep_res = resp_prep["result"]
+                assert isinstance(prep_res, dict) and prep_res.get("isError") is False
+                sc = prep_res.get("structuredContent")
+                assert isinstance(sc, dict) and sc.get("ok") is True
+                pdata = sc.get("data")
+                assert isinstance(pdata, dict)
+                assert pdata.get("workspace_id") == expected_ws.repo_id
+                assert pdata.get("checkout_id") == expected_ws.checkout_id
+                rc_shim, stderr_shim = shim_sess.finish()
+                assert rc_shim == 0 and stderr_shim == b""
+
+        wrong_cwd_res = run_installed_command(
+            inc2_installed_env,
+            str(entry_a["command"]),
+            [str(a) for a in entry_a["args"]],
+            cwd=co_b,
+            stdin_bytes=b"",
+        )
+        assert wrong_cwd_res.returncode == 1
+        assert ErrorCode.IDENTITY_MISMATCH.value in wrong_cwd_res.stderr.decode("utf-8", errors="replace")
 
         # 5. Out-of-band U1 edit -> `brain rollback` preserves U1 byte-for-byte!
         toml_u1 = (co_b / ".codex" / "config.toml").read_text(encoding="utf-8") + (

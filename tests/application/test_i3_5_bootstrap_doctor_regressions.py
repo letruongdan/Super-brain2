@@ -21,6 +21,7 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
+import superbrain.composition.doctor_entry as doctor_entry
 from superbrain.adapters.harness_config.bootstrap_templates import (
     AdapterBootstrapPlanner,
     plan_claude_bootstrap,
@@ -34,7 +35,6 @@ from superbrain.application.approvals import OperatorService
 from superbrain.application.bootstrap import create_bootstrap_proposal
 from superbrain.application.review_apply import ReviewApplyService, TargetWriteInput
 from superbrain.cli.main import main as brain_main
-from superbrain.composition import doctor_entry
 from superbrain.composition.init_entry import InitReport, InitRequest, init_store
 from superbrain.composition.operator_entry import make_default_bootstrap_handler
 from superbrain.core._kernel_approval import (
@@ -58,7 +58,7 @@ from superbrain.storage.proposals import PolicyApplyAuthority, StoreProposalAdap
 from tests.support.clock import FakeClock
 from tests.support.fs import digest_tree
 from tests.support.inc2_fixture import reopen_kernel_job_runtime
-from tests.support.inc2_transport import FakeMonotonicClock
+from tests.support.inc2_transport import FakeMonotonicClock, register_workspace_direct
 from tests.support.kernel_auth import seed_principal_and_credential
 
 OWNER = "dan"
@@ -112,6 +112,8 @@ def _write_profile(
     cfg_dir: Path,
     expected_store_id: str,
     checkout_path: Path | None = None,
+    credential_file: Path | None = None,
+    workspace: dict[str, str] | None = None,
 ) -> Path:
     payload: dict[str, Any] = {
         "version": 1,
@@ -119,9 +121,11 @@ def _write_profile(
         "expected_store_id": expected_store_id,
         "ca_file": str(cfg_dir / "tls" / "ca.pem"),
         "leaf_cert_sha256": "a" * 64,
-        "credential_file": str(cfg_dir / "cli.credential"),
+        "credential_file": str(credential_file if credential_file is not None else (cfg_dir / "cli.credential")),
     }
-    if checkout_path is not None:
+    if workspace is not None:
+        payload["workspace"] = workspace
+    elif checkout_path is not None:
         payload["workspace"] = {
             "alias": "ws-r2",
             "checkout_path": str(checkout_path),
@@ -450,9 +454,57 @@ def test_r04_and_n2_bootstrap_junction_leak_dotdot_rejection_and_claude_rollback
     assert huge_err.value.code is ErrorCode.INVALID_INPUT
 
     # (c) Reject '..' segments in OperatorService `/v2/operator/proposal/bootstrap` & `create_bootstrap_proposal`.
+    from superbrain.composition._bootstrap_wiring import PolicyHarnessProfileValidator
+
     rt = reopen_kernel_job_runtime(data_root, rep.store_id, os_)
     try:
         cli = seed_principal_and_credential(rt.policy, owner_id=OWNER, harness_id="cli", machine_id=MACHINE)
+        claude_cred = seed_principal_and_credential(
+            rt.policy, owner_id=OWNER, harness_id="claude-code", machine_id=MACHINE
+        )
+        ws_co = register_workspace_direct(
+            rt, clock, claude_cred.principal, alias="ws-r04-co", checkout_dir=co, remote="https://github.example/dan/r04-co.git"
+        )
+        ws_j = register_workspace_direct(
+            rt,
+            clock,
+            claude_cred.principal,
+            alias="ws-r04-j",
+            checkout_dir=co_j_claude,
+            remote="https://github.example/dan/r04-j.git",
+        )
+        claude_cred_file = cfg_dir / "claude.credential"
+        claude_cred_file.write_text(f"{claude_cred.token}\n", encoding="ascii")
+        os_.permissions.secure_file(claude_cred_file)
+        harness_profile = _write_profile(
+            cfg_dir / "harness.profile.json",
+            os_,
+            data_root=data_root,
+            cfg_dir=cfg_dir,
+            expected_store_id=rep.store_id,
+            credential_file=claude_cred_file,
+            workspace={
+                "alias": ws_co.alias,
+                "checkout_path": str(co),
+                "expected_workspace_id": ws_co.repo_id,
+                "expected_checkout_id": ws_co.checkout_id,
+            },
+        )
+        j_profile = _write_profile(
+            cfg_dir / "j-harness.profile.json",
+            os_,
+            data_root=data_root,
+            cfg_dir=cfg_dir,
+            expected_store_id=rep.store_id,
+            credential_file=claude_cred_file,
+            workspace={
+                "alias": ws_j.alias,
+                "checkout_path": str(co_j_claude),
+                "expected_workspace_id": ws_j.repo_id,
+                "expected_checkout_id": ws_j.checkout_id,
+            },
+        )
+
         svc = ReviewApplyService(
             StoreProposalAdapter(rt.store, os_),
             PolicyApplyAuthority(rt.policy),
@@ -462,28 +514,31 @@ def test_r04_and_n2_bootstrap_junction_leak_dotdot_rejection_and_claude_rollback
             config_merger=SharedConfigMergerAdapter(),
         )
         planner = AdapterBootstrapPlanner()
+        validator = PolicyHarnessProfileValidator(rt.policy, os_)
         with pytest.raises(BrainError) as cp_err:
             create_bootstrap_proposal(
                 svc,
                 owner_id=OWNER,
                 harness_id="claude-code",
                 checkout_root=co_j_claude,
-                profile_path=profile,
+                harness_profile_path=j_profile,
                 planner=planner,
+                profile_validator=validator,
                 os_=os_,
             )
         assert cp_err.value.code is ErrorCode.UNSAFE_PATH
 
         dotdot_co = co / "sub" / ".." / "escape"
-        dotdot_prof = cfg_dir / "sub" / ".." / "cli.profile.json"
+        dotdot_prof = cfg_dir / "sub" / ".." / "harness.profile.json"
         with pytest.raises(BrainError) as dd_err1:
             create_bootstrap_proposal(
                 svc,
                 owner_id=OWNER,
                 harness_id="claude-code",
                 checkout_root=dotdot_co,
-                profile_path=profile,
+                harness_profile_path=harness_profile,
                 planner=planner,
+                profile_validator=validator,
                 os_=os_,
             )
         assert dd_err1.value.code is ErrorCode.UNSAFE_PATH
@@ -492,11 +547,11 @@ def test_r04_and_n2_bootstrap_junction_leak_dotdot_rejection_and_claude_rollback
             rt.policy,
             ssh_verifier=lambda: None,
             review_apply=svc,
-            bootstrap_handler=make_default_bootstrap_handler(os_),
+            bootstrap_handler=make_default_bootstrap_handler(rt.policy, os_),
         )
         for body in (
-            {"harness": "claude-code", "checkout_root": str(dotdot_co), "profile_path": str(profile)},
-            {"harness": "claude-code", "checkout_root": str(co), "profile_path": str(dotdot_prof)},
+            {"harness": "claude-code", "checkout_root": str(dotdot_co), "harness_profile_path": str(harness_profile)},
+            {"harness": "claude-code", "checkout_root": str(co), "harness_profile_path": str(dotdot_prof)},
         ):
             with pytest.raises(BrainError) as op_dd:
                 op.handle("/v2/operator/proposal/bootstrap", cli.principal, body)
@@ -514,8 +569,9 @@ def test_r04_and_n2_bootstrap_junction_leak_dotdot_rejection_and_claude_rollback
             owner_id=OWNER,
             harness_id="claude-code",
             checkout_root=co,
-            profile_path=profile,
+            harness_profile_path=harness_profile,
             planner=planner,
+            profile_validator=validator,
             os_=os_,
         )
         assert len(boot_prop.targets) == 3

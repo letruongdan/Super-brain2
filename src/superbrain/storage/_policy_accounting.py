@@ -159,12 +159,33 @@ def _period_key(now: datetime) -> str:
     return utc_dt.astimezone(UTC).strftime("%Y-%m-%d")
 
 
+def _month_key(now: datetime) -> str:
+    utc_dt, _ = require_aware_utc(now)
+    return utc_dt.astimezone(UTC).strftime("%Y-%m")
+
+
+def _is_month_period(period_key: str) -> bool:
+    return (
+        len(period_key) == 7
+        and period_key[4] == "-"
+        and period_key[:4].isdigit()
+        and period_key[5:].isdigit()
+    )
+
+
 def _committed_sum(db: sqlite3.Connection, owner_id: str, period_key: str) -> Decimal:
-    rows = db.execute(
-        "SELECT state, reserved_amount, settled_amount FROM accounting_invocations "
-        "WHERE owner_id = ? AND period_key = ?",
-        (owner_id, period_key),
-    ).fetchall()
+    if _is_month_period(period_key):
+        rows = db.execute(
+            "SELECT state, reserved_amount, settled_amount FROM accounting_invocations "
+            "WHERE owner_id = ? AND (period_key = ? OR period_key LIKE ?)",
+            (owner_id, period_key, f"{period_key}-%"),
+        ).fetchall()
+    else:
+        rows = db.execute(
+            "SELECT state, reserved_amount, settled_amount FROM accounting_invocations "
+            "WHERE owner_id = ? AND period_key = ?",
+            (owner_id, period_key),
+        ).fetchall()
     total = Decimal("0")
     for state, reserved, settled in rows:
         st = str(state)
@@ -317,13 +338,14 @@ class PolicyAccountingMixin:
         require_opaque_id(owner_id, label="owner_id")
         require_decimal(max_amount)
         period = _period_key(now)
+        month_period = _month_key(now)
         stamp = utc_timestamp(now)
         with self._authority_tx() as db:
             ensure_accounting_schema(db)
             locked = db.execute(
-                "SELECT 1 FROM accounting_locks WHERE state = 'locked' AND owner_id IN (?, '*') AND period_key = ? "
-                "LIMIT 1",
-                (owner_id, period),
+                "SELECT 1 FROM accounting_locks WHERE state = 'locked' AND owner_id IN (?, '*') "
+                "AND period_key IN (?, ?) LIMIT 1",
+                (owner_id, month_period, period),
             ).fetchone()
             if locked is not None:
                 raise BrainError(ErrorCode.CAPABILITY_UNAVAILABLE, "accounting locked pending reconciliation")
@@ -345,7 +367,7 @@ class PolicyAccountingMixin:
             cap_row = db.execute(
                 "SELECT value FROM meta WHERE key = ?", (f"{_CAP_META_PREFIX}{owner_id}",)
             ).fetchone()
-            if cap_row is not None and _committed_sum(db, owner_id, period) + Decimal(max_amount) > Decimal(
+            if cap_row is not None and _committed_sum(db, owner_id, month_period) + Decimal(max_amount) > Decimal(
                 str(cap_row[0])
             ):
                 raise BrainError(ErrorCode.CAPABILITY_UNAVAILABLE, "period accounting cap exceeded")
@@ -448,8 +470,12 @@ class PolicyAccountingMixin:
             clauses.append("owner_id = ?")
             params.append(owner_id)
         if period_key is not None:
-            clauses.append("period_key = ?")
-            params.append(period_key)
+            if _is_month_period(period_key):
+                clauses.append("(period_key = ? OR period_key LIKE ?)")
+                params.extend((period_key, f"{period_key}-%"))
+            else:
+                clauses.append("period_key = ?")
+                params.append(period_key)
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         rows = db.execute(
             f"SELECT {_INV_COLS} FROM accounting_invocations {where} ORDER BY rowid", tuple(params)

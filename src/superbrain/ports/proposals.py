@@ -124,6 +124,10 @@ class ProposalStorePort(Protocol):
 
     def list_manifests(self, proposal_id: str) -> tuple[ManagedSliceManifest, ...]: ...
 
+    def list_latest_manifests_for_owner(
+        self, owner_id: str
+    ) -> tuple[tuple[ManagedSliceManifest, ProposalStatus], ...]: ...
+
 
 class ApplyAuthorityPort(Protocol):
     def trust_generation(self) -> int: ...

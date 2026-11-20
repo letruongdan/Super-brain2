@@ -216,6 +216,31 @@ class ReviewApplyService:
     def get_journal(self, journal_id: str) -> ApplyJournal:
         return self._proposals.get_journal(journal_id)
 
+    def active_slice_digests(self, checkout_root: Path, *, owner_id: str) -> dict[tuple[str, str], str]:
+        """Return active ``(normalized_rel_path, slice_id) -> slice_digest`` for ``checkout_root``."""
+        require_opaque_id(owner_id, label="owner_id")
+        phys = self._os.physical
+        target_id = phys.stat_physical_identity(checkout_root) if phys is not None else None
+        resolved_root = str(checkout_root.resolve())
+        digests: dict[tuple[str, str], str] = {}
+        seen_slices: set[tuple[str, str]] = set()
+        for manifest, status in self._proposals.list_latest_manifests_for_owner(owner_id):
+            m_root = Path(manifest.target_root)
+            if target_id is not None and phys is not None:
+                m_id = phys.stat_physical_identity(m_root)
+                matches = m_id == target_id if m_id is not None else str(m_root.resolve()) == resolved_root
+            else:
+                matches = str(m_root.resolve()) == resolved_root
+            if not matches:
+                continue
+            slice_key = (manifest.normalized_rel_path, manifest.slice_id)
+            if slice_key in seen_slices:
+                continue
+            seen_slices.add(slice_key)
+            if status is ProposalStatus.APPLIED:
+                digests[slice_key] = manifest.slice_digest
+        return digests
+
     def _validate_proposal_approval(
         self,
         prop: ChangeProposal,

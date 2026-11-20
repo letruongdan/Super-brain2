@@ -19,7 +19,7 @@ from superbrain.core._kernel_approval import (
     SignerEnrollment,
     SignerRecord,
 )
-from superbrain.core.kernel import Principal
+from superbrain.core.kernel import AuthSnapshot, Principal
 
 
 class SshApprovalVerifierPort(Protocol):
@@ -56,6 +56,8 @@ class ApprovalPolicyPort(Protocol):
     """The slice of ``PolicyStore`` the operator surface uses; called on the owner thread only."""
 
     def resolve_credential(self, token: str) -> Principal: ...
+
+    def snapshot(self) -> AuthSnapshot: ...
 
     def active_signers(self) -> tuple[SignerRecord, ...]: ...
 

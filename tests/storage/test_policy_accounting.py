@@ -419,7 +419,7 @@ def test_restore_policy_preview_immediate_locks_carry_forward_and_reconcile_unlo
     assert rev_cred_id in diff.revived_credential_ids
     assert d_q_extra in diff.removed_quarantines
     assert ("event", tomb_extra_id) in diff.removed_tombstones
-    assert diff.affected_periods == (day0, day1, day2)
+    assert diff.affected_periods == ("2026-10", "2026-11", day0, day1, day2)
     assert diff.next_trust_generation > diff.backup_trust_generation
 
     # First restore_policy with PolicyRestoreStageHook proves stage locks + hook run BEFORE swap/READY.
@@ -451,7 +451,7 @@ def test_restore_policy_preview_immediate_locks_carry_forward_and_reconcile_unlo
             migrations=KERNEL_POLICY_MIGRATIONS,
             stage_hooks=(hook,),
         )
-    assert staged_locks == [3]
+    assert staged_locks == [5]
 
     # Very first request after restore_policy MUST be blocked immediately by accounting_locks!
     rt_locked = reopen_kernel_job_runtime(root_path, store_id, os_)
@@ -483,7 +483,7 @@ def test_restore_policy_preview_immediate_locks_carry_forward_and_reconcile_unlo
     rt_carried = reopen_kernel_job_runtime(root_path, store_id, os_)
     try:
         locks = rt_carried.policy.list_accounting_locks(state="locked")
-        assert {lk.period_key for lk in locks} == {day0, day1, day2, day3, day4}
+        assert {lk.period_key for lk in locks} == {"2026-10", "2026-11", day0, day1, day2, day3, day4}
         assert rt_carried.policy.signer_reset_recorded() is True
         carried_unk = rt_carried.policy.accounting_invocation(inv_unk)
         assert carried_unk is not None and carried_unk.reserved_amount == "2.25"
@@ -552,7 +552,7 @@ def test_restore_policy_preview_immediate_locks_carry_forward_and_reconcile_unlo
             channel=ApprovalChannel.SSH_KEY,
             expected_restore_epoch=cur_epoch,
         )
-        assert len(reconciled) == 5
+        assert len(reconciled) == 7
         assert rt_carried.policy.list_accounting_locks(state="locked") == ()
         assert svc_c.reserve_invocation(l_blocked2, UsageReservation(max_amount="0.25"))
     finally:

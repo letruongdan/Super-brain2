@@ -16,8 +16,18 @@ from pathlib import Path
 from typing import Any
 
 from superbrain.adapters.os import os_adapters
-from superbrain.adapters.os.daemon_config import read_daemon_config, read_owner_json_object
-from superbrain.adapters.os.tls_material import create_store_tls
+from superbrain.adapters.os.daemon_config import (
+    read_client_credential,
+    read_daemon_config,
+    read_owner_json_object,
+)
+from superbrain.composition._init_recovery import (
+    compute_init_request_digest,
+    has_existing_data_artifacts,
+    prepare_init_recovery,
+    recover_or_provision_tls,
+    write_init_bootstrap_state,
+)
 from superbrain.composition._maintenance_wiring import ensure_maintenance_backend
 from superbrain.composition.kernel_projections import kernel_store_extensions
 from superbrain.core._kernel_approval import CLI_HARNESS_ID, ApprovalChannel, SignerEnrollment, SignerRecord
@@ -25,11 +35,11 @@ from superbrain.core._kernel_base import require_opaque_id
 from superbrain.core.canonical import canonical_json
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.ids import new_id
-from superbrain.core.kernel import BootstrapAuthorization, DaemonConfig
+from superbrain.core.kernel import BootstrapAuthorization, DaemonConfig, parse_bearer_token
 from superbrain.ports.os import OsAdapters
 from superbrain.storage._policy_approvals import store_owner
 from superbrain.storage.kernel_schema import KERNEL_POLICY_MIGRATIONS, KERNEL_STORE_MIGRATIONS
-from superbrain.storage.layout import DataRoot, verify_existing_data_root
+from superbrain.storage.layout import verify_existing_data_root
 from superbrain.storage.runtime import (
     _preadmission_scratch,
     admit_existing_pair,
@@ -80,7 +90,7 @@ def _invalid() -> BrainError:
     return BrainError(ErrorCode.INVALID_INPUT, "invalid input")
 
 
-def _preflight_init_paths(request: InitRequest, os_: OsAdapters) -> None:
+def _preflight_base_paths(request: InitRequest, os_: OsAdapters) -> None:
     data_root, config_dir = request.data_root, request.config_dir
     if not data_root.is_absolute() or not isinstance(config_dir, Path) or not config_dir.is_absolute():
         raise _invalid()
@@ -89,35 +99,25 @@ def _preflight_init_paths(request: InitRequest, os_: OsAdapters) -> None:
         os_.paths.reject_links(target)
         if os_.permissions.check_ancestors(target):
             raise BrainError(ErrorCode.INSECURE_PERMISSIONS, "insecure permissions")
-
-    root = DataRoot.at(data_root)
-    existing_data = (
-        root.lock_path,
-        root.policy_db,
-        root.store_db,
-        root.policy_dir,
-        root.store_dir,
-        root.cas_dir,
-        root.backups_dir,
-    )
-    if any(os.path.lexists(path) for path in existing_data):
-        raise _invalid()
     if os.path.lexists(data_root):
         if not data_root.is_dir():
             raise _invalid()
         if os_.permissions.object_problems(data_root):
             raise BrainError(ErrorCode.INSECURE_PERMISSIONS, "insecure permissions")
-        if any(entry.name.startswith(("policy.", "store.")) for entry in data_root.iterdir()):
-            raise _invalid()
-
-    existing_cfg = (config_dir / DAEMON_CONFIG_NAME, config_dir / CLI_CREDENTIAL_NAME, config_dir / TLS_DIR_NAME)
-    if any(os.path.lexists(path) for path in existing_cfg):
-        raise _invalid()
     if os.path.lexists(config_dir):
         if not config_dir.is_dir():
             raise _invalid()
         if os_.permissions.object_problems(config_dir):
             raise BrainError(ErrorCode.INSECURE_PERMISSIONS, "insecure permissions")
+
+
+def _preflight_fresh_config(config_dir: Path, os_: OsAdapters) -> None:
+    existing_cfg = (config_dir / DAEMON_CONFIG_NAME, config_dir / CLI_CREDENTIAL_NAME, config_dir / TLS_DIR_NAME)
+    if any(os.path.lexists(path) for path in existing_cfg):
+        raise _invalid()
+    tls_dir = config_dir / TLS_DIR_NAME
+    if os.path.lexists(tls_dir):
+        raise _invalid()
 
 
 def _require_config_dir(config_dir: Path, os_: OsAdapters) -> None:
@@ -145,19 +145,34 @@ def _write_owner_file(path: Path, data: bytes, os_: OsAdapters) -> None:
     os_.permissions.secure_file(path)
 
 
-def init_store(request: InitRequest, os_: OsAdapters) -> InitReport:
-    """Create a brand-new store pair and everything a daemon and the CLI need; an existing store is ``INVALID_INPUT``.
+def _write_daemon_config_if_missing(
+    daemon_config: Path,
+    *,
+    data_root: Path,
+    store_id: str,
+    cert_path: Path,
+    key_path: Path,
+    os_: OsAdapters,
+) -> None:
+    if os.path.lexists(daemon_config):
+        return
+    _write_owner_file(
+        daemon_config,
+        canonical_json(
+            {
+                "version": 1,
+                "data_root": str(data_root),
+                "expected_store_id": store_id,
+                "cert_path": str(cert_path),
+                "key_path": str(key_path),
+            }
+        ),
+        os_,
+    )
+    os_.publisher.sync_directory(daemon_config.parent)
 
-    Nothing is written when the target already holds a store, a daemon config, a CLI credential or TLS material.
-    """
-    if not isinstance(request, InitRequest) or not isinstance(request.data_root, Path):
-        raise _invalid()
-    require_opaque_id(request.owner_id, label="owner_id")
-    require_opaque_id(request.machine_id, label="machine_id")
-    if request.signer.owner_id != request.owner_id:
-        raise _invalid()
-    _preflight_init_paths(request, os_)
 
+def _init_fresh_store(request: InitRequest, req_digest: str, os_: OsAdapters) -> InitReport:
     config_dir = request.config_dir
     daemon_config = config_dir / DAEMON_CONFIG_NAME
     cli_credential = config_dir / CLI_CREDENTIAL_NAME
@@ -179,40 +194,160 @@ def init_store(request: InitRequest, os_: OsAdapters) -> InitReport:
         _principal, token = rt.policy.provision_credential(
             owner_id=request.owner_id, harness_id=CLI_HARNESS_ID, machine_id=request.machine_id
         )
+        cred_id, _ = parse_bearer_token(token)
         rt.store.reconcile_policy()
         generation = rt.policy.trust_generation()
+        write_init_bootstrap_state(
+            rt,
+            status="in_progress",
+            request_digest=req_digest,
+            config_dir=config_dir,
+            cli_credential_id=cred_id,
+        )
+        cert_path, key_path = recover_or_provision_tls(
+            store_id=store_id,
+            owner_id=request.owner_id,
+            generation=generation,
+            data_root=request.data_root,
+            tls_dir=tls_dir,
+            os_=os_,
+        )
+        _write_daemon_config_if_missing(
+            daemon_config,
+            data_root=request.data_root,
+            store_id=store_id,
+            cert_path=cert_path,
+            key_path=key_path,
+            os_=os_,
+        )
+        _write_owner_file(cli_credential, f"{token}\n".encode("ascii"), os_)
+        os_.publisher.sync_directory(config_dir)
+        write_init_bootstrap_state(
+            rt,
+            status="completed",
+            request_digest=req_digest,
+            config_dir=config_dir,
+            cli_credential_id=cred_id,
+        )
     finally:
         rt.close()
-
-    authorization = BootstrapAuthorization(
-        intent_id=new_id(),
-        store_id=store_id,
-        owner_id=request.owner_id,
-        action="provision_tls",
-        subject_id=store_id,
-        trust_generation=generation,
-        expires_at=os_.clock.now() + _BOOTSTRAP_TTL,
-        issuer_id=_BOOTSTRAP_ISSUER,
-        destination=tls_dir,
-    )
-    tls = create_store_tls(store_id, tls_dir, authorization, os_.clock, os_)
-    _write_owner_file(
-        daemon_config,
-        canonical_json(
-            {
-                "version": 1,
-                "data_root": str(request.data_root),
-                "expected_store_id": store_id,
-                "cert_path": str(tls.cert_path),
-                "key_path": str(tls.key_path),
-            }
-        ),
-        os_,
-    )
-    _write_owner_file(cli_credential, f"{token}\n".encode("ascii"), os_)
     return InitReport(
         store_id=store_id, daemon_config_path=daemon_config, cli_credential_path=cli_credential, signer=signer
     )
+
+
+def _recover_interrupted_init(
+    request: InitRequest,
+    req_digest: str,
+    store_id: str,
+    prev_cred_id: str,
+    os_: OsAdapters,
+) -> InitReport:
+    config_dir = request.config_dir
+    daemon_config = config_dir / DAEMON_CONFIG_NAME
+    cli_credential = config_dir / CLI_CREDENTIAL_NAME
+    tls_dir = config_dir / TLS_DIR_NAME
+    _require_config_dir(config_dir, os_)
+
+    admitted = admit_existing_pair(request.data_root, store_id, os_, purpose="serve")
+    handlers, kinds = kernel_store_extensions()
+    rt = open_runtime_under_lease(admitted, handlers=handlers, kinds=kinds)
+    try:
+        signers = rt.policy.active_signers()
+        if len(signers) != 1 or signers[0].key_digest != request.signer.key_digest:
+            raise _invalid()
+        signer = signers[0]
+        generation = rt.policy.trust_generation()
+        cert_path, key_path = recover_or_provision_tls(
+            store_id=store_id,
+            owner_id=request.owner_id,
+            generation=generation,
+            data_root=request.data_root,
+            tls_dir=tls_dir,
+            os_=os_,
+        )
+        _write_daemon_config_if_missing(
+            daemon_config,
+            data_root=request.data_root,
+            store_id=store_id,
+            cert_path=cert_path,
+            key_path=key_path,
+            os_=os_,
+        )
+        active_cred_id = prev_cred_id
+        if os.path.lexists(cli_credential):
+            token = read_client_credential(cli_credential, os_)
+            rt.policy.resolve_credential(token)
+        else:
+            snap = rt.policy.snapshot()
+            if prev_cred_id in snap.credentials and not snap.credentials[prev_cred_id].revoked:
+                rt.policy.record_authorized_revocation(
+                    prev_cred_id,
+                    BootstrapAuthorization(
+                        intent_id=new_id(),
+                        store_id=store_id,
+                        owner_id=request.owner_id,
+                        action="credential_revoke",
+                        subject_id=prev_cred_id,
+                        trust_generation=generation,
+                        expires_at=os_.clock.now() + _BOOTSTRAP_TTL,
+                        issuer_id=_BOOTSTRAP_ISSUER,
+                    ),
+                )
+            _principal, token = rt.policy.provision_credential(
+                owner_id=request.owner_id, harness_id=CLI_HARNESS_ID, machine_id=request.machine_id
+            )
+            active_cred_id, _ = parse_bearer_token(token)
+            rt.store.reconcile_policy()
+            write_init_bootstrap_state(
+                rt,
+                status="in_progress",
+                request_digest=req_digest,
+                config_dir=config_dir,
+                cli_credential_id=active_cred_id,
+            )
+            _write_owner_file(cli_credential, f"{token}\n".encode("ascii"), os_)
+            os_.publisher.sync_directory(config_dir)
+        write_init_bootstrap_state(
+            rt,
+            status="completed",
+            request_digest=req_digest,
+            config_dir=config_dir,
+            cli_credential_id=active_cred_id,
+        )
+    finally:
+        rt.close()
+    return InitReport(
+        store_id=store_id, daemon_config_path=daemon_config, cli_credential_path=cli_credential, signer=signer
+    )
+
+
+def init_store(request: InitRequest, os_: OsAdapters) -> InitReport:
+    """Create a new store pair and config/TLS/CLI artifacts, or durably resume an interrupted identical init."""
+    if not isinstance(request, InitRequest) or not isinstance(request.data_root, Path):
+        raise _invalid()
+    require_opaque_id(request.owner_id, label="owner_id")
+    require_opaque_id(request.machine_id, label="machine_id")
+    if request.signer.owner_id != request.owner_id:
+        raise _invalid()
+    _preflight_base_paths(request, os_)
+    req_digest = compute_init_request_digest(
+        owner_id=request.owner_id,
+        machine_id=request.machine_id,
+        signer=request.signer,
+        config_dir=request.config_dir,
+    )
+    if has_existing_data_artifacts(request.data_root):
+        store_id, state = prepare_init_recovery(
+            data_root=request.data_root,
+            config_dir=request.config_dir,
+            owner_id=request.owner_id,
+            request_digest=req_digest,
+            os_=os_,
+        )
+        return _recover_interrupted_init(request, req_digest, store_id, state.cli_credential_id, os_)
+    _preflight_fresh_config(request.config_dir, os_)
+    return _init_fresh_store(request, req_digest, os_)
 
 
 def _preflight_reset_owner(config: DaemonConfig, enrollment: SignerEnrollment, os_: OsAdapters) -> None:

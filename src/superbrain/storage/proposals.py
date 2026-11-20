@@ -299,6 +299,28 @@ class StoreProposalAdapter(ProposalStorePort):
         )
         return tuple(decode_manifest(self._store.cas.read(str(row[0]))) for row in rows)
 
+    def list_latest_manifests_for_owner(
+        self, owner_id: str
+    ) -> tuple[tuple[ManagedSliceManifest, ProposalStatus], ...]:
+        rows = self._query(
+            "SELECT m.target_key_digest, m.manifest_digest, p.status "
+            "FROM p_proposals_manifests m "
+            "JOIN p_proposals_proposals p ON m.proposal_id = p.proposal_id "
+            "WHERE p.owner_id = ? "
+            "ORDER BY m.sequence DESC",
+            (owner_id,),
+        )
+        seen_keys: set[str] = set()
+        out: list[tuple[ManagedSliceManifest, ProposalStatus]] = []
+        for key_digest_obj, manifest_digest_obj, status_obj in rows:
+            key_digest = str(key_digest_obj)
+            if key_digest in seen_keys:
+                continue
+            seen_keys.add(key_digest)
+            manifest = decode_manifest(self._store.cas.read(str(manifest_digest_obj)))
+            out.append((manifest, ProposalStatus(str(status_obj))))
+        return tuple(out)
+
 
 class PolicyApplyAuthority(ApplyAuthorityPort):
     """Bridges ``PolicyStore`` v4 approval/grant authority to ``ApplyAuthorityPort``."""

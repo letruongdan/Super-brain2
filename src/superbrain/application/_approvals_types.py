@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import inspect
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -154,7 +155,7 @@ class BootstrapProposalHandler(Protocol):
         owner_id: str,
         harness_id: str,
         checkout_root: Path,
-        profile_path: Path,
+        harness_profile_path: Path,
         reason: str | None = None,
     ) -> ChangeProposal: ...
 
@@ -164,13 +165,15 @@ def prepare_bootstrap_call(
     body: Mapping[str, JsonValue],
     review_apply: ReviewApplyService | None,
     bootstrap_handler: BootstrapProposalHandler | None,
+    *,
+    policy: ApprovalPolicyPort | None = None,
 ) -> PreparedOperatorCall:
     """Validate `/v2/operator/proposal/bootstrap` body and build a ``PENDING`` bootstrap proposal."""
-    if not set(body) <= {"harness", "checkout_root", "profile_path", "reason"}:
+    if not set(body) <= {"harness", "checkout_root", "harness_profile_path", "reason"}:
         raise _invalid()
     harness = body.get("harness")
     checkout_raw = body.get("checkout_root")
-    profile_raw = body.get("profile_path")
+    harness_profile_raw = body.get("harness_profile_path")
     reason = body.get("reason")
     if (
         not isinstance(harness, str)
@@ -179,26 +182,41 @@ def prepare_bootstrap_call(
         or not checkout_raw
         or "\x00" in checkout_raw
         or not Path(checkout_raw).is_absolute()
-        or not isinstance(profile_raw, str)
-        or not profile_raw
-        or "\x00" in profile_raw
-        or not Path(profile_raw).is_absolute()
+        or not isinstance(harness_profile_raw, str)
+        or not harness_profile_raw
+        or "\x00" in harness_profile_raw
+        or not Path(harness_profile_raw).is_absolute()
     ):
         raise _invalid()
-    if ".." in Path(checkout_raw).parts or ".." in Path(profile_raw).parts:
+    if ".." in Path(checkout_raw).parts or ".." in Path(harness_profile_raw).parts:
         raise BrainError(ErrorCode.UNSAFE_PATH, "unsafe path")
     if reason is not None and (not isinstance(reason, str) or not reason or "\x00" in reason):
         raise _invalid()
     if review_apply is None or bootstrap_handler is None:
         raise BrainError(ErrorCode.CAPABILITY_UNAVAILABLE, "capability unavailable")
-    prop = bootstrap_handler(
-        review_apply,
-        owner_id=principal.owner_id,
-        harness_id=harness,
-        checkout_root=Path(checkout_raw),
-        profile_path=Path(profile_raw),
-        reason=reason,
-    )
+    sig = inspect.signature(bootstrap_handler)
+    if policy is not None and (
+        "policy" in sig.parameters
+        or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+    ):
+        prop = bootstrap_handler(
+            review_apply,
+            owner_id=principal.owner_id,
+            harness_id=harness,
+            checkout_root=Path(checkout_raw),
+            harness_profile_path=Path(harness_profile_raw),
+            reason=reason,
+            policy=policy,  # type: ignore[call-arg]
+        )
+    else:
+        prop = bootstrap_handler(
+            review_apply,
+            owner_id=principal.owner_id,
+            harness_id=harness,
+            checkout_root=Path(checkout_raw),
+            harness_profile_path=Path(harness_profile_raw),
+            reason=reason,
+        )
     return PreparedOperatorCall(immediate={"proposal": _proposal_json(prop)})
 
 

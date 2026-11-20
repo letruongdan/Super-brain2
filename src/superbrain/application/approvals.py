@@ -166,7 +166,9 @@ class OperatorService:
         if path in _PROPOSAL_MUTATING_PATHS:
             return self._prepare_proposal_action(path, principal, token, body)
         if path == "/v2/operator/proposal/bootstrap":
-            return prepare_bootstrap_call(principal, body, self._review_apply, self._bootstrap_handler)
+            return prepare_bootstrap_call(
+                principal, body, self._review_apply, self._bootstrap_handler, policy=self._policy
+            )
         if path == "/v2/operator/restore":
             return self._prepare_restore(principal, token, body)
         if path in _DEFERRED_PATHS:

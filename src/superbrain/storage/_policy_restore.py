@@ -55,9 +55,19 @@ def _affected_periods(backup_created_at: str, now: datetime) -> tuple[str, ...]:
     start = datetime.fromisoformat(backup_created_at.replace("Z", "+00:00")).astimezone(UTC).date()
     end = now.astimezone(UTC).date()
     if end < start:
-        return (end.strftime("%Y-%m-%d"),)
+        return (end.strftime("%Y-%m"), end.strftime("%Y-%m-%d"))
+    months: list[str] = []
+    year, month = start.year, start.month
+    while (year, month) <= (end.year, end.month):
+        months.append(f"{year:04d}-{month:02d}")
+        if month == 12:
+            year += 1
+            month = 1
+        else:
+            month += 1
     days = (end - start).days
-    return tuple((start + timedelta(days=offset)).strftime("%Y-%m-%d") for offset in range(days + 1))
+    day_keys = [(start + timedelta(days=offset)).strftime("%Y-%m-%d") for offset in range(days + 1)]
+    return tuple(months + day_keys)
 
 
 def _read_lock_hwm(root: DataRoot, os_: OsAdapters) -> int:
