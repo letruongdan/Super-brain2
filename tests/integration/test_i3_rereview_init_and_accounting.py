@@ -5,26 +5,16 @@ Requirement sources: spec rev 22 §5.7, §9, §11.3; ``docs/reviews/2026-11-20-s
 
 from __future__ import annotations
 
-import base64
-import struct
-from collections.abc import Mapping
-from dataclasses import replace
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
-from cryptography import x509
-from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 from superbrain.adapters.os import os_adapters
-from superbrain.adapters.os.daemon_config import read_daemon_config
-from superbrain.adapters.os.tls_material import verify_server_tls_files
 from superbrain.composition.init_entry import InitRequest, init_store
 from superbrain.core._kernel_approval import (
-    CLI_HARNESS_ID,
     RISK_POLICY_VERSION,
     ApprovalAction,
     ApprovalChannel,
@@ -35,17 +25,17 @@ from superbrain.core._kernel_approval import (
     classify_policy_change_risk,
     policy_change_subject_id,
 )
-from superbrain.core._kernel_auth import parse_bearer_token
 from superbrain.core.canonical import digest_bytes
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.ids import new_id
 from superbrain.core.kernel import ResourceDigest
-from superbrain.ports.os import DurabilityReport, NoReplacePublisher, OsAdapters
+from superbrain.ports.os import OsAdapters
 from superbrain.storage.backup import create_policy_backup
 from superbrain.storage.kernel_schema import KERNEL_POLICY_MIGRATIONS
 from superbrain.storage.layout import DataRoot
 from superbrain.storage.restore import preview_policy_restore, read_restore_epoch, restore_policy
 from tests.storage.conftest import maintenance_lease
+from tests.support import rereview_1d666f5 as rr
 from tests.support.clock import FakeClock
 from tests.support.fs import digest_tree
 from tests.support.inc2_fixture import open_kernel_job_runtime, reopen_kernel_job_runtime
@@ -55,92 +45,10 @@ MACHINE = "rereview-f3-f5"
 D_DIFF = digest_bytes(b'{"reconcile_accounting":true}')
 
 
-def _ssh_enrollment(tag: str) -> SignerEnrollment:
-    raw = Ed25519PrivateKey.generate().public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
-    blob = struct.pack(">I", 11) + b"ssh-ed25519" + struct.pack(">I", len(raw)) + raw
-    return SignerEnrollment(
-        owner_id=OWNER,
-        channel=ApprovalChannel.SSH_KEY,
-        public_key="ssh-ed25519 " + base64.b64encode(blob).decode("ascii") + f" {tag}@devbox",
-    )
+_ssh_enrollment = rr.ssh_enrollment
+_faulty_os = rr.faulty_os
+_assert_clean_completed_init = rr.assert_clean_completed_init
 
-
-class _FaultyPublisher(NoReplacePublisher):
-    """Test-only publisher wrapper injecting ``IO_ERROR`` on one target file name."""
-
-    def __init__(self, inner: Any, fail_name: str) -> None:
-        self._inner = inner
-        self._fail_name = fail_name
-
-    def write_new(self, path: Path, data: bytes) -> None:
-        if path.name == self._fail_name:
-            raise BrainError(ErrorCode.IO_ERROR, f"injected io_error on {path.name}")
-        self._inner.write_new(path, data)
-
-    def publish(self, staging: Path, final: Path) -> None:
-        if final.name == self._fail_name:
-            raise BrainError(ErrorCode.IO_ERROR, f"injected io_error on {final.name}")
-        self._inner.publish(staging, final)
-
-    def publish_no_replace(self, staging: Path, final: Path) -> None:
-        if final.name == self._fail_name:
-            raise BrainError(ErrorCode.IO_ERROR, f"injected io_error on {final.name}")
-        self._inner.publish_no_replace(staging, final)
-
-    def rename_dir(self, src: Path, dst: Path) -> None:
-        self._inner.rename_dir(src, dst)
-
-    def sync_directory(self, directory: Path) -> None:
-        self._inner.sync_directory(directory)
-
-    def flush_file(self, path: Path) -> None:
-        self._inner.flush_file(path)
-
-    def durability(self, directory: Path, env: Mapping[str, str]) -> DurabilityReport:
-        res: DurabilityReport = self._inner.durability(directory, env)
-        return res
-
-
-def _faulty_os(base_os: OsAdapters, fail_name: str) -> OsAdapters:
-    return replace(base_os, publisher=_FaultyPublisher(base_os.publisher, fail_name))
-
-
-def _verify_ca_signed_leaf(ca_pem_path: Path, leaf_pem_path: Path) -> None:
-    ca_cert = x509.load_pem_x509_certificate(ca_pem_path.read_bytes())
-    leaf_cert = x509.load_pem_x509_certificate(leaf_pem_path.read_bytes())
-    pub = ca_cert.public_key()
-    assert isinstance(pub, ec.EllipticCurvePublicKey)
-    assert leaf_cert.signature_hash_algorithm is not None
-    pub.verify(leaf_cert.signature, leaf_cert.tbs_certificate_bytes, ec.ECDSA(leaf_cert.signature_hash_algorithm))
-
-
-def _assert_clean_completed_init(req: InitRequest, report: Any, os_: OsAdapters, clock: FakeClock) -> None:
-    """Exactly one signer/credential/principal, reconciled policy, CA-signed leaf and no leftover init marker file."""
-    data_root, cfg_dir = req.data_root, req.config_dir
-    cfg = read_daemon_config(report.daemon_config_path, os_)
-    assert (cfg.data_root, cfg.expected_store_id) == (data_root, report.store_id)
-    assert verify_server_tls_files(cfg, clock, os_).store_id == report.store_id
-    _verify_ca_signed_leaf(cfg_dir / "tls" / "ca.pem", cfg.cert_path)
-    assert not (cfg_dir / ".init-bootstrap.json").exists()
-    token = report.cli_credential_path.read_text(encoding="ascii").strip()
-    cred_id, _ = parse_bearer_token(token)
-    rt = reopen_kernel_job_runtime(data_root, report.store_id, os_)
-    try:
-        principal = rt.policy.resolve_credential(token)
-        assert (principal.owner_id, principal.harness_id, principal.machine_id) == (OWNER, CLI_HARNESS_ID, MACHINE)
-        snap = rt.policy.snapshot()
-        assert [cid for cid, rec in snap.credentials.items() if not rec.revoked] == [cred_id]
-        assert len(snap.principals) == 1
-        assert rt.store.reconcile_policy() == 0
-        intents = len(rt.policy.intents())
-        with rt.store.transaction() as txn:
-            applied = txn.db.execute("SELECT COUNT(*) FROM applied_intents").fetchone()
-        assert applied is not None and int(applied[0]) == intents
-        signers = rt.policy.active_signers()
-        assert [s.signer_id for s in signers] == [report.signer.signer_id]
-        assert signers[0].tofu is True and signers[0].key_digest == req.signer.key_digest
-    finally:
-        rt.close()
 
 @pytest.mark.parametrize("fail_target", ["ca.pem", "server.pem", "daemon.json", "cli.credential"])
 def test_f3_init_store_durable_recovery_across_tls_daemon_and_credential_failures(
@@ -354,6 +262,59 @@ def test_f3_completed_and_user_owned_stores_refuse_init_without_mutation(trusted
         assert digest_tree(req.data_root) == snap_data and digest_tree(req.config_dir) == snap_cfg
     assert not (legacy.config_dir / ".init-bootstrap.json").exists()
     assert not any(legacy.config_dir.iterdir())
+
+
+@pytest.mark.parametrize("artifact", rr.INIT_ARTIFACTS)
+def test_f3_hard_kill_after_first_byte_never_leaves_partial_final_name_and_retry_completes(
+    trusted_tmp: Path, artifact: str
+) -> None:
+    """0f3c6d6 F3 (spec §5.7/§9): a kill after byte 1 of ANY init/TLS artifact never leaves it under its final name."""
+    clock = FakeClock(datetime(2026, 11, 20, 12, 0, tzinfo=UTC))
+    os_ = os_adapters(clock=clock)
+    plan = rr.init_write_plan(trusted_tmp, os_)
+    req = _f3_request(trusted_tmp, os_, f"f3-kill-{artifact}")
+    final = req.config_dir / rr.artifact_rel(artifact)
+
+    partial = rr.crash_init_after_first_byte(req, os_, plan, artifact)
+
+    assert not os.path.lexists(final), f"{artifact}: partial bytes were written under the final name"
+    assert partial != final and partial.parent == final.parent and partial.stat().st_size == 1  # staging, same dir
+    for name in rr.INIT_ARTIFACTS:  # no published artifact is ever a truncated 1-byte remnant
+        done = req.config_dir / rr.artifact_rel(name)
+        assert not done.exists() or done.stat().st_size > 1
+    _assert_clean_completed_init(req, init_store(req, os_), os_, clock)
+    rr.assert_only_published_init_files(req.config_dir)
+
+
+@pytest.mark.parametrize(
+    ("rel_path", "content"),
+    [
+        (".init-bootstrap.json", b"{"),
+        (".init-bootstrap.json", b'{"status":"in_progress","user":true}\n'),
+        ("daemon.json", b'{"user": true}\n'),
+        ("cli.credential", b"user-supplied-token\n"),
+        ("tls/ca.pem", b"user ca\n"),
+        ("tls/server.pem", b"user leaf\n"),
+        ("tls/foreign.txt", b"foreign\n"),
+    ],
+)
+def test_f3_preexisting_user_files_refuse_init_without_any_mutation(
+    trusted_tmp: Path, rel_path: str, content: bytes
+) -> None:
+    """0f3c6d6 F3 control: a user-owned file at any init/TLS name is refused and never altered or removed."""
+    os_ = os_adapters(clock=FakeClock(datetime(2026, 11, 20, 12, 0, tzinfo=UTC)))
+    req = _f3_request(trusted_tmp, os_, f"f3-user-{rel_path.replace('/', '-')}-{len(content)}")
+    target = req.config_dir / rel_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    os_.permissions.secure_directory(target.parent)
+    target.write_bytes(content)
+    os_.permissions.secure_file(target)
+    snap_cfg, snap_data = digest_tree(req.config_dir), digest_tree(req.data_root)
+    with pytest.raises(BrainError) as refused:
+        init_store(req, os_)
+    assert refused.value.code in (ErrorCode.INVALID_INPUT, ErrorCode.UNSAFE_PATH)
+    assert target.read_bytes() == content
+    assert digest_tree(req.config_dir) == snap_cfg and digest_tree(req.data_root) == snap_data
 
 
 def _reconcile_all(rt: Any, store_id: str, signer_id: str, layout: DataRoot) -> Any:

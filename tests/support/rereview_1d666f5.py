@@ -8,22 +8,37 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import os
+import re
 import ssl
 import struct
 from collections.abc import Mapping
+from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
+import pytest
+from cryptography import x509
+from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
-from superbrain.adapters.os.tls_material import create_store_tls
+from superbrain.adapters.harness_config.bootstrap_templates import (
+    HandoffTakeoverEditDecision,
+    evaluate_takeover_edit_gate,
+)
+from superbrain.adapters.os.daemon_config import read_daemon_config
+from superbrain.adapters.os.tls_material import create_store_tls, verify_server_tls_files
 from superbrain.composition.init_entry import InitRequest, init_store
-from superbrain.core._kernel_approval import ApprovalChannel, SignerEnrollment
+from superbrain.core._kernel_approval import CLI_HARNESS_ID, ApprovalChannel, SignerEnrollment
+from superbrain.core._kernel_auth import parse_bearer_token
+from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.kernel import WorkspaceBinding
 from superbrain.ports.clock import Clock
-from superbrain.ports.os import OsAdapters
+from superbrain.ports.os import DurabilityReport, NoReplacePublisher, OsAdapters
+from tests.support.clock import FakeClock
+from tests.support.inc2_fixture import reopen_kernel_job_runtime
 from tests.support.kernel_auth import make_bootstrap_auth
 
 
@@ -102,9 +117,239 @@ def assert_f2_rule_scope(rule_text: str) -> None:
     )
     assert "proceed" in clause or "continue" in clause, "branch (ii) must proceed normally"
     assert "policy" in clause and "manual_submission" in low
+    # 0f3c6d6 F2: ``not_stored_policy`` ACKs still carry the live ``writer_status`` (spec §7.4), so a ``not_holder``
+    # stop/re-read is only valid for an open-handoff takeover or a stored book, never as ordinary-work order.
+    stop_words = ("do not edit", "re-read", "reread", "block", "stop")
+    scoped_clauses = 0
+    for part in re.split(r"[.;:]\s", low):
+        if "not_holder" not in part or not any(w in part for w in stop_words):
+            continue
+        ordinary = any(p in part for p in ("not taking over", "without taking over", "no open handoff", "ordinary"))
+        takeover = any(p in part for p in ("taking over", "takeover", "take over", "open handoff"))
+        assert "handoff_status=stored" in part or (takeover and not ordinary), f"unconditional not_holder: {part!r}"
+        scoped_clauses += 1
+    assert scoped_clauses, "missing scoped writer_status=not_holder stop + re-read clause"
+
+
+def assert_not_stored_policy_not_holder_ack_pair() -> None:
+    """0f3c6d6 F2: the ACK pair ``not_stored_policy`` + ``not_holder`` decides by context; ``stored`` re-reads."""
+    blocked, ordinary = HandoffTakeoverEditDecision(False, "policy_disabled", False, True), HandoffTakeoverEditDecision(
+        True, "proceed_without_handoff_policy"
+    )
+
+    def gate(status: str, session: str | None, *, takeover: bool, ack: bool = False) -> HandoffTakeoverEditDecision:
+        return evaluate_takeover_edit_gate(
+            holding_session_state=session, acknowledge_active=ack, handoff_status=status, writer_status="not_holder",
+            commit_outcome_unknown=False, taking_over_open_handoff=takeover,
+        )
+
+    for session in ("ended", "active"):
+        assert gate("not_stored_policy", session, takeover=True, ack=session == "active") == blocked
+    opt_sessions: tuple[str | None, ...] = (None, "ended")
+    for opt_session in opt_sessions:
+        assert gate("not_stored_policy", opt_session, takeover=False) == ordinary
+    for takeover in (True, False):
+        assert gate("stored", "ended", takeover=takeover) == HandoffTakeoverEditDecision(False, "reread_handoff")
+
+
+def _verify_ca_signed_leaf(ca_pem_path: Path, leaf_pem_path: Path) -> None:
+    ca_cert = x509.load_pem_x509_certificate(ca_pem_path.read_bytes())
+    leaf_cert = x509.load_pem_x509_certificate(leaf_pem_path.read_bytes())
+    pub = ca_cert.public_key()
+    assert isinstance(pub, ec.EllipticCurvePublicKey)
+    assert leaf_cert.signature_hash_algorithm is not None
+    pub.verify(leaf_cert.signature, leaf_cert.tbs_certificate_bytes, ec.ECDSA(leaf_cert.signature_hash_algorithm))
+
+
+def assert_clean_completed_init(req: InitRequest, report: Any, os_: OsAdapters, clock: FakeClock) -> None:
+    """Exactly one signer/credential/principal, reconciled policy, CA-signed leaf and no leftover init marker file."""
+    data_root, cfg_dir = req.data_root, req.config_dir
+    cfg = read_daemon_config(report.daemon_config_path, os_)
+    assert (cfg.data_root, cfg.expected_store_id) == (data_root, report.store_id)
+    assert verify_server_tls_files(cfg, clock, os_).store_id == report.store_id
+    _verify_ca_signed_leaf(cfg_dir / "tls" / "ca.pem", cfg.cert_path)
+    assert not (cfg_dir / ".init-bootstrap.json").exists()
+    token = report.cli_credential_path.read_text(encoding="ascii").strip()
+    cred_id, _ = parse_bearer_token(token)
+    rt = reopen_kernel_job_runtime(data_root, report.store_id, os_)
+    try:
+        principal = rt.policy.resolve_credential(token)
+        assert (principal.owner_id, principal.harness_id, principal.machine_id) == (
+            req.owner_id, CLI_HARNESS_ID, req.machine_id,
+        )
+        snap = rt.policy.snapshot()
+        assert [cid for cid, rec in snap.credentials.items() if not rec.revoked] == [cred_id]
+        assert len(snap.principals) == 1
+        assert rt.store.reconcile_policy() == 0
+        intents = len(rt.policy.intents())
+        with rt.store.transaction() as txn:
+            applied = txn.db.execute("SELECT COUNT(*) FROM applied_intents").fetchone()
+        assert applied is not None and int(applied[0]) == intents
+        signers = rt.policy.active_signers()
+        assert [s.signer_id for s in signers] == [report.signer.signer_id]
+        assert signers[0].tofu is True and signers[0].key_digest == req.signer.key_digest
+    finally:
+        rt.close()
+
+
+class FaultyPublisher(NoReplacePublisher):
+    """Test-only publisher wrapper injecting ``IO_ERROR`` on one target file name."""
+
+    def __init__(self, inner: Any, fail_name: str) -> None:
+        self._inner = inner
+        self._fail_name = fail_name
+
+    def write_new(self, path: Path, data: bytes) -> None:
+        if path.name == self._fail_name:
+            raise BrainError(ErrorCode.IO_ERROR, f"injected io_error on {path.name}")
+        self._inner.write_new(path, data)
+
+    def publish(self, staging: Path, final: Path) -> None:
+        if final.name == self._fail_name:
+            raise BrainError(ErrorCode.IO_ERROR, f"injected io_error on {final.name}")
+        self._inner.publish(staging, final)
+
+    def publish_no_replace(self, staging: Path, final: Path) -> None:
+        if final.name == self._fail_name:
+            raise BrainError(ErrorCode.IO_ERROR, f"injected io_error on {final.name}")
+        self._inner.publish_no_replace(staging, final)
+
+    def rename_dir(self, src: Path, dst: Path) -> None:
+        self._inner.rename_dir(src, dst)
+
+    def sync_directory(self, directory: Path) -> None:
+        self._inner.sync_directory(directory)
+
+    def flush_file(self, path: Path) -> None:
+        self._inner.flush_file(path)
+
+    def durability(self, directory: Path, env: Mapping[str, str]) -> DurabilityReport:
+        res: DurabilityReport = self._inner.durability(directory, env)
+        return res
+
+
+def faulty_os(base_os: OsAdapters, fail_name: str) -> OsAdapters:
+    return replace(base_os, publisher=FaultyPublisher(base_os.publisher, fail_name))
+
+
+INIT_ARTIFACTS = (
+    ".init-bootstrap.json", "ca.pem", "ca.key", "server.pem", "server.key", "daemon.json", "cli.credential",
+)
+_TLS_NAMES = frozenset({"ca.pem", "ca.key", "server.pem", "server.key"})
+
+
+def artifact_rel(artifact: str) -> str:
+    """Config-dir-relative POSIX path of an init/TLS artifact (TLS material lives under ``tls/``)."""
+    return f"tls/{artifact}" if artifact in _TLS_NAMES else artifact
+
+
+class ProcessKilledError(BaseException):
+    """Simulated SIGKILL: ``BaseException`` so no in-process ``except Exception`` recovery may run."""
+
+
+class CrashProbePublisher(NoReplacePublisher):
+    """Records every ``write_new`` and its eventual final name; optionally hard-kills one write after byte 1.
+
+    The kill writes ``data[:1]`` to the exact path handed to ``write_new`` and aborts WITHOUT the real
+    ``write_new`` cleanup (``unlink``): the on-disk state a process kill between ``write`` and ``fsync`` leaves.
+    """
+
+    def __init__(self, inner: Any, cfg_dir: Path, kill_at: int | None = None) -> None:
+        self._inner, self._cfg_dir, self._kill_at = inner, cfg_dir, kill_at
+        self.writes: list[Path] = []
+        self._finals: dict[int, Path] = {}
+        self._pending: dict[Path, int] = {}
+        self.partial: Path | None = None
+
+    def final_rels(self) -> tuple[str | None, ...]:
+        """Config-dir-relative final name of each ``write_new`` call (``None`` outside the config dir)."""
+        out: list[str | None] = []
+        for idx, written in enumerate(self.writes):
+            try:
+                out.append(self._finals.get(idx, written).relative_to(self._cfg_dir).as_posix())
+            except ValueError:
+                out.append(None)
+        return tuple(out)
+
+    def write_new(self, path: Path, data: bytes) -> None:
+        idx = len(self.writes)
+        self.writes.append(path)
+        self._pending[path] = idx
+        if idx == self._kill_at:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0), 0o600)
+            try:
+                os.write(fd, data[:1])
+            finally:
+                os.close(fd)
+            self.partial = path
+            raise ProcessKilledError(f"killed after first byte of {path.name}")
+        self._inner.write_new(path, data)
+
+    def _resolve(self, staging: Path, final: Path) -> None:
+        idx = self._pending.pop(staging, None)
+        if idx is not None:
+            self._finals[idx] = final
+
+    def publish(self, staging: Path, final: Path) -> None:
+        self._inner.publish(staging, final)
+        self._resolve(staging, final)
+
+    def publish_no_replace(self, staging: Path, final: Path) -> None:
+        self._inner.publish_no_replace(staging, final)
+        self._resolve(staging, final)
+
+    def rename_dir(self, src: Path, dst: Path) -> None:
+        self._inner.rename_dir(src, dst)
+
+    def sync_directory(self, directory: Path) -> None:
+        self._inner.sync_directory(directory)
+
+    def flush_file(self, path: Path) -> None:
+        self._inner.flush_file(path)
+
+    def durability(self, directory: Path, env: Mapping[str, str]) -> DurabilityReport:
+        res: DurabilityReport = self._inner.durability(directory, env)
+        return res
+
+
+_WRITE_PLAN: list[tuple[str | None, ...]] = []
+
+
+def init_write_plan(base: Path, os_: OsAdapters) -> tuple[str | None, ...]:
+    """Final name of every ``write_new`` of one healthy ``init_store`` (computed once, in-process)."""
+    if not _WRITE_PLAN:
+        cfg_dir = base / "plan-cfg"
+        cfg_dir.mkdir(parents=True)
+        os_.permissions.secure_directory(cfg_dir)
+        probe = CrashProbePublisher(os_.publisher, cfg_dir)
+        req = InitRequest(
+            data_root=base / "plan-data", config_dir=cfg_dir, owner_id="dan", machine_id="plan-box",
+            signer=ssh_enrollment("plan"),
+        )
+        init_store(req, replace(os_, publisher=probe))
+        _WRITE_PLAN.append(probe.final_rels())
+    return _WRITE_PLAN[0]
+
+
+def crash_init_after_first_byte(req: InitRequest, os_: OsAdapters, plan: tuple[str | None, ...], artifact: str) -> Path:
+    """Run ``init_store``, hard-kill it right after byte 1 of ``artifact``'s first write; return the leftover."""
+    probe = CrashProbePublisher(os_.publisher, req.config_dir, kill_at=plan.index(artifact_rel(artifact)))
+    with pytest.raises(ProcessKilledError):
+        init_store(req, replace(os_, publisher=probe))
+    assert probe.partial is not None and probe.partial.is_file()
+    return probe.partial
+
+
+def assert_only_published_init_files(cfg_dir: Path) -> None:
+    """Zero stray staging/``.tmp`` files: only the final init/TLS artifacts remain."""
+    assert sorted(p.name for p in cfg_dir.iterdir()) == ["cli.credential", "daemon.json", "tls"]
+    assert sorted(p.name for p in (cfg_dir / "tls").iterdir()) == sorted(_TLS_NAMES)
 
 
 __all__ = [
-    "assert_f2_rule_scope", "daemon_identity", "flip_last_hex_char", "foreign_ca_file", "leaf_sha", "prop_id",
-    "rotated_tls", "ssh_enrollment", "ws_dict",
+    "INIT_ARTIFACTS", "CrashProbePublisher", "FaultyPublisher", "ProcessKilledError", "artifact_rel",
+    "assert_clean_completed_init", "assert_f2_rule_scope", "assert_not_stored_policy_not_holder_ack_pair",
+    "assert_only_published_init_files", "crash_init_after_first_byte", "daemon_identity", "faulty_os",
+    "flip_last_hex_char", "foreign_ca_file", "init_write_plan", "leaf_sha", "prop_id", "rotated_tls", "ssh_enrollment",
+    "ws_dict",
 ]

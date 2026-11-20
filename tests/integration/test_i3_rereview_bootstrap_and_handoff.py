@@ -366,6 +366,11 @@ def test_f2_handoff_rule_and_sp2_takeover_edit_gate_oracle(trusted_tmp: Path) ->
             holding_session_state="ended", acknowledge_active=False,
             handoff_status=h_s, writer_status=w_s, commit_outcome_unknown=False,
         ).allow_edit
+    rr.assert_not_stored_policy_not_holder_ack_pair()  # 0f3c6d6 F2: same ACK pair, both contexts, stored still re-reads
+
+
+def test_f2_not_stored_policy_with_not_holder_ack_pair_decides_by_context() -> None:
+    rr.assert_not_stored_policy_not_holder_ack_pair()
 
 
 def test_f4_manifest_driven_rebootstrap_preserves_u1_and_blocks_in_slice_tamper(trusted_tmp: Path) -> None:

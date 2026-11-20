@@ -53,12 +53,12 @@ HANDOFF_RULE_TEXT = (
     "When holding session state is active, notify the user and pass takeover.acknowledge_active=true "
     "for takeover. When taking over an open handoff, do not edit any checkout file until "
     "takeover ACK returns BOTH handoff_status=stored and writer_status=holder. "
-    "If writer_status=not_holder, do not edit and re-read the latest handoff via "
+    "If handoff_status=stored and writer_status=not_holder, do not edit and re-read the latest handoff via "
     "prepare_task(mode=discover), get_artifact L1, and handoff_live. "
     "If handoff_status=not_stored_policy (manual_submission=false, disabled by policy; "
     "no holder or revision change): when taking over an open handoff, do not edit and "
     "notify the user or ask the user how to proceed; for ordinary work that is not taking over "
-    "an open handoff, proceed normally under the repo policy. "
+    "an open handoff, proceed normally under the repo policy even if writer_status=not_holder is also reported. "
     "If commit_outcome_unknown is reported, retry submit_episode with the same idempotency_key "
     "before any edit."
 )
@@ -96,6 +96,8 @@ def evaluate_takeover_edit_gate(
     if not taking_over_open_handoff:
         if handoff_status == "not_stored_policy":
             return HandoffTakeoverEditDecision(allow_edit=True, action="proceed_without_handoff_policy")
+        if handoff_status == "stored" and writer_status == "not_holder":
+            return HandoffTakeoverEditDecision(allow_edit=False, action="reread_handoff")
         return HandoffTakeoverEditDecision(allow_edit=True, action="proceed_edit")
     if holding_session_state == "active" and not acknowledge_active:
         return HandoffTakeoverEditDecision(

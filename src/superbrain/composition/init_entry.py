@@ -18,6 +18,7 @@ from typing import Any
 
 from superbrain.adapters.os import os_adapters
 from superbrain.adapters.os.daemon_config import (
+    publish_new_owner_file,
     read_client_credential,
     read_daemon_config,
     read_owner_json_object,
@@ -29,6 +30,7 @@ from superbrain.composition._init_recovery import (
     recover_or_provision_tls,
     remove_init_marker,
     require_matching_marker,
+    sweep_config_stage_files,
     write_init_bootstrap_state,
     write_init_marker,
 )
@@ -143,11 +145,8 @@ def _require_config_dir(config_dir: Path, os_: OsAdapters) -> None:
 
 
 def _write_owner_file(path: Path, data: bytes, os_: OsAdapters) -> None:
-    try:
-        os_.publisher.write_new(path, data)
-    except FileExistsError as err:
-        raise _invalid() from err
-    os_.permissions.secure_file(path)
+    publish_new_owner_file(path, data, os_)
+
 
 
 def _write_daemon_config_if_missing(
@@ -266,6 +265,7 @@ def _complete_init_under_runtime(
     rt.store.reconcile_policy()
     record(active_cred_id, leaf_sha, "completed")
     remove_init_marker(config_dir, os_)
+    sweep_config_stage_files(config_dir, os_)
     return InitReport(
         store_id=store_id, daemon_config_path=daemon_config, cli_credential_path=cli_credential, signer=signer
     )
@@ -299,6 +299,7 @@ def _start_marked_init(request: InitRequest, req_digest: str, os_: OsAdapters) -
     config_dir = request.config_dir
     _preflight_fresh_config(config_dir, os_)
     _require_config_dir(config_dir, os_)
+    sweep_config_stage_files(config_dir, os_)
     owned = require_matching_marker(
         config_dir, request_digest=req_digest, data_root=request.data_root, owner_id=request.owner_id, os_=os_,
         must_exist=False,

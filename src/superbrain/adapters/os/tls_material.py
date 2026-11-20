@@ -15,6 +15,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 from superbrain.adapters.os import os_adapters
+from superbrain.adapters.os.daemon_config import publish_new_owner_file
 from superbrain.adapters.os.durable import map_os_error
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.kernel import (
@@ -211,11 +212,7 @@ def create_store_tls(
         (cert_path, leaf_pem),
         (key_path, leaf_key_pem),
     ):
-        try:
-            adapters.publisher.write_new(path, content)
-        except FileExistsError as err:
-            raise BrainError(ErrorCode.INVALID_INPUT, "invalid input") from err
-        adapters.permissions.secure_file(path)
+        publish_new_owner_file(path, content, adapters)
     adapters.publisher.sync_directory(dest)
 
     leaf_der = leaf_cert.public_bytes(serialization.Encoding.DER)

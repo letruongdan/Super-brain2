@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import timedelta
@@ -22,6 +23,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 
 from superbrain.adapters.os.daemon_config import (
+    publish_new_owner_file,
     read_client_ca,
     read_client_credential,
     read_daemon_config,
@@ -44,12 +46,16 @@ from superbrain.storage.writer import acquire_writer_unbumped
 __all__ = [
     "INIT_BOOTSTRAP_STATE_KEY", "INIT_MARKER_NAME", "InitBootstrapState", "compute_init_request_digest",
     "has_existing_data_artifacts", "prepare_init_recovery", "recover_or_provision_tls", "remove_init_marker",
-    "require_matching_marker", "write_init_bootstrap_state", "write_init_marker",
+    "require_matching_marker", "sweep_config_stage_files", "write_init_bootstrap_state", "write_init_marker",
 ]
 
 INIT_BOOTSTRAP_STATE_KEY = "init_bootstrap_state"
 INIT_MARKER_NAME = ".init-bootstrap.json"
 _TLS_KNOWN_NAMES = frozenset({"ca.pem", "ca.key", "server.pem", "server.key"})
+_UUID7 = r"[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
+# Staging siblings of ``publish_new_owner_file`` (a hard kill may leave one); nothing else is ever swept.
+_CONFIG_STAGE_RE = re.compile(rf"\.(?:\.init-bootstrap\.json|daemon\.json|cli\.credential)\.stage-{_UUID7}")
+_TLS_STAGE_RE = re.compile(rf"\.(?:ca\.pem|ca\.key|server\.pem|server\.key)\.stage-{_UUID7}")
 _BOOTSTRAP_ISSUER = "owner:local-bootstrap"
 _BOOTSTRAP_TTL = timedelta(minutes=10)
 _FRESH_ONLY_ROWS = (
@@ -145,12 +151,38 @@ def write_init_marker(
     """Durably write the owner-only, non-secret pre-marker BEFORE any data-root byte is created."""
     path = config_dir / INIT_MARKER_NAME
     body = _marker_body(request_digest=request_digest, data_root=data_root, config_dir=config_dir, owner_id=owner_id)
-    try:
-        os_.publisher.write_new(path, canonical_json(body) + b"\n")
-    except FileExistsError as err:
-        raise _invalid() from err
-    os_.permissions.secure_file(path)
-    os_.publisher.sync_directory(config_dir)
+    publish_new_owner_file(path, canonical_json(body) + b"\n", os_)
+
+
+
+def _verified_stages(directory: Path, pattern: re.Pattern[str], os_: OsAdapters) -> list[Path]:
+    """Our own staging files in ``directory`` (never links/foreign names); unsafe ones refuse the init."""
+    if not os.path.lexists(directory) or not directory.is_dir():
+        return []
+    found: list[Path] = []
+    for entry in directory.iterdir():
+        if not pattern.fullmatch(entry.name):
+            continue
+        os_.paths.reject_links(entry)
+        if not entry.is_file():
+            raise _invalid()
+        if os_.permissions.object_problems(entry):
+            raise BrainError(ErrorCode.INSECURE_PERMISSIONS, "insecure permissions")
+        found.append(entry)
+    return found
+
+
+def _sweep_stages(directory: Path, pattern: re.Pattern[str], os_: OsAdapters) -> None:
+    stages = _verified_stages(directory, pattern, os_)
+    for stage in stages:
+        stage.unlink()
+    if stages:
+        os_.publisher.sync_directory(directory)
+
+
+def sweep_config_stage_files(config_dir: Path, os_: OsAdapters) -> None:
+    """Remove verified leftover init staging files (marker/``daemon.json``/``cli.credential``) of a killed init."""
+    _sweep_stages(config_dir, _CONFIG_STAGE_RE, os_)
 
 
 def remove_init_marker(config_dir: Path, os_: OsAdapters) -> None:
@@ -207,7 +239,7 @@ def _validate_recovery_config_dir(
         if os_.permissions.object_problems(tls_dir):
             raise BrainError(ErrorCode.INSECURE_PERMISSIONS, "insecure permissions")
         for entry in tls_dir.iterdir():
-            if entry.name not in _TLS_KNOWN_NAMES:
+            if entry.name not in _TLS_KNOWN_NAMES and not _TLS_STAGE_RE.fullmatch(entry.name):
                 raise _invalid()
             os_.paths.reject_links(entry)
             if not entry.is_file():
@@ -215,6 +247,7 @@ def _validate_recovery_config_dir(
             if os_.permissions.object_problems(entry):
                 raise BrainError(ErrorCode.INSECURE_PERMISSIONS, "insecure permissions")
 
+    _verified_stages(config_dir, _CONFIG_STAGE_RE, os_)
     daemon_cfg = config_dir / "daemon.json"
     if os.path.lexists(daemon_cfg):
         cfg = read_daemon_config(daemon_cfg, os_)
@@ -334,6 +367,7 @@ def prepare_init_recovery(
                 must_exist=True,
             )
             _require_unstarted_config(config_dir)
+            _verified_stages(config_dir, _CONFIG_STAGE_RE, os_)
             _verify_premeta_root(verified, owner_id, signer, os_)
             return None, InitBootstrapState("in_progress", request_digest, os.path.abspath(config_dir))
         if existing_owner != owner_id or info is None or not os.path.lexists(root.store_db):
@@ -397,11 +431,13 @@ def recover_or_provision_tls(
         server_pem = tls_dir / "server.pem"
         leaf = x509.load_pem_x509_certificate(server_pem.read_bytes())
         sha = hashlib.sha256(leaf.public_bytes(serialization.Encoding.DER)).hexdigest()
+        _sweep_stages(tls_dir, _TLS_STAGE_RE, os_)
         return server_pem, tls_dir / "server.key", sha
     if existing:
         for path in existing:
             path.unlink()
         os_.publisher.sync_directory(tls_dir)
+    _sweep_stages(tls_dir, _TLS_STAGE_RE, os_)
     auth = BootstrapAuthorization(
         intent_id=new_id(), store_id=store_id, owner_id=owner_id, action="provision_tls", subject_id=store_id,
         trust_generation=generation, expires_at=os_.clock.now() + _BOOTSTRAP_TTL, issuer_id=_BOOTSTRAP_ISSUER,

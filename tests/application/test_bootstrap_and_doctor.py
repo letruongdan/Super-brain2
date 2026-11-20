@@ -58,7 +58,7 @@ from tests.support.fs import digest_tree
 from tests.support.inc2_fixture import reopen_kernel_job_runtime
 from tests.support.inc2_transport import FakeMonotonicClock, register_workspace_direct
 from tests.support.kernel_auth import seed_principal_and_credential
-from tests.support.rereview_1d666f5 import assert_f2_rule_scope
+from tests.support.rereview_1d666f5 import assert_f2_rule_scope, assert_not_stored_policy_not_holder_ack_pair
 
 OWNER = "dan"
 MACHINE = "i3-5-box"
@@ -182,6 +182,7 @@ def test_bootstrap_templates_embed_section_7_4_handoff_rules_and_nonblocking_hoo
         for token in required_tokens:
             assert token in md_lower, f"missing §7.4 token {token!r} in {md_name}"
         assert_f2_rule_scope(md_text)
+        assert_not_stored_policy_not_holder_ack_pair()
         assert "# User Prose" in md_text or "# Agents Prose" in md_text
         hook_text = by_rel[hook_name].preview_text
         for cmd in AUTHORITY_ASK_COMMANDS:
