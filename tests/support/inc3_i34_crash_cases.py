@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -24,7 +25,13 @@ from tests.support.crash_cases import (
     run_marked,
 )
 from tests.support.inc2_cli import is_writer_lock_held, write_daemon_config_file
-from tests.support.inc2_fixture import InstalledEnv, open_kernel_job_runtime, reopen_kernel_job_runtime
+from tests.support.inc2_fixture import (
+    InstalledEnv,
+    ensure_template_base,
+    open_kernel_job_runtime,
+    reopen_kernel_job_runtime,
+)
+from tests.support.inc2_transport import clone_owner_only_tree
 from tests.support.kernel_auth import make_bootstrap_auth, seed_principal_and_credential
 
 I3_4_CRASHPOINTS = frozenset({"restoring.store.after_swap_before_effect_drain"})
@@ -56,48 +63,73 @@ class I34CrashCase:
         return f"{self.operation}@{self.crashpoint}"
 
 
-def prepare_i34_seed(ctx: KernelCrashContext) -> I34Seed:
-    """Create backup with expiring Evidence E, promote live E to DURABLE, return seed past E's expiry."""
-    root = ctx.case_dir / "data"
-    cfg_dir = ctx.case_dir / "config"
-    cfg_dir.mkdir(parents=True, exist_ok=True)
-    t0 = dt.datetime(2026, 10, 30, 12, 0, tzinfo=dt.UTC)
-    clock = FakeClock(t0)
-    adapters = os_adapters(clock=clock)
-    adapters.permissions.secure_directory(cfg_dir)
+@dataclass(frozen=True)
+class _I34Template:
+    root: Path
+    store_id: str
+    evidence_id: str
+    evidence_digest: str
+    cert_name: str
+    key_name: str
 
+
+_I34_TEMPLATE: _I34Template | None = None
+_I34_T0 = dt.datetime(2026, 10, 30, 12, 0, tzinfo=dt.UTC)
+
+
+def _i34_template() -> _I34Template:
+    """Build once per session: live store (E promoted DURABLE) + pre-promotion backup + TLS under the template base."""
+    global _I34_TEMPLATE
+    if _I34_TEMPLATE is not None and _I34_TEMPLATE.root.is_dir():
+        return _I34_TEMPLATE
+    root = ensure_template_base() / f"i34-seed-{uuid.uuid4().hex}"
+    root.mkdir()
+    clock = FakeClock(_I34_T0)
+    adapters = os_adapters(clock=clock)
     evidence_id = new_id()
-    expires_at = t0 + dt.timedelta(days=5)
-    rt = open_kernel_job_runtime(root, adapters, role="i3-4-crash-seed")
+    rt = open_kernel_job_runtime(root / "data", adapters, role="i3-4-crash-seed")
     try:
         store_id = rt.store.store_id
         generation = rt.policy.trust_generation()
         seed_principal_and_credential(rt.policy, owner_id=OWNER, harness_id="claude-code", machine_id="m1")
-        digest = rt.store.store_content(EVIDENCE_BYTES, "evidence", evidence_id, RetentionClass.EVIDENCE, expires_at)
-        backup_dir = create_store_backup(rt.store, adapters, t0)
+        expires = _I34_T0 + dt.timedelta(days=5)
+        digest = rt.store.store_content(EVIDENCE_BYTES, "evidence", evidence_id, RetentionClass.EVIDENCE, expires)
+        clone_owner_only_tree(create_store_backup(rt.store, adapters, _I34_T0), root / "backup")
         # In the live store after backup, a Lesson promotes Evidence E to DURABLE (still readable later).
         rt.store.store_content(EVIDENCE_BYTES, "evidence", evidence_id, RetentionClass.DURABLE, None)
     finally:
         rt.close()
-
     auth = make_bootstrap_auth(
         store_id=store_id,
         owner_id=OWNER,
         action="provision_tls",
         subject_id=store_id,
         trust_generation=generation,
-        expires_at=t0 + dt.timedelta(hours=4),
-        destination=cfg_dir / "tls",
+        expires_at=_I34_T0 + dt.timedelta(hours=4),
+        destination=root / "tls",
     )
-    tls = create_store_tls(store_id, cfg_dir / "tls", auth, clock, adapters)
+    tls = create_store_tls(store_id, root / "tls", auth, clock, adapters)
+    _I34_TEMPLATE = _I34Template(root, store_id, evidence_id, digest, tls.cert_path.name, tls.key_path.name)
+    return _I34_TEMPLATE
+
+
+def prepare_i34_seed(ctx: KernelCrashContext) -> I34Seed:
+    """Clone the cached seed (backup with expiring E, live E promoted to DURABLE); restore time is past E's expiry."""
+    tpl = _i34_template()
+    root, cfg_dir, backup_dir = ctx.case_dir / "data", ctx.case_dir / "config", ctx.case_dir / "backup"
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    os_adapters().permissions.secure_directory(cfg_dir)
+    clone_owner_only_tree(tpl.root / "data", root)
+    clone_owner_only_tree(tpl.root / "backup", backup_dir)
+    clone_owner_only_tree(tpl.root / "tls", cfg_dir / "tls")
     cfg_path = write_daemon_config_file(
         cfg_dir / "daemon.json",
         data_root=root,
-        expected_store_id=store_id,
-        cert_path=tls.cert_path,
-        key_path=tls.key_path,
+        expected_store_id=tpl.store_id,
+        cert_path=cfg_dir / "tls" / tpl.cert_name,
+        key_path=cfg_dir / "tls" / tpl.key_name,
     )
-    restore_time = t0 + dt.timedelta(days=10)
+    restore_time = _I34_T0 + dt.timedelta(days=10)
     payload_path = ctx.case_dir / "i34-payload.json"
     payload_path.write_text(
         json.dumps({"backup_dir": str(backup_dir), "now_iso": restore_time.isoformat()}),
@@ -108,11 +140,11 @@ def prepare_i34_seed(ctx: KernelCrashContext) -> I34Seed:
         config_path=cfg_path,
         payload_path=payload_path,
         backup_dir=backup_dir,
-        store_id=store_id,
-        evidence_id=evidence_id,
-        evidence_digest=digest,
+        store_id=tpl.store_id,
+        evidence_id=tpl.evidence_id,
+        evidence_digest=tpl.evidence_digest,
         restore_time=restore_time,
-        expires_at=expires_at,
+        expires_at=_I34_T0 + dt.timedelta(days=5),
     )
 
 
@@ -169,14 +201,15 @@ def run_i34_crash_case(ctx: KernelCrashContext, case: I34CrashCase) -> I34Seed:
     # Startup via daemon_entry.serve MUST drain pending_restore_tombstones before READY.
     served = run_i34_child(
         ctx.env,
-        "serve-recover",
+        "serve-recover-stop",
         seed.config_path,
         seed.payload_path,
         cwd=ctx.cwd,
     )
     assert_wheel_provenance(served, ctx)
     assert_entered(served)
-    assert served.ready is not None and served.result.returncode == 0 and served.result.hit is None, served.describe()
+    assert served.result.returncode == 0 and served.result.hit is None, served.describe()
+    assert "READY_STOPPED " in served.result.stderr and not served.timed_out, served.describe()
     assert not layout.pending_restore_tombstones_path.exists()
 
     # Reopen and assert E is tombstoned in policy.db and blocked on the VERY FIRST read before expire_due/GC.
@@ -202,13 +235,14 @@ def run_i34_crash_case(ctx: KernelCrashContext, case: I34CrashCase) -> I34Seed:
     # Second restart STILL arming crashpoint must succeed idempotently without hitting crashpoint again.
     again = run_i34_child(
         ctx.env,
-        "serve-recover",
+        "serve-recover-stop",
         seed.config_path,
         seed.payload_path,
         cwd=ctx.cwd,
         crashpoint=case.crashpoint,
     )
-    assert again.ready is not None and again.result.returncode == 0 and again.result.hit is None, again.describe()
+    assert again.result.returncode == 0 and again.result.hit is None, again.describe()
+    assert "READY_STOPPED " in again.result.stderr and not again.timed_out, again.describe()
     return seed
 
 

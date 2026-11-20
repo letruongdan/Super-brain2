@@ -11,7 +11,10 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import shutil
+import subprocess
+import sys
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -118,6 +121,31 @@ def test_brain_init_routes_to_the_isolated_init_entry(trusted_tmp: Path, capfd: 
         assert brain_main(argv) == 1, argv
         assert capfd.readouterr().err.strip().splitlines()[-1] == ErrorCode.NOT_FOUND.value, argv
 
+
+def test_main_with_explicit_argv_never_replaces_the_calling_process(
+    trusted_tmp: Path, capfd: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``main(argv=[...])`` is a library call: it returns an int and never ``os.execv``-s (POSIX sep)."""
+    missing = trusted_tmp / "missing-init.json"
+    execv_calls: list[str] = []
+    pid = os.getpid()
+    capfd.readouterr()
+    with monkeypatch.context() as patched:
+        patched.setattr(os, "sep", "/")
+        patched.setattr(os, "execv", lambda path, *_a: execv_calls.append(str(path)))
+        rc = brain_main(["init", "--config", str(missing)])
+    assert execv_calls == []
+    assert rc == 1 and os.getpid() == pid
+    assert capfd.readouterr().err.strip().splitlines()[-1] == ErrorCode.NOT_FOUND.value
+
+
+@pytest.mark.skipif(os.sep == "\\", reason="POSIX CLI entry replaces the process via os.execv")
+def test_cli_subprocess_on_posix_keeps_execv_replacement_semantics(trusted_tmp: Path) -> None:
+    missing = trusted_tmp / "missing-init.json"
+    cmd = [sys.executable, "-I", "-m", "superbrain.cli.main", "init", "--config", str(missing)]
+    res = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=60)
+    assert res.returncode == 1
+    assert res.stderr.strip().splitlines()[-1] == ErrorCode.NOT_FOUND.value
 
 # --- brain init (TOFU) ---------------------------------------------------------------------------------------------
 

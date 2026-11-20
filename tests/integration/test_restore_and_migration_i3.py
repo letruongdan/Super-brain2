@@ -26,10 +26,8 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from superbrain.adapters.harness_config.markdown_blocks import merge_markdown_block
 from superbrain.adapters.harness_config.merger import SharedConfigMergerAdapter
 from superbrain.adapters.os import os_adapters
-from superbrain.adapters.os.daemon_config import read_daemon_config
 from superbrain.application.journal_recovery import reconcile_and_classify_journals
 from superbrain.application.review_apply import ReviewApplyService, TargetWriteInput
-from superbrain.cli.main import main as brain_main
 from superbrain.cli_api.operator import OPERATOR_PATHS
 from superbrain.composition import daemon_entry, init_entry
 from superbrain.composition.migrate_entry import migrate_offline
@@ -47,7 +45,7 @@ from superbrain.core._kernel_base import ResourceDigest
 from superbrain.core.errors import SAFE_WIRE_MESSAGES, BrainError, ErrorCode
 from superbrain.core.kernel import DaemonConfig, Ready, UsageReservation
 from superbrain.core.proposals import ManagedFormat, ProposalStatus
-from superbrain.ports.os import NoReplacePublisher
+from superbrain.ports.os import NoReplacePublisher, OsAdapters
 from superbrain.ports.policy import IntentKind
 from superbrain.storage.backup import create_policy_backup, create_store_backup, verify_backup
 from superbrain.storage.kernel_schema import KERNEL_POLICY_MIGRATIONS, KERNEL_STORE_MIGRATIONS
@@ -76,6 +74,7 @@ from tests.support.inc2_fixture import (
 from tests.support.inc2_transport import FakeMonotonicClock, read_raw_http_response
 from tests.support.inc3_i34_crash_cases import I34_CHILD, I34CrashCase, prepare_i34_seed, run_i34_crash_case
 from tests.support.kernel_auth import seed_principal_and_credential
+from tests.support.seed_clone import restore_migration_fixture_clone
 
 OWNER = "dan"
 MACHINE = "devbox-i34"
@@ -108,24 +107,12 @@ def _ssh_sig_b64(priv: Ed25519PrivateKey, payload: bytes) -> str:
 
 def _init_fixture(
     base_dir: Path,
-) -> tuple[FakeClock, FakeMonotonicClock, Any, Ed25519PrivateKey, init_entry.InitReport, DaemonConfig, str, str]:
-    clock = FakeClock(datetime.now(UTC).replace(microsecond=0))
-    mono = FakeMonotonicClock(1_000_000_000)
-    os_ = os_adapters(clock=clock, monotonic=mono)
-    priv, s_enr = _ssh_signer_key()
-    cfg_dir = base_dir / "cfg"
-    cfg_dir.mkdir()
-    os_.permissions.secure_directory(cfg_dir)
-    rep = init_entry.init_store(
-        init_entry.InitRequest(
-            data_root=base_dir / "data", config_dir=cfg_dir, owner_id=OWNER, machine_id=MACHINE, signer=s_enr
-        ),
-        os_,
-    )
-    cfg = read_daemon_config(rep.daemon_config_path, os_)
-    ca_pem = (cfg_dir / "tls" / "ca.pem").read_text(encoding="utf-8")
-    cli_token = rep.cli_credential_path.read_text(encoding="ascii").strip()
-    return clock, mono, os_, priv, rep, cfg, ca_pem, cli_token
+) -> tuple[
+    FakeClock, FakeMonotonicClock, OsAdapters, Ed25519PrivateKey,
+    init_entry.InitReport, DaemonConfig, str, str, Path, Path, int
+
+]:
+    return restore_migration_fixture_clone(base_dir, _ssh_signer_key, OWNER, MACHINE)
 
 
 def _restore_msg(store_id: str, ch: dict[str, Any], db_digest: str, fallback_gen: int | None = None) -> ApprovalMessage:
@@ -364,7 +351,7 @@ def test_online_operator_restore_route_auth_preview_and_immediate_effect(trusted
     from superbrain.core.canonical import digest_bytes
 
     assert "/v2/operator/restore" in OPERATOR_PATHS
-    clock, mono, os_, priv, rep, cfg, ca_pem, cli_token = _init_fixture(trusted_tmp)
+    clock, mono, os_, priv, rep, cfg, ca_pem, cli_token, *_ = _init_fixture(trusted_tmp)
 
     rt = reopen_kernel_job_runtime(cfg.data_root, rep.store_id, os_)
     try:
@@ -434,20 +421,13 @@ def test_online_operator_restore_route_auth_preview_and_immediate_effect(trusted
 
 
 def test_offline_restore_cli_refuses_writer_held_and_recovers_missing_or_corrupt_live_dbs(
-    inc2_installed_env: InstalledEnv, trusted_tmp: Path, capfd: pytest.CaptureFixture[str]
+    inc2_installed_env: InstalledEnv, trusted_tmp: Path
 ) -> None:
-    clock, mono, os_, priv, rep, cfg, _, _ = _init_fixture(trusted_tmp)
+    clock, mono, os_, priv, rep, cfg, _, _, store_bak, policy_bak, gen1 = _init_fixture(trusted_tmp)
     cwd = trusted_tmp / "cli-cwd"
     cwd.mkdir()
     os_.permissions.secure_directory(cwd)
     layout = DataRoot.at(cfg.data_root)
-    rt = reopen_kernel_job_runtime(cfg.data_root, rep.store_id, os_)
-    try:
-        store_bak = create_store_backup(rt.store, os_, clock.now())
-        policy_bak = create_policy_backup(rt.policy, os_, clock.now())
-        gen1 = rt.policy.trust_generation()
-    finally:
-        rt.close()
 
     def _sign_from_preview(out_json: bytes, out_path: Path, db_digest: str, fallback_gen: int | None = None) -> Path:
         data = json.loads(out_json)["data"]
@@ -483,10 +463,8 @@ def test_offline_restore_cli_refuses_writer_held_and_recovers_missing_or_corrupt
 
     # 1) WriterLease held by daemon -> brain restore --offline refuses WRITER_HELD.
     with _daemon(cfg, os_, clock, mono):
-        capfd.readouterr()
-        args = ["restore", "--offline", "--kind", "store", "--backup", str(store_bak), "--preview"]
-        rc = brain_main([*args, "--config", str(rep.daemon_config_path)])
-        assert rc == 1 and ErrorCode.WRITER_HELD.value in capfd.readouterr().err
+        res_held = _wheel_restore("store", store_bak, "--preview")
+        assert res_held.returncode == 1 and ErrorCode.WRITER_HELD.value in res_held.stderr.decode()
 
     # 2) Corrupt live store/brain.db -> preview + restore via installed wheel recovers cleanly.
     layout.store_db.write_bytes(b"corrupt-store-db-bytes")

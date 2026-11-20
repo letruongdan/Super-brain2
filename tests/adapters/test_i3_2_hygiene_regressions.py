@@ -195,7 +195,8 @@ def test_r03_win_stat_physical_reads_link_attrs_from_opened_handle(
     probe.write_bytes(b"regular file before CreateFileW\n")
 
     assert sys.platform == "win32"
-    real_create = physical_fs._CREATE_FILE_W
+    real_create = vars(physical_fs)["_CREATE_FILE_W"]
+    assert callable(real_create)
     swapped = [False]
 
     def _toctou_create(path_str: str, *rest: Any) -> Any:

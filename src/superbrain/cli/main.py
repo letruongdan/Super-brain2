@@ -311,7 +311,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         sys.stdout.flush()
         sys.stderr.flush()
 
-    if os.sep != "\\":
+    if os.sep != "\\" and argv is None:
         try:
             os.execv(sys.executable, cmd)
         except OSError:

@@ -15,7 +15,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-_MODES = ("apply", "rollback-applied", "rollback-interrupted", "serve-recover")
+_MODES = ("apply", "rollback-applied", "rollback-interrupted", "serve-recover", "serve-recover-twice")
 
 
 def _mark(tag: str, value: str) -> None:
@@ -172,6 +172,104 @@ def _run_serve_recover(config_path: Path, payload: dict[str, Any]) -> int:
         shutil.rmtree(scratch_base, ignore_errors=True)
 
 
+def _rows(db_path: Path, scratch: Path, sql: str) -> list[tuple[object, ...]]:
+    import contextlib
+
+    from superbrain.storage.sqlite import open_readonly
+
+    scratch.mkdir(parents=True, exist_ok=True)
+    with contextlib.closing(open_readonly(db_path, scratch_dir=scratch)) as db:
+        return [tuple(r) for r in db.execute(sql)]
+
+
+def raw_i33_policy(data_root: Path, scratch: Path) -> dict[str, list[tuple[object, ...]]]:
+    from superbrain.storage.layout import DataRoot
+
+    db = DataRoot.at(data_root).policy_db
+    return {
+        "grants": _rows(
+            db,
+            scratch,
+            "SELECT grant_id, journal_id, recovery_scope, trust_generation, state, end_reason "
+            "FROM recovery_grant ORDER BY rowid",
+        ),
+        "turns": _rows(
+            db,
+            scratch,
+            "SELECT turn_id, journal_id, approval_id, direction, state FROM apply_turn_intent ORDER BY rowid",
+        ),
+    }
+
+
+def raw_i33_store(data_root: Path, scratch: Path) -> dict[str, list[tuple[object, ...]]]:
+    from superbrain.storage.layout import DataRoot
+
+    db = DataRoot.at(data_root).store_db
+    return {
+        "proposals": _rows(
+            db,
+            scratch,
+            "SELECT proposal_id, status, active_journal_id FROM p_proposals_proposals ORDER BY proposal_id",
+        ),
+        "journals": _rows(
+            db,
+            scratch,
+            "SELECT journal_id, proposal_id, direction, status, grant_id FROM p_proposals_journals ORDER BY sequence",
+        ),
+        "manifests": _rows(
+            db,
+            scratch,
+            "SELECT proposal_id, target_key_digest, slice_digest FROM p_proposals_manifests ORDER BY sequence",
+        ),
+    }
+
+
+def _run_serve_recover_twice(config_path: Path, payload: dict[str, Any]) -> int:
+    """Recover twice in one process: each ``serve`` stops cleanly from ``on_ready``; the second must change nothing."""
+    import threading
+
+    from superbrain.application.owner_loop import OwnerLoop
+    from superbrain.composition.daemon_entry import serve
+    from superbrain.core.kernel import Ready
+    from tests.support.clock import FakeClock
+    from tests.support.inc2_cli import is_writer_lock_held
+
+    clock = FakeClock(dt.datetime.fromisoformat(str(payload["now_iso"])))
+    cfg, adapters, scratch_base = _adapters_for(config_path, clock)
+    ro_scratch, watched = Path(str(payload["ro_scratch"])), [Path(p) for p in payload["watch_files"]]
+
+    def _state() -> tuple[object, ...]:
+        files = [p.read_bytes() if p.exists() else None for p in watched]
+        return (raw_i33_policy(cfg.data_root, ro_scratch), raw_i33_store(cfg.data_root, ro_scratch), files)
+
+    def _recover(tag: str) -> int:
+        stop = threading.Event()
+
+        def _on_ready(ready: Ready, _loop: OwnerLoop) -> None:
+            shutil.rmtree(scratch_base, ignore_errors=True)
+            _mark(tag, ready.endpoint.encode_canonical().decode("utf-8"))
+            stop.set()
+
+        try:
+            rc = serve(cfg, os_=adapters, clock=clock, stop_event=stop, on_ready=_on_ready)
+        finally:
+            shutil.rmtree(scratch_base, ignore_errors=True)
+        if rc == 0 and is_writer_lock_held(cfg.data_root) is not False:
+            _mark("DRIVER_ERROR", f"writer lock still held after {tag}")
+            return 4
+        return rc
+
+    rc = _recover("READY_1")
+    if rc != 0:
+        return rc
+    after_first = _state()
+    rc = _recover("READY_2")
+    if rc == 0 and _state() != after_first:
+        _mark("DRIVER_ERROR", "second recovery changed policy/store/files state")
+        return 5
+    return rc
+
+
 def main(argv: list[str]) -> int:
     if len(argv) != 4 or argv[1] not in _MODES or not Path(argv[2]).is_absolute() or not Path(argv[3]).is_absolute():
         _mark("DRIVER_ERROR", "usage")
@@ -201,6 +299,8 @@ def main(argv: list[str]) -> int:
     try:
         if mode == "serve-recover":
             return _run_serve_recover(config_path, payload)
+        if mode == "serve-recover-twice":
+            return _run_serve_recover_twice(config_path, payload)
         return _run_journal_op(config_path, mode, payload)
     except BrainError as err:
         sys.stderr.write(f"{err.code.value}\n")

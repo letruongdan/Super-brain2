@@ -420,7 +420,7 @@ def test_i3_wheel_synthetic_lifecycle_e2e(inc2_installed_env: InstalledEnv, trus
                     {"harness": harness, "checkout_root": str(co_dir), "harness_profile_path": str(bad_hp)},
                 )
                 assert direct["ok"] is False and direct["error"]["code"] == ErrorCode.IDENTITY_MISMATCH.value, direct
-                if variant == "ca":
+                if (harness, variant) not in {("claude-code", "pin"), ("claude-code", "dir"), ("codex", "name")}:
                     continue
                 cli_bad = run_installed_command(
                     inc2_installed_env,

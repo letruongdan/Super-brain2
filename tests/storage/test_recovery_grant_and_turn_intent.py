@@ -71,9 +71,10 @@ from superbrain.storage.proposals import PolicyApplyAuthority, StoreProposalAdap
 from superbrain.storage.runtime import Runtime
 from tests.support.clock import FakeClock
 from tests.support.inc2_cli import write_client_profile_file, write_daemon_config_file, write_owner_only_bytes
-from tests.support.inc2_fixture import open_kernel_job_runtime, reopen_kernel_job_runtime
+from tests.support.inc2_fixture import reopen_kernel_job_runtime
 from tests.support.inc2_transport import FakeMonotonicClock, clone_owner_only_tree, create_transport_template
 from tests.support.kernel_auth import make_bootstrap_auth, seed_principal_and_credential
+from tests.support.seed_clone import recovery_grant_ctx_clone
 
 OWNER = "dan"
 
@@ -109,8 +110,7 @@ def _open_ctx(tmp: Path, *, role: str) -> Ctx:
     for d in (tmp, checkout, home):
         d.mkdir(parents=True, exist_ok=True)
         os_.permissions.secure_directory(d)
-    rt = open_kernel_job_runtime(root, os_, role=role)
-    signer = rt.policy.enroll_first_signer(_ssh_enrollment(role))
+    rt, signer = recovery_grant_ctx_clone(root, os_, _ssh_enrollment)
     proposals, authority = StoreProposalAdapter(rt.store, os_), PolicyApplyAuthority(rt.policy)
     svc = ReviewApplyService(
         proposals, authority, os_, data_root=root, home_dir=home, config_merger=SharedConfigMergerAdapter()

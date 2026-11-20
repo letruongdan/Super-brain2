@@ -31,7 +31,7 @@ from superbrain.application.bootstrap import create_bootstrap_proposal
 from superbrain.application.review_apply import ReviewApplyService
 from superbrain.composition._bootstrap_wiring import PolicyHarnessProfileValidator
 from superbrain.composition._bootstrap_wiring import make_default_bootstrap_handler as wiring_handler
-from superbrain.composition.init_entry import InitReport, InitRequest, init_store
+from superbrain.composition.init_entry import InitReport
 from superbrain.composition.operator_entry import make_default_bootstrap_handler
 from superbrain.core._kernel_approval import (
     RISK_POLICY_VERSION,
@@ -60,6 +60,7 @@ from tests.support.clock import FakeClock
 from tests.support.fs import digest_tree
 from tests.support.inc2_fixture import reopen_kernel_job_runtime
 from tests.support.inc2_transport import FakeMonotonicClock, register_workspace_direct
+from tests.support.init_clone import init_store_cloned
 from tests.support.kernel_auth import SeededCredential, make_bootstrap_auth, seed_principal_and_credential
 
 OWNER, MACHINE = "dan", "rereview-box"
@@ -173,10 +174,8 @@ def _open_ctx(base: Path, tag: str) -> Iterator[_Ctx]:
     for d in (cfg_dir, home):
         d.mkdir(parents=True, exist_ok=True)
         os_.permissions.secure_directory(d)
-    rep = init_store(
-        InitRequest(data_root=data_root, config_dir=cfg_dir, owner_id=OWNER, machine_id=MACHINE,
-                    signer=_ssh_enrollment(tag)),
-        os_,
+    rep = init_store_cloned(
+        os_, data_root=data_root, cfg_dir=cfg_dir, owner_id=OWNER, machine_id=MACHINE, signer=_ssh_enrollment(tag)
     )
     rt = reopen_kernel_job_runtime(data_root, rep.store_id, os_)
     try:

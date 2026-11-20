@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-_MODES = ("restore-store", "serve-recover")
+_MODES = ("restore-store", "serve-recover", "serve-recover-stop")
 
 
 def _mark(tag: str, value: str) -> None:
@@ -116,6 +116,30 @@ def _run_serve_recover(config_path: Path, payload: dict[str, Any]) -> int:
         shutil.rmtree(scratch_base, ignore_errors=True)
 
 
+def _run_serve_recover_stop(config_path: Path, payload: dict[str, Any]) -> int:
+    """``serve`` stopped cleanly through ``stop_event`` from ``on_ready`` (no process-group signal needed)."""
+    import threading
+
+    from superbrain.application.owner_loop import OwnerLoop
+    from superbrain.composition.daemon_entry import serve
+    from superbrain.core.kernel import Ready
+    from tests.support.clock import FakeClock
+
+    clock = FakeClock(dt.datetime.fromisoformat(str(payload["now_iso"])))
+    cfg, adapters, scratch_base = _adapters_for(config_path, clock)
+    stop = threading.Event()
+
+    def _on_ready(ready: Ready, _loop: OwnerLoop) -> None:
+        shutil.rmtree(scratch_base, ignore_errors=True)
+        _mark("READY_STOPPED", ready.endpoint.encode_canonical().decode("utf-8"))
+        stop.set()
+
+    try:
+        return serve(cfg, os_=adapters, clock=clock, stop_event=stop, on_ready=_on_ready)
+    finally:
+        shutil.rmtree(scratch_base, ignore_errors=True)
+
+
 def main(argv: list[str]) -> int:
     if len(argv) != 4 or argv[1] not in _MODES or not Path(argv[2]).is_absolute() or not Path(argv[3]).is_absolute():
         _mark("DRIVER_ERROR", "usage")
@@ -145,6 +169,8 @@ def main(argv: list[str]) -> int:
     try:
         if mode == "restore-store":
             return _run_restore_store(config_path, payload)
+        if mode == "serve-recover-stop":
+            return _run_serve_recover_stop(config_path, payload)
         return _run_serve_recover(config_path, payload)
     except BrainError as err:
         sys.stderr.write(f"{err.code.value}\n")

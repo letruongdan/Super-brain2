@@ -30,7 +30,7 @@ from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.ids import new_id
 from superbrain.core.kernel import ResourceDigest
 from superbrain.ports.os import OsAdapters
-from superbrain.storage.backup import create_policy_backup, create_store_backup
+from superbrain.storage.backup import create_store_backup
 from superbrain.storage.cas import RetentionClass, held_digests
 from superbrain.storage.kernel_schema import KERNEL_POLICY_MIGRATIONS, KERNEL_STORE_MIGRATIONS
 from superbrain.storage.kinds import KindRegistry
@@ -41,12 +41,13 @@ from superbrain.storage.restore import restore_policy, restore_store
 from superbrain.storage.retention import expire_due
 from superbrain.storage.runtime import admit_existing_pair, open_runtime
 from superbrain.storage.schema import Migration, SchemaInfo, read_schema_info
-from superbrain.storage.swap import READY, recover_interrupted_swaps
+from superbrain.storage.swap import recover_interrupted_swaps
 from superbrain.storage.writer import acquire_writer
 from tests.storage.conftest import DEMO_KINDS, maintenance_lease
 from tests.support.clock import FakeClock
 from tests.support.fs import db_files, fake_link, read_all_bytes
 from tests.support.inc2_fixture import open_kernel_job_runtime, reopen_kernel_job_runtime
+from tests.support.seed_clone import case101_seeded_clone, v5_live_clone, v5_ready_stage_clone
 
 if TYPE_CHECKING:
     pass
@@ -167,7 +168,7 @@ def test_store_v5_create_and_lt5_upgrade_seed_zero_and_preserve_data_root_layout
 def test_store_v5_invalid_restore_epoch_rejected_on_open_and_ready_swap(
     trusted_tmp: Path, os_: OsAdapters, monkeypatch: pytest.MonkeyPatch, mode: str
 ) -> None:
-    root_path, store_id = _open_v5(trusted_tmp / f"live-{mode}", os_)
+    root_path, store_id = v5_live_clone(trusted_tmp / f"live-{mode}", os_)
     layout = DataRoot.at(root_path)
     _tamper_restore_epoch(layout.restore_epoch_path, mode, trusted_tmp, os_, monkeypatch)
 
@@ -180,27 +181,7 @@ def test_store_v5_invalid_restore_epoch_rejected_on_open_and_ready_swap(
     assert err_admit.value.code is ErrorCode.INTEGRITY_FAILURE
 
     # Also test interrupted READY stage during recover_interrupted_swaps (Cases 75, 77).
-    stage_root = trusted_tmp / f"ready-{mode}"
-    _, stage_sid = _open_v5(stage_root, os_)
-    stage_layout = DataRoot.at(stage_root)
-    rt = reopen_kernel_job_runtime(stage_root, stage_sid, os_)
-    try:
-        backup = create_store_backup(rt.store, os_, os_.clock.now())
-    finally:
-        rt.close()
-    # Build a real READY interrupted store.restoring stage by simulating mid-swap state.
-    with maintenance_lease(stage_root) as (root, lease):
-        pol = PolicyStore.open(root, lease, os_, migrations=KERNEL_POLICY_MIGRATIONS)
-        try:
-            restore_store(root, lease, os_, backup, pol, os_.clock.now(), migrations=KERNEL_STORE_MIGRATIONS)
-        finally:
-            pol.close()
-    replaced = sorted(stage_root.glob("store.replaced-*"))[-1]
-    stage_dir = stage_root / "store.restoring"
-    shutil.move(str(stage_layout.store_dir), str(stage_dir))
-    (stage_dir / READY).write_bytes(b"")
-    os_.permissions.secure_file(stage_dir / READY)
-    _ = replaced
+    stage_root, stage_dir, stage_layout = v5_ready_stage_clone(trusted_tmp / f"ready-{mode}", os_, maintenance_lease)
     _tamper_restore_epoch(stage_dir / "restore_epoch.json", mode, trusted_tmp, os_, monkeypatch)
 
     lease = acquire_writer(stage_layout, os_)
@@ -222,6 +203,7 @@ def test_store_v5_invalid_restore_epoch_rejected_on_open_and_ready_swap(
         )
     assert err_rt.value.code is ErrorCode.INTEGRITY_FAILURE
     assert not stage_layout.store_dir.exists()
+
 
 
 def test_consecutive_restores_bump_epoch_migrate_preserves_it_and_policy_change_fences_it(
@@ -380,33 +362,13 @@ def test_case_101_restore_orders_and_policy_only_block_expired_on_first_read(
     from superbrain.adapters.os import os_adapters
     from superbrain.storage.cas import active_held_digests
 
-    root_path = trusted_tmp / f"case101-{mode}"
     os_ = os_adapters(clock=clock)
-    t0 = clock.now()
-    rt = open_kernel_job_runtime(root_path, os_, role=f"c101-{mode}")
-    store_id = rt.store.store_id
-    ev_id = new_id()
-    evid_exp_id = new_id()
-    evid_keep_id = new_id()
-    ev_bytes = b"event-payload-case101"
-    evid_exp_bytes = b"expired-evidence-case101"
-    shared_bytes = b"shared-case101"
-    d_ev = rt.store.store_content(ev_bytes, "event", ev_id, RetentionClass.EVENT_PAYLOAD, t0 + timedelta(days=90))
-    d_evid_exp = rt.store.store_content(
-        evid_exp_bytes, "evidence", evid_exp_id, RetentionClass.EVIDENCE, t0 + timedelta(days=10)
-    )
-    d_shared = rt.store.store_content(
-        shared_bytes, "event", ev_id, RetentionClass.EVENT_PAYLOAD, t0 + timedelta(days=90)
-    )
-    rt.store.store_content(shared_bytes, "evidence", evid_keep_id, RetentionClass.DURABLE, None)
-    store_bak = create_store_backup(rt.store, os_, t0)
-    policy_bak = create_policy_backup(rt.policy, os_, t0)
-    rt.close()
+    root_path, store_bak, policy_bak, tpl = case101_seeded_clone(trusted_tmp, mode, clock)
 
     # Wait past expiry and run expire_due once before restoring backups from t0.
     clock.advance(timedelta(days=95))
     t_late = clock.now()
-    rt = reopen_kernel_job_runtime(root_path, store_id, os_)
+    rt = reopen_kernel_job_runtime(root_path, tpl.store_id, os_)
     expire_due(rt.store, rt.policy, t_late)
     rt.close()
 
@@ -418,11 +380,11 @@ def test_case_101_restore_orders_and_policy_only_block_expired_on_first_read(
             finally:
                 pol.close()
             restore_policy(
-                root, lease, os_, policy_bak, store_id=store_id, now=t_late, migrations=KERNEL_POLICY_MIGRATIONS
+                root, lease, os_, policy_bak, store_id=tpl.store_id, now=t_late, migrations=KERNEL_POLICY_MIGRATIONS
             )
         elif mode == "policy_then_store":
             restore_policy(
-                root, lease, os_, policy_bak, store_id=store_id, now=t_late, migrations=KERNEL_POLICY_MIGRATIONS
+                root, lease, os_, policy_bak, store_id=tpl.store_id, now=t_late, migrations=KERNEL_POLICY_MIGRATIONS
             )
             pol = PolicyStore.open(root, lease, os_, migrations=KERNEL_POLICY_MIGRATIONS)
             try:
@@ -431,16 +393,16 @@ def test_case_101_restore_orders_and_policy_only_block_expired_on_first_read(
                 pol.close()
         else:
             restore_policy(
-                root, lease, os_, policy_bak, store_id=store_id, now=t_late, migrations=KERNEL_POLICY_MIGRATIONS
+                root, lease, os_, policy_bak, store_id=tpl.store_id, now=t_late, migrations=KERNEL_POLICY_MIGRATIONS
             )
 
     # First read after reopen BEFORE expire_due or GC runs MUST refuse expired holders while keeping DURABLE.
-    rt_after = reopen_kernel_job_runtime(root_path, store_id, os_)
+    rt_after = reopen_kernel_job_runtime(root_path, tpl.store_id, os_)
     try:
         for kind, hid, digest in (
-            ("event", ev_id, d_ev),
-            ("evidence", evid_exp_id, d_evid_exp),
-            ("event", ev_id, d_shared),
+            ("event", tpl.ev_id, tpl.d_ev),
+            ("evidence", tpl.evid_exp_id, tpl.d_evid_exp),
+            ("event", tpl.ev_id, tpl.d_shared),
         ):
             with pytest.raises(BrainError) as err:
                 rt_after.store.cas.read_held(digest, holder_kind=kind, holder_id=hid, now=t_late)
@@ -449,8 +411,8 @@ def test_case_101_restore_orders_and_policy_only_block_expired_on_first_read(
                 assert txn.read_held_blob(digest, holder_id=hid, holder_kind=kind, now=t_late) is None
                 assert digest not in active_held_digests(txn.db, kind, hid, now=t_late)
         assert (
-            rt_after.store.cas.read_held(d_shared, holder_kind="evidence", holder_id=evid_keep_id, now=t_late)
-            == shared_bytes
+            rt_after.store.cas.read_held(tpl.d_shared, holder_kind="evidence", holder_id=tpl.evid_keep_id, now=t_late)
+            == tpl.shared_bytes
         )
     finally:
         rt_after.close()

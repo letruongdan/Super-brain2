@@ -42,6 +42,7 @@ from tests.support import rereview_1d666f5 as rr
 from tests.support.clock import FakeClock
 from tests.support.fs import digest_tree
 from tests.support.inc2_fixture import open_kernel_job_runtime, reopen_kernel_job_runtime
+from tests.support.init_clone import init_store_cloned
 
 OWNER = "dan"
 MACHINE = "rereview-f3-f5"
@@ -246,7 +247,10 @@ def test_f3_completed_and_user_owned_stores_refuse_init_without_mutation(trusted
     clock = FakeClock(datetime(2026, 11, 20, 12, 0, tzinfo=UTC))
     os_ = os_adapters(clock=clock)
     done = _f3_request(trusted_tmp, os_, "f3-completed")
-    init_store(done, os_)
+    init_store_cloned(
+        os_, data_root=done.data_root, cfg_dir=done.config_dir, owner_id=done.owner_id,
+        machine_id=done.machine_id, signer=done.signer,
+    )
     stale = done.config_dir / ".init-bootstrap.json"
     stale.write_bytes(b'{"status":"in_progress","stale":true}\n')
     os_.permissions.secure_file(stale)

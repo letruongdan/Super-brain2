@@ -566,8 +566,10 @@ def test_r04_case93_verifies_original_physical_id_and_parent_physical_id(ctx: Ct
         g_x.grant_id, str(ctx.root / "apply_staging" / jid_x), (fe_x,), now, now,
     ))
     up(prop_x.proposal_id, ProposalStatus.ROLLING_BACK, active_journal_id=jid_x, updated_at=now)
+    (tmp_x := ctx.checkout / "c93rb.tmp").write_bytes(b"orig-rb\n")  # allocated BEFORE unlink: inode never reused
     f_x.unlink()
-    f_x.write_bytes(b"orig-rb\n")  # identical bytes, different PhysicalObjectId
+    tmp_x.replace(f_x)  # identical bytes, different PhysicalObjectId
+    assert phys.stat_physical_identity(f_x) != orig_x_id
     rep_x = _reconcile(ctx)
     assert rep_x.recovery_required_journals == 1 and rep_x.rolled_back_journals == 0
     assert ctx.proposals.get_proposal(prop_x.proposal_id).status is ProposalStatus.RECOVERY_REQUIRED

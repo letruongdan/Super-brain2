@@ -9,10 +9,10 @@ converges and remains idempotent across a second restart.
 from __future__ import annotations
 
 import base64
-import contextlib
 import datetime as dt
 import json
 import struct
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -40,10 +40,9 @@ from superbrain.core._kernel_approval import (
 from superbrain.core._kernel_base import ResourceDigest
 from superbrain.core.canonical import digest_bytes
 from superbrain.core.proposals import ChangeProposal, ManagedFormat, ProposalStatus
-from superbrain.storage.layout import DataRoot
+from superbrain.ports.os import OsAdapters
 from superbrain.storage.policy_store import PolicyStore
 from superbrain.storage.proposals import PolicyApplyAuthority, StoreProposalAdapter
-from superbrain.storage.sqlite import open_readonly
 from tests.support.clock import FakeClock
 from tests.support.crash_cases import (
     KernelCrashContext,
@@ -54,7 +53,15 @@ from tests.support.crash_cases import (
     run_marked,
 )
 from tests.support.inc2_cli import is_writer_lock_held, write_daemon_config_file
-from tests.support.inc2_fixture import InstalledEnv, open_kernel_job_runtime
+from tests.support.inc2_fixture import (
+    InstalledEnv,
+    ensure_template_base,
+    open_kernel_job_runtime,
+    reopen_kernel_job_runtime,
+)
+from tests.support.inc2_transport import clone_owner_only_tree
+from tests.support.inc3_crash_child import raw_i33_policy as raw_i33_policy
+from tests.support.inc3_crash_child import raw_i33_store as raw_i33_store
 from tests.support.kernel_auth import make_bootstrap_auth, seed_principal_and_credential
 
 OWNER = "dan"
@@ -127,51 +134,6 @@ def _sign_proposal(
     )
 
 
-def _rows(db_path: Path, scratch: Path, sql: str) -> list[tuple[object, ...]]:
-    scratch.mkdir(parents=True, exist_ok=True)
-    with contextlib.closing(open_readonly(db_path, scratch_dir=scratch)) as db:
-        return [tuple(r) for r in db.execute(sql)]
-
-
-def raw_i33_policy(data_root: Path, scratch: Path) -> dict[str, list[tuple[object, ...]]]:
-    db = DataRoot.at(data_root).policy_db
-    return {
-        "grants": _rows(
-            db,
-            scratch,
-            "SELECT grant_id, journal_id, recovery_scope, trust_generation, state, end_reason "
-            "FROM recovery_grant ORDER BY rowid",
-        ),
-        "turns": _rows(
-            db,
-            scratch,
-            "SELECT turn_id, journal_id, approval_id, direction, state FROM apply_turn_intent ORDER BY rowid",
-        ),
-    }
-
-
-def raw_i33_store(data_root: Path, scratch: Path) -> dict[str, list[tuple[object, ...]]]:
-    db = DataRoot.at(data_root).store_db
-    return {
-        "proposals": _rows(
-            db,
-            scratch,
-            "SELECT proposal_id, status, active_journal_id FROM p_proposals_proposals ORDER BY proposal_id",
-        ),
-        "journals": _rows(
-            db,
-            scratch,
-            "SELECT journal_id, proposal_id, direction, status, grant_id "
-            "FROM p_proposals_journals ORDER BY sequence",
-        ),
-        "manifests": _rows(
-            db,
-            scratch,
-            "SELECT proposal_id, target_key_digest, slice_digest FROM p_proposals_manifests ORDER BY sequence",
-        ),
-    }
-
-
 @dataclass(frozen=True)
 class I33Seed:
     data_root: Path
@@ -221,6 +183,47 @@ def _write_payload(path: Path, data: dict[str, object]) -> Path:
     return path
 
 
+@dataclass(frozen=True)
+class _SeedTemplate:
+    """Session-cached pre-seeded base: schema'd data root + enrolled signer + principal + TLS (no proposals)."""
+
+    root: Path
+    store_id: str
+    signer_id: str
+    cert_name: str
+    key_name: str
+
+
+_SEED_TEMPLATE: _SeedTemplate | None = None
+
+
+def _seed_template(adapters: OsAdapters, clock: FakeClock, base_time: dt.datetime) -> _SeedTemplate:
+    global _SEED_TEMPLATE
+    if _SEED_TEMPLATE is not None and _SEED_TEMPLATE.root.is_dir():
+        return _SEED_TEMPLATE
+    root = ensure_template_base() / f"i33-seed-{uuid.uuid4().hex}"
+    root.mkdir()
+    rt = open_kernel_job_runtime(root / "data", adapters, role="i3-3-seed")
+    try:
+        signer = rt.policy.enroll_first_signer(_ssh_enrollment())
+        seed_principal_and_credential(rt.policy, owner_id=OWNER, harness_id=CLI_HARNESS_ID, machine_id="m-i33")
+        store_id, generation = rt.store.store_id, rt.policy.trust_generation()
+    finally:
+        rt.close()
+    auth = make_bootstrap_auth(
+        store_id=store_id,
+        owner_id=OWNER,
+        action="provision_tls",
+        subject_id=store_id,
+        trust_generation=generation,
+        expires_at=base_time + dt.timedelta(hours=4),
+        destination=root / "tls",
+    )
+    tls = create_store_tls(store_id, root / "tls", auth, clock, adapters)
+    _SEED_TEMPLATE = _SeedTemplate(root, store_id, signer.signer_id, tls.cert_path.name, tls.key_path.name)
+    return _SEED_TEMPLATE
+
+
 def prepare_i33_seed(
     ctx: KernelCrashContext,
     *,
@@ -250,10 +253,11 @@ def prepare_i33_seed(
     )
     agents_bytes = b"# Brain Agents\n"
 
-    rt = open_kernel_job_runtime(data_root, adapters, role="i3-3-seed")
+    tpl = _seed_template(adapters, clock, base_time)
+    clone_owner_only_tree(tpl.root / "data", data_root)
+    clone_owner_only_tree(tpl.root / "tls", ctx.case_dir / "tls")
+    rt = reopen_kernel_job_runtime(data_root, tpl.store_id, adapters)
     try:
-        signer = rt.policy.enroll_first_signer(_ssh_enrollment())
-        seed_principal_and_credential(rt.policy, owner_id=OWNER, harness_id=CLI_HARNESS_ID, machine_id="m-i33")
         proposals = StoreProposalAdapter(rt.store, adapters)
         authority = PolicyApplyAuthority(rt.policy)
         svc = ReviewApplyService(
@@ -299,7 +303,7 @@ def prepare_i33_seed(
             svc.apply_proposal(
                 prop.proposal_id,
                 approval=apply_msg,
-                signer_id=signer.signer_id,
+                signer_id=tpl.signer_id,
                 channel=ApprovalChannel.SSH_KEY,
             )
             if preserve_u1:
@@ -323,36 +327,25 @@ def prepare_i33_seed(
                 action=ApprovalAction.APPLY,
                 recovery_scope=recovery_scope,
             )
-        store_id, generation = rt.store.store_id, rt.policy.trust_generation()
     finally:
         rt.close()
 
-    auth = make_bootstrap_auth(
-        store_id=store_id,
-        owner_id=OWNER,
-        action="provision_tls",
-        subject_id=store_id,
-        trust_generation=generation,
-        expires_at=base_time + dt.timedelta(hours=4),
-        destination=ctx.case_dir / "tls",
-    )
-    tls = create_store_tls(store_id, ctx.case_dir / "tls", auth, clock, adapters)
     cfg_dir = ctx.case_dir / "cfg"
     cfg_dir.mkdir()
     adapters.permissions.secure_directory(cfg_dir)
     config = write_daemon_config_file(
         cfg_dir / "daemon.json",
         data_root=data_root,
-        expected_store_id=store_id,
-        cert_path=tls.cert_path,
-        key_path=tls.key_path,
+        expected_store_id=tpl.store_id,
+        cert_path=ctx.case_dir / "tls" / tpl.cert_name,
+        key_path=ctx.case_dir / "tls" / tpl.key_name,
     )
     payload_path = _write_payload(
         ctx.case_dir / "op-payload.json",
         {
             "proposal_id": prop.proposal_id,
             "approval": serialize_approval(msg),
-            "signer_id": signer.signer_id,
+            "signer_id": tpl.signer_id,
             "channel": ApprovalChannel.SSH_KEY.value,
             "home_dir": str(home),
             "now_iso": base_time.isoformat(),
@@ -365,9 +358,9 @@ def prepare_i33_seed(
         home=home,
         claude_path=claude,
         agents_path=agents,
-        store_id=store_id,
+        store_id=tpl.store_id,
         proposal_id=prop.proposal_id,
-        signer_id=signer.signer_id,
+        signer_id=tpl.signer_id,
         base_time=base_time,
         payload_path=payload_path,
     )
@@ -462,14 +455,23 @@ def run_i33_crash_case(case: I33CrashCase, ctx: KernelCrashContext) -> None:
     offset_s = 1500 if case.advance_past_ttl else 60
     rec_payload = _write_payload(
         ctx.case_dir / "recover-payload.json",
-        {"now_iso": (seed.base_time + dt.timedelta(seconds=offset_s)).isoformat()},
+        {
+            "now_iso": (seed.base_time + dt.timedelta(seconds=offset_s)).isoformat(),
+            "ro_scratch": str(scratch),
+            "watch_files": [str(seed.claude_path), str(seed.agents_path)],
+        },
     )
-    rec1 = run_i33_child(
-        ctx.env, "serve-recover", seed.config, rec_payload, cwd=ctx.cwd, crashpoint=case.crashpoint
+    # One wheel process runs recovery twice: each ``serve`` stops cleanly from ``on_ready``, the writer lock is
+    # released after each, and the child fails (``DRIVER_ERROR``) unless recovery 2 left policy/store/files untouched.
+    rec = run_i33_child(
+        ctx.env, "serve-recover-twice", seed.config, rec_payload, cwd=ctx.cwd, crashpoint=case.crashpoint
     )
-    assert rec1.ready is not None and rec1.result.returncode == 0 and rec1.result.hit is None, rec1.describe()
-    assert_entered(rec1)
-    assert_wheel_provenance(rec1, ctx)
+    assert rec.result.returncode == 0 and rec.result.hit is None and not rec.timed_out, rec.describe()
+    assert "READY_1 " in rec.result.stderr and "READY_2 " in rec.result.stderr, rec.describe()
+    assert "DRIVER_ERROR" not in rec.result.stderr, rec.describe()
+    assert_entered(rec)
+    assert_wheel_provenance(rec, ctx)
+    assert is_writer_lock_held(seed.data_root) is False
 
     pol_after = raw_i33_policy(seed.data_root, scratch)
     st_after = raw_i33_store(seed.data_root, scratch)
@@ -490,14 +492,6 @@ def run_i33_crash_case(case: I33CrashCase, ctx: KernelCrashContext) -> None:
             assert "# Out-of-band U1" in claude_text
         assert not seed.agents_path.exists()
         assert pol_after["turns"][-1][3:] == ("rollback", "rolled_back")
-
-    rec2 = run_i33_child(
-        ctx.env, "serve-recover", seed.config, rec_payload, cwd=ctx.cwd, crashpoint=case.crashpoint
-    )
-    assert rec2.ready is not None and rec2.result.returncode == 0 and rec2.result.hit is None, rec2.describe()
-    assert raw_i33_policy(seed.data_root, scratch) == pol_after
-    assert raw_i33_store(seed.data_root, scratch) == st_after
-    assert seed.claude_path.read_text(encoding="utf-8") == claude_text
 
 
 I3_3_CRASH_CASES: tuple[I33CrashCase, ...] = (
