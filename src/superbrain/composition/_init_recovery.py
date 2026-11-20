@@ -1,7 +1,13 @@
-"""Durable state and recovery helpers for ``brain init`` (F3)."""
+"""Durable state and recovery helpers for ``brain init`` (F3).
+
+Ownership evidence of an interrupted init is two-tiered: the non-secret ``meta['init_bootstrap_state']`` row in
+``policy.db`` and, for crashes *before* that row exists (or before ``policy.db`` itself exists), the owner-only
+``<config_dir>/.init-bootstrap.json`` pre-marker written before any data-root byte.
+"""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -15,9 +21,14 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 
-from superbrain.adapters.os.daemon_config import read_client_ca, read_client_credential, read_daemon_config
+from superbrain.adapters.os.daemon_config import (
+    read_client_ca,
+    read_client_credential,
+    read_daemon_config,
+    read_owner_json_object,
+)
 from superbrain.adapters.os.tls_material import create_store_tls, verify_server_tls_files
-from superbrain.core._kernel_approval import SignerEnrollment
+from superbrain.core._kernel_approval import CLI_HARNESS_ID, SignerEnrollment
 from superbrain.core.canonical import canonical_json, digest_bytes
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.ids import new_id
@@ -31,14 +42,19 @@ from superbrain.storage.sqlite import open_readonly
 from superbrain.storage.writer import acquire_writer_unbumped
 
 __all__ = [
-    "INIT_BOOTSTRAP_STATE_KEY", "InitBootstrapState", "compute_init_request_digest",
-    "has_existing_data_artifacts", "prepare_init_recovery", "recover_or_provision_tls", "write_init_bootstrap_state",
+    "INIT_BOOTSTRAP_STATE_KEY", "INIT_MARKER_NAME", "InitBootstrapState", "compute_init_request_digest",
+    "has_existing_data_artifacts", "prepare_init_recovery", "recover_or_provision_tls", "remove_init_marker",
+    "require_matching_marker", "write_init_bootstrap_state", "write_init_marker",
 ]
 
 INIT_BOOTSTRAP_STATE_KEY = "init_bootstrap_state"
+INIT_MARKER_NAME = ".init-bootstrap.json"
 _TLS_KNOWN_NAMES = frozenset({"ca.pem", "ca.key", "server.pem", "server.key"})
 _BOOTSTRAP_ISSUER = "owner:local-bootstrap"
 _BOOTSTRAP_TTL = timedelta(minutes=10)
+_FRESH_ONLY_ROWS = (
+    "workspace_checkout", "approval_receipt_meta", "recovery_grant", "apply_turn_intent",
+)
 
 
 @dataclass(frozen=True)
@@ -46,7 +62,8 @@ class InitBootstrapState:
     status: str
     request_digest: str
     config_dir: str
-    cli_credential_id: str
+    cli_credential_id: str = ""
+    tls_leaf_cert_sha256: str = ""
 
 
 def _invalid() -> BrainError:
@@ -76,7 +93,13 @@ def has_existing_data_artifacts(data_root: Path) -> bool:
 
 
 def write_init_bootstrap_state(
-    rt: Runtime, *, status: str, request_digest: str, config_dir: Path, cli_credential_id: str
+    rt: Runtime,
+    *,
+    status: str,
+    request_digest: str,
+    config_dir: Path,
+    cli_credential_id: str,
+    tls_leaf_cert_sha256: str = "",
 ) -> None:
     """Persist non-secret ``init_bootstrap_state`` into ``policy.db`` ``meta`` table."""
     payload = json.dumps(
@@ -85,6 +108,7 @@ def write_init_bootstrap_state(
             "request_digest": request_digest,
             "config_dir": os.path.abspath(config_dir),
             "cli_credential_id": cli_credential_id,
+            "tls_leaf_cert_sha256": tls_leaf_cert_sha256,
         },
         sort_keys=True,
     )
@@ -101,11 +125,67 @@ def _parse_state(raw: object) -> InitBootstrapState:
         raise _invalid() from err
     if not isinstance(parsed, dict):
         raise _invalid()
-    keys = ("status", "request_digest", "config_dir", "cli_credential_id")
-    vals = [parsed.get(k) for k in keys]
-    if not all(isinstance(v, str) and v for v in vals):
+    required = [parsed.get(k) for k in ("status", "request_digest", "config_dir")]
+    optional = [parsed.get(k, "") for k in ("cli_credential_id", "tls_leaf_cert_sha256")]
+    if not all(isinstance(v, str) and v for v in required) or not all(isinstance(v, str) for v in optional):
         raise _invalid()
-    return InitBootstrapState(str(vals[0]), str(vals[1]), str(vals[2]), str(vals[3]))
+    return InitBootstrapState(str(required[0]), str(required[1]), str(required[2]), str(optional[0]), str(optional[1]))
+
+
+def _marker_body(*, request_digest: str, data_root: Path, config_dir: Path, owner_id: str) -> dict[str, object]:
+    return {
+        "version": 1, "status": "in_progress", "request_digest": request_digest,
+        "data_root": os.path.abspath(data_root), "config_dir": os.path.abspath(config_dir), "owner_id": owner_id,
+    }
+
+
+def write_init_marker(
+    *, request_digest: str, data_root: Path, config_dir: Path, owner_id: str, os_: OsAdapters
+) -> None:
+    """Durably write the owner-only, non-secret pre-marker BEFORE any data-root byte is created."""
+    path = config_dir / INIT_MARKER_NAME
+    body = _marker_body(request_digest=request_digest, data_root=data_root, config_dir=config_dir, owner_id=owner_id)
+    try:
+        os_.publisher.write_new(path, canonical_json(body) + b"\n")
+    except FileExistsError as err:
+        raise _invalid() from err
+    os_.permissions.secure_file(path)
+    os_.publisher.sync_directory(config_dir)
+
+
+def remove_init_marker(config_dir: Path, os_: OsAdapters) -> None:
+    """Remove the pre-marker (if any) once ownership is carried by the completed ``meta`` row."""
+    path = config_dir / INIT_MARKER_NAME
+    if os.path.lexists(path):
+        path.unlink()
+        os_.publisher.sync_directory(config_dir)
+
+
+def _marker_matches(
+    config_dir: Path, *, request_digest: str, data_root: Path, owner_id: str, os_: OsAdapters
+) -> bool | None:
+    """``None`` when no marker exists; otherwise whether it is exactly this request's marker."""
+    path = config_dir / INIT_MARKER_NAME
+    if not os.path.lexists(path):
+        return None
+    try:
+        raw = read_owner_json_object(path, os_)
+    except BrainError as err:
+        if err.code in (ErrorCode.INVALID_INPUT, ErrorCode.NOT_FOUND):
+            return False
+        raise
+    want = _marker_body(request_digest=request_digest, data_root=data_root, config_dir=config_dir, owner_id=owner_id)
+    return bool(raw == want)
+
+
+def require_matching_marker(
+    config_dir: Path, *, request_digest: str, data_root: Path, owner_id: str, os_: OsAdapters, must_exist: bool
+) -> bool:
+    """Refuse a foreign/mismatching marker; return whether a matching one exists."""
+    state = _marker_matches(config_dir, request_digest=request_digest, data_root=data_root, owner_id=owner_id, os_=os_)
+    if state is False or (state is None and must_exist):
+        raise _invalid()
+    return state is True
 
 
 def _validate_recovery_config_dir(
@@ -149,35 +229,114 @@ def _validate_recovery_config_dir(
     cli_cred = config_dir / "cli.credential"
     if os.path.lexists(cli_cred):
         cid, _ = parse_bearer_token(read_client_credential(cli_cred, os_))
-        if cid != expected_cred_id:
+        if not expected_cred_id or cid != expected_cred_id:
             raise _invalid()
+
+
+def _count(db: sqlite3.Connection, sql: str, params: tuple[object, ...] = ()) -> int:
+    row = db.execute(sql, params).fetchone()
+    return int(row[0]) if row is not None else 0
+
+
+def _check_premeta_policy(db: sqlite3.Connection, owner_id: str, signer: SignerEnrollment) -> None:
+    if store_owner(db) not in (None, owner_id):
+        raise _invalid()
+    signers = db.execute("SELECT owner_id, channel, key_digest, revoked_at FROM signer").fetchall()
+    if len(signers) > 1 or any(
+        (str(s[0]), str(s[1]), str(s[2])) != (owner_id, signer.channel.value, signer.key_digest) or s[3] is not None
+        for s in signers
+    ):
+        raise _invalid()
+    if _count(db, "SELECT COUNT(*) FROM principal WHERE harness_id <> ?", (CLI_HARNESS_ID,)) != 0:
+        raise _invalid()
+    if any(_count(db, f"SELECT COUNT(*) FROM {table}") != 0 for table in _FRESH_ONLY_ROWS):
+        raise _invalid()
+
+
+def _dir_is_empty(path: Path) -> bool:
+    if not os.path.lexists(path):
+        return True
+    if not path.is_dir():
+        return False
+    with os.scandir(path) as entries:
+        return next(iter(entries), None) is None
+
+
+def _verify_premeta_root(verified: DataRoot, owner_id: str, signer: SignerEnrollment, os_: OsAdapters) -> None:
+    """Read-only proof that a ``meta``-less root holds nothing but the init's own fresh bootstrap state."""
+    if not _dir_is_empty(verified.cas_dir) or not _dir_is_empty(verified.backups_dir):
+        raise _invalid()
+    with _preadmission_scratch(verified.root, os_, None) as scratch_dir:
+        try:
+            if os.path.lexists(verified.policy_db):
+                if read_schema_info(verified.policy_db) is None:
+                    raise _invalid()
+                pdb = open_readonly(verified.policy_db, scratch_dir=scratch_dir)
+                try:
+                    _check_premeta_policy(pdb, owner_id, signer)
+                finally:
+                    pdb.close()
+            if os.path.lexists(verified.store_db):
+                sdb = open_readonly(verified.store_db, scratch_dir=scratch_dir)
+                try:
+                    if _count(sdb, "SELECT COUNT(*) FROM ledger WHERE kind NOT LIKE 'policy%'") != 0:
+                        raise _invalid()
+                finally:
+                    sdb.close()
+        except sqlite3.Error as exc:
+            raise _invalid() from exc
+
+
+def _require_unstarted_config(config_dir: Path) -> None:
+    if any(os.path.lexists(config_dir / name) for name in ("daemon.json", "cli.credential", "tls")):
+        raise _invalid()
 
 
 def prepare_init_recovery(
-    *, data_root: Path, config_dir: Path, owner_id: str, request_digest: str, os_: OsAdapters
-) -> tuple[str, InitBootstrapState]:
-    """Read-only verification of an interrupted ``init_store`` root; raises ``INVALID_INPUT`` if unsafe/completed."""
+    *, data_root: Path, config_dir: Path, owner_id: str, request_digest: str, signer: SignerEnrollment, os_: OsAdapters
+) -> tuple[str | None, InitBootstrapState]:
+    """Read-only verification of an interrupted ``init_store`` root; raises ``INVALID_INPUT`` if unsafe/completed.
+
+    Returns ``(store_id, state)`` when ``meta['init_bootstrap_state']`` proves an ``in_progress`` init of this exact
+    request, or ``(None, state)`` when only the pre-marker proves ownership (crash before the ``meta`` row existed).
+    A completed store, a legacy/user-owned store and any mismatch refuse without touching a byte.
+    """
     root = DataRoot.at(data_root)
-    if not os.path.lexists(root.policy_db) or not os.path.lexists(root.store_db):
-        raise _invalid()
-    verified = verify_existing_data_root(data_root, os_)
+    try:
+        verified = verify_existing_data_root(data_root, os_)
+    except BrainError as err:
+        if err.code is ErrorCode.NOT_FOUND:
+            raise _invalid() from err
+        raise
     with acquire_writer_unbumped(verified, os_):
-        info = read_schema_info(verified.policy_db)
-        if info is None:
-            raise _invalid()
-        with _preadmission_scratch(verified.root, os_, None) as scratch_dir:
-            ro_db = open_readonly(verified.policy_db, scratch_dir=scratch_dir)
-            try:
+        row = None
+        info = None
+        existing_owner: str | None = None
+        if os.path.lexists(root.policy_db):
+            info = read_schema_info(verified.policy_db)
+            if info is None:
+                raise _invalid()
+            with _preadmission_scratch(verified.root, os_, None) as scratch_dir:
+                ro_db = open_readonly(verified.policy_db, scratch_dir=scratch_dir)
                 try:
-                    row = ro_db.execute(
-                        "SELECT value FROM meta WHERE key = ?", (INIT_BOOTSTRAP_STATE_KEY,)
-                    ).fetchone()
-                    existing_owner = store_owner(ro_db)
-                except sqlite3.Error as exc:
-                    raise _invalid() from exc
-            finally:
-                ro_db.close()
-        if row is None or existing_owner != owner_id:
+                    try:
+                        row = ro_db.execute(
+                            "SELECT value FROM meta WHERE key = ?", (INIT_BOOTSTRAP_STATE_KEY,)
+                        ).fetchone()
+                        existing_owner = store_owner(ro_db)
+                    except sqlite3.Error as exc:
+                        raise _invalid() from exc
+                finally:
+                    ro_db.close()
+        if row is None:
+            require_matching_marker(
+                config_dir, request_digest=request_digest, data_root=data_root, owner_id=owner_id, os_=os_,
+                must_exist=True,
+            )
+            _require_unstarted_config(config_dir)
+            _verify_premeta_root(verified, owner_id, signer, os_)
+            return None, InitBootstrapState("in_progress", request_digest, os.path.abspath(config_dir))
+        if existing_owner != owner_id or info is None or not os.path.lexists(root.store_db):
             raise _invalid()
         state = _parse_state(row[0])
         if (
@@ -186,6 +345,10 @@ def prepare_init_recovery(
             or state.config_dir != os.path.abspath(config_dir)
         ):
             raise _invalid()
+        require_matching_marker(
+            config_dir, request_digest=request_digest, data_root=data_root, owner_id=owner_id, os_=os_,
+            must_exist=False,
+        )
         _validate_recovery_config_dir(
             data_root=data_root,
             config_dir=config_dir,
@@ -221,14 +384,20 @@ def _verify_complete_tls(tls_dir: Path, data_root: Path, store_id: str, os_: OsA
 
 def recover_or_provision_tls(
     *, store_id: str, owner_id: str, generation: int, data_root: Path, tls_dir: Path, os_: OsAdapters
-) -> tuple[Path, Path]:
-    """Reuse complete valid TLS files or clean incomplete known TLS files and provision fresh TLS."""
+) -> tuple[Path, Path, str]:
+    """Reuse complete valid TLS files or clean incomplete known TLS files and provision fresh TLS.
+
+    Returns ``(cert_path, key_path, leaf_cert_sha256)``; the pin is the SHA-256 of the DER leaf certificate.
+    """
     known = [tls_dir / name for name in ("ca.pem", "ca.key", "server.pem", "server.key")]
     existing = [p for p in known if os.path.lexists(p)]
     if len(existing) == 4:
         if not _verify_complete_tls(tls_dir, data_root, store_id, os_):
             raise _invalid()
-        return tls_dir / "server.pem", tls_dir / "server.key"
+        server_pem = tls_dir / "server.pem"
+        leaf = x509.load_pem_x509_certificate(server_pem.read_bytes())
+        sha = hashlib.sha256(leaf.public_bytes(serialization.Encoding.DER)).hexdigest()
+        return server_pem, tls_dir / "server.key", sha
     if existing:
         for path in existing:
             path.unlink()
@@ -239,4 +408,4 @@ def recover_or_provision_tls(
         destination=tls_dir,
     )
     tls = create_store_tls(store_id, tls_dir, auth, os_.clock, os_)
-    return tls.cert_path, tls.key_path
+    return tls.cert_path, tls.key_path, tls.leaf_cert_sha256

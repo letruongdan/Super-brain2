@@ -314,6 +314,9 @@ def _open_owner_session(
                     os_=adapters,
                     review_apply=review_apply,
                     restore_handler=restore_handler,
+                    expected_endpoint_path=rt.root.endpoint_path,
+                    expected_leaf_cert_sha256=verified_tls.leaf_cert_sha256,
+                    server_cert_path=verified_tls.cert_path,
                 )
             )
         return session

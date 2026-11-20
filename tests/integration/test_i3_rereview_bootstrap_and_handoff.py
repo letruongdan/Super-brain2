@@ -5,13 +5,9 @@ Requirement sources: spec rev 22 §7.4, §11.2-§11.3, D3; ``docs/reviews/2026-1
 
 from __future__ import annotations
 
-import base64
-import hashlib
 import json
 import os
-import ssl
-import struct
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -20,8 +16,6 @@ from typing import Any, Literal
 
 import pytest
 import tomlkit
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 from superbrain.adapters.harness_config import bootstrap_templates as bt
 from superbrain.adapters.harness_config.bootstrap_templates import (
@@ -47,7 +41,6 @@ from superbrain.core._kernel_approval import (
     RecoveryScope,
     RiskLevel,
     RiskResource,
-    SignerEnrollment,
 )
 from superbrain.core._kernel_base import ResourceDigest
 from superbrain.core.canonical import canonical_json, digest_bytes
@@ -62,6 +55,7 @@ from superbrain.core.proposals import (
 )
 from superbrain.ports.os import OsAdapters
 from superbrain.storage.proposals import PolicyApplyAuthority, StoreProposalAdapter
+from tests.support import rereview_1d666f5 as rr
 from tests.support.clock import FakeClock
 from tests.support.fs import digest_tree
 from tests.support.inc2_fixture import reopen_kernel_job_runtime
@@ -80,24 +74,7 @@ REQUIRED_7_4_TOKENS = (
 )
 
 
-def _ssh_enrollment(tag: str) -> SignerEnrollment:
-    raw = Ed25519PrivateKey.generate().public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
-    blob = struct.pack(">I", 11) + b"ssh-ed25519" + struct.pack(">I", len(raw)) + raw
-    pk = f"ssh-ed25519 {base64.b64encode(blob).decode('ascii')} {tag}@devbox"
-    return SignerEnrollment(owner_id=OWNER, channel=ApprovalChannel.SSH_KEY, public_key=pk)
-
-
-def _ws_dict(ws: WorkspaceBinding, checkout: Path | None = None) -> dict[str, str]:
-    co = checkout if checkout is not None else ws.checkout_path
-    return {
-        "alias": ws.alias, "checkout_path": str(co),
-        "expected_workspace_id": ws.repo_id, "expected_checkout_id": ws.checkout_id,
-    }
-
-
-def _prop_id(out: Mapping[str, Any]) -> str:
-    assert isinstance((prop_obj := out["proposal"]), Mapping)
-    return str(prop_obj["proposal_id"])
+_ssh_enrollment, _ws_dict, _prop_id = rr.ssh_enrollment, rr.ws_dict, rr.prop_id
 
 
 @dataclass
@@ -120,16 +97,16 @@ class _Ctx:
             self.os_.permissions.secure_directory(d)
 
     def profile(
-        self, name: str, cred_file: Path, ws: dict[str, str] | None = None, *, store_id: str | None = None
+        self, name: str, cred_file: Path, ws: dict[str, str] | None = None, *, store_id: str | None = None,
+        pin: str | None = None, ca_file: Path | None = None, endpoint: Path | None = None,
     ) -> Path:
         path = self.cfg_dir / name
-        leaf_sha = hashlib.sha256(
-            ssl.PEM_cert_to_DER_cert((self.cfg_dir / "tls" / "server.pem").read_text("utf-8"))
-        ).hexdigest()
         payload: dict[str, Any] = {
-            "version": 1, "endpoint_path": str(self.data_root / "endpoint.json"),
-            "expected_store_id": store_id or self.rep.store_id, "ca_file": str(self.cfg_dir / "tls" / "ca.pem"),
-            "leaf_cert_sha256": leaf_sha, "credential_file": str(cred_file),
+            "version": 1, "endpoint_path": str(endpoint or self.data_root / "endpoint.json"),
+            "expected_store_id": store_id or self.rep.store_id,
+            "ca_file": str(ca_file or self.cfg_dir / "tls" / "ca.pem"),
+            "leaf_cert_sha256": pin or rr.leaf_sha(self.cfg_dir / "tls" / "server.pem"),
+            "credential_file": str(cred_file),
         }
         if ws is not None:
             payload["workspace"] = ws
@@ -242,7 +219,26 @@ def test_f1_bootstrap_profile_validation_matrix_and_isolation(trusted_tmp: Path)
             "expected_workspace_id": f"{u_pref}777", "expected_checkout_id": f"{u_pref}778",
         })
 
-        h1, h2 = wiring_handler(ctx.rt.policy, ctx.os_), make_default_bootstrap_handler(ctx.rt.policy, ctx.os_)
+        ident = rr.daemon_identity(ctx.data_root, ctx.cfg_dir)
+
+        # F1 (1d666f5): TLS pin / CA / endpoint identity must match the pinned daemon, not just parse.
+        kw: dict[str, Any] = {"owner_id": OWNER, "harness_id": "claude-code", "checkout_root": co_a}
+        f_ca = rr.foreign_ca_file(
+            trusted_tmp, ctx.os_, owner_id=OWNER, machine_id=MACHINE, signer=_ssh_enrollment("f1-foreign")
+        )
+        ws_dict_a = _ws_dict(ws_a)
+        bad_pin = rr.flip_last_hex_char(ident["expected_leaf_cert_sha256"])
+        p_pin = ctx.profile("pin.json", c_cred, ws_dict_a, pin=bad_pin)
+        p_fca = ctx.profile("fca.json", c_cred, ws_dict_a, ca_file=f_ca)
+        p_ep_dir = ctx.profile("epd.json", c_cred, ws_dict_a, endpoint=trusted_tmp / "other-data" / "endpoint.json")
+        p_ep_name = ctx.profile("epn.json", c_cred, ws_dict_a, endpoint=ctx.data_root / "other.json")
+
+        with pytest.raises(BrainError) as default_err:  # a default-constructed validator also rejects the wrong pin
+            ctx.validator.validate_harness_profile(harness_profile_path=p_pin, **kw)
+        assert default_err.value.code is ErrorCode.IDENTITY_MISMATCH
+        ctx.validator = PolicyHarnessProfileValidator(ctx.rt.policy, ctx.os_, **ident)
+        h1 = wiring_handler(ctx.rt.policy, ctx.os_, **ident)
+        h2 = make_default_bootstrap_handler(ctx.rt.policy, ctx.os_, **ident)
         op = OperatorService(ctx.rt.policy, ssh_verifier=lambda: None, review_apply=ctx.svc, bootstrap_handler=h1)
         op2 = OperatorService(ctx.rt.policy, ssh_verifier=lambda: None, review_apply=ctx.svc, bootstrap_handler=h2)
 
@@ -255,6 +251,10 @@ def test_f1_bootstrap_profile_validation_matrix_and_isolation(trusted_tmp: Path)
             ("claude-code", co_a, p_bad_path, ErrorCode.IDENTITY_MISMATCH),
             ("claude-code", co_a, p_bad_ids, ErrorCode.IDENTITY_MISMATCH),
             ("claude-code", co_unreg, p_unreg, ErrorCode.IDENTITY_MISMATCH),
+            ("claude-code", co_a, p_pin, ErrorCode.IDENTITY_MISMATCH),
+            ("claude-code", co_a, p_fca, ErrorCode.IDENTITY_MISMATCH),
+            ("claude-code", co_a, p_ep_dir, ErrorCode.IDENTITY_MISMATCH),
+            ("claude-code", co_a, p_ep_name, ErrorCode.IDENTITY_MISMATCH),
         ]
         for h, co_dir, bad_prof, expected_code in cases:
             with pytest.raises(BrainError) as v_err:
@@ -269,6 +269,19 @@ def test_f1_bootstrap_profile_validation_matrix_and_isolation(trusted_tmp: Path)
                 op.handle("/v2/operator/proposal/bootstrap", cli_p.principal,
                           {"harness": h, "checkout_root": str(co_dir), "harness_profile_path": str(bad_prof)})
             assert op_err.value.code is expected_code
+
+        # Daemon pin override: a rotated TLS bundle is accepted, the stale init pin / CA is rejected.
+        r_cert, r_ca, r_sha = rr.rotated_tls(ctx.rep.store_id, trusted_tmp / "rot-tls", OWNER, ctx.clock, ctx.os_)
+        rot = PolicyHarnessProfileValidator(
+            ctx.rt.policy, ctx.os_, expected_endpoint_path=ident["expected_endpoint_path"],
+            expected_leaf_cert_sha256=r_sha, server_cert_path=r_cert,
+        )
+        p_rot = ctx.profile("rot.json", c_cred, ws_dict_a, pin=r_sha, ca_file=r_ca)
+        rot.validate_harness_profile(harness_profile_path=p_rot, **kw)
+        for stale_v, stale_p in ((rot, p_claude), (ctx.validator, p_rot)):
+            with pytest.raises(BrainError) as stale_err:
+                stale_v.validate_harness_profile(harness_profile_path=stale_p, **kw)
+            assert stale_err.value.code is ErrorCode.IDENTITY_MISMATCH
 
         ctx.rt.policy.record_authorized_revocation(
             cred_c.credential_id,
@@ -316,14 +329,15 @@ def test_f2_handoff_rule_and_sp2_takeover_edit_gate_oracle(trusted_tmp: Path) ->
             assert m in txt
         for tok in REQUIRED_7_4_TOKENS:
             assert tok in low, f"missing {tok!r} in {md_path.name}"
+        rr.assert_f2_rule_scope(txt)
 
     for sess, ack, h_s, w_s, unk, expected in [
         ("ended", False, None, None, True, d_cls(False, "retry_same_idempotency_key")),
         ("in_progress_unknown", False, "stored", "holder", True, d_cls(False, "retry_same_idempotency_key")),
         ("active", False, None, None, False, d_cls(False, "require_active_takeover_ack", True, True)),
         ("active", False, "stored", "holder", False, d_cls(False, "require_active_takeover_ack", True, True)),
-        ("ended", False, "not_stored_policy", None, False, d_cls(False, "policy_disabled")),
-        ("active", True, "not_stored_policy", "holder", False, d_cls(False, "policy_disabled")),
+        ("ended", False, "not_stored_policy", None, False, d_cls(False, "policy_disabled", False, True)),
+        ("active", True, "not_stored_policy", "holder", False, d_cls(False, "policy_disabled", False, True)),
         ("ended", False, "stored", "not_holder", False, d_cls(False, "reread_handoff")),
         ("active", True, "stored", "not_holder", False, d_cls(False, "reread_handoff")),
         ("ended", False, "stored", "holder", False, d_cls(True, "proceed_edit")),
@@ -336,6 +350,17 @@ def test_f2_handoff_rule_and_sp2_takeover_edit_gate_oracle(trusted_tmp: Path) ->
             handoff_status=h_s, writer_status=w_s, commit_outcome_unknown=unk,
         )
         assert dec == expected
+    # F2: explicit takeover keeps the block + notify; ordinary work (no open handoff) proceeds under repo policy.
+    for h_s, unk, takeover, expected in (
+        ("not_stored_policy", False, True, d_cls(False, "policy_disabled", False, True)),
+        ("not_stored_policy", False, False, d_cls(True, "proceed_without_handoff_policy")),
+        (None, False, False, d_cls(True, "proceed_edit")),
+        (None, True, False, d_cls(False, "retry_same_idempotency_key")),
+    ):
+        assert evaluate_takeover_edit_gate(
+            holding_session_state=None, acknowledge_active=False, handoff_status=h_s, writer_status=None,
+            commit_outcome_unknown=unk, taking_over_open_handoff=takeover,
+        ) == expected
     for h_s, w_s in ((None, None), ("stored", None), (None, "holder")):
         assert not evaluate_takeover_edit_gate(
             holding_session_state="ended", acknowledge_active=False,
@@ -381,29 +406,23 @@ def test_f4_manifest_driven_rebootstrap_preserves_u1_and_blocks_in_slice_tamper(
         )))
 
         # Out-of-band U1 edits across Markdown, JSON, dual-slice JSON, & TOML!
-        (co_c / "CLAUDE.md").write_text(
-            (co_c / "CLAUDE.md").read_text("utf-8") + "\n## User Prose After\nKeep me.\n", "utf-8"
-        )
-        mcp_obj = json.loads((co_c / ".mcp.json").read_text("utf-8"))
-        mcp_obj["userSibling"], mcp_obj["mcpServers"]["user-extra"] = "keep", {"command": "true"}
-        (co_c / ".mcp.json").write_text(json.dumps(mcp_obj, indent=2) + "\n", "utf-8")
-        set_obj = json.loads((co_c / ".claude" / "settings.local.json").read_text("utf-8"))
-        set_obj["permissions"]["allow"] = ["Bash(git status *)"]
-        set_obj["hooks"]["PostToolUse"] = [{"type": "user-post"}]
-        (co_c / ".claude" / "settings.local.json").write_text(json.dumps(set_obj, indent=2) + "\n", "utf-8")
+        def _append(path: Path, text: str) -> None:
+            path.write_text(path.read_text("utf-8") + text, "utf-8")
 
-        (co_x / "AGENTS.md").write_text(
-            (co_x / "AGENTS.md").read_text("utf-8") + "\n## Agents Prose After\nKeep me.\n", "utf-8"
-        )
-        (co_x / ".codex" / "config.toml").write_text(
-            (co_x / ".codex" / "config.toml").read_text("utf-8")
-            + '\n# U1 post-apply comment\n[profiles.u1]\nowner = "keep"\n',
-            "utf-8",
-        )
-        xhook_obj = json.loads((co_x / ".codex" / "hooks.json").read_text("utf-8"))
-        xhook_obj["hooks"]["PostToolUse"] = [{"type": "codex-post"}]
-        (co_x / ".codex" / "hooks.json").write_text(json.dumps(xhook_obj, indent=2) + "\n", "utf-8")
+        def _jedit(path: Path, mutate: Callable[[Any], object]) -> None:
+            obj = json.loads(path.read_text("utf-8"))
+            mutate(obj)
+            path.write_text(json.dumps(obj, indent=2) + "\n", "utf-8")
 
+        _append(co_c / "CLAUDE.md", "\n## User Prose After\nKeep me.\n")
+        _jedit(co_c / ".mcp.json", lambda o: (
+            o.update(userSibling="keep"), o["mcpServers"].update({"user-extra": {"command": "true"}})))
+        _jedit(co_c / ".claude" / "settings.local.json", lambda o: (
+            o["permissions"].update(allow=["Bash(git status *)"]),
+            o["hooks"].update(PostToolUse=[{"type": "user-post"}])))
+        _append(co_x / "AGENTS.md", "\n## Agents Prose After\nKeep me.\n")
+        _append(co_x / ".codex" / "config.toml", '\n# U1 post-apply comment\n[profiles.u1]\nowner = "keep"\n')
+        _jedit(co_x / ".codex" / "hooks.json", lambda o: o["hooks"].update(PostToolUse=[{"type": "codex-post"}]))
         # Rotate to c_prof2 / x_prof2 -> re-bootstrap updates cleanly and preserves 100% of U1 edits & TOML comments!
         ctx.apply(ctx.propose("claude-code", co_c, c_prof2).proposal_id)
         ctx.apply(_prop_id(op.handle(

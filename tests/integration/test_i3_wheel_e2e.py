@@ -44,7 +44,9 @@ from superbrain.core._kernel_approval import (
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.kernel import Endpoint, ResourceDigest
 from superbrain.storage.backup import create_policy_backup, create_store_backup
+from tests.support import rereview_1d666f5 as rr
 from tests.support.clock import FakeClock
+from tests.support.fs import digest_tree
 from tests.support.inc2_cli import (
     InstalledMcpPipeSession,
     is_writer_lock_held,
@@ -383,6 +385,56 @@ def test_i3_wheel_synthetic_lifecycle_e2e(inc2_installed_env: InstalledEnv, trus
             assert bad_res.returncode == 1
         assert not (co_a / ".mcp.json").exists()
 
+        # 3b. F1 (1d666f5): a wrong TLS pin / endpoint path / foreign CA never yields a proposal, on BOTH harnesses.
+        foreign_base = trusted_tmp / "foreign"
+        foreign_base.mkdir()
+        os_.permissions.secure_directory(foreign_base)
+        foreign_ca = rr.foreign_ca_file(
+            foreign_base, os_, owner_id=OWNER, machine_id=MACHINE, signer=rr.ssh_enrollment("foreign", OWNER)
+        )
+        overrides: dict[str, dict[str, Any]] = {
+            "pin": {"leaf_cert_sha256": rr.flip_last_hex_char(leaf_sha)},
+            "dir": {"endpoint_path": trusted_tmp / "other-data" / "endpoint.json"},
+            "name": {"endpoint_path": data_root / "other.json"},
+            "ca": {"ca_file": foreign_ca},
+        }
+        for harness, co_dir, cred_path, ws_bind in (
+            ("claude-code", co_a, claude_cred_path, ws_a),
+            ("codex", co_b, codex_cred_path, ws_b),
+        ):
+            snap_co = digest_tree(co_dir)
+            for variant, override in overrides.items():
+                profile_args: dict[str, Any] = {
+                    "endpoint_path": data_root / "endpoint.json",
+                    "expected_store_id": store_id,
+                    "ca_file": cfg_dir / "tls" / "ca.pem",
+                    "leaf_cert_sha256": leaf_sha,
+                    "credential_file": cred_path,
+                    "workspace": rr.ws_dict(ws_bind, co_dir),
+                    **override,
+                }
+                bad_path = trusted_tmp / f"{harness}-bad-{variant}.profile.json"
+                bad_hp, _ = write_client_profile_file(bad_path, **profile_args)
+                direct = _post_daemon(
+                    ep, ca_pem, "/v2/operator/proposal/bootstrap", cli_token,
+                    {"harness": harness, "checkout_root": str(co_dir), "harness_profile_path": str(bad_hp)},
+                )
+                assert direct["ok"] is False and direct["error"]["code"] == ErrorCode.IDENTITY_MISMATCH.value, direct
+                if variant == "ca":
+                    continue
+                cli_bad = run_installed_command(
+                    inc2_installed_env,
+                    "brain",
+                    [
+                        "bootstrap", "--harness", harness, "--checkout", str(co_dir), "--profile", str(profile_path),
+                        "--harness-profile", str(bad_hp), "--json",
+                    ],
+                    cwd=cwd,
+                )
+                assert cli_bad.returncode == 1, (harness, variant, cli_bad.stderr)
+                assert ErrorCode.IDENTITY_MISMATCH.value in cli_bad.stderr.decode("utf-8", errors="replace")
+            assert digest_tree(co_dir) == snap_co
+
         b_a = run_installed_command(
             inc2_installed_env,
             "brain",
@@ -454,6 +506,7 @@ def test_i3_wheel_synthetic_lifecycle_e2e(inc2_installed_env: InstalledEnv, trus
         claude_md = (co_a / "CLAUDE.md").read_text(encoding="utf-8")
         assert "# Claude User Header" in claude_md and LAYER1_RULE_TEXT in claude_md
         assert HANDOFF_RULE_TEXT in claude_md and str(claude_a_profile) in claude_md
+        rr.assert_f2_rule_scope(claude_md)
         assert str(profile_path) not in claude_md
         for cmd in AUTHORITY_ASK_COMMANDS:
             assert cmd in (co_a / ".claude" / "settings.local.json").read_text(encoding="utf-8")
@@ -506,6 +559,7 @@ def test_i3_wheel_synthetic_lifecycle_e2e(inc2_installed_env: InstalledEnv, trus
         agents_md = (co_b / "AGENTS.md").read_text(encoding="utf-8")
         assert "# Codex User Header" in agents_md and LAYER1_RULE_TEXT in agents_md
         assert HANDOFF_RULE_TEXT in agents_md and str(codex_b_profile) in agents_md
+        rr.assert_f2_rule_scope(agents_md)
         assert str(profile_path) not in agents_md
 
         # 4c. Parse installed MCP configs directly, run wheel shims in co_a & co_b, and check wrong-CWD refusal!

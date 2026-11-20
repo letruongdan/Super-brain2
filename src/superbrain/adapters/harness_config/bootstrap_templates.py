@@ -51,12 +51,14 @@ HANDOFF_RULE_TEXT = (
     "(plan_created_or_changed, decision_or_rejection_recorded, user_constraint_added, "
     "step_completed, before_long_running_command, task_ended). "
     "When holding session state is active, notify the user and pass takeover.acknowledge_active=true "
-    "for takeover. Never edit any checkout file until takeover ACK returns BOTH "
-    "handoff_status=stored and writer_status=holder. "
+    "for takeover. When taking over an open handoff, do not edit any checkout file until "
+    "takeover ACK returns BOTH handoff_status=stored and writer_status=holder. "
     "If writer_status=not_holder, do not edit and re-read the latest handoff via "
     "prepare_task(mode=discover), get_artifact L1, and handoff_live. "
-    "If handoff_status=not_stored_policy, manual_submission is disabled by policy "
-    "(no holder or revision change; do not edit). "
+    "If handoff_status=not_stored_policy (manual_submission=false, disabled by policy; "
+    "no holder or revision change): when taking over an open handoff, do not edit and "
+    "notify the user or ask the user how to proceed; for ordinary work that is not taking over "
+    "an open handoff, proceed normally under the repo policy. "
     "If commit_outcome_unknown is reported, retry submit_episode with the same idempotency_key "
     "before any edit."
 )
@@ -79,13 +81,22 @@ def evaluate_takeover_edit_gate(
     handoff_status: str | None = None,
     writer_status: str | None = None,
     commit_outcome_unknown: bool = False,
+    taking_over_open_handoff: bool = True,
 ) -> HandoffTakeoverEditDecision:
-    """Evaluate whether checkout edits may proceed under spec §7.4 and SP2 ACK invariants."""
+    """Evaluate whether checkout edits may proceed under spec §7.4 and SP2 ACK invariants.
+
+    The stored+holder ACK gate and the ``not_stored_policy`` block apply only when taking over an
+    open handoff; ordinary work proceeds under the repo policy.
+    """
     if commit_outcome_unknown:
         return HandoffTakeoverEditDecision(
             allow_edit=False,
             action="retry_same_idempotency_key",
         )
+    if not taking_over_open_handoff:
+        if handoff_status == "not_stored_policy":
+            return HandoffTakeoverEditDecision(allow_edit=True, action="proceed_without_handoff_policy")
+        return HandoffTakeoverEditDecision(allow_edit=True, action="proceed_edit")
     if holding_session_state == "active" and not acknowledge_active:
         return HandoffTakeoverEditDecision(
             allow_edit=False,
@@ -97,6 +108,7 @@ def evaluate_takeover_edit_gate(
         return HandoffTakeoverEditDecision(
             allow_edit=False,
             action="policy_disabled",
+            notify_user=True,
         )
     if handoff_status != "stored" or writer_status != "holder":
         return HandoffTakeoverEditDecision(

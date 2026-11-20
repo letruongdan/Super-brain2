@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hmac
 import json
+import os
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -79,6 +81,24 @@ def _parse_args(args: list[str]) -> _ParsedBootstrapCli | None:
     )
 
 
+def _same_endpoint(a: Path, b: Path) -> bool:
+    return a.name == b.name and os.path.normcase(os.path.realpath(a.parent)) == os.path.normcase(
+        os.path.realpath(b.parent)
+    )
+
+
+def _require_matching_daemon_identity(operator_profile: Path, harness_profile: Path, os_: OsAdapters) -> None:
+    """Both profiles must pin the same store, leaf certificate and endpoint before any RPC is sent."""
+    op = read_client_profile(operator_profile, os_)
+    hp = read_client_profile(harness_profile, os_)
+    if (
+        op.expected_store_id != hp.expected_store_id
+        or not hmac.compare_digest(op.leaf_cert_sha256.lower(), hp.leaf_cert_sha256.lower())
+        or not _same_endpoint(op.endpoint_path, hp.endpoint_path)
+    ):
+        raise BrainError(ErrorCode.IDENTITY_MISMATCH, "identity mismatch")
+
+
 def run_bootstrap_cli(args: list[str], *, os_: OsAdapters | None = None) -> int:
     parsed = _parse_args(args)
     if parsed is None:
@@ -86,7 +106,7 @@ def run_bootstrap_cli(args: list[str], *, os_: OsAdapters | None = None) -> int:
         return 2
     adapters = os_ if os_ is not None else os_adapters()
     try:
-        read_client_profile(parsed.harness_profile_path, adapters)
+        _require_matching_daemon_identity(parsed.profile_path, parsed.harness_profile_path, adapters)
         result = call_operator_from_profile(
             parsed.profile_path,
             "/v2/operator/proposal/bootstrap",

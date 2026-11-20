@@ -60,6 +60,7 @@ from tests.support.fs import digest_tree
 from tests.support.inc2_fixture import reopen_kernel_job_runtime
 from tests.support.inc2_transport import FakeMonotonicClock, register_workspace_direct
 from tests.support.kernel_auth import seed_principal_and_credential
+from tests.support.rereview_1d666f5 import leaf_sha
 
 OWNER = "dan"
 MACHINE = "r2-box"
@@ -120,7 +121,7 @@ def _write_profile(
         "endpoint_path": str(data_root / "endpoint.json"),
         "expected_store_id": expected_store_id,
         "ca_file": str(cfg_dir / "tls" / "ca.pem"),
-        "leaf_cert_sha256": "a" * 64,
+        "leaf_cert_sha256": leaf_sha(cfg_dir / "tls" / "server.pem"),
         "credential_file": str(credential_file if credential_file is not None else (cfg_dir / "cli.credential")),
     }
     if workspace is not None:

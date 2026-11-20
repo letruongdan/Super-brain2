@@ -154,6 +154,9 @@ def build_operator_service(
     review_apply: ReviewApplyService | None = None,
     restore_handler: RestoreHandler | None = None,
     bootstrap_handler: BootstrapProposalHandler | None = None,
+    expected_endpoint_path: Path | None = None,
+    expected_leaf_cert_sha256: str | None = None,
+    server_cert_path: Path | None = None,
 ) -> OperatorService:
     """The operator service over ``policy`` with real SSH, localhost WebAuthn, and bootstrap wiring."""
     return OperatorService(
@@ -163,7 +166,15 @@ def build_operator_service(
         review_apply=review_apply,
         restore_handler=restore_handler,
         bootstrap_handler=(
-            bootstrap_handler if bootstrap_handler is not None else make_default_bootstrap_handler(policy, os_)
+            bootstrap_handler
+            if bootstrap_handler is not None
+            else make_default_bootstrap_handler(
+                policy,
+                os_,
+                expected_endpoint_path=expected_endpoint_path,
+                expected_leaf_cert_sha256=expected_leaf_cert_sha256,
+                server_cert_path=server_cert_path,
+            )
         ),
     )
 

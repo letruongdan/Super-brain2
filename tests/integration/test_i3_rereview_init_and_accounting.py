@@ -114,6 +114,34 @@ def _verify_ca_signed_leaf(ca_pem_path: Path, leaf_pem_path: Path) -> None:
     pub.verify(leaf_cert.signature, leaf_cert.tbs_certificate_bytes, ec.ECDSA(leaf_cert.signature_hash_algorithm))
 
 
+def _assert_clean_completed_init(req: InitRequest, report: Any, os_: OsAdapters, clock: FakeClock) -> None:
+    """Exactly one signer/credential/principal, reconciled policy, CA-signed leaf and no leftover init marker file."""
+    data_root, cfg_dir = req.data_root, req.config_dir
+    cfg = read_daemon_config(report.daemon_config_path, os_)
+    assert (cfg.data_root, cfg.expected_store_id) == (data_root, report.store_id)
+    assert verify_server_tls_files(cfg, clock, os_).store_id == report.store_id
+    _verify_ca_signed_leaf(cfg_dir / "tls" / "ca.pem", cfg.cert_path)
+    assert not (cfg_dir / ".init-bootstrap.json").exists()
+    token = report.cli_credential_path.read_text(encoding="ascii").strip()
+    cred_id, _ = parse_bearer_token(token)
+    rt = reopen_kernel_job_runtime(data_root, report.store_id, os_)
+    try:
+        principal = rt.policy.resolve_credential(token)
+        assert (principal.owner_id, principal.harness_id, principal.machine_id) == (OWNER, CLI_HARNESS_ID, MACHINE)
+        snap = rt.policy.snapshot()
+        assert [cid for cid, rec in snap.credentials.items() if not rec.revoked] == [cred_id]
+        assert len(snap.principals) == 1
+        assert rt.store.reconcile_policy() == 0
+        intents = len(rt.policy.intents())
+        with rt.store.transaction() as txn:
+            applied = txn.db.execute("SELECT COUNT(*) FROM applied_intents").fetchone()
+        assert applied is not None and int(applied[0]) == intents
+        signers = rt.policy.active_signers()
+        assert [s.signer_id for s in signers] == [report.signer.signer_id]
+        assert signers[0].tofu is True and signers[0].key_digest == req.signer.key_digest
+    finally:
+        rt.close()
+
 @pytest.mark.parametrize("fail_target", ["ca.pem", "server.pem", "daemon.json", "cli.credential"])
 def test_f3_init_store_durable_recovery_across_tls_daemon_and_credential_failures(
     trusted_tmp: Path, fail_target: str
@@ -138,32 +166,7 @@ def test_f3_init_store_durable_recovery_across_tls_daemon_and_credential_failure
     assert io_err.value.code is ErrorCode.IO_ERROR
 
     # Retry identical request with healthy OS succeeds completely.
-    report = init_store(req, os_)
-    cfg = read_daemon_config(report.daemon_config_path, os_)
-    assert (cfg.data_root, cfg.expected_store_id) == (data_root, report.store_id)
-    verified_tls = verify_server_tls_files(cfg, clock, os_)
-    assert verified_tls.store_id == report.store_id
-    _verify_ca_signed_leaf(cfg_dir / "tls" / "ca.pem", cfg.cert_path)
-
-    token = report.cli_credential_path.read_text(encoding="ascii").strip()
-    cred_id, _ = parse_bearer_token(token)
-    rt = reopen_kernel_job_runtime(data_root, report.store_id, os_)
-    try:
-        principal = rt.policy.resolve_credential(token)
-        assert (principal.owner_id, principal.harness_id, principal.machine_id) == (OWNER, CLI_HARNESS_ID, MACHINE)
-        snap = rt.policy.snapshot()
-        assert [cid for cid, rec in snap.credentials.items() if not rec.revoked] == [cred_id]
-        assert len(snap.principals) == 1
-        assert rt.store.reconcile_policy() == 0
-        intents = len(rt.policy.intents())
-        with rt.store.transaction() as txn:
-            applied = txn.db.execute("SELECT COUNT(*) FROM applied_intents").fetchone()
-        assert applied is not None and int(applied[0]) == intents
-        signers = rt.policy.active_signers()
-        assert [s.signer_id for s in signers] == [report.signer.signer_id]
-        assert signers[0].tofu is True and signers[0].key_digest == req.signer.key_digest
-    finally:
-        rt.close()
+    _assert_clean_completed_init(req, init_store(req, os_), os_, clock)
 
     # Completed init MUST refuse any further retry without mutating bytes.
     snap_data, snap_cfg = digest_tree(data_root), digest_tree(cfg_dir)
@@ -261,6 +264,96 @@ def test_f3_init_store_negative_guards_do_not_mutate_existing_bytes(trusted_tmp:
         init_store(req3, os_)
     assert f_err.value.code is ErrorCode.INVALID_INPUT
     assert digest_tree(d3) == snap_d3 and digest_tree(c3) == snap_c3
+
+
+def _f3_request(trusted_tmp: Path, os_: OsAdapters, tag: str) -> InitRequest:
+    base = trusted_tmp / tag
+    cfg_dir = base / "cfg"
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    os_.permissions.secure_directory(cfg_dir)
+    return InitRequest(
+        data_root=base / "data", config_dir=cfg_dir, owner_id=OWNER, machine_id=MACHINE, signer=_ssh_enrollment(tag)
+    )
+
+
+def _fail_marker_write(monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(*_args: Any, **_kwargs: Any) -> None:
+        raise BrainError(ErrorCode.IO_ERROR, "injected marker io_error")
+
+    monkeypatch.setattr("superbrain.composition.init_entry.write_init_bootstrap_state", boom)
+
+
+def test_f3_marker_io_error_before_any_marker_then_identical_retry_completes(
+    trusted_tmp: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F3: ``IO_ERROR`` at the marker write (before init ownership evidence) must not strand the store."""
+    clock = FakeClock(datetime(2026, 11, 20, 12, 0, tzinfo=UTC))
+    os_ = os_adapters(clock=clock)
+    req = _f3_request(trusted_tmp, os_, "f3-pre-marker")
+    with monkeypatch.context() as mp:
+        _fail_marker_write(mp)
+        with pytest.raises(BrainError) as io_err:
+            init_store(req, os_)
+    assert io_err.value.code is ErrorCode.IO_ERROR
+    assert not (req.config_dir / "daemon.json").exists()
+    _assert_clean_completed_init(req, init_store(req, os_), os_, clock)
+
+
+def test_f3_open_runtime_failure_before_brain_db_then_identical_retry_completes(trusted_tmp: Path) -> None:
+    """F3: ``IO_ERROR`` while ``open_runtime`` publishes ``brain.db`` leaves a root an identical retry completes."""
+    clock = FakeClock(datetime(2026, 11, 20, 12, 0, tzinfo=UTC))
+    os_ = os_adapters(clock=clock)
+    req = _f3_request(trusted_tmp, os_, "f3-brain-db")
+    with pytest.raises(BrainError) as io_err:
+        init_store(req, _faulty_os(os_, "brain.db"))
+    assert io_err.value.code is ErrorCode.IO_ERROR
+    assert not (req.config_dir / "daemon.json").exists()
+    _assert_clean_completed_init(req, init_store(req, os_), os_, clock)
+
+
+@pytest.mark.parametrize("resume_fail", ["daemon.json", "cli.credential"])
+def test_f3_interruption_before_marker_then_mid_resume_then_third_attempt_completes(
+    trusted_tmp: Path, monkeypatch: pytest.MonkeyPatch, resume_fail: str
+) -> None:
+    """F3: attempt 1 fails before the marker, attempt 2 fails mid-resume, attempt 3 completes cleanly."""
+    clock = FakeClock(datetime(2026, 11, 20, 12, 0, tzinfo=UTC))
+    os_ = os_adapters(clock=clock)
+    req = _f3_request(trusted_tmp, os_, f"f3-resume-{resume_fail}")
+    with monkeypatch.context() as mp:
+        _fail_marker_write(mp)
+        with pytest.raises(BrainError) as first:
+            init_store(req, os_)
+    assert first.value.code is ErrorCode.IO_ERROR
+    with pytest.raises(BrainError) as second:
+        init_store(req, _faulty_os(os_, resume_fail))
+    assert second.value.code is ErrorCode.IO_ERROR
+    _assert_clean_completed_init(req, init_store(req, os_), os_, clock)
+
+
+def test_f3_completed_and_user_owned_stores_refuse_init_without_mutation(trusted_tmp: Path) -> None:
+    """F3 controls: a completed store (even with a planted stale marker file) and a legacy store are never adopted."""
+    clock = FakeClock(datetime(2026, 11, 20, 12, 0, tzinfo=UTC))
+    os_ = os_adapters(clock=clock)
+    done = _f3_request(trusted_tmp, os_, "f3-completed")
+    init_store(done, os_)
+    stale = done.config_dir / ".init-bootstrap.json"
+    stale.write_bytes(b'{"status":"in_progress","stale":true}\n')
+    os_.permissions.secure_file(stale)
+    legacy = _f3_request(trusted_tmp, os_, "f3-legacy")
+    legacy_rt = open_kernel_job_runtime(legacy.data_root, os_, role="f3-legacy")
+    try:
+        with legacy_rt.policy._authority_tx() as db:
+            assert db.execute("SELECT value FROM meta WHERE key = 'init_bootstrap_state'").fetchone() is None
+    finally:
+        legacy_rt.close()
+    for req in (done, legacy):
+        snap_data, snap_cfg = digest_tree(req.data_root), digest_tree(req.config_dir)
+        with pytest.raises(BrainError) as refused:
+            init_store(req, os_)
+        assert refused.value.code is ErrorCode.INVALID_INPUT
+        assert digest_tree(req.data_root) == snap_data and digest_tree(req.config_dir) == snap_cfg
+    assert not (legacy.config_dir / ".init-bootstrap.json").exists()
+    assert not any(legacy.config_dir.iterdir())
 
 
 def _reconcile_all(rt: Any, store_id: str, signer_id: str, layout: DataRoot) -> Any:

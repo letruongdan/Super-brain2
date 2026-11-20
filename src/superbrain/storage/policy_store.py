@@ -278,6 +278,20 @@ class PolicyStore(PolicyAuthorityMixin, PolicyAccountingMixin):
         self._check()
         return self._root
 
+    @property
+    def data_root(self) -> Path:
+        """The data-root directory this policy store lives under (read-only)."""
+        self._check()
+        return self._root.root
+
+    def meta_value(self, key: str) -> str | None:
+        """Read-only value of a ``meta`` row (``None`` when absent or not text)."""
+        self._check()
+        rows = self._query("SELECT value FROM meta WHERE key = ?", (key,))
+        if len(rows) != 1 or not isinstance(rows[0][0], str):
+            return None
+        return rows[0][0]
+
     def adopt_after_owner_exit(self, exited_owner: threading.Thread) -> None:
         if exited_owner.is_alive() or exited_owner.ident is None or self._owner != exited_owner.ident:
             raise AssertionError("policy store owner thread has not exited")

@@ -58,6 +58,7 @@ from tests.support.fs import digest_tree
 from tests.support.inc2_fixture import reopen_kernel_job_runtime
 from tests.support.inc2_transport import FakeMonotonicClock, register_workspace_direct
 from tests.support.kernel_auth import seed_principal_and_credential
+from tests.support.rereview_1d666f5 import assert_f2_rule_scope
 
 OWNER = "dan"
 MACHINE = "i3-5-box"
@@ -152,6 +153,7 @@ def test_bootstrap_templates_embed_section_7_4_handoff_rules_and_nonblocking_hoo
     )
     for token in required_tokens:
         assert token in lower_rule, f"missing §7.4 token {token!r} in HANDOFF_RULE_TEXT"
+    assert_f2_rule_scope(HANDOFF_RULE_TEXT)
 
     checkout = trusted_tmp / "repo"
     checkout.mkdir()
@@ -179,6 +181,7 @@ def test_bootstrap_templates_embed_section_7_4_handoff_rules_and_nonblocking_hoo
             assert moment in md_text
         for token in required_tokens:
             assert token in md_lower, f"missing §7.4 token {token!r} in {md_name}"
+        assert_f2_rule_scope(md_text)
         assert "# User Prose" in md_text or "# Agents Prose" in md_text
         hook_text = by_rel[hook_name].preview_text
         for cmd in AUTHORITY_ASK_COMMANDS:
@@ -186,6 +189,33 @@ def test_bootstrap_templates_embed_section_7_4_handoff_rules_and_nonblocking_hoo
         hook_json = json.loads(hook_text)
         assert "hooks" in hook_json
         assert "non_blocking" in hook_text or "remind" in hook_text.lower()
+
+
+def test_takeover_edit_gate_scopes_not_stored_policy_to_open_handoff_takeover() -> None:
+    """F2 (Plan I3 line 215): takeover is blocked + user notified; ordinary work proceeds under repo policy."""
+    from superbrain.adapters.harness_config.bootstrap_templates import (
+        HandoffTakeoverEditDecision,
+        evaluate_takeover_edit_gate,
+    )
+
+    def gate(handoff_status: str | None, unknown: bool, *, takeover: bool) -> HandoffTakeoverEditDecision:
+        return evaluate_takeover_edit_gate(
+            holding_session_state=None, acknowledge_active=False, handoff_status=handoff_status,
+            writer_status=None, commit_outcome_unknown=unknown, taking_over_open_handoff=takeover,
+        )
+
+    blocked = HandoffTakeoverEditDecision(allow_edit=False, action="policy_disabled", notify_user=True)
+    assert gate("not_stored_policy", False, takeover=True) == blocked
+    assert evaluate_takeover_edit_gate(
+        holding_session_state="ended", acknowledge_active=False, handoff_status="not_stored_policy", writer_status=None
+    ) == blocked
+    assert gate("not_stored_policy", False, takeover=False) == HandoffTakeoverEditDecision(
+        allow_edit=True, action="proceed_without_handoff_policy"
+    )
+    assert gate(None, False, takeover=False) == HandoffTakeoverEditDecision(allow_edit=True, action="proceed_edit")
+    assert gate(None, True, takeover=False) == HandoffTakeoverEditDecision(
+        allow_edit=False, action="retry_same_idempotency_key"
+    )
 
 
 def test_bootstrap_service_and_cli_create_high_risk_proposal_without_writing_checkout(
