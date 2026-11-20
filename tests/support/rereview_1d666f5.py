@@ -8,13 +8,16 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import os
 import re
 import ssl
 import struct
-from collections.abc import Mapping
+import subprocess
+import sys
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -28,16 +31,19 @@ from superbrain.adapters.harness_config.bootstrap_templates import (
     HandoffTakeoverEditDecision,
     evaluate_takeover_edit_gate,
 )
+from superbrain.adapters.os import os_adapters
 from superbrain.adapters.os.daemon_config import read_daemon_config
 from superbrain.adapters.os.tls_material import create_store_tls, verify_server_tls_files
 from superbrain.composition.init_entry import InitRequest, init_store
 from superbrain.core._kernel_approval import CLI_HARNESS_ID, ApprovalChannel, SignerEnrollment
 from superbrain.core._kernel_auth import parse_bearer_token
 from superbrain.core.errors import BrainError, ErrorCode
+from superbrain.core.ids import new_id
 from superbrain.core.kernel import WorkspaceBinding
 from superbrain.ports.clock import Clock
 from superbrain.ports.os import DurabilityReport, NoReplacePublisher, OsAdapters
 from tests.support.clock import FakeClock
+from tests.support.fs import digest_tree, file_identity
 from tests.support.inc2_fixture import reopen_kernel_job_runtime
 from tests.support.kernel_auth import make_bootstrap_auth
 
@@ -254,8 +260,12 @@ class CrashProbePublisher(NoReplacePublisher):
     ``write_new`` cleanup (``unlink``): the on-disk state a process kill between ``write`` and ``fsync`` leaves.
     """
 
-    def __init__(self, inner: Any, cfg_dir: Path, kill_at: int | None = None) -> None:
+    def __init__(
+        self, inner: Any, cfg_dir: Path, kill_at: int | None = None,
+        *, exit_code: int | None = None, record_path: Path | None = None,
+    ) -> None:
         self._inner, self._cfg_dir, self._kill_at = inner, cfg_dir, kill_at
+        self._exit_code, self._record_path = exit_code, record_path
         self.writes: list[Path] = []
         self._finals: dict[int, Path] = {}
         self._pending: dict[Path, int] = {}
@@ -282,6 +292,10 @@ class CrashProbePublisher(NoReplacePublisher):
             finally:
                 os.close(fd)
             self.partial = path
+            if self._record_path is not None:
+                self._record_path.write_text(str(path), encoding="utf-8")
+            if self._exit_code is not None:
+                os._exit(self._exit_code)
             raise ProcessKilledError(f"killed after first byte of {path.name}")
         self._inner.write_new(path, data)
 
@@ -346,10 +360,221 @@ def assert_only_published_init_files(cfg_dir: Path) -> None:
     assert sorted(p.name for p in (cfg_dir / "tls").iterdir()) == sorted(_TLS_NAMES)
 
 
+def _secure_user_file(path: Path, content: bytes, os_: OsAdapters) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    os_.permissions.secure_directory(path.parent)
+    path.write_bytes(content)
+    os_.permissions.secure_file(path)
+
+
+def assert_init_preserves_files(
+    req: InitRequest, os_: OsAdapters, clock: FakeClock, files: Sequence[tuple[Path, bytes]]
+) -> None:
+    """Run ``init_store`` and require every ``(path, content)`` to stay intact whether init completes or refuses."""
+    expected = [(path, content, file_identity(path)) for path, content in files]
+    snap_cfg, snap_data = digest_tree(req.config_dir), digest_tree(req.data_root)
+    try:
+        report = init_store(req, os_)
+    except BrainError as err:
+        assert err.code in (ErrorCode.INVALID_INPUT, ErrorCode.UNSAFE_PATH)
+        assert digest_tree(req.config_dir) == snap_cfg
+        assert digest_tree(req.data_root) == snap_data
+    else:
+        assert_clean_completed_init(req, report, os_, clock)
+    for path, content, ident in expected:
+        assert path.is_file() and path.read_bytes() == content and file_identity(path) == ident, (
+            f"unowned file deleted or mutated: {path}"
+        )
+
+
+def assert_unowned_stage_named_case_preserved(
+    req: InitRequest, os_: OsAdapters, clock: FakeClock, case: str
+) -> None:
+    """50c3846 F3 (a): unowned ``.<artifact>.stage-<uuid7>`` files (fresh or recovery) stay byte-identical."""
+    uid = new_id()
+    rel_by_case = {
+        "fresh-marker": f"..init-bootstrap.json.stage-{uid}",
+        "fresh-daemon": f".daemon.json.stage-{uid}",
+        "fresh-cred": f".cli.credential.stage-{uid}",
+        "mid-tls": f"tls/.ca.pem.stage-{uid}",
+        "post-tls": f"tls/.ca.pem.stage-{uid}",
+        "post-tls-cfg": f".daemon.json.stage-{uid}",
+    }
+    fail_by_case = {"mid-tls": "server.pem", "post-tls": "daemon.json", "post-tls-cfg": "daemon.json"}
+    if case in fail_by_case:
+        with pytest.raises(BrainError) as io_err:
+            init_store(req, faulty_os(os_, fail_by_case[case]))
+        assert io_err.value.code is ErrorCode.IO_ERROR
+    target = req.config_dir / rel_by_case[case]
+    content = f"user-stage-{case}\n".encode("ascii")
+    _secure_user_file(target, content, os_)
+    assert_init_preserves_files(req, os_, clock, [(target, content)])
+
+
+def assert_foreign_marker_and_stages_refused(base: Path, os_: OsAdapters) -> None:
+    """50c3846 F3 (b1): foreign ``req_B`` marker + stage siblings refuse ``req_A`` with zero cfg/data mutation."""
+    cfg_dir = base / "cfg"
+    cfg_dir.mkdir(parents=True)
+    os_.permissions.secure_directory(cfg_dir)
+    req_b = InitRequest(
+        data_root=base / "data-b", config_dir=cfg_dir, owner_id="bob", machine_id="box-b",
+        signer=ssh_enrollment("bob", owner_id="bob"),
+    )
+    with pytest.raises(BrainError) as err_b:
+        init_store(req_b, faulty_os(os_, "brain.db"))
+    assert err_b.value.code is ErrorCode.IO_ERROR
+    for rel in (f"..init-bootstrap.json.stage-{new_id()}", f".daemon.json.stage-{new_id()}"):
+        _secure_user_file(cfg_dir / rel, b"{", os_)
+    snap_cfg, snap_db = digest_tree(cfg_dir), digest_tree(req_b.data_root)
+    req_a = InitRequest(
+        data_root=base / "data-a", config_dir=cfg_dir, owner_id="dan", machine_id="box-a",
+        signer=ssh_enrollment("dan", owner_id="dan"),
+    )
+    with pytest.raises(BrainError) as err_a:
+        init_store(req_a, os_)
+    assert err_a.value.code in (ErrorCode.INVALID_INPUT, ErrorCode.UNSAFE_PATH)
+    assert digest_tree(cfg_dir) == snap_cfg, "foreign marker/stage siblings in cfg_dir were mutated"
+    assert digest_tree(req_b.data_root) == snap_db
+    assert digest_tree(req_a.data_root) == {}
+
+
+def assert_foreign_byte1_stage_preserved(base: Path, os_: OsAdapters, clock: FakeClock, mode: str) -> None:
+    """50c3846 F3 (b2): stage file created by ``req_B`` byte-1 crash is never deleted or mutated by ``req_A``."""
+    plan = init_write_plan(base, os_)
+    if mode in ("fresh-marker-stage", "foreign-with-tls"):
+        cfg_dir = base / "cfg"
+        cfg_dir.mkdir(parents=True)
+        os_.permissions.secure_directory(cfg_dir)
+        req_b = InitRequest(
+            data_root=base / "data-b", config_dir=cfg_dir, owner_id="bob", machine_id="box-b",
+            signer=ssh_enrollment("bob", owner_id="bob"),
+        )
+        req_a = InitRequest(
+            data_root=base / "data-a", config_dir=cfg_dir, owner_id="dan", machine_id="box-a",
+            signer=ssh_enrollment("dan", owner_id="dan"),
+        )
+        if mode == "fresh-marker-stage":
+            partial_b = crash_init_after_first_byte(req_b, os_, plan, ".init-bootstrap.json")
+            assert_init_preserves_files(req_a, os_, clock, [(partial_b, partial_b.read_bytes())])
+            return
+        partial_b = crash_init_after_first_byte(req_b, os_, plan, "daemon.json")
+        snap_cfg, snap_db = digest_tree(cfg_dir), digest_tree(req_b.data_root)
+        with pytest.raises(BrainError) as err_a:
+            init_store(req_a, os_)
+        assert err_a.value.code in (ErrorCode.INVALID_INPUT, ErrorCode.UNSAFE_PATH)
+        assert digest_tree(cfg_dir) == snap_cfg and digest_tree(req_b.data_root) == snap_db
+        assert digest_tree(req_a.data_root) == {} and partial_b.is_file()
+        return
+
+    cfg_b, cfg_a = base / "cfg-b", base / "cfg-a"
+    for d in (cfg_b, cfg_a):
+        d.mkdir(parents=True)
+        os_.permissions.secure_directory(d)
+    b_owner, b_tag, b_art, a_fail, sub = (
+        ("bob", "bob", "ca.pem", "server.pem", "tls")
+        if mode == "mid-tls-foreign"
+        else ("dan", "dan-other", "daemon.json", "daemon.json", "")
+    )
+    req_b = InitRequest(
+        data_root=base / "data-b", config_dir=cfg_b, owner_id=b_owner, machine_id="box-b",
+        signer=ssh_enrollment(b_tag, owner_id=b_owner),
+    )
+    partial_b = crash_init_after_first_byte(req_b, os_, plan, b_art)
+    req_a = InitRequest(
+        data_root=base / "data-a", config_dir=cfg_a, owner_id="dan", machine_id="box-a",
+        signer=ssh_enrollment("dan", owner_id="dan"),
+    )
+    with pytest.raises(BrainError) as io_err:
+        init_store(req_a, faulty_os(os_, a_fail))
+    assert io_err.value.code is ErrorCode.IO_ERROR
+    foreign_in_a = (cfg_a / sub if sub else cfg_a) / partial_b.name
+    content_b = partial_b.read_bytes()
+    _secure_user_file(foreign_in_a, content_b, os_)
+    assert_init_preserves_files(req_a, os_, clock, [(foreign_in_a, content_b)])
+
+
+def run_byte1_kill_child() -> None:
+    """Child-process entrypoint for real ``os._exit(1)`` after byte 1 of an init/TLS stage file."""
+    cfg = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+    clock = FakeClock(datetime.fromisoformat(cfg["when"]))
+    base_os = os_adapters(clock=clock)
+    cfg_dir = Path(cfg["config_dir"])
+    probe = CrashProbePublisher(
+        base_os.publisher, cfg_dir, kill_at=int(cfg["kill_at"]),
+        exit_code=1, record_path=Path(cfg["record_path"]),
+    )
+    req = InitRequest(
+        data_root=Path(cfg["data_root"]),
+        config_dir=cfg_dir,
+        owner_id=cfg["owner_id"],
+        machine_id=cfg["machine_id"],
+        signer=SignerEnrollment(
+            owner_id=cfg["owner_id"],
+            channel=ApprovalChannel(cfg["channel"]),
+            public_key=cfg["public_key"],
+        ),
+    )
+    init_store(req, replace(base_os, publisher=probe))
+
+
+def assert_real_subprocess_kill_recovers(
+    aux_dir: Path, req: InitRequest, os_: OsAdapters, clock: FakeClock, artifact: str
+) -> None:
+    """50c3846 F3 (c): real child process ``os._exit(1)`` at byte 1 leaves owned stage that in-process retry cleans."""
+    aux_dir.mkdir(parents=True, exist_ok=True)
+    plan = init_write_plan(aux_dir, os_)
+    cfg_json, record_path = aux_dir / "kill-req.json", aux_dir / "partial-path.txt"
+    cfg_json.write_text(
+        json.dumps(
+            {
+                "data_root": str(req.data_root),
+                "config_dir": str(req.config_dir),
+                "owner_id": req.owner_id,
+                "machine_id": req.machine_id,
+                "channel": req.signer.channel.value,
+                "public_key": req.signer.public_key,
+                "kill_at": plan.index(artifact_rel(artifact)),
+                "when": clock.now().isoformat(),
+                "record_path": str(record_path),
+            }
+        ),
+        encoding="utf-8",
+    )
+    repo_root = Path(__file__).resolve().parents[2]
+    env = dict(os.environ)
+    prev_pp = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = str(repo_root) if not prev_pp else f"{repo_root}{os.pathsep}{prev_pp}"
+    proc = subprocess.run(
+        [
+            sys.executable, "-c",
+            "from tests.support.rereview_1d666f5 import run_byte1_kill_child; run_byte1_kill_child()",
+            str(cfg_json),
+        ],
+        cwd=str(repo_root),
+        env=env,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=60.0,
+        check=False,
+    )
+    assert proc.returncode != 0
+    assert record_path.is_file(), f"child did not reach byte-1 kill for {artifact}: stderr={proc.stderr!r}"
+    partial = Path(record_path.read_text(encoding="utf-8").strip())
+    final = req.config_dir / artifact_rel(artifact)
+    assert not os.path.lexists(final), f"{artifact}: partial bytes left under final name"
+    assert partial != final and partial.parent == final.parent and partial.is_file() and partial.stat().st_size == 1
+    assert_clean_completed_init(req, init_store(req, os_), os_, clock)
+    assert_only_published_init_files(req.config_dir)
+
+
 __all__ = [
     "INIT_ARTIFACTS", "CrashProbePublisher", "FaultyPublisher", "ProcessKilledError", "artifact_rel",
-    "assert_clean_completed_init", "assert_f2_rule_scope", "assert_not_stored_policy_not_holder_ack_pair",
-    "assert_only_published_init_files", "crash_init_after_first_byte", "daemon_identity", "faulty_os",
-    "flip_last_hex_char", "foreign_ca_file", "init_write_plan", "leaf_sha", "prop_id", "rotated_tls", "ssh_enrollment",
-    "ws_dict",
+    "assert_clean_completed_init", "assert_f2_rule_scope", "assert_foreign_byte1_stage_preserved",
+    "assert_foreign_marker_and_stages_refused", "assert_init_preserves_files",
+    "assert_not_stored_policy_not_holder_ack_pair", "assert_only_published_init_files",
+    "assert_real_subprocess_kill_recovers", "assert_unowned_stage_named_case_preserved",
+    "crash_init_after_first_byte", "daemon_identity", "faulty_os", "flip_last_hex_char", "foreign_ca_file",
+    "init_write_plan", "leaf_sha", "prop_id", "rotated_tls", "run_byte1_kill_child", "ssh_enrollment", "ws_dict",
 ]

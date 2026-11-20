@@ -317,6 +317,37 @@ def test_f3_preexisting_user_files_refuse_init_without_any_mutation(
     assert digest_tree(req.config_dir) == snap_cfg and digest_tree(req.data_root) == snap_data
 
 
+@pytest.mark.parametrize("case", ["fresh-marker", "fresh-daemon", "fresh-cred", "mid-tls", "post-tls", "post-tls-cfg"])
+def test_f3_unowned_stage_named_files_are_never_deleted_or_mutated(trusted_tmp: Path, case: str) -> None:
+    """50c3846 F3 (a): pre-existing/unowned ``.<artifact>.stage-<uuid7>`` files stay byte-identical."""
+    clock = FakeClock(datetime(2026, 11, 20, 12, 0, tzinfo=UTC))
+    os_ = os_adapters(clock=clock)
+    rr.assert_unowned_stage_named_case_preserved(_f3_request(trusted_tmp, os_, f"f3-unowned-{case}"), os_, clock, case)
+
+
+def test_f3_foreign_marker_and_stage_siblings_refused_without_mutation(trusted_tmp: Path) -> None:
+    """50c3846 F3 (b1): foreign ``req_B`` marker + stage siblings refuse ``req_A`` with zero mutation."""
+    os_ = os_adapters(clock=FakeClock(datetime(2026, 11, 20, 12, 0, tzinfo=UTC)))
+    rr.assert_foreign_marker_and_stages_refused(trusted_tmp / "f3-foreign-marker", os_)
+
+
+@pytest.mark.parametrize("mode", ["fresh-marker-stage", "mid-tls-foreign", "post-tls-foreign-cfg", "foreign-with-tls"])
+def test_f3_foreign_byte1_stage_file_never_deleted_by_other_init(trusted_tmp: Path, mode: str) -> None:
+    """50c3846 F3 (b2): ``req_B`` byte-1 crash stage file is never deleted or mutated by ``req_A``."""
+    clock = FakeClock(datetime(2026, 11, 20, 12, 0, tzinfo=UTC))
+    os_ = os_adapters(clock=clock)
+    rr.assert_foreign_byte1_stage_preserved(trusted_tmp / f"f3-foreign-b1-{mode}", os_, clock, mode)
+
+
+@pytest.mark.parametrize("artifact", [".init-bootstrap.json", "ca.pem", "daemon.json", "cli.credential"])
+def test_f3_real_subprocess_death_stage_recovery_completes(trusted_tmp: Path, artifact: str) -> None:
+    """50c3846 F3 (c): real child ``os._exit(1)`` at byte 1 leaves owned stage that recovery cleans."""
+    clock = FakeClock(datetime(2026, 11, 20, 12, 0, tzinfo=UTC))
+    os_ = os_adapters(clock=clock)
+    req = _f3_request(trusted_tmp, os_, f"f3-proc-{artifact}")
+    rr.assert_real_subprocess_kill_recovers(trusted_tmp / f"f3-proc-aux-{artifact}", req, os_, clock, artifact)
+
+
 def _reconcile_all(rt: Any, store_id: str, signer_id: str, layout: DataRoot) -> Any:
     rev = rt.policy.policy_revision()
     cur_epoch = read_restore_epoch(layout, schema_version=5, os_=rt.os_)

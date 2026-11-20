@@ -10,7 +10,7 @@ import contextlib
 import os
 import sqlite3
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -26,11 +26,15 @@ from superbrain.adapters.os.daemon_config import (
 from superbrain.composition._init_recovery import (
     compute_init_request_digest,
     has_existing_data_artifacts,
+    marker_bytes,
+    marker_stage_path,
     prepare_init_recovery,
     recover_or_provision_tls,
     remove_init_marker,
     require_matching_marker,
-    sweep_config_stage_files,
+    sweep_owned_marker_stage,
+    sweep_owned_stage_files,
+    verify_marker_stage_file,
     write_init_bootstrap_state,
     write_init_marker,
 )
@@ -144,9 +148,14 @@ def _require_config_dir(config_dir: Path, os_: OsAdapters) -> None:
         raise BrainError(ErrorCode.INSECURE_PERMISSIONS, "insecure permissions")
 
 
-def _write_owner_file(path: Path, data: bytes, os_: OsAdapters) -> None:
-    publish_new_owner_file(path, data, os_)
-
+def _write_owner_file(
+    path: Path,
+    data: bytes,
+    os_: OsAdapters,
+    *,
+    before_stage: Callable[[Path], None] | None = None,
+) -> None:
+    publish_new_owner_file(path, data, os_, before_stage=before_stage)
 
 
 def _write_daemon_config_if_missing(
@@ -157,6 +166,7 @@ def _write_daemon_config_if_missing(
     cert_path: Path,
     key_path: Path,
     os_: OsAdapters,
+    before_stage: Callable[[Path], None] | None = None,
 ) -> None:
     if os.path.lexists(daemon_config):
         return
@@ -172,6 +182,7 @@ def _write_daemon_config_if_missing(
             }
         ),
         os_,
+        before_stage=before_stage,
     )
     os_.publisher.sync_directory(daemon_config.parent)
 
@@ -225,7 +236,12 @@ def _revoke_active_cli_credentials(rt: Runtime, request: InitRequest, store_id: 
 
 
 def _complete_init_under_runtime(
-    rt: Runtime, request: InitRequest, req_digest: str, prev_cred_id: str, os_: OsAdapters
+    rt: Runtime,
+    request: InitRequest,
+    req_digest: str,
+    prev_cred_id: str,
+    prev_staging_files: Sequence[str],
+    os_: OsAdapters,
 ) -> InitReport:
     """Idempotently drive an init (fresh or resumed) to ``completed`` under one writer lease."""
     config_dir = request.config_dir
@@ -233,46 +249,107 @@ def _complete_init_under_runtime(
     cli_credential = config_dir / CLI_CREDENTIAL_NAME
     tls_dir = config_dir / TLS_DIR_NAME
     store_id = rt.store.store_id
+    active_stages: list[str] = list(dict.fromkeys(prev_staging_files))
+    cur_cred_id = prev_cred_id
+    cur_leaf_sha = ""
 
-    def record(cred_id: str, leaf_sha: str, status: str = "in_progress") -> None:
+    def persist(cred_id: str, leaf_sha: str, status: str = "in_progress") -> None:
         write_init_bootstrap_state(
-            rt, status=status, request_digest=req_digest, config_dir=config_dir,
-            cli_credential_id=cred_id, tls_leaf_cert_sha256=leaf_sha,
+            rt,
+            status=status,
+            request_digest=req_digest,
+            config_dir=config_dir,
+            cli_credential_id=cred_id,
+            tls_leaf_cert_sha256=leaf_sha,
+            staging_files=tuple(active_stages),
         )
 
-    record(prev_cred_id, "")  # durable ownership proof BEFORE the first signer/credential/TLS byte
+    def track_stage(stage: Path) -> None:
+        rel = stage.relative_to(config_dir).as_posix()
+        if rel not in active_stages:
+            active_stages.append(rel)
+        persist(cur_cred_id, cur_leaf_sha)
+
+    def drop_stages(rels: Sequence[str]) -> None:
+        drop_set = set(rels)
+        remaining = [rel for rel in active_stages if rel not in drop_set]
+        if len(remaining) != len(active_stages):
+            active_stages[:] = remaining
+            persist(cur_cred_id, cur_leaf_sha)
+
+    def sweep_prefix(prefix: str) -> None:
+        targets = [rel for rel in active_stages if rel.startswith(prefix)]
+        if targets:
+            sweep_owned_stage_files(config_dir, targets, os_)
+            drop_stages(targets)
+
+    persist(cur_cred_id, cur_leaf_sha)  # durable ownership proof BEFORE the first signer/credential/TLS byte
     signer = _enroll_or_verify_signer(rt, request)
     generation = rt.policy.trust_generation()
-    cert_path, key_path, leaf_sha = recover_or_provision_tls(
-        store_id=store_id, owner_id=request.owner_id, generation=generation, data_root=request.data_root,
-        tls_dir=tls_dir, os_=os_,
+    cert_path, key_path, cur_leaf_sha = recover_or_provision_tls(
+        store_id=store_id,
+        owner_id=request.owner_id,
+        generation=generation,
+        data_root=request.data_root,
+        tls_dir=tls_dir,
+        os_=os_,
+        owned_tls_stages=tuple(rel for rel in active_stages if rel.startswith("tls/")),
+        before_stage=track_stage,
+        on_swept_tls=drop_stages,
     )
-    record(prev_cred_id, leaf_sha)
-    _write_daemon_config_if_missing(
-        daemon_config, data_root=request.data_root, store_id=store_id, cert_path=cert_path, key_path=key_path, os_=os_
-    )
+    persist(cur_cred_id, cur_leaf_sha)
+    if not os.path.lexists(daemon_config):
+        sweep_prefix(f".{DAEMON_CONFIG_NAME}.stage-")
+        _write_daemon_config_if_missing(
+            daemon_config,
+            data_root=request.data_root,
+            store_id=store_id,
+            cert_path=cert_path,
+            key_path=key_path,
+            os_=os_,
+            before_stage=track_stage,
+        )
     active_cred_id = _resume_cli_credential(rt, request, prev_cred_id, cli_credential)
     if active_cred_id is None:
+        sweep_prefix(f".{CLI_CREDENTIAL_NAME}.stage-")
         _revoke_active_cli_credentials(rt, request, store_id, generation)
         _principal, token = rt.policy.provision_credential(
             owner_id=request.owner_id, harness_id=CLI_HARNESS_ID, machine_id=request.machine_id
         )
         active_cred_id, _ = parse_bearer_token(token)
         rt.store.reconcile_policy()
-        record(active_cred_id, leaf_sha)
-        _write_owner_file(cli_credential, f"{token}\n".encode("ascii"), os_)
+        cur_cred_id = active_cred_id
+        persist(cur_cred_id, cur_leaf_sha)
+        _write_owner_file(cli_credential, f"{token}\n".encode("ascii"), os_, before_stage=track_stage)
         os_.publisher.sync_directory(config_dir)
+    else:
+        cur_cred_id = active_cred_id
     rt.store.reconcile_policy()
-    record(active_cred_id, leaf_sha, "completed")
+    m_stage = marker_stage_path(config_dir, req_digest, request.data_root)
+    if os.path.lexists(m_stage):
+        m_bytes = marker_bytes(
+            request_digest=req_digest, data_root=request.data_root, config_dir=config_dir, owner_id=request.owner_id
+        )
+        verify_marker_stage_file(m_stage, m_bytes, os_)
+        if m_stage.name not in active_stages:
+            active_stages.append(m_stage.name)
+    if active_stages:
+        sweep_owned_stage_files(config_dir, active_stages, os_)
+        active_stages.clear()
+    persist(active_cred_id, cur_leaf_sha, "completed")
     remove_init_marker(config_dir, os_)
-    sweep_config_stage_files(config_dir, os_)
     return InitReport(
         store_id=store_id, daemon_config_path=daemon_config, cli_credential_path=cli_credential, signer=signer
     )
 
 
 def _run_init(
-    request: InitRequest, req_digest: str, store_id: str | None, prev_cred_id: str, os_: OsAdapters
+    request: InitRequest,
+    req_digest: str,
+    store_id: str | None,
+    prev_cred_id: str,
+    prev_staging_files: Sequence[str],
+    os_: OsAdapters,
 ) -> InitReport:
     _require_config_dir(request.config_dir, os_)
     handlers, kinds = kernel_store_extensions()
@@ -289,7 +366,7 @@ def _run_init(
         admitted = admit_existing_pair(request.data_root, store_id, os_, purpose="serve")
         rt = open_runtime_under_lease(admitted, handlers=handlers, kinds=kinds)
     try:
-        return _complete_init_under_runtime(rt, request, req_digest, prev_cred_id, os_)
+        return _complete_init_under_runtime(rt, request, req_digest, prev_cred_id, prev_staging_files, os_)
     finally:
         rt.close()
 
@@ -299,18 +376,27 @@ def _start_marked_init(request: InitRequest, req_digest: str, os_: OsAdapters) -
     config_dir = request.config_dir
     _preflight_fresh_config(config_dir, os_)
     _require_config_dir(config_dir, os_)
-    sweep_config_stage_files(config_dir, os_)
     owned = require_matching_marker(
         config_dir, request_digest=req_digest, data_root=request.data_root, owner_id=request.owner_id, os_=os_,
         must_exist=False,
     )
+    m_stage = marker_stage_path(config_dir, req_digest, request.data_root)
+    m_bytes = marker_bytes(
+        request_digest=req_digest, data_root=request.data_root, config_dir=config_dir, owner_id=request.owner_id
+    )
+    pre_stages: tuple[str, ...] = ()
     if not owned:
+        if os.path.lexists(m_stage):
+            sweep_owned_marker_stage(m_stage, m_bytes, os_)
         write_init_marker(
             request_digest=req_digest, data_root=request.data_root, config_dir=config_dir,
-            owner_id=request.owner_id, os_=os_,
+            owner_id=request.owner_id, os_=os_, stage_path=m_stage,
         )
+    elif os.path.lexists(m_stage):
+        verify_marker_stage_file(m_stage, m_bytes, os_)
+        pre_stages = (m_stage.name,)
     try:
-        return _run_init(request, req_digest, None, "", os_)
+        return _run_init(request, req_digest, None, "", pre_stages, os_)
     except BaseException:
         if not owned and not has_existing_data_artifacts(request.data_root):
             with contextlib.suppress(OSError, BrainError):
@@ -343,7 +429,7 @@ def init_store(request: InitRequest, os_: OsAdapters) -> InitReport:
         signer=request.signer,
         os_=os_,
     )
-    return _run_init(request, req_digest, store_id, state.cli_credential_id, os_)
+    return _run_init(request, req_digest, store_id, state.cli_credential_id, state.staging_files, os_)
 
 
 def _preflight_reset_owner(config: DaemonConfig, enrollment: SignerEnrollment, os_: OsAdapters) -> None:

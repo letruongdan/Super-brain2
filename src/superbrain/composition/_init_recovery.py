@@ -12,7 +12,9 @@ import json
 import os
 import re
 import sqlite3
-from dataclasses import dataclass
+import stat
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -29,6 +31,7 @@ from superbrain.adapters.os.daemon_config import (
     read_daemon_config,
     read_owner_json_object,
 )
+from superbrain.adapters.os.durable import map_os_error
 from superbrain.adapters.os.tls_material import create_store_tls, verify_server_tls_files
 from superbrain.core._kernel_approval import CLI_HARNESS_ID, SignerEnrollment
 from superbrain.core.canonical import canonical_json, digest_bytes
@@ -45,17 +48,20 @@ from superbrain.storage.writer import acquire_writer_unbumped
 
 __all__ = [
     "INIT_BOOTSTRAP_STATE_KEY", "INIT_MARKER_NAME", "InitBootstrapState", "compute_init_request_digest",
-    "has_existing_data_artifacts", "prepare_init_recovery", "recover_or_provision_tls", "remove_init_marker",
-    "require_matching_marker", "sweep_config_stage_files", "write_init_bootstrap_state", "write_init_marker",
+    "has_existing_data_artifacts", "marker_bytes", "marker_stage_path", "prepare_init_recovery",
+    "recover_or_provision_tls", "remove_init_marker", "require_matching_marker",
+    "sweep_owned_marker_stage", "sweep_owned_stage_files", "verify_marker_stage_file",
+    "write_init_bootstrap_state", "write_init_marker",
 ]
 
 INIT_BOOTSTRAP_STATE_KEY = "init_bootstrap_state"
 INIT_MARKER_NAME = ".init-bootstrap.json"
 _TLS_KNOWN_NAMES = frozenset({"ca.pem", "ca.key", "server.pem", "server.key"})
 _UUID7 = r"[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
-# Staging siblings of ``publish_new_owner_file`` (a hard kill may leave one); nothing else is ever swept.
-_CONFIG_STAGE_RE = re.compile(rf"\.(?:\.init-bootstrap\.json|daemon\.json|cli\.credential)\.stage-{_UUID7}")
-_TLS_STAGE_RE = re.compile(rf"\.(?:ca\.pem|ca\.key|server\.pem|server\.key)\.stage-{_UUID7}")
+# Exact relative path shapes allowed in durable ``staging_files`` ownership lists (never used for dir scanning).
+_CFG_STAGE_REL_RE = re.compile(rf"^\.(?:daemon\.json|cli\.credential)\.stage-{_UUID7}$")
+_TLS_STAGE_REL_RE = re.compile(rf"^tls/\.(?:ca\.pem|ca\.key|server\.pem|server\.key)\.stage-{_UUID7}$")
+_MARKER_STAGE_REL_RE = re.compile(r"^\.\.init-bootstrap\.json\.stage-[0-9a-f]{32}$")
 _BOOTSTRAP_ISSUER = "owner:local-bootstrap"
 _BOOTSTRAP_TTL = timedelta(minutes=10)
 _FRESH_ONLY_ROWS = (
@@ -70,6 +76,7 @@ class InitBootstrapState:
     config_dir: str
     cli_credential_id: str = ""
     tls_leaf_cert_sha256: str = ""
+    staging_files: tuple[str, ...] = ()
 
 
 def _invalid() -> BrainError:
@@ -98,6 +105,20 @@ def has_existing_data_artifacts(data_root: Path) -> bool:
     return False
 
 
+def _validate_stage_rel(rel: object) -> str:
+    if not isinstance(rel, str) or not rel or "\x00" in rel or "\\" in rel:
+        raise _invalid()
+    if Path(rel).is_absolute() or ".." in Path(rel).parts:
+        raise _invalid()
+    if not (
+        _CFG_STAGE_REL_RE.fullmatch(rel)
+        or _TLS_STAGE_REL_RE.fullmatch(rel)
+        or _MARKER_STAGE_REL_RE.fullmatch(rel)
+    ):
+        raise _invalid()
+    return rel
+
+
 def write_init_bootstrap_state(
     rt: Runtime,
     *,
@@ -106,8 +127,10 @@ def write_init_bootstrap_state(
     config_dir: Path,
     cli_credential_id: str,
     tls_leaf_cert_sha256: str = "",
+    staging_files: Sequence[str] = (),
 ) -> None:
     """Persist non-secret ``init_bootstrap_state`` into ``policy.db`` ``meta`` table."""
+    validated = tuple(dict.fromkeys(_validate_stage_rel(rel) for rel in staging_files))
     payload = json.dumps(
         {
             "status": status,
@@ -115,6 +138,7 @@ def write_init_bootstrap_state(
             "config_dir": os.path.abspath(config_dir),
             "cli_credential_id": cli_credential_id,
             "tls_leaf_cert_sha256": tls_leaf_cert_sha256,
+            "staging_files": list(validated),
         },
         sort_keys=True,
     )
@@ -135,7 +159,18 @@ def _parse_state(raw: object) -> InitBootstrapState:
     optional = [parsed.get(k, "") for k in ("cli_credential_id", "tls_leaf_cert_sha256")]
     if not all(isinstance(v, str) and v for v in required) or not all(isinstance(v, str) for v in optional):
         raise _invalid()
-    return InitBootstrapState(str(required[0]), str(required[1]), str(required[2]), str(optional[0]), str(optional[1]))
+    raw_stages = parsed.get("staging_files", [])
+    if not isinstance(raw_stages, list):
+        raise _invalid()
+    staging_files = tuple(dict.fromkeys(_validate_stage_rel(item) for item in raw_stages))
+    return InitBootstrapState(
+        str(required[0]),
+        str(required[1]),
+        str(required[2]),
+        str(optional[0]),
+        str(optional[1]),
+        staging_files,
+    )
 
 
 def _marker_body(*, request_digest: str, data_root: Path, config_dir: Path, owner_id: str) -> dict[str, object]:
@@ -145,44 +180,106 @@ def _marker_body(*, request_digest: str, data_root: Path, config_dir: Path, owne
     }
 
 
+def marker_stage_path(config_dir: Path, request_digest: str, data_root: Path) -> Path:
+    """Deterministic request-and-data-root-bound staging path for ``.init-bootstrap.json``."""
+    full_digest = digest_bytes(
+        canonical_json(
+            {
+                "kind": "init_marker_stage",
+                "request_digest": request_digest,
+                "data_root": os.path.abspath(data_root),
+            }
+        )
+    )
+    tag = full_digest.removeprefix("sha256:")[:32]
+    return config_dir / f".{INIT_MARKER_NAME}.stage-{tag}"
+
+
+def marker_bytes(*, request_digest: str, data_root: Path, config_dir: Path, owner_id: str) -> bytes:
+    """Exact canonical byte payload of this init request's ``.init-bootstrap.json`` marker."""
+    body = _marker_body(
+        request_digest=request_digest, data_root=data_root, config_dir=config_dir, owner_id=owner_id
+    )
+    return canonical_json(body) + b"\n"
+
+
+def _validate_stage_file(target: Path, os_: OsAdapters, *, must_exist: bool = False) -> os.stat_result | None:
+    """Validate an existing owned stage file read-only; return ``None`` when absent unless ``must_exist``."""
+    os_.paths.reject_unsafe_path(str(target))
+    os_.paths.reject_links(target)
+    if not os.path.lexists(target):
+        if must_exist:
+            raise _invalid()
+        return None
+    if os_.permissions.check_ancestors(target):
+        raise BrainError(ErrorCode.INSECURE_PERMISSIONS, "insecure permissions")
+    try:
+        st = target.lstat()
+    except FileNotFoundError as err:
+        if must_exist:
+            raise _invalid() from err
+        return None
+    except OSError as err:
+        raise map_os_error(err, "inspecting stage file") from err
+    if stat.S_ISLNK(st.st_mode):
+        raise BrainError(ErrorCode.UNSAFE_PATH, "unsafe path")
+    if not stat.S_ISREG(st.st_mode):
+        raise _invalid()
+    if os_.permissions.object_problems(target):
+        raise BrainError(ErrorCode.INSECURE_PERMISSIONS, "insecure permissions")
+    return st
+
+
+def verify_marker_stage_file(path: Path, expected: bytes, os_: OsAdapters) -> None:
+    """Verify ``path`` is a regular owner-only non-link prefix of ``expected``; fail closed without deleting."""
+    st = _validate_stage_file(path, os_, must_exist=True)
+    assert st is not None
+    if st.st_size > len(expected):
+        raise _invalid()
+    try:
+        raw = path.read_bytes()
+    except OSError as err:
+        raise map_os_error(err, "reading marker stage file") from err
+    if len(raw) > len(expected) or not expected.startswith(raw):
+        raise _invalid()
+
+
+def sweep_owned_marker_stage(stage: Path, expected: bytes, os_: OsAdapters) -> None:
+    """Verify and unlink a crash-leftover pre-marker stage file belonging to this exact init request."""
+    if not os.path.lexists(stage):
+        return
+    verify_marker_stage_file(stage, expected, os_)
+    stage.unlink()
+    os_.publisher.sync_directory(stage.parent)
+
+
 def write_init_marker(
-    *, request_digest: str, data_root: Path, config_dir: Path, owner_id: str, os_: OsAdapters
+    *, request_digest: str, data_root: Path, config_dir: Path, owner_id: str, os_: OsAdapters,
+    stage_path: Path | None = None,
 ) -> None:
     """Durably write the owner-only, non-secret pre-marker BEFORE any data-root byte is created."""
     path = config_dir / INIT_MARKER_NAME
-    body = _marker_body(request_digest=request_digest, data_root=data_root, config_dir=config_dir, owner_id=owner_id)
-    publish_new_owner_file(path, canonical_json(body) + b"\n", os_)
+    payload = marker_bytes(request_digest=request_digest, data_root=data_root, config_dir=config_dir, owner_id=owner_id)
+    resolved_stage = stage_path if stage_path is not None else marker_stage_path(config_dir, request_digest, data_root)
+    publish_new_owner_file(path, payload, os_, stage_path=resolved_stage)
 
 
-
-def _verified_stages(directory: Path, pattern: re.Pattern[str], os_: OsAdapters) -> list[Path]:
-    """Our own staging files in ``directory`` (never links/foreign names); unsafe ones refuse the init."""
-    if not os.path.lexists(directory) or not directory.is_dir():
-        return []
-    found: list[Path] = []
-    for entry in directory.iterdir():
-        if not pattern.fullmatch(entry.name):
+def sweep_owned_stage_files(config_dir: Path, owned_rels: Sequence[str], os_: OsAdapters) -> list[str]:
+    """Verify and unlink only exact owned staging relative paths under ``config_dir``."""
+    swept: list[str] = []
+    synced_dirs: list[Path] = []
+    for rel in dict.fromkeys(owned_rels):
+        valid_rel = _validate_stage_rel(rel)
+        target = config_dir / valid_rel
+        if _validate_stage_file(target, os_) is None:
             continue
-        os_.paths.reject_links(entry)
-        if not entry.is_file():
-            raise _invalid()
-        if os_.permissions.object_problems(entry):
-            raise BrainError(ErrorCode.INSECURE_PERMISSIONS, "insecure permissions")
-        found.append(entry)
-    return found
-
-
-def _sweep_stages(directory: Path, pattern: re.Pattern[str], os_: OsAdapters) -> None:
-    stages = _verified_stages(directory, pattern, os_)
-    for stage in stages:
-        stage.unlink()
-    if stages:
+        target.unlink()
+        swept.append(valid_rel)
+        if target.parent not in synced_dirs:
+            synced_dirs.append(target.parent)
+    for directory in synced_dirs:
         os_.publisher.sync_directory(directory)
-
-
-def sweep_config_stage_files(config_dir: Path, os_: OsAdapters) -> None:
-    """Remove verified leftover init staging files (marker/``daemon.json``/``cli.credential``) of a killed init."""
-    _sweep_stages(config_dir, _CONFIG_STAGE_RE, os_)
+    return swept
 
 
 def remove_init_marker(config_dir: Path, os_: OsAdapters) -> None:
@@ -221,7 +318,13 @@ def require_matching_marker(
 
 
 def _validate_recovery_config_dir(
-    *, data_root: Path, config_dir: Path, store_id: str, expected_cred_id: str, os_: OsAdapters
+    *,
+    data_root: Path,
+    config_dir: Path,
+    store_id: str,
+    expected_cred_id: str,
+    owned_stages: Sequence[str],
+    os_: OsAdapters,
 ) -> None:
     if not os.path.lexists(config_dir):
         return
@@ -231,6 +334,7 @@ def _validate_recovery_config_dir(
     if os_.permissions.object_problems(config_dir):
         raise BrainError(ErrorCode.INSECURE_PERMISSIONS, "insecure permissions")
 
+    owned_set = frozenset(_validate_stage_rel(rel) for rel in owned_stages)
     tls_dir = config_dir / "tls"
     if os.path.lexists(tls_dir):
         os_.paths.reject_links(tls_dir)
@@ -239,7 +343,7 @@ def _validate_recovery_config_dir(
         if os_.permissions.object_problems(tls_dir):
             raise BrainError(ErrorCode.INSECURE_PERMISSIONS, "insecure permissions")
         for entry in tls_dir.iterdir():
-            if entry.name not in _TLS_KNOWN_NAMES and not _TLS_STAGE_RE.fullmatch(entry.name):
+            if entry.name not in _TLS_KNOWN_NAMES and f"tls/{entry.name}" not in owned_set:
                 raise _invalid()
             os_.paths.reject_links(entry)
             if not entry.is_file():
@@ -247,7 +351,8 @@ def _validate_recovery_config_dir(
             if os_.permissions.object_problems(entry):
                 raise BrainError(ErrorCode.INSECURE_PERMISSIONS, "insecure permissions")
 
-    _verified_stages(config_dir, _CONFIG_STAGE_RE, os_)
+    for rel in owned_set:
+        _validate_stage_file(config_dir / rel, os_)
     daemon_cfg = config_dir / "daemon.json"
     if os.path.lexists(daemon_cfg):
         cfg = read_daemon_config(daemon_cfg, os_)
@@ -367,9 +472,18 @@ def prepare_init_recovery(
                 must_exist=True,
             )
             _require_unstarted_config(config_dir)
-            _verified_stages(config_dir, _CONFIG_STAGE_RE, os_)
+            m_stage = marker_stage_path(config_dir, request_digest, data_root)
+            pre_stages: tuple[str, ...] = ()
+            if os.path.lexists(m_stage):
+                m_bytes = marker_bytes(
+                    request_digest=request_digest, data_root=data_root, config_dir=config_dir, owner_id=owner_id
+                )
+                verify_marker_stage_file(m_stage, m_bytes, os_)
+                pre_stages = (m_stage.name,)
             _verify_premeta_root(verified, owner_id, signer, os_)
-            return None, InitBootstrapState("in_progress", request_digest, os.path.abspath(config_dir))
+            return None, InitBootstrapState(
+                "in_progress", request_digest, os.path.abspath(config_dir), staging_files=pre_stages
+            )
         if existing_owner != owner_id or info is None or not os.path.lexists(root.store_db):
             raise _invalid()
         state = _parse_state(row[0])
@@ -383,14 +497,24 @@ def prepare_init_recovery(
             config_dir, request_digest=request_digest, data_root=data_root, owner_id=owner_id, os_=os_,
             must_exist=False,
         )
+        owned_stages = list(state.staging_files)
+        m_stage = marker_stage_path(config_dir, request_digest, data_root)
+        if os.path.lexists(m_stage):
+            m_bytes = marker_bytes(
+                request_digest=request_digest, data_root=data_root, config_dir=config_dir, owner_id=owner_id
+            )
+            verify_marker_stage_file(m_stage, m_bytes, os_)
+            if m_stage.name not in owned_stages:
+                owned_stages.append(m_stage.name)
         _validate_recovery_config_dir(
             data_root=data_root,
             config_dir=config_dir,
             store_id=info.store_id,
             expected_cred_id=state.cli_credential_id,
+            owned_stages=owned_stages,
             os_=os_,
         )
-        return info.store_id, state
+        return info.store_id, replace(state, staging_files=tuple(owned_stages))
 
 
 def _verify_complete_tls(tls_dir: Path, data_root: Path, store_id: str, os_: OsAdapters) -> bool:
@@ -417,12 +541,24 @@ def _verify_complete_tls(tls_dir: Path, data_root: Path, store_id: str, os_: OsA
 
 
 def recover_or_provision_tls(
-    *, store_id: str, owner_id: str, generation: int, data_root: Path, tls_dir: Path, os_: OsAdapters
+    *,
+    store_id: str,
+    owner_id: str,
+    generation: int,
+    data_root: Path,
+    tls_dir: Path,
+    os_: OsAdapters,
+    owned_tls_stages: Sequence[str] = (),
+    before_stage: Callable[[Path], None] | None = None,
+    on_swept_tls: Callable[[Sequence[str]], None] | None = None,
 ) -> tuple[Path, Path, str]:
     """Reuse complete valid TLS files or clean incomplete known TLS files and provision fresh TLS.
 
     Returns ``(cert_path, key_path, leaf_cert_sha256)``; the pin is the SHA-256 of the DER leaf certificate.
     """
+    tls_rels = tuple(rel for rel in owned_tls_stages if rel.startswith("tls/"))
+    if len(tls_rels) != len(owned_tls_stages):
+        raise _invalid()
     known = [tls_dir / name for name in ("ca.pem", "ca.key", "server.pem", "server.key")]
     existing = [p for p in known if os.path.lexists(p)]
     if len(existing) == 4:
@@ -431,17 +567,23 @@ def recover_or_provision_tls(
         server_pem = tls_dir / "server.pem"
         leaf = x509.load_pem_x509_certificate(server_pem.read_bytes())
         sha = hashlib.sha256(leaf.public_bytes(serialization.Encoding.DER)).hexdigest()
-        _sweep_stages(tls_dir, _TLS_STAGE_RE, os_)
+        if tls_rels:
+            sweep_owned_stage_files(tls_dir.parent, tls_rels, os_)
+            if on_swept_tls is not None:
+                on_swept_tls(tls_rels)
         return server_pem, tls_dir / "server.key", sha
     if existing:
         for path in existing:
             path.unlink()
         os_.publisher.sync_directory(tls_dir)
-    _sweep_stages(tls_dir, _TLS_STAGE_RE, os_)
+    if tls_rels:
+        sweep_owned_stage_files(tls_dir.parent, tls_rels, os_)
+        if on_swept_tls is not None:
+            on_swept_tls(tls_rels)
     auth = BootstrapAuthorization(
         intent_id=new_id(), store_id=store_id, owner_id=owner_id, action="provision_tls", subject_id=store_id,
         trust_generation=generation, expires_at=os_.clock.now() + _BOOTSTRAP_TTL, issuer_id=_BOOTSTRAP_ISSUER,
         destination=tls_dir,
     )
-    tls = create_store_tls(store_id, tls_dir, auth, os_.clock, os_)
+    tls = create_store_tls(store_id, tls_dir, auth, os_.clock, os_, before_stage=before_stage)
     return tls.cert_path, tls.key_path, tls.leaf_cert_sha256
