@@ -26,15 +26,11 @@ from superbrain.adapters.os.daemon_config import (
 from superbrain.composition._init_recovery import (
     compute_init_request_digest,
     has_existing_data_artifacts,
-    marker_bytes,
-    marker_stage_path,
     prepare_init_recovery,
     recover_or_provision_tls,
     remove_init_marker,
     require_matching_marker,
-    sweep_owned_marker_stage,
     sweep_owned_stage_files,
-    verify_marker_stage_file,
     write_init_bootstrap_state,
     write_init_marker,
 )
@@ -325,14 +321,6 @@ def _complete_init_under_runtime(
     else:
         cur_cred_id = active_cred_id
     rt.store.reconcile_policy()
-    m_stage = marker_stage_path(config_dir, req_digest, request.data_root)
-    if os.path.lexists(m_stage):
-        m_bytes = marker_bytes(
-            request_digest=req_digest, data_root=request.data_root, config_dir=config_dir, owner_id=request.owner_id
-        )
-        verify_marker_stage_file(m_stage, m_bytes, os_)
-        if m_stage.name not in active_stages:
-            active_stages.append(m_stage.name)
     if active_stages:
         sweep_owned_stage_files(config_dir, active_stages, os_)
         active_stages.clear()
@@ -380,23 +368,13 @@ def _start_marked_init(request: InitRequest, req_digest: str, os_: OsAdapters) -
         config_dir, request_digest=req_digest, data_root=request.data_root, owner_id=request.owner_id, os_=os_,
         must_exist=False,
     )
-    m_stage = marker_stage_path(config_dir, req_digest, request.data_root)
-    m_bytes = marker_bytes(
-        request_digest=req_digest, data_root=request.data_root, config_dir=config_dir, owner_id=request.owner_id
-    )
-    pre_stages: tuple[str, ...] = ()
     if not owned:
-        if os.path.lexists(m_stage):
-            sweep_owned_marker_stage(m_stage, m_bytes, os_)
         write_init_marker(
             request_digest=req_digest, data_root=request.data_root, config_dir=config_dir,
-            owner_id=request.owner_id, os_=os_, stage_path=m_stage,
+            owner_id=request.owner_id, os_=os_,
         )
-    elif os.path.lexists(m_stage):
-        verify_marker_stage_file(m_stage, m_bytes, os_)
-        pre_stages = (m_stage.name,)
     try:
-        return _run_init(request, req_digest, None, "", pre_stages, os_)
+        return _run_init(request, req_digest, None, "", (), os_)
     except BaseException:
         if not owned and not has_existing_data_artifacts(request.data_root):
             with contextlib.suppress(OSError, BrainError):

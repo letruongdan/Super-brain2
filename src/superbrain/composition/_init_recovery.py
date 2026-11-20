@@ -14,7 +14,7 @@ import re
 import sqlite3
 import stat
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -48,9 +48,9 @@ from superbrain.storage.writer import acquire_writer_unbumped
 
 __all__ = [
     "INIT_BOOTSTRAP_STATE_KEY", "INIT_MARKER_NAME", "InitBootstrapState", "compute_init_request_digest",
-    "has_existing_data_artifacts", "marker_bytes", "marker_stage_path", "prepare_init_recovery",
+    "has_existing_data_artifacts", "prepare_init_recovery",
     "recover_or_provision_tls", "remove_init_marker", "require_matching_marker",
-    "sweep_owned_marker_stage", "sweep_owned_stage_files", "verify_marker_stage_file",
+    "sweep_owned_stage_files",
     "write_init_bootstrap_state", "write_init_marker",
 ]
 
@@ -61,7 +61,6 @@ _UUID7 = r"[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
 # Exact relative path shapes allowed in durable ``staging_files`` ownership lists (never used for dir scanning).
 _CFG_STAGE_REL_RE = re.compile(rf"^\.(?:daemon\.json|cli\.credential)\.stage-{_UUID7}$")
 _TLS_STAGE_REL_RE = re.compile(rf"^tls/\.(?:ca\.pem|ca\.key|server\.pem|server\.key)\.stage-{_UUID7}$")
-_MARKER_STAGE_REL_RE = re.compile(r"^\.\.init-bootstrap\.json\.stage-[0-9a-f]{32}$")
 _BOOTSTRAP_ISSUER = "owner:local-bootstrap"
 _BOOTSTRAP_TTL = timedelta(minutes=10)
 _FRESH_ONLY_ROWS = (
@@ -113,7 +112,6 @@ def _validate_stage_rel(rel: object) -> str:
     if not (
         _CFG_STAGE_REL_RE.fullmatch(rel)
         or _TLS_STAGE_REL_RE.fullmatch(rel)
-        or _MARKER_STAGE_REL_RE.fullmatch(rel)
     ):
         raise _invalid()
     return rel
@@ -180,29 +178,6 @@ def _marker_body(*, request_digest: str, data_root: Path, config_dir: Path, owne
     }
 
 
-def marker_stage_path(config_dir: Path, request_digest: str, data_root: Path) -> Path:
-    """Deterministic request-and-data-root-bound staging path for ``.init-bootstrap.json``."""
-    full_digest = digest_bytes(
-        canonical_json(
-            {
-                "kind": "init_marker_stage",
-                "request_digest": request_digest,
-                "data_root": os.path.abspath(data_root),
-            }
-        )
-    )
-    tag = full_digest.removeprefix("sha256:")[:32]
-    return config_dir / f".{INIT_MARKER_NAME}.stage-{tag}"
-
-
-def marker_bytes(*, request_digest: str, data_root: Path, config_dir: Path, owner_id: str) -> bytes:
-    """Exact canonical byte payload of this init request's ``.init-bootstrap.json`` marker."""
-    body = _marker_body(
-        request_digest=request_digest, data_root=data_root, config_dir=config_dir, owner_id=owner_id
-    )
-    return canonical_json(body) + b"\n"
-
-
 def _validate_stage_file(target: Path, os_: OsAdapters, *, must_exist: bool = False) -> os.stat_result | None:
     """Validate an existing owned stage file read-only; return ``None`` when absent unless ``must_exist``."""
     os_.paths.reject_unsafe_path(str(target))
@@ -230,38 +205,15 @@ def _validate_stage_file(target: Path, os_: OsAdapters, *, must_exist: bool = Fa
     return st
 
 
-def verify_marker_stage_file(path: Path, expected: bytes, os_: OsAdapters) -> None:
-    """Verify ``path`` is a regular owner-only non-link prefix of ``expected``; fail closed without deleting."""
-    st = _validate_stage_file(path, os_, must_exist=True)
-    assert st is not None
-    if st.st_size > len(expected):
-        raise _invalid()
-    try:
-        raw = path.read_bytes()
-    except OSError as err:
-        raise map_os_error(err, "reading marker stage file") from err
-    if len(raw) > len(expected) or not expected.startswith(raw):
-        raise _invalid()
-
-
-def sweep_owned_marker_stage(stage: Path, expected: bytes, os_: OsAdapters) -> None:
-    """Verify and unlink a crash-leftover pre-marker stage file belonging to this exact init request."""
-    if not os.path.lexists(stage):
-        return
-    verify_marker_stage_file(stage, expected, os_)
-    stage.unlink()
-    os_.publisher.sync_directory(stage.parent)
-
-
 def write_init_marker(
     *, request_digest: str, data_root: Path, config_dir: Path, owner_id: str, os_: OsAdapters,
-    stage_path: Path | None = None,
 ) -> None:
-    """Durably write the owner-only, non-secret pre-marker BEFORE any data-root byte is created."""
-    path = config_dir / INIT_MARKER_NAME
-    payload = marker_bytes(request_digest=request_digest, data_root=data_root, config_dir=config_dir, owner_id=owner_id)
-    resolved_stage = stage_path if stage_path is not None else marker_stage_path(config_dir, request_digest, data_root)
-    publish_new_owner_file(path, payload, os_, stage_path=resolved_stage)
+    """Durably write the owner-only, non-secret pre-marker BEFORE any data-root byte is created.
+
+    Uses a fresh random stage name, so it never reads, deletes or collides with a pre-existing file.
+    """
+    body = _marker_body(request_digest=request_digest, data_root=data_root, config_dir=config_dir, owner_id=owner_id)
+    publish_new_owner_file(config_dir / INIT_MARKER_NAME, canonical_json(body) + b"\n", os_)
 
 
 def sweep_owned_stage_files(config_dir: Path, owned_rels: Sequence[str], os_: OsAdapters) -> list[str]:
@@ -472,18 +424,8 @@ def prepare_init_recovery(
                 must_exist=True,
             )
             _require_unstarted_config(config_dir)
-            m_stage = marker_stage_path(config_dir, request_digest, data_root)
-            pre_stages: tuple[str, ...] = ()
-            if os.path.lexists(m_stage):
-                m_bytes = marker_bytes(
-                    request_digest=request_digest, data_root=data_root, config_dir=config_dir, owner_id=owner_id
-                )
-                verify_marker_stage_file(m_stage, m_bytes, os_)
-                pre_stages = (m_stage.name,)
             _verify_premeta_root(verified, owner_id, signer, os_)
-            return None, InitBootstrapState(
-                "in_progress", request_digest, os.path.abspath(config_dir), staging_files=pre_stages
-            )
+            return None, InitBootstrapState("in_progress", request_digest, os.path.abspath(config_dir))
         if existing_owner != owner_id or info is None or not os.path.lexists(root.store_db):
             raise _invalid()
         state = _parse_state(row[0])
@@ -497,24 +439,15 @@ def prepare_init_recovery(
             config_dir, request_digest=request_digest, data_root=data_root, owner_id=owner_id, os_=os_,
             must_exist=False,
         )
-        owned_stages = list(state.staging_files)
-        m_stage = marker_stage_path(config_dir, request_digest, data_root)
-        if os.path.lexists(m_stage):
-            m_bytes = marker_bytes(
-                request_digest=request_digest, data_root=data_root, config_dir=config_dir, owner_id=owner_id
-            )
-            verify_marker_stage_file(m_stage, m_bytes, os_)
-            if m_stage.name not in owned_stages:
-                owned_stages.append(m_stage.name)
         _validate_recovery_config_dir(
             data_root=data_root,
             config_dir=config_dir,
             store_id=info.store_id,
             expected_cred_id=state.cli_credential_id,
-            owned_stages=owned_stages,
+            owned_stages=state.staging_files,
             os_=os_,
         )
-        return info.store_id, replace(state, staging_files=tuple(owned_stages))
+        return info.store_id, state
 
 
 def _verify_complete_tls(tls_dir: Path, data_root: Path, store_id: str, os_: OsAdapters) -> bool:

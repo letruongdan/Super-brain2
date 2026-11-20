@@ -5,7 +5,10 @@ Requirement sources: spec rev 22 §5.7, §9, §11.3; ``docs/reviews/2026-11-20-s
 
 from __future__ import annotations
 
+import json
 import os
+import sqlite3
+from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -282,8 +285,8 @@ def test_f3_hard_kill_after_first_byte_never_leaves_partial_final_name_and_retry
     for name in rr.INIT_ARTIFACTS:  # no published artifact is ever a truncated 1-byte remnant
         done = req.config_dir / rr.artifact_rel(name)
         assert not done.exists() or done.stat().st_size > 1
-    _assert_clean_completed_init(req, init_store(req, os_), os_, clock)
-    rr.assert_only_published_init_files(req.config_dir)
+    # 75eca45 F1: tracked stages (all DB-recorded artifacts) are swept; an unproven pre-marker orphan is preserved.
+    rr.assert_kill_retry_outcome(req, os_, clock, artifact, partial)
 
 
 @pytest.mark.parametrize(
@@ -317,9 +320,16 @@ def test_f3_preexisting_user_files_refuse_init_without_any_mutation(
     assert digest_tree(req.config_dir) == snap_cfg and digest_tree(req.data_root) == snap_data
 
 
-@pytest.mark.parametrize("case", ["fresh-marker", "fresh-daemon", "fresh-cred", "mid-tls", "post-tls", "post-tls-cfg"])
+@pytest.mark.parametrize(
+    "case",
+    [
+        "fresh-marker", "fresh-daemon", "fresh-cred", "mid-tls", "post-tls", "post-tls-cfg",
+        "fresh-marker-prefix", "fresh-marker-prefix-long", "post-marker-prefix", "post-tls-marker-prefix",
+    ],
+)
 def test_f3_unowned_stage_named_files_are_never_deleted_or_mutated(trusted_tmp: Path, case: str) -> None:
-    """50c3846 F3 (a): pre-existing/unowned ``.<artifact>.stage-<uuid7>`` files stay byte-identical."""
+    """50c3846/75eca45 F3 (a): pre-existing ``.<artifact>.stage-*`` files (even the marker stage with a valid
+    marker prefix, before or after the marker exists) stay byte-identical: init has no ownership proof for them."""
     clock = FakeClock(datetime(2026, 11, 20, 12, 0, tzinfo=UTC))
     os_ = os_adapters(clock=clock)
     rr.assert_unowned_stage_named_case_preserved(_f3_request(trusted_tmp, os_, f"f3-unowned-{case}"), os_, clock, case)
@@ -346,6 +356,30 @@ def test_f3_real_subprocess_death_stage_recovery_completes(trusted_tmp: Path, ar
     os_ = os_adapters(clock=clock)
     req = _f3_request(trusted_tmp, os_, f"f3-proc-{artifact}")
     rr.assert_real_subprocess_kill_recovers(trusted_tmp / f"f3-proc-aux-{artifact}", req, os_, clock, artifact)
+
+
+@pytest.mark.parametrize("injected", ["daemon.json", "tls/ca.pem", "../outside.txt", ".daemon.json.stage-not-a-uuid"])
+def test_f3_foreign_path_injected_into_durable_staging_files_fails_closed(trusted_tmp: Path, injected: str) -> None:
+    """75eca45 M7: durable ``staging_files`` may hold only exact stage names; any other path refuses untouched."""
+    os_ = os_adapters(clock=FakeClock(datetime(2026, 11, 20, 12, 0, tzinfo=UTC)))
+    req = _f3_request(trusted_tmp, os_, f"f3-m7-{injected.replace('/', '-')}")
+    with pytest.raises(BrainError) as io_err:
+        init_store(req, _faulty_os(os_, "cli.credential"))
+    assert io_err.value.code is ErrorCode.IO_ERROR
+    outside = req.config_dir.parent / "outside.txt"
+    outside.write_bytes(b"victim\n")
+    with closing(sqlite3.connect(DataRoot.at(req.data_root).policy_db)) as db, db:
+        row = db.execute("SELECT value FROM meta WHERE key = 'init_bootstrap_state'").fetchone()
+        state = json.loads(row[0])
+        assert state["status"] == "in_progress"
+        state["staging_files"] = [injected]
+        db.execute("UPDATE meta SET value = ? WHERE key = 'init_bootstrap_state'", (json.dumps(state, sort_keys=True),))
+    snap_data, snap_cfg = digest_tree(req.data_root), digest_tree(req.config_dir)
+    with pytest.raises(BrainError) as refused:
+        init_store(req, os_)
+    assert refused.value.code is ErrorCode.INVALID_INPUT
+    assert digest_tree(req.data_root) == snap_data and digest_tree(req.config_dir) == snap_cfg
+    assert outside.read_bytes() == b"victim\n" and (req.config_dir / "daemon.json").is_file()
 
 
 def _reconcile_all(rt: Any, store_id: str, signer_id: str, layout: DataRoot) -> Any:
@@ -392,6 +426,13 @@ def _reconcile_all(rt: Any, store_id: str, signer_id: str, layout: DataRoot) -> 
     )
 
 
+def _reserve(rt: Any, amount: str, now: datetime, invocation_id: str | None = None) -> Any:
+    return rt.policy.reserve_accounting_invocation(
+        invocation_id=invocation_id or new_id(), job_id=new_id(), owner_id=OWNER, writer_epoch=rt.lease.epoch,
+        max_amount=amount, now=now,
+    )
+
+
 def test_f5_utc_monthly_and_daily_accounting_locks_and_reconcile(trusted_tmp: Path) -> None:
     """F5: policy restore locks UTC month + day across midnight/month-end, unblocks at next month or reconcile."""
     clock = FakeClock(datetime(2026, 11, 19, 8, 0, tzinfo=UTC))
@@ -426,27 +467,13 @@ def test_f5_utc_monthly_and_daily_accounting_locks_and_reconcile(trusted_tmp: Pa
         ):
             clock.set(blocked_dt)
             with pytest.raises(BrainError) as err_b:
-                rt2.policy.reserve_accounting_invocation(
-                    invocation_id=new_id(),
-                    job_id=new_id(),
-                    owner_id=OWNER,
-                    writer_epoch=rt2.lease.epoch,
-                    max_amount="0.5",
-                    now=blocked_dt,
-                )
+                _reserve(rt2, "0.5", blocked_dt)
             assert err_b.value.code is ErrorCode.CAPABILITY_UNAVAILABLE
 
         # Unblocked once UTC month advances to 2026-12-01T00:00Z!
         dec1 = datetime(2026, 12, 1, 0, 0, tzinfo=UTC)
         clock.set(dec1)
-        rec_dec = rt2.policy.reserve_accounting_invocation(
-            invocation_id=new_id(),
-            job_id=new_id(),
-            owner_id=OWNER,
-            writer_epoch=rt2.lease.epoch,
-            max_amount="0.5",
-            now=dec1,
-        )
+        rec_dec = _reserve(rt2, "0.5", dec1)
         assert rec_dec.period_key == "2026-12-01"
 
         # Reconcile unlocks BOTH "2026-11" and "2026-11-19" -> calls on 2026-11-19 & 2026-11-20 succeed!
@@ -455,14 +482,7 @@ def test_f5_utc_monthly_and_daily_accounting_locks_and_reconcile(trusted_tmp: Pa
         assert rt2.policy.list_accounting_locks(state="locked") == ()
         for ok_dt in (datetime(2026, 11, 19, 13, 0, tzinfo=UTC), datetime(2026, 11, 20, 1, 0, tzinfo=UTC)):
             clock.set(ok_dt)
-            assert rt2.policy.reserve_accounting_invocation(
-                invocation_id=new_id(),
-                job_id=new_id(),
-                owner_id=OWNER,
-                writer_epoch=rt2.lease.epoch,
-                max_amount="0.25",
-                now=ok_dt,
-            )
+            assert _reserve(rt2, "0.25", ok_dt)
     finally:
         rt2.close()
 
@@ -495,14 +515,7 @@ def test_f5_utc_monthly_and_daily_accounting_locks_and_reconcile(trusted_tmp: Pa
         for dt_chk in (datetime(2026, 11, 20, 12, 0, tzinfo=UTC), datetime(2026, 12, 2, 12, 5, tzinfo=UTC)):
             clock.set(dt_chk)
             with pytest.raises(BrainError) as err_c:
-                rt3.policy.reserve_accounting_invocation(
-                    invocation_id=new_id(),
-                    job_id=new_id(),
-                    owner_id=OWNER,
-                    writer_epoch=rt3.lease.epoch,
-                    max_amount="0.25",
-                    now=dt_chk,
-                )
+                _reserve(rt3, "0.25", dt_chk)
             assert err_c.value.code is ErrorCode.CAPABILITY_UNAVAILABLE
     finally:
         rt3.close()
@@ -516,14 +529,7 @@ def test_f5_monthly_period_cap_accumulates_across_days_and_resets_next_month(tru
     try:
         rt.policy.set_period_cap(OWNER, "5")
         inv1 = new_id()
-        rt.policy.reserve_accounting_invocation(
-            invocation_id=inv1,
-            job_id=new_id(),
-            owner_id=OWNER,
-            writer_epoch=rt.lease.epoch,
-            max_amount="3",
-            now=clock.now(),
-        )
+        _reserve(rt, "3", clock.now(), inv1)
         rt.policy.settle_accounting_invocation(invocation_id=inv1, amount="3", complete=True, now=clock.now())
         assert rt.policy.period_committed_total(OWNER, "2026-11") == "3"
         assert rt.policy.period_committed_total(OWNER, "2026-11-19") == "3"
@@ -532,53 +538,25 @@ def test_f5_monthly_period_cap_accumulates_across_days_and_resets_next_month(tru
         # Next UTC day (2026-11-20) shares the "2026-11" monthly cap!
         clock.set(datetime(2026, 11, 20, 10, 0, tzinfo=UTC))
         with pytest.raises(BrainError) as cap_over:
-            rt.policy.reserve_accounting_invocation(
-                invocation_id=new_id(),
-                job_id=new_id(),
-                owner_id=OWNER,
-                writer_epoch=rt.lease.epoch,
-                max_amount="2.5",
-                now=clock.now(),
-            )
+            _reserve(rt, "2.5", clock.now())
         assert cap_over.value.code is ErrorCode.CAPABILITY_UNAVAILABLE
 
         inv2 = new_id()
-        rt.policy.reserve_accounting_invocation(
-            invocation_id=inv2,
-            job_id=new_id(),
-            owner_id=OWNER,
-            writer_epoch=rt.lease.epoch,
-            max_amount="2",
-            now=clock.now(),
-        )
+        _reserve(rt, "2", clock.now(), inv2)
         assert rt.policy.period_committed_total(OWNER, "2026-11") == "5"
         assert rt.policy.period_committed_total(OWNER, "2026-11-19") == "3"
         assert rt.policy.period_committed_total(OWNER, "2026-11-20") == "2"
         assert len(rt.policy.list_accounting_invocations(owner_id=OWNER, period_key="2026-11")) == 2
 
         with pytest.raises(BrainError) as cap_full:
-            rt.policy.reserve_accounting_invocation(
-                invocation_id=new_id(),
-                job_id=new_id(),
-                owner_id=OWNER,
-                writer_epoch=rt.lease.epoch,
-                max_amount="0.5",
-                now=clock.now(),
-            )
+            _reserve(rt, "0.5", clock.now())
         assert cap_full.value.code is ErrorCode.CAPABILITY_UNAVAILABLE
 
         # New UTC month 2026-12-01T00:00Z resets monthly budget to 0!
         clock.set(datetime(2026, 12, 1, 0, 0, tzinfo=UTC))
         assert rt.policy.period_committed_total(OWNER, "2026-12") == "0"
         assert rt.policy.list_accounting_invocations(owner_id=OWNER, period_key="2026-12") == ()
-        rt.policy.reserve_accounting_invocation(
-            invocation_id=new_id(),
-            job_id=new_id(),
-            owner_id=OWNER,
-            writer_epoch=rt.lease.epoch,
-            max_amount="5",
-            now=clock.now(),
-        )
+        _reserve(rt, "5", clock.now())
         assert rt.policy.period_committed_total(OWNER, "2026-12") == "5"
         assert rt.policy.period_committed_total(OWNER, "2026-11") == "5"
     finally:
