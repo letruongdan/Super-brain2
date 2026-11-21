@@ -8,6 +8,7 @@ from superbrain.core._kernel_base import require_positive_int
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.ports.capture import (
     MAX_CAPTURE_BATCH_EVENTS,
+    MAX_CAPTURE_ENTRY_BYTES,
     OUTBOX_RECORD_EVENT,
     OUTBOX_RECORD_GAP,
     CaptureBatchAck,
@@ -15,7 +16,7 @@ from superbrain.ports.capture import (
     compute_contiguous_event_acked_through,
 )
 
-DEFAULT_MAX_WIRE_BATCH_BYTES = 4 * 1024 * 1024
+DEFAULT_MAX_WIRE_BATCH_BYTES = MAX_CAPTURE_ENTRY_BYTES
 
 
 __all__ = [
@@ -56,13 +57,16 @@ def partition_pending_for_batch(
     for entry in entries:
         if not isinstance(entry, OutboxEntry):
             raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
-        if current and (len(current) >= max_events or current_bytes + entry.byte_size > max_wire_bytes):
+        if entry.byte_size > max_wire_bytes:
+            raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+        sep = 1 if current else 0
+        if current and (len(current) >= max_events or current_bytes + sep + entry.byte_size > max_wire_bytes):
             batches.append(tuple(current))
             current = [entry]
             current_bytes = entry.byte_size
         else:
             current.append(entry)
-            current_bytes += entry.byte_size
+            current_bytes += sep + entry.byte_size
     if current:
         batches.append(tuple(current))
     return tuple(batches)

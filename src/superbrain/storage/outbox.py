@@ -2,12 +2,9 @@
 
 from __future__ import annotations
 
-import errno
-import hashlib
 import json
 import os
 import stat
-import threading
 import time
 import zlib
 from collections.abc import Callable, Iterator
@@ -21,6 +18,7 @@ from superbrain.core.jsonvalue import JsonValue
 from superbrain.ports.capture import (
     DEFAULT_OUTBOX_MAX_BYTES,
     MAX_CAPTURE_BATCH_EVENTS,
+    MAX_CAPTURE_ENTRY_BYTES,
     OUTBOX_RECORD_EVENT,
     OUTBOX_RECORD_GAP,
     CaptureBatchAck,
@@ -30,91 +28,27 @@ from superbrain.ports.capture import (
     OutboxPermissionsPort,
     ProducerCaptureGap,
     default_outbox_file_lock,
+    default_outbox_permissions,
 )
-
-_REPARSE_POINT = 0x400
-_PART_SUFFIX = ".part"
-_FRAME_SUFFIX = ".frame"
-_STREAMS_DIR = "streams"
-_LOCK_FILE = ".spool.lock"
-_PROCESS_LOCKS_GUARD = threading.Lock()
-_PROCESS_LOCKS: dict[str, threading.RLock] = {}
-_ENOSPC_WINERROR = 112
-
-
-def _thread_lock_for(path: Path) -> threading.RLock:
-    key = os.path.normcase(os.path.abspath(os.fspath(path)))
-    with _PROCESS_LOCKS_GUARD:
-        lock = _PROCESS_LOCKS.get(key)
-        if lock is None:
-            lock = threading.RLock()
-            _PROCESS_LOCKS[key] = lock
-        return lock
-
-
-def _is_link_path(path: Path) -> bool:
-    try:
-        if path.is_symlink():
-            return True
-        st = os.lstat(path)
-    except (FileNotFoundError, NotADirectoryError):
-        return False
-    except OSError as err:
-        raise BrainError(ErrorCode.UNSAFE_PATH, f"cannot inspect outbox path: {err}") from err
-    return stat.S_ISLNK(st.st_mode) or bool(getattr(st, "st_file_attributes", 0) & _REPARSE_POINT)
-
-
-def _check_safe_path_syntax(path: Path) -> None:
-    if not isinstance(path, Path):
-        raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
-    raw = os.fspath(path)
-    if not raw or "\x00" in raw or ".." in path.parts:
-        raise BrainError(ErrorCode.UNSAFE_PATH, "unsafe outbox path")
-    if raw.startswith(("\\\\", "//")):
-        raise BrainError(ErrorCode.UNSAFE_PATH, "unsafe outbox path")
-    drive_colon = 1 if len(raw) >= 2 and raw[0].isalpha() and raw[1] == ":" else -1
-    if any(i != drive_colon for i, ch in enumerate(raw) if ch == ":"):
-        raise BrainError(ErrorCode.UNSAFE_PATH, "unsafe outbox path")
-
-
-def _reject_links_upward(path: Path) -> None:
-    cur = path if path.is_absolute() else path.absolute()
-    seen: set[Path] = set()
-    while cur not in seen:
-        seen.add(cur)
-        if _is_link_path(cur):
-            raise BrainError(ErrorCode.UNSAFE_PATH, "outbox path must not contain a symlink or reparse point")
-        parent = cur.parent
-        if parent == cur:
-            break
-        cur = parent
-
-
-def _raise_storage_error(err: OSError, message: str) -> BrainError:
-    winerr = getattr(err, "winerror", None)
-    if err.errno in (errno.ENOSPC, errno.EDQUOT) or winerr == _ENOSPC_WINERROR:
-        return BrainError(ErrorCode.STORAGE_FULL, "storage full")
-    return BrainError(ErrorCode.IO_ERROR, f"{message}: {err}")
-
-
-def _maybe_crashpoint(name: str) -> None:
-    if os.environ.get("SUPERBRAIN_CRASHPOINT") or os.environ.get("SUPERBRAIN_PAUSEPOINT"):
-        from superbrain.core.faults import crashpoint
-
-        crashpoint(name)
-
-
-def _stream_dir_key(producer_stream: str) -> str:
-    return hashlib.sha256(producer_stream.encode("utf-8")).hexdigest()[:24]
-
-
-def _parse_frame_order(path: Path) -> tuple[int, str]:
-    stem = path.stem
-    head, _, _rest = stem.partition("_")
-    try:
-        return (int(head), path.name)
-    except ValueError:
-        return (0, path.name)
+from superbrain.storage._outbox_io import (
+    _FRAME_SUFFIX,
+    _LOCK_FILE,
+    _O_BINARY,
+    _O_NOFOLLOW,
+    _PART_SUFFIX,
+    _STREAMS_DIR,
+    check_safe_path_syntax,
+    is_link_path,
+    maybe_crashpoint,
+    parse_frame_order,
+    raise_storage_error,
+    read_all_binary,
+    reject_links_upward,
+    stream_dir_key,
+    sync_dir,
+    thread_lock_for,
+    write_all_fd,
+)
 
 
 class OutboxSpool:
@@ -129,84 +63,95 @@ class OutboxSpool:
         permissions: OutboxPermissionsPort | None = None,
         file_lock: OutboxFileLockPort | None = None,
     ) -> None:
-        _check_safe_path_syntax(path)
+        check_safe_path_syntax(path)
         require_positive_int(max_bytes)
-        _reject_links_upward(path)
+        reject_links_upward(path)
         self._root = path if path.is_absolute() else path.absolute()
         self._max_bytes = max_bytes
         self._monotonic_ns = monotonic_ns
         self._permissions = permissions
         self._file_lock = file_lock
-        self._thread_lock = _thread_lock_for(self._root)
-        self._ensure_layout_verified()
+        self._resolve_permissions()
+        self._resolve_file_lock()
+        self._thread_lock = thread_lock_for(self._root)
+        self._verify_existing_root_readonly()
 
     @property
     def root(self) -> Path:
         return self._root
 
-    def _secure_dir(self, directory: Path) -> None:
-        if self._permissions is not None:
-            self._permissions.secure_directory(directory)
-            return
-        try:
-            os.chmod(directory, 0o700)
-        except OSError as err:
-            raise BrainError(ErrorCode.INSECURE_PERMISSIONS, f"cannot secure directory {directory}: {err}") from err
+    def _resolve_permissions(self) -> OutboxPermissionsPort:
+        perms = self._permissions if self._permissions is not None else default_outbox_permissions()
+        if perms is None:
+            raise BrainError(ErrorCode.INSECURE_PERMISSIONS, "outbox permission adapter is not configured")
+        return perms
 
-    def _secure_file(self, file_path: Path) -> None:
-        if self._permissions is not None:
-            self._permissions.secure_file(file_path)
-            return
-        try:
-            os.chmod(file_path, 0o600)
-        except OSError as err:
-            raise BrainError(ErrorCode.INSECURE_PERMISSIONS, f"cannot secure file {file_path}: {err}") from err
+    def _resolve_file_lock(self) -> OutboxFileLockPort:
+        adapter = self._file_lock if self._file_lock is not None else default_outbox_file_lock()
+        if adapter is None:
+            raise BrainError(ErrorCode.CAPABILITY_UNAVAILABLE, "outbox file lock adapter is not configured")
+        return adapter
 
-    def _ensure_dir(self, directory: Path) -> None:
-        _reject_links_upward(directory)
-        created = False
-        if not os.path.lexists(directory):
-            try:
-                directory.mkdir(parents=True, exist_ok=True)
-                created = True
-            except OSError as err:
-                raise _raise_storage_error(err, f"cannot create outbox directory {directory}") from err
-        if _is_link_path(directory):
-            raise BrainError(ErrorCode.UNSAFE_PATH, "outbox directory must not be a link")
-        try:
-            st = os.lstat(directory)
-        except OSError as err:
-            raise BrainError(ErrorCode.IO_ERROR, f"cannot inspect outbox directory {directory}: {err}") from err
-        if not stat.S_ISDIR(st.st_mode):
-            raise BrainError(ErrorCode.INTEGRITY_FAILURE, f"outbox path {directory} is not a directory")
-        self._secure_dir(directory)
-        if created:
-            self._sync_dir(directory.parent)
+    def _verify_owner_only(self, target: Path, perms: OutboxPermissionsPort | None = None) -> None:
+        guard = perms if perms is not None else self._resolve_permissions()
+        obj_check = getattr(guard, "object_problems", None)
+        probs = obj_check(target) if callable(obj_check) else guard.problems(target)
+        if probs:
+            raise BrainError(ErrorCode.INSECURE_PERMISSIONS, f"insecure permissions on {target}")
 
-    @staticmethod
-    def _sync_dir(directory: Path) -> None:
-        try:
-            fd = os.open(directory, os.O_RDONLY)
-        except OSError:
-            return
-        try:
-            os.fsync(fd)
-        except OSError:
-            pass
-        finally:
-            os.close(fd)
-
-    def _ensure_layout_verified(self) -> None:
+    def _verify_existing_root_readonly(self) -> None:
         if not os.path.lexists(self._root):
             return
-        _reject_links_upward(self._root)
-        if _is_link_path(self._root):
+        reject_links_upward(self._root)
+        if is_link_path(self._root):
             raise BrainError(ErrorCode.UNSAFE_PATH, "outbox root is a link")
-        st = os.lstat(self._root)
-        if not stat.S_ISDIR(st.st_mode):
+        if not stat.S_ISDIR(os.lstat(self._root).st_mode):
             raise BrainError(ErrorCode.INTEGRITY_FAILURE, "outbox root is not a directory")
-        self._secure_dir(self._root)
-        self._sweep_links_and_parts()
+        self._verify_owner_only(self._root)
+        for dirpath, dirnames, filenames in os.walk(self._root, followlinks=False):
+            dp = Path(dirpath)
+            if is_link_path(dp):
+                raise BrainError(ErrorCode.UNSAFE_PATH, "symlink detected in outbox")
+            for name in (*dirnames, *filenames):
+                if is_link_path(dp / name):
+                    raise BrainError(ErrorCode.UNSAFE_PATH, "symlink detected in outbox")
+
+    def _ensure_dir_tree(self, directory: Path) -> None:
+        perms = self._resolve_permissions()
+        missing: list[Path] = []
+        cur = directory
+        while not os.path.lexists(cur):
+            missing.append(cur)
+            parent = cur.parent
+            if parent == cur:
+                raise BrainError(ErrorCode.IO_ERROR, f"no existing ancestor directory for {directory}")
+            cur = parent
+        reject_links_upward(cur)
+        for item in reversed(missing) if missing else (directory,):
+            created = False
+            if missing:
+                try:
+                    item.mkdir(mode=0o700)
+                    created = True
+                except FileExistsError:
+                    pass
+                except OSError as err:
+                    raise raise_storage_error(err, f"cannot create outbox directory {item}") from err
+            else:
+                reject_links_upward(item)
+            if is_link_path(item):
+                raise BrainError(ErrorCode.UNSAFE_PATH, "outbox directory must not be a link")
+            try:
+                st = os.lstat(item)
+            except OSError as err:
+                raise BrainError(ErrorCode.IO_ERROR, f"cannot inspect outbox directory {item}: {err}") from err
+            if not stat.S_ISDIR(st.st_mode):
+                raise BrainError(ErrorCode.INTEGRITY_FAILURE, f"outbox path {item} is not a directory")
+            if created:
+                perms.secure_directory(item)
+                sync_dir(item.parent)
+            else:
+                self._verify_owner_only(item, perms)
 
     def _sweep_links_and_parts(self) -> None:
         if not os.path.lexists(self._root):
@@ -214,15 +159,14 @@ class OutboxSpool:
         to_unlink: list[Path] = []
         for dirpath, dirnames, filenames in os.walk(self._root, followlinks=False):
             dp = Path(dirpath)
-            if _is_link_path(dp):
+            if is_link_path(dp):
                 raise BrainError(ErrorCode.UNSAFE_PATH, "symlink detected in outbox")
             for dname in dirnames:
-                dpath = dp / dname
-                if _is_link_path(dpath):
+                if is_link_path(dp / dname):
                     raise BrainError(ErrorCode.UNSAFE_PATH, "symlink detected in outbox")
             for fname in filenames:
                 fpath = dp / fname
-                if _is_link_path(fpath):
+                if is_link_path(fpath):
                     raise BrainError(ErrorCode.UNSAFE_PATH, "symlink detected in outbox")
                 if fname.endswith(_PART_SUFFIX):
                     to_unlink.append(fpath)
@@ -231,38 +175,54 @@ class OutboxSpool:
 
     @contextmanager
     def _locked(self, *, create_root: bool, deadline_ns: int | None = None) -> Iterator[None]:
+        perms = self._resolve_permissions()
+        adapter = self._resolve_file_lock()
         with self._thread_lock:
             if not os.path.lexists(self._root):
                 if not create_root:
                     yield
                     return
-                self._ensure_dir(self._root)
+                self._ensure_dir_tree(self._root)
             else:
-                _reject_links_upward(self._root)
-            lock_path = self._root / _LOCK_FILE
-            if _is_link_path(lock_path):
-                raise BrainError(ErrorCode.UNSAFE_PATH, "outbox lock file is a link")
-            fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+                reject_links_upward(self._root)
+                self._ensure_dir_tree(self._root)
+            fd = self._open_lock_file(self._root / _LOCK_FILE, perms=perms)
             locked = False
             try:
-                self._secure_file(lock_path)
-                locked = self._acquire_file_lock(fd, deadline_ns=deadline_ns)
+                locked = self._acquire_file_lock(fd, adapter=adapter, deadline_ns=deadline_ns)
                 self._sweep_links_and_parts()
                 yield
             finally:
                 try:
                     if locked:
-                        self._release_file_lock(fd)
+                        adapter.unlock_fd(fd)
                 finally:
                     os.close(fd)
 
-    def _resolve_file_lock(self) -> OutboxFileLockPort | None:
-        return self._file_lock if self._file_lock is not None else default_outbox_file_lock()
+    def _open_lock_file(self, lock_path: Path, *, perms: OutboxPermissionsPort) -> int:
+        if is_link_path(lock_path):
+            raise BrainError(ErrorCode.UNSAFE_PATH, "outbox lock file is a link")
+        if os.path.lexists(lock_path):
+            if not stat.S_ISREG(os.lstat(lock_path).st_mode):
+                raise BrainError(ErrorCode.INTEGRITY_FAILURE, "outbox lock file is not a regular file")
+            self._verify_owner_only(lock_path, perms)
+            return os.open(lock_path, os.O_RDWR | _O_BINARY | _O_NOFOLLOW)
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR | _O_BINARY | _O_NOFOLLOW, 0o600)
+        except FileExistsError as err:
+            if is_link_path(lock_path):
+                raise BrainError(ErrorCode.UNSAFE_PATH, "outbox lock file is a link") from err
+            self._verify_owner_only(lock_path, perms)
+            return os.open(lock_path, os.O_RDWR | _O_BINARY | _O_NOFOLLOW)
+        try:
+            perms.secure_file(lock_path)
+            self._verify_owner_only(lock_path, perms)
+        except BaseException:
+            os.close(fd)
+            raise
+        return fd
 
-    def _acquire_file_lock(self, fd: int, *, deadline_ns: int | None) -> bool:
-        adapter = self._resolve_file_lock()
-        if adapter is None:
-            return False
+    def _acquire_file_lock(self, fd: int, *, adapter: OutboxFileLockPort, deadline_ns: int | None) -> bool:
         while True:
             if deadline_ns is not None and int(self._monotonic_ns()) >= deadline_ns:
                 raise BrainError(ErrorCode.DEADLINE_EXCEEDED, "deadline exceeded")
@@ -270,60 +230,59 @@ class OutboxSpool:
                 if adapter.try_lock_fd(fd):
                     return True
             except OSError as err:
-                raise _raise_storage_error(err, "cannot lock outbox") from err
+                raise raise_storage_error(err, "cannot lock outbox") from err
             time.sleep(0.002)
 
-    def _release_file_lock(self, fd: int) -> None:
-        adapter = self._resolve_file_lock()
-        if adapter is not None:
-            adapter.unlock_fd(fd)
+    def _collect_regular_frames(self, directory: Path) -> list[Path]:
+        perms = self._resolve_permissions()
+        if is_link_path(directory):
+            raise BrainError(ErrorCode.UNSAFE_PATH, "stream directory is a link")
+        if not stat.S_ISDIR(os.lstat(directory).st_mode):
+            raise BrainError(ErrorCode.INTEGRITY_FAILURE, "stream path is not a directory")
+        self._verify_owner_only(directory, perms)
+        found: list[Path] = []
+        for p in directory.iterdir():
+            if is_link_path(p):
+                raise BrainError(ErrorCode.UNSAFE_PATH, "frame file is a link")
+            if p.name.endswith(_FRAME_SUFFIX):
+                if not stat.S_ISREG(os.lstat(p).st_mode):
+                    raise BrainError(ErrorCode.INTEGRITY_FAILURE, "frame entry is not a regular file")
+                found.append(p)
+        return found
 
     def _iter_frame_paths(self, *, producer_stream: str | None = None) -> list[Path]:
         streams_root = self._root / _STREAMS_DIR
         if not os.path.lexists(streams_root):
             return []
-        if _is_link_path(streams_root):
+        if is_link_path(streams_root):
             raise BrainError(ErrorCode.UNSAFE_PATH, "streams directory is a link")
+        self._verify_owner_only(streams_root)
         if producer_stream is not None:
-            sdir = streams_root / _stream_dir_key(producer_stream)
-            if not os.path.lexists(sdir):
-                return []
-            if _is_link_path(sdir):
-                raise BrainError(ErrorCode.UNSAFE_PATH, "stream directory is a link")
-            paths = [p for p in sdir.iterdir() if p.is_file() and p.name.endswith(_FRAME_SUFFIX)]
+            sdir = streams_root / stream_dir_key(producer_stream)
+            paths = self._collect_regular_frames(sdir) if os.path.lexists(sdir) else []
         else:
             paths = []
             for sdir in streams_root.iterdir():
-                if _is_link_path(sdir):
+                if is_link_path(sdir):
                     raise BrainError(ErrorCode.UNSAFE_PATH, "stream directory is a link")
-                if sdir.is_dir():
-                    for p in sdir.iterdir():
-                        if _is_link_path(p):
-                            raise BrainError(ErrorCode.UNSAFE_PATH, "frame file is a link")
-                        if p.is_file() and p.name.endswith(_FRAME_SUFFIX):
-                            paths.append(p)
-        paths.sort(key=_parse_frame_order)
+                if stat.S_ISDIR(os.lstat(sdir).st_mode):
+                    paths.extend(self._collect_regular_frames(sdir))
+        paths.sort(key=parse_frame_order)
         return paths
 
-    def _decode_frame_file(self, path: Path) -> OutboxEntry | None:
-        if _is_link_path(path):
+    def _decode_frame_file(self, path: Path) -> OutboxEntry:
+        if is_link_path(path):
             raise BrainError(ErrorCode.UNSAFE_PATH, "frame file is a link")
-        try:
-            raw = path.read_bytes()
-        except OSError as err:
-            raise BrainError(ErrorCode.IO_ERROR, f"cannot read frame {path}: {err}") from err
+        if not stat.S_ISREG(os.lstat(path).st_mode):
+            raise BrainError(ErrorCode.INTEGRITY_FAILURE, "corrupt outbox frame type")
+        self._verify_owner_only(path)
+        raw = read_all_binary(path)
         nl_idx = raw.rfind(b"\n")
         if nl_idx == -1:
-            # Whole file lacks a newline delimiter -> treat only as torn incomplete tail at EOF?
-            # If the file starts like a complete JSON frame without newline or is pure junk, drop torn tail.
-            path.unlink(missing_ok=True)
-            return None
+            raise BrainError(ErrorCode.INTEGRITY_FAILURE, "corrupt outbox frame missing delimiter")
         committed_slice = raw[:nl_idx]
         has_tail = nl_idx < len(raw) - 1
-        # Expect single canonical JSON line ending at last valid newline before EOF tail (or multiple?).
-        first_nl = committed_slice.find(b"\n")
-        if first_nl != -1:
-            # Multiple newline-terminated lines inside a single-frame file -> corrupted framing.
+        if committed_slice.find(b"\n") != -1:
             raise BrainError(ErrorCode.INTEGRITY_FAILURE, "corrupt outbox frame framing")
         try:
             obj = json.loads(committed_slice.decode("utf-8"))
@@ -331,23 +290,15 @@ class OutboxSpool:
             raise BrainError(ErrorCode.INTEGRITY_FAILURE, "corrupt outbox frame") from err
         if not isinstance(obj, dict):
             raise BrainError(ErrorCode.INTEGRITY_FAILURE, "corrupt outbox frame")
-        record_kind = obj.get("record_kind")
-        producer_stream = obj.get("producer_stream")
-        sequence = obj.get("sequence")
-        entry_id = obj.get("entry_id")
-        payload_json = obj.get("payload_json")
-        payload_digest = obj.get("payload_digest")
-        byte_size = obj.get("byte_size")
-        frame_crc = obj.get("frame_crc32")
+        record_kind, producer_stream = obj.get("record_kind"), obj.get("producer_stream")
+        sequence, entry_id = obj.get("sequence"), obj.get("entry_id")
+        payload_json, payload_digest = obj.get("payload_json"), obj.get("payload_digest")
+        byte_size, frame_crc = obj.get("byte_size"), obj.get("frame_crc32")
         if (
-            not isinstance(record_kind, str)
-            or not isinstance(producer_stream, str)
-            or type(sequence) is not int
-            or not isinstance(entry_id, str)
-            or not isinstance(payload_json, str)
-            or not isinstance(payload_digest, str)
-            or type(byte_size) is not int
-            or not isinstance(frame_crc, str)
+            not isinstance(record_kind, str) or not isinstance(producer_stream, str)
+            or type(sequence) is not int or not isinstance(entry_id, str)
+            or not isinstance(payload_json, str) or not isinstance(payload_digest, str)
+            or type(byte_size) is not int or not isinstance(frame_crc, str)
         ):
             raise BrainError(ErrorCode.INTEGRITY_FAILURE, "corrupt outbox frame schema")
         require_sha256_digest(payload_digest)
@@ -356,54 +307,73 @@ class OutboxSpool:
             raise BrainError(ErrorCode.INTEGRITY_FAILURE, "corrupt outbox payload digest")
         core_canonical = canonical_json(
             {
-                "byte_size": byte_size,
-                "entry_id": entry_id,
-                "payload_digest": payload_digest,
-                "payload_json": payload_json,
-                "producer_stream": producer_stream,
-                "record_kind": record_kind,
-                "sequence": sequence,
+                "byte_size": byte_size, "entry_id": entry_id, "payload_digest": payload_digest,
+                "payload_json": payload_json, "producer_stream": producer_stream,
+                "record_kind": record_kind, "sequence": sequence,
             }
         )
-        expected_crc = f"{zlib.crc32(core_canonical) & 0xFFFFFFFF:08x}"
-        if frame_crc != expected_crc:
+        if frame_crc != f"{zlib.crc32(core_canonical) & 0xFFFFFFFF:08x}":
             raise BrainError(ErrorCode.INTEGRITY_FAILURE, "corrupt outbox frame crc32")
         if has_tail:
-            # Truncate away torn incomplete EOF bytes while keeping the durable committed frame.
-            self._rewrite_clean_bytes(path, raw[: nl_idx + 1])
+            self._atomic_publish_frame(path, path.with_name(f"{path.name}{_PART_SUFFIX}"), raw[: nl_idx + 1])
         return OutboxEntry(
-            record_kind=record_kind,
-            producer_stream=producer_stream,
-            sequence=sequence,
-            entry_id=entry_id,
-            payload_json=payload_json,
-            payload_digest=payload_digest,
-            byte_size=byte_size,
+            record_kind=record_kind, producer_stream=producer_stream, sequence=sequence,
+            entry_id=entry_id, payload_json=payload_json, payload_digest=payload_digest, byte_size=byte_size,
         )
 
-    def _rewrite_clean_bytes(self, path: Path, data: bytes) -> None:
-        fd = os.open(path, os.O_WRONLY | os.O_TRUNC)
+    def _atomic_publish_frame(
+        self,
+        final_path: Path,
+        part_path: Path,
+        frame_bytes: bytes,
+        *,
+        crashpoint_name: str | None = None,
+    ) -> None:
+        perms = self._resolve_permissions()
+        part_path.unlink(missing_ok=True)
+        fd = -1
+        committed = False
         try:
-            os.write(fd, data)
-            os.fsync(fd)
-        except OSError as err:
-            raise _raise_storage_error(err, "cannot repair outbox EOF tail") from err
-        finally:
+            fd = os.open(part_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_BINARY | _O_NOFOLLOW, 0o600)
+            write_all_fd(fd, frame_bytes)
             os.close(fd)
+            fd = -1
+            perms.secure_file(part_path)
+            if crashpoint_name is not None:
+                maybe_crashpoint(crashpoint_name)
+            fd = os.open(part_path, os.O_RDWR | _O_BINARY | _O_NOFOLLOW)
+            os.fsync(fd)
+            os.close(fd)
+            fd = -1
+            os.replace(part_path, final_path)
+            sync_dir(final_path.parent)
+            committed = True
+        except BrainError:
+            raise
+        except OSError as err:
+            raise raise_storage_error(err, "cannot write outbox frame") from err
+        finally:
+            if fd != -1:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            if not committed:
+                part_path.unlink(missing_ok=True)
 
     def _find_existing_entry(
         self, producer_stream: str, record_kind: str, sequence: int
     ) -> tuple[Path, OutboxEntry] | None:
         for path in self._iter_frame_paths(producer_stream=producer_stream):
             entry = self._decode_frame_file(path)
-            if entry is not None and entry.record_kind == record_kind and entry.sequence == sequence:
+            if entry.record_kind == record_kind and entry.sequence == sequence:
                 return (path, entry)
         return None
 
     def _next_order_index(self) -> int:
         highest = 0
         for path in self._iter_frame_paths():
-            order, _ = _parse_frame_order(path)
+            order, _ = parse_frame_order(path)
             if order > highest:
                 highest = order
         return highest + 1
@@ -411,9 +381,8 @@ class OutboxSpool:
     def _total_bytes_unlocked(self) -> int:
         total = 0
         for path in self._iter_frame_paths():
-            entry = self._decode_frame_file(path)
-            if entry is not None:
-                total += path.stat().st_size
+            self._decode_frame_file(path)
+            total += path.stat().st_size
         return total
 
     def _enqueue_record(
@@ -427,20 +396,17 @@ class OutboxSpool:
         deadline_ns: int | None,
     ) -> str:
         payload_bytes = canonical_json(payload_dict)
+        if len(payload_bytes) > MAX_CAPTURE_ENTRY_BYTES:
+            raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
         payload_json = payload_bytes.decode("utf-8")
         payload_digest = digest_bytes(payload_bytes)
         byte_size = len(payload_bytes)
         core_fields: dict[str, JsonValue] = {
-            "byte_size": byte_size,
-            "entry_id": entry_id,
-            "payload_digest": payload_digest,
-            "payload_json": payload_json,
-            "producer_stream": producer_stream,
-            "record_kind": record_kind,
-            "sequence": sequence,
+            "byte_size": byte_size, "entry_id": entry_id, "payload_digest": payload_digest,
+            "payload_json": payload_json, "producer_stream": producer_stream,
+            "record_kind": record_kind, "sequence": sequence,
         }
-        crc_hex = f"{zlib.crc32(canonical_json(core_fields)) & 0xFFFFFFFF:08x}"
-        core_fields["frame_crc32"] = crc_hex
+        core_fields["frame_crc32"] = f"{zlib.crc32(canonical_json(core_fields)) & 0xFFFFFFFF:08x}"
         frame_bytes = canonical_json(core_fields) + b"\n"
 
         with self._locked(create_root=True, deadline_ns=deadline_ns):
@@ -452,54 +418,19 @@ class OutboxSpool:
                 if existing_entry.entry_id == entry_id and existing_entry.payload_digest == payload_digest:
                     return existing_entry.entry_id
                 raise BrainError(ErrorCode.IDEMPOTENCY_CONFLICT, "idempotency conflict")
-
-            used = self._total_bytes_unlocked()
-            if used + len(frame_bytes) > self._max_bytes:
+            if self._total_bytes_unlocked() + len(frame_bytes) > self._max_bytes:
                 raise BrainError(ErrorCode.STORAGE_FULL, "storage full")
-
             streams_root = self._root / _STREAMS_DIR
-            self._ensure_dir(streams_root)
-            sdir = streams_root / _stream_dir_key(producer_stream)
-            self._ensure_dir(sdir)
-
-            order_idx = self._next_order_index()
-            base = f"{order_idx:016d}_{record_kind}_{sequence:020d}"
-            part_path = sdir / f"{base}{_PART_SUFFIX}"
-            final_path = sdir / f"{base}{_FRAME_SUFFIX}"
-            part_path.unlink(missing_ok=True)
-            fd = os.open(part_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            committed = False
-            try:
-                view = memoryview(frame_bytes)
-                written = 0
-                while written < len(frame_bytes):
-                    n = os.write(fd, view[written:])
-                    if n <= 0:
-                        raise BrainError(ErrorCode.IO_ERROR, "short write on outbox frame")
-                    written += n
-                os.close(fd)
-                fd = -1
-                self._secure_file(part_path)
-                _maybe_crashpoint("capture.outbox.after_write_before_fsync")
-                fd = os.open(part_path, os.O_RDWR)
-                os.fsync(fd)
-                os.close(fd)
-                fd = -1
-                os.replace(part_path, final_path)
-                self._sync_dir(sdir)
-                committed = True
-            except BrainError:
-                raise
-            except OSError as err:
-                raise _raise_storage_error(err, "cannot write outbox frame") from err
-            finally:
-                if fd != -1:
-                    try:
-                        os.close(fd)
-                    except OSError:
-                        pass
-                if not committed:
-                    part_path.unlink(missing_ok=True)
+            self._ensure_dir_tree(streams_root)
+            sdir = streams_root / stream_dir_key(producer_stream)
+            self._ensure_dir_tree(sdir)
+            base = f"{self._next_order_index():016d}_{record_kind}_{sequence:020d}"
+            self._atomic_publish_frame(
+                sdir / f"{base}{_FRAME_SUFFIX}",
+                sdir / f"{base}{_PART_SUFFIX}",
+                frame_bytes,
+                crashpoint_name="capture.outbox.after_write_before_fsync",
+            )
             return entry_id
 
     def enqueue_event(self, record: CaptureEventRecord, *, deadline_ns: int | None = None) -> str:
@@ -507,12 +438,9 @@ class OutboxSpool:
         if not isinstance(record, CaptureEventRecord):
             raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
         return self._enqueue_record(
-            record_kind=OUTBOX_RECORD_EVENT,
-            producer_stream=record.producer_stream,
-            sequence=record.sequence,
-            entry_id=record.event_id,
-            payload_dict=record.to_dict(),
-            deadline_ns=deadline_ns,
+            record_kind=OUTBOX_RECORD_EVENT, producer_stream=record.producer_stream,
+            sequence=record.sequence, entry_id=record.event_id,
+            payload_dict=record.to_dict(), deadline_ns=deadline_ns,
         )
 
     def enqueue_gap(self, gap: ProducerCaptureGap, *, deadline_ns: int | None = None) -> str:
@@ -520,12 +448,9 @@ class OutboxSpool:
         if not isinstance(gap, ProducerCaptureGap):
             raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
         return self._enqueue_record(
-            record_kind=OUTBOX_RECORD_GAP,
-            producer_stream=gap.producer_stream,
-            sequence=gap.sequence,
-            entry_id=gap.gap_id,
-            payload_dict=gap.to_dict(),
-            deadline_ns=deadline_ns,
+            record_kind=OUTBOX_RECORD_GAP, producer_stream=gap.producer_stream,
+            sequence=gap.sequence, entry_id=gap.gap_id,
+            payload_dict=gap.to_dict(), deadline_ns=deadline_ns,
         )
 
     def read_pending(
@@ -543,11 +468,9 @@ class OutboxSpool:
                 return []
             out: list[OutboxEntry] = []
             for path in self._iter_frame_paths(producer_stream=producer_stream):
-                entry = self._decode_frame_file(path)
-                if entry is not None:
-                    out.append(entry)
-                    if len(out) >= limit:
-                        break
+                out.append(self._decode_frame_file(path))
+                if len(out) >= limit:
+                    break
             return out
 
     def apply_ack(self, ack: CaptureBatchAck) -> int:
@@ -562,13 +485,13 @@ class OutboxSpool:
             evicted = 0
             for path in self._iter_frame_paths(producer_stream=ack.producer_stream):
                 entry = self._decode_frame_file(path)
-                if entry is not None and ack.allows_eviction(entry.record_kind, entry.sequence):
+                if ack.allows_eviction(entry.record_kind, entry.sequence):
                     path.unlink(missing_ok=True)
                     evicted += 1
             if evicted:
-                sdir = self._root / _STREAMS_DIR / _stream_dir_key(ack.producer_stream)
+                sdir = self._root / _STREAMS_DIR / stream_dir_key(ack.producer_stream)
                 if sdir.exists():
-                    self._sync_dir(sdir)
+                    sync_dir(sdir)
             return evicted
 
     def total_bytes(self) -> int:

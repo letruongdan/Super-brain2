@@ -1,12 +1,13 @@
-"""Store v6 capture event persistence, CAS 90-day holds, producer watermarks, and gap tracking."""
+"""Store v6 capture event persistence, CAS 90-day holds, producer watermarks, and O(batch) interval gap tracking."""
 
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Sequence
+from collections.abc import Iterable, Iterator, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from superbrain.core._kernel_base import require_opaque_id, require_positive_int
+from superbrain.core._kernel_base import require_opaque_id
 from superbrain.core._kernel_dispatch import require_aware_utc
 from superbrain.core.canonical import canonical_json
 from superbrain.core.errors import BrainError, ErrorCode
@@ -18,13 +19,37 @@ from superbrain.ports.capture import (
     CaptureStorePort,
     ProducerCaptureGap,
     StagedCaptureEvent,
-    compute_contiguous_event_acked_through,
+    require_capture_sequence,
 )
 from superbrain.storage.errors import sqlite_error
 from superbrain.storage.kinds import RetentionClass
 from superbrain.storage.store import Store
 
 _EVENT_RETENTION = timedelta(days=90)
+_SQL_CHUNK = 200
+
+
+@dataclass
+class _DaemonGapSpan:
+    gap_id: str
+    start: int
+    end: int
+    status: str
+    repo_id: str | None
+    checkout_id: str | None
+    recorded_at: str
+    closed_at: str | None
+
+
+def _chunk_ints(values: Iterable[int], size: int = _SQL_CHUNK) -> Iterator[list[int]]:
+    buf: list[int] = []
+    for val in values:
+        buf.append(val)
+        if len(buf) >= size:
+            yield buf
+            buf = []
+    if buf:
+        yield buf
 
 
 def _event_identity(
@@ -47,6 +72,201 @@ def _gap_identity(gap: ProducerCaptureGap) -> tuple[str, str, str]:
     return (gap.gap_id, gap.reason, gap.recorded_at)
 
 
+def _query_existing_events(
+    db: sqlite3.Connection, producer_stream: str, seqs: Iterable[int]
+) -> dict[int, tuple[str, str, str, str, str, str, str, str | None]]:
+    out: dict[int, tuple[str, str, str, str, str, str, str, str | None]] = {}
+    for chunk in _chunk_ints(seqs):
+        placeholders = ",".join("?" for _ in chunk)
+        rows = db.execute(
+            "SELECT sequence, event_id, payload_digest, kind, recorded_at, harness_id, "
+            f"repo_id, checkout_id, session_ref FROM capture_events "
+            f"WHERE producer_stream = ? AND sequence IN ({placeholders})",
+            (producer_stream, *chunk),
+        ).fetchall()
+        for row in rows:
+            out[int(row[0])] = (
+                str(row[1]), str(row[2]), str(row[3]), str(row[4]),
+                str(row[5]), str(row[6]), str(row[7]), None if row[8] is None else str(row[8]),
+            )
+    return out
+
+
+def _query_existing_prod_gaps(
+    db: sqlite3.Connection, producer_stream: str, seqs: Iterable[int]
+) -> dict[int, tuple[str, str, str]]:
+    out: dict[int, tuple[str, str, str]] = {}
+    for chunk in _chunk_ints(seqs):
+        placeholders = ",".join("?" for _ in chunk)
+        rows = db.execute(
+            "SELECT sequence, gap_id, reason, recorded_at FROM capture_gaps "
+            f"WHERE producer_stream = ? AND gap_origin = 'producer' AND sequence IN ({placeholders})",
+            (producer_stream, *chunk),
+        ).fetchall()
+        for row in rows:
+            out[int(row[0])] = (str(row[1]), str(row[2]), str(row[3]))
+    return out
+
+
+def _load_daemon_spans(db: sqlite3.Connection, producer_stream: str) -> list[_DaemonGapSpan]:
+    rows = db.execute(
+        "SELECT gap_id, sequence, estimated_count, status, repo_id, checkout_id, recorded_at, closed_at "
+        "FROM capture_gaps WHERE producer_stream = ? AND gap_origin = 'daemon' ORDER BY sequence ASC",
+        (producer_stream,),
+    ).fetchall()
+    spans: list[_DaemonGapSpan] = []
+    for row in rows:
+        start = int(row[1])
+        count = max(1, int(row[2]))
+        spans.append(
+            _DaemonGapSpan(
+                gap_id=str(row[0]),
+                start=start,
+                end=start + count - 1,
+                status=str(row[3]),
+                repo_id=None if row[4] is None else str(row[4]),
+                checkout_id=None if row[5] is None else str(row[5]),
+                recorded_at=str(row[6]),
+                closed_at=None if row[7] is None else str(row[7]),
+            )
+        )
+    return spans
+
+
+def _insert_daemon_span(
+    db: sqlite3.Connection,
+    *,
+    producer_stream: str,
+    start: int,
+    end: int,
+    status: str,
+    repo_id: str | None,
+    checkout_id: str | None,
+    recorded_at: str,
+    closed_at: str | None,
+) -> _DaemonGapSpan:
+    gid = new_id()
+    db.execute(
+        "INSERT INTO capture_gaps ("
+        "gap_id, producer_stream, sequence, gap_origin, status, reason, estimated_count, "
+        "duration_ms, repo_id, checkout_id, recorded_at, closed_at"
+        ") VALUES (?, ?, ?, 'daemon', ?, 'dropped', ?, NULL, ?, ?, ?, ?)",
+        (gid, producer_stream, start, status, end - start + 1, repo_id, checkout_id, recorded_at, closed_at),
+    )
+    return _DaemonGapSpan(
+        gap_id=gid,
+        start=start,
+        end=end,
+        status=status,
+        repo_id=repo_id,
+        checkout_id=checkout_id,
+        recorded_at=recorded_at,
+        closed_at=closed_at,
+    )
+
+
+def _subtract_seq_from_open_spans(
+    db: sqlite3.Connection,
+    spans: list[_DaemonGapSpan],
+    *,
+    producer_stream: str,
+    seq: int,
+) -> None:
+    for idx, span in enumerate(spans):
+        if span.status != "open" or not (span.start <= seq <= span.end):
+            continue
+        orig_end = span.end
+        if span.start == orig_end:
+            db.execute("DELETE FROM capture_gaps WHERE gap_id = ?", (span.gap_id,))
+            spans.pop(idx)
+        elif seq == span.start:
+            new_start = seq + 1
+            db.execute(
+                "UPDATE capture_gaps SET sequence = ?, estimated_count = ? WHERE gap_id = ?",
+                (new_start, orig_end - new_start + 1, span.gap_id),
+            )
+            span.start = new_start
+        elif seq == orig_end:
+            new_end = seq - 1
+            db.execute(
+                "UPDATE capture_gaps SET estimated_count = ? WHERE gap_id = ?",
+                (new_end - span.start + 1, span.gap_id),
+            )
+            span.end = new_end
+        else:
+            left_end = seq - 1
+            db.execute(
+                "UPDATE capture_gaps SET estimated_count = ? WHERE gap_id = ?",
+                (left_end - span.start + 1, span.gap_id),
+            )
+            span.end = left_end
+            right_span = _insert_daemon_span(
+                db,
+                producer_stream=producer_stream,
+                start=seq + 1,
+                end=orig_end,
+                status="open",
+                repo_id=span.repo_id,
+                checkout_id=span.checkout_id,
+                recorded_at=span.recorded_at,
+                closed_at=None,
+            )
+            spans.insert(idx + 1, right_span)
+        return
+
+
+def _add_missing_interval(
+    db: sqlite3.Connection,
+    spans: list[_DaemonGapSpan],
+    *,
+    producer_stream: str,
+    start: int,
+    end: int,
+    repo_id: str,
+    checkout_id: str,
+    recorded_at: str,
+) -> None:
+    if start > end:
+        return
+    cur = start
+    for sp in list(spans):
+        if sp.end < cur:
+            continue
+        if sp.start > end:
+            break
+        if cur < sp.start:
+            new_sp = _insert_daemon_span(
+                db,
+                producer_stream=producer_stream,
+                start=cur,
+                end=sp.start - 1,
+                status="open",
+                repo_id=repo_id,
+                checkout_id=checkout_id,
+                recorded_at=recorded_at,
+                closed_at=None,
+            )
+            spans.append(new_sp)
+        cur = max(cur, sp.end + 1)
+        if cur > end:
+            break
+    if cur <= end:
+        spans.append(
+            _insert_daemon_span(
+                db,
+                producer_stream=producer_stream,
+                start=cur,
+                end=end,
+                status="open",
+                repo_id=repo_id,
+                checkout_id=checkout_id,
+                recorded_at=recorded_at,
+                closed_at=None,
+            )
+        )
+    spans.sort(key=lambda item: item.start)
+
+
 class KernelCaptureStore(CaptureStorePort):
     """Transactional ``store v6`` capture storage backed by ``Store`` + 90-day ``EVENT_PAYLOAD`` CAS holds."""
 
@@ -58,50 +278,6 @@ class KernelCaptureStore(CaptureStorePort):
     def _require_v6(self) -> None:
         if self._store.schema_version < 6:
             raise BrainError(ErrorCode.CAPABILITY_UNAVAILABLE, "capability unavailable")
-
-    def _read_existing_state(
-        self,
-        db: sqlite3.Connection,
-        producer_stream: str,
-    ) -> tuple[
-        dict[int, tuple[str, str, str, str, str, str, str, str | None]],
-        dict[int, tuple[str, str, str]],
-        set[int],
-    ]:
-        ev_rows = db.execute(
-            "SELECT sequence, event_id, payload_digest, kind, recorded_at, harness_id, "
-            "repo_id, checkout_id, session_ref "
-            "FROM capture_events WHERE producer_stream = ?",
-            (producer_stream,),
-        ).fetchall()
-        events_by_seq: dict[int, tuple[str, str, str, str, str, str, str, str | None]] = {}
-        for row in ev_rows:
-            seq = int(row[0])
-            events_by_seq[seq] = (
-                str(row[1]),
-                str(row[2]),
-                str(row[3]),
-                str(row[4]),
-                str(row[5]),
-                str(row[6]),
-                str(row[7]),
-                None if row[8] is None else str(row[8]),
-            )
-
-        gap_rows = db.execute(
-            "SELECT sequence, gap_origin, gap_id, reason, recorded_at FROM capture_gaps WHERE producer_stream = ?",
-            (producer_stream,),
-        ).fetchall()
-        prod_gaps: dict[int, tuple[str, str, str]] = {}
-        daemon_gaps: set[int] = set()
-        for row in gap_rows:
-            seq = int(row[0])
-            origin = str(row[1])
-            if origin == "producer":
-                prod_gaps[seq] = (str(row[2]), str(row[3]), str(row[4]))
-            elif origin == "daemon":
-                daemon_gaps.add(seq)
-        return events_by_seq, prod_gaps, daemon_gaps
 
     def commit_staged_batch(
         self,
@@ -120,12 +296,13 @@ class KernelCaptureStore(CaptureStorePort):
         require_opaque_id(repo_id, label="repo_id")
         require_opaque_id(checkout_id, label="checkout_id")
         require_opaque_id(principal_id, label="principal_id")
-        require_aware_utc(now)
+        clock_now, committed_at = require_aware_utc(now)
 
         seen_events: dict[int, StagedCaptureEvent] = {}
         for ev in events:
             if not isinstance(ev, StagedCaptureEvent) or ev.record.producer_stream != producer_stream:
                 raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+            require_capture_sequence(ev.record.sequence)
             prev_ev = seen_events.get(ev.record.sequence)
             if prev_ev is None:
                 seen_events[ev.record.sequence] = ev
@@ -138,6 +315,7 @@ class KernelCaptureStore(CaptureStorePort):
         for gap in gaps:
             if not isinstance(gap, ProducerCaptureGap) or gap.producer_stream != producer_stream:
                 raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+            require_capture_sequence(gap.sequence)
             prev_gap = seen_gaps.get(gap.sequence)
             if prev_gap is None:
                 seen_gaps[gap.sequence] = gap
@@ -146,7 +324,8 @@ class KernelCaptureStore(CaptureStorePort):
 
         self._store._check()
         try:
-            existing_events, existing_prod_gaps, _ = self._read_existing_state(self._store._db, producer_stream)
+            existing_events = _query_existing_events(self._store._db, producer_stream, seen_events.keys())
+            existing_prod_gaps = _query_existing_prod_gaps(self._store._db, producer_stream, seen_gaps.keys())
         except sqlite3.Error as exc:
             raise sqlite_error("cannot read existing capture state", exc) from exc
 
@@ -171,9 +350,17 @@ class KernelCaptureStore(CaptureStorePort):
         acked_gap_seqs: set[int] = set()
 
         with self._store.transaction() as txn:
-            clock_now, committed_at = require_aware_utc(self._store._os.clock.now())
             expires_at_dt = clock_now + _EVENT_RETENTION
-            cur_events, cur_prod_gaps, cur_daemon_gaps = self._read_existing_state(txn.db, producer_stream)
+            cur_events = _query_existing_events(txn.db, producer_stream, seen_events.keys())
+            cur_prod_gaps = _query_existing_prod_gaps(txn.db, producer_stream, seen_gaps.keys())
+            wm_row = txn.db.execute(
+                "SELECT high_seq, contiguous_seq FROM producer_watermarks WHERE producer_stream = ?",
+                (producer_stream,),
+            ).fetchone()
+            prev_high_seq = int(wm_row[0]) if wm_row is not None else 0
+            prev_contiguous = int(wm_row[1]) if wm_row is not None else 0
+            daemon_spans = _load_daemon_spans(txn.db, producer_stream)
+            newly_covered: set[int] = set()
 
             for ev in events:
                 seq = ev.record.sequence
@@ -194,31 +381,14 @@ class KernelCaptureStore(CaptureStorePort):
                     "session_ref, source_metadata_json, committed_at"
                     ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
-                        producer_stream,
-                        seq,
-                        ev.record.event_id,
-                        ev.record.harness_id,
-                        ev.record.kind,
-                        ev.record.recorded_at,
-                        ev.payload_digest,
-                        cas_holder_id,
-                        ev.source,
-                        ev.source_verification,
-                        repo_id,
-                        checkout_id,
-                        principal_id,
-                        ev.record.session_ref,
-                        canonical_json(ev.record.source_metadata),
-                        committed_at,
+                        producer_stream, seq, ev.record.event_id, ev.record.harness_id, ev.record.kind,
+                        ev.record.recorded_at, ev.payload_digest, cas_holder_id, ev.source,
+                        ev.source_verification, repo_id, checkout_id, principal_id,
+                        ev.record.session_ref, canonical_json(ev.record.source_metadata), committed_at,
                     ),
                 )
-                if seq in cur_daemon_gaps:
-                    txn.db.execute(
-                        "DELETE FROM capture_gaps WHERE producer_stream = ? AND sequence = ? "
-                        "AND gap_origin = 'daemon' AND status = 'open'",
-                        (producer_stream, seq),
-                    )
                 cur_events[seq] = ident
+                newly_covered.add(seq)
                 accepted_count += 1
                 any_fresh_commit = True
                 committed_seqs.add(seq)
@@ -239,45 +409,40 @@ class KernelCaptureStore(CaptureStorePort):
                     "duration_ms, repo_id, checkout_id, recorded_at, closed_at"
                     ") VALUES (?, ?, ?, 'producer', 'producer', ?, ?, ?, ?, ?, ?, NULL)",
                     (
-                        gap.gap_id,
-                        producer_stream,
-                        seq,
-                        gap.reason,
-                        gap.estimated_count,
-                        gap.duration_ms,
-                        repo_id,
-                        checkout_id,
-                        gap.recorded_at,
+                        gap.gap_id, producer_stream, seq, gap.reason,
+                        gap.estimated_count, gap.duration_ms, repo_id, checkout_id, gap.recorded_at,
                     ),
                 )
-                if seq in cur_daemon_gaps:
-                    txn.db.execute(
-                        "DELETE FROM capture_gaps WHERE producer_stream = ? AND sequence = ? "
-                        "AND gap_origin = 'daemon' AND status = 'open'",
-                        (producer_stream, seq),
-                    )
                 cur_prod_gaps[seq] = g_ident
+                newly_covered.add(seq)
                 accepted_count += 1
                 any_fresh_commit = True
                 acked_gap_seqs.add(seq)
 
-            # Refresh daemon gap detection across [1..high_seq] for this producer stream.
-            high_seq = max((*cur_events.keys(), *cur_prod_gaps.keys()), default=0)
-            contiguous = compute_contiguous_event_acked_through(cur_events.keys())
-            for missing_seq in range(1, high_seq + 1):
-                if (
-                    missing_seq not in cur_events
-                    and missing_seq not in cur_prod_gaps
-                    and missing_seq not in cur_daemon_gaps
-                ):
-                    txn.db.execute(
-                        "INSERT INTO capture_gaps ("
-                        "gap_id, producer_stream, sequence, gap_origin, status, reason, estimated_count, "
-                        "duration_ms, repo_id, checkout_id, recorded_at, closed_at"
-                        ") VALUES (?, ?, ?, 'daemon', 'open', 'dropped', 1, NULL, ?, ?, ?, NULL)",
-                        (new_id(), producer_stream, missing_seq, repo_id, checkout_id, committed_at),
+            for cov_seq in sorted(s for s in newly_covered if s <= prev_high_seq):
+                _subtract_seq_from_open_spans(txn.db, daemon_spans, producer_stream=producer_stream, seq=cov_seq)
+
+            cursor = prev_high_seq
+            for high_new in sorted(s for s in newly_covered if s > prev_high_seq):
+                if high_new > cursor + 1:
+                    _add_missing_interval(
+                        txn.db, daemon_spans, producer_stream=producer_stream,
+                        start=cursor + 1, end=high_new - 1, repo_id=repo_id,
+                        checkout_id=checkout_id, recorded_at=committed_at,
                     )
-                    cur_daemon_gaps.add(missing_seq)
+                cursor = high_new
+            high_seq = max(prev_high_seq, cursor)
+
+            contiguous = prev_contiguous
+            for (seq_val,) in txn.db.execute(
+                "SELECT sequence FROM capture_events WHERE producer_stream = ? AND sequence > ? ORDER BY sequence ASC",
+                (producer_stream, prev_contiguous),
+            ):
+                seq_int = int(seq_val)
+                if seq_int == contiguous + 1:
+                    contiguous = seq_int
+                elif seq_int > contiguous + 1:
+                    break
 
             txn.db.execute(
                 "INSERT INTO producer_watermarks (producer_stream, high_seq, contiguous_seq, updated_at) "
@@ -314,7 +479,7 @@ class KernelCaptureStore(CaptureStorePort):
         """Persistently mark a daemon-detected sequence gap as ``closed`` inside a store transaction."""
         self._require_v6()
         require_opaque_id(producer_stream, label="producer_stream")
-        require_positive_int(sequence)
+        require_capture_sequence(sequence)
         _, closed_at = require_aware_utc(now)
         if repo_id is not None:
             require_opaque_id(repo_id, label="repo_id")
@@ -322,21 +487,57 @@ class KernelCaptureStore(CaptureStorePort):
             require_opaque_id(checkout_id, label="checkout_id")
 
         with self._store.transaction() as txn:
-            cur = txn.db.execute(
-                "UPDATE capture_gaps SET status = 'closed', closed_at = ? "
-                "WHERE producer_stream = ? AND sequence = ? AND gap_origin = 'daemon'",
-                (closed_at, producer_stream, sequence),
-            )
-            if cur.rowcount == 0:
-                txn.db.execute(
-                    "INSERT INTO capture_gaps ("
-                    "gap_id, producer_stream, sequence, gap_origin, status, reason, estimated_count, "
-                    "duration_ms, repo_id, checkout_id, recorded_at, closed_at"
-                    ") VALUES (?, ?, ?, 'daemon', 'closed', 'dropped', 1, NULL, ?, ?, ?, ?) "
-                    "ON CONFLICT (producer_stream, sequence, gap_origin) DO UPDATE SET "
-                    "status = 'closed', closed_at = excluded.closed_at",
-                    (new_id(), producer_stream, sequence, repo_id, checkout_id, closed_at, closed_at),
+            spans = _load_daemon_spans(txn.db, producer_stream)
+            for span in spans:
+                if not (span.start <= sequence <= span.end):
+                    continue
+                if span.status == "closed":
+                    txn.db.execute(
+                        "UPDATE capture_gaps SET closed_at = ? WHERE gap_id = ?",
+                        (closed_at, span.gap_id),
+                    )
+                    return
+                orig_end = span.end
+                eff_repo = repo_id if repo_id is not None else span.repo_id
+                eff_chk = checkout_id if checkout_id is not None else span.checkout_id
+                if span.start == orig_end:
+                    txn.db.execute(
+                        "UPDATE capture_gaps SET status = 'closed', closed_at = ? WHERE gap_id = ?",
+                        (closed_at, span.gap_id),
+                    )
+                    return
+                if sequence == span.start:
+                    txn.db.execute(
+                        "UPDATE capture_gaps SET sequence = ?, estimated_count = ? WHERE gap_id = ?",
+                        (sequence + 1, orig_end - sequence, span.gap_id),
+                    )
+                elif sequence == orig_end:
+                    txn.db.execute(
+                        "UPDATE capture_gaps SET estimated_count = ? WHERE gap_id = ?",
+                        (sequence - span.start, span.gap_id),
+                    )
+                else:
+                    txn.db.execute(
+                        "UPDATE capture_gaps SET estimated_count = ? WHERE gap_id = ?",
+                        (sequence - span.start, span.gap_id),
+                    )
+                    _insert_daemon_span(
+                        txn.db, producer_stream=producer_stream, start=sequence + 1, end=orig_end,
+                        status="open", repo_id=span.repo_id, checkout_id=span.checkout_id,
+                        recorded_at=span.recorded_at, closed_at=None,
+                    )
+                _insert_daemon_span(
+                    txn.db, producer_stream=producer_stream, start=sequence, end=sequence,
+                    status="closed", repo_id=eff_repo, checkout_id=eff_chk,
+                    recorded_at=span.recorded_at, closed_at=closed_at,
                 )
+                return
+
+            _insert_daemon_span(
+                txn.db, producer_stream=producer_stream, start=sequence, end=sequence,
+                status="closed", repo_id=repo_id, checkout_id=checkout_id,
+                recorded_at=closed_at, closed_at=closed_at,
+            )
 
     def read_capture_health(self) -> CaptureHealthSnapshot:
         """Read durable store v6 event/gap counts without modifying store state."""

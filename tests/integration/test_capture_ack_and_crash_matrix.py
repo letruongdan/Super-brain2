@@ -800,3 +800,427 @@ def test_sp2_2_wheel_crash_omission_detection(
     )
     ctx.case_dir.mkdir()
     run_sp2_2_omission_checks(ctx, monkeypatch)
+
+
+def test_capture_only_policy_keeps_payload_and_source_when_manual_submission_disabled() -> None:
+    from superbrain.cli_api.capture_client import CaptureClient
+
+    tpl = get_shared_t7_transport_template()
+    ws_a = tpl.ws_a
+    assert ws_a is not None
+    stream = "caponly-f1-stream"
+    cfg_dig = "sha256:" + ("c" * 64)
+
+    with open_test_loopback_transport(tpl, name="sp22-f1-caponly", domain=TransportTestDomain(ws_a=ws_a)) as h:
+        cap_cred, _cli_cred = _setup_capture_and_cli(h, ws_a, stream=stream)
+        cap_client = CaptureClient(h.open_client())
+        target = h.make_target()
+
+        def _configure_cap_only(*, automatic_capture: bool) -> None:
+            def _act() -> None:
+                session: Any = h.loop._session
+                assert session is not None
+                session._rt.policy.set_repo_policy(
+                    ws_a.repo_id,
+                    manual_submission_enabled=False,
+                    automatic_capture_enabled=automatic_capture,
+                )
+                session._rt.policy.set_layer2_state(
+                    harness_id="claude-code",
+                    host_version="2.1.325",
+                    config_digest=cfg_dig,
+                    state=Layer2State.VERIFIED,
+                )
+
+            h.loop.run_owner_action(_act).result(timeout=5.0)
+
+        _configure_cap_only(automatic_capture=True)
+        secret_pat = "github_pat_" + ("F1AbCdEf" * 4)
+        ev1 = _ev_dict(
+            1,
+            stream,
+            {
+                "tool": "Read",
+                "summary": "inspect <private>F1_TAG_SECRET_99</private> notes",
+                "path": "README.md",
+                "token": secret_pat,
+            },
+            source_metadata={"host_version": "2.1.325", "config_digest": cfg_dig},
+        )
+        ack1 = cap_client.post_batch(
+            target,
+            CaptureBatchCommand(stream, ws_a.repo_id, ws_a.checkout_id, (ev1,), cap_cred.token),
+        )
+        assert ack1.accepted_count == 1
+        assert ack1.policy_disabled is False
+        assert ack1.committed_event_sequences == (1,)
+
+        def _inspect_committed() -> tuple[str, str, dict[str, Any], dict[str, Any]]:
+            session: Any = h.loop._session
+            assert session is not None
+            rt = session._rt
+            row = rt.store._db.execute(
+                "SELECT source, source_verification, payload_digest, source_metadata_json "
+                "FROM capture_events WHERE producer_stream = ? AND sequence = 1",
+                (stream,),
+            ).fetchone()
+            assert row is not None
+            meta_obj = json.loads(bytes(row[3]))
+            payload_obj = json.loads(rt.store.cas.read(str(row[2])))
+            return str(row[0]), str(row[1]), meta_obj, payload_obj
+
+        src, sver, stored_meta, stored_payload = h.loop.run_owner_action(_inspect_committed).result(timeout=5.0)
+        assert (src, sver) == ("tool_observed", "verified_host")
+        assert stored_meta == {"host_version": "2.1.325", "config_digest": cfg_dig}
+        assert stored_payload["tool"] == "Read"
+        assert stored_payload["path"] == "README.md"
+        assert "inspect" in str(stored_payload["summary"])
+        dumped_payload = json.dumps(stored_payload, sort_keys=True)
+        assert "F1_TAG_SECRET_99" not in dumped_payload
+        assert secret_pat not in dumped_payload
+
+        # Negative checks remain enforced under manual_submission_enabled=False.
+        unclosed = _ev_dict(2, stream, {"note": "<private>F1_UNCLOSED_99"})
+        with pytest.raises(BrainError) as exc_unclosed:
+            cap_client.post_batch(
+                target,
+                CaptureBatchCommand(stream, ws_a.repo_id, ws_a.checkout_id, (unclosed,), cap_cred.token),
+            )
+        assert exc_unclosed.value.code is ErrorCode.INVALID_INPUT
+        assert "F1_UNCLOSED_99" not in str(exc_unclosed.value)
+
+        forged = _ev_dict(2, stream, {"raw_session_id": "raw-123"})
+        with pytest.raises(BrainError) as exc_forged:
+            cap_client.post_batch(
+                target,
+                CaptureBatchCommand(stream, ws_a.repo_id, ws_a.checkout_id, (forged,), cap_cred.token),
+            )
+        assert exc_forged.value.code is ErrorCode.INVALID_INPUT
+
+        _configure_cap_only(automatic_capture=False)
+        ack_off = cap_client.post_batch(
+            target,
+            CaptureBatchCommand(
+                stream,
+                ws_a.repo_id,
+                ws_a.checkout_id,
+                (_ev_dict(2, stream, {"tool": "Read", "summary": "ignored when disabled"}),),
+                cap_cred.token,
+            ),
+        )
+        assert ack_off.policy_disabled is True
+        assert ack_off.accepted_count == 0
+
+
+def test_capture_sparse_high_sequence_gap_intervals_closure_validation_and_clock_now() -> None:
+    from superbrain.cli_api.capture_client import CaptureClient
+    from superbrain.core.canonical import digest_bytes
+    from superbrain.ports.capture import CaptureEventRecord, StagedCaptureEvent
+    from superbrain.storage.capture_events import KernelCaptureStore
+
+    tpl = get_shared_t7_transport_template()
+    ws_a = tpl.ws_a
+    assert ws_a is not None
+    stream = "sparse-gap-f6"
+
+    with open_test_loopback_transport(tpl, name="sp22-f6-gaps", domain=TransportTestDomain(ws_a=ws_a)) as h:
+        cap_cred, _cli_cred = _setup_capture_and_cli(h, ws_a, stream=stream)
+        cap_client = CaptureClient(h.open_client())
+        target = h.make_target()
+
+        def _daemon_gaps_for(target_stream: str) -> list[tuple[int, str, int]]:
+            def _read() -> list[tuple[int, str, int]]:
+                session: Any = h.loop._session
+                assert session is not None
+                rows = session._rt.store._db.execute(
+                    "SELECT sequence, status, estimated_count FROM capture_gaps "
+                    "WHERE producer_stream = ? AND gap_origin = 'daemon' ORDER BY sequence ASC",
+                    (target_stream,),
+                ).fetchall()
+                return [(int(r[0]), str(r[1]), int(r[2])) for r in rows]
+
+            return h.loop.run_owner_action(_read).result(timeout=5.0)
+
+        # Sparse sequence=5_000_000 inserts 1 interval row [1..4_999_999], O(1), health degraded.
+        ack_high = cap_client.post_batch(
+            target,
+            CaptureBatchCommand(
+                stream,
+                ws_a.repo_id,
+                ws_a.checkout_id,
+                (_ev_dict(5_000_000, stream, {"sparse": "high"}, recorded_at="2026-11-21T12:00:01Z"),),
+                cap_cred.token,
+            ),
+        )
+        assert ack_high.accepted_count == 1
+        assert ack_high.contiguous_event_acked_through == 0
+        assert ack_high.committed_event_sequences == (5_000_000,)
+        gaps_after_high = _daemon_gaps_for(stream)
+        open_after_high = [g for g in gaps_after_high if g[1] == "open"]
+        assert open_after_high == [(1, "open", 4_999_999)]
+        assert "capture_gap_present" in _get_health(h, tpl.cred.token, deep=False)["degraded_codes"]
+
+        # Late sequence=2_000_000 splits open interval into [1..1_999_999] and [2_000_001..4_999_999].
+        ack_mid = cap_client.post_batch(
+            target,
+            CaptureBatchCommand(
+                stream,
+                ws_a.repo_id,
+                ws_a.checkout_id,
+                (_ev_dict(2_000_000, stream, {"sparse": "mid"}, recorded_at="2026-11-21T12:00:02Z"),),
+                cap_cred.token,
+            ),
+        )
+        assert ack_mid.accepted_count == 1
+        assert ack_mid.contiguous_event_acked_through == 0
+        gaps_after_mid = _daemon_gaps_for(stream)
+        open_after_mid = [g for g in gaps_after_mid if g[1] == "open"]
+        assert open_after_mid == [(1, "open", 1_999_999), (2_000_001, "open", 2_999_999)]
+
+        # Closing sequence=2 produces closed_gaps == 1 while leaving remaining open intervals open.
+        def _close_seq2() -> tuple[int, int, bool]:
+            session: Any = h.loop._session
+            assert session is not None
+            cstore = KernelCaptureStore(session._rt.store)
+            cstore.mark_daemon_gap_closed(producer_stream=stream, sequence=2, now=h.clock.now())
+            snap = cstore.read_capture_health()
+            return snap.open_gaps, snap.closed_gaps, snap.has_gaps
+
+        open_cnt, closed_cnt, has_gaps = h.loop.run_owner_action(_close_seq2).result(timeout=5.0)
+        assert closed_cnt == 1
+        assert open_cnt >= 1
+        assert has_gaps is True
+        gaps_after_close = _daemon_gaps_for(stream)
+        assert [(s, c) for s, st, c in gaps_after_close if st == "closed"] == [(2, 1)]
+        remaining_open = [(s, c) for s, st, c in gaps_after_close if st == "open"]
+        assert sum(c for _s, c in remaining_open) == 4_999_997
+        assert all(not (s <= 2 < s + c) for s, c in remaining_open)
+
+        # Oversized sequence=10**20 rejected with INVALID_INPUT.
+        with pytest.raises(BrainError) as exc_huge:
+            cap_client.post_batch(
+                target,
+                CaptureBatchCommand(
+                    stream,
+                    ws_a.repo_id,
+                    ws_a.checkout_id,
+                    (_ev_dict(10**20, stream, {"bad": "huge"}, recorded_at="2026-11-21T12:00:03Z"),),
+                    cap_cred.token,
+                ),
+            )
+        assert exc_huge.value.code is ErrorCode.INVALID_INPUT
+
+        # Explicit now passed to KernelCaptureStore.commit_staged_batch is persisted rather than overwritten.
+        custom_now = datetime(2029, 3, 15, 10, 45, 0, tzinfo=UTC)
+        clock_stream = "clock-now-f6"
+
+        def _commit_with_custom_now() -> tuple[str, str, str]:
+            session: Any = h.loop._session
+            assert session is not None
+            rt = session._rt
+            cstore = KernelCaptureStore(rt.store)
+            rec = CaptureEventRecord(
+                event_id="ev-clock-f6-1",
+                producer_stream=clock_stream,
+                sequence=1,
+                harness_id="claude-code",
+                kind="tool_post",
+                recorded_at="2026-11-21T12:00:04Z",
+                payload={"clock": "explicit"},
+            )
+            p_bytes = canonical_json(rec.payload)
+            staged = StagedCaptureEvent(
+                record=rec,
+                payload_bytes=p_bytes,
+                payload_digest=digest_bytes(p_bytes),
+                source="unknown",
+                source_verification="unverified",
+            )
+            cstore.commit_staged_batch(
+                producer_stream=clock_stream,
+                repo_id=ws_a.repo_id,
+                checkout_id=ws_a.checkout_id,
+                principal_id=cap_cred.principal.principal_id,
+                events=(staged,),
+                gaps=(),
+                now=custom_now,
+            )
+            ev_row = rt.store._db.execute(
+                "SELECT committed_at, cas_holder_id FROM capture_events WHERE producer_stream = ? AND sequence = 1",
+                (clock_stream,),
+            ).fetchone()
+            assert ev_row is not None
+            wm_row = rt.store._db.execute(
+                "SELECT updated_at FROM producer_watermarks WHERE producer_stream = ?",
+                (clock_stream,),
+            ).fetchone()
+            assert wm_row is not None
+            hold_row = rt.store._db.execute(
+                "SELECT expires_at FROM p_cas_holders_ WHERE holder_kind = 'event' AND holder_id = ?",
+                (str(ev_row[1]),),
+            ).fetchone()
+            assert hold_row is not None
+            return str(ev_row[0]), str(wm_row[0]), str(hold_row[0])
+
+        committed_at_s, updated_at_s, expires_at_s = h.loop.run_owner_action(_commit_with_custom_now).result(
+            timeout=5.0
+        )
+        assert committed_at_s == "2029-03-15T10:45:00.000000Z"
+        assert updated_at_s == "2029-03-15T10:45:00.000000Z"
+        assert expires_at_s == "2029-06-13T10:45:00.000000Z"
+
+
+def _sized_capture_dict(seq: int, stream: str, target_bytes: int) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    i = 0
+    while True:
+        sample = _ev_dict(
+            seq,
+            stream,
+            payload,
+            event_id=f"ev-f7-{seq}",
+            recorded_at="2026-11-21T12:20:00Z",
+        )
+        cur = len(canonical_json(sample))
+        rem = target_bytes - cur
+        if rem <= 12:
+            break
+        take = min(50_000, max(1, rem - 10))
+        payload[f"k{i:03d}"] = "x" * take
+        i += 1
+    return _ev_dict(
+        seq,
+        stream,
+        payload,
+        event_id=f"ev-f7-{seq}",
+        recorded_at="2026-11-21T12:20:00Z",
+    )
+
+
+def test_drain_outbox_chunks_large_backlog_and_stops_on_mid_drain_policy_disable(trusted_tmp: Path) -> None:
+    from superbrain.adapters.os.locks import OUTBOX_FILE_LOCK
+    from superbrain.cli_api.capture_client import CaptureClient
+    from superbrain.cli_api.loopback import LoopbackTarget
+    from superbrain.composition.capture_drain_entry import drain_outbox
+    from superbrain.domain.capture.outbox_rules import partition_pending_for_batch
+    from superbrain.ports.capture import CaptureBatchAck, CaptureEventRecord
+    from superbrain.storage.outbox import OutboxSpool
+
+    os_ = os_adapters()
+    tpl = get_shared_t7_transport_template()
+    ws_a = tpl.ws_a
+    assert ws_a is not None
+    stream1 = "f7-drain-full"
+    stream2 = "f7-drain-mid"
+
+    with open_test_loopback_transport(tpl, name="sp22-f7-drain", domain=TransportTestDomain(ws_a=ws_a)) as h:
+        cap1, _ = _setup_capture_and_cli(h, ws_a, stream=stream1)
+        cap2_holder: list[Any] = []
+
+        def _setup_stream2() -> None:
+            cap2_holder.append(
+                _setup_capture_producer(
+                    h, harness_id="claude-code", stream=stream2, repo_id=ws_a.repo_id, checkout_id=ws_a.checkout_id
+                )
+            )
+
+        h.loop.run_owner_action(_setup_stream2).result(timeout=5.0)
+        cap2 = cap2_holder[0]
+        cap_client = CaptureClient(h.open_client())
+        target = h.make_target()
+
+        # Part A: 7 x 200 KB + ~950 KB record drains cleanly across multiple batches to 0 bytes.
+        outbox1 = trusted_tmp / "outbox-f7-full"
+        spool1 = OutboxSpool(outbox1, permissions=os_.permissions, file_lock=OUTBOX_FILE_LOCK)
+        for seq in range(1, 8):
+            spool1.enqueue_event(CaptureEventRecord.from_dict(_sized_capture_dict(seq, stream1, 200_000)))
+        spool1.enqueue_event(CaptureEventRecord.from_dict(_sized_capture_dict(8, stream1, 950_000)))
+        assert spool1.total_bytes() > 2_000_000
+
+        ack_full = drain_outbox(
+            spool1,
+            client=cap_client,
+            target=target,
+            producer_stream=stream1,
+            repo_id=ws_a.repo_id,
+            checkout_id=ws_a.checkout_id,
+            token=cap1.token,
+        )
+        assert ack_full is not None
+        assert ack_full.accepted_count == 8
+        assert ack_full.committed_event_sequences == (1, 2, 3, 4, 5, 6, 7, 8)
+        assert ack_full.contiguous_event_acked_through == 8
+        assert ack_full.policy_disabled is False
+        assert spool1.total_bytes() == 0
+        assert spool1.read_pending(limit=20, producer_stream=stream1) == []
+
+        # Part B: Mid-drain automatic_capture_enabled=False after batch 1 preserves batch 2 in outbox.
+        outbox2 = trusted_tmp / "outbox-f7-mid"
+        spool2 = OutboxSpool(outbox2, permissions=os_.permissions, file_lock=OUTBOX_FILE_LOCK)
+        for seq in range(1, 8):
+            spool2.enqueue_event(CaptureEventRecord.from_dict(_sized_capture_dict(seq, stream2, 200_000)))
+        planned = partition_pending_for_batch(spool2.read_pending(limit=20, producer_stream=stream2))
+        assert len(planned) >= 2
+        batch1_len = len(planned[0])
+        assert 1 <= batch1_len < 7
+
+        def _set_auto_capture(enabled: bool) -> None:
+            def _act() -> None:
+                session: Any = h.loop._session
+                assert session is not None
+                session._rt.policy.set_repo_policy(ws_a.repo_id, automatic_capture_enabled=enabled)
+
+            h.loop.run_owner_action(_act).result(timeout=5.0)
+
+        class _ToggleAfterFirstBatchClient(CaptureClient):
+            def __init__(self, inner_loopback: Any) -> None:
+                super().__init__(inner_loopback)
+                self.calls = 0
+
+            def post_batch(
+                self,
+                t: LoopbackTarget,
+                command: CaptureBatchCommand,
+                *,
+                deadline_ns: int | None = None,
+            ) -> CaptureBatchAck:
+                self.calls += 1
+                ack = super().post_batch(t, command, deadline_ns=deadline_ns)
+                if self.calls == 1:
+                    _set_auto_capture(False)
+                return ack
+
+        toggle_client = _ToggleAfterFirstBatchClient(h.open_client())
+        ack_mid = drain_outbox(
+            spool2,
+            client=toggle_client,
+            target=target,
+            producer_stream=stream2,
+            repo_id=ws_a.repo_id,
+            checkout_id=ws_a.checkout_id,
+            token=cap2.token,
+        )
+        assert ack_mid is not None
+        assert ack_mid.policy_disabled is True
+        assert ack_mid.accepted_count == batch1_len
+        assert ack_mid.committed_event_sequences == tuple(range(1, batch1_len + 1))
+
+        remaining = spool2.read_pending(limit=20, producer_stream=stream2)
+        assert [e.sequence for e in remaining] == list(range(batch1_len + 1, 8))
+
+        # Re-enable automatic capture and complete draining remaining entries.
+        _set_auto_capture(True)
+        ack_rest = drain_outbox(
+            spool2,
+            client=cap_client,
+            target=target,
+            producer_stream=stream2,
+            repo_id=ws_a.repo_id,
+            checkout_id=ws_a.checkout_id,
+            token=cap2.token,
+        )
+        assert ack_rest is not None
+        assert ack_rest.policy_disabled is False
+        assert ack_rest.accepted_count == 7 - batch1_len
+        assert spool2.total_bytes() == 0
+        assert spool2.read_pending(limit=20, producer_stream=stream2) == []

@@ -374,9 +374,12 @@ def test_hook_entry_subprocess_enqueues_sanitized_stays_within_budget_and_import
     assert res.returncode == 0, res.stderr.decode(errors="replace")
     assert cold_ns < 2_000_000_000, f"cold hook subprocess exceeded 2s hard cap: {cold_ns} ns"
 
+    from superbrain.adapters.os import os_adapters
+    from superbrain.adapters.os.locks import OUTBOX_FILE_LOCK
     from superbrain.storage.outbox import OutboxSpool
 
-    spool = OutboxSpool(outbox_dir)
+    os_ = os_adapters()
+    spool = OutboxSpool(outbox_dir, permissions=os_.permissions, file_lock=OUTBOX_FILE_LOCK)
     pending = spool.read_pending(limit=10)
     assert len(pending) == 1
     assert secret not in pending[0].payload_json
@@ -413,7 +416,9 @@ def test_hook_entry_subprocess_enqueues_sanitized_stays_within_budget_and_import
     assert res_sess.returncode == 0
     assert raw_session.encode() not in res_sess.stdout + res_sess.stderr
     if sess_outbox.exists():
-        assert OutboxSpool(sess_outbox).read_pending(limit=10) == []
+        assert OutboxSpool(
+            sess_outbox, permissions=os_.permissions, file_lock=OUTBOX_FILE_LOCK
+        ).read_pending(limit=10) == []
         assert sum(p.stat().st_size for p in sess_outbox.rglob("*") if p.is_file()) == 0
     assert sess_log.is_file()
     sess_log_text = sess_log.read_text(encoding="utf-8")
@@ -485,10 +490,14 @@ def test_hook_entry_privacy_rejection_exits_zero_with_zero_leaks_and_static_log(
     assert res.returncode == 0
     assert secret_bait.encode() not in res.stdout + res.stderr
 
+    from superbrain.adapters.os import os_adapters
+    from superbrain.adapters.os.locks import OUTBOX_FILE_LOCK
     from superbrain.storage.outbox import OutboxSpool
 
     if outbox_dir.exists():
-        assert OutboxSpool(outbox_dir).read_pending(limit=10) == []
+        assert OutboxSpool(
+            outbox_dir, permissions=os_adapters().permissions, file_lock=OUTBOX_FILE_LOCK
+        ).read_pending(limit=10) == []
         for fpath in outbox_dir.rglob("*"):
             if fpath.is_file():
                 assert secret_bait.encode() not in fpath.read_bytes()
@@ -521,6 +530,11 @@ def test_hook_entry_timeout_writes_hook_timeout_gap_and_exits_zero(trusted_tmp: 
     def fake_mono() -> int:
         return now[0]
 
+    from superbrain.adapters.os import os_adapters
+    from superbrain.adapters.os.locks import OUTBOX_FILE_LOCK
+
+    os_ = os_adapters()
+
     class _StallingSpool(OutboxSpool):
         def enqueue_event(self, record: CaptureEventRecord, *, deadline_ns: int | None = None) -> str:
             # Simulate stalling disk I/O past HOOK_HARD_CAP_NS (no real sleep in gate).
@@ -528,7 +542,9 @@ def test_hook_entry_timeout_writes_hook_timeout_gap_and_exits_zero(trusted_tmp: 
             return str(super().enqueue_event(record, deadline_ns=deadline_ns))
 
     def _factory(path: Path) -> OutboxSpool:
-        return _StallingSpool(path, monotonic_ns=fake_mono)
+        return _StallingSpool(
+            path, monotonic_ns=fake_mono, permissions=os_.permissions, file_lock=OUTBOX_FILE_LOCK
+        )
 
     rc = run_hook(
         raw_bytes,
@@ -539,7 +555,7 @@ def test_hook_entry_timeout_writes_hook_timeout_gap_and_exits_zero(trusted_tmp: 
     )
     assert rc == 0
 
-    reopened = OutboxSpool(outbox_dir)
+    reopened = OutboxSpool(outbox_dir, permissions=os_.permissions, file_lock=OUTBOX_FILE_LOCK)
     entries = reopened.read_pending(limit=10)
     assert len(entries) == 1
     assert entries[0].record_kind == OUTBOX_RECORD_GAP
@@ -564,7 +580,7 @@ def test_hook_entry_timeout_writes_hook_timeout_gap_and_exits_zero(trusted_tmp: 
             raise BrainError(ErrorCode.IO_ERROR, "disk unwritable")
 
     def broken_factory(p: Path) -> OutboxSpool:
-        return _BrokenSpool(p, monotonic_ns=fake_mono)
+        return _BrokenSpool(p, monotonic_ns=fake_mono, permissions=os_.permissions, file_lock=OUTBOX_FILE_LOCK)
     rc_broken = run_hook(
         raw_bytes,
         outbox_dir=trusted_tmp / "outbox-broken",
@@ -573,3 +589,287 @@ def test_hook_entry_timeout_writes_hook_timeout_gap_and_exits_zero(trusted_tmp: 
         spool_factory=broken_factory,
     )
     assert rc_broken == 0
+
+
+def test_capture_privacy_gate_preserves_payload_and_metadata_with_manual_submission_disabled() -> None:
+    from superbrain.application.privacy import PrivacyFilter
+    from superbrain.domain.capture.privacy_gate import CapturePrivacyGate
+    from superbrain.ports.capture import CaptureEventRecord
+
+    gate = CapturePrivacyGate(PrivacyFilter())
+    secret_pat = "github_pat_" + ("Z9y8X7w6" * 5)
+    raw = CaptureEventRecord(
+        event_id="evt-caponly-unit-1",
+        producer_stream="claude-hook-chk-a",
+        sequence=1,
+        harness_id="claude-code",
+        kind="tool_post",
+        recorded_at="2026-11-21T12:00:00Z",
+        payload={
+            "tool": "Read",
+            "summary": "read <private>SECRET_TAG_F1</private> docs",
+            "path": "README.md",
+            "token": secret_pat,
+        },
+        session_ref="sha256:" + ("a" * 64),
+        source_metadata={"host_version": "2.1.325", "config_digest": "sha256:" + ("c" * 64)},
+    )
+    sanitized = gate.sanitize_event(raw, policy=FilterPolicy(manual_submission=False))
+    serialized = json.dumps(sanitized.to_dict(), sort_keys=True)
+    assert sanitized.payload["tool"] == "Read"
+    assert sanitized.payload["path"] == "README.md"
+    assert "read" in str(sanitized.payload["summary"])
+    assert "SECRET_TAG_F1" not in serialized
+    assert secret_pat not in serialized
+    assert dict(sanitized.source_metadata) == {
+        "host_version": "2.1.325",
+        "config_digest": "sha256:" + ("c" * 64),
+    }
+
+
+def test_hook_entry_secures_outbox_and_log_even_under_loose_parent_acls(trusted_tmp: Path) -> None:
+    from superbrain.adapters.os import os_adapters
+    from tests.support.winacl import grant
+
+    os_ = os_adapters()
+    loose_parent = trusted_tmp / "loose-parent-f3"
+    loose_parent.mkdir()
+    if sys.platform == "win32":
+        grant(loose_parent, "S-1-1-0", 0x120089, flags=0x3)
+    else:
+        os.chmod(loose_parent, 0o755)
+    assert os_.permissions.problems(loose_parent), "precondition: loose parent must have insecure ACL/mode"
+
+    outbox_dir = loose_parent / "outbox"
+    log_path = loose_parent / "hook.log"
+    hook_cmd = (
+        "import os, sys; "
+        "os.umask(0o022) if os.name == 'posix' else None; "
+        "from superbrain.composition.hook_entry import main; "
+        "sys.exit(main(sys.argv[1:]))"
+    )
+    ev_bytes = json.dumps(_base_event_dict(event_id="evt-acl-f3")).encode()
+    res_ok = subprocess.run(
+        [sys.executable, "-I", "-c", hook_cmd, "--outbox", str(outbox_dir), "--log", str(log_path)],
+        input=ev_bytes,
+        env=_clean_hook_env(),
+        capture_output=True,
+        check=False,
+        timeout=15.0,
+    )
+    assert res_ok.returncode == 0, res_ok.stderr.decode(errors="replace")
+
+    res_log = subprocess.run(
+        [sys.executable, "-I", "-c", hook_cmd, "--outbox", str(outbox_dir), "--log", str(log_path)],
+        input=b"not valid json",
+        env=_clean_hook_env(),
+        capture_output=True,
+        check=False,
+        timeout=15.0,
+    )
+    assert res_log.returncode == 0, res_log.stderr.decode(errors="replace")
+    assert log_path.is_file()
+    assert os_.permissions.problems(outbox_dir) == []
+    assert os_.permissions.object_problems(log_path) == []
+
+
+def test_hook_entry_bounded_under_spool_lock_contention_and_refuses_gap_raw_session_leak(
+    trusted_tmp: Path,
+) -> None:
+    from superbrain.adapters.os import os_adapters
+    from superbrain.adapters.os.locks import OUTBOX_FILE_LOCK
+    from superbrain.composition.hook_entry import run_hook
+    from superbrain.ports.capture import CaptureEventRecord
+    from superbrain.storage.outbox import OutboxSpool
+
+    os_ = os_adapters()
+    outbox_dir = trusted_tmp / "contended-outbox"
+    spool = OutboxSpool(outbox_dir, permissions=os_.permissions, file_lock=OUTBOX_FILE_LOCK)
+    spool.enqueue_event(
+        CaptureEventRecord(
+            event_id="evt-pre-lock-1",
+            producer_stream="s-lock-test",
+            sequence=1,
+            harness_id="claude-code",
+            kind="tool_post",
+            recorded_at="2026-11-21T12:00:00Z",
+            payload={"ok": "init"},
+        )
+    )
+    lock_file = outbox_dir / ".spool.lock"
+    assert lock_file.is_file()
+
+    holder_code = (
+        "import os, sys, time; "
+        "from superbrain.adapters.os.locks import OUTBOX_FILE_LOCK; "
+        "fd = os.open(sys.argv[1], os.O_CREAT | os.O_RDWR, 0o600); "
+        "locked = OUTBOX_FILE_LOCK.try_lock_fd(fd); "
+        "assert locked; "
+        "sys.stdout.write('LOCKED\\n'); sys.stdout.flush(); "
+        "time.sleep(2.5); "
+        "OUTBOX_FILE_LOCK.unlock_fd(fd); os.close(fd)"
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-I", "-c", holder_code, str(lock_file)],
+        env=_clean_hook_env(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert proc.stdout is not None
+        ready_line = proc.stdout.readline().strip()
+        assert ready_line == "LOCKED", proc.stderr.read() if proc.stderr is not None else ""
+
+        log_path = trusted_tmp / "contended-hook.log"
+        raw_bytes = json.dumps(
+            _base_event_dict(event_id="evt-locked-2", producer_stream="s-lock-test", sequence=2)
+        ).encode()
+        t0 = time.monotonic()
+        rc = run_hook(raw_bytes, outbox_dir=outbox_dir, log_path=log_path, cap_ns=200_000_000)
+        elapsed = time.monotonic() - t0
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+        proc.wait(timeout=5.0)
+
+    assert rc == 0
+    assert elapsed < 1.0, f"run_hook exceeded bounded cap under lock contention: {elapsed:.3f}s"
+    assert log_path.is_file()
+    assert "deadline_exceeded" in log_path.read_text(encoding="utf-8")
+
+    # ProducerCaptureGap refusing raw_session_id leaks in gap_id and producer_stream
+    raw_sess = "raw-sess-gap-bait-4421"
+    for idx, gap_override in enumerate(
+        (
+            {"gap_id": f"gap-{raw_sess}-0", "producer_stream": "gap-clean-stream"},
+            {"gap_id": "gap-clean-1", "producer_stream": f"stream-{raw_sess}-1"},
+        )
+    ):
+        g_outbox = trusted_tmp / f"gap-neg-outbox-{idx}"
+        g_log = trusted_tmp / f"gap-neg-{idx}.log"
+        g_bytes = json.dumps(_base_gap_dict(**gap_override)).encode()
+        g_rc = run_hook(g_bytes, outbox_dir=g_outbox, log_path=g_log, raw_session_id=raw_sess)
+        assert g_rc == 0
+        if g_outbox.exists():
+            assert (
+                OutboxSpool(g_outbox, permissions=os_.permissions, file_lock=OUTBOX_FILE_LOCK).read_pending(limit=10)
+                == []
+            )
+            for p in g_outbox.rglob("*"):
+                if p.is_file():
+                    assert raw_sess.encode() not in p.read_bytes()
+        assert g_log.is_file()
+        g_log_text = g_log.read_text(encoding="utf-8")
+        assert "invalid_input" in g_log_text
+        assert raw_sess not in g_log_text
+
+    # Clean ProducerCaptureGap with raw_session_id passed still succeeds.
+    good_outbox = trusted_tmp / "gap-pos-outbox"
+    good_bytes = json.dumps(_base_gap_dict(gap_id="gap-clean-ok", producer_stream="gap-clean-stream")).encode()
+    assert run_hook(good_bytes, outbox_dir=good_outbox, raw_session_id=raw_sess) == 0
+    assert (
+        len(
+            OutboxSpool(good_outbox, permissions=os_.permissions, file_lock=OUTBOX_FILE_LOCK).read_pending(limit=10)
+        )
+        == 1
+    )
+
+
+def _sized_event_dict(seq: int, target_bytes: int, *, stream: str = "s-f7-size") -> dict[str, Any]:
+    from superbrain.core.canonical import canonical_json
+
+    chunk = 50_000
+    payload: dict[str, Any] = {}
+    i = 0
+    while True:
+        sample = _base_event_dict(event_id=f"ev-sz-{seq}", producer_stream=stream, sequence=seq, payload=payload)
+        cur = len(canonical_json(sample))
+        rem = target_bytes - cur
+        if rem <= 12:
+            break
+        take = min(chunk, max(1, rem - 10))
+        payload[f"k{i:03d}"] = "x" * take
+        i += 1
+    return _base_event_dict(event_id=f"ev-sz-{seq}", producer_stream=stream, sequence=seq, payload=payload)
+
+
+def test_outbox_wire_batch_limit_oversized_record_and_int64_sequence_bounds(trusted_tmp: Path) -> None:
+    from superbrain.adapters.os import os_adapters
+    from superbrain.adapters.os.locks import OUTBOX_FILE_LOCK
+    from superbrain.cli_api._loopback_wire import encode_capture_batch
+    from superbrain.core._json_parse import MAX_WIRE_BODY_BYTES
+    from superbrain.core.canonical import canonical_json
+    from superbrain.core.kernel import CaptureBatchCommand
+    from superbrain.domain.capture.envelope import normalize_capture_record
+    from superbrain.domain.capture.outbox_rules import DEFAULT_MAX_WIRE_BATCH_BYTES, partition_pending_for_batch
+    from superbrain.ports.capture import CaptureEventRecord
+    from superbrain.storage.outbox import OutboxSpool
+
+    os_ = os_adapters()
+    assert DEFAULT_MAX_WIRE_BATCH_BYTES <= MAX_WIRE_BODY_BYTES - 4096
+
+    # 1_046_000 B single record rejected cleanly; 950_000 B succeeds and encodes within MAX_WIRE_BODY_BYTES.
+    big_dict = _sized_event_dict(1, 1_046_000)
+    big_bytes = len(canonical_json(big_dict))
+    assert 1_045_000 <= big_bytes < MAX_WIRE_BODY_BYTES
+
+    with pytest.raises(BrainError) as exc_big:
+        rec_big = normalize_capture_record(big_dict)
+        assert isinstance(rec_big, CaptureEventRecord)
+        big_spool = OutboxSpool(trusted_tmp / "big-spool", permissions=os_.permissions, file_lock=OUTBOX_FILE_LOCK)
+        big_spool.enqueue_event(rec_big)
+        for batch in partition_pending_for_batch(big_spool.read_pending(limit=10)):
+            encode_capture_batch(
+                CaptureBatchCommand(
+                    "s-f7-size", "r1", "c1", tuple(json.loads(e.payload_json) for e in batch), "tok"
+                )
+            )
+    assert exc_big.value.code is ErrorCode.INVALID_INPUT
+
+    ok_dict = _sized_event_dict(2, 950_000)
+    rec_ok = normalize_capture_record(ok_dict)
+    assert isinstance(rec_ok, CaptureEventRecord)
+    ok_spool = OutboxSpool(trusted_tmp / "ok-spool", permissions=os_.permissions, file_lock=OUTBOX_FILE_LOCK)
+    ok_spool.enqueue_event(rec_ok)
+    ok_batches = partition_pending_for_batch(ok_spool.read_pending(limit=10))
+    assert len(ok_batches) == 1
+    encoded_ok = encode_capture_batch(
+        CaptureBatchCommand(
+            "s-f7-size", "r1", "c1", tuple(json.loads(e.payload_json) for e in ok_batches[0]), "tok"
+        )
+    )
+    assert len(encoded_ok) <= MAX_WIRE_BODY_BYTES
+
+    # 7 x 200 KB entries split cleanly across >= 2 batches using default partition_pending_for_batch args.
+    chunk_spool = OutboxSpool(trusted_tmp / "chunk-spool", permissions=os_.permissions, file_lock=OUTBOX_FILE_LOCK)
+    for seq in range(1, 8):
+        rec = normalize_capture_record(_sized_event_dict(seq, 200_000, stream="s-f7-200k"))
+        assert isinstance(rec, CaptureEventRecord)
+        chunk_spool.enqueue_event(rec)
+    batches = partition_pending_for_batch(chunk_spool.read_pending(limit=20, producer_stream="s-f7-200k"))
+    assert len(batches) >= 2
+    seen_seqs: list[int] = []
+    for batch in batches:
+        assert sum(e.byte_size for e in batch) <= DEFAULT_MAX_WIRE_BATCH_BYTES
+        enc = encode_capture_batch(
+            CaptureBatchCommand(
+                "s-f7-200k", "r1", "c1", tuple(json.loads(e.payload_json) for e in batch), "tok"
+            )
+        )
+        assert len(enc) <= MAX_WIRE_BODY_BYTES
+        seen_seqs.extend(e.sequence for e in batch)
+    assert seen_seqs == [1, 2, 3, 4, 5, 6, 7]
+
+    # Signed int64 sequence boundary enforcement (F6 domain boundary)
+    max_i64 = (2**63) - 1
+    ok_i64 = normalize_capture_record(_base_event_dict(sequence=max_i64))
+    assert isinstance(ok_i64, CaptureEventRecord) and ok_i64.sequence == max_i64
+    for bad_seq_raw in (
+        _base_event_dict(sequence=2**63),
+        _base_event_dict(sequence=10**20),
+        _base_gap_dict(sequence=10**20),
+    ):
+        with pytest.raises(BrainError) as exc_seq:
+            normalize_capture_record(bad_seq_raw)
+        assert exc_seq.value.code is ErrorCode.INVALID_INPUT

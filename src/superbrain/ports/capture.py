@@ -9,6 +9,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Protocol
 
+from superbrain.core._json_parse import MAX_WIRE_BODY_BYTES
 from superbrain.core._kernel_base import (
     is_strict_int,
     require_non_negative_int,
@@ -18,12 +19,21 @@ from superbrain.core._kernel_base import (
     require_sha256_digest,
 )
 from superbrain.core._kernel_workspace import FilterPolicy, SafePayload
-from superbrain.core.canonical import validate_json
+from superbrain.core.canonical import canonical_json, validate_json
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.jsonvalue import JsonValue
 
 DEFAULT_OUTBOX_MAX_BYTES = 104_857_600
 """Default per-outbox disk cap (100 MiB = 104,857,600 bytes)."""
+
+MAX_CAPTURE_SEQUENCE = (1 << 63) - 1
+"""Maximum valid capture sequence fitting signed 64-bit SQLite storage."""
+
+CAPTURE_WIRE_OVERHEAD_RESERVE_BYTES = 4096
+"""Reserved bytes below ``MAX_WIRE_BODY_BYTES`` for loopback batch envelope metadata."""
+
+MAX_CAPTURE_ENTRY_BYTES = MAX_WIRE_BODY_BYTES - CAPTURE_WIRE_OVERHEAD_RESERVE_BYTES
+"""Maximum canonical serialized bytes for any single capture record."""
 
 HOOK_TARGET_BUDGET_NS = 100_000_000
 """Warm hook target latency budget (100 ms)."""
@@ -71,6 +81,14 @@ _GAP_ALLOWED_KEYS: frozenset[str] = frozenset(
 
 def _invalid() -> BrainError:
     return BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+
+
+def require_capture_sequence(value: object) -> int:
+    """Validate a capture sequence within ``1..MAX_CAPTURE_SEQUENCE`` (signed 64-bit SQLite range)."""
+    seq = require_positive_int(value)
+    if seq > MAX_CAPTURE_SEQUENCE:
+        raise _invalid()
+    return seq
 
 
 def require_iso_utc_timestamp(value: object) -> str:
@@ -172,6 +190,7 @@ class OutboxFileLockPort(Protocol):
 
 
 _DEFAULT_OUTBOX_FILE_LOCK: OutboxFileLockPort | None = None
+_DEFAULT_OUTBOX_PERMISSIONS: OutboxPermissionsPort | None = None
 
 
 def register_outbox_file_lock(adapter: OutboxFileLockPort) -> None:
@@ -183,6 +202,17 @@ def register_outbox_file_lock(adapter: OutboxFileLockPort) -> None:
 def default_outbox_file_lock() -> OutboxFileLockPort | None:
     """Return the registered OS file-lock adapter, or ``None`` if OS adapters have not loaded."""
     return _DEFAULT_OUTBOX_FILE_LOCK
+
+
+def register_outbox_permissions(adapter: OutboxPermissionsPort) -> None:
+    """Register the process-wide OS permission adapter used by ``OutboxSpool`` by default."""
+    global _DEFAULT_OUTBOX_PERMISSIONS
+    _DEFAULT_OUTBOX_PERMISSIONS = adapter
+
+
+def default_outbox_permissions() -> OutboxPermissionsPort | None:
+    """Return the registered OS permission adapter, or ``None`` if OS adapters have not loaded."""
+    return _DEFAULT_OUTBOX_PERMISSIONS
 
 
 @dataclass(frozen=True)
@@ -246,6 +276,11 @@ class CaptureStorePort(Protocol):
     def has_gaps(self) -> bool: ...
 
 
+def _enforce_capture_entry_size(record_dict: Mapping[str, JsonValue]) -> None:
+    if len(canonical_json(record_dict)) > MAX_CAPTURE_ENTRY_BYTES:
+        raise _invalid()
+
+
 @dataclass(frozen=True)
 class CaptureEventRecord:
     """Normalized untrusted hook/transcript capture event envelope (before host attribution)."""
@@ -263,7 +298,7 @@ class CaptureEventRecord:
     def __post_init__(self) -> None:
         require_opaque_id(self.event_id, label="event_id")
         require_opaque_id(self.producer_stream, label="producer_stream")
-        require_positive_int(self.sequence)
+        require_capture_sequence(self.sequence)
         require_opaque_id(self.harness_id, label="harness_id")
         require_object_kind(self.kind)
         require_iso_utc_timestamp(self.recorded_at)
@@ -271,18 +306,14 @@ class CaptureEventRecord:
             require_sha256_digest(self.session_ref)
         object.__setattr__(self, "payload", freeze_json_mapping(self.payload))
         object.__setattr__(self, "source_metadata", freeze_json_mapping(self.source_metadata))
+        _enforce_capture_entry_size(self.to_dict())
 
     def to_dict(self) -> dict[str, JsonValue]:
         return {
-            "record_kind": OUTBOX_RECORD_EVENT,
-            "event_id": self.event_id,
-            "producer_stream": self.producer_stream,
-            "sequence": self.sequence,
-            "harness_id": self.harness_id,
-            "kind": self.kind,
-            "recorded_at": self.recorded_at,
-            "payload": clone_json_mapping(self.payload),
-            "session_ref": self.session_ref,
+            "record_kind": OUTBOX_RECORD_EVENT, "event_id": self.event_id,
+            "producer_stream": self.producer_stream, "sequence": self.sequence,
+            "harness_id": self.harness_id, "kind": self.kind, "recorded_at": self.recorded_at,
+            "payload": clone_json_mapping(self.payload), "session_ref": self.session_ref,
             "source_metadata": clone_json_mapping(self.source_metadata),
         }
 
@@ -299,45 +330,29 @@ class CaptureEventRecord:
         required = ("event_id", "producer_stream", "sequence", "harness_id", "kind", "recorded_at", "payload")
         if any(key not in raw for key in required):
             raise _invalid()
-        event_id = raw["event_id"]
-        producer_stream = raw["producer_stream"]
-        sequence = raw["sequence"]
-        harness_id = raw["harness_id"]
-        kind = raw["kind"]
-        recorded_at = raw["recorded_at"]
-        payload = raw["payload"]
-        session_ref = raw.get("session_ref")
-        source_metadata = raw.get("source_metadata")
+        event_id, producer_stream, sequence = raw["event_id"], raw["producer_stream"], raw["sequence"]
+        harness_id, kind, recorded_at, payload = raw["harness_id"], raw["kind"], raw["recorded_at"], raw["payload"]
+        session_ref, source_metadata = raw.get("session_ref"), raw.get("source_metadata")
         if (
-            not isinstance(event_id, str)
-            or not isinstance(producer_stream, str)
-            or not is_strict_int(sequence)
-            or not isinstance(harness_id, str)
-            or not isinstance(kind, str)
-            or not isinstance(recorded_at, str)
+            not isinstance(event_id, str) or not isinstance(producer_stream, str)
+            or not is_strict_int(sequence) or not isinstance(harness_id, str)
+            or not isinstance(kind, str) or not isinstance(recorded_at, str)
             or not isinstance(payload, Mapping)
         ):
             raise _invalid()
         assert isinstance(sequence, int)
         if session_ref is not None and not isinstance(session_ref, str):
             raise _invalid()
-        resolved_meta: dict[str, JsonValue]
         if source_metadata is None:
-            resolved_meta = {}
+            resolved_meta: dict[str, JsonValue] = {}
         elif isinstance(source_metadata, Mapping):
             resolved_meta = clone_json_mapping(source_metadata)
         else:
             raise _invalid()
         return cls(
-            event_id=event_id,
-            producer_stream=producer_stream,
-            sequence=sequence,
-            harness_id=harness_id,
-            kind=kind,
-            recorded_at=recorded_at,
-            payload=clone_json_mapping(payload),
-            session_ref=session_ref,
-            source_metadata=resolved_meta,
+            event_id=event_id, producer_stream=producer_stream, sequence=sequence,
+            harness_id=harness_id, kind=kind, recorded_at=recorded_at,
+            payload=clone_json_mapping(payload), session_ref=session_ref, source_metadata=resolved_meta,
         )
 
 
@@ -356,24 +371,21 @@ class ProducerCaptureGap:
     def __post_init__(self) -> None:
         require_opaque_id(self.gap_id, label="gap_id")
         require_opaque_id(self.producer_stream, label="producer_stream")
-        require_positive_int(self.sequence)
+        require_capture_sequence(self.sequence)
         if not isinstance(self.reason, str) or self.reason not in CAPTURE_GAP_REASONS:
             raise _invalid()
         require_iso_utc_timestamp(self.recorded_at)
         require_positive_int(self.estimated_count)
         if self.duration_ms is not None:
             require_non_negative_int(self.duration_ms)
+        _enforce_capture_entry_size(self.to_dict())
 
     def to_dict(self) -> dict[str, JsonValue]:
         return {
-            "record_kind": OUTBOX_RECORD_GAP,
-            "gap_id": self.gap_id,
-            "producer_stream": self.producer_stream,
-            "sequence": self.sequence,
-            "reason": self.reason,
-            "recorded_at": self.recorded_at,
-            "estimated_count": self.estimated_count,
-            "duration_ms": self.duration_ms,
+            "record_kind": OUTBOX_RECORD_GAP, "gap_id": self.gap_id,
+            "producer_stream": self.producer_stream, "sequence": self.sequence,
+            "reason": self.reason, "recorded_at": self.recorded_at,
+            "estimated_count": self.estimated_count, "duration_ms": self.duration_ms,
         }
 
     @classmethod
@@ -389,35 +401,22 @@ class ProducerCaptureGap:
         required = ("gap_id", "producer_stream", "sequence", "reason", "recorded_at")
         if any(key not in raw for key in required):
             raise _invalid()
-        gap_id = raw["gap_id"]
-        producer_stream = raw["producer_stream"]
-        sequence = raw["sequence"]
-        reason = raw["reason"]
-        recorded_at = raw["recorded_at"]
-        estimated_count = raw.get("estimated_count", 1)
-        duration_ms = raw.get("duration_ms")
+        gap_id, producer_stream, sequence = raw["gap_id"], raw["producer_stream"], raw["sequence"]
+        reason, recorded_at = raw["reason"], raw["recorded_at"]
+        estimated_count, duration_ms = raw.get("estimated_count", 1), raw.get("duration_ms")
         if (
-            not isinstance(gap_id, str)
-            or not isinstance(producer_stream, str)
-            or not is_strict_int(sequence)
-            or not isinstance(reason, str)
-            or not isinstance(recorded_at, str)
-            or not is_strict_int(estimated_count)
+            not isinstance(gap_id, str) or not isinstance(producer_stream, str)
+            or not is_strict_int(sequence) or not isinstance(reason, str)
+            or not isinstance(recorded_at, str) or not is_strict_int(estimated_count)
         ):
             raise _invalid()
-        assert isinstance(sequence, int)
-        assert isinstance(estimated_count, int)
+        assert isinstance(sequence, int) and isinstance(estimated_count, int)
         if duration_ms is not None and not is_strict_int(duration_ms):
             raise _invalid()
         assert duration_ms is None or isinstance(duration_ms, int)
         return cls(
-            gap_id=gap_id,
-            producer_stream=producer_stream,
-            sequence=sequence,
-            reason=reason,
-            recorded_at=recorded_at,
-            estimated_count=estimated_count,
-            duration_ms=duration_ms,
+            gap_id=gap_id, producer_stream=producer_stream, sequence=sequence,
+            reason=reason, recorded_at=recorded_at, estimated_count=estimated_count, duration_ms=duration_ms,
         )
 
 
@@ -437,12 +436,14 @@ class OutboxEntry:
         if self.record_kind not in (OUTBOX_RECORD_EVENT, OUTBOX_RECORD_GAP):
             raise _invalid()
         require_opaque_id(self.producer_stream, label="producer_stream")
-        require_positive_int(self.sequence)
+        require_capture_sequence(self.sequence)
         require_opaque_id(self.entry_id, label="entry_id")
         if not isinstance(self.payload_json, str) or not self.payload_json:
             raise _invalid()
         require_sha256_digest(self.payload_digest)
         require_positive_int(self.byte_size)
+        if self.byte_size > MAX_CAPTURE_ENTRY_BYTES:
+            raise _invalid()
 
 
 def _req_str_field(raw: Mapping[str, JsonValue], key: str) -> str:
@@ -482,14 +483,16 @@ class CaptureBatchAck:
             self.committed_event_sequences, Sequence
         ):
             raise _invalid()
-        ev_seqs = tuple(require_positive_int(seq) for seq in self.committed_event_sequences)
+        ev_seqs = tuple(require_capture_sequence(seq) for seq in self.committed_event_sequences)
         object.__setattr__(self, "committed_event_sequences", ev_seqs)
         require_non_negative_int(self.contiguous_event_acked_through)
+        if self.contiguous_event_acked_through > MAX_CAPTURE_SEQUENCE:
+            raise _invalid()
         if isinstance(self.acked_producer_gap_sequences, (str, bytes)) or not isinstance(
             self.acked_producer_gap_sequences, Sequence
         ):
             raise _invalid()
-        gap_seqs = tuple(require_positive_int(seq) for seq in self.acked_producer_gap_sequences)
+        gap_seqs = tuple(require_capture_sequence(seq) for seq in self.acked_producer_gap_sequences)
         object.__setattr__(self, "acked_producer_gap_sequences", gap_seqs)
         require_non_negative_int(self.accepted_count)
         require_non_negative_int(self.deduped_count)
@@ -500,7 +503,7 @@ class CaptureBatchAck:
         """Whether an outbox entry of ``record_kind`` at ``sequence`` may be evicted by this ACK."""
         if record_kind not in (OUTBOX_RECORD_EVENT, OUTBOX_RECORD_GAP):
             raise _invalid()
-        require_positive_int(sequence)
+        require_capture_sequence(sequence)
         if self.policy_disabled:
             return False
         if record_kind == OUTBOX_RECORD_EVENT:
@@ -512,51 +515,37 @@ class CaptureBatchAck:
 
     def to_dict(self) -> dict[str, JsonValue]:
         return {
-            "producer_stream": self.producer_stream,
-            "repo_id": self.repo_id,
-            "checkout_id": self.checkout_id,
+            "producer_stream": self.producer_stream, "repo_id": self.repo_id, "checkout_id": self.checkout_id,
             "committed_event_sequences": list(self.committed_event_sequences),
             "contiguous_event_acked_through": self.contiguous_event_acked_through,
             "acked_producer_gap_sequences": list(self.acked_producer_gap_sequences),
-            "accepted_count": self.accepted_count,
-            "deduped_count": self.deduped_count,
+            "accepted_count": self.accepted_count, "deduped_count": self.deduped_count,
             "policy_disabled": self.policy_disabled,
         }
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, JsonValue]) -> CaptureBatchAck:
         expected = {
-            "producer_stream",
-            "repo_id",
-            "checkout_id",
-            "committed_event_sequences",
-            "contiguous_event_acked_through",
-            "acked_producer_gap_sequences",
-            "accepted_count",
-            "deduped_count",
-            "policy_disabled",
+            "producer_stream", "repo_id", "checkout_id", "committed_event_sequences",
+            "contiguous_event_acked_through", "acked_producer_gap_sequences",
+            "accepted_count", "deduped_count", "policy_disabled",
         }
         if not isinstance(raw, Mapping) or set(raw) != expected:
             raise _invalid()
-        ev_raw = raw["committed_event_sequences"]
-        gap_raw = raw["acked_producer_gap_sequences"]
+        ev_raw, gap_raw = raw["committed_event_sequences"], raw["acked_producer_gap_sequences"]
         if not isinstance(ev_raw, list) or not isinstance(gap_raw, list):
             raise _invalid()
-        ev_seqs = tuple(require_positive_int(x) for x in ev_raw)
-        gap_seqs = tuple(require_positive_int(x) for x in gap_raw)
+        ev_seqs = tuple(require_capture_sequence(x) for x in ev_raw)
+        gap_seqs = tuple(require_capture_sequence(x) for x in gap_raw)
         policy_disabled = raw["policy_disabled"]
         if not isinstance(policy_disabled, bool):
             raise _invalid()
         return cls(
-            producer_stream=_req_str_field(raw, "producer_stream"),
-            repo_id=_req_str_field(raw, "repo_id"),
-            checkout_id=_req_str_field(raw, "checkout_id"),
-            committed_event_sequences=ev_seqs,
+            producer_stream=_req_str_field(raw, "producer_stream"), repo_id=_req_str_field(raw, "repo_id"),
+            checkout_id=_req_str_field(raw, "checkout_id"), committed_event_sequences=ev_seqs,
             contiguous_event_acked_through=_req_int_field(raw, "contiguous_event_acked_through"),
-            acked_producer_gap_sequences=gap_seqs,
-            accepted_count=_req_int_field(raw, "accepted_count"),
-            deduped_count=_req_int_field(raw, "deduped_count"),
-            policy_disabled=policy_disabled,
+            acked_producer_gap_sequences=gap_seqs, accepted_count=_req_int_field(raw, "accepted_count"),
+            deduped_count=_req_int_field(raw, "deduped_count"), policy_disabled=policy_disabled,
         )
 
 
@@ -587,12 +576,15 @@ class CaptureHealthSnapshot:
 
 
 __all__ = [
-    "CAPTURE_GAP_REASONS", "DEFAULT_OUTBOX_MAX_BYTES", "EVENT_SOURCES", "EVENT_SOURCE_VERIFICATIONS",
-    "FORBIDDEN_CLIENT_CAPTURE_KEYS", "HOOK_HARD_CAP_NS", "HOOK_TARGET_BUDGET_NS",
-    "MAX_CAPTURE_BATCH_EVENTS", "OUTBOX_RECORD_EVENT", "OUTBOX_RECORD_GAP",
+    "CAPTURE_GAP_REASONS", "CAPTURE_WIRE_OVERHEAD_RESERVE_BYTES", "DEFAULT_OUTBOX_MAX_BYTES",
+    "EVENT_SOURCES", "EVENT_SOURCE_VERIFICATIONS", "FORBIDDEN_CLIENT_CAPTURE_KEYS",
+    "HOOK_HARD_CAP_NS", "HOOK_TARGET_BUDGET_NS", "MAX_CAPTURE_BATCH_EVENTS",
+    "MAX_CAPTURE_ENTRY_BYTES", "MAX_CAPTURE_SEQUENCE", "OUTBOX_RECORD_EVENT", "OUTBOX_RECORD_GAP",
     "CaptureBatchAck", "CaptureEventRecord", "CaptureHealthSnapshot",
     "CapturePrivacyFilterPort", "CaptureStorePort", "OutboxEntry", "OutboxFileLockPort",
     "OutboxPermissionsPort", "ProducerCaptureGap", "StagedCaptureEvent",
     "assert_no_forbidden_capture_keys", "clone_json_mapping", "compute_contiguous_event_acked_through",
-    "default_outbox_file_lock", "freeze_json_mapping", "register_outbox_file_lock", "require_iso_utc_timestamp",
+    "default_outbox_file_lock", "default_outbox_permissions", "freeze_json_mapping",
+    "register_outbox_file_lock", "register_outbox_permissions", "require_capture_sequence",
+    "require_iso_utc_timestamp",
 ]

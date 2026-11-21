@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import time
 from collections.abc import Callable, Mapping
 
@@ -83,15 +84,16 @@ class CapturePrivacyGate:
             ):
                 raise BrainError(ErrorCode.INVALID_INPUT, _PRIVACY_REJECT_MSG)
 
+        effective_policy = dataclasses.replace(resolved_policy, manual_submission=True)
         try:
             safe_payload = self._filter.apply(
                 clone_json_mapping(record.payload),
-                resolved_policy,
+                effective_policy,
                 deadline_ns=deadline_ns,
             )
             safe_meta = self._filter.apply(
                 clone_json_mapping(record.source_metadata),
-                resolved_policy,
+                effective_policy,
                 deadline_ns=deadline_ns,
             )
         except BrainError as err:
@@ -123,3 +125,28 @@ class CapturePrivacyGate:
         ):
             raise BrainError(ErrorCode.INVALID_INPUT, _PRIVACY_REJECT_MSG)
         return sanitized
+
+    def validate_gap(
+        self,
+        gap: ProducerCaptureGap,
+        *,
+        raw_session_id: str | None = None,
+        deadline_ns: int | None = None,
+    ) -> ProducerCaptureGap:
+        """Validate a ``ProducerCaptureGap`` against deadline, forbidden keys, and ``raw_session_id`` leaks."""
+        if not isinstance(gap, ProducerCaptureGap):
+            raise BrainError(ErrorCode.INVALID_INPUT, _PRIVACY_REJECT_MSG)
+        if deadline_ns is not None and int(self._monotonic_ns()) >= deadline_ns:
+            raise BrainError(ErrorCode.DEADLINE_EXCEEDED, _DEADLINE_MSG)
+        assert_no_forbidden_capture_keys(gap.to_dict())
+        if raw_session_id is not None:
+            if not isinstance(raw_session_id, str) or not raw_session_id:
+                raise BrainError(ErrorCode.INVALID_INPUT, _PRIVACY_REJECT_MSG)
+            if (
+                raw_session_id in gap.gap_id
+                or raw_session_id in gap.producer_stream
+                or raw_session_id in gap.reason
+                or raw_session_id in gap.recorded_at
+            ):
+                raise BrainError(ErrorCode.INVALID_INPUT, _PRIVACY_REJECT_MSG)
+        return gap

@@ -73,7 +73,9 @@ def test_outbox_never_imports_sqlite3_or_faults_at_import(trusted_tmp: Path) -> 
         "from superbrain.storage.outbox import OutboxSpool; "
         "from superbrain.ports.capture import CaptureBatchAck, CaptureEventRecord, OUTBOX_RECORD_EVENT; "
         "has_faults_on_import = 'superbrain.core.faults' in sys.modules; "
-        "spool = OutboxSpool(Path(sys.argv[1])); "
+        "from superbrain.adapters.os import os_adapters; "
+        "from superbrain.adapters.os.locks import OUTBOX_FILE_LOCK; "
+        "spool = OutboxSpool(Path(sys.argv[1]), permissions=os_adapters().permissions, file_lock=OUTBOX_FILE_LOCK); "
         "ev = CaptureEventRecord('ev-1','s1',1,'claude-code','tool_post','2026-11-21T12:00:00Z',{'k':'v'}); "
         "eid = spool.enqueue_event(ev); "
         "pending = spool.read_pending(limit=10); "
@@ -267,6 +269,7 @@ def test_enqueue_rejects_non_record_objects(trusted_tmp: Path, bad_record: Any) 
 
 
 def test_enqueue_survives_immediate_os_exit_after_commit(trusted_tmp: Path) -> None:
+    from superbrain.adapters.os.locks import OUTBOX_FILE_LOCK
     from superbrain.storage.outbox import OutboxSpool
 
     spool_dir = trusted_tmp / "exit-spool"
@@ -274,7 +277,10 @@ def test_enqueue_survives_immediate_os_exit_after_commit(trusted_tmp: Path) -> N
         "import os, sys; from pathlib import Path; "
         "from superbrain.ports.capture import CaptureEventRecord; "
         "from superbrain.storage.outbox import OutboxSpool; "
-        "s = OutboxSpool(Path(sys.argv[1])); "
+        "assert 'superbrain.core.faults' not in sys.modules; "
+        "from superbrain.adapters.os import os_adapters; "
+        "from superbrain.adapters.os.locks import OUTBOX_FILE_LOCK; "
+        "s = OutboxSpool(Path(sys.argv[1]), permissions=os_adapters().permissions, file_lock=OUTBOX_FILE_LOCK); "
         "s.enqueue_event(CaptureEventRecord('ev-exit-1','s1',1,'claude-code','tool_post',"
         "'2026-11-21T12:00:00Z',{'ok':'durable'})); "
         "os._exit(0)"
@@ -287,7 +293,9 @@ def test_enqueue_survives_immediate_os_exit_after_commit(trusted_tmp: Path) -> N
         timeout=15.0,
     )
     assert res.returncode == 0, res.stderr.decode(errors="replace")
-    pending = OutboxSpool(spool_dir).read_pending(limit=10)
+    pending = OutboxSpool(
+        spool_dir, permissions=os_adapters().permissions, file_lock=OUTBOX_FILE_LOCK
+    ).read_pending(limit=10)
     assert len(pending) == 1 and pending[0].entry_id == "ev-exit-1"
 
 
@@ -439,3 +447,233 @@ def test_outbox_discards_torn_staging_and_eof_tail_but_rejects_middle_corruption
     with pytest.raises(BrainError) as exc_mid:
         OutboxSpool(spool_dir).read_pending(limit=10)
     assert exc_mid.value.code is ErrorCode.INTEGRITY_FAILURE
+
+
+def test_outbox_init_does_not_sweep_part_unlocked_and_read_pending_sweeps_under_lock(
+    trusted_tmp: Path,
+) -> None:
+    from superbrain.adapters.os.locks import OUTBOX_FILE_LOCK
+    from superbrain.storage.outbox import OutboxSpool
+
+    os_ = os_adapters()
+    spool_dir = trusted_tmp / "init-no-sweep-spool"
+    s1 = OutboxSpool(spool_dir, permissions=os_.permissions, file_lock=OUTBOX_FILE_LOCK)
+    s1.enqueue_event(_mk_event(1, note="kept-event-1"))
+
+    root_part = spool_dir / "pending.part"
+    root_part.write_bytes(b'{"partial": true')
+    os_.permissions.secure_file(root_part)
+
+    stream_dirs = [p for p in (spool_dir / "streams").iterdir() if p.is_dir()]
+    assert stream_dirs
+    stream_part = stream_dirs[0] / "orphan.part"
+    stream_part.write_bytes(b'{"orphan": true')
+    os_.permissions.secure_file(stream_part)
+
+    class _SpyLock:
+        def __init__(self) -> None:
+            self.acquires = 0
+            self.unlocks = 0
+            self.parts_present_on_first_lock: list[bool] = []
+
+        def try_lock_fd(self, fd: int) -> bool:
+            ok = bool(OUTBOX_FILE_LOCK.try_lock_fd(fd))
+            if ok:
+                if self.acquires == 0:
+                    self.parts_present_on_first_lock = [root_part.exists(), stream_part.exists()]
+                self.acquires += 1
+            return ok
+
+        def unlock_fd(self, fd: int) -> None:
+            self.unlocks += 1
+            OUTBOX_FILE_LOCK.unlock_fd(fd)
+
+    spy = _SpyLock()
+    reopened = OutboxSpool(spool_dir, permissions=os_.permissions, file_lock=spy)
+    assert spy.acquires == 0
+    assert root_part.exists() is True
+    assert stream_part.exists() is True
+
+    entries = reopened.read_pending(limit=10)
+    assert spy.acquires >= 1
+    assert spy.unlocks == spy.acquires
+    assert spy.parts_present_on_first_lock == [True, True]
+    assert not root_part.exists()
+    assert not stream_part.exists()
+    assert [e.sequence for e in entries] == [1]
+
+
+def test_outbox_fails_closed_without_os_adapters_in_clean_process(trusted_tmp: Path) -> None:
+    script = (
+        "import json, sys\n"
+        "from pathlib import Path\n"
+        "from superbrain.core.errors import BrainError, ErrorCode\n"
+        "from superbrain.ports.capture import CaptureEventRecord\n"
+        "from superbrain.storage.outbox import OutboxSpool\n"
+        "class _StubPerms:\n"
+        "    def secure_directory(self, path: Path) -> None: pass\n"
+        "    def secure_file(self, path: Path) -> None: pass\n"
+        "    def problems(self, path: Path) -> list[object]: return []\n"
+        "class _StubLock:\n"
+        "    def try_lock_fd(self, fd: int) -> bool: return True\n"
+        "    def unlock_fd(self, fd: int) -> None: pass\n"
+        "ev = CaptureEventRecord('ev-fc-1','s1',1,'claude-code','tool_post','2026-11-21T12:00:00Z',{'k':'v'})\n"
+        "allowed = {ErrorCode.CAPABILITY_UNAVAILABLE.value, ErrorCode.INSECURE_PERMISSIONS.value}\n"
+        "results = {}\n"
+        "for label, kwargs in [\n"
+        "    ('no_adapters', {}),\n"
+        "    ('no_lock', {'permissions': _StubPerms()}),\n"
+        "    ('no_perms', {'file_lock': _StubLock()}),\n"
+        "]:\n"
+        "    try:\n"
+        "        s = OutboxSpool(Path(sys.argv[1]) / label, **kwargs)\n"
+        "        s.enqueue_event(ev)\n"
+        "        results[label] = 'UNEXPECTED_SUCCESS'\n"
+        "    except BrainError as exc:\n"
+        "        results[label] = exc.code.value\n"
+        "print(json.dumps({'results': results, 'os_imported': 'superbrain.adapters.os' in sys.modules, "
+        "'allowed': sorted(allowed)}))"
+    )
+    res = subprocess.run(
+        [sys.executable, "-I", "-c", script, str(trusted_tmp / "clean-fail-closed")],
+        env=_clean_env(),
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=15.0,
+    )
+    assert res.returncode == 0, res.stderr
+    data = json.loads(res.stdout)
+    assert data["os_imported"] is False
+    allowed = set(data["allowed"])
+    for key in ("no_adapters", "no_lock", "no_perms"):
+        assert data["results"][key] in allowed, f"{key} failed with {data['results'][key]!r} instead of {allowed}"
+
+
+def test_outbox_rejects_preexisting_insecure_directory_and_symlinked_stream_frame(
+    trusted_tmp: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from superbrain.adapters.os.locks import OUTBOX_FILE_LOCK
+    from superbrain.storage.outbox import OutboxSpool
+
+    os_ = os_adapters()
+    bad_dir = trusted_tmp / "pre-insecure-outbox"
+    bad_dir.mkdir()
+    if sys.platform == "win32":
+        from tests.support.winacl import grant
+
+        grant(bad_dir, "S-1-1-0", 0x120089, flags=0x3)
+    else:
+        os.chmod(bad_dir, 0o755)
+    assert os_.permissions.problems(bad_dir)
+
+    with pytest.raises(BrainError) as exc_perm:
+        s_bad = OutboxSpool(bad_dir, permissions=os_.permissions, file_lock=OUTBOX_FILE_LOCK)
+        s_bad.read_pending(limit=10)
+    assert exc_perm.value.code is ErrorCode.INSECURE_PERMISSIONS
+
+    # Symlinked .frame under filtered read_pending(producer_stream=...) must fail closed with UNSAFE_PATH.
+    good_dir = trusted_tmp / "symlink-frame-outbox"
+    spool = OutboxSpool(good_dir, permissions=os_.permissions, file_lock=OUTBOX_FILE_LOCK)
+    spool.enqueue_event(_mk_event(1, stream="stream-link-f3", note="frame-link-bait"))
+    frame_files = sorted(p for p in good_dir.rglob("*.frame") if p.is_file())
+    assert len(frame_files) == 1
+    fake_link(monkeypatch, frame_files[0])
+    with pytest.raises(BrainError) as exc_link:
+        OutboxSpool(good_dir, permissions=os_.permissions, file_lock=OUTBOX_FILE_LOCK).read_pending(
+            limit=10, producer_stream="stream-link-f3"
+        )
+    assert exc_link.value.code is ErrorCode.UNSAFE_PATH
+
+
+def test_outbox_frames_use_pure_lf_fail_closed_on_newlineless_frame_and_repair_atomically(
+    trusted_tmp: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from superbrain.adapters.os.locks import OUTBOX_FILE_LOCK
+    from superbrain.storage.outbox import OutboxSpool
+
+    os_ = os_adapters()
+    lf_dir = trusted_tmp / "pure-lf-spool"
+    s_lf = OutboxSpool(lf_dir, permissions=os_.permissions, file_lock=OUTBOX_FILE_LOCK)
+    s_lf.enqueue_event(_mk_event(1, note="pure-lf-spool-1"))
+    s_lf.enqueue_gap(_mk_gap(2))
+
+    hook_lf_dir = trusted_tmp / "pure-lf-hook"
+    hook_ev = json.dumps(
+        {
+            "event_id": "evt-hook-lf-1",
+            "producer_stream": "hook-lf-stream",
+            "sequence": 1,
+            "harness_id": "claude-code",
+            "kind": "tool_post",
+            "recorded_at": "2026-11-21T12:00:00Z",
+            "payload": {"note": "pure-lf-hook-1"},
+        }
+    ).encode()
+    res_hook = subprocess.run(
+        [sys.executable, "-I", "-m", "superbrain.composition.hook_entry", "--outbox", str(hook_lf_dir)],
+        input=hook_ev,
+        env=_clean_env(),
+        capture_output=True,
+        check=False,
+        timeout=15.0,
+    )
+    assert res_hook.returncode == 0, res_hook.stderr.decode(errors="replace")
+
+    for base in (lf_dir, hook_lf_dir):
+        frames = sorted(p for p in base.rglob("*.frame") if p.is_file())
+        assert frames
+        for frame in frames:
+            raw = frame.read_bytes()
+            assert b"\r\n" not in raw, f"CRLF detected in outbox frame {frame}"
+            assert raw.endswith(b"\n")
+
+    # Empty or newline-less .frame files fail closed with INTEGRITY_FAILURE without unlinking evidence.
+    for label, corrupt_bytes in (("empty", b""), ("no_nl", b'{"no":"newline"}')):
+        corrupt_dir = trusted_tmp / f"corrupt-{label}"
+        cs = OutboxSpool(corrupt_dir, permissions=os_.permissions, file_lock=OUTBOX_FILE_LOCK)
+        cs.enqueue_event(_mk_event(1, note=f"corrupt-{label}"))
+        c_frames = sorted(p for p in corrupt_dir.rglob("*.frame") if p.is_file())
+        assert len(c_frames) == 1
+        c_frame = c_frames[0]
+        c_frame.write_bytes(corrupt_bytes)
+        with pytest.raises(BrainError) as exc_nl:
+            OutboxSpool(corrupt_dir, permissions=os_.permissions, file_lock=OUTBOX_FILE_LOCK).read_pending(limit=10)
+        assert exc_nl.value.code is ErrorCode.INTEGRITY_FAILURE
+        assert c_frame.exists() is True
+        assert c_frame.read_bytes() == corrupt_bytes
+
+    # Torn EOF suffix repair uses atomic .part + os.replace; os.replace failure leaves committed bytes intact.
+    repair_dir = trusted_tmp / "atomic-repair-spool"
+    rs = OutboxSpool(repair_dir, permissions=os_.permissions, file_lock=OUTBOX_FILE_LOCK)
+    rs.enqueue_event(_mk_event(1, note="atomic-ok-1"))
+    rs.enqueue_event(_mk_event(2, note="atomic-ok-2"))
+    tail_candidates = sorted(
+        p for p in repair_dir.rglob("*.frame") if p.is_file() and b"atomic-ok-2" in p.read_bytes()
+    )
+    assert tail_candidates
+    tail_file = tail_candidates[-1]
+    committed_bytes = tail_file.read_bytes()
+    torn_bytes = committed_bytes + b'{"record_kind":"event","torn":'
+    tail_file.write_bytes(torn_bytes)
+
+    replace_calls: list[tuple[Any, Any]] = []
+
+    def _failing_replace(src: Any, dst: Any) -> None:
+        replace_calls.append((src, dst))
+        raise OSError(errno.EIO, "simulated replace crash")
+
+    monkeypatch.setattr(os, "replace", _failing_replace)
+    with pytest.raises(BrainError) as exc_rep:
+        OutboxSpool(repair_dir, permissions=os_.permissions, file_lock=OUTBOX_FILE_LOCK).read_pending(limit=10)
+    assert exc_rep.value.code is ErrorCode.IO_ERROR
+    assert len(replace_calls) == 1
+    assert tail_file.read_bytes().startswith(committed_bytes)
+
+    monkeypatch.undo()
+    repaired_entries = OutboxSpool(
+        repair_dir, permissions=os_.permissions, file_lock=OUTBOX_FILE_LOCK
+    ).read_pending(limit=10)
+    assert [e.sequence for e in repaired_entries] == [1, 2]
+    assert tail_file.read_bytes() == committed_bytes
+    assert list(repair_dir.rglob("*.part")) == []

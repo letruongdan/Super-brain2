@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import dataclasses
 import time
 from collections.abc import Callable, Mapping
 
 from superbrain.core._kernel_auth import RepoPolicy
 from superbrain.core._kernel_base import Principal
 from superbrain.core._kernel_daemon import CaptureBatchCommand
-from superbrain.core._kernel_workspace import FilterPolicy, RepoFlags
+from superbrain.core._kernel_workspace import FilterPolicy
 from superbrain.core.canonical import canonical_json, digest_bytes
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.jsonvalue import JsonValue
@@ -107,11 +108,12 @@ class CaptureIngestService:
                 policy_disabled=True,
             )
 
-        flags = RepoFlags.from_repo_policy(repo_policy)
+        if filter_policy is not None and not isinstance(filter_policy, FilterPolicy):
+            raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
         effective_filter = (
-            FilterPolicy(manual_submission=flags.manual_submission)
-            if filter_policy is None
-            else filter_policy
+            dataclasses.replace(filter_policy, manual_submission=True)
+            if filter_policy is not None
+            else FilterPolicy()
         )
         staged_events: list[StagedCaptureEvent] = []
         gaps: list[ProducerCaptureGap] = []
@@ -124,7 +126,7 @@ class CaptureIngestService:
             if record.producer_stream != command.producer_stream:
                 raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
             if isinstance(record, ProducerCaptureGap):
-                gaps.append(record)
+                gaps.append(self._privacy_gate.validate_gap(record, deadline_ns=deadline_ns))
                 continue
             assert isinstance(record, CaptureEventRecord)
             sanitized = self._privacy_gate.sanitize_event(
