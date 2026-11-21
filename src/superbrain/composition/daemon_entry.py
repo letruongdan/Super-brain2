@@ -14,14 +14,19 @@ from datetime import datetime
 from pathlib import Path
 from types import FrameType
 
+from superbrain.adapters.harness_config.merger import SharedConfigMergerAdapter
 from superbrain.adapters.os import os_adapters
 from superbrain.adapters.os.daemon_config import read_daemon_config
 from superbrain.adapters.os.tls_material import verify_server_tls_files
+from superbrain.application.approvals import OperatorHandle
 from superbrain.application.deadlines import Reservation
 from superbrain.application.dispatch import KernelToolDomain
 from superbrain.application.jobs import JobService
+from superbrain.application.journal_recovery import reconcile_and_classify_journals
 from superbrain.application.owner_loop import AuthGate, OwnerLoop, OwnerSession
+from superbrain.application.review_apply import ReviewApplyService
 from superbrain.cli_api._loopback_server import LoopbackServer
+from superbrain.composition._daemon_restore import DaemonRestoreHandler, build_review_apply_service
 from superbrain.composition._daemon_session import (
     DaemonTestHooks,
     _AdmittedOwnerSession,
@@ -36,6 +41,8 @@ from superbrain.composition._endpoint import (
 )
 from superbrain.composition.kernel_bridge import KernelBridge
 from superbrain.composition.kernel_projections import kernel_store_extensions
+from superbrain.composition.operator_entry import build_operator_service, make_operator_executor
+from superbrain.core._kernel_approval import canonical_utc
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.faults import crashpoint
 from superbrain.core.ids import new_id
@@ -58,6 +65,7 @@ from superbrain.ports.clock import Clock, MonotonicClock
 from superbrain.ports.os import OsAdapters
 from superbrain.storage.idempotency import StagedKernelStore
 from superbrain.storage.jobs import has_legacy_incomplete_settled_projections
+from superbrain.storage.proposals import PolicyApplyAuthority, StoreProposalAdapter
 from superbrain.storage.runtime import admit_existing_pair, open_runtime_under_lease
 from superbrain.workers.executor import PRODUCTION_JOB_HANDLERS, JobExecutor, JobHandler
 
@@ -96,6 +104,7 @@ def _open_owner_session(
     job_handlers: Mapping[str, JobHandler] | None,
     hooks: DaemonTestHooks,
     on_listener_bound: Callable[[BoundLoopbackListener], None] | None,
+    operator: OperatorHandle | None = None,
 ) -> _AdmittedOwnerSession:
     adapters = os_ if os_ is not None else os_adapters(clock=clock, monotonic=monotonic_clock)
     resolved_clock = clock if clock is not None else adapters.clock
@@ -136,12 +145,23 @@ def _open_owner_session(
             rt.policy,
             resolved_clock,
             writer_epoch=rt.lease.epoch,
+            accounting=rt.policy if rt.policy.schema_version >= 4 else None,
             cancel_signal=executor.cancel if executor is not None else None,
         )
 
         if hooks.before_job_recover is not None:
             hooks.before_job_recover(rt)
         job_service.recover(rt.lease.epoch)
+        if rt.store.schema_version >= 5 and rt.policy.schema_version >= 4:
+            reconcile_and_classify_journals(
+                StoreProposalAdapter(rt.store, adapters),
+                PolicyApplyAuthority(rt.policy),
+                adapters,
+                data_root=rt.root.root,
+                home_dir=Path.home(),
+                config_merger=SharedConfigMergerAdapter(),
+                now_utc_fn=lambda: canonical_utc(resolved_clock.now()),
+            )
 
         instance_id = new_id()
         auth_gate = AuthGate(rt.store.store_id, rt.lease.epoch, instance_id)
@@ -267,10 +287,42 @@ def _open_owner_session(
             hooks=hooks,
             reply_meta_lock=reply_meta_lock,
             reply_meta=reply_meta,
+            operator=operator,
         )
         session_box.append(session)
+        if operator is not None:
+            review_apply = build_review_apply_service(
+                rt.store,
+                rt.policy,
+                rt.root.root,
+                adapters,
+                service_cls=ReviewApplyService,
+            )
+            restore_handler = DaemonRestoreHandler(
+                session=session,
+                adapters=adapters,
+                clock=resolved_clock,
+                executor=executor,
+                composite_domain=composite_domain,
+                instance_id=instance_id,
+                operator=operator,
+                review_apply_cls=ReviewApplyService,
+            )
+            operator.bind(
+                build_operator_service(
+                    rt.policy,
+                    os_=adapters,
+                    review_apply=review_apply,
+                    restore_handler=restore_handler,
+                    expected_endpoint_path=rt.root.endpoint_path,
+                    expected_leaf_cert_sha256=verified_tls.leaf_cert_sha256,
+                    server_cert_path=verified_tls.cert_path,
+                )
+            )
         return session
     except BaseException:
+        if operator is not None:
+            operator.unbind()
         if auth_gate is not None:
             auth_gate.close()
         if endpoint is not None:
@@ -295,6 +347,7 @@ def create_daemon_owner_loop(
     job_handlers: Mapping[str, JobHandler] | None = None,
     hooks: DaemonTestHooks | None = None,
     on_listener_bound: Callable[[BoundLoopbackListener], None] | None = None,
+    operator: OperatorHandle | None = None,
 ) -> OwnerLoop:
     """Construct an ``OwnerLoop`` wired to real admission, recovery, bridge, worker, and listener ports."""
     resolved_hooks = hooks if hooks is not None else DaemonTestHooks()
@@ -317,6 +370,7 @@ def create_daemon_owner_loop(
             job_handlers=job_handlers,
             hooks=resolved_hooks,
             on_listener_bound=on_listener_bound,
+            operator=operator,
         )
 
     return OwnerLoop(_factory)
@@ -395,6 +449,7 @@ def serve(
     resolved_clock = clock if clock is not None else adapters.clock
     resolved_mono = monotonic_clock if monotonic_clock is not None else adapters.monotonic
     bound_listeners: list[BoundLoopbackListener] = []
+    operator_handle = OperatorHandle()
 
     loop = create_daemon_owner_loop(
         os_=adapters,
@@ -404,6 +459,7 @@ def serve(
         job_handlers=job_handlers,
         hooks=hooks,
         on_listener_bound=bound_listeners.append,
+        operator=operator_handle,
     )
     effective_stop = stop_event if stop_event is not None else threading.Event()
     with _signal_stop_guard(effective_stop) as signalled:
@@ -420,6 +476,7 @@ def serve(
                 owner=loop,
                 monotonic_ns=resolved_mono.monotonic_ns,
                 stop_event=effective_stop,
+                operator=make_operator_executor(loop, operator_handle, resolved_mono.monotonic_ns),
             )
             # The synchronous signal latch is authoritative during startup;
             # the background Event conversion may not have run yet.

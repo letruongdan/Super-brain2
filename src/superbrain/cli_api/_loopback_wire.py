@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hmac
+import re
 
 from superbrain.core._json_parse import MAX_WIRE_BODY_BYTES, _validate_wire_structure
 from superbrain.core._wire_catalog import EXPECTED_TOOL_ORDER
@@ -39,6 +40,16 @@ _CAPTURE_BATCH_KEYS: frozenset[str] = frozenset(
 _SCOPE_KEYS: frozenset[str] = frozenset({"repo_id", "checkout_id"})
 _IDENTITY_CORE_KEYS: frozenset[str] = frozenset({"store_id", "writer_epoch", "instance_id", "contract"})
 _IDENTITY_KEYS: frozenset[str] = _IDENTITY_CORE_KEYS | {"schema_digest"}
+_OPERATOR_PATH_RE = re.compile(r"^/v2/operator/[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*$")
+_V2_PATH_RE = re.compile(r"^/v2/[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*$")
+
+
+def validate_request_path(path: str, *, operator_only: bool = False) -> str:
+    """Validate an ASCII loopback HTTP POST path before opening a socket connection."""
+    pattern = _OPERATOR_PATH_RE if operator_only else _V2_PATH_RE
+    if not isinstance(path, str) or not pattern.fullmatch(path):
+        raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+    return path
 
 
 def _validate_correlation_id(value: object) -> str | None:

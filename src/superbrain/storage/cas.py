@@ -11,6 +11,8 @@ Holders are the ``cas_holders`` projection of the reserved ``cas.hold``/``cas.re
 for a tombstoned holder is skipped, so a replay applies tombstones recorded since.
 """
 
+from __future__ import annotations
+
 import hashlib
 import os
 import re
@@ -30,8 +32,9 @@ from superbrain.ports.os import OsAdapters
 from superbrain.ports.policy import PolicyView
 from superbrain.storage.errors import os_error, sqlite_error
 from superbrain.storage.kinds import RetentionClass as RetentionClass
+from superbrain.storage.kinds import is_uuid
 from superbrain.storage.layout import DataRoot
-from superbrain.storage.ledger import LedgerEntry, Txn
+from superbrain.storage.ledger import LedgerEntry, Txn, utc_timestamp
 
 _DIGEST = re.compile(r"sha256:([0-9a-f]{64})")
 _SHARD_NAME = re.compile(r"[0-9a-f]{2}")
@@ -71,10 +74,21 @@ def is_link(st: os.stat_result) -> bool:
     return stat.S_ISLNK(st.st_mode) or bool(getattr(st, "st_file_attributes", 0) & _REPARSE_POINT)
 
 
+def validate_path_syntax(path: Path, os_: OsAdapters) -> None:
+    """Reject empty, NUL, ``..``, UNC/device, and Windows ADS paths before any ``lstat`` syscall."""
+    raw = os.fspath(path)
+    if not raw or "\x00" in raw:
+        raise BrainError(ErrorCode.INVALID_INPUT, "invalid path")
+    os_.paths.reject_unsafe_path(raw)
+    if ".." in path.parts:
+        raise BrainError(ErrorCode.UNSAFE_PATH, "path must not contain '..'")
+
+
 def check_container(directory: Path, os_: OsAdapters) -> None:
     """Check an existing directory before anything in it is entered or copied (spec 5.9): neither it nor a directory
     above it may be a link or reparse point (``UNSAFE_PATH``), it must be a directory (``INTEGRITY_FAILURE``) and
     owner-only (``INSECURE_PERMISSIONS``, with the real ``PermissionGuard``). Nothing is changed or re-secured."""
+    validate_path_syntax(directory, os_)
     os_.paths.reject_links(directory)
     ancestor_problems = os_.permissions.check_ancestors(directory)
     if ancestor_problems:
@@ -198,6 +212,44 @@ def held_digests(db: sqlite3.Connection, holder_kind: str, holder_id: str) -> li
     except sqlite3.Error as exc:
         raise sqlite_error("cannot read the holders", exc) from exc
     return [str(row[0]) for row in rows]
+
+
+def active_held_digests(db: sqlite3.Connection, holder_kind: str, holder_id: str, *, now: datetime) -> list[str]:
+    """Sorted digests held by ``(holder_kind, holder_id)`` whose hold is not expired at ``now``."""
+    if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
+        raise BrainError(ErrorCode.INVALID_INPUT, "now must be timezone-aware")
+    cutoff = utc_timestamp(now)
+    try:
+        rows = db.execute(
+            f"SELECT digest FROM {HOLDERS_TABLE} WHERE holder_kind = ? AND holder_id = ?"
+            " AND (retention_class = ? OR expires_at IS NULL OR expires_at > ?) ORDER BY digest",
+            (holder_kind, holder_id, RetentionClass.DURABLE.value, cutoff),
+        ).fetchall()
+    except sqlite3.Error as exc:
+        raise sqlite_error("cannot read active holders", exc) from exc
+    return [str(row[0]) for row in rows]
+
+
+def read_held_blob_or_none(
+    db: sqlite3.Connection,
+    cas: ContentStore,
+    policy: PolicyView,
+    digest: str,
+    *,
+    holder_kind: str,
+    holder_id: str,
+    now: datetime,
+) -> bytes | None:
+    """Return bytes of ``digest`` iff actively held at ``now``, non-tombstoned, unquarantined, and intact."""
+    if not is_uuid(holder_id):
+        return None
+    if policy.is_tombstoned(holder_kind, holder_id):
+        return None
+    if digest not in active_held_digests(db, holder_kind, holder_id, now=now):
+        return None
+    if policy.is_quarantined(digest) or not cas.blob_intact(digest):
+        return None
+    return cas.read(digest)
 
 
 def _meta_text(entry: LedgerEntry, name: str) -> str:
@@ -340,6 +392,20 @@ class ContentStore:
         if digest_bytes(data) != digest:
             raise BrainError(ErrorCode.INTEGRITY_FAILURE, f"the stored blob {digest} does not match its digest")
         return data
+
+    def read_held(self, digest: str, *, holder_kind: str, holder_id: str, now: datetime) -> bytes:
+        """Read ``digest`` iff held cleanly by ``(holder_kind, holder_id)`` and not expired/tombstoned/quarantined."""
+        self._check()
+        if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
+            raise BrainError(ErrorCode.INVALID_INPUT, "now must be timezone-aware")
+        self._checked(digest)
+        if self._policy.is_quarantined(digest):
+            raise BrainError(ErrorCode.QUARANTINED, f"blob {digest} is quarantined")
+        if self._policy.is_tombstoned(holder_kind, holder_id):
+            raise BrainError(ErrorCode.NOT_FOUND, f"holder {holder_kind}:{holder_id} is tombstoned")
+        if digest not in active_held_digests(self._db, holder_kind, holder_id, now=now):
+            raise BrainError(ErrorCode.NOT_FOUND, f"blob {digest} is not actively held by {holder_kind}:{holder_id}")
+        return self.read(digest)
 
     def exists(self, digest: str) -> bool:
         self._check()

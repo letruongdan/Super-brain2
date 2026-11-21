@@ -131,54 +131,22 @@ class KernelBridge(KernelBlobStagePort):
             resolved_mono = SystemMonotonicClock()
             enforce_unreserved = False
 
-        self._store = store
-        self._policy = policy
         self._clock = clock
         self._monotonic_clock = resolved_mono
-        self._writer_epoch = writer_epoch
         self._instance_id = resolved_instance_id
-        self._owner_identity = Identity(
-            store_id=store.store_id,
-            writer_epoch=writer_epoch,
-            instance_id=resolved_instance_id,
-        )
+        self._enforce_unreserved = enforce_unreserved
         self._domain = domain
-        self._blob_stager = KernelBlobStager(store)
-        self._idempotency = KernelIdempotencyStore(
-            store,
-            policy,
-            policy_view=policy,
-            writer_epoch=writer_epoch,
-            is_expired=is_idempotency_expired,
-        )
-        self._send_attempts = KernelSendAttemptStore(
-            store,
-            policy,
-            writer_epoch=writer_epoch,
-        )
-        if recover_pending_on_init:
-            self._send_attempts.recover_pending_attempts()
+        self._before_enter_commit = before_enter_commit
+        self._on_commit_completed = on_commit_completed
         self._auth_state: _MutableRequestAuthState = (
             auth_state if auth_state is not None else AtomicRequestAuthState(store.store_id)
         )
         self._before_auth_gate_publish = before_auth_gate_publish
         self._on_owner_reply_ready = on_owner_reply_ready
         self._on_clock_untrusted_changed = on_clock_untrusted_changed
-        self._dispatcher = KernelDispatcher(
-            store_id=store.store_id,
-            policy=policy,
-            idempotency=self._idempotency,
-            blob_stager=self._blob_stager,
-            clock=clock,
-            monotonic_clock=resolved_mono,
-            enforce_unreserved_deadline=enforce_unreserved,
-            store_schema_version=self._read_store_schema_version,
-            policy_schema_version=self._read_policy_schema_version,
-            domain=domain,
-            send_attempts=self._send_attempts,
-            before_enter_commit=before_enter_commit,
-            on_commit_completed=on_commit_completed,
-        )
+        self._wire_stores(store, policy, writer_epoch)
+        if recover_pending_on_init:
+            self._send_attempts.recover_pending_attempts()
         reservations_table = ReservationTable(on_change=on_reservation_change)
         self._coordinator = KernelDeadlineCoordinator(
             store_id=store.store_id,
@@ -194,6 +162,52 @@ class KernelBridge(KernelBlobStagePort):
             on_queue_wake=on_queue_wake,
             on_owner_finished=on_owner_finished,
         )
+
+    def _wire_stores(self, store: Store, policy: PolicyStore, writer_epoch: int) -> None:
+        self._store = store
+        self._policy = policy
+        self._writer_epoch = writer_epoch
+        self._owner_identity = Identity(
+            store_id=store.store_id,
+            writer_epoch=writer_epoch,
+            instance_id=self._instance_id,
+        )
+        self._blob_stager = KernelBlobStager(store)
+        self._idempotency = KernelIdempotencyStore(
+            store,
+            policy,
+            policy_view=policy,
+            writer_epoch=writer_epoch,
+            is_expired=is_idempotency_expired,
+        )
+        self._send_attempts = KernelSendAttemptStore(
+            store,
+            policy,
+            writer_epoch=writer_epoch,
+        )
+        self._dispatcher = KernelDispatcher(
+            store_id=store.store_id,
+            policy=policy,
+            idempotency=self._idempotency,
+            blob_stager=self._blob_stager,
+            clock=self._clock,
+            monotonic_clock=self._monotonic_clock,
+            enforce_unreserved_deadline=self._enforce_unreserved,
+            store_schema_version=self._read_store_schema_version,
+            policy_schema_version=self._read_policy_schema_version,
+            domain=self._domain,
+            send_attempts=self._send_attempts,
+            before_enter_commit=self._before_enter_commit,
+            on_commit_completed=self._on_commit_completed,
+        )
+
+    def rebind_stores(self, *, store: Store, policy: PolicyStore, writer_epoch: int) -> None:
+        """Rebind the bridge to reopened ``Store`` / ``PolicyStore`` handles after an online restore."""
+        require_positive_int(writer_epoch)
+        verify_admitted_store_pair(store, policy, writer_epoch=writer_epoch)
+        _verify_domain_pair(self._domain, store=store, policy=policy)
+        self._wire_stores(store, policy, writer_epoch)
+        self._coordinator.rebind_writer_epoch(writer_epoch)
 
     def _check_live_pair(self) -> None:
         verify_admitted_store_pair(self._store, self._policy, writer_epoch=self._writer_epoch)

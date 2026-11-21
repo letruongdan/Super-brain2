@@ -66,7 +66,8 @@ class OsPathSafety:
         if any(i != drive_colon for i, ch in enumerate(raw) if ch == ":"):
             raise BrainError(ErrorCode.UNSAFE_PATH, "':' is only allowed after a drive letter")
 
-    def reject_links(self, path: Path, *, entries: Sequence[Path] = ()) -> None:
+    def reject_links(self, path: Path, *, entries: Sequence[Path] | None = ()) -> None:
+        entry_seq: Sequence[Path] = () if entries is None else entries
         if Path.is_symlink is _ORIG_IS_SYMLINK and Path.lstat is _ORIG_PATH_LSTAT:
             cur = _fast_abs_str(os.fspath(path))
             seen_str: set[str] = set()
@@ -78,7 +79,7 @@ class OsPathSafety:
                 if parent == cur:
                     break
                 cur = parent
-            for entry in entries:
+            for entry in entry_seq:
                 ecur = _fast_abs_str(os.fspath(entry))
                 if ecur in seen_str:
                     continue
@@ -89,7 +90,7 @@ class OsPathSafety:
 
         supplied = Path(path).absolute()
         seen: set[Path] = set()
-        for candidate in (supplied, *supplied.parents, *(Path(e).absolute() for e in entries)):
+        for candidate in (supplied, *supplied.parents, *(Path(e).absolute() for e in entry_seq)):
             if candidate in seen:
                 continue
             seen.add(candidate)

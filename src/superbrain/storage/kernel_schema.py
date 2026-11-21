@@ -7,6 +7,9 @@ import sqlite3
 from datetime import UTC, datetime
 
 from superbrain.core.ids import new_id
+from superbrain.storage._proposal_schema import (
+    KERNEL_PROPOSAL_KINDS as KERNEL_PROPOSAL_KINDS,
+)
 from superbrain.storage.kinds import EntryKind, FieldType
 from superbrain.storage.ledger import utc_timestamp
 from superbrain.storage.schema import POLICY_MIGRATIONS, STORE_MIGRATIONS, Migration
@@ -51,6 +54,76 @@ KERNEL_POLICY_KINDS: tuple[EntryKind, ...] = (
         },
         {},
         nullable=frozenset({"locator_digest", "subject_id"}),
+        reserved=True,
+    ),
+    EntryKind(
+        "policy.signer_reset",
+        1,
+        {
+            "intent_id": FieldType.UUID,
+            "previous_generation": FieldType.INT,
+            "new_generation": FieldType.INT,
+            "signers_revoked": FieldType.INT,
+            "nonces_cancelled": FieldType.INT,
+            "grants_ended": FieldType.INT,
+        },
+        {},
+        reserved=True,
+    ),
+    EntryKind(
+        "policy.repo_policy_set",
+        1,
+        {
+            "intent_id": FieldType.UUID,
+            "repo_id": FieldType.OPAQUE_ID,
+            "owner_id": FieldType.OPAQUE_ID,
+            "automatic_capture_enabled": FieldType.BOOL,
+            "manual_submission_enabled": FieldType.BOOL,
+            "indexing_enabled": FieldType.BOOL,
+            "provider_egress_enabled": FieldType.BOOL,
+            "post_session_review_enabled": FieldType.BOOL,
+        },
+        {},
+        reserved=True,
+    ),
+    EntryKind(
+        "policy.layer2_state_set",
+        1,
+        {
+            "intent_id": FieldType.UUID,
+            "harness_id": FieldType.OPAQUE_ID,
+            "host_version": FieldType.OPAQUE_ID,
+            "config_digest": FieldType.DIGEST,
+            "state": FieldType.ENUM,
+        },
+        {"state": frozenset({"unknown", "unsupported", "verified"})},
+        reserved=True,
+    ),
+    EntryKind(
+        "policy.recovery_grant_opened",
+        1,
+        {
+            "intent_id": FieldType.UUID,
+            "grant_id": FieldType.UUID,
+            "approval_id": FieldType.UUID,
+            "journal_id": FieldType.UUID,
+            "subject_digest": FieldType.DIGEST,
+            "recovery_scope": FieldType.ENUM,
+            "trust_generation": FieldType.INT,
+        },
+        {"recovery_scope": frozenset({"continue", "rollback", "continue_or_rollback"})},
+        reserved=True,
+    ),
+    EntryKind(
+        "policy.recovery_grant_ended",
+        1,
+        {
+            "intent_id": FieldType.UUID,
+            "grant_id": FieldType.UUID,
+            "reason": FieldType.ENUM,
+            "trust_generation": FieldType.INT,
+        },
+        {"reason": frozenset({"trust_reset", "journal_closed"})},
         reserved=True,
     ),
 )
@@ -341,20 +414,162 @@ def _store_v4(db: sqlite3.Connection) -> None:
     )
 
 
+POLICY_V4_TABLES: frozenset[str] = frozenset(
+    {
+        "signer",
+        "approval_nonce",
+        "approval_receipt_meta",
+        "harness_layer2_state",
+        "recovery_grant",
+        "apply_turn_intent",
+        "accounting_invocations",
+        "accounting_locks",
+    }
+)
+_REPO_FLAG_COLUMNS: tuple[str, ...] = (
+    "automatic_capture_enabled",
+    "manual_submission_enabled",
+    "indexing_enabled",
+    "post_session_review_enabled",
+)
+
+
+def _policy_v4(db: sqlite3.Connection) -> None:
+    """Policy store v4 (``schema_version=4, min_reader_version=4``): signers, single-use approval nonces and receipts,
+    harness layer-2 state, recovery grants, apply-turn intents, accounting tables and the repo privacy flags (the
+    migrated rows keep ``provider_egress_enabled`` and get every new flag on, spec 14.2).
+    """
+    db.execute(
+        "CREATE TABLE signer ("
+        "id TEXT PRIMARY KEY, "
+        "owner_id TEXT NOT NULL, "
+        "channel TEXT NOT NULL CHECK (channel IN ('passkey_uv', 'ssh_sk_verified', 'ssh_sk', 'ssh_key')), "
+        "key_digest TEXT NOT NULL, "
+        "public_key TEXT NOT NULL, "
+        "credential_id TEXT, "
+        "sign_count INTEGER NOT NULL DEFAULT 0 CHECK (sign_count >= 0), "
+        "tofu INTEGER NOT NULL CHECK (tofu IN (0, 1)), "
+        "created_at TEXT NOT NULL, "
+        "revoked_at TEXT, "
+        "last_used_at TEXT)"
+    )
+    db.execute("CREATE UNIQUE INDEX idx_signer_active_key ON signer (owner_id, key_digest) WHERE revoked_at IS NULL")
+    db.execute(
+        "CREATE TABLE approval_nonce ("
+        "nonce TEXT PRIMARY KEY, "
+        "owner_id TEXT NOT NULL, "
+        "action TEXT NOT NULL, "
+        "subject_id TEXT NOT NULL, "
+        "risk_level TEXT NOT NULL CHECK (risk_level IN ('low', 'high')), "
+        "trust_generation INTEGER NOT NULL CHECK (trust_generation >= 1), "
+        "issued_at TEXT NOT NULL, "
+        "expires_at TEXT NOT NULL, "
+        "state TEXT NOT NULL CHECK (state IN ('pending', 'consumed', 'cancelled')), "
+        "ended_at TEXT, "
+        "end_reason TEXT)"
+    )
+    db.execute(
+        "CREATE TABLE approval_receipt_meta ("
+        "approval_id TEXT PRIMARY KEY, "
+        "nonce TEXT NOT NULL UNIQUE REFERENCES approval_nonce(nonce), "
+        "action TEXT NOT NULL, "
+        "subject_id TEXT NOT NULL, "
+        "risk_level TEXT NOT NULL, "
+        "channel TEXT NOT NULL, "
+        "assurance TEXT NOT NULL, "
+        "signer_id TEXT, "
+        "trust_generation INTEGER NOT NULL, "
+        "recovery_scope TEXT NOT NULL, "
+        "message_json BLOB NOT NULL, "
+        "created_at TEXT NOT NULL)"
+    )
+    db.execute(
+        "CREATE TABLE harness_layer2_state ("
+        "seq INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "harness_id TEXT NOT NULL, "
+        "host_version TEXT NOT NULL, "
+        "config_digest TEXT NOT NULL, "
+        "state TEXT NOT NULL CHECK (state IN ('unknown', 'unsupported', 'verified')), "
+        "intent_id TEXT NOT NULL, "
+        "created_at TEXT NOT NULL)"
+    )
+    db.execute(
+        "CREATE TABLE recovery_grant ("
+        "grant_id TEXT PRIMARY KEY, "
+        "approval_id TEXT NOT NULL UNIQUE, "
+        "journal_id TEXT NOT NULL, "
+        "subject_id TEXT NOT NULL, "
+        "recovery_scope TEXT NOT NULL, "
+        "trust_generation INTEGER NOT NULL, "
+        "state TEXT NOT NULL CHECK (state IN ('active', 'ended')), "
+        "end_reason TEXT, "
+        "opened_intent_id TEXT NOT NULL, "
+        "ended_intent_id TEXT, "
+        "opened_at TEXT NOT NULL, "
+        "ended_at TEXT)"
+    )
+    db.execute(
+        "CREATE TABLE apply_turn_intent ("
+        "turn_id TEXT PRIMARY KEY, "
+        "journal_id TEXT NOT NULL, "
+        "approval_id TEXT NOT NULL, "
+        "direction TEXT NOT NULL CHECK (direction IN ('apply', 'rollback')), "
+        "state TEXT NOT NULL, "
+        "created_at TEXT NOT NULL)"
+    )
+    db.execute(
+        "CREATE TABLE accounting_invocations ("
+        "invocation_id TEXT PRIMARY KEY, "
+        "job_id TEXT NOT NULL, "
+        "owner_id TEXT NOT NULL, "
+        "writer_epoch INTEGER NOT NULL, "
+        "period_key TEXT NOT NULL, "
+        "reserved_amount TEXT NOT NULL, "
+        "settled_amount TEXT, "
+        "state TEXT NOT NULL CHECK (state IN ('reserved', 'outcome_unknown', 'settled')), "
+        "recorded_at TEXT NOT NULL, "
+        "updated_at TEXT NOT NULL)"
+    )
+    db.execute(
+        "CREATE TABLE accounting_locks ("
+        "lock_key TEXT PRIMARY KEY, "
+        "owner_id TEXT NOT NULL, "
+        "period_key TEXT NOT NULL, "
+        "backup_created_at TEXT NOT NULL, "
+        "locked_at TEXT NOT NULL, "
+        "state TEXT NOT NULL CHECK (state IN ('locked', 'reconciled')), "
+        "reconciled_at TEXT, "
+        "reconciled_approval_id TEXT)"
+    )
+    for column in _REPO_FLAG_COLUMNS:
+        db.execute(f"ALTER TABLE repo_policy ADD COLUMN {column} INTEGER NOT NULL DEFAULT 1 CHECK ({column} IN (0, 1))")
+
+
+def _store_v5(db: sqlite3.Connection) -> None:
+    """Main store v5 capability fence (``schema_version=5, min_reader_version=5``): reserved ``policy.*``
+    and ``proposal.*`` ledger kinds plus ``ProposalProjectionHandler`` tables (``p_proposals_*``).
+    """
+    _ = db
+
+
 POLICY_V2_MIGRATION = Migration(to_version=2, min_reader_version=2, apply=_policy_v2)
 POLICY_V3_MIGRATION = Migration(to_version=3, min_reader_version=3, apply=_policy_v3)
+POLICY_V4_MIGRATION = Migration(to_version=4, min_reader_version=4, apply=_policy_v4)
 STORE_V2_MIGRATION = Migration(to_version=2, min_reader_version=2, apply=_store_v2)
 STORE_V3_MIGRATION = Migration(to_version=3, min_reader_version=3, apply=_store_v3)
 STORE_V4_MIGRATION = Migration(to_version=4, min_reader_version=4, apply=_store_v4)
+STORE_V5_MIGRATION = Migration(to_version=5, min_reader_version=5, apply=_store_v5)
 
 KERNEL_POLICY_MIGRATIONS: tuple[Migration, ...] = (
     *POLICY_MIGRATIONS,
     POLICY_V2_MIGRATION,
     POLICY_V3_MIGRATION,
+    POLICY_V4_MIGRATION,
 )
 KERNEL_STORE_MIGRATIONS: tuple[Migration, ...] = (
     *STORE_MIGRATIONS,
     STORE_V2_MIGRATION,
     STORE_V3_MIGRATION,
     STORE_V4_MIGRATION,
+    STORE_V5_MIGRATION,
 )

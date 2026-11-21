@@ -9,6 +9,7 @@ from superbrain.storage.store import Store
 from tests.storage.conftest import Env
 from tests.support.crash import run_child, run_until_crash
 from tests.support.fs import digest_tree
+from tests.support.inc2_fixture import open_cloned_runtime
 
 E1 = "0192f3a4-5b6c-7d8e-9f01-000000000e01"  # crash_child.EVENT_ID
 E2 = "0192f3a4-5b6c-7d8e-9f01-000000000e02"
@@ -144,7 +145,7 @@ def test_tombstone_also_blocks_later_holds(env: Env) -> None:
 
 
 def test_store_open_reconciles_pending_intents(trusted_tmp: Path) -> None:
-    rt = open_runtime(trusted_tmp / "r", os_adapters())
+    rt = open_cloned_runtime(trusted_tmp / "r", os_adapters(), role="rec-pending")
     d = hold(rt.store, b"pending", [("event", E1)])
     intent = rt.policy.record_intent(IntentKind.TOMBSTONE, {"holder_kind": "event", "holder_id": E1})
     rt.close()

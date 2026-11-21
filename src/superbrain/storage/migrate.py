@@ -15,6 +15,8 @@ from typing import Literal
 
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.ports.os import OsAdapters, PlatformTraits
+from superbrain.storage._policy_accounting import sync_legacy_accounting_from_store
+from superbrain.storage._restore_epoch import read_restore_epoch, write_restore_epoch
 from superbrain.storage.backup import (
     BackupKind,
     copy_blobs,
@@ -165,6 +167,9 @@ def migrate_database(
     )
     pending = [m for m in migrations if m.to_version > info.schema_version]
     name = source.name
+    existing_epoch = (
+        read_restore_epoch(root, schema_version=info.schema_version, os_=os_) if target == "store" else 0
+    )
 
     def build(stage: Path) -> None:
         copy_database(source, stage / name, "into the migration stage")
@@ -175,6 +180,11 @@ def migrate_database(
         if target == "store":
             copy_blobs(root.cas_dir, stage / "cas", sorted(blob_digests(root.cas_dir, os_)), os_)
             new_directory(stage / "staging", os_)
+            if latest >= 5:
+                write_restore_epoch(stage, existing_epoch, os_)
+        elif info.schema_version < 4 <= latest:
+            sync_legacy_accounting_from_store(stage / name, root, now=now)
+            os_.publisher.flush_file(stage / name)
 
     replaced = stage_and_swap(root, lease, os_, target=target, purpose="migrating", build=build, now=now)
     return MigrationReport(

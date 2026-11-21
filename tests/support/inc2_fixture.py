@@ -13,6 +13,7 @@ import hashlib
 import ipaddress
 import os
 import shutil
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -37,6 +38,7 @@ from superbrain.application.jobs import JobService
 from superbrain.composition.kernel_projections import kernel_store_extensions
 from superbrain.core.canonical import digest_bytes
 from superbrain.core.errors import BrainError
+from superbrain.core.ids import new_id
 from superbrain.core.kernel import JobRef, JobSpec, ObjectRef, UsageRecord
 from superbrain.ports.clock import Clock
 from superbrain.ports.os import OsAdapters
@@ -47,7 +49,7 @@ from superbrain.storage.layout import DataRoot, prepare_data_root, secure_subdir
 from superbrain.storage.ledger import ProjectionHandler
 from superbrain.storage.policy_store import PolicyStore
 from superbrain.storage.runtime import Runtime, admit_existing_pair, open_runtime, open_runtime_under_lease
-from superbrain.storage.schema import Migration
+from superbrain.storage.schema import POLICY_MIGRATIONS, STORE_MIGRATIONS, Migration
 from superbrain.storage.store import Store
 from superbrain.storage.writer import acquire_writer
 from superbrain.workers.executor import JobContext, JobHandler
@@ -389,6 +391,7 @@ def fixture_job_registry() -> Mapping[str, JobHandler]:
 _RUNTIME_TEMPLATE_LOCK = threading.Lock()
 _RUNTIME_TEMPLATE_BASE: Path | None = None
 _RUNTIME_TEMPLATE_CACHE: dict[tuple[object, ...], Path] = {}
+_BASE_RUNTIME_CACHE: dict[tuple[object, ...], Path] = {}
 _RUNTIME_TEMPLATE_COUNTER = 0
 
 
@@ -466,8 +469,8 @@ def open_cloned_runtime(
     role: str = "default",
     handlers: Sequence[ProjectionHandler] = (),
     kinds: KindRegistry | None = None,
-    store_migrations: Sequence[Migration] = KERNEL_STORE_MIGRATIONS,
-    policy_migrations: Sequence[Migration] = KERNEL_POLICY_MIGRATIONS,
+    store_migrations: Sequence[Migration] = STORE_MIGRATIONS,
+    policy_migrations: Sequence[Migration] = POLICY_MIGRATIONS,
 ) -> Runtime:
     """Instantiate a fresh empty ``Runtime`` by cloning cached closed schema DBs for ``role``.
 
@@ -508,10 +511,11 @@ def open_cloned_runtime(
             policy_migrations=policy_migrations,
         )
 
+    base_key = key[1:]
     with _RUNTIME_TEMPLATE_LOCK:
         tpl_dir = _RUNTIME_TEMPLATE_CACHE.get(key)
         if tpl_dir is None or not tpl_dir.is_dir():
-            if len(_RUNTIME_TEMPLATE_CACHE) >= 24:
+            if len(_RUNTIME_TEMPLATE_CACHE) >= 256:
                 return open_runtime(
                     root,
                     os_,
@@ -520,20 +524,66 @@ def open_cloned_runtime(
                     store_migrations=store_migrations,
                     policy_migrations=policy_migrations,
                 )
+            base_tpl_dir = _BASE_RUNTIME_CACHE.get(base_key)
+            if base_tpl_dir is None or not base_tpl_dir.is_dir():
+                base = _ensure_runtime_template_base()
+                _RUNTIME_TEMPLATE_COUNTER += 1
+                base_tpl_dir = base / f"base-tpl-{_RUNTIME_TEMPLATE_COUNTER}"
+                seed_clock = FakeClock(dt.datetime(2026, 10, 30, 12, 0, tzinfo=dt.UTC))
+                seed_os = os_adapters(clock=seed_clock)
+                rt_base = open_runtime(
+                    base_tpl_dir,
+                    seed_os,
+                    handlers=handlers,
+                    kinds=kinds_obj,
+                    store_migrations=store_migrations,
+                    policy_migrations=policy_migrations,
+                )
+                rt_base.close()
+                _BASE_RUNTIME_CACHE[base_key] = base_tpl_dir
+
             base = _ensure_runtime_template_base()
             _RUNTIME_TEMPLATE_COUNTER += 1
             tpl_dir = base / f"tpl-{_RUNTIME_TEMPLATE_COUNTER}"
-            seed_clock = FakeClock(dt.datetime(2026, 10, 30, 12, 0, tzinfo=dt.UTC))
-            seed_os = os_adapters(clock=seed_clock)
-            rt_tpl = open_runtime(
-                tpl_dir,
-                seed_os,
-                handlers=handlers,
-                kinds=kinds_obj,
-                store_migrations=store_migrations,
-                policy_migrations=policy_migrations,
-            )
-            rt_tpl.close()
+            tpl_root = DataRoot.at(tpl_dir)
+            base_root = DataRoot.at(base_tpl_dir)
+            tpl_root.policy_dir.mkdir(parents=True, exist_ok=True)
+            tpl_root.store_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(base_root.policy_db, tpl_root.policy_db)
+            shutil.copyfile(base_root.store_db, tpl_root.store_db)
+            if os.path.lexists(base_root.restore_epoch_path):
+                shutil.copyfile(base_root.restore_epoch_path, tpl_root.restore_epoch_path)
+
+            tpl_perms = os_adapters().permissions
+            new_store_id = new_id()
+            for db_p in (tpl_root.policy_db, tpl_root.store_db):
+                conn = sqlite3.connect(db_p)
+                try:
+                    cur = conn.execute("UPDATE meta SET value = ? WHERE key = 'store_id'", (new_store_id,))
+                    assert cur.rowcount == 1
+                    if db_p == tpl_root.policy_db:
+                        has_digest_key = (
+                            conn.execute(
+                                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'request_digest_key'"
+                            ).fetchone()
+                            is not None
+                        )
+                        if has_digest_key:
+                            cur_k = conn.execute(
+                                "UPDATE request_digest_key SET id = ?, key_bytes = ?",
+                                (new_id(), os.urandom(32)),
+                            )
+                            assert cur_k.rowcount == 1
+                    conn.commit()
+                    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                finally:
+                    conn.close()
+                assert not os.path.lexists(str(db_p) + "-wal")
+                assert not os.path.lexists(str(db_p) + "-shm")
+                tpl_perms.secure_file(db_p)
+            if os.path.lexists(tpl_root.restore_epoch_path):
+                tpl_perms.secure_file(tpl_root.restore_epoch_path)
+
             _RUNTIME_TEMPLATE_CACHE[key] = tpl_dir
 
     tpl_root = DataRoot.at(tpl_dir)
@@ -547,6 +597,9 @@ def open_cloned_runtime(
         os_.permissions.secure_file(data_root.policy_db)
         shutil.copyfile(tpl_root.store_db, data_root.store_db)
         os_.permissions.secure_file(data_root.store_db)
+        if os.path.lexists(tpl_root.restore_epoch_path):
+            shutil.copyfile(tpl_root.restore_epoch_path, data_root.restore_epoch_path)
+            os_.permissions.secure_file(data_root.restore_epoch_path)
         policy = PolicyStore.open(data_root, lease, os_, migrations=policy_migrations)
         store = Store.open(data_root, lease, os_, policy, handlers, kinds_obj, migrations=store_migrations)
         policy.mark_store_published()

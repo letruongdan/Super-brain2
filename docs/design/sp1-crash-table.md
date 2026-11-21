@@ -35,7 +35,8 @@ tập tên của `CRASH_CASES` (đợt 1) cộng `KERNEL_CRASH_CASES` (đợt 2,
 - **GC và backup không để lại trạng thái pin.** GC và backup cùng chạy trên owner thread, nên tự tuần tự. Cờ
   `Store.maintenance()` không lồng được: gọi GC khi backup đang chạy trả `STORE_BUSY`. Không có bảng pin bền vững, nên
   crash giữa backup không để lại gì cần thu hồi (xem các dòng `backup.*`).
-- **ApplyJournal thuộc đợt 3.** Bảng này chưa có dòng cho ApplyJournal. Đợt 3 thêm crashpoint và dòng tương ứng.
+- **ApplyJournal thuộc đợt 3 (I3-3).** Mười điểm cắt của `ApplyJournal` và `apply_turn_intent` / `recovery_grant`
+  được liệt kê ở bảng bên dưới (tổng cộng 39 crashpoint).
 
 ## Writer lock
 
@@ -140,12 +141,38 @@ credential và store chưa áp intent. Startup áp đúng một `policy.credenti
 replay và đọc ref trực tiếp, còn credential đối chứng cùng principal replay được dữ liệu đã ACK. Lượt startup thứ hai
 gọi lại cùng authority với fault env vẫn bật, trả cùng intent mà không ghi thêm. Hàng và node ID của đợt 1 giữ nguyên.
 
+## ApplyJournal và recovery_grant (SP1 đợt 3, I3-3)
+
+Mười dòng này là `I33CrashCase` trong `tests/support/inc3_crash_cases.py::I3_3_CRASH_CASES`, chạy từ wheel venv bởi
+`tests/integration/test_apply_journal_crash_matrix.py` qua `tests/support/inc3_crash_child.py` với `python -I`.
+
+| Crashpoint | Operation | Trước | Sau crash | Đã ACK? | Phục hồi | Invariant | CrashCase | Tiến trình chết | Mất điện |
+|---|---|---|---|---|---|---|---|---|---|
+| `apply.after_policy_turn_intent` | `apply` | Proposal `pending`/`approved`, tệp đích `U0` nguyên vẹn | `policy.db` đã ghi `apply_turn_intent(direction='apply')` + `recovery_grant` `active`; `brain.db` chưa có `ApplyJournal`, đĩa chưa chạm | Chưa | `reconcile_and_classify_journals` chiếu journal `APPLYING` sang `brain.db`, stage từ CAS và chạy tiếp tới `applied` (hoạt động cả sau TTL 10 phút) | Trạng thái quyền đi trước kho; grant sống qua restart sau hết hạn nonce | `apply@apply.after_policy_turn_intent` | Có test từ wheel | Hai DB WAL `synchronous=FULL`; intent bền trước mọi ghi file |
+| `apply.before_move_original` | `apply` | Staging `rep-*` đã flush và ghim `replacement_physical_id`; journal `APPLYING` trong `brain.db` | Chưa dời tệp gốc đầu tiên sang backup; `U0` trên đĩa nguyên vẹn | Chưa | Kiểm grant + `PhysicalObjectId` + `Q25`, dời gốc sang backup rồi publish bản mới tới `applied` | Không ghi đè file đích trước khi backup gốc được xác minh | `apply@apply.before_move_original` | Có test từ wheel | File staged qua port; journal bền trong WAL |
+| `apply.after_move_before_phase` | `apply` | Tệp đích `U0` vừa `publish(tgt, bak-0)` sang backup | Backup `bak-0` mang `U0` đã nằm trên đĩa, tệp đích vắng, `brain.db` vẫn ghi `phase='planned'` | Chưa | Kiểm đĩa thấy đích vắng và `bak-0` khớp `(PhysicalObjectId, digest)`, ghi nhận `ORIGINAL_MOVED` rồi tiếp tục publish | Không mất tệp gốc khi crash trước cập nhật phase journal | `apply@apply.after_move_before_phase` | Có test từ wheel | Rename backup đi qua `DurablePublisher` + sync thư mục cha |
+| `apply.before_publish_replacement` | `apply` | `ORIGINAL_MOVED` và `bak-0` đã bền | Thư mục cha đã sẵn sàng, chưa gọi `publish_no_replace`; tệp đích vẫn vắng | Chưa | Xác minh `bak-0`, gọi `publish_no_replace(rep-0, tgt)` và hoàn tất các file còn lại | Không dùng replace-existing để ghi đè file người dùng mới xuất hiện | `apply@apply.before_publish_replacement` | Có test từ wheel | Backup đã sync và bền trong `policy`/`staging` trước khi publish |
+| `apply.after_publish_before_phase` | `apply` | `ORIGINAL_MOVED`; `rep-0` có `replacement_physical_id` đã ghim | `publish_no_replace` đã đưa `rep-0` vào đích, `brain.db` chưa ghi `REPLACEMENT_PUBLISHED` | Chưa | Phân loại đĩa thấy `PhysicalObjectId(tgt) == replacement_physical_id` nên nhận diện file của Brain, ghi `REPLACEMENT_PUBLISHED` mà không đụng đĩa hay lỗi `FileExistsError` | Pre-pin `replacement_physical_id` tránh vòng lặp lỗi `FileExistsError` giả | `apply@apply.after_publish_before_phase` | Có test từ wheel | Rename `publish_no_replace` giữ nguyên object ID vật lý đã ghim |
+| `rollback.after_policy_turn_intent` | `rollback-applied` | Proposal đang `applied`; có chỉnh sửa ngoài luồng `U1` trong file dùng chung | `policy.db` đã ghi `apply_turn_intent(direction='rollback')` + `recovery_grant`; `brain.db` chưa có rollback journal | Chưa | Chiếu rollback journal từ `policy.db`, kiểm toàn vẹn mục tiêu/manifest rồi gỡ slice giữ nguyên `U1` | Hướng `rollback` bền trước khi chạm file hoặc tạo journal phụ | `rollback-applied@rollback.after_policy_turn_intent` | Có test từ wheel | Commit `policy.db` với `synchronous=FULL` trước `brain.db` |
+| `rollback.before_first_move` | `rollback-applied` | Journal `ROLLING_BACK` với mọi file ở `replacement_published`; tất cả backup đã qua kiểm tra | Tất cả file vẫn ở trạng thái sau `applied`, chưa dời file đầu tiên (ca R21-01 / 107) | Chưa | Đọc `direction='rollback'` **trước** khi phân loại phase nên không kết thúc nhầm `applied`; hoàn tất rollback hoặc dừng `recovery_required` nếu backup mất/hỏng | Thứ tự kiểm toàn bộ backup trước lần dời đầu và không đảo hướng `rollback` | `rollback-applied@rollback.before_first_move` | Có test từ wheel | Journal + manifest + intent đã commit trước bước chạm file |
+| `rollback.after_move_replacement` | `rollback-applied` | Bản đã cài bị dời ra backup rollback (`rb-bak-*` / holding) | Tệp đích vắng, `rb-bak-*` và `rb-rep-*` còn nguyên trên đĩa | Chưa | Tiếp tục `publish_no_replace` bản `U1`/`U0` khôi phục vào đích tới `rolled_back` | Không ghi đè file người dùng chen ngang bằng `no-replace` | `rollback-applied@rollback.after_move_replacement` | Có test từ wheel | Move giữ bản gốc qua `DurablePublisher` trước khi publish bản khôi phục |
+| `rollback.after_restore_last_original` | `rollback-applied` | Tệp đích cuối cùng đã khôi phục xong về `U0`/`U1` trên đĩa | Đĩa đã hoàn nguyên sạch sẽ, `recovery_grant` vẫn `active`, `brain.db` chưa ghi `rolled_back` | Chưa | Thấy toàn bộ file đã khớp trạng thái khôi phục nên đóng `recovery_grant` trong `policy.db` trước rồi cập nhật `ROLLED_BACK` | Không ghi `ROLLED_BACK` mà bỏ quên `recovery_grant` đang `active` | `rollback-applied@rollback.after_restore_last_original` | Có test từ wheel | File khôi phục đã `publish_no_replace` và sync thư mục |
+| `apply.after_policy_grant_ended` | `apply` | Mọi file đã publish xong và verified; `policy.db` vừa đóng `recovery_grant` (`journal_closed`) + ghi outcome `applied` | Grant trong `policy.db` đã `ended` với outcome `applied`; `brain.db` vẫn ghi `applying`/`partially_applied` (ca 93) | Chưa | Chiếu trạng thái `applied` + manifest còn thiếu sang `brain.db` **không** mở lại `recovery_grant` | Grant đã `ended` không bao giờ hồi sinh quyền ghi sau restart hoặc restore | `apply@apply.after_policy_grant_ended` | Có test từ wheel | Commit đóng grant + outcome ở `policy.db` đi trước `brain.db` |
+
+## Restore bước 7 và drain (SP1 đợt 3, I3-4)
+
+Một dòng này là `I34CrashCase` trong `tests/support/inc3_i34_crash_cases.py::I3_4_CRASH_CASES`, chạy từ wheel venv bởi `tests/integration/test_restore_and_migration_i3.py` qua `tests/support/inc3_i34_crash_child.py` với `python -I`.
+
+| Crashpoint | Operation | Trước | Sau crash | Đã ACK? | Phục hồi | Invariant | CrashCase | Tiến trình chết | Mất điện |
+|---|---|---|---|---|---|---|---|---|---|
+| `restoring.store.after_swap_before_effect_drain` | `restore-store` | Backup `store_full` chụp lúc Evidence `E` còn hạn; ở kho sống `E` còn được giữ (`DURABLE`), tới hiện tại `E` trong snapshot đã quá hạn; dựng xong `store/restore_epoch.json` mới và `pending_restore_tombstones.json` trong stage | `stage_and_swap` đã đổi tên `store/` -> `store.replaced-*` và công bố stage làm `store/` mới (mang `restore_epoch.json` tăng và `pending_restore_tombstones.json`); `policy.db` **chưa** nhận `TOMBSTONE` của `E` | Chưa | `open_runtime` / `open_runtime_under_lease` chạy `drain_published_restore_effects` trên đúng snapshot đã công bố **trước** khi mở đọc hay nhận Job: ghi `TOMBSTONE(E)` vào `policy.db`, reconcile vào `brain.db`, xóa file tạm; lần đọc đầu chặn `E`. Lần khởi động thứ hai với hook vẫn bật là no-op | Không bao giờ ghi tombstone trước swap (bảo vệ kho sống nếu chết trước hoán đổi), nhưng một khi đã swap thì hiệu ứng hết hạn luôn hoàn tất trước khi phục vụ | `restore-store@restoring.store.after_swap_before_effect_drain` | Có test từ wheel | Snapshot đã atomic rename + `READY` trước khi `writer.lock` tăng epoch; danh sách tombstone nằm sẵn bên trong `store/` vừa công bố nên restart đọc đúng bản đó và hoàn tất bước 7 |
+
 ## Bảo đảm của chính ma trận
 
-- `test_every_known_crashpoint_has_a_case_and_a_doc_row`: mỗi crashpoint đã đăng ký có đúng một ca (`CrashCase` hoặc
-  `KernelCrashCase`) và đúng một dòng trong tài liệu này, không tên nào trùng.
-- `test_registry_is_exactly_the_increment_1_names_plus_the_task_8_names`: registry bằng đúng 19 tên đợt 1 cộng 10 tên
-  Task 8 (tổng 29). 19 ca đợt 1 giữ nguyên node ID.
+- `test_every_known_crashpoint_has_a_case_and_a_doc_row`: mỗi crashpoint đã đăng ký có đúng một ca (`CrashCase`, `KernelCrashCase`,
+  `I33CrashCase`, hoặc `I34CrashCase`) và đúng một dòng trong tài liệu này, không tên nào trùng.
+- `test_registry_is_exactly_the_increment_1_names_plus_the_task_8_and_i3_names`: registry bằng đúng 19 tên đợt 1 cộng
+  10 tên Task 8 cộng 10 tên I3-3 cộng 1 tên I3-4 (tổng 40). 19 ca đợt 1 và 10 ca Task 8 giữ nguyên node ID.
 - `test_kernel_cases_keep_operation_at_crashpoint_ids_and_all_run`: node ID `operation@crashpoint`, operation thuộc
   `serve`/`serve-fixture`/`migrate`/`serve-jobs`/`job-operation`. Crashpoint trên đường request của shim có trigger sau READY.
 - `test_crash_case`: mỗi ca phải chết với mã 86 **đúng** ở crashpoint của nó (`run_until_crash`).

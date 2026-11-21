@@ -276,6 +276,8 @@ _DEFAULT_CASE_COST_MS = 20
 _WHEEL_FIXTURE_FILES: frozenset[str] = frozenset(
     {
         "tests/contract/test_mcp_v2_schema.py",
+        "tests/integration/test_apply_journal_crash_matrix.py",
+        "tests/integration/test_i3_wheel_e2e.py",
         "tests/integration/test_kernel_cli.py",
         "tests/integration/test_kernel_crash_recovery.py",
         "tests/integration/test_kernel_native_receipt_contract.py",
@@ -283,161 +285,195 @@ _WHEEL_FIXTURE_FILES: frozenset[str] = frozenset(
         "tests/integration/test_kernel_receipts.py",
         "tests/integration/test_kernel_shim.py",
         "tests/integration/test_sp2_i2_wheel_compat.py",
+        "tests/integration/test_restore_and_migration_i3.py",
         "tests/integration/test_t9_benchmark_scratch.py",
     }
 )
-# R47 calibration across all 148 collected test files from hosted Windows CI 3.14 JUnit timings (ci-44326455601)
-# with _WHEEL_SETUP_COST_MS=3000 (since JUnit already measures inc2_installed_env setup inside wheel suites).
-# Only scheduling estimates change; the collected inventory, shared 300s budget and wheel overhead remain intact.
+# Calibrated across all 181 collected test files using hosted windows-2022 CI measurements
+# (run 44705523078 shard-0, baseline 035a4cd, and Azure 2.43x storage scaling for new/updated storage modules)
+# plus session wheel setup overhead across the two wheel shards. _WHEEL_SETUP_COST_MS=3000 and 300s budget intact.
 _HEAVY_FILE_COST_MS: dict[str, int] = {
-    "tests/integration/test_kernel_daemon.py": 48864,
+    "tests/integration/test_apply_journal_crash_matrix.py": 66000,
+    "tests/integration/test_kernel_crash_recovery.py": 61000,
     "tests/storage/test_kernel_revocation.py": 45672,
-    "tests/integration/test_kernel_crash_recovery.py": 39346,
+    "tests/integration/test_kernel_native_receipt_contract.py": 35503,
     "tests/storage/test_backup.py": 33528,
+    "tests/integration/test_kernel_daemon.py": 29453,
+    "tests/integration/test_i3_wheel_e2e.py": 28000,
     "tests/storage/test_cas.py": 24444,
+    "tests/integration/test_i3_rereview_init_and_accounting.py": 24000,
     "tests/storage/test_remediation_i2_t5.py": 23717,
     "tests/storage/test_crash_matrix.py": 23606,
-    "tests/integration/test_kernel_cli.py": 22163,
-    "tests/storage/test_kernel_idempotency.py": 20369,
-    "tests/integration/test_kernel_native_receipt_contract.py": 19453,
+    "tests/storage/test_kernel_idempotency.py": 22180,
+    "tests/storage/test_remediation_i2_os01.py": 19998,
     "tests/storage/test_restore.py": 18918,
+    "tests/storage/test_remediation_i2_t3_lineage.py": 18576,
     "tests/storage/test_migrate.py": 17878,
-    "tests/storage/test_remediation_i2_os01.py": 17683,
+    "tests/architecture/test_gate_receipt.py": 17550,
     "tests/storage/test_kernel_migration.py": 17155,
-    "tests/storage/test_remediation_i2_t3_lineage.py": 16232,
-    "tests/integration/test_i2_close_01_canonical_compat.py": 16172,
+    "tests/integration/test_kernel_cli.py": 16997,
+    "tests/integration/test_restore_and_migration_i3.py": 16000,
     "tests/storage/test_ledger.py": 15664,
     "tests/storage/test_remediation_c04_r8_backup_files.py": 15078,
-    "tests/application/test_t8_review_p01_r2_edge_globs.py": 14612,
     "tests/storage/test_runtime.py": 14611,
-    "tests/integration/test_t9_socket_readiness.py": 14435,
+    "tests/integration/test_t9_signal_stop_conversion.py": 14387,
     "tests/integration/test_kernel_receipts.py": 14239,
-    "tests/application/test_t8_review_p01_wrapped_paths.py": 14102,
-    "tests/architecture/test_gate_receipt.py": 13117,
+    "tests/storage/test_recovery_grant_and_turn_intent.py": 12490,
+    "tests/storage/test_remediation_c02_r6_restore_marker.py": 11839,
     "tests/storage/test_kernel_workspaces.py": 11769,
-    "tests/storage/test_policy_store.py": 10790,
-    "tests/storage/test_remediation_c02_r6_restore_marker.py": 10302,
+    "tests/storage/test_policy_accounting.py": 10955,
+    "tests/storage/test_restore_epoch_and_expiry.py": 10570,
+    "tests/application/test_t8_review_p01_wrapped_paths.py": 10342,
+    "tests/storage/test_policy_store.py": 10225,
     "tests/storage/test_kernel_identity.py": 9530,
-    "tests/integration/test_kernel_shim.py": 9517,
-    "tests/integration/test_kernel_transport.py": 8813,
+    "tests/integration/test_i3_rereview_bootstrap_and_handoff.py": 9322,
+    "tests/application/test_t8_review_p01_r2_edge_globs.py": 9205,
     "tests/storage/test_remediation_c04_r9_imported_backup_ancestors.py": 8653,
-    "tests/integration/test_kernel_privacy_persistence.py": 7587,
+    "tests/storage/test_remediation_i2_t3_mirror_history.py": 8300,
+    "tests/storage/test_i3_4_storage_regressions.py": 8274,
+    "tests/integration/test_kernel_shim.py": 8250,
     "tests/storage/test_reconcile.py": 7426,
-    "tests/integration/test_i2_close_01_wire_replay.py": 7336,
-    "tests/application/test_kernel_send_attempts.py": 7229,
+    "tests/integration/test_kernel_privacy_persistence.py": 7400,
+    "tests/storage/test_remediation_c04_cas_shard_boundary.py": 7305,
     "tests/storage/test_remediation_c01_wal_admission.py": 7166,
+    "tests/storage/test_remediation_c04_r6_backup_container_perms.py": 7095,
+    "tests/integration/test_kernel_transport.py": 7036,
+    "tests/storage/test_remediation_i2_t4a.py": 6978,
     "tests/storage/test_kernel_jobs.py": 6857,
     "tests/contract/test_mcp_v2_schema.py": 6836,
     "tests/storage/test_remediation_c02_lost_main_db.py": 6532,
-    "tests/application/test_kernel_job_worker.py": 6045,
+    "tests/application/test_kernel_daemon_worker.py": 6124,
     "tests/storage/test_flush_routing.py": 5790,
-    "tests/storage/test_remediation_i2_t4a.py": 5742,
-    "tests/integration/test_t9_signal_stop_conversion.py": 5324,
-    "tests/storage/test_remediation_c04_r6_backup_container_perms.py": 4999,
-    "tests/storage/test_writer.py": 4770,
+    "tests/support/test_bounded_worker.py": 5718,
+    "tests/integration/test_cli_init_and_authority.py": 5193,
+    "tests/storage/test_swap.py": 5015,
+    "tests/application/test_bootstrap_and_doctor.py": 4891,
+    "tests/storage/test_writer.py": 4655,
     "tests/storage/test_remediation_c01_r4_reading_leftovers.py": 4558,
-    "tests/integration/test_i2_close_01_transport_stdio.py": 4506,
-    "tests/application/test_t8_review_p01_r3_spellings.py": 4476,
-    "tests/storage/test_remediation_i2_t3_mirror_history.py": 4355,
-    "tests/support/test_bounded_worker.py": 4315,
-    "tests/storage/test_swap.py": 4305,
+    "tests/application/test_i3_5_bootstrap_doctor_regressions.py": 4525,
+    "tests/integration/test_i2_close_01_canonical_compat.py": 4382,
+    "tests/application/test_kernel_send_attempts.py": 4377,
+    "tests/integration/test_t9_socket_readiness.py": 4179,
     "tests/storage/test_remediation_c04_r2_cas_siblings.py": 4098,
-    "tests/application/test_kernel_deadlines.py": 3945,
-    "tests/integration/test_kernel_performance.py": 3712,
-    "tests/architecture/test_remediation_c08_r11_raw_path_admission.py": 3577,
-    "tests/storage/test_remediation_c04_cas_shard_boundary.py": 3464,
+    "tests/application/test_i3_4_accounting_regressions.py": 3890,
+    "tests/storage/test_signer_and_layer2_authority.py": 3883,
+    "tests/integration/test_apply_journal_e2e.py": 3742,
+    "tests/application/test_t8_review_p01_r3_spellings.py": 3574,
+    "tests/integration/test_t9_startup_signal_latch.py": 3462,
+    "tests/integration/test_kernel_serve_signal_lifecycle.py": 3402,
     "tests/storage/test_remediation_c02_r8_restore_carryover.py": 3334,
-    "tests/application/test_kernel_daemon_worker.py": 3099,
-    "tests/storage/test_remediation_c03_handler_downgrade.py": 2996,
+    "tests/integration/test_kernel_performance.py": 3220,
+    "tests/integration/test_i3_1_review_regressions.py": 3218,
+    "tests/support/test_crash_harness.py": 3206,
+    "tests/integration/test_review_apply_cli_and_operator.py": 3187,
+    "tests/integration/test_t9_signal_stop_guard.py": 2982,
+    "tests/integration/test_i2_close_01_transport_stdio.py": 2851,
+    "tests/integration/test_t9_benchmark_scratch.py": 2804,
     "tests/storage/test_remediation_i2_t5_residual.py": 2692,
     "tests/storage/test_remediation_c01_r5_policy_wal_reader.py": 2671,
-    "tests/application/test_t8_review_p01_n01_linear.py": 2620,
     "tests/storage/test_errors.py": 2584,
     "tests/storage/test_cas_gc.py": 2517,
-    "tests/application/test_t8_review_w01_canonical_reuse.py": 2494,
-    "tests/integration/test_kernel_serve_signal_lifecycle.py": 2418,
-    "tests/cli_api/test_t9_tcp_latency.py": 2289,
+    "tests/application/test_kernel_deadlines.py": 2500,
+    "tests/application/test_i3_3_review_regressions.py": 2473,
+    "tests/application/test_i3_2_journal_regressions.py": 2433,
+    "tests/integration/test_i2_close_01_wire_replay.py": 2311,
     "tests/storage/test_retention.py": 2263,
-    "tests/integration/test_t9_r22_stop_completion.py": 2229,
-    "tests/adapters/test_durable.py": 2193,
-    "tests/support/test_crash_harness.py": 2126,
-    "tests/integration/test_t9_r21_shutdown_wait.py": 2019,
-    "tests/application/test_t8_review_p01_n04_short_spellings.py": 1978,
+    "tests/cli_api/test_i3_5_review_web_regressions.py": 2200,
+    "tests/cli_api/test_review_web.py": 2109,
+    "tests/application/test_t8_review_p01_n01_linear.py": 2046,
+    "tests/storage/test_remediation_c03_handler_downgrade.py": 2040,
+    "tests/architecture/test_imports.py": 1996,
+    "tests/integration/test_i3_4_restore_regressions.py": 1986,
+    "tests/application/test_kernel_job_worker.py": 1853,
     "tests/storage/test_remediation_c04_r5_backup_cas_link.py": 1798,
+    "tests/application/test_remediation_i2_t5_worker.py": 1791,
+    "tests/storage/test_remediation_c02_r7_live_marker.py": 1766,
+    "tests/application/test_change_proposal_and_journal.py": 1730,
+    "tests/application/test_t8_review_p01_n04_short_spellings.py": 1671,
+    "tests/integration/test_t9_r22_stop_completion.py": 1668,
     "tests/storage/test_remediation_c05_r2_resync.py": 1632,
-    "tests/architecture/test_remediation_c06_gate_xpass.py": 1608,
-    "tests/application/test_t8_review_p01_r4_oracle_fixes.py": 1526,
-    "tests/application/test_t8_review_p01_n03_r2_inner_literals.py": 1522,
-    "tests/storage/test_remediation_c02_r7_live_marker.py": 1505,
+    "tests/application/test_i3_2_rollback_and_schema_regressions.py": 1582,
     "tests/storage/test_remediation_c02_r4_intents_signal.py": 1485,
     "tests/storage/test_remediation_c05_shard_parent_sync.py": 1478,
-    "tests/application/test_t8_review_p01_n01_r2_edges.py": 1307,
-    "tests/application/test_t8_review_w02_private_large_blocks.py": 1168,
-    "tests/application/test_t8_closure_privacy_r2.py": 1163,
-    "tests/application/test_remediation_i2_t4bc.py": 1158,
-    "tests/integration/test_t9_benchmark_scratch.py": 1029,
-    "tests/integration/test_t9_signal_stop_guard.py": 1014,
-    "tests/architecture/test_imports.py": 1013,
-    "tests/application/test_t8_review_p01_n03_edge_cost.py": 941,
-    "tests/integration/test_t9_startup_signal_latch.py": 830,
-    "tests/application/test_t8_closure_privacy.py": 811,
-    "tests/architecture/test_t8_review_w02_canonical_payload_source.py": 797,
-    "tests/architecture/test_remediation_i2_os01.py": 761,
-    "tests/application/test_t8_review_w01_private_equivalence.py": 732,
-    "tests/architecture/test_remediation_c08_r13_unavailable_drive.py": 709,
-    "tests/application/test_remediation_i2_t5_worker.py": 622,
-    "tests/integration/test_t9_client_sighting.py": 620,
-    "tests/storage/test_layout.py": 617,
-    "tests/architecture/test_t9_ci_checkout_bytes.py": 573,
-    "tests/application/test_t8_privacy_performance_equivalence.py": 556,
-    "tests/application/test_kernel_privacy.py": 514,
-    "tests/cli_api/test_loopback_client.py": 478,
-    "tests/adapters/test_client_profile.py": 330,
-    "tests/support/test_inc2_process_cleanup.py": 330,
-    "tests/architecture/test_t9_ci_seal.py": 294,
-    "tests/core/test_faults.py": 256,
-    "tests/mcp/test_stdio.py": 256,
+    "tests/architecture/test_t8_review_w02_canonical_payload_source.py": 1447,
+    "tests/adapters/test_durable.py": 1403,
+    "tests/architecture/test_t9_ci_checkout_bytes.py": 1400,
+    "tests/architecture/test_remediation_c08_r13_unavailable_drive.py": 1244,
+    "tests/architecture/test_remediation_c06_gate_xpass.py": 1241,
+    "tests/application/test_t8_closure_privacy_r2.py": 1228,
+    "tests/application/test_t8_review_p01_n03_r2_inner_literals.py": 1200,
+    "tests/application/test_t8_closure_privacy.py": 1051,
+    "tests/application/test_t8_review_w02_private_large_blocks.py": 1041,
+    "tests/application/test_t8_review_p01_r4_oracle_fixes.py": 1010,
+    "tests/application/test_remediation_i2_t4bc.py": 919,
+    "tests/architecture/test_remediation_c08_r11_raw_path_admission.py": 900,
+    "tests/application/test_t8_review_p01_n01_r2_edges.py": 893,
+    "tests/integration/test_i3_2_operator_cli_regressions.py": 881,
+    "tests/application/test_t8_review_w01_private_equivalence.py": 846,
+    "tests/integration/test_t9_client_sighting.py": 837,
+    "tests/adapters/test_approval_verifiers.py": 827,
+    "tests/integration/test_t9_r21_shutdown_wait.py": 788,
+    "tests/application/test_i3_3_r3_regressions.py": 761,
+    "tests/architecture/test_t9_ci_seal.py": 717,
+    "tests/application/test_t8_review_w01_canonical_reuse.py": 694,
+    "tests/application/test_t8_review_p01_n03_edge_cost.py": 653,
+    "tests/cli_api/test_t9_tcp_latency.py": 653,
+    "tests/core/test_faults.py": 631,
+    "tests/storage/test_i3_3_authority_regressions.py": 617,
+    "tests/storage/test_layout.py": 614,
+    "tests/cli_api/test_loopback_client.py": 595,
+    "tests/application/test_operator_service_and_verifiers_r2.py": 567,
+    "tests/storage/test_t9_endpoint_casefold.py": 542,
+    "tests/support/test_inc2_process_cleanup.py": 541,
+    "tests/architecture/test_remediation_i2_os01.py": 474,
+    "tests/adapters/test_physical_fs_and_no_replace.py": 473,
+    "tests/application/test_kernel_privacy.py": 415,
+    "tests/application/test_t8_privacy_performance_equivalence.py": 359,
+    "tests/cli_api/test_loopback_frames.py": 304,
+    "tests/adapters/test_client_profile.py": 301,
+    "tests/architecture/test_t9_gate_environment_isolation.py": 264,
+    "tests/architecture/test_t9_gate_job_drain.py": 261,
+    "tests/application/test_t8_closure_privacy_r2_gates.py": 252,
     "tests/storage/test_schema.py": 252,
-    "tests/application/test_t8_closure_privacy_r2_gates.py": 225,
-    "tests/storage/test_t9_endpoint_casefold.py": 210,
-    "tests/architecture/test_t9_gate_job_drain.py": 168,
-    "tests/cli_api/test_loopback_frames.py": 167,
-    "tests/core/test_ids.py": 142,
-    "tests/application/test_t9_privacy_non_retention.py": 130,
-    "tests/architecture/test_t9_gate_environment_isolation.py": 130,
-    "tests/composition/test_client_scope.py": 113,
-    "tests/cli_api/test_t8_closure_wire.py": 112,
-    "tests/architecture/test_remediation_c08_r6_root_itself.py": 108,
+    "tests/mcp/test_stdio.py": 222,
+    "tests/architecture/test_remediation_c08_r6_root_itself.py": 204,
+    "tests/application/test_t9_privacy_non_retention.py": 203,
+    "tests/core/test_ids.py": 167,
+    "tests/architecture/test_remediation_c08_r8_root_links.py": 142,
+    "tests/cli_api/test_t8_closure_wire.py": 120,
+    "tests/architecture/test_remediation_c08_r4_preflight_failures.py": 104,
+    "tests/integration/test_t9_libproc_client_pid.py": 102,
     "tests/storage/test_t9_reserved_sibling_casefold.py": 93,
-    "tests/application/test_t8_closure_privacy_r5_shapes.py": 92,
-    "tests/architecture/test_remediation_c08_r8_root_links.py": 77,
-    "tests/application/test_remediation_i2_t3_privacy.py": 54,
-    "tests/application/test_t8_closure_privacy_r5_paths.py": 52,
-    "tests/application/test_t8_review_r01_path_enforcement.py": 46,
+    "tests/adapters/test_paths.py": 86,
+    "tests/application/test_t8_closure_privacy_r5_shapes.py": 68,
+    "tests/adapters/test_i3_2_hygiene_regressions.py": 66,
+    "tests/adapters/test_permissions.py": 65,
+    "tests/integration/test_t8_closure_perf_probe_r5.py": 59,
+    "tests/architecture/test_remediation_c08_gate_environment.py": 53,
+    "tests/application/test_t8_closure_privacy_r5_paths.py": 49,
+    "tests/application/test_remediation_i2_t3_privacy.py": 48,
     "tests/storage/test_kinds.py": 46,
-    "tests/architecture/test_remediation_c08_r9_missing_root_linked_parent.py": 43,
-    "tests/architecture/test_remediation_c08_r4_preflight_failures.py": 38,
-    "tests/adapters/test_permissions.py": 32,
-    "tests/integration/test_t8_closure_perf_probe_r5.py": 32,
-    "tests/adapters/test_paths.py": 31,
-    "tests/integration/test_t9_libproc_client_pid.py": 29,
+    "tests/architecture/test_remediation_c08_r2_real_probe.py": 41,
+    "tests/composition/test_client_scope.py": 33,
     "tests/application/test_t8_closure_privacy_r4_literals.py": 26,
-    "tests/architecture/test_remediation_c08_gate_environment.py": 23,
-    "tests/integration/test_t9_process_sighting.py": 23,
-    "tests/architecture/test_remediation_c08_r2_real_probe.py": 21,
-    "tests/core/test_t8_closure_normalize.py": 20,
-    "tests/application/test_t8_closure_prequeue.py": 20,
-    "tests/application/test_t8_review_p02_rule_gates.py": 20,
-    "tests/integration/test_t8_review_20261112_perf_attribution.py": 20,
-    "tests/storage/test_t9_checkout_spelling.py": 20,
+    "tests/integration/test_t9_process_sighting.py": 26,
+    "tests/application/test_t8_review_r01_path_enforcement.py": 23,
+    "tests/architecture/test_remediation_c08_r9_missing_root_linked_parent.py": 22,
+    "tests/adapters/test_shared_config_mergers.py": 20,
     "tests/application/test_kernel_lineage.py": 20,
-    "tests/integration/test_t8_review_20261112_perf_replay.py": 20,
+    "tests/application/test_t8_closure_prequeue.py": 20,
     "tests/application/test_t8_closure_privacy_r3_casefold.py": 20,
-    "tests/integration/test_t8_closure_perf_probe.py": 20,
-    "tests/core/test_canonical.py": 20,
-    "tests/support/test_fs.py": 20,
     "tests/application/test_t8_review_p02_r2_rule_discovery.py": 20,
+    "tests/application/test_t8_review_p02_rule_gates.py": 20,
+    "tests/core/test_approval_message.py": 20,
+    "tests/core/test_canonical.py": 20,
+    "tests/core/test_t8_closure_normalize.py": 20,
+    "tests/integration/test_t8_closure_perf_probe.py": 20,
+    "tests/integration/test_t8_review_20261112_perf_attribution.py": 20,
+    "tests/integration/test_t8_review_20261112_perf_replay.py": 20,
     "tests/integration/test_t9_linux_scan_budget.py": 20,
+    "tests/storage/test_t9_checkout_spelling.py": 20,
+    "tests/support/test_fs.py": 20,
 }
 
 
@@ -452,43 +488,111 @@ def _is_storage_file(path: str) -> bool:
     return path.replace("\\", "/").startswith("tests/storage/")
 
 
+def _wheel_shard_count(wheel_total: int, non_wheel_total: int, size: int, wheel_file_count: int) -> int:
+    """Minimum shard prefix needed so wheel suites do not exceed a single shard's fair share."""
+    if size <= 1 or wheel_file_count <= 1:
+        return 1
+    single_shard_target = (wheel_total + non_wheel_total + _WHEEL_SETUP_COST_MS) // size
+    if wheel_total + _WHEEL_SETUP_COST_MS <= single_shard_target:
+        return 1
+    needed = math.ceil((wheel_total + _WHEEL_SETUP_COST_MS) / max(1, single_shard_target))
+    return min(size, wheel_file_count, max(1, needed))
+
+
 def _order_bucket_for_io_stagger(shard_idx: int, group: list[str]) -> list[str]:
-    """Order files within a shard to stagger heavy SQLite/fsync storage suites across shards."""
+    """Order files within a shard to stagger heavy SQLite/fsync storage suites and wheel installs across shards."""
+    wheel = sorted(f for f in group if f.replace("\\", "/") in _WHEEL_FIXTURE_FILES)
+    non_wheel = [f for f in group if f.replace("\\", "/") not in _WHEEL_FIXTURE_FILES]
+    non_storage = [f for f in non_wheel if not _is_storage_file(f)]
+    storage = [f for f in non_wheel if _is_storage_file(f)]
     if shard_idx == 0:
-        wheel = sorted(f for f in group if f.replace("\\", "/") in _WHEEL_FIXTURE_FILES)
-        non_wheel = [f for f in group if f.replace("\\", "/") not in _WHEEL_FIXTURE_FILES]
-        non_storage = [f for f in non_wheel if not _is_storage_file(f)]
-        storage = [f for f in non_wheel if _is_storage_file(f)]
         return [*wheel, *non_storage, *storage]
-    storage = [f for f in group if _is_storage_file(f)]
-    non_storage = [f for f in group if not _is_storage_file(f)]
     if shard_idx == 1:
-        return [*storage, *non_storage]
-    return [*non_storage, *storage]
+        return [*storage, *non_storage, *wheel]
+    return [*non_storage, *storage, *wheel]
+
+
+TIMING_CONTRACT_PARALLEL_MAX = "parallel_max_per_worker_bounded_300s"
+_PARTITION_SPEC = re.compile(r"^([0-9]+)/([0-9]+)$")
+
+
+def parse_partition(spec: str) -> tuple[int, int]:
+    """Parse ``'<index>/<count>'`` into ``(index, count)`` with ``0 <= index < count`` and ``count >= 1``."""
+    match = _PARTITION_SPEC.fullmatch(spec.strip())
+    if match is None:
+        raise ValueError(f"partition must be '<index>/<count>', got {spec!r}")
+    index, count = int(match.group(1)), int(match.group(2))
+    if count < 1 or index < 0 or index >= count:
+        raise ValueError(f"partition index {index} out of range for count {count}")
+    return index, count
+
+
+def partition_files(collected_ids: Sequence[str], partition: tuple[int, int]) -> list[str]:
+    """Deterministically partition whole test files across ``count`` balanced buckets and return bucket ``index``."""
+    index, count = partition
+    if count < 1 or index < 0 or index >= count:
+        raise ValueError(f"invalid partition {partition!r}")
+    counts = Counter(node.split("::", 1)[0] for node in collected_ids)
+    if not counts:
+        return []
+    if count == 1:
+        return sorted(counts)
+    buckets: list[list[str]] = [[] for _ in range(count)]
+    loads = [0] * count
+    wheel_items: list[tuple[int, str]] = []
+    remaining: list[tuple[int, str]] = []
+    for file, case_count in counts.items():
+        cost = _estimated_file_cost_ms(file, case_count)
+        if file.replace("\\", "/") in _WHEEL_FIXTURE_FILES:
+            wheel_items.append((cost, file))
+        else:
+            remaining.append((cost, file))
+    for cost, file in sorted(wheel_items, key=lambda item: (-item[0], item[1])):
+        bucket_idx = min(range(count), key=lambda idx: (loads[idx], idx))
+        buckets[bucket_idx].append(file)
+        loads[bucket_idx] += cost
+    for idx in range(count):
+        if buckets[idx]:
+            loads[idx] += _WHEEL_SETUP_COST_MS
+    for cost, file in sorted(remaining, key=lambda item: (-item[0], item[1])):
+        bucket_idx = min(range(count), key=lambda idx: (loads[idx], idx))
+        buckets[bucket_idx].append(file)
+        loads[bucket_idx] += cost
+    return sorted(buckets[index])
 
 
 def shard_files(collected_ids: Sequence[str], shards: int) -> list[list[str]]:
-    """Group whole test files by estimated millisecond cost, isolating session wheel setup onto shard 0."""
+    """Group whole test files by estimated millisecond cost, placing wheel suites across the minimal shard prefix."""
     counts = Counter(node.split("::", 1)[0] for node in collected_ids)
     size = min(max(1, shards), len(counts))
     if size == 0:
         return []
     groups: list[list[str]] = [[] for _ in range(size)]
     loads = [0] * size
+    wheel_items: list[tuple[int, str]] = []
     remaining: list[tuple[int, str]] = []
-    has_wheel = False
     for file, count in counts.items():
         cost = _estimated_file_cost_ms(file, count)
         if size > 1 and file.replace("\\", "/") in _WHEEL_FIXTURE_FILES:
-            groups[0].append(file)
-            loads[0] += cost
-            has_wheel = True
+            wheel_items.append((cost, file))
         else:
             remaining.append((cost, file))
-    if has_wheel:
-        groups[0].sort()
-        loads[0] += _WHEEL_SETUP_COST_MS
-    # Balance non-wheel tests across all shards (including shard 0) so wheel overhead does not skew shard loads.
+    if wheel_items:
+        wheel_shards = _wheel_shard_count(
+            sum(cost for cost, _ in wheel_items),
+            sum(cost for cost, _ in remaining),
+            size,
+            len(wheel_items),
+        )
+        for cost, file in sorted(wheel_items, key=lambda item: (-item[0], item[1])):
+            index = min(range(wheel_shards), key=lambda idx: (loads[idx], idx))
+            groups[index].append(file)
+            loads[index] += cost
+        for idx in range(wheel_shards):
+            if groups[idx]:
+                groups[idx].sort()
+                loads[idx] += _WHEEL_SETUP_COST_MS
+    # Balance non-wheel tests across all shards so wheel setup overhead stays evenly offset.
     for cost, file in sorted(remaining, key=lambda item: (-item[0], item[1])):
         index = min(range(size), key=lambda idx: (loads[idx], idx))
         groups[index].append(file)
@@ -574,17 +678,28 @@ def parse_junit(path: Path, *, root: Path | None = None) -> tuple[list[str], dic
     return _parse_junit(path.read_bytes(), root=root)
 
 
+def _junit_nodeid(case: ET.Element, *, root: Path | None) -> str:
+    classname = case.get("classname") or ""
+    name = case.get("name") or ""
+    file_attr = (case.get("file") or "").replace("\\", "/")
+    if file_attr and classname:
+        mod_dotted = file_attr.replace("/", ".")
+        if classname == mod_dotted:
+            return f"{file_attr}::{name}"
+        if classname.startswith(mod_dotted + "."):
+            classes = classname[len(mod_dotted) + 1 :].split(".")
+            return "::".join([file_attr, *classes, name])
+    if classname:
+        module, classes = _split_classname(classname, root)
+        return "::".join([module, *classes, name])
+    return name
+
+
 def _parse_junit(report: bytes, *, root: Path | None) -> tuple[list[str], dict[str, str]]:
     ids: list[str] = []
     outcomes: dict[str, str] = {}
     for case in ET.fromstring(report).iter("testcase"):
-        classname = case.get("classname") or ""
-        name = case.get("name") or ""
-        if classname:
-            module, classes = _split_classname(classname, root)
-            node_id = "::".join([module, *classes, name])
-        else:
-            node_id = name
+        node_id = _junit_nodeid(case, root=root)
         if node_id in outcomes:
             raise ValueError(f"duplicate testcase in JUnit report: {node_id}")
         ids.append(node_id)
@@ -951,7 +1066,7 @@ def source_identity(repo: Path) -> SourceIdentity:
 
 
 def _uv(worktree: Path, python: str, *tool: str) -> list[str]:
-    return ["uv", "run", "--locked", "--project", str(worktree), "--python", python, *tool]
+    return ["uv", "run", "--locked", "--no-sync", "--project", str(worktree), "--python", python, *tool]
 
 
 def receipt_name(receipt: Mapping[str, JsonValue]) -> str:
@@ -959,7 +1074,9 @@ def receipt_name(receipt: Mapping[str, JsonValue]) -> str:
     impl, version, platform = receipt["implementation"], receipt["python"], receipt["platform"]
     if not isinstance(start, dict):  # the source could not be read: never named after a commit
         return f"receipt-unverified-{impl}{version}-{platform}-{uuid.uuid4().hex[:12]}.json"
-    commit, lock = str(start["commit"]), str(start["lock_digest"])
+    commit = str(start["commit"])
+    raw_lock = start.get("lock_digest") or start.get("tracked") or start.get("tree") or ("sha256:" + "0" * 64)
+    lock = str(raw_lock)
     return f"receipt-{commit[:12]}-{impl}{version}-{platform}-{lock[7:19]}.json"
 
 
@@ -1018,7 +1135,12 @@ class EvidenceDirError(OSError):
 
 
 def run_gate(
-    repo: Path, python: str, *, evidence_dir: Path | None = None, shards: int = PYTEST_SHARDS
+    repo: Path,
+    python: str,
+    *,
+    evidence_dir: Path | None = None,
+    shards: int = PYTEST_SHARDS,
+    partition: tuple[int, int] | None = None,
 ) -> tuple[dict[str, JsonValue], str]:
     """Run the gate in a detached worktree of the resolved HEAD. Returns the receipt and a printable log.
 
@@ -1078,6 +1200,8 @@ def run_gate(
     phases: list[PhaseResult] = []
     interpreter: InterpreterInfo | None = None
     collected: list[str] = []
+    selected_files: list[str] = []
+    target_ids: list[str] = []
     junit_ids: list[str] = []
     outcomes: dict[str, str] = {}
     start: SourceIdentity | None = None
@@ -1144,7 +1268,7 @@ def run_gate(
         codes: list[int | None] = []
         runner_error = execution_failed
         expected: dict[str, set[str]] = {file: set() for group in groups for file in group}
-        for node in collected:
+        for node in target_ids:
             expected[node.split("::", 1)[0]].add(node)
         for index, result in enumerate(results):
             name = f"pytest-shard-{index}"
@@ -1270,7 +1394,15 @@ def run_gate(
                     "lint-imports": _uv(worktree, python, "lint-imports"),
                     "pytest": _uv(worktree, python, "pytest", f"--junitxml={junit}", "-q", "-rfEX"),
                 }
-                groups = shard_files(collected, shards)
+                selected_files = []
+                target_ids = list(collected)
+                if partition is not None:
+                    selected_files = partition_files(collected, partition)
+                    selected_set = set(selected_files)
+                    target_ids = [nid for nid in collected if nid.split("::", 1)[0] in selected_set]
+                    ev.write("collected-full.json", canonical_json(sorted(collected)))
+                    ev.write("collected-partition.json", canonical_json(sorted(target_ids)))
+                groups = shard_files(target_ids, shards)
                 for name in REQUIRED_PHASES:
                     timeout = bounded(f"phase {name}", PHASE_TIMEOUTS_S[name])
                     if timeout is None:
@@ -1279,7 +1411,16 @@ def run_gate(
                         phase, job_ended = run_sharded_pytest(groups, deadline)
                         phases.append(phase)
                         continue
-                    code, output, seconds, error = step(name, commands[name], worktree, timeout)
+                    if name == "pytest" and partition is not None and not groups:
+                        extra.append("partition has empty test inventory")
+                        phases.append(PhaseResult("pytest", 1, 0.0))
+                        continue
+                    cmd = (
+                        [*commands[name], *groups[0]]
+                        if name == "pytest" and partition is not None and len(groups) == 1
+                        else commands[name]
+                    )
+                    code, output, seconds, error = step(name, cmd, worktree, timeout)
                     if error is not None:
                         extra.append(f"phase {name} {error}")
                         halted = "an earlier step did not complete"
@@ -1293,7 +1434,7 @@ def run_gate(
                         log.append(f"--- {name} (exit {code}) ---\n{output[-4000:]}")
                 if job_ended is None:
                     job_ended = time.monotonic()
-                    if len(groups) <= 1:
+                    if len(groups) <= 1 and not (partition is not None and not groups):
                         junit_ids, outcomes = read_report(junit, "junit.xml", pytest_output)
         if created:
             try:
@@ -1329,7 +1470,7 @@ def run_gate(
         start=start,
         end=end,
         phases=phases,
-        collected_ids=collected,
+        collected_ids=target_ids,
         junit_ids=junit_ids,
         junit_outcomes=outcomes,
         python=(interpreter.version.split()[0] if interpreter else python),
@@ -1352,6 +1493,15 @@ def run_gate(
     }
     receipt["steps"] = steps
     receipt["host"] = _host()
+    if partition is not None:
+        part_files: list[JsonValue] = list(sorted(selected_files))
+        receipt["partition"] = {
+            "index": partition[0],
+            "count": partition[1],
+            "files": part_files,
+            "full_collected_count": len(collected),
+            "full_collected_digest": digest_bytes(canonical_json(sorted(collected))),
+        }
     receipt["evidence"] = {
         "attempt_dir": str(attempt_dir) if attempt_dir is not None else None,
         "manifest": dict(ev.manifest),
@@ -1371,15 +1521,419 @@ def run_gate(
     return receipt, "\n".join(log)
 
 
+def _is_finite_non_neg_number(val: object) -> bool:
+    return (
+        isinstance(val, (int, float))
+        and not isinstance(val, bool)
+        and math.isfinite(float(val))
+        and float(val) >= 0.0
+    )
+
+
+def _worker_source_clean(identity: object) -> bool:
+    if not isinstance(identity, Mapping):
+        return False
+    flag = identity.get("tree_clean") if "tree_clean" in identity else identity.get("clean")
+    return flag is True
+
+
+def _parse_junit_items(report: bytes) -> tuple[list[tuple[str, str]], float]:
+    items: list[tuple[str, str]] = []
+    total_time = 0.0
+    for case in ET.fromstring(report).iter("testcase"):
+        node_id = _junit_nodeid(case, root=None)
+        items.append((node_id, _outcome(case)))
+        raw_t = case.get("time")
+        if raw_t is not None:
+            try:
+                total_time += float(raw_t)
+            except ValueError:
+                pass
+    return items, total_time
+
+
+def aggregate_partition_receipts(
+    workers_dir: Path,
+    *,
+    python: str,
+    partition_count: int,
+    evidence_dir: Path | None = None,
+    expected_commit: str | None = None,
+) -> tuple[dict[str, JsonValue], str]:
+    """Verify and combine all ``partition_count`` worker attempts into one F4 aggregate receipt."""
+    attempt_dir: Path | None = None
+    if evidence_dir is not None:
+        try:
+            evidence_dir.mkdir(parents=True, exist_ok=True)
+            attempt_dir = evidence_dir / f"attempt-{datetime.now(UTC):%Y%m%dT%H%M%S%fZ}-{uuid.uuid4().hex[:8]}"
+            attempt_dir.mkdir()
+        except OSError as err:
+            raise EvidenceDirError(f"{type(err).__name__}: {err}") from err
+    ev = _Evidence(attempt_dir)
+    reasons: list[str] = []
+    if partition_count < 1:
+        reasons.append(f"invalid partition_count {partition_count}")
+
+    receipt_paths = sorted(workers_dir.rglob("receipt.json")) if workers_dir.is_dir() else []
+    by_index: dict[int, tuple[Path, dict[str, object]]] = {}
+    for r_path in receipt_paths:
+        try:
+            raw_obj = json.loads(r_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as err:
+            reasons.append(f"unreadable worker receipt {r_path}: {type(err).__name__}: {err}")
+            continue
+        if not isinstance(raw_obj, dict):
+            reasons.append(f"worker receipt {r_path} is not a JSON object")
+            continue
+        stored_digest = raw_obj.get("receipt_digest")
+        computed_digest = digest_bytes(canonical_json({k: v for k, v in raw_obj.items() if k != "receipt_digest"}))
+        if not isinstance(stored_digest, str) or stored_digest != computed_digest:
+            reasons.append(f"worker receipt {r_path} has tampered or invalid receipt_digest")
+            continue
+        part = raw_obj.get("partition")
+        if not isinstance(part, dict):
+            reasons.append(f"worker receipt {r_path} missing partition metadata")
+            continue
+        idx = part.get("index")
+        cnt = part.get("count")
+        if type(idx) is not int or type(cnt) is not int or cnt != partition_count or idx < 0 or idx >= partition_count:
+            reasons.append(
+                f"worker receipt {r_path} has invalid partition ({idx}/{cnt}, expected count {partition_count})"
+            )
+            continue
+        if idx in by_index:
+            reasons.append(f"duplicate partition index {idx} among worker receipts")
+            continue
+        by_index[idx] = (r_path, raw_obj)
+
+    missing_parts = [i for i in range(partition_count) if i not in by_index]
+    if missing_parts:
+        reasons.append(f"missing partition(s): {missing_parts}")
+
+    all_outcomes: dict[str, str] = {}
+    dup_nodeids: list[str] = []
+    worker_times: list[float] = []
+    worker_summaries: list[JsonValue] = []
+    total_junit_s = 0.0
+    base_full: list[str] | None = None
+    ref_start: object = None
+    ref_end: object = None
+    ref_commit: object = None
+    ref_platform: object = None
+    ref_python: object = None
+    ref_impl: object = None
+    ref_env: object = None
+
+    for idx in sorted(by_index):
+        r_path, w = by_index[idx]
+        w_dir = r_path.parent
+        w_prefix = f"partition {idx}"
+
+        ev_sec = w.get("evidence")
+        manifest = ev_sec.get("manifest") if isinstance(ev_sec, dict) else None
+        if not isinstance(manifest, dict) or not manifest:
+            reasons.append(f"{w_prefix}: missing evidence manifest")
+        else:
+            w_root_resolved = w_dir.resolve()
+            for rel, exp_sha in manifest.items():
+                artifact = w_dir / str(rel)
+                if not artifact.resolve().is_relative_to(w_root_resolved) or not artifact.is_file():
+                    reasons.append(f"{w_prefix}: missing manifest artifact {rel}")
+                    continue
+                if digest_bytes(artifact.read_bytes()) != exp_sha:
+                    reasons.append(f"{w_prefix}: tampered artifact {rel}: manifest SHA-256 mismatch")
+            on_disk = {p.relative_to(w_dir).as_posix() for p in w_dir.rglob("*") if p.is_file()}
+            if on_disk - {r_path.name} != set(manifest):
+                reasons.append(f"{w_prefix}: unlisted or missing files relative to manifest")
+
+        if w.get("accepted") is not True:
+            w_rs = w.get("reasons")
+            reasons.append(f"{w_prefix}: worker did not pass (accepted={w.get('accepted')!r}, reasons={w_rs!r})")
+
+        phases_raw = w.get("phases")
+        phase_names = (
+            {p.get("name") for p in phases_raw if isinstance(p, dict)} if isinstance(phases_raw, list) else set()
+        )
+        if not isinstance(phases_raw, list) or phase_names != set(REQUIRED_PHASES):
+            reasons.append(f"{w_prefix}: missing required gate phases")
+        else:
+            for p_entry in phases_raw:
+                if not isinstance(p_entry, dict) or p_entry.get("exit_code") != 0:
+                    pname = p_entry.get("name") if isinstance(p_entry, dict) else "?"
+                    reasons.append(f"{w_prefix}: phase {pname} failed")
+
+        w_time = w.get("test_job_seconds")
+        if not isinstance(w_time, (int, float)) or isinstance(w_time, bool) or not math.isfinite(float(w_time)):
+            reasons.append(f"{w_prefix}: non-numeric or non-finite test_job_seconds {w_time!r}")
+            w_time_val: JsonValue = None
+        elif float(w_time) < 0.0:
+            reasons.append(f"{w_prefix}: negative test_job_seconds {w_time!r}")
+            w_time_val = None
+        else:
+            w_float = float(w_time)
+            w_time_val = w_float
+            worker_times.append(w_float)
+            if w_float >= TEST_JOB_BUDGET_S:
+                reasons.append(
+                    f"{w_prefix}: test_job_seconds {w_float:.3f}s exceeds {TEST_JOB_BUDGET_S:.1f}s budget"
+                )
+
+        w_req_py = w.get("requested_python")
+        if w_req_py != python:
+            reasons.append(f"{w_prefix}: requested_python {w_req_py!r} != {python!r}")
+        w_env = w.get("environment")
+        if not isinstance(w_env, dict) or w_env.get("accepted") is not True:
+            reasons.append(f"{w_prefix}: environment was not accepted")
+
+        w_start, w_end, w_commit = w.get("start"), w.get("end"), w.get("resolved_commit")
+        if not _worker_source_clean(w_start) or not _worker_source_clean(w_end) or w_start != w_end:
+            reasons.append(f"{w_prefix}: source identity unverified, dirty, or changed during run")
+        if ref_start is None:
+            ref_start, ref_end, ref_commit = w_start, w_end, w_commit
+            ref_platform = w.get("platform")
+            ref_python = w.get("python")
+            ref_impl = w.get("implementation")
+            ref_env = w_env
+        else:
+            if w_start != ref_start or w_end != ref_end or w_commit != ref_commit:
+                reasons.append(f"{w_prefix}: commit/source identity mismatch across partitions")
+            if (
+                w.get("platform") != ref_platform
+                or w.get("python") != ref_python
+                or w.get("implementation") != ref_impl
+            ):
+                reasons.append(f"{w_prefix}: interpreter/platform mismatch across partitions")
+        if expected_commit is not None and w_commit != expected_commit:
+            reasons.append(f"{w_prefix}: commit {w_commit!r} != expected {expected_commit!r}")
+
+        part_meta = w["partition"]
+        assert isinstance(part_meta, dict)
+        full_p = w_dir / "collected-full.json"
+        part_p = w_dir / "collected-partition.json"
+        if not isinstance(manifest, dict) or "collected-full.json" not in manifest or not full_p.is_file():
+            reasons.append(f"{w_prefix}: missing collected-full.json")
+        else:
+            try:
+                w_full = json.loads(full_p.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as err:
+                reasons.append(f"{w_prefix}: invalid collected-full.json: {err}")
+                w_full = None
+            if not isinstance(w_full, list) or not all(isinstance(x, str) for x in w_full):
+                reasons.append(f"{w_prefix}: malformed collected-full.json")
+            else:
+                sorted_full = sorted(w_full)
+                exp_full_dig = part_meta.get("full_collected_digest")
+                exp_full_cnt = part_meta.get("full_collected_count")
+                if len(set(sorted_full)) != len(sorted_full):
+                    reasons.append(f"{w_prefix}: full collected inventory contains duplicates")
+                elif digest_bytes(canonical_json(sorted_full)) != exp_full_dig or len(sorted_full) != exp_full_cnt:
+                    reasons.append(f"{w_prefix}: full_collected_digest or count mismatch")
+                elif base_full is None:
+                    base_full = sorted_full
+                elif sorted_full != base_full:
+                    reasons.append(f"{w_prefix}: full test inventory mismatch across partitions")
+
+        w_part_ids: list[str] | None = None
+        if not isinstance(manifest, dict) or "collected-partition.json" not in manifest or not part_p.is_file():
+            reasons.append(f"{w_prefix}: missing collected-partition.json")
+        else:
+            try:
+                raw_part_ids = json.loads(part_p.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as err:
+                reasons.append(f"{w_prefix}: invalid collected-partition.json: {err}")
+                raw_part_ids = None
+            if isinstance(raw_part_ids, list) and all(isinstance(x, str) for x in raw_part_ids):
+                w_part_ids = sorted(raw_part_ids)
+            else:
+                reasons.append(f"{w_prefix}: malformed collected-partition.json")
+
+        w_junit_rels = sorted(
+            str(rel) for rel in (manifest or {}) if str(rel).startswith("junit") and str(rel).endswith(".xml")
+        )
+        if not w_junit_rels:
+            reasons.append(f"{w_prefix}: missing JUnit XML report in manifest")
+        worker_junit_ids: list[str] = []
+        raw_outcomes_obj = w.get("outcomes")
+        raw_w_outcomes: dict[object, object] = raw_outcomes_obj if isinstance(raw_outcomes_obj, dict) else {}
+        for jrel in w_junit_rels:
+            try:
+                items, jtime = _parse_junit_items((w_dir / jrel).read_bytes())
+            except (OSError, ET.ParseError, ValueError) as err:
+                reasons.append(f"{w_prefix}: invalid JUnit {jrel}: {err}")
+                continue
+            total_junit_s += jtime
+            for nid, outc in items:
+                worker_junit_ids.append(nid)
+                if outc == "passed" and raw_w_outcomes.get(nid) == "xpassed":
+                    outc = "xpassed"
+                if nid in all_outcomes:
+                    dup_nodeids.append(nid)
+                else:
+                    all_outcomes[nid] = outc
+        if w_part_ids is not None and sorted(worker_junit_ids) != w_part_ids:
+            reasons.append(f"{w_prefix}: JUnit nodeids do not match partition collected inventory")
+
+        raw_digest = w.get("receipt_digest")
+        w_counts = w.get("counts")
+        worker_summaries.append({
+            "index": idx,
+            "accepted": bool(w.get("accepted")),
+            "test_job_seconds": w_time_val,
+            "receipt_digest": str(raw_digest) if isinstance(raw_digest, str) else None,
+            "counts": dict(w_counts) if isinstance(w_counts, dict) else None,
+            "attempt_dir": str(w_dir),
+        })
+
+    if dup_nodeids:
+        sample = sorted(set(dup_nodeids))[:5]
+        reasons.append(f"duplicate testcase nodeid(s) across partitions ({len(dup_nodeids)}): {sample}")
+    if base_full is not None:
+        missing_tests = sorted(set(base_full) - set(all_outcomes))
+        if missing_tests:
+            reasons.append(f"missing testcase(s) from aggregate JUnit ({len(missing_tests)}): {missing_tests[:5]}")
+        extra_tests = sorted(set(all_outcomes) - set(base_full))
+        if extra_tests:
+            reasons.append(f"unexpected testcase(s) in aggregate JUnit ({len(extra_tests)}): {extra_tests[:5]}")
+    bad = sorted(nid for nid, v in all_outcomes.items() if v not in NON_FAILING)
+    if bad:
+        reasons.append(f"{len(bad)} test(s) did not pass across partitions, first: {bad[:5]}")
+
+    counted = Counter(v for v in all_outcomes.values() if v in TERMINAL_OUTCOMES)
+    counts: dict[str, JsonValue] = {name: counted.get(name, 0) for name in sorted(TERMINAL_OUTCOMES)}
+    agg_test_job_s = max(worker_times) if worker_times else None
+    worker_sum_s = sum(worker_times) if worker_times else None
+    if agg_test_job_s is not None and agg_test_job_s >= TEST_JOB_BUDGET_S:
+        if not any("budget" in r for r in reasons):
+            reasons.append(
+                f"aggregate test_job_seconds {agg_test_job_s:.3f}s meets/exceeds {TEST_JOB_BUDGET_S:.1f}s budget"
+            )
+
+    ev.write(
+        "source.json",
+        canonical_json({
+            "resolved_commit": ref_commit if isinstance(ref_commit, str) else None,
+            "start": ref_start if isinstance(ref_start, dict) else None,
+            "end": ref_end if isinstance(ref_end, dict) else None,
+            "host": _host(),
+        }),
+    )
+    reasons.extend(ev.errors)
+    reason_items: list[JsonValue] = list(reasons)
+    time_items: list[JsonValue] = list(worker_times)
+    agg_receipt: dict[str, JsonValue] = {
+        "accepted": not reasons,
+        "reasons": reason_items,
+        "timing_contract": TIMING_CONTRACT_PARALLEL_MAX,
+        "test_job_seconds": agg_test_job_s,
+        "time_budget_s": TEST_JOB_BUDGET_S,
+        "worker_test_job_seconds": time_items,
+        "worker_sum_seconds": worker_sum_s,
+        "total_junit_seconds": total_junit_s,
+        "full_collected_count": len(base_full) if base_full is not None else 0,
+        "test_count": len(base_full) if base_full is not None else len(all_outcomes),
+        "test_inventory_digest": digest_bytes(canonical_json(base_full)) if base_full is not None else None,
+        "junit_inventory_digest": digest_bytes(canonical_json(sorted(all_outcomes))),
+        "counts": counts,
+        "workers": worker_summaries,
+        "start": dict(ref_start) if isinstance(ref_start, dict) else None,
+        "end": dict(ref_end) if isinstance(ref_end, dict) else None,
+        "resolved_commit": ref_commit if isinstance(ref_commit, str) else None,
+        "requested_python": python,
+        "python": ref_python if isinstance(ref_python, str) else python,
+        "implementation": ref_impl if isinstance(ref_impl, str) else "unknown",
+        "platform": ref_platform if isinstance(ref_platform, str) else sys.platform,
+        "environment": dict(ref_env) if isinstance(ref_env, dict) else None,
+        "host": _host(),
+        "evidence": {
+            "attempt_dir": str(attempt_dir) if attempt_dir is not None else None,
+            "manifest": dict(ev.manifest),
+        },
+    }
+    agg_digest = digest_bytes(canonical_json(agg_receipt))
+    agg_receipt["receipt_digest"] = agg_digest
+    failure = ev.write_receipt(agg_receipt)
+    if failure is not None:
+        del agg_receipt["receipt_digest"]
+        agg_receipt["accepted"] = False
+        r_list = agg_receipt["reasons"]
+        assert isinstance(r_list, list)
+        r_list.append(failure)
+        agg_digest = digest_bytes(canonical_json(agg_receipt))
+        agg_receipt["receipt_digest"] = agg_digest
+    return agg_receipt, agg_digest
+
+
+def _aggregate_main(argv: Sequence[str]) -> int:
+    parser = argparse.ArgumentParser(description="Aggregate partitioned worker receipts into one F4 cell receipt.")
+    parser.add_argument("--python", required=True, help="Expected Python version")
+    parser.add_argument("--partition-count", type=int, required=True, help="Expected number of worker partitions")
+    parser.add_argument("--workers-dir", required=True, help="Directory holding worker attempt directories")
+    parser.add_argument("--evidence-dir", help="Absolute directory for the aggregate attempt dir")
+    parser.add_argument("--expected-commit", help="Optional resolved commit SHA all workers must match")
+    args = parser.parse_args(list(argv))
+    evidence: Path | None = None
+    if args.evidence_dir is not None:
+        evidence = Path(args.evidence_dir)
+        if not evidence.is_absolute():
+            print(
+                f"gate aggregate refused: --evidence-dir must be absolute, got {args.evidence_dir!r}",
+                file=sys.stderr,
+            )
+            return 2
+        if evidence.exists() and not evidence.is_dir():
+            print(f"gate aggregate refused: the evidence dir {evidence} is not a directory", file=sys.stderr)
+            return 2
+    repo = Path(__file__).resolve().parent.parent
+    try:
+        receipt, _ = aggregate_partition_receipts(
+            Path(args.workers_dir),
+            python=args.python,
+            partition_count=args.partition_count,
+            evidence_dir=evidence,
+            expected_commit=args.expected_commit,
+        )
+    except EvidenceDirError as err:
+        print(f"gate aggregate refused: the evidence dir could not be prepared: {err}", file=sys.stderr)
+        return 2
+    out_dir = repo / ".gate"
+    path = out_dir / receipt_name(receipt)
+    try:
+        out_dir.mkdir(exist_ok=True)
+        path.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    except OSError as err:
+        print(f"gate aggregate: the legacy receipt could not be written: {err}", file=sys.stderr)
+        return 1
+    counts = receipt["counts"]
+    assert isinstance(counts, dict)
+    summary = ", ".join(f"{k}={v}" for k, v in counts.items() if v)
+    print(f"gate aggregate {'ACCEPTED' if receipt['accepted'] else 'NOT ACCEPTED'}: {summary or 'no tests'} -> {path}")
+    reasons = receipt["reasons"]
+    if isinstance(reasons, list):
+        for reason in reasons:
+            print(f"  reason: {reason}", file=sys.stderr)
+    return 0 if receipt["accepted"] else 1
+
+
 def main(argv: Sequence[str] | None = None) -> int:
+    argv_list = list(sys.argv[1:] if argv is None else argv)
+    if argv_list and argv_list[0] == "aggregate":
+        return _aggregate_main(argv_list[1:])
     parser = argparse.ArgumentParser(description="Run the default gate and write a receipt.")
     parser.add_argument("--python", required=True, help="Python version to run the gate with, e.g. 3.14")
     parser.add_argument("--evidence-dir", help="absolute directory; each run writes a new attempt dir under it")
     parser.add_argument("--shards", type=int, default=PYTEST_SHARDS, help="maximum parallel pytest processes")
-    args = parser.parse_args(argv)
+    parser.add_argument("--partition", help="optional worker partition '<index>/<count>'")
+    args = parser.parse_args(argv_list)
     if args.shards < 1:
         print("gate refused: --shards must be at least 1", file=sys.stderr)
         return 2
+    partition: tuple[int, int] | None = None
+    if args.partition is not None:
+        try:
+            partition = parse_partition(args.partition)
+        except ValueError as err:
+            print(f"gate refused: invalid partition {args.partition!r}: {err}", file=sys.stderr)
+            return 2
     evidence: Path | None = None
     if args.evidence_dir is not None:
         evidence = Path(args.evidence_dir)
@@ -1394,7 +1948,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("gate refused: the working tree has uncommitted changes to tracked files", file=sys.stderr)
         return 2
     try:
-        receipt, log = run_gate(repo, args.python, evidence_dir=evidence, shards=args.shards)
+        receipt, log = run_gate(repo, args.python, evidence_dir=evidence, shards=args.shards, partition=partition)
     except EvidenceDirError as err:  # the attempt dir could not be created; nothing ran
         print(f"gate refused: the evidence dir could not be prepared: {err}", file=sys.stderr)
         return 2

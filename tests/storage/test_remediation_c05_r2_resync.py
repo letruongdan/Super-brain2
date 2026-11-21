@@ -25,6 +25,7 @@ from superbrain.storage.cas import RetentionClass, blob_path
 from superbrain.storage.layout import DataRoot
 from superbrain.storage.runtime import Runtime, open_runtime
 from tests.support.crash import CHILD_TIMEOUT, CRASH_EXIT
+from tests.support.inc2_fixture import open_cloned_runtime
 
 PAYLOAD = b"c05 round 2: the first payload of a new shard"
 HOLDER = "0192f3a4-5b6c-7d8e-9f01-0000000c0511"
@@ -61,7 +62,7 @@ def held(rt: Runtime) -> list[tuple[str, str]]:
 def test_a_retry_whose_cas_resync_fails_again_fails_and_records_no_ref(
     trusted_tmp: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    rt = open_runtime(trusted_tmp / "r", os_adapters())
+    rt = open_cloned_runtime(trusted_tmp / "r", os_adapters(), role="c05r2-resync-1")
     try:
         sync = FailingParentSync(rt, times=2)
         monkeypatch.setattr(rt.os_.publisher, "sync_directory", sync)
@@ -81,7 +82,7 @@ def test_a_retry_whose_cas_resync_fails_again_fails_and_records_no_ref(
 
 
 def test_the_put_after_a_failed_resync_syncs_cas_again(trusted_tmp: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    rt = open_runtime(trusted_tmp / "r", os_adapters())
+    rt = open_cloned_runtime(trusted_tmp / "r", os_adapters(), role="c05r2-resync-2")
     try:
         sync = FailingParentSync(rt, times=2)
         monkeypatch.setattr(rt.os_.publisher, "sync_directory", sync)
@@ -141,7 +142,7 @@ os._exit(1)
 
 def test_a_retry_in_a_new_process_syncs_cas_before_the_ref(trusted_tmp: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     data_root = trusted_tmp / "r"
-    open_runtime(data_root, os_adapters()).close()
+    open_cloned_runtime(data_root, os_adapters(), role="c05r2-resync-3").close()
     done = subprocess.run(
         [sys.executable, "-I", "-c", _FAIL_CAS_SYNC_THEN_DIE, str(data_root)],
         capture_output=True,

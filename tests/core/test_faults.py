@@ -58,8 +58,22 @@ def test_unregistered_pausepoint_is_a_programming_error() -> None:
 
 
 def test_registry_contents() -> None:
-    assert len(KNOWN_CRASHPOINTS) == 29
+    assert len(KNOWN_CRASHPOINTS) == 40
     assert "writer.mid_slot_write" in KNOWN_CRASHPOINTS and "migrating.policy.between_renames" in KNOWN_CRASHPOINTS
+    for name in (
+        "apply.after_policy_turn_intent",
+        "apply.before_move_original",
+        "apply.after_move_before_phase",
+        "apply.before_publish_replacement",
+        "apply.after_publish_before_phase",
+        "rollback.after_policy_turn_intent",
+        "rollback.before_first_move",
+        "rollback.after_move_replacement",
+        "rollback.after_restore_last_original",
+        "apply.after_policy_grant_ended",
+        "restoring.store.after_swap_before_effect_drain",
+    ):
+        assert name in KNOWN_CRASHPOINTS
     assert KNOWN_PAUSEPOINTS == KNOWN_CRASHPOINTS | {"writer.held"}
 
 

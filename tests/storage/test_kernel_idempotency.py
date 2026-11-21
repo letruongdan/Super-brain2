@@ -1462,10 +1462,14 @@ def test_store3_to_store4_migration_min_reader_fence_and_backup_restore(
     mono = Mono()
     assert STORE_V4_MIGRATION.to_version == 4
     assert STORE_V4_MIGRATION.min_reader_version == 4
-    assert code_version(KERNEL_STORE_MIGRATIONS) == 4
+    assert code_version(KERNEL_STORE_MIGRATIONS) == 5
 
     v3_store_migrations = KERNEL_STORE_MIGRATIONS[:3]
+    v4_store_migrations = KERNEL_STORE_MIGRATIONS[:4]
+    v3_policy_migrations = KERNEL_POLICY_MIGRATIONS[:3]
     assert code_version(v3_store_migrations) == 3
+    assert code_version(v4_store_migrations) == 4
+    assert code_version(v3_policy_migrations) == 3
 
     # Create a (store=3, policy=3) root and populate workspace data.
     root = trusted_tmp / "mig-root"
@@ -1476,7 +1480,7 @@ def test_store3_to_store4_migration_min_reader_fence_and_backup_restore(
         handlers=handlers,
         kinds=kinds,
         store_migrations=v3_store_migrations,
-        policy_migrations=KERNEL_POLICY_MIGRATIONS,
+        policy_migrations=v3_policy_migrations,
     )
     try:
         seeded = seed_principal_and_credential(rt_v3.policy)
@@ -1487,12 +1491,12 @@ def test_store3_to_store4_migration_min_reader_fence_and_backup_restore(
 
     assert read_schema_info(root / "store" / "brain.db") == SchemaInfo(3, 3, store_id)
 
-    # Serve admission before offline migration refuses mixed (store=3, policy=3) against target (4, 3).
+    # Serve admission before offline migration refuses mixed (store=3, policy=3) against target (5, 4).
     with pytest.raises(BrainError) as mixed_exc:
         admit_existing_pair(root, store_id, os_, purpose="serve")
     assert mixed_exc.value.code is ErrorCode.MIGRATION_REQUIRED
 
-    # Offline migrate upgrades store 3 -> 4 (policy 3 noop).
+    # Offline migrate with the I2 sequences upgrades store 3 -> 4 (policy 3 noop): the historical store4 step.
     cert_f = trusted_tmp / "leaf.pem"
     key_f = trusted_tmp / "leaf.key"
     cert_f.write_bytes(b"cert")
@@ -1504,7 +1508,9 @@ def test_store3_to_store4_migration_min_reader_fence_and_backup_restore(
         cert_path=cert_f,
         key_path=key_f,
     )
-    mig_report = migrate_offline(cfg, os_)
+    mig_report = migrate_offline(
+        cfg, os_, policy_migrations=v3_policy_migrations, store_migrations=v4_store_migrations
+    )
     assert mig_report.policy_report.status == "skipped"
     assert mig_report.store_report.status == "migrated"
     assert mig_report.store_report.from_version == 3
@@ -1519,9 +1525,16 @@ def test_store3_to_store4_migration_min_reader_fence_and_backup_restore(
             os_,
             purpose="serve",
             store_migrations=v3_store_migrations,
-            policy_migrations=KERNEL_POLICY_MIGRATIONS,
+            policy_migrations=v3_policy_migrations,
         )
     assert down_exc.value.code is ErrorCode.UNSUPPORTED_VERSION
+
+    # The I3 binary then upgrades the I2 pair (store=4, policy=3) to (store=5, policy=4).
+    top_report = migrate_offline(cfg, os_)
+    assert (top_report.policy_report.status, top_report.policy_report.to_version) == ("migrated", 4)
+    assert (top_report.store_report.from_version, top_report.store_report.to_version) == (4, 5)
+    assert read_schema_info(root / "store" / "brain.db") == SchemaInfo(5, 5, store_id)
+    assert read_schema_info(root / "policy" / "policy.db") == SchemaInfo(4, 4, store_id)
 
     # Open store4, take a policy backup BEFORE adding a new request key, commit an idempotent row, backup & restore.
     rt_v4 = _reopen_fixture_runtime(root, store_id, os_)
@@ -1611,6 +1624,70 @@ def test_store3_to_store4_migration_min_reader_fence_and_backup_restore(
         )
     finally:
         rt_missing_key.close()
+
+
+def test_i2_committed_result_replays_after_upgrade_to_store5_policy4(
+    trusted_tmp: Path, os_: OsAdapters, clock: FakeClock
+) -> None:
+    """I3-1 ``(5, 4)``: a result committed on the shipped I2 pair replays unchanged after the offline upgrade."""
+    mono = Mono()
+    i2_store, i2_policy = KERNEL_STORE_MIGRATIONS[:4], KERNEL_POLICY_MIGRATIONS[:3]
+    root = trusted_tmp / "i2-pair-root"
+    handlers, kinds = fixture_store_extensions()
+    rt_i2 = open_runtime(
+        root, os_, handlers=handlers, kinds=kinds, store_migrations=i2_store, policy_migrations=i2_policy
+    )
+    try:
+        seeded = seed_principal_and_credential(rt_i2.policy)
+        ws = _register_ws(rt_i2, clock, seeded, alias="ws-i2", checkout_dir=trusted_tmp / "chk-i2")
+        store_id = rt_i2.store.store_id
+        scope = Scope(ws.repo_id, ws.checkout_id)
+        bridge, _ = _make_bridge(rt_i2, clock, mono, observer=FakeObserver(descriptor=_desc(TREE_A)))
+        call = normalize_call(
+            "prepare_task",
+            {
+                "schema_version": "2.0",
+                "workspace_hint": "ws-i2",
+                "description": "row committed on the I2 pair",
+                "idempotency_key": "idem_i2_pair_upgrade_01",
+            },
+            seeded.principal,
+            selected_scope=scope,
+        )
+        committed = _expect_ok(
+            "prepare_task",
+            bridge.dispatch(
+                call, _ctx_for(rt_i2, seeded.principal, mono, selected_scope=scope), auth=_auth_for(seeded)
+            ),
+        )
+    finally:
+        rt_i2.close()
+
+    cfg = DaemonConfig(
+        version=1,
+        data_root=root,
+        expected_store_id=store_id,
+        cert_path=trusted_tmp / "leaf.pem",
+        key_path=trusted_tmp / "leaf.key",
+    )
+    clock.advance(dt.timedelta(seconds=5))
+    report = migrate_offline(cfg, os_)
+    assert (report.policy_report.from_version, report.policy_report.to_version) == (3, 4)
+    assert (report.store_report.from_version, report.store_report.to_version) == (4, 5)
+
+    rt_i3 = _reopen_fixture_runtime(root, store_id, os_)
+    try:
+        bridge_i3, dom_i3 = _make_bridge(rt_i3, clock, mono, observer=FakeObserver(descriptor=_desc(TREE_B)))
+        replayed = _expect_ok(
+            "prepare_task",
+            bridge_i3.dispatch(
+                call, _ctx_for(rt_i3, seeded.principal, mono, selected_scope=scope), auth=_auth_for(seeded)
+            ),
+        )
+        assert replayed == committed
+        assert dom_i3.apply_calls == 0
+    finally:
+        rt_i3.close()
 
 
 # --- 9. Canary privacy scan across commit, rollback, retry, and repr -----------------------------------------------

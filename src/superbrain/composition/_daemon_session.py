@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from superbrain.application._future_notify import safe_set_result
+from superbrain.application.approvals import OperatorHandle
 from superbrain.application.deadlines import Reservation
 from superbrain.application.dispatch import KernelToolDomain, PreparedEffect
 from superbrain.application.jobs import JobService
@@ -77,6 +78,10 @@ class _DaemonCompositeDomain:
     def __init__(self, job_service: JobService, delegate: KernelToolDomain | None) -> None:
         self._job_service = job_service
         self._delegate = delegate
+
+    def rebind_job_service(self, job_service: JobService) -> None:
+        """Point subsequent job queries at the post-restore ``JobService``."""
+        self._job_service = job_service
 
     @property
     def store(self) -> object:
@@ -157,6 +162,7 @@ class _AdmittedOwnerSession(OwnerSession):
         hooks: DaemonTestHooks,
         reply_meta_lock: threading.Lock,
         reply_meta: dict[str, tuple[AuthGrantStamp | None, SendAttemptCompletion | None]],
+        operator: OperatorHandle | None = None,
     ) -> None:
         self._rt = rt
         self._ready = ready
@@ -171,6 +177,7 @@ class _AdmittedOwnerSession(OwnerSession):
         self._hooks = hooks
         self._reply_meta_lock = reply_meta_lock
         self._reply_meta = reply_meta
+        self._operator = operator
         self._claim_lock = threading.Lock()
         self._claim_closed = False
         self._metrics_lock = threading.Lock()
@@ -185,8 +192,36 @@ class _AdmittedOwnerSession(OwnerSession):
         return self._ready
 
     @property
+    def rt(self) -> Runtime:
+        return self._rt
+
+    @property
+    def listener(self) -> BoundLoopbackListener:
+        return self._listener
+
+    @property
     def auth_gate(self) -> AuthGate:
         return self._auth_gate
+
+    def bridge_clock_untrusted(self) -> bool:
+        return self._bridge.clock_untrusted()
+
+    def rebind_after_restore(
+        self,
+        *,
+        rt: Runtime,
+        job_store: StagedKernelStore,
+        job_service: JobService,
+        ready: Ready | None = None,
+    ) -> None:
+        """Atomically rebind owner-thread session handles after an online store/policy restore."""
+        self._rt = rt
+        self._job_store = job_store
+        self._job_service = job_service
+        self._job_service.set_claim_commit_guard(self._admit_claim_commit)
+        if ready is not None:
+            self._ready = ready
+        self._bridge.rebind_stores(store=rt.store, policy=rt.policy, writer_epoch=rt.lease.epoch)
 
     @property
     def clock(self) -> Clock:
@@ -408,6 +443,8 @@ class _AdmittedOwnerSession(OwnerSession):
     def teardown_on_owner(self, *, overrun: bool, cancelled_requests: int = 0) -> ShutdownReport:
         self._listener.close()
         self._auth_gate.close()
+        if self._operator is not None:
+            self._operator.unbind()
         self._close_claim_gate()
         drained, worker_drained = self.shutdown_metrics()
         removed = False

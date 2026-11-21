@@ -21,13 +21,17 @@ from superbrain.cli_api._server_http import (
     _safe_join,
     _validate_stop_deadline,
     handle_identity_request,
+    join_before_cutoff,
     read_admitted_tool_command,
+    try_handle_operator_request,
     write_error_response,
     write_json_response,
 )
+from superbrain.cli_api.operator import OperatorExecutor
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.kernel import (
     CAPABILITY_MCP_TOOL,
+    OPERATOR_REQUEST_BUDGET_NS,
     TOTAL_REQUEST_BUDGET_NS,
     ArtifactSendAttempt,
     CallResult,
@@ -46,18 +50,7 @@ _REPLY_WAIT_SLICE_S = 0.005
 _JOIN_WAIT_SLICE_S = 0.001
 
 _LOGGER = logging.getLogger(__name__)
-
-
-def _join_before_cutoff(thread: threading.Thread | None, deadline: float) -> None:
-    if thread is None or thread is threading.current_thread():
-        return
-    while thread.is_alive():
-        remaining = deadline - time.perf_counter()
-        if remaining <= 0:
-            return
-        # Long timed joins can return well past their requested timeout on
-        # coalescing OS timers. Recheck the shared cutoff after short waits.
-        _safe_join(thread, min(remaining, _JOIN_WAIT_SLICE_S))
+_join_before_cutoff = join_before_cutoff
 
 
 class LoopbackServer:
@@ -71,6 +64,7 @@ class LoopbackServer:
         owner: OwnerLoop,
         monotonic_ns: Callable[[], int],
         stop_event: threading.Event,
+        operator: OperatorExecutor | None = None,
     ) -> None:
         if (
             not isinstance(listener, socket.socket)
@@ -88,6 +82,7 @@ class LoopbackServer:
         self._owner = owner
         self._monotonic_ns = monotonic_ns
         self._stop_event = stop_event
+        self._operator = operator
 
         self._lock = threading.Lock()
         self._accept_ready = threading.Event()
@@ -528,6 +523,21 @@ class LoopbackServer:
                 return
             t0_tool = int(self._monotonic_ns())
             tool_deadline_ns = t0_tool + TOTAL_REQUEST_BUDGET_NS
+            handled, op_clean = try_handle_operator_request(
+                ssl_sock,
+                reader,
+                self._ready,
+                auth_gate=lambda: self._owner.auth_gate,
+                operator=self._operator,
+                deadline_ns=tool_deadline_ns,
+                operator_deadline_ns=t0_tool + OPERATOR_REQUEST_BUDGET_NS,
+                monotonic_ns=self._monotonic_ns,
+                is_quiesced=self._is_quiesced,
+                past_stop_deadline=self._past_stop_deadline,
+            )
+            if handled:
+                clean_done = op_clean
+                return
             command = read_admitted_tool_command(
                 ssl_sock,
                 reader,

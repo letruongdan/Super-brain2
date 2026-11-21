@@ -26,6 +26,7 @@ from superbrain.storage.cas import ContentStore, RetentionClass, blob_path
 from superbrain.storage.layout import DataRoot
 from superbrain.storage.runtime import open_runtime
 from tests.support.fs import digest_tree, modes_tree
+from tests.support.inc2_fixture import open_cloned_runtime
 from tests.support.platform import posix_only, windows_only
 
 PAYLOAD = b"c04: payload whose shard is replaced"
@@ -51,12 +52,12 @@ def same_shard_payload(payload: bytes) -> bytes:
 
 
 def fresh_root(data_root: Path) -> DataRoot:
-    open_runtime(data_root, os_adapters()).close()
+    open_cloned_runtime(data_root, os_adapters(), role="c04-fresh").close()
     return DataRoot.at(data_root)
 
 
 def store_payload(data_root: Path, payload: bytes, holder: str = HOLDER) -> str:
-    rt = open_runtime(data_root, os_adapters())
+    rt = open_cloned_runtime(data_root, os_adapters(), role="c04-payload")
     try:
         return rt.store.store_content(payload, "event", holder, RetentionClass.EVENT_PAYLOAD, None)
     finally:

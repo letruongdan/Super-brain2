@@ -82,6 +82,7 @@ from superbrain.core._kernel_daemon import (
 )
 from superbrain.core._kernel_deadlines import (
     HANDLER_RESERVE_NS,
+    OPERATOR_REQUEST_BUDGET_NS,
     RESPONSE_RESERVE_NS,
     TOTAL_REQUEST_BUDGET_NS,
     QueuedKernelRequest,
@@ -486,6 +487,7 @@ __all__ = [
     "OBJECT_KIND_RE",
     "OPAQUE_ID_PATTERN",
     "OPAQUE_ID_RE",
+    "OPERATOR_REQUEST_BUDGET_NS",
     "ObjectRef",
     "OwnerReply",
     "Principal",

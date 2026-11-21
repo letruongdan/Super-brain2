@@ -25,6 +25,7 @@ from superbrain.cli_api._loopback_wire import (
     encode_call,
     encode_capture_batch,
     parse_identity_response,
+    validate_request_path,
 )
 from superbrain.core.errors import (
     SAFE_WIRE_MESSAGES_BY_CODE,
@@ -44,6 +45,7 @@ from superbrain.core.wire import load_catalog
 
 CLIENT_CONNECT_BUDGET_NS = 2_000_000_000
 CLIENT_TOOL_BUDGET_NS = 2_000_000_000
+CLIENT_OPERATOR_BUDGET_NS = 15_000_000_000
 
 _HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 _ERROR_STATUS_EXPECTED_CODE: dict[int, str] = {
@@ -198,8 +200,8 @@ class PinnedConnection:
         self,
         prepare: Callable[[], tuple[str, bytes]],
         *,
-        path: str = TOOL_CALL_PATH,
         deadline_ns: int | None,
+        path: str = TOOL_CALL_PATH,
     ) -> CallResult:
         with self._lock:
             if self._claimed or self._closed or self._sock is None or self._reader is None:
@@ -231,6 +233,7 @@ class PinnedConnection:
                 )
 
             ep = self._endpoint
+            validate_request_path(path)
             post_head = (
                 f"POST {path} HTTP/1.1\r\n"
                 f"Host: 127.0.0.1:{ep.port}\r\n"
@@ -358,7 +361,13 @@ class LoopbackClient:
             raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
         self._monotonic_ns = monotonic_ns
 
-    def connect(self, target: LoopbackTarget, deadline_ns: int | None = None) -> PinnedConnection:
+    def connect(
+        self,
+        target: LoopbackTarget,
+        deadline_ns: int | None = None,
+        *,
+        post_budget_ns: int = CLIENT_TOOL_BUDGET_NS,
+    ) -> PinnedConnection:
         if not isinstance(target, LoopbackTarget):
             raise LoopbackTransportError(
                 ErrorCode.INVALID_INPUT,
@@ -546,7 +555,7 @@ class LoopbackClient:
                 )
 
             _remaining_budget_s(self._monotonic_ns, connect_deadline_ns, request_may_have_run=False)
-            tool_deadline_ns = int(self._monotonic_ns()) + CLIENT_TOOL_BUDGET_NS
+            tool_deadline_ns = int(self._monotonic_ns()) + post_budget_ns
             conn = PinnedConnection(
                 sock=ssl_sock,
                 reader=reader,
@@ -654,3 +663,13 @@ class LoopbackClient:
             path=CAPTURE_EVENTS_PATH,
             deadline_ns=deadline_ns,
         )
+
+    def call_operator(
+        self, target: LoopbackTarget, path: str, body_bytes: bytes, token: str, *, deadline_ns: int | None = None
+    ) -> CallResult:
+        validate_request_path(path, operator_only=True)
+        conn = self.connect(target, deadline_ns=deadline_ns, post_budget_ns=CLIENT_OPERATOR_BUDGET_NS)
+        try:
+            return conn._call(lambda: (token, body_bytes), deadline_ns=deadline_ns, path=path)
+        finally:
+            conn.close()

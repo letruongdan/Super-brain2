@@ -138,6 +138,10 @@ class KernelDeadlineCoordinator:
     def reservations(self) -> ReservationTable:
         return self._reservations
 
+    def rebind_writer_epoch(self, writer_epoch: int) -> None:
+        """Update the admitted ``writer_epoch`` after an online store restore."""
+        self._writer_epoch = require_positive_int(writer_epoch)
+
     def queue_depth(self) -> int:
         with self._queue_cv:
             return len(self._queue)

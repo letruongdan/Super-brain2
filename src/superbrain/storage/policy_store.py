@@ -34,6 +34,11 @@ from superbrain.core.kernel import (
 from superbrain.ports.os import OsAdapters
 from superbrain.ports.policy import Intent, IntentKind
 from superbrain.storage import backup
+from superbrain.storage._policy_accounting import (
+    PolicyAccountingMixin,
+    accounting_schema_ready,
+    ensure_accounting_schema,
+)
 from superbrain.storage._policy_authority import (
     build_policy_snapshot,
     ensure_v2_tables,
@@ -42,6 +47,7 @@ from superbrain.storage._policy_authority import (
     read_policy_request_digest_key_by_id,
     resolve_policy_credential,
 )
+from superbrain.storage._policy_authority_api import PolicyAuthorityMixin
 from superbrain.storage._policy_mutations import (
     record_policy_authorized_revocation,
     register_policy_authorized_workspace,
@@ -114,7 +120,7 @@ def _decode_intent(row: Sequence[object]) -> Intent:
     return Intent(intent_id=intent_id, kind=intent_kind, payload=checked, created_at=created_at)
 
 
-class PolicyStore:
+class PolicyStore(PolicyAuthorityMixin, PolicyAccountingMixin):
     """Implements ``PolicySource``. Obtain it with ``create`` or ``open``; ``close`` it when done."""
 
     def __init__(
@@ -231,6 +237,14 @@ class PolicyStore:
             for file in db_files(path):
                 if file.exists():
                     os_.permissions.secure_file(file)
+            if policy._schema_version >= 4:
+                try:
+                    ready = accounting_schema_ready(policy._db)
+                except sqlite3.Error as exc:
+                    raise sqlite_error("cannot inspect the policy store", exc) from exc
+                if not ready:
+                    with policy._authority_tx() as txdb:
+                        ensure_accounting_schema(txdb)
             policy._align_trust_generation()
         except BaseException:
             db.close()
@@ -272,6 +286,20 @@ class PolicyStore:
     def root(self) -> DataRoot:
         self._check()
         return self._root
+
+    @property
+    def data_root(self) -> Path:
+        """The data-root directory this policy store lives under (read-only)."""
+        self._check()
+        return self._root.root
+
+    def meta_value(self, key: str) -> str | None:
+        """Read-only value of a ``meta`` row (``None`` when absent or not text)."""
+        self._check()
+        rows = self._query("SELECT value FROM meta WHERE key = ?", (key,))
+        if len(rows) != 1 or not isinstance(rows[0][0], str):
+            return None
+        return rows[0][0]
 
     def adopt_after_owner_exit(self, exited_owner: threading.Thread) -> None:
         if exited_owner.is_alive() or exited_owner.ident is None or self._owner != exited_owner.ident:

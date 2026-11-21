@@ -163,6 +163,38 @@ class AuthGate(RequestAuthStatePort):
     ) -> RequestAuthView | None:
         return self.publish_view(view, health_meta=health_meta)
 
+    def rebind_writer_epoch(
+        self,
+        new_epoch: int,
+        view: RequestAuthView,
+        *,
+        health_meta: ShallowHealthMeta,
+    ) -> RequestAuthView:
+        """Atomically advance the admitted writer epoch and publish the refreshed auth view."""
+        if not isinstance(view, RequestAuthView) or not isinstance(health_meta, ShallowHealthMeta):
+            raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+        if (
+            view.auth.store_id != self._identity.store_id
+            or health_meta.store_id != self._identity.store_id
+            or health_meta.writer_epoch != new_epoch
+            or health_meta.instance_id != self._identity.instance_id
+        ):
+            raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
+        with self._lock:
+            if self._closed:
+                raise BrainError(ErrorCode.DAEMON_UNAVAILABLE, "daemon unavailable")
+            if view.version <= self._installed_version:
+                raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
+            self._identity = replace(self._identity, writer_epoch=new_epoch)
+            self._view = view
+            self._installed_version = view.version
+            if view.version > self._issued_version:
+                self._issued_version = view.version
+            self._cached_key_id = view.active_request_key_id
+            self._cached_key_bytes = view.active_request_key_bytes
+            self._health_meta = health_meta
+            return view
+
     def update_clock_untrusted(self, untrusted: bool) -> None:
         if not isinstance(untrusted, bool):
             raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")

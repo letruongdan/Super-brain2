@@ -153,8 +153,15 @@ class KernelTx(Protocol):
         """Release the ``event`` hold of ``holder_id`` on ``digest`` (reason ``expired`` only); absent hold: no-op."""
         ...
 
-    def read_held_blob(self, digest: str, *, holder_id: str) -> bytes | None:
-        """Bytes of ``digest`` iff ``(event, holder_id)`` holds it and policy neither tombstones nor quarantines it."""
+    def read_held_blob(
+        self,
+        digest: str,
+        *,
+        holder_id: str,
+        holder_kind: str = "event",
+        now: datetime | None = None,
+    ) -> bytes | None:
+        """Bytes of ``digest`` iff actively held by ``(holder_kind, holder_id)`` at ``now`` and not restricted."""
         ...
 
     def read_job(self, job_id: str) -> JobRecord | None:
@@ -288,3 +295,29 @@ class SourceRestrictionPort(Protocol):
     def is_restricted(self, ref: LineageRef) -> bool:
         """True iff the source of ``ref`` is quarantined, tombstoned, missing or cannot be resolved (any kind)."""
         ...
+
+
+class PolicyAccountingPort(Protocol):
+    """Self-contained ``policy.db`` accounting authority over reservations, usage settlements, and epochs."""
+
+    def reserve_accounting_invocation(
+        self,
+        *,
+        invocation_id: str,
+        job_id: str,
+        owner_id: str,
+        writer_epoch: int,
+        max_amount: str,
+        now: datetime,
+    ) -> object: ...
+
+    def settle_accounting_invocation(
+        self,
+        *,
+        invocation_id: str,
+        amount: str | None,
+        complete: bool,
+        now: datetime,
+    ) -> object: ...
+
+    def recover_accounting_epochs(self, *, current_epoch: int, now: datetime) -> int: ...

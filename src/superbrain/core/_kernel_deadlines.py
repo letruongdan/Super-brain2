@@ -19,6 +19,9 @@ from superbrain.core.errors import BrainError, ErrorCode
 TOTAL_REQUEST_BUDGET_NS = 1_500_000_000
 """Total daemon request budget (1,500 ms) from receive timestamp ``t0_ns`` (D5)."""
 
+OPERATOR_REQUEST_BUDGET_NS = 15_000_000_000
+"""Operator daemon request budget (15,000 ms) for `/v2/operator/*` calls."""
+
 HANDLER_RESERVE_NS = COMMIT_RESERVE_NS
 """Final 200 ms reserved after handler preparation (handler deadline = total - 200 ms = 1,300 ms)."""
 

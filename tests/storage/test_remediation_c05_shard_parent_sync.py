@@ -20,7 +20,8 @@ from superbrain.adapters.os import os_adapters
 from superbrain.core.canonical import digest_bytes
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.storage.cas import RetentionClass, blob_path
-from superbrain.storage.runtime import Runtime, open_runtime
+from superbrain.storage.runtime import Runtime
+from tests.support.inc2_fixture import open_cloned_runtime
 
 PAYLOAD = b"c05: the first payload of a new shard"
 HOLDER = "0192f3a4-5b6c-7d8e-9f01-0000000c0501"
@@ -49,7 +50,7 @@ class FailingParentSync:
 def test_retry_after_a_failed_cas_sync_syncs_cas_again_before_returning(
     trusted_tmp: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    rt = open_runtime(trusted_tmp / "r", os_adapters())
+    rt = open_cloned_runtime(trusted_tmp / "r", os_adapters(), role="c05-shard-sync-1")
     try:
         shard = blob_path(rt.root.cas_dir, digest_bytes(PAYLOAD)).parent
         assert not shard.exists()
@@ -76,7 +77,7 @@ def test_retry_after_a_failed_cas_sync_syncs_cas_again_before_returning(
 def test_retry_through_store_content_syncs_cas_before_the_ref_is_written(
     trusted_tmp: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    rt = open_runtime(trusted_tmp / "r", os_adapters())
+    rt = open_cloned_runtime(trusted_tmp / "r", os_adapters(), role="c05-shard-sync-2")
     try:
         digest = digest_bytes(PAYLOAD)
         sync = FailingParentSync(rt, times=1)
@@ -108,7 +109,7 @@ def test_retry_through_store_content_syncs_cas_before_the_ref_is_written(
 def test_a_real_io_error_from_the_directory_sync_primitive_fails_the_put_and_is_retried(
     trusted_tmp: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    rt = open_runtime(trusted_tmp / "r", os_adapters())
+    rt = open_cloned_runtime(trusted_tmp / "r", os_adapters(), role="c05-shard-sync-3")
     try:
         cas_dir = rt.root.cas_dir
         publisher = rt.os_.publisher
@@ -139,7 +140,7 @@ def test_an_unsupported_directory_sync_degrades_without_failing_the_put(
     trusted_tmp: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """``_sync_dir`` returning ``False`` is the adapter's "this OS/filesystem cannot sync a directory" result."""
-    rt = open_runtime(trusted_tmp / "r", os_adapters())
+    rt = open_cloned_runtime(trusted_tmp / "r", os_adapters(), role="c05-shard-sync-4")
     try:
         monkeypatch.setattr(rt.os_.publisher, "_sync_dir", lambda directory: False)
 

@@ -14,10 +14,10 @@ from superbrain.ports.policy import IntentKind
 from superbrain.storage.backup import create_maintenance_backup
 from superbrain.storage.layout import DataRoot
 from superbrain.storage.migrate import migrate_database
-from superbrain.storage.runtime import open_runtime
 from superbrain.storage.schema import STORE_MIGRATIONS, Migration
 from tests.storage.conftest import Env, maintenance_lease
 from tests.support.fs import digest_tree
+from tests.support.inc2_fixture import open_cloned_runtime
 
 ERROR_DISK_FULL = 112
 STORE_V2 = (*STORE_MIGRATIONS, Migration(to_version=2, min_reader_version=1, apply=lambda db: None))
@@ -154,7 +154,7 @@ def failing_copy(err: OSError, when: Callable[[Path], bool]) -> Callable[[Path, 
 def test_disk_full_while_copying_for_a_maintenance_backup_is_storage_full(
     trusted_tmp: Path, monkeypatch: pytest.MonkeyPatch, code: int
 ) -> None:
-    open_runtime(trusted_tmp, os_adapters()).close()
+    open_cloned_runtime(trusted_tmp, os_adapters(), role="err-maint").close()
     monkeypatch.setattr(shutil, "copyfile", failing_copy(OSError(code, "injected"), lambda dst: True))
     with maintenance_lease(trusted_tmp) as (root, lease), pytest.raises(BrainError) as e:
         create_maintenance_backup(root, lease, os_adapters(), target="store", now=os_adapters().clock.now())
@@ -165,7 +165,7 @@ def test_disk_full_while_copying_for_a_maintenance_backup_is_storage_full(
 def test_disk_full_while_copying_into_the_migration_stage_is_storage_full(
     trusted_tmp: Path, monkeypatch: pytest.MonkeyPatch, code: int
 ) -> None:
-    open_runtime(trusted_tmp, os_adapters()).close()
+    open_cloned_runtime(trusted_tmp, os_adapters(), role="err-migr").close()
     store_dir = DataRoot.at(trusted_tmp).store_dir
     before = digest_tree(store_dir)
     in_stage = lambda dst: dst.parent.name.endswith(".migrating")  # noqa: E731

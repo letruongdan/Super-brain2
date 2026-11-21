@@ -23,16 +23,18 @@ import pytest
 
 from superbrain.adapters.os import os_adapters
 from superbrain.adapters.os.tls_material import create_store_tls
+from superbrain.composition.kernel_projections import kernel_store_extensions
 from superbrain.core.canonical import canonical_json, digest_bytes
 from superbrain.core.errors import ErrorCode
-from superbrain.core.kernel import Endpoint
+from superbrain.core.kernel import Endpoint, WorkspaceBinding
 from superbrain.core.wire import load_catalog, parse_json
+from superbrain.storage.kernel_schema import KERNEL_POLICY_MIGRATIONS, KERNEL_STORE_MIGRATIONS
+from superbrain.storage.runtime import open_runtime
 from tests.support.clock import FakeClock
 from tests.support.inc2_cli import (
     InstalledServeProcess,
     decode_stdio_frames,
     encode_stdio_frames,
-    get_shared_t7_transport_template,
     mcp_call_frame,
     mcp_init_frames,
     run_installed_command,
@@ -51,9 +53,8 @@ from tests.support.inc2_fixture import (
     _clean_subprocess_env,
     _cleanup_dir,
     _make_trusted_session_dir,
-    open_kernel_job_runtime,
 )
-from tests.support.inc2_transport import clone_owner_only_tree, read_raw_http_response
+from tests.support.inc2_transport import read_raw_http_response, register_workspace_direct
 from tests.support.kernel_auth import (
     generate_bearer_token,
     make_bootstrap_auth,
@@ -215,6 +216,7 @@ class _LiveWheelDaemon:
     profile_path: Path
     client_cwd: Path
     identity_bytes: bytes
+    workspace: WorkspaceBinding
 
 
 @dataclasses.dataclass(frozen=True)
@@ -228,20 +230,31 @@ class _DualDaemonBundle:
     tls_key_path: Path
 
 
-def _seed_daemon_root(scratch: Path, label: str, schema_src_root: Path) -> _LiveWheelDaemon:
+def _seed_daemon_root(scratch: Path, label: str, *, frozen_i2: bool) -> _LiveWheelDaemon:
     base = scratch / label
     data_root = base / "daemon-data"
     client_cwd = base / "client-cwd"
     client_cwd.mkdir(parents=True)
-    clock = FakeClock(dt.datetime(2026, 11, 19, 4, 0, 0, tzinfo=dt.UTC))
+    clock = FakeClock(dt.datetime.now(dt.UTC).replace(microsecond=0) - dt.timedelta(minutes=5))
     adapters = os_adapters(clock=clock)
 
-    rt = open_kernel_job_runtime(data_root, adapters)
+    extensions, kinds = kernel_store_extensions()
+    store_version, policy_version = (4, 3) if frozen_i2 else (5, 4)
+    rt = open_runtime(
+        data_root,
+        adapters,
+        handlers=extensions,
+        kinds=kinds,
+        store_migrations=tuple(m for m in KERNEL_STORE_MIGRATIONS if m.to_version <= store_version),
+        policy_migrations=tuple(m for m in KERNEL_POLICY_MIGRATIONS if m.to_version <= policy_version),
+    )
     try:
+        assert (rt.store.schema_version, rt.policy.schema_version) == (store_version, policy_version)
         store_id = rt.store.store_id
         cred = seed_principal_and_credential(
             rt.policy, owner_id="dan", harness_id="claude-code", machine_id="devbox-1"
         )
+        workspace = register_workspace_direct(rt, clock, cred.principal, alias="ws-a", checkout_dir=client_cwd)
     finally:
         rt.close()
 
@@ -262,7 +275,6 @@ def _seed_daemon_root(scratch: Path, label: str, schema_src_root: Path) -> _Live
         cert_path=tls.cert_path,
         key_path=tls.key_path,
     )
-    del schema_src_root
     return _LiveWheelDaemon(
         data_root=data_root,
         endpoint=Endpoint(
@@ -281,6 +293,7 @@ def _seed_daemon_root(scratch: Path, label: str, schema_src_root: Path) -> _Live
         profile_path=cfg_path,
         client_cwd=client_cwd,
         identity_bytes=b"",
+        workspace=workspace,
     )
 
 
@@ -319,8 +332,8 @@ def compat_daemons(
     verify_installed_wheel_isolation(frozen_i2_installed_env, cwd=frozen_i2_installed_env.venv_dir)
 
     scratch = _make_trusted_session_dir("i2-compat-run-", tmp_path_factory)
-    sp2_seed = _seed_daemon_root(scratch, "sp2", SOURCE_SCHEMA_PATH.parent)
-    i2_seed = _seed_daemon_root(scratch, "i2", frozen_i2_installed_env.source_schema_path.parent)
+    sp2_seed = _seed_daemon_root(scratch, "sp2", frozen_i2=False)
+    i2_seed = _seed_daemon_root(scratch, "i2", frozen_i2=True)
 
     sp2_proc: InstalledServeProcess | None = None
     i2_proc: InstalledServeProcess | None = None
@@ -1105,30 +1118,20 @@ def test_i2_to_sp2_daemon_upgrade_replays_read_acks_and_marks_store4_attempts_un
     from superbrain.core.kernel import ARTIFACT_LEVEL_UNKNOWN, is_verified_l1_send
     from superbrain.storage.send_attempts import read_send_attempt_row
 
-    tpl = get_shared_t7_transport_template()
-    assert tpl.ws_a is not None
-    ws_a = tpl.ws_a
     upg_dir = _make_trusted_session_dir("i2-sp2-upgrade-", tmp_path_factory)
     try:
-        data_root = upg_dir / "data"
-        clone_owner_only_tree(tpl.root, data_root)
-        os_adapters().permissions.secure_directory(data_root)
-
-        cfg_path = write_daemon_config_file(
-            upg_dir / "daemon-config.json",
-            data_root=data_root,
-            expected_store_id=tpl.store_id,
-            cert_path=tpl.tls.cert_path,
-            key_path=tpl.tls.key_path,
-        )
-        ca_path = write_ca_file(upg_dir / "ca.pem", tpl.tls.ca_cert_path.read_bytes())
-        cred_path = write_credential_file(upg_dir / "cred.txt", tpl.cred.token)
+        i2 = _seed_daemon_root(upg_dir, "i2", frozen_i2=True)
+        ws_a = i2.workspace
+        data_root = i2.data_root
+        cfg_path = i2.profile_path
+        ca_path = i2.ca_path
+        cred_path = write_credential_file(upg_dir / "cred.txt", i2.token)
         profile_path, _ = write_client_profile_file(
             upg_dir / "profile.json",
             endpoint_path=data_root / "endpoint.json",
-            expected_store_id=tpl.store_id,
+            expected_store_id=i2.store_id,
             ca_file=ca_path,
-            leaf_cert_sha256=tpl.tls.leaf_cert_sha256,
+            leaf_cert_sha256=i2.leaf_sha256,
             credential_file=cred_path,
             workspace={
                 "alias": ws_a.alias,
@@ -1274,6 +1277,16 @@ def test_i2_to_sp2_daemon_upgrade_replays_read_acks_and_marks_store4_attempts_un
                 for tbl in ("idempotency", "ledger", "artifact_read_ack")
             }
         assert counts_before["artifact_read_ack"] == 2
+
+        migration = run_installed_command(
+            inc2_installed_env, "brain", ["migrate", "--offline", "--config", str(cfg_path)], cwd=upg_dir,
+        )
+        assert migration.returncode == 0, migration.stderr
+        from superbrain.storage.schema import read_schema_info
+
+        for path, expected in ((db_path, 5), (data_root / "policy" / "policy.db", 4)):
+            info = read_schema_info(path)
+            assert info is not None and info.store_id == i2.store_id and info.schema_version == expected
 
         # Phase 2: Boot SP2 wheel daemon on SAME data_root; lost-ACK SP2 6-key replays succeed with 0 mutations.
         sp2_proc = InstalledServeProcess(

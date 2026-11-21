@@ -40,7 +40,7 @@ from tests.storage.test_retention import hold_event
 from tests.support.clock import FakeClock
 from tests.support.crash import paused_child, run_child, run_until_crash
 from tests.support.fs import corrupt_bytes, digest_data_root, digest_tree, file_identity
-from tests.support.inc2_fixture import _cleanup_dir
+from tests.support.inc2_fixture import _cleanup_dir, open_cloned_runtime
 
 BEFORE_ID = "0192f3a4-5b6c-7d8e-9f01-0000000000b1"
 AFTER_ID = "0192f3a4-5b6c-7d8e-9f01-0000000000a1"
@@ -125,7 +125,7 @@ def seed_before_backup_after(data_root: Path) -> None:
         cached = _RESTORE_SEED_CACHE.get("before_after")
         if cached is None or not cached[0].is_dir():
             tpl = _restore_seed_base() / "before_after"
-            rt = open_runtime(tpl, os_adapters())
+            rt = open_cloned_runtime(tpl, os_adapters(), role="restore-before-after")
             try:
                 hold(rt.store, "before", BEFORE_ID)
                 create_store_backup(rt.store, rt.os_, now())
@@ -196,7 +196,7 @@ def seed_event_and_backup(data_root: Path, clock: FakeClock | None = None) -> st
         if cached is None or not cached[0].is_dir():
             tpl = _restore_seed_base() / cache_key
             seed_clk = FakeClock(datetime(2026, 10, 30, 12, 0, tzinfo=UTC)) if clock is not None else None
-            rt = open_runtime(tpl, os_adapters(clock=seed_clk))
+            rt = open_cloned_runtime(tpl, os_adapters(clock=seed_clk), role=f"restore-{cache_key}")
             try:
                 if seed_clk is not None:
                     d = hold_event(rt.store, seed_clk)
@@ -249,7 +249,7 @@ def seed_policy_backup(data_root: Path) -> int:
         cached = _RESTORE_SEED_CACHE.get("policy_gen5")
         if cached is None or not cached[0].is_dir():
             tpl = _restore_seed_base() / "policy_gen5"
-            rt = open_runtime(tpl, os_adapters())
+            rt = open_cloned_runtime(tpl, os_adapters(), role="restore-gen5")
             rt.lease.raise_trust_hwm(4)
             rt.close()
             rt = open_runtime(tpl, os_adapters())
@@ -276,7 +276,7 @@ def set_meta_versions(path: Path, version: int) -> None:
 
 def full_backup_with_schema(data_root: Path, *, schema_version: int) -> Path:
     """A ``store_full`` backup of a store whose schema is ``schema_version``; the live store keeps version 1."""
-    open_runtime(data_root, os_adapters()).close()
+    open_cloned_runtime(data_root, os_adapters(), role="restore-schema").close()
     with maintenance_lease(data_root) as (root, lease):
         set_meta_versions(root.store_db, schema_version)
         path = create_maintenance_backup(root, lease, os_adapters(), target="store", now=now())
@@ -287,7 +287,7 @@ def full_backup_with_schema(data_root: Path, *, schema_version: int) -> Path:
 @pytest.fixture
 def other_backup(trusted_tmp: Path) -> Path:
     """A valid ``store`` backup of another data root (another store id)."""
-    rt = open_runtime(trusted_tmp / "other", os_adapters())
+    rt = open_cloned_runtime(trusted_tmp / "other", os_adapters(), role="restore-other")
     try:
         hold(rt.store, "before", BEFORE_ID)
         return create_store_backup(rt.store, rt.os_, now())

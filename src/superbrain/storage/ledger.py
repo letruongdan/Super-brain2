@@ -190,10 +190,12 @@ class Txn:
         check_owner: Callable[[], None],
         blob_intact: Callable[[str], bool],
         history_versions: Mapping[str, int],
+        read_held: Callable[[sqlite3.Connection, str, str, str, datetime], bytes | None] | None = None,
     ) -> None:
         self._db = db
         self._blob_intact = blob_intact
         self._history_versions = history_versions
+        self._read_held = read_held
         self._kinds = kinds
         self._handlers = tuple(handlers)
         self._policy = policy
@@ -202,6 +204,21 @@ class Txn:
         self._clock = clock
         self._check_owner = check_owner
         self._active = True
+
+    def read_held_blob(
+        self,
+        digest: str,
+        *,
+        holder_id: str,
+        holder_kind: str = "event",
+        now: datetime | None = None,
+    ) -> bytes | None:
+        """Bytes of ``digest`` iff actively held by ``(holder_kind, holder_id)`` at ``now`` and not restricted."""
+        self._check()
+        if self._read_held is None:
+            raise AssertionError("Txn has no read_held callback")
+        check_now = self._clock.now() if now is None else now
+        return self._read_held(self._db, digest, holder_kind, holder_id, check_now)
 
     @property
     def db(self) -> sqlite3.Connection:

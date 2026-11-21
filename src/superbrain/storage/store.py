@@ -18,10 +18,13 @@ from superbrain.core.ids import new_id
 from superbrain.ports.os import OsAdapters
 from superbrain.ports.policy import PolicySource, PolicyView
 from superbrain.storage import backup
+from superbrain.storage._proposal_schema import with_proposal_defaults
+from superbrain.storage._restore_epoch import read_restore_epoch, write_restore_epoch
 from superbrain.storage.cas import (
     ContentStore,
     RetentionClass,
     held_digests,
+    read_held_blob_or_none,
     remove_staging_leftovers,
 )
 from superbrain.storage.errors import sqlite_error
@@ -216,8 +219,8 @@ class Store:
         ``HolderProjection`` and ``CORE_KINDS`` are always registered, in addition to ``handlers`` and ``kinds``.
         """
         _check_lease(root, lease)
-        extra = KERNEL_POLICY_KINDS if code_version(migrations) >= 2 else ()
-        handlers, kinds = with_defaults(handlers, kinds, extra_kinds=extra)
+        base_handlers, extra = with_proposal_defaults(handlers, code_version(migrations), KERNEL_POLICY_KINDS)
+        handlers, kinds = with_defaults(base_handlers, kinds, extra_kinds=extra)
         check_handlers(handlers, kinds)
         path = root.store_db
         if any(os.path.lexists(p) for p in db_files(path)):
@@ -235,6 +238,8 @@ class Store:
             if any(os.path.lexists(p) for p in db_files(staging)[1:]):
                 raise BrainError(ErrorCode.IO_ERROR, f"{staging}: the WAL was not checkpointed away on close")
             os_.permissions.secure_file(staging)
+            if code_version(migrations) >= 5 and not os.path.lexists(root.restore_epoch_path):
+                write_restore_epoch(root.store_dir, 0, os_)
             os_.publisher.publish(staging, path)
             return cls._open_registered(root, lease, os_, policy, handlers, kinds, migrations)
         except BaseException:
@@ -259,8 +264,8 @@ class Store:
         unfinished ``put``s are removed. Both end with ``reconcile_policy``, so every pending intent is applied.
         """
         _check_lease(root, lease)
-        extra = KERNEL_POLICY_KINDS if code_version(migrations) >= 2 else ()
-        handlers, kinds = with_defaults(handlers, kinds, extra_kinds=extra)
+        base_handlers, extra = with_proposal_defaults(handlers, code_version(migrations), KERNEL_POLICY_KINDS)
+        handlers, kinds = with_defaults(base_handlers, kinds, extra_kinds=extra)
         check_handlers(handlers, kinds)
         lease.register_handle(_HANDLE)
         try:
@@ -286,6 +291,8 @@ class Store:
         if info is None:
             raise BrainError(ErrorCode.NOT_FOUND, f"no store database at {path}")
         ensure_writable(info, migrations)
+        if info.schema_version >= 5:
+            read_restore_epoch(root, schema_version=info.schema_version, os_=os_)
         if info.store_id != policy.store_id:
             raise BrainError(ErrorCode.INTEGRITY_FAILURE, "the store belongs to a different policy store")
         db = connect(path, traits=os_.traits)
@@ -314,15 +321,15 @@ class Store:
         (a handler registered after entries of its kinds were written must not start empty), then secure the
         database files and remove staging leftovers. Handlers whose live tables exist are not replayed."""
         self._history_versions = check_history(self._db, self._handlers)
-        with self._immediate() as db:
-            try:
-                fresh = [h for h in self._handlers if not _tables_with_prefix(db, live_prefix(h))]
-                for handler in fresh:
-                    _create_tables(db, handler, live_prefix(handler))
-                if fresh:
+        try:
+            fresh = [h for h in self._handlers if not _tables_with_prefix(self._db, live_prefix(h))]
+            if fresh:
+                with self._immediate() as db:
+                    for handler in fresh:
+                        _create_tables(db, handler, live_prefix(handler))
                     _replay(db, fresh, self._policy, live_prefix)
-            except sqlite3.Error as exc:
-                raise sqlite_error("cannot create projection tables", exc) from exc
+        except sqlite3.Error as exc:
+            raise sqlite_error("cannot create projection tables", exc) from exc
         for path in db_files(self._root.store_db):
             if path.exists():
                 self._os.permissions.secure_file(path)
@@ -406,6 +413,9 @@ class Store:
                     check_owner=self._check,
                     blob_intact=self._cas.blob_intact,
                     history_versions=self._history_versions,
+                    read_held=lambda db_, dig, hk, hi, dt: read_held_blob_or_none(
+                        db_, self._cas, self._policy, dig, holder_kind=hk, holder_id=hi, now=dt
+                    ),
                 )
                 try:
                     yield txn

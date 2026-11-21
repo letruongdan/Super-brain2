@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import stat
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from superbrain.adapters.os.durable import map_os_error
 from superbrain.core.client_profile import (
@@ -15,6 +17,7 @@ from superbrain.core.client_profile import (
     WorkspaceProfile,
 )
 from superbrain.core.errors import BrainError, ErrorCode
+from superbrain.core.ids import new_id
 from superbrain.core.kernel import (
     DaemonConfig,
     Endpoint,
@@ -23,7 +26,7 @@ from superbrain.core.kernel import (
     require_workspace_alias,
 )
 from superbrain.core.wire import parse_json
-from superbrain.ports.os import OsAdapters
+from superbrain.ports.os import NoReplacePublisher, OsAdapters
 
 MAX_DAEMON_CONFIG_BYTES = 65_536
 MAX_CLIENT_PROFILE_BYTES = 65_536
@@ -166,6 +169,14 @@ def read_daemon_config(path: Path, os_: OsAdapters) -> DaemonConfig:
     )
 
 
+def read_owner_json_object(path: Path, os_: OsAdapters) -> dict[str, Any]:
+    """Strictly read an owner-only JSON object file (same path, permission and size rules as the daemon config)."""
+    parsed = parse_json(_read_checked_file_bytes(path, os_, max_bytes=MAX_DAEMON_CONFIG_BYTES))
+    if not isinstance(parsed, dict):
+        raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+    return parsed
+
+
 def read_client_profile(path: Path, os_: OsAdapters) -> Any:
     """Validate owner-only ``ClientProfile`` file and parse its typed fields without opening trust/endpoint targets."""
     raw = _read_checked_file_bytes(path, os_, max_bytes=MAX_CLIENT_PROFILE_BYTES)
@@ -260,3 +271,69 @@ def read_client_credential(path: Path, os_: OsAdapters) -> str:
         token = text
     parse_bearer_token(token)
     return token
+
+def _validate_publish_target(target: Path, os_: OsAdapters) -> None:
+    if not isinstance(target, Path) or not target.is_absolute():
+        raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+    raw_str = os.fspath(target)
+    if not raw_str or "\x00" in raw_str:
+        raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+    os_.paths.reject_unsafe_path(raw_str)
+    if ".." in target.parts:
+        raise BrainError(ErrorCode.UNSAFE_PATH, "unsafe path")
+    os_.paths.reject_links(target)
+
+
+def publish_new_owner_file(
+    path: Path,
+    data: bytes,
+    os_: OsAdapters,
+    *,
+    stage_path: Path | None = None,
+    before_stage: Callable[[Path], None] | None = None,
+) -> None:
+    """Crash-safely create a NEW owner-only file: stage, secure, flush, then publish without replacing anything.
+
+    No byte ever lands on ``path`` before it is complete and flushed; a pre-existing ``path`` (user file) is refused
+    with ``INVALID_INPUT`` and never replaced. A hard kill leaves at most a ``.<name>.stage-<uuid7>`` sibling
+    (or ``stage_path`` when specified). When ``before_stage`` is provided, it runs before a single byte is written.
+    """
+    _validate_publish_target(path, os_)
+    if os_.permissions.check_ancestors(path):
+        raise BrainError(ErrorCode.INSECURE_PERMISSIONS, "insecure permissions")
+    if os.path.lexists(path):
+        raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+    if stage_path is not None:
+        _validate_publish_target(stage_path, os_)
+        if stage_path == path or stage_path.parent != path.parent:
+            raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+        stage = stage_path
+    else:
+        stage = path.parent / f".{path.name}.stage-{new_id()}"
+    if os.path.lexists(stage):
+        raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+    if before_stage is not None:
+        before_stage(stage)
+    created_stage = False
+    try:
+        os_.publisher.write_new(stage, data)
+        created_stage = True
+        os_.permissions.secure_file(stage)
+        os_.publisher.flush_file(stage)
+        cast(NoReplacePublisher, os_.publisher).publish_no_replace(stage, path)
+        os_.permissions.secure_file(path)
+        os_.publisher.sync_directory(path.parent)
+    except FileExistsError as err:
+        if created_stage:
+            _discard_stage(stage)
+        raise BrainError(ErrorCode.INVALID_INPUT, "invalid input") from err
+    except Exception:
+        if created_stage:
+            _discard_stage(stage)
+        raise
+
+
+def _discard_stage(stage: Path) -> None:
+    """Best-effort unlink of our own staging file on a handled error (a hard kill leaves it for the verified sweep)."""
+    with contextlib.suppress(OSError):
+        stage.unlink()
