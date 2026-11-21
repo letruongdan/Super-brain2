@@ -28,6 +28,7 @@ from superbrain.core.kernel import (
     Call,
     CallContext,
     CallResult,
+    CaptureBatchCommand,
     Endpoint,
     InvocationRecord,
     JobRecord,
@@ -46,6 +47,7 @@ from superbrain.core.kernel import (
     WorkspaceBinding,
     WorkspaceRegistration,
 )
+from superbrain.core.wire import encode_envelope, make_success_envelope
 from superbrain.ports.clock import Clock, MonotonicClock
 from superbrain.ports.policy import Intent
 from superbrain.storage.idempotency import StagedKernelStore
@@ -252,6 +254,18 @@ class _AdmittedOwnerSession(OwnerSession):
             on_response=lambda env: self._resolve_reply_future(future, holder, env),
             on_reserved=holder.append,
         )
+
+    def ingest_capture_batch(
+        self,
+        command: CaptureBatchCommand,
+        *,
+        deadline_ns: int | None = None,
+    ) -> CallResult:
+        """Process one capture batch on the owner thread and return an encoded ``CallResult``."""
+        ack = self._bridge.ingest_capture_batch(command, deadline_ns=deadline_ns)
+        envelope = make_success_envelope(ack.to_dict())
+        encode_envelope(envelope)
+        return envelope
 
     def _resolve_reply_future(
         self,

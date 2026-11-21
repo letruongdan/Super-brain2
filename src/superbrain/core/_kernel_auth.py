@@ -350,12 +350,23 @@ class RepoPolicy:
     repo_id: str
     owner_id: str
     provider_egress_enabled: bool = False
+    automatic_capture_enabled: bool = True
+    manual_submission_enabled: bool = True
+    indexing_enabled: bool = True
+    post_session_review_enabled: bool = True
 
     def __post_init__(self) -> None:
         require_opaque_id(self.repo_id, label="repo_id")
         require_opaque_id(self.owner_id, label="owner_id")
-        if not isinstance(self.provider_egress_enabled, bool):
-            raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+        for flag in (
+            self.provider_egress_enabled,
+            self.automatic_capture_enabled,
+            self.manual_submission_enabled,
+            self.indexing_enabled,
+            self.post_session_review_enabled,
+        ):
+            if not isinstance(flag, bool):
+                raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
 
 
 @dataclass(frozen=True)

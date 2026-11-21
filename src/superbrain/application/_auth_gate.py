@@ -10,6 +10,7 @@ from superbrain.application._prequeue import authorize_call_against_snapshot
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.jsonvalue import JsonValue
 from superbrain.core.kernel import (
+    CAPTURE_GAPS_PRESENT_CODE,
     HANDLER_RESERVE_NS,
     IDEMPOTENCY_CLOCK_UNTRUSTED_CODE,
     TLS_EXPIRED_CODE,
@@ -203,6 +204,14 @@ class AuthGate(RequestAuthStatePort):
                 if self._health_meta.idempotency_clock_untrusted != untrusted:
                     self._health_meta = replace(self._health_meta, idempotency_clock_untrusted=untrusted)
 
+    def update_capture_gaps_present(self, present: bool) -> None:
+        if not isinstance(present, bool):
+            raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+        with self._lock:
+            if not self._closed and self._health_meta is not None:
+                if self._health_meta.capture_gaps_present != present:
+                    self._health_meta = replace(self._health_meta, capture_gaps_present=present)
+
     def authorize_release(self, credential_id: str, generation: int) -> bool:
         if not isinstance(credential_id, str) or not is_strict_int(generation):
             return False
@@ -273,6 +282,8 @@ def evaluate_shallow_health(
     degraded_codes: list[JsonValue] = []
     if health_meta.idempotency_clock_untrusted:
         degraded_codes.append(IDEMPOTENCY_CLOCK_UNTRUSTED_CODE)
+    if health_meta.capture_gaps_present:
+        degraded_codes.append(CAPTURE_GAPS_PRESENT_CODE)
     if remaining <= timedelta(0):
         degraded_codes.append(TLS_EXPIRED_CODE)
     elif remaining <= TLS_EXPIRING_WINDOW:

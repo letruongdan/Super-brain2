@@ -164,7 +164,7 @@ def test_job_reducers_and_kinds_are_registered_at_version_one_without_schema_cha
     assert {"snapshot.observed", "lineage.task_bound"} <= kinds.kinds()  # Task 3 kinds stay registered
     hold = next(kind for kind in CORE_KINDS if kind.kind == "cas.hold")
     assert hold.enums["holder_kind"] == frozenset({"event", "evidence", "artifact", "lesson", "proposal", "receipt"})
-    assert KERNEL_STORE_MIGRATIONS[-1].to_version == 5 and KERNEL_POLICY_MIGRATIONS[-1].to_version == 4
+    assert KERNEL_STORE_MIGRATIONS[-1].to_version == 6 and KERNEL_POLICY_MIGRATIONS[-1].to_version == 4
     assert RECOVERY_BATCH == 100
 
 

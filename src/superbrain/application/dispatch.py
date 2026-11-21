@@ -19,6 +19,7 @@ from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.faults import crashpoint
 from superbrain.core.jsonvalue import JsonValue
 from superbrain.core.kernel import (
+    CAPTURE_GAPS_PRESENT_CODE,
     HANDLER_RESERVE_NS,
     IDEMPOTENCY_CLOCK_UNTRUSTED_CODE,
     ArtifactSendSpec,
@@ -113,6 +114,7 @@ class KernelDispatcher:
         send_attempts: KernelSendAttemptPort | None = None,
         before_enter_commit: Callable[[Reservation | None], None] | None = None,
         on_commit_completed: Callable[[StoredResult], None] | None = None,
+        has_capture_gaps: Callable[[], bool] | None = None,
     ) -> None:
         require_opaque_id(store_id, label="store_id")
         self._store_id = store_id
@@ -128,6 +130,7 @@ class KernelDispatcher:
         self._send_attempts = send_attempts
         self._before_enter_commit = before_enter_commit
         self._on_commit_completed = on_commit_completed
+        self._has_capture_gaps = has_capture_gaps
 
     def dispatch(self, call: Call, ctx: CallContext, *, auth: PrivateRequestAuth) -> CallResult:
         """Execute ``call`` on the owner thread and return a validated v2 ``CallResult`` envelope."""
@@ -294,6 +297,8 @@ class KernelDispatcher:
             if is_shallow_health:
                 untrusted = self._idempotency.clock_untrusted()
                 degraded: list[JsonValue] = [IDEMPOTENCY_CLOCK_UNTRUSTED_CODE] if untrusted else []
+                if self._has_capture_gaps is not None and self._has_capture_gaps():
+                    degraded.append(CAPTURE_GAPS_PRESENT_CODE)
                 return {
                     "ready": not untrusted,
                     "store_id": self._store_id,

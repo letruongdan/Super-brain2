@@ -27,6 +27,7 @@ from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.kernel import Principal
 from superbrain.core.proposals import ApplyTurnIntent, JournalDirection
 from superbrain.ports.os import OsAdapters
+from superbrain.ports.policy import Intent
 from superbrain.storage import _policy_approvals as approvals
 from superbrain.storage import _policy_grants as grants
 from superbrain.storage import _policy_layer2 as layer2
@@ -196,6 +197,39 @@ class PolicyAuthorityMixin:
                 host_version=host_version,
                 config_digest=config_digest,
                 state=state,
+                now=self._now(),
+            )
+
+    def layer2_state(self, harness_id: str) -> tuple[str, str, str, Layer2State] | None:
+        """Latest ``harness_layer2_state`` tuple for ``harness_id``, or ``None`` if absent/below v4."""
+        self._check()
+        if self._schema_version < _MIN_AUTHORITY_SCHEMA:
+            return None
+        try:
+            return layer2.read_latest_layer2_state(self._db, harness_id=harness_id)
+        except sqlite3.Error as exc:
+            raise sqlite_error("cannot read layer2 state", exc) from exc
+
+    def set_repo_policy(
+        self,
+        repo_id: str,
+        *,
+        automatic_capture_enabled: bool | None = None,
+        manual_submission_enabled: bool | None = None,
+        indexing_enabled: bool | None = None,
+        provider_egress_enabled: bool | None = None,
+        post_session_review_enabled: bool | None = None,
+    ) -> Intent:
+        """Update live repository capture/privacy/egress flags atomically under policy authority."""
+        with self._authority_tx() as db:
+            return layer2.set_repo_policy_flags(
+                db,
+                repo_id=repo_id,
+                automatic_capture_enabled=automatic_capture_enabled,
+                manual_submission_enabled=manual_submission_enabled,
+                indexing_enabled=indexing_enabled,
+                provider_egress_enabled=provider_egress_enabled,
+                post_session_review_enabled=post_session_review_enabled,
                 now=self._now(),
             )
 

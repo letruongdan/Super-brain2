@@ -61,6 +61,7 @@ from superbrain.core._kernel_base import (
     require_workspace_hint,
 )
 from superbrain.core._kernel_daemon import (
+    CAPTURE_GAPS_PRESENT_CODE,
     DAEMON_LISTEN_BACKLOG,
     DAEMON_QUEUE_DEPTH,
     DEFAULT_SHUTDOWN_GRACE_S,
@@ -433,6 +434,7 @@ __all__ = [
     "CAPABILITY_CAPTURE_PRODUCER",
     "CAPABILITY_MCP_TOOL",
     "CAPABILITY_OPERATOR_CLI",
+    "CAPTURE_GAPS_PRESENT_CODE",
     "COMMIT_RESERVE_NS",
     "Call",
     "CallContext",

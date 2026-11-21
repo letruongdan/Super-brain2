@@ -400,7 +400,7 @@ def test_f3_foreign_path_injected_into_durable_staging_files_fails_closed(truste
 
 def _reconcile_all(rt: Any, store_id: str, signer_id: str, layout: DataRoot) -> Any:
     rev = rt.policy.policy_revision()
-    cur_epoch = read_restore_epoch(layout, schema_version=5, os_=rt.os_)
+    cur_epoch = read_restore_epoch(layout, schema_version=6, os_=rt.os_)
     assert (
         classify_policy_change_risk(
             widens_capture_or_egress=False, sets_review_harness_or_command=False, reconcile_accounting=True

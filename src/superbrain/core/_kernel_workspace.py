@@ -280,7 +280,12 @@ class RepoFlags:
     def from_repo_policy(cls, policy: RepoPolicy) -> RepoFlags:
         if not isinstance(policy, RepoPolicy):
             raise _invalid()
-        return cls(provider_egress=policy.provider_egress_enabled)
+        return cls(
+            automatic_capture=policy.automatic_capture_enabled,
+            manual_submission=policy.manual_submission_enabled,
+            indexing=policy.indexing_enabled,
+            provider_egress=policy.provider_egress_enabled,
+        )
 
 
 @dataclass(frozen=True)

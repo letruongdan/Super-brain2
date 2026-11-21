@@ -36,6 +36,7 @@ from superbrain.core.kernel import (
 )
 from superbrain.ports.clock import Clock
 from superbrain.ports.os import OsAdapters
+from superbrain.storage.capture_events import KernelCaptureStore
 from superbrain.storage.idempotency import StagedKernelStore
 from superbrain.storage.jobs import has_legacy_incomplete_settled_projections
 from superbrain.storage.kernel_schema import KERNEL_POLICY_MIGRATIONS, KERNEL_STORE_MIGRATIONS
@@ -322,6 +323,7 @@ class DaemonRestoreHandler(RestoreHandler):
                 policy_schema_version=rt.policy.schema_version,
                 tls_not_after=self._session.ready.tls_not_after,
                 idempotency_clock_untrusted=self._session.bridge_clock_untrusted(),
+                capture_gaps_present=KernelCaptureStore(rt.store).has_gaps() if rt.store.schema_version >= 6 else False,
             )
             view = RequestAuthView(
                 version=self._session.auth_gate.next_version(),

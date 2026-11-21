@@ -47,6 +47,9 @@ KNOWN_CRASHPOINTS: frozenset[str] = frozenset({
     "apply.after_policy_grant_ended",
     # I3-4: restore post-swap before effect drain crashpoint
     "restoring.store.after_swap_before_effect_drain",
+    # SP2-2: capture outbox + daemon ingest crashpoints
+    "capture.outbox.after_write_before_fsync",
+    "capture.daemon.after_commit_before_ack",
 })
 
 KNOWN_PAUSEPOINTS: frozenset[str] = KNOWN_CRASHPOINTS | {"writer.held"}

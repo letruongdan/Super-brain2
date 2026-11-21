@@ -1230,11 +1230,11 @@ def test_cross_revision_v1_workspace_register_root_reopens_reconciles_and_blocks
     assert mig_a.policy_report.to_version == 4
     assert mig_a.store_report.status == "migrated"
     assert mig_a.store_report.from_version == 2
-    assert mig_a.store_report.to_version == 5
+    assert mig_a.store_report.to_version == 6
     assert code_version(KERNEL_POLICY_MIGRATIONS) == 4
-    assert code_version(KERNEL_STORE_MIGRATIONS) == 5
+    assert code_version(KERNEL_STORE_MIGRATIONS) == 6
     assert read_schema_info(root_a / "policy" / "policy.db") == SchemaInfo(4, 4, store_id_a)
-    assert read_schema_info(root_a / "store" / "brain.db") == SchemaInfo(5, 5, store_id_a)
+    assert read_schema_info(root_a / "store" / "brain.db") == SchemaInfo(6, 6, store_id_a)
 
     # Post-migration serve admission + open_runtime_under_lease preserves retained 6-key intent and handler_version=1.
     clock.advance(dt.timedelta(seconds=5))
@@ -1455,9 +1455,9 @@ def test_cross_revision_v1_workspace_register_root_reopens_reconciles_and_blocks
     assert mig_b.policy_report.to_version == 4
     assert mig_b.store_report.status == "migrated"
     assert mig_b.store_report.from_version == 2
-    assert mig_b.store_report.to_version == 5
+    assert mig_b.store_report.to_version == 6
     assert read_schema_info(root_b / "policy" / "policy.db") == SchemaInfo(4, 4, store_id_b)
-    assert read_schema_info(root_b / "store" / "brain.db") == SchemaInfo(5, 5, store_id_b)
+    assert read_schema_info(root_b / "store" / "brain.db") == SchemaInfo(6, 6, store_id_b)
 
     clock.advance(dt.timedelta(seconds=5))
     admitted_b = admit_existing_pair(root_b, store_id_b, os_, purpose="serve")
@@ -1504,7 +1504,7 @@ def test_cross_revision_v1_workspace_register_root_reopens_reconciles_and_blocks
             )
         finally:
             pol_b.close()
-    assert read_schema_info(root_b / "store" / "brain.db") == SchemaInfo(5, 5, store_id_b)
+    assert read_schema_info(root_b / "store" / "brain.db") == SchemaInfo(6, 6, store_id_b)
 
     clock.advance(dt.timedelta(seconds=5))
     admitted_b2 = admit_existing_pair(root_b, store_id_b, os_, purpose="serve")
@@ -2067,10 +2067,10 @@ def test_historical_v2_writer_is_fenced_before_policy_mutation_across_migrate_an
             maint_v2_policy_backup = mig_hist.policy_report.backup
             assert mig_hist.store_report.status == "migrated"
             assert mig_hist.store_report.from_version == 2
-            assert mig_hist.store_report.to_version == 5
+            assert mig_hist.store_report.to_version == 6
             assert mig_hist.store_report.backup is not None
             assert read_schema_info(root_hist / "policy" / "policy.db") == SchemaInfo(4, 4, hist_store_id)
-            assert read_schema_info(root_hist / "store" / "brain.db") == SchemaInfo(5, 5, hist_store_id)
+            assert read_schema_info(root_hist / "store" / "brain.db") == SchemaInfo(6, 6, hist_store_id)
 
             clock.advance(dt.timedelta(seconds=5))
             adm_cur = admit_existing_pair(root_hist, hist_store_id, os_, purpose="serve")
@@ -2126,7 +2126,7 @@ def test_historical_v2_writer_is_fenced_before_policy_mutation_across_migrate_an
                     )
                 finally:
                     pol_h.close()
-            assert read_schema_info(root_hist / "store" / "brain.db") == SchemaInfo(5, 5, hist_store_id)
+            assert read_schema_info(root_hist / "store" / "brain.db") == SchemaInfo(6, 6, hist_store_id)
 
             _assert_root_hist_fenced("step4-after-restore-store")
 
@@ -2207,7 +2207,7 @@ def test_historical_v2_writer_is_fenced_before_policy_mutation_across_migrate_an
     assert code_version(v2_policy) == 2
     assert code_version(v2_store) == 2
     assert code_version(KERNEL_POLICY_MIGRATIONS) == 4
-    assert code_version(KERNEL_STORE_MIGRATIONS) == 5
+    assert code_version(KERNEL_STORE_MIGRATIONS) == 6
 
     # B1 & B2: Create a root at v1, take v1 policy backup, upgrade to (store=2, policy=2), take v2 policy backup,
     # then upgrade via migrate_offline to (store=5, policy=4).
@@ -2258,8 +2258,8 @@ def test_historical_v2_writer_is_fenced_before_policy_mutation_across_migrate_an
     assert not mig_b1_to_v3.noop
     assert mig_b1_to_v3.policy_report.from_version == 2 and mig_b1_to_v3.policy_report.to_version == 4
     assert mig_b1_to_v3.store_report.status == "migrated"
-    assert mig_b1_to_v3.store_report.from_version == 2 and mig_b1_to_v3.store_report.to_version == 5
-    assert read_schema_info(b1_root / "store" / "brain.db") == SchemaInfo(5, 5, b1_store_id)
+    assert mig_b1_to_v3.store_report.from_version == 2 and mig_b1_to_v3.store_report.to_version == 6
+    assert read_schema_info(b1_root / "store" / "brain.db") == SchemaInfo(6, 6, b1_store_id)
 
     # Clean up prior policy.replaced-* / store.replaced-* from setup so stage-creation checks start clean.
     for leftover in list(b1_root.iterdir()):
@@ -3069,13 +3069,13 @@ def test_historical_restore_policy_cannot_strip_main_store_fence_before_authorit
                     # Pass 0 reproduces probe_historical_restore.py directly first, then checks pre-admission & v5.
                     _assert_hist_open_mutations_fenced(f"step-e-{bak_label}", expected_ledger_versions=[2])
                     assert mig_initial.store_report.status == "migrated"
-                    assert mig_initial.store_report.from_version == 2 and mig_initial.store_report.to_version == 5
+                    assert mig_initial.store_report.from_version == 2 and mig_initial.store_report.to_version == 6
                     assert mig_initial.store_report.backup is not None
-                    assert read_schema_info(root_hist / "store" / "brain.db") == SchemaInfo(5, 5, hist_store_id)
+                    assert read_schema_info(root_hist / "store" / "brain.db") == SchemaInfo(6, 6, hist_store_id)
                     _assert_hist_preadmission_fenced(f"step-e-{bak_label}-preadm")
                 else:
                     # Pass 1 runs pre-admission checks first (on fresh DELETE-mode restored policy.db) then open_runtime
-                    assert read_schema_info(root_hist / "store" / "brain.db") == SchemaInfo(5, 5, hist_store_id)
+                    assert read_schema_info(root_hist / "store" / "brain.db") == SchemaInfo(6, 6, hist_store_id)
                     _assert_hist_preadmission_fenced(f"step-e-{bak_label}-preadm")
                     _assert_hist_open_mutations_fenced(f"step-e-{bak_label}", expected_ledger_versions=[2])
 
@@ -3111,9 +3111,9 @@ def test_historical_restore_policy_cannot_strip_main_store_fence_before_authorit
                 assert mig_recover.policy_report.status == "migrated"
                 assert mig_recover.policy_report.from_version == 2 and mig_recover.policy_report.to_version == 4
                 assert mig_recover.store_report.status == "skipped"
-                assert mig_recover.store_report.from_version == 5 and mig_recover.store_report.to_version == 5
+                assert mig_recover.store_report.from_version == 6 and mig_recover.store_report.to_version == 6
                 assert read_schema_info(root_hist / "policy" / "policy.db") == SchemaInfo(4, 4, hist_store_id)
-                assert read_schema_info(root_hist / "store" / "brain.db") == SchemaInfo(5, 5, hist_store_id)
+                assert read_schema_info(root_hist / "store" / "brain.db") == SchemaInfo(6, 6, hist_store_id)
 
                 clock.advance(dt.timedelta(seconds=5))
                 adm_recovered = admit_existing_pair(root_hist, hist_store_id, os_, purpose="serve")
@@ -3216,7 +3216,7 @@ def test_historical_restore_policy_cannot_strip_main_store_fence_before_authorit
                         )
                     finally:
                         pol_g.close()
-                assert read_schema_info(root_hist / "store" / "brain.db") == SchemaInfo(5, 5, hist_store_id)
+                assert read_schema_info(root_hist / "store" / "brain.db") == SchemaInfo(6, 6, hist_store_id)
 
                 hist_restore_after_s = _run_r4_child(
                     {
@@ -3229,7 +3229,7 @@ def test_historical_restore_policy_cannot_strip_main_store_fence_before_authorit
                 )
                 assert hist_restore_after_s["status"] == "accepted"
                 assert read_schema_info(root_hist / "policy" / "policy.db") == SchemaInfo(2, 2, hist_store_id)
-                assert read_schema_info(root_hist / "store" / "brain.db") == SchemaInfo(5, 5, hist_store_id)
+                assert read_schema_info(root_hist / "store" / "brain.db") == SchemaInfo(6, 6, hist_store_id)
 
                 _assert_hist_preadmission_fenced(f"step-g-{s_bak_label}-preadm")
                 _assert_hist_open_mutations_fenced(f"step-g-{s_bak_label}", expected_ledger_versions=[])
@@ -3240,7 +3240,7 @@ def test_historical_restore_policy_cannot_strip_main_store_fence_before_authorit
                     os_,
                 )
                 assert mig_g_rec.policy_report.status == "migrated" and mig_g_rec.policy_report.to_version == 4
-                assert mig_g_rec.store_report.status == "skipped" and mig_g_rec.store_report.to_version == 5
+                assert mig_g_rec.store_report.status == "skipped" and mig_g_rec.store_report.to_version == 6
                 adm_g = admit_existing_pair(root_hist, hist_store_id, os_, purpose="serve")
                 rt_g = open_runtime_under_lease(adm_g)
                 try:
@@ -3263,7 +3263,7 @@ def test_historical_restore_policy_cannot_strip_main_store_fence_before_authorit
     assert code_version(v2_store) == 2
     assert code_version(v3_store) == 3
     assert code_version(KERNEL_POLICY_MIGRATIONS) == 4
-    assert code_version(KERNEL_STORE_MIGRATIONS) == 5
+    assert code_version(KERNEL_STORE_MIGRATIONS) == 6
 
     # B1. Build (store=5, policy=4) root from v1 -> v2 -> (5, 4) with v1/v2/v5 backups and handler_version=2 history.
     pb_root = trusted_tmp / "part-b-r4-root"
@@ -3315,7 +3315,7 @@ def test_historical_restore_policy_cannot_strip_main_store_fence_before_authorit
         DaemonConfig(1, pb_root, pb_store_id, trusted_tmp / "pb.pem", trusted_tmp / "pb.key"),
         os_,
     )
-    assert mig_pb_v3.policy_report.to_version == 4 and mig_pb_v3.store_report.to_version == 5
+    assert mig_pb_v3.policy_report.to_version == 4 and mig_pb_v3.store_report.to_version == 6
     assert mig_pb_v3.store_report.backup is not None
     pb_v2_store_full_backup = mig_pb_v3.store_report.backup
 
@@ -3518,7 +3518,7 @@ def test_historical_restore_policy_cannot_strip_main_store_fence_before_authorit
                 )
             finally:
                 pol_up.close()
-        assert read_schema_info(pb_root / "store" / "brain.db") == SchemaInfo(5, 5, pb_store_id)
+        assert read_schema_info(pb_root / "store" / "brain.db") == SchemaInfo(6, 6, pb_store_id)
 
     adm_pb_after_v1 = admit_existing_pair(pb_root, pb_store_id, os_, purpose="serve")
     rt_pb_after_v1 = open_runtime_under_lease(adm_pb_after_v1)
@@ -3698,9 +3698,9 @@ def test_historical_restore_policy_cannot_strip_main_store_fence_before_authorit
     assert mig_sim_up.policy_report.status == "migrated"
     assert mig_sim_up.policy_report.from_version == 2 and mig_sim_up.policy_report.to_version == 4
     assert mig_sim_up.store_report.status == "migrated"
-    assert mig_sim_up.store_report.from_version == 3 and mig_sim_up.store_report.to_version == 5
+    assert mig_sim_up.store_report.from_version == 3 and mig_sim_up.store_report.to_version == 6
     assert read_schema_info(sim_root / "policy" / "policy.db") == SchemaInfo(4, 4, sim_sid)
-    assert read_schema_info(sim_root / "store" / "brain.db") == SchemaInfo(5, 5, sim_sid)
+    assert read_schema_info(sim_root / "store" / "brain.db") == SchemaInfo(6, 6, sim_sid)
 
     adm_sim_ok = admit_existing_pair(sim_root, sim_sid, os_, purpose="serve")
     rt_sim_ok = open_runtime_under_lease(adm_sim_ok)

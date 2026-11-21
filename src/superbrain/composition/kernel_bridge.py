@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Protocol, TypeVar, cast
 
 from superbrain.adapters.os.clock import SystemMonotonicClock
+from superbrain.application.capture_ingest import CaptureBatchAck, CaptureIngestService
 from superbrain.application.deadlines import (
     DEFAULT_MAX_QUEUE_DEPTH,
     AtomicRequestAuthState,
@@ -17,6 +18,8 @@ from superbrain.application.deadlines import (
 )
 from superbrain.application.dispatch import KernelDispatcher, KernelToolDomain
 from superbrain.application.idempotency import is_idempotency_expired
+from superbrain.application.privacy import PrivacyFilter
+from superbrain.core._kernel_approval import Layer2State
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.ids import new_id
 from superbrain.core.jsonvalue import JsonValue
@@ -27,6 +30,7 @@ from superbrain.core.kernel import (
     Call,
     CallContext,
     CallResult,
+    CaptureBatchCommand,
     Identity,
     Principal,
     PrivateRequestAuth,
@@ -45,6 +49,7 @@ from superbrain.ports.clock import Clock, MonotonicClock
 from superbrain.ports.kernel import KernelBlobStagePort, KernelStorePort, RequestAuthStatePort
 from superbrain.ports.policy import Intent, IntentKind
 from superbrain.storage._pair_admission import verify_admitted_store_pair
+from superbrain.storage.capture_events import KernelCaptureStore
 from superbrain.storage.idempotency import KernelBlobStager, KernelIdempotencyStore, StrictKernelStore
 from superbrain.storage.policy_store import PolicyStore
 from superbrain.storage.send_attempts import KernelSendAttemptStore
@@ -110,6 +115,7 @@ class KernelBridge(KernelBlobStagePort):
         | None = None,
         on_owner_finished: Callable[[Reservation, bool], None] | None = None,
         on_clock_untrusted_changed: Callable[[bool], None] | None = None,
+        on_capture_gaps_changed: Callable[[bool], None] | None = None,
     ) -> None:
         if not isinstance(recover_pending_on_init, bool):
             raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
@@ -144,6 +150,7 @@ class KernelBridge(KernelBlobStagePort):
         self._before_auth_gate_publish = before_auth_gate_publish
         self._on_owner_reply_ready = on_owner_reply_ready
         self._on_clock_untrusted_changed = on_clock_untrusted_changed
+        self._on_capture_gaps_changed = on_capture_gaps_changed
         self._wire_stores(store, policy, writer_epoch)
         if recover_pending_on_init:
             self._send_attempts.recover_pending_attempts()
@@ -185,6 +192,13 @@ class KernelBridge(KernelBlobStagePort):
             policy,
             writer_epoch=writer_epoch,
         )
+        self._capture_store = KernelCaptureStore(store)
+        self._capture_ingest = CaptureIngestService(
+            capture_store=self._capture_store,
+            privacy_filter=PrivacyFilter(monotonic_ns=self._monotonic_clock.monotonic_ns),
+            clock=self._clock,
+            monotonic_ns=self._monotonic_clock.monotonic_ns,
+        )
         self._dispatcher = KernelDispatcher(
             store_id=store.store_id,
             policy=policy,
@@ -199,6 +213,7 @@ class KernelBridge(KernelBlobStagePort):
             send_attempts=self._send_attempts,
             before_enter_commit=self._before_enter_commit,
             on_commit_completed=self._on_commit_completed,
+            has_capture_gaps=self.capture_gaps_present,
         )
 
     def rebind_stores(self, *, store: Store, policy: PolicyStore, writer_epoch: int) -> None:
@@ -526,3 +541,53 @@ class KernelBridge(KernelBlobStagePort):
     def recover_pending_send_attempts(self) -> int:
         self._check_live_pair()
         return self._send_attempts.recover_pending_attempts()
+
+    def capture_gaps_present(self) -> bool:
+        self._check_live_pair()
+        return self._capture_store.has_gaps()
+
+    def _verified_layer2_tuple(self, harness_id: str) -> tuple[str, str] | None:
+        latest = self._policy.layer2_state(harness_id)
+        if latest is None or latest[3] is not Layer2State.VERIFIED:
+            return None
+        return (latest[1], latest[2])
+
+    def ingest_capture_batch(self, command: CaptureBatchCommand, *, deadline_ns: int | None = None) -> CaptureBatchAck:
+        """Authorize, privacy-filter, attribute, and commit one ``POST /v2/capture/events`` batch."""
+        self._check_live_pair()
+        if deadline_ns is not None and self._monotonic_clock.monotonic_ns() >= deadline_ns:
+            raise BrainError(ErrorCode.DEADLINE_EXCEEDED, "deadline exceeded")
+        view = self._auth_state.current()
+        if view is None:
+            raise BrainError(ErrorCode.POLICY_UNAVAILABLE, "policy unavailable")
+        ram_p = view.auth.authorize_capture_producer(
+            command.token,
+            producer_stream=command.producer_stream,
+            repo_id=command.repo_id,
+            checkout_id=command.checkout_id,
+        )
+        live_p = self._policy.resolve_credential(command.token)
+        if live_p != ram_p:
+            raise BrainError(ErrorCode.IDENTITY_MISMATCH, "principal identity mismatch")
+        snap = self._policy.snapshot()
+        repo_pol = snap.repo_policies.get(command.repo_id)
+        chk = snap.checkouts.get(command.checkout_id)
+        if (
+            repo_pol is None
+            or chk is None
+            or snap.principals.get(live_p.principal_id) != live_p
+            or (live_p.principal_id, command.repo_id) not in snap.grants
+            or repo_pol.owner_id != live_p.owner_id
+            or chk.owner_id != live_p.owner_id
+            or chk.repo_id != command.repo_id
+            or chk.machine_id != live_p.machine_id
+        ):
+            raise BrainError(ErrorCode.IDENTITY_MISMATCH, "principal identity mismatch")
+        try:
+            return self._capture_ingest.ingest_batch(
+                command, principal=live_p, repo_policy=repo_pol,
+                layer2_lookup=self._verified_layer2_tuple, deadline_ns=deadline_ns,
+            )
+        finally:
+            if self._on_capture_gaps_changed is not None:
+                self._on_capture_gaps_changed(self._capture_store.has_gaps())

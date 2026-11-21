@@ -1462,7 +1462,7 @@ def test_store3_to_store4_migration_min_reader_fence_and_backup_restore(
     mono = Mono()
     assert STORE_V4_MIGRATION.to_version == 4
     assert STORE_V4_MIGRATION.min_reader_version == 4
-    assert code_version(KERNEL_STORE_MIGRATIONS) == 5
+    assert code_version(KERNEL_STORE_MIGRATIONS) == 6
 
     v3_store_migrations = KERNEL_STORE_MIGRATIONS[:3]
     v4_store_migrations = KERNEL_STORE_MIGRATIONS[:4]
@@ -1532,8 +1532,8 @@ def test_store3_to_store4_migration_min_reader_fence_and_backup_restore(
     # The I3 binary then upgrades the I2 pair (store=4, policy=3) to (store=5, policy=4).
     top_report = migrate_offline(cfg, os_)
     assert (top_report.policy_report.status, top_report.policy_report.to_version) == ("migrated", 4)
-    assert (top_report.store_report.from_version, top_report.store_report.to_version) == (4, 5)
-    assert read_schema_info(root / "store" / "brain.db") == SchemaInfo(5, 5, store_id)
+    assert (top_report.store_report.from_version, top_report.store_report.to_version) == (4, 6)
+    assert read_schema_info(root / "store" / "brain.db") == SchemaInfo(6, 6, store_id)
     assert read_schema_info(root / "policy" / "policy.db") == SchemaInfo(4, 4, store_id)
 
     # Open store4, take a policy backup BEFORE adding a new request key, commit an idempotent row, backup & restore.
@@ -1673,7 +1673,7 @@ def test_i2_committed_result_replays_after_upgrade_to_store5_policy4(
     clock.advance(dt.timedelta(seconds=5))
     report = migrate_offline(cfg, os_)
     assert (report.policy_report.from_version, report.policy_report.to_version) == (3, 4)
-    assert (report.store_report.from_version, report.store_report.to_version) == (4, 5)
+    assert (report.store_report.from_version, report.store_report.to_version) == (4, 6)
 
     rt_i3 = _reopen_fixture_runtime(root, store_id, os_)
     try:

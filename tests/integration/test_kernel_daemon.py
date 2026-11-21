@@ -1624,7 +1624,7 @@ def test_shallow_health_bypasses_blocked_write_queue(
                 "ready": True,
                 "store_id": _daemon_template.store_id,
                 "writer_epoch": ready.endpoint.writer_epoch,
-                "schema_version": 5,
+                "schema_version": 6,
                 "policy_schema_version": 4,
                 "degraded_codes": [],
             },

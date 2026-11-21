@@ -63,6 +63,7 @@ from superbrain.core.kernel import (
 )
 from superbrain.ports.clock import Clock, MonotonicClock
 from superbrain.ports.os import OsAdapters
+from superbrain.storage.capture_events import KernelCaptureStore
 from superbrain.storage.idempotency import StagedKernelStore
 from superbrain.storage.jobs import has_legacy_incomplete_settled_projections
 from superbrain.storage.proposals import PolicyApplyAuthority, StoreProposalAdapter
@@ -205,6 +206,7 @@ def _open_owner_session(
             on_owner_reply_ready=_on_reply_ready,
             on_owner_finished=_on_owner_finished,
             on_clock_untrusted_changed=auth_gate.update_clock_untrusted,
+            on_capture_gaps_changed=auth_gate.update_capture_gaps_present,
         )
         bridge.recover_pending_send_attempts()
 
@@ -224,6 +226,7 @@ def _open_owner_session(
             policy_schema_version=rt.policy.schema_version,
             tls_not_after=verified_tls.not_after,
             idempotency_clock_untrusted=bridge.clock_untrusted(),
+            capture_gaps_present=KernelCaptureStore(rt.store).has_gaps() if rt.store.schema_version >= 6 else False,
         )
         initial_view = RequestAuthView(
             version=auth_gate.next_version(),

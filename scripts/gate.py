@@ -277,6 +277,7 @@ _WHEEL_FIXTURE_FILES: frozenset[str] = frozenset(
     {
         "tests/contract/test_mcp_v2_schema.py",
         "tests/integration/test_apply_journal_crash_matrix.py",
+        "tests/integration/test_capture_ack_and_crash_matrix.py",
         "tests/integration/test_i3_wheel_e2e.py",
         "tests/integration/test_kernel_cli.py",
         "tests/integration/test_kernel_crash_recovery.py",
@@ -303,6 +304,9 @@ _HEAVY_FILE_COST_MS: dict[str, int] = {
     "tests/integration/test_kernel_daemon.py": 39018,
     "tests/integration/test_i3_wheel_e2e.py": 28000,
     "tests/integration/test_sp2_i2_wheel_compat.py": 24633,
+    "tests/integration/test_capture_ack_and_crash_matrix.py": 18000,
+    "tests/domain/test_capture_envelope_and_privacy.py": 1500,
+    "tests/storage/test_outbox_durability_and_limits.py": 2000,
     "tests/storage/test_cas.py": 7286,
     "tests/integration/test_i3_rereview_init_and_accounting.py": 24000,
     "tests/storage/test_remediation_i2_t5.py": 9697,

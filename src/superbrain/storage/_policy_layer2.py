@@ -18,7 +18,7 @@ from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.ids import new_id
 from superbrain.core.jsonvalue import JsonValue
 from superbrain.ports.policy import Intent, IntentKind
-from superbrain.storage._policy_approvals import OWNER_META_KEY, record_intent_row, refused
+from superbrain.storage._policy_approvals import OWNER_META_KEY, _integrity, record_intent_row, refused
 from superbrain.storage.kinds import is_uuid
 from superbrain.storage.ledger import utc_timestamp
 
@@ -56,6 +56,101 @@ def set_layer2_state(
         "INSERT INTO harness_layer2_state (harness_id, host_version, config_digest, state, intent_id, created_at) "
         "VALUES (?, ?, ?, ?, ?, ?)",
         (harness_id, host_version, config_digest, state.value, intent.intent_id, intent.created_at),
+    )
+    return intent
+
+
+def read_latest_layer2_state(
+    db: sqlite3.Connection, *, harness_id: str
+) -> tuple[str, str, str, Layer2State] | None:
+    """Return latest ``(harness_id, host_version, config_digest, state)`` row for ``harness_id``, or ``None``."""
+    if not isinstance(harness_id, str) or not OPAQUE_ID_RE.fullmatch(harness_id):
+        raise _invalid()
+    row = db.execute(
+        "SELECT host_version, config_digest, state FROM harness_layer2_state "
+        "WHERE harness_id = ? ORDER BY seq DESC LIMIT 1",
+        (harness_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    host_ver, cfg_dig, state_raw = row
+    if not isinstance(host_ver, str) or not isinstance(cfg_dig, str) or not isinstance(state_raw, str):
+        raise _integrity("harness_layer2_state row")
+    try:
+        state_val = Layer2State(state_raw)
+    except ValueError as err:
+        raise _integrity("harness_layer2_state state") from err
+    return (harness_id, host_ver, cfg_dig, state_val)
+
+
+def set_repo_policy_flags(
+    db: sqlite3.Connection,
+    *,
+    repo_id: str,
+    automatic_capture_enabled: bool | None = None,
+    manual_submission_enabled: bool | None = None,
+    indexing_enabled: bool | None = None,
+    provider_egress_enabled: bool | None = None,
+    post_session_review_enabled: bool | None = None,
+    now: datetime,
+) -> Intent:
+    """Update per-repo policy flags atomically and record ``REPO_POLICY_SET`` intent."""
+    if not isinstance(repo_id, str) or not OPAQUE_ID_RE.fullmatch(repo_id):
+        raise _invalid()
+    for val in (
+        automatic_capture_enabled,
+        manual_submission_enabled,
+        indexing_enabled,
+        provider_egress_enabled,
+        post_session_review_enabled,
+    ):
+        if val is not None and not isinstance(val, bool):
+            raise _invalid()
+    row = db.execute(
+        "SELECT owner_id, automatic_capture_enabled, manual_submission_enabled, indexing_enabled, "
+        "provider_egress_enabled, post_session_review_enabled FROM repo_policy WHERE repo_id = ?",
+        (repo_id,),
+    ).fetchone()
+    if row is None:
+        raise BrainError(ErrorCode.NOT_FOUND, "not found")
+    owner_id_raw, cur_auto, cur_manual, cur_idx, cur_egress, cur_review = row
+    if not isinstance(owner_id_raw, str):
+        raise _integrity("repo_policy owner_id")
+    for col in (cur_auto, cur_manual, cur_idx, cur_egress, cur_review):
+        if type(col) is not int or col not in (0, 1):
+            raise _integrity("repo_policy flag")
+    next_auto = (cur_auto == 1) if automatic_capture_enabled is None else automatic_capture_enabled
+    next_manual = (cur_manual == 1) if manual_submission_enabled is None else manual_submission_enabled
+    next_idx = (cur_idx == 1) if indexing_enabled is None else indexing_enabled
+    next_egress = (cur_egress == 1) if provider_egress_enabled is None else provider_egress_enabled
+    next_review = (cur_review == 1) if post_session_review_enabled is None else post_session_review_enabled
+    intent = record_intent_row(
+        db,
+        IntentKind.REPO_POLICY_SET,
+        {
+            "repo_id": repo_id,
+            "owner_id": owner_id_raw,
+            "automatic_capture_enabled": next_auto,
+            "manual_submission_enabled": next_manual,
+            "indexing_enabled": next_idx,
+            "provider_egress_enabled": next_egress,
+            "post_session_review_enabled": next_review,
+        },
+        now,
+    )
+    db.execute(
+        "UPDATE repo_policy SET automatic_capture_enabled = ?, manual_submission_enabled = ?, "
+        "indexing_enabled = ?, provider_egress_enabled = ?, post_session_review_enabled = ?, updated_at = ? "
+        "WHERE repo_id = ?",
+        (
+            1 if next_auto else 0,
+            1 if next_manual else 0,
+            1 if next_idx else 0,
+            1 if next_egress else 0,
+            1 if next_review else 0,
+            utc_timestamp(now),
+            repo_id,
+        ),
     )
     return intent
 

@@ -11,6 +11,7 @@ import time
 from collections.abc import Callable
 from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FuturesTimeoutError
+from typing import TypeVar
 
 from superbrain.application.owner_loop import OwnerLoop
 from superbrain.cli_api._http_frames import FramedReader, HttpFramingError
@@ -51,6 +52,9 @@ _JOIN_WAIT_SLICE_S = 0.001
 
 _LOGGER = logging.getLogger(__name__)
 _join_before_cutoff = join_before_cutoff
+
+
+_T = TypeVar("_T")
 
 
 class LoopbackServer:
@@ -335,11 +339,18 @@ class LoopbackServer:
         finally:
             self._accept_ready.set()
 
-    def _await_owner_reply(self, reply_fut: Future[OwnerReply], deadline_ns: int) -> OwnerReply | None:
+    def _poll_future_until(
+        self,
+        fut: Future[_T],
+        deadline_ns: int,
+        *,
+        on_abandon: Callable[[Future[_T]], None] | None = None,
+    ) -> _T | None:
         while True:
             rem_ns = deadline_ns - int(self._monotonic_ns())
             if rem_ns <= 0 or self._past_stop_deadline():
-                self._abandon_reply_future(reply_fut)
+                if on_abandon is not None:
+                    on_abandon(fut)
                 return None
             wait_s = min(_REPLY_WAIT_SLICE_S, max(0.001, rem_ns / 1_000_000_000.0))
             with self._lock:
@@ -347,13 +358,17 @@ class LoopbackServer:
             if stop_dl is not None:
                 stop_rem = stop_dl - time.perf_counter()
                 if stop_rem <= 0:
-                    self._abandon_reply_future(reply_fut)
+                    if on_abandon is not None:
+                        on_abandon(fut)
                     return None
                 wait_s = min(wait_s, max(0.001, stop_rem))
             try:
-                return reply_fut.result(timeout=wait_s)
+                return fut.result(timeout=wait_s)
             except FuturesTimeoutError:
                 continue
+
+    def _await_owner_reply(self, reply_fut: Future[OwnerReply], deadline_ns: int) -> OwnerReply | None:
+        return self._poll_future_until(reply_fut, deadline_ns, on_abandon=self._abandon_reply_future)
 
     def _abandon_reply_future(self, reply_fut: Future[OwnerReply]) -> None:
         claimed = False
@@ -629,10 +644,15 @@ class LoopbackServer:
                 monotonic_ns=self._monotonic_ns,
             )
             return
-        stub_err: CallResult = make_error_envelope(
-            BrainError(ErrorCode.CAPABILITY_UNAVAILABLE, "capability unavailable")
-        )
-        self._write_200_best_effort(ssl_sock, encode_envelope(stub_err), deadline_ns)
+        try:
+            reply_fut = self._owner.submit_capture_batch(command, deadline_ns)
+            envelope = self._poll_future_until(reply_fut, deadline_ns)
+        except BrainError as err:
+            self._write_200_best_effort(ssl_sock, encode_envelope(make_error_envelope(err)), deadline_ns)
+            return
+        if envelope is None:
+            return
+        self._write_200_best_effort(ssl_sock, encode_envelope(envelope), deadline_ns)
 
     def _reject_non_mcp_tool_token(
         self,

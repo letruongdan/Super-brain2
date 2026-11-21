@@ -205,7 +205,7 @@ def test_i3_wheel_synthetic_lifecycle_e2e(inc2_installed_env: InstalledEnv, trus
     )
     assert doc_init.returncode == 0
     doc0 = json.loads(doc_init.stdout)["data"]
-    assert doc0["schema"]["store_version"] == 5 and doc0["schema"]["policy_version"] == 4
+    assert doc0["schema"]["store_version"] == 6 and doc0["schema"]["policy_version"] == 4
     assert doc0["restore_epoch"] == 0 and doc0["terminal_channel_eligible"] is False
 
     # Prepare synthetic WebAuthn key & CLI profile before launching foreground `brain serve`.

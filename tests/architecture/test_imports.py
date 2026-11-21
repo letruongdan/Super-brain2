@@ -215,7 +215,14 @@ def test_checker_reports_no_cycle_for_one_way_package_import(tmp_path: Path) -> 
     assert find_package_cycles(pkg / "superbrain") == []
 
 
-FAULT_FREE_ENTRIES = ("mcp", "cli", "composition/shim_entry.py", "composition/client_entry.py")
+FAULT_FREE_ENTRIES = (
+    "mcp",
+    "cli",
+    "composition/shim_entry.py",
+    "composition/client_entry.py",
+    "composition/hook_entry.py",
+    "composition/capture_drain_entry.py",
+)
 """Client-side code: no crash or pause hook may be reachable from these files, however it is spelled."""
 FAULT_MODULE = f"{ROOT}.core.faults"
 FAULT_STRINGS = (FAULT_MODULE, "SUPERBRAIN_CRASHPOINT", "SUPERBRAIN_PAUSEPOINT")
@@ -256,6 +263,8 @@ def test_fault_hook_scanner_catches_aliases_relative_and_dynamic_imports(tmp_pat
             "superbrain/composition/client_entry.py": (
                 "import importlib\nm = importlib.import_module('superbrain.core.faults')\n"
             ),
+            "superbrain/composition/hook_entry.py": "",
+            "superbrain/composition/capture_drain_entry.py": "",
             "superbrain/composition/daemon_entry.py": "from superbrain.core.faults import crashpoint\n",
             "superbrain/storage/x.py": "from superbrain.core.faults import crashpoint\n",
             "superbrain/core/faults.py": "def crashpoint(name):\n    pass\n",

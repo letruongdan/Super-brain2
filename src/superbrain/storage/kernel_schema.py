@@ -552,6 +552,13 @@ def _store_v5(db: sqlite3.Connection) -> None:
     _ = db
 
 
+def _store_v6(db: sqlite3.Connection) -> None:
+    """Main store v6 capture continuity tables (``schema_version=6, min_reader_version=6``)."""
+    from superbrain.storage._capture_schema import apply_capture_store_v6
+
+    apply_capture_store_v6(db)
+
+
 POLICY_V2_MIGRATION = Migration(to_version=2, min_reader_version=2, apply=_policy_v2)
 POLICY_V3_MIGRATION = Migration(to_version=3, min_reader_version=3, apply=_policy_v3)
 POLICY_V4_MIGRATION = Migration(to_version=4, min_reader_version=4, apply=_policy_v4)
@@ -559,6 +566,7 @@ STORE_V2_MIGRATION = Migration(to_version=2, min_reader_version=2, apply=_store_
 STORE_V3_MIGRATION = Migration(to_version=3, min_reader_version=3, apply=_store_v3)
 STORE_V4_MIGRATION = Migration(to_version=4, min_reader_version=4, apply=_store_v4)
 STORE_V5_MIGRATION = Migration(to_version=5, min_reader_version=5, apply=_store_v5)
+STORE_V6_MIGRATION = Migration(to_version=6, min_reader_version=6, apply=_store_v6)
 
 KERNEL_POLICY_MIGRATIONS: tuple[Migration, ...] = (
     *POLICY_MIGRATIONS,
@@ -572,4 +580,5 @@ KERNEL_STORE_MIGRATIONS: tuple[Migration, ...] = (
     STORE_V3_MIGRATION,
     STORE_V4_MIGRATION,
     STORE_V5_MIGRATION,
+    STORE_V6_MIGRATION,
 )

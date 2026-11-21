@@ -35,8 +35,9 @@ tập tên của `CRASH_CASES` (đợt 1) cộng `KERNEL_CRASH_CASES` (đợt 2,
 - **GC và backup không để lại trạng thái pin.** GC và backup cùng chạy trên owner thread, nên tự tuần tự. Cờ
   `Store.maintenance()` không lồng được: gọi GC khi backup đang chạy trả `STORE_BUSY`. Không có bảng pin bền vững, nên
   crash giữa backup không để lại gì cần thu hồi (xem các dòng `backup.*`).
-- **ApplyJournal thuộc đợt 3 (I3-3).** Mười điểm cắt của `ApplyJournal` và `apply_turn_intent` / `recovery_grant`
-  được liệt kê ở bảng bên dưới (tổng cộng 39 crashpoint).
+- **ApplyJournal thuộc đợt 3 (I3-3).** Mười điểm cắt của `ApplyJournal` và `apply_turn_intent` / `recovery_grant`,
+  1 điểm cắt drain sau restore (`I3-4`), cùng 2 điểm cắt capture outbox/ingest (`SP2-2`) được liệt kê ở các bảng bên dưới
+  (tổng cộng 42 crashpoint).
 
 ## Writer lock
 
@@ -167,12 +168,22 @@ Một dòng này là `I34CrashCase` trong `tests/support/inc3_i34_crash_cases.py
 |---|---|---|---|---|---|---|---|---|---|
 | `restoring.store.after_swap_before_effect_drain` | `restore-store` | Backup `store_full` chụp lúc Evidence `E` còn hạn; ở kho sống `E` còn được giữ (`DURABLE`), tới hiện tại `E` trong snapshot đã quá hạn; dựng xong `store/restore_epoch.json` mới và `pending_restore_tombstones.json` trong stage | `stage_and_swap` đã đổi tên `store/` -> `store.replaced-*` và công bố stage làm `store/` mới (mang `restore_epoch.json` tăng và `pending_restore_tombstones.json`); `policy.db` **chưa** nhận `TOMBSTONE` của `E` | Chưa | `open_runtime` / `open_runtime_under_lease` chạy `drain_published_restore_effects` trên đúng snapshot đã công bố **trước** khi mở đọc hay nhận Job: ghi `TOMBSTONE(E)` vào `policy.db`, reconcile vào `brain.db`, xóa file tạm; lần đọc đầu chặn `E`. Lần khởi động thứ hai với hook vẫn bật là no-op | Không bao giờ ghi tombstone trước swap (bảo vệ kho sống nếu chết trước hoán đổi), nhưng một khi đã swap thì hiệu ứng hết hạn luôn hoàn tất trước khi phục vụ | `restore-store@restoring.store.after_swap_before_effect_drain` | Có test từ wheel | Snapshot đã atomic rename + `READY` trước khi `writer.lock` tăng epoch; danh sách tombstone nằm sẵn bên trong `store/` vừa công bố nên restart đọc đúng bản đó và hoàn tất bước 7 |
 
+## Capture Outbox và Ingest (`SP2-2`)
+
+Hai dòng này là `SP22CrashCase` trong `tests/support/sp2_crash_cases.py::SP2_2_CRASH_CASES`, chạy từ wheel venv bởi
+`tests/integration/test_capture_ack_and_crash_matrix.py` qua `tests/support/sp2_crash_child.py` với `python -I`.
+
+| Crashpoint | Operation | Trước | Sau crash | Đã ACK? | Phục hồi | Invariant | CrashCase | Tiến trình chết | Mất điện |
+|---|---|---|---|---|---|---|---|---|---|
+| `capture.outbox.after_write_before_fsync` | `outbox-enqueue` | Outbox đã có `Event(seq=1)` đã `fsync` | File staging `.part` hoặc phần ghi dở cho `Event(seq=2)` chưa `fsync` / chưa publish nguyên tử | Chưa: `enqueue_event(2)` chưa trả về | Mở lại `OutboxSpool` dọn sạch file `.part` / frame rách ở cuối và giữ nguyên mọi mục đã `fsync` | Mục đã `fsync` không bao giờ mất; mục ghi dở trước `fsync` không làm hỏng phần trước | `outbox-enqueue@capture.outbox.after_write_before_fsync` | Có test từ wheel | Dữ liệu mới nằm trong `.part` chưa `fsync`/rename hoặc tail chưa đủ checksum nên reopen loại bỏ an toàn |
+| `capture.daemon.after_commit_before_ack` | `capture-serve` | Outbox có `Event(1..2)`; daemon đã nhận `POST /v2/capture/events` hợp lệ | `brain.db` WAL đã `COMMIT` `capture_events` + watermark + CAS holder 90 ngày + ledger; tiến trình chết trước khi gửi HTTP `CaptureBatchAck` | Chưa ở client; đã bền trong `brain.db` | Restart daemon, client giữ `Event(1..2)` gửi lại cùng stream -> dedup nguyên vẹn trả `CaptureBatchAck(committed=(1,2), contiguous=2)` và xóa outbox | Cấm outbox xóa mục khi chưa nhận ACK; dedup theo `(producer_stream, sequence)` idempotent; replay không chạy lại commit crashpoint | `capture-serve@capture.daemon.after_commit_before_ack` | Có test từ wheel | SQLite WAL `synchronous=FULL` đã durable trước crashpoint; restart phục vụ retry theo trạng thái đã commit |
+
 ## Bảo đảm của chính ma trận
 
 - `test_every_known_crashpoint_has_a_case_and_a_doc_row`: mỗi crashpoint đã đăng ký có đúng một ca (`CrashCase`, `KernelCrashCase`,
-  `I33CrashCase`, hoặc `I34CrashCase`) và đúng một dòng trong tài liệu này, không tên nào trùng.
+  `I33CrashCase`, `I34CrashCase`, hoặc `SP22CrashCase`) và đúng một dòng trong tài liệu này, không tên nào trùng.
 - `test_registry_is_exactly_the_increment_1_names_plus_the_task_8_and_i3_names`: registry bằng đúng 19 tên đợt 1 cộng
-  10 tên Task 8 cộng 10 tên I3-3 cộng 1 tên I3-4 (tổng 40). 19 ca đợt 1 và 10 ca Task 8 giữ nguyên node ID.
+  10 tên Task 8 cộng 10 tên I3-3 cộng 1 tên I3-4 cộng 2 tên SP2-2 (tổng 42). 19 ca đợt 1 và 10 ca Task 8 giữ nguyên node ID.
 - `test_kernel_cases_keep_operation_at_crashpoint_ids_and_all_run`: node ID `operation@crashpoint`, operation thuộc
   `serve`/`serve-fixture`/`migrate`/`serve-jobs`/`job-operation`. Crashpoint trên đường request của shim có trigger sau READY.
 - `test_crash_case`: mỗi ca phải chết với mã 86 **đúng** ở crashpoint của nó (`run_until_crash`).

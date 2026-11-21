@@ -30,6 +30,7 @@ from superbrain.core.kernel import (
     ArtifactSendAttempt,
     BootstrapAuthorization,
     CallResult,
+    CaptureBatchCommand,
     DaemonConfig,
     InvocationRecord,
     JobRecord,
@@ -256,6 +257,36 @@ class OwnerLoop:
         fut: DeferredCallbackFuture[OwnerReply] = DeferredCallbackFuture()
         session.submit_queued_reply(command, receive_ns, fut)
         return fut
+
+    def submit_capture_batch(self, command: CaptureBatchCommand, deadline_ns: int) -> Future[CallResult]:
+        if not isinstance(command, CaptureBatchCommand):
+            raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+        if not is_strict_int(deadline_ns):
+            raise BrainError(ErrorCode.INVALID_INPUT, "boolean not allowed for integer")
+        with self._lifecycle_lock:
+            session = self._session
+            stopping = self._stopping
+        if session is None or stopping:
+            fut_err: DeferredCallbackFuture[CallResult] = DeferredCallbackFuture()
+            safe_set_result(fut_err, make_checked_error(ErrorCode.DAEMON_UNAVAILABLE, "daemon unavailable"))
+            return fut_err
+
+        def _run_capture(sess: OwnerSession) -> CallResult:
+            try:
+                now_utc, _ = require_aware_utc(sess.clock.now())
+                if now_utc >= sess.ready.tls_not_after:
+                    return make_checked_error(ErrorCode.DAEMON_UNAVAILABLE, "daemon unavailable")
+                if sess.monotonic_clock.monotonic_ns() >= deadline_ns:
+                    return make_checked_error(ErrorCode.DEADLINE_EXCEEDED, "deadline exceeded")
+                handler = getattr(sess, "ingest_capture_batch", None)
+                if handler is None:
+                    return make_checked_error(ErrorCode.CAPABILITY_UNAVAILABLE, "capability unavailable")
+                result: CallResult = handler(command, deadline_ns=deadline_ns)
+                return result
+            except BrainError as err:
+                return make_checked_error(err.code, err.message)
+
+        return self._enqueue_internal(_run_capture)
 
     def _enqueue_internal(self, fn: Callable[[OwnerSession], _T]) -> Future[_T]:
         fut: DeferredCallbackFuture[_T] = DeferredCallbackFuture()

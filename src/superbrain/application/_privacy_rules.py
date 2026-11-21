@@ -10,11 +10,8 @@ import unicodedata
 from collections.abc import Sequence
 from functools import lru_cache
 
-from superbrain.core.kernel import (
-    OPAQUE_ID_RE,
-    SHA256_DIGEST_RE,
-    blocked_path_components,
-)
+from superbrain.core._kernel_base import OPAQUE_ID_RE, SHA256_DIGEST_RE
+from superbrain.core._kernel_workspace import blocked_path_components
 
 REDACTED = "[redacted]"
 REJECTED_MESSAGE = "privacy filter rejected payload"

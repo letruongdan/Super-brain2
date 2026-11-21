@@ -64,15 +64,15 @@ from superbrain.application._privacy_scan import (
     _shipped_rules_active,
     _TextScans,
 )
-from superbrain.core.canonical import canonical_json
-from superbrain.core.errors import BrainError, ErrorCode
-from superbrain.core.jsonvalue import JsonValue
-from superbrain.core.kernel import (
-    OPAQUE_ID_RE,
+from superbrain.core._kernel_base import OPAQUE_ID_RE
+from superbrain.core._kernel_workspace import (
     FilterPolicy,
     RepoFlags,
     SafePayload,
 )
+from superbrain.core.canonical import canonical_json
+from superbrain.core.errors import BrainError, ErrorCode
+from superbrain.core.jsonvalue import JsonValue
 
 _CountKeyT = TypeVar("_CountKeyT", str, int)
 
