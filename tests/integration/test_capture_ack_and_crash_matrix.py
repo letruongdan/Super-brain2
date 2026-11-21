@@ -69,9 +69,11 @@ from tests.support.inc2_transport import (
 from tests.support.kernel_auth import seed_principal_and_credential, seed_repo_grant
 from tests.support.sp2_crash_cases import (
     SP2_2_CRASH_CASES,
+    SP2_3_CRASH_CASES,
     SP22CrashCase,
     run_sp2_2_crash_case,
     run_sp2_2_omission_checks,
+    run_sp2_3_crash_case,
 )
 
 
@@ -730,7 +732,7 @@ def test_offline_store5_to_store6_migration_and_installed_hook_wheel(
     )
     assert mig.returncode == 0, mig.stderr.decode(errors="replace")
     assert read_schema_info(DataRoot.at(root_path).store_db) == SchemaInfo(6, 6, store_id)
-    assert read_schema_info(DataRoot.at(root_path).policy_db) == SchemaInfo(4, 4, store_id)
+    assert read_schema_info(DataRoot.at(root_path).policy_db) == SchemaInfo(5, 5, store_id)
     assert read_restore_epoch(DataRoot.at(root_path), schema_version=6, os_=adapters) == 0
     assert code_version(KERNEL_STORE_MIGRATIONS) == 6
 
@@ -800,6 +802,22 @@ def test_sp2_2_wheel_crash_omission_detection(
     )
     ctx.case_dir.mkdir()
     run_sp2_2_omission_checks(ctx, monkeypatch)
+
+
+@pytest.mark.parametrize("case", SP2_3_CRASH_CASES, ids=lambda c: c.node_id)
+def test_sp2_3_wheel_crash_matrix(
+    inc2_installed_env: InstalledEnv, trusted_tmp: Path, case: SP22CrashCase
+) -> None:
+    cwd = trusted_tmp / "outside"
+    cwd.mkdir()
+    ctx = KernelCrashContext(
+        env=inc2_installed_env,
+        template=get_shared_t7_transport_template(),
+        case_dir=trusted_tmp / "case-sp23",
+        cwd=cwd,
+    )
+    ctx.case_dir.mkdir()
+    run_sp2_3_crash_case(ctx, case)
 
 
 def test_capture_only_policy_keeps_payload_and_source_when_manual_submission_disabled() -> None:

@@ -1415,6 +1415,7 @@ def test_legacy_projection_and_pending_attempt_recovered_before_ready(
             before_bind=_before_bind,
         ),
         on_listener_bound=bound_listeners.append,
+        job_handlers={},
     )
     try:
         ready = loop.start(cfg)
@@ -1625,7 +1626,7 @@ def test_shallow_health_bypasses_blocked_write_queue(
                 "store_id": _daemon_template.store_id,
                 "writer_epoch": ready.endpoint.writer_epoch,
                 "schema_version": 6,
-                "policy_schema_version": 4,
+                "policy_schema_version": 5,
                 "degraded_codes": [],
             },
         }
@@ -1835,7 +1836,7 @@ def test_get_job_uses_owner_scope(
     ws_a = _daemon_template.ws_a
     ws_b = _daemon_template.ws_b
 
-    assert dict(PRODUCTION_JOB_HANDLERS) == {}
+    assert set(PRODUCTION_JOB_HANDLERS) == {"continuity.refresh"}
 
     secret_global = b"secret-global-job-payload-9911"
     secret_scoped = b"secret-scoped-job-payload-9922"
@@ -1872,7 +1873,7 @@ def test_get_job_uses_owner_scope(
         rt_seed.close()
 
     # Start real production OwnerLoop (domain=None, job_handlers=None).
-    loop = create_daemon_owner_loop(os_=adapters, clock=clock, monotonic_clock=mono)
+    loop = create_daemon_owner_loop(os_=adapters, clock=clock, monotonic_clock=mono, job_handlers={})
     try:
         loop.start(cfg)
         dl_ns = mono.now + TOTAL_REQUEST_BUDGET_NS

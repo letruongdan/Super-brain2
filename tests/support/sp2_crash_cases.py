@@ -36,6 +36,12 @@ SP2_2_CRASHPOINTS: frozenset[str] = frozenset(
         "capture.daemon.after_commit_before_ack",
     }
 )
+SP2_3_CRASHPOINTS: frozenset[str] = frozenset(
+    {
+        "session.after_policy_bind_before_store_project",
+        "continuity.worker.before_owner_commit",
+    }
+)
 SP22_CHILD = Path(__file__).resolve().with_name("sp2_crash_child.py")
 OWNER = "dan"
 
@@ -53,6 +59,11 @@ class SP22CrashCase:
 SP2_2_CRASH_CASES: tuple[SP22CrashCase, ...] = (
     SP22CrashCase("outbox-enqueue", "capture.outbox.after_write_before_fsync"),
     SP22CrashCase("capture-serve", "capture.daemon.after_commit_before_ack"),
+)
+
+SP2_3_CRASH_CASES: tuple[SP22CrashCase, ...] = (
+    SP22CrashCase("session-bind", "session.after_policy_bind_before_store_project"),
+    SP22CrashCase("continuity-worker", "continuity.worker.before_owner_commit"),
 )
 
 
@@ -392,3 +403,272 @@ def run_sp2_2_omission_checks(ctx: KernelCrashContext, monkeypatch: Any) -> None
     )
     assert run_daemon.result.hit is None and not run_daemon.timed_out, run_daemon.describe()
     assert len(acks) == 1 and acks[0].accepted_count == 2
+
+
+def _prepare_session_bind_crash_case(ctx: KernelCrashContext) -> tuple[Path, Path, dict[str, Any]]:
+    import datetime as dt
+
+    from tests.support.clock import FakeClock
+    from tests.support.inc2_fixture import open_kernel_job_runtime
+    from tests.support.inc2_transport import register_workspace_direct
+    from tests.support.kernel_auth import seed_principal_and_credential, seed_repo_grant
+
+    clock = FakeClock(dt.datetime(2026, 11, 21, 14, 0, tzinfo=dt.UTC))
+    from superbrain.domain.continuity.sessions import compute_session_ref
+
+    adapters = os_adapters(clock=clock)
+    data_root = ctx.case_dir / "session-data"
+    rt = open_kernel_job_runtime(data_root, adapters, role="sp23-bind-crash")
+    raw_sid = "SP23_WHEEL_BIND_CRASH_SID"
+    try:
+        sid = rt.policy.store_id
+        prin_a = seed_principal_and_credential(
+            rt.policy, owner_id=OWNER, harness_id="claude-code", machine_id="m-w"
+        ).principal
+        prin_b = seed_principal_and_credential(
+            rt.policy, owner_id="bob", harness_id="codex", machine_id="m-w2"
+        ).principal
+        ws_a = register_workspace_direct(rt, clock, prin_a, alias="sp23-ws", checkout_dir=ctx.case_dir / "chk-bind")
+        seed_repo_grant(rt.policy, principal_id=prin_b.principal_id, repo_id=ws_a.repo_id, owner_id=OWNER)
+        rt.store.reconcile_policy()
+        expected_ref = compute_session_ref(rt.policy.session_hmac_key(), raw_sid)
+    finally:
+        rt.close()
+
+    payload = {
+        "store_id": sid,
+        "principal_id": prin_a.principal_id,
+        "repo_id": ws_a.repo_id,
+        "checkout_id": ws_a.checkout_id,
+        "harness_id": "claude-code",
+        "raw_session_id": raw_sid,
+        "now_iso": clock.now().isoformat(),
+    }
+    payload_path = ctx.case_dir / "session-bind-payload.json"
+    payload_path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+    return data_root, payload_path, {
+        "store_id": sid,
+        "prin_a": prin_a,
+        "prin_b": prin_b,
+        "ws_a": ws_a,
+        "raw_sid": raw_sid,
+        "expected_ref": expected_ref,
+        "clock": clock,
+        "adapters": adapters,
+    }
+
+
+def _prepare_continuity_worker_crash_case(ctx: KernelCrashContext) -> tuple[Path, Path, dict[str, Any]]:
+    import datetime as dt
+
+    from superbrain.core.canonical import digest_bytes
+    from superbrain.core.ids import new_id
+    from superbrain.ports.capture import CaptureEventRecord
+    from tests.support.clock import FakeClock
+    from tests.support.inc2_fixture import open_kernel_job_runtime
+    from tests.support.inc2_transport import register_workspace_direct
+    from tests.support.kernel_auth import seed_principal_and_credential
+
+    clock = FakeClock(dt.datetime(2026, 11, 21, 14, 0, tzinfo=dt.UTC))
+    from superbrain.storage.sessions import SessionStore
+
+    adapters = os_adapters(clock=clock)
+    data_root = ctx.case_dir / "cw-data"
+    rt = open_kernel_job_runtime(data_root, adapters, role="sp23-cw-crash")
+    agent_ref = digest_bytes(b"sp23-wheel-live-agent-ref")
+    task_id = f"task-{new_id()}"
+    try:
+        sid = rt.policy.store_id
+        prin = seed_principal_and_credential(
+            rt.policy, owner_id=OWNER, harness_id="claude-code", machine_id="m-cw"
+        ).principal
+        ws_a = register_workspace_direct(rt, clock, prin, alias="sp23-cw-ws", checkout_dir=ctx.case_dir / "chk-cw")
+        rt.store.reconcile_policy()
+        ss = SessionStore(rt.store, rt.policy)
+        sess = ss.bind_session(
+            principal_id=prin.principal_id,
+            repo_id=ws_a.repo_id,
+            checkout_id=ws_a.checkout_id,
+            harness_id="claude-code",
+            raw_session_id="SP23_WHEEL_CW_CRASH_SID",
+            now=clock.now(),
+        )
+        ss.ensure_task_handoff(
+            task_id=task_id,
+            repo_id=ws_a.repo_id,
+            checkout_id=ws_a.checkout_id,
+            session_ref=sess.session_ref,
+            now=clock.now(),
+        )
+        ss.apply_agent_handoff_patch(
+            task_id=task_id,
+            repo_id=ws_a.repo_id,
+            checkout_id=ws_a.checkout_id,
+            session_ref=sess.session_ref,
+            base_revision=0,
+            agent_ref=agent_ref,
+            now=clock.now(),
+        )
+        for seq in range(1, 21):
+            ss.record_session_event(
+                session_ref=sess.session_ref,
+                repo_id=ws_a.repo_id,
+                checkout_id=ws_a.checkout_id,
+                task_id=task_id,
+                producer_stream="sp23-cw-stream",
+                event=CaptureEventRecord(
+                    event_id=f"evt-cw-wheel-{seq}",
+                    producer_stream="sp23-cw-stream",
+                    sequence=seq,
+                    harness_id="claude-code",
+                    kind="tool_post",
+                    recorded_at="2026-11-21T14:00:00Z",
+                    payload={"tool": "Edit", "file_path": f"f_{seq}.py"},
+                    session_ref=sess.session_ref,
+                ),
+                now=clock.now(),
+            )
+    finally:
+        rt.close()
+
+    payload_path = ctx.case_dir / "cw-payload.json"
+    payload_path.write_text(
+        json.dumps(
+            {
+                "store_id": sid,
+                "task_id": task_id,
+                "enqueue": True,
+                "recover_stale": False,
+                "now_iso": clock.now().isoformat(),
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    return data_root, payload_path, {
+        "store_id": sid,
+        "task_id": task_id,
+        "agent_ref": agent_ref,
+        "clock": clock,
+        "adapters": adapters,
+    }
+
+
+def run_sp2_3_crash_case(ctx: KernelCrashContext, case: SP22CrashCase) -> None:
+    import subprocess
+
+    import pytest
+
+    from superbrain.core.errors import BrainError, ErrorCode
+    from tests.support.inc2_cli import clean_installed_subprocess_env
+    from tests.support.inc2_fixture import reopen_kernel_job_runtime
+
+    ro_scratch = ctx.case_dir / "ro-scratch"
+    from superbrain.storage.sessions import SessionStore
+
+    if case.crashpoint == "session.after_policy_bind_before_store_project":
+        data_root, payload_path, extras = _prepare_session_bind_crash_case(ctx)
+        run = run_marked(
+            sp22_child_cmd(ctx.env, case.operation, data_root, payload_path),
+            cwd=ctx.cwd,
+            crashpoint=case.crashpoint,
+        )
+        assert_wheel_provenance(run, ctx)
+        assert_t8_crashed(run, case.crashpoint)
+
+        ro_scratch.mkdir(exist_ok=True)
+        with contextlib.closing(open_readonly(DataRoot.at(data_root).policy_db, scratch_dir=ro_scratch)) as pol_ro:
+            assert (
+                pol_ro.execute(
+                    "SELECT principal_id FROM session_ref_bindings WHERE session_ref = ?",
+                    (extras["expected_ref"],),
+                ).fetchone()
+                is not None
+            )
+        with contextlib.closing(open_readonly(DataRoot.at(data_root).store_db, scratch_dir=ro_scratch)) as str_ro:
+            pending_rows = str_ro.execute(
+                "SELECT session_ref FROM sessions WHERE session_ref = ?",
+                (extras["expected_ref"],),
+            ).fetchall()
+            assert pending_rows == []
+
+        # Restart child cleanly: reconciles once and returns session_ref.
+        retry = subprocess.run(
+            sp22_child_cmd(ctx.env, case.operation, data_root, payload_path),
+            cwd=str(ctx.cwd),
+            env=clean_installed_subprocess_env(),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30.0,
+        )
+        assert retry.returncode == 0, retry.stderr
+        assert json.loads(retry.stdout.strip())["session_ref"] == extras["expected_ref"]
+
+        rt = reopen_kernel_job_runtime(data_root, extras["store_id"], extras["adapters"])
+        try:
+            ss = SessionStore(rt.store, rt.policy)
+            with pytest.raises(BrainError) as mismatch:
+                ss.bind_session(
+                    principal_id=extras["prin_b"].principal_id,
+                    repo_id=extras["ws_a"].repo_id,
+                    checkout_id=extras["ws_a"].checkout_id,
+                    harness_id="codex",
+                    raw_session_id=extras["raw_sid"],
+                    now=extras["clock"].now(),
+                )
+            assert mismatch.value.code is ErrorCode.IDENTITY_MISMATCH
+        finally:
+            rt.close()
+        return
+
+    if case.crashpoint == "continuity.worker.before_owner_commit":
+        data_root, payload_path, extras = _prepare_continuity_worker_crash_case(ctx)
+        run = run_marked(
+            sp22_child_cmd(ctx.env, case.operation, data_root, payload_path),
+            cwd=ctx.cwd,
+            crashpoint=case.crashpoint,
+        )
+        assert_wheel_provenance(run, ctx)
+        assert_t8_crashed(run, case.crashpoint)
+
+        ro_scratch = ctx.case_dir / "ro-cw"
+        ro_scratch.mkdir(exist_ok=True)
+        with contextlib.closing(open_readonly(DataRoot.at(data_root).store_db, scratch_dir=ro_scratch)) as str_ro:
+            row = str_ro.execute(
+                "SELECT observed_ref, agent_ref, handoff_revision FROM task_handoffs WHERE task_id = ?",
+                (extras["task_id"],),
+            ).fetchone()
+            assert row is not None and row[0] is None and row[1] == extras["agent_ref"] and int(row[2]) == 1
+
+        # Restart cleanly with stale job recovery enabled: observed_ref commits cleanly while preserving agent_ref!
+        recovery_payload = json.loads(payload_path.read_text(encoding="utf-8"))
+        recovery_payload["enqueue"] = False
+        recovery_payload["recover_stale"] = True
+        payload_path.write_text(json.dumps(recovery_payload, sort_keys=True), encoding="utf-8")
+        res = subprocess.run(
+            sp22_child_cmd(ctx.env, case.operation, data_root, payload_path),
+            cwd=str(ctx.cwd),
+            env=clean_installed_subprocess_env(),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30.0,
+        )
+        assert res.returncode == 0, res.stderr
+        assert json.loads(res.stdout.strip())["observed_ref"] is not None
+
+        rt = reopen_kernel_job_runtime(data_root, extras["store_id"], extras["adapters"])
+        try:
+            handoff = SessionStore(rt.store, rt.policy).read_task_handoff(extras["task_id"])
+            assert handoff is not None
+            assert handoff.observed_ref is not None
+            assert handoff.agent_ref == extras["agent_ref"]
+            assert handoff.handoff_revision == 1
+        finally:
+            rt.close()
+        return
+
+    raise AssertionError(f"unexpected SP2-3 crashpoint: {case.crashpoint!r}")

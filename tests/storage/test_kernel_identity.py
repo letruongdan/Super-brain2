@@ -1109,7 +1109,7 @@ def test_overlong_and_unsupported_policy_version_metadata_fails_closed_without_w
     # Non-hardcoded future policy tuple compatibility: injected next-version policy migration allows all 6
     # KernelPolicyPort methods to succeed at schema_version == next_ver, while still rejecting out-of-band drift.
     base_ver = code_version(KERNEL_POLICY_MIGRATIONS)
-    assert base_ver == 4
+    assert base_ver == 5
     next_ver = base_ver + 1
     v_next_policy_migrations = (
         *KERNEL_POLICY_MIGRATIONS,
@@ -1125,7 +1125,7 @@ def test_overlong_and_unsupported_policy_version_metadata_fails_closed_without_w
         v_next_info = read_schema_info(rt_v_next.root.policy_db)
         assert (
             v_next_info is not None
-            and v_next_info.schema_version == 5
+            and v_next_info.schema_version == 6
             and v_next_info.schema_version == next_ver
             and v_next_info.min_reader_version == base_ver
         )

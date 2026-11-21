@@ -1079,7 +1079,7 @@ def expect_crash_after_policy_swap(ctx: KernelCrashContext, seed: KernelSeed, ru
     resumes only the store, a repeat is a no-op, and neither run fires the hook again although its env stays set."""
     data_root, scratch = seed.data_root, ctx.case_dir / "ro-scratch"
     root = DataRoot.at(data_root)
-    assert schema_versions(data_root) == (4, 2)
+    assert schema_versions(data_root) == (5, 2)
     aside = sorted(p.name.split("-")[0] for p in data_root.iterdir() if p.name.startswith(("policy.", "store.")))
     assert aside == ["policy.replaced"], aside  # the store migration never started
     assert pair_rows(data_root, scratch) == seed.snapshot
@@ -1092,18 +1092,18 @@ def expect_crash_after_policy_swap(ctx: KernelCrashContext, seed: KernelSeed, ru
     )
     assert refused.result.stdout == "" and refused.ready is None
     assert not root.endpoint_path.exists() and endpoint_stages(data_root) == []
-    assert schema_versions(data_root) == (4, 2) and pair_rows(data_root, scratch) == seed.snapshot
+    assert schema_versions(data_root) == (5, 2) and pair_rows(data_root, scratch) == seed.snapshot
 
     hook_env = {"SUPERBRAIN_CRASHPOINT": run.result.hit or ""}
     migrate = ("migrate", "--offline", "--config", str(seed.config))
     resumed = _owner_envelope(run_installed_command(ctx.env, "brain", migrate, cwd=ctx.cwd, extra_env=hook_env))
-    assert resumed["policy"] == {"status": "skipped", "from_version": 4, "to_version": 4}, resumed
+    assert resumed["policy"] == {"status": "skipped", "from_version": 5, "to_version": 5}, resumed
     assert resumed["store"] == {"status": "migrated", "from_version": 2, "to_version": 6}, resumed
     assert (resumed["store_id"], resumed["noop"]) == (seed.store_id, False), resumed
-    assert schema_versions(data_root) == (4, 6) and pair_rows(data_root, scratch) == seed.snapshot
+    assert schema_versions(data_root) == (5, 6) and pair_rows(data_root, scratch) == seed.snapshot
 
     repeat = _owner_envelope(run_installed_command(ctx.env, "brain", migrate, cwd=ctx.cwd, extra_env=hook_env))
-    assert repeat["policy"] == {"status": "skipped", "from_version": 4, "to_version": 4}, repeat
+    assert repeat["policy"] == {"status": "skipped", "from_version": 5, "to_version": 5}, repeat
     assert repeat["store"] == {"status": "skipped", "from_version": 6, "to_version": 6}, repeat
     assert repeat["noop"] is True and pair_rows(data_root, scratch) == seed.snapshot
 
@@ -1535,3 +1535,4 @@ KERNEL_CRASH_CASES: tuple[KernelCrashCase, ...] = (
 from tests.support.inc3_crash_cases import I3_3_CRASH_CASES as I3_3_CRASH_CASES  # noqa: E402, F401
 from tests.support.inc3_i34_crash_cases import I3_4_CRASH_CASES as I3_4_CRASH_CASES  # noqa: E402, F401
 from tests.support.sp2_crash_cases import SP2_2_CRASH_CASES as SP2_2_CRASH_CASES  # noqa: E402, F401
+from tests.support.sp2_crash_cases import SP2_3_CRASH_CASES as SP2_3_CRASH_CASES  # noqa: E402, F401

@@ -221,7 +221,13 @@ class JobService:
 
         return self._store.transact(resolve)
 
-    def complete(self, lease: JobLease, result: JobOutcome) -> None:
+    def complete(
+        self,
+        lease: JobLease,
+        result: JobOutcome,
+        *,
+        on_complete_in_tx: Callable[[KernelTx, JobRecord, JobOutcome], None] | None = None,
+    ) -> None:
         """Finish the running attempt: succeeded, failed (nonretryable), queued again with backoff, or dead letter."""
         self._require_current(lease)
         if not isinstance(result, JobOutcome):
@@ -237,6 +243,8 @@ class JobService:
             if result.succeeded:
                 digest = None if descriptor is None else tx.hold_blob(descriptor, holder_id=lease.job_id)
                 self._terminal(tx, row, JobState.SUCCEEDED, now, result_digest=digest)
+                if on_complete_in_tx is not None:
+                    on_complete_in_tx(tx, row, result)
             elif not result.retryable:
                 self._terminal(tx, row, JobState.FAILED, now, reason=result.error_code)
             else:
@@ -247,10 +255,19 @@ class JobService:
 
         self._store.transact(complete)
 
-    def apply_command(self, command: WorkerCommand) -> None:
+    def apply_command(
+        self,
+        command: WorkerCommand,
+        *,
+        on_complete_in_tx: Callable[[KernelTx, JobRecord, JobOutcome], None] | None = None,
+    ) -> None:
         """Apply one typed worker command on the owner side (completion, failure or usage)."""
         if isinstance(command, WorkerCompleted):
-            self.complete(command.lease, JobOutcome.success(command.result_refs))
+            self.complete(
+                command.lease,
+                JobOutcome.success(command.result_refs),
+                on_complete_in_tx=on_complete_in_tx,
+            )
         elif isinstance(command, WorkerFailed):
             self.complete(command.lease, JobOutcome.failure(command.code, retryable=command.retryable))
         elif isinstance(command, WorkerUsage):

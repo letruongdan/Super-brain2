@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 
 from superbrain.core._kernel_auth import RepoPolicy
 from superbrain.core._kernel_base import Principal
@@ -82,6 +82,7 @@ class CaptureIngestService:
         layer2_lookup: Callable[[str], tuple[str, str] | None],
         filter_policy: FilterPolicy | None = None,
         deadline_ns: int | None = None,
+        before_commit: Callable[[Sequence[StagedCaptureEvent]], None] | None = None,
     ) -> CaptureBatchAck:
         """Ingest a capture batch after verifying live ``automatic_capture``, D6 privacy, and attribution."""
         if (
@@ -152,12 +153,16 @@ class CaptureIngestService:
                 )
             )
 
+        staged_tuple = tuple(staged_events)
+        if before_commit is not None and staged_tuple:
+            before_commit(staged_tuple)
+
         return self._store.commit_staged_batch(
             producer_stream=command.producer_stream,
             repo_id=command.repo_id,
             checkout_id=command.checkout_id,
             principal_id=principal.principal_id,
-            events=tuple(staged_events),
+            events=staged_tuple,
             gaps=tuple(gaps),
             now=self._clock.now(),
         )

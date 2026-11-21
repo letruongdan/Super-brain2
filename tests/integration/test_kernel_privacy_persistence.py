@@ -158,7 +158,7 @@ def _privacy_daemon(
         mp.setattr(inc2_t8_harness, "FixtureDomainProxy", lambda: proxy)
         mp.setattr(inc2_t8_harness, "fixture_store_extensions", store_extensions)
         hooks = DaemonTestHooks(before_job_recover=ready_runtime)
-        with inc2_t8_harness.fixture_daemon(mp, template, root, hooks=hooks) as (h, _, tracker):
+        with inc2_t8_harness.fixture_daemon(mp, template, root, hooks=hooks, job_handlers={}) as (h, _, tracker):
             (rt,) = captured
             yield h, rt, proxy, tracker
 
@@ -546,7 +546,7 @@ def test_health_stays_shallow_under_owner_saturation(
                 assert (health["store_id"], health["writer_epoch"]) == (
                     template.store_id, h.ready.endpoint.writer_epoch
                 )
-                assert (health["schema_version"], health["policy_schema_version"]) == (6, 4)
+                assert (health["schema_version"], health["policy_schema_version"]) == (6, 5)
             finally:
                 release.set()
             assert blocker.result(timeout=WAIT_S)["ok"] is True

@@ -99,7 +99,7 @@ def test_two_schema_upgrade_restarts_between_swaps(trusted_tmp: Path, os_: OsAda
     data_root = DataRoot.at(root_path)
     policy_info = read_schema_info(data_root.policy_db)
     store_info = read_schema_info(data_root.store_db)
-    assert policy_info is not None and policy_info.schema_version == 4 and policy_info.min_reader_version == 4
+    assert policy_info is not None and policy_info.schema_version == 5 and policy_info.min_reader_version == 5
     assert store_info is not None and store_info.schema_version == 1
 
     # Serve admission refuses mixed (policy=4, store=1) with zero byte changes (including writer.lock byte 0..end).
@@ -114,7 +114,7 @@ def test_two_schema_upgrade_restarts_between_swaps(trusted_tmp: Path, os_: OsAda
     resumed = migrate_offline(cfg, os_)
     assert resumed.store_id == store_id
     assert resumed.policy_report.status == "skipped"
-    assert resumed.policy_report.from_version == 4 and resumed.policy_report.to_version == 4
+    assert resumed.policy_report.from_version == 5 and resumed.policy_report.to_version == 5
     assert resumed.store_report.status == "migrated"
     assert resumed.store_report.from_version == 1 and resumed.store_report.to_version == 6
     assert resumed.store_report.report is not None
@@ -228,10 +228,10 @@ def test_two_target_orchestration_with_injected_sequences_and_noop(
     )
     assert not first.noop
     assert first.policy_report.status == "migrated"
-    assert first.policy_report.from_version == 1 and first.policy_report.to_version == 4
+    assert first.policy_report.from_version == 1 and first.policy_report.to_version == 5
     assert first.store_report.status == "migrated"
     assert first.store_report.from_version == 1 and first.store_report.to_version == 6
-    assert code_version(KERNEL_POLICY_MIGRATIONS) == 4
+    assert code_version(KERNEL_POLICY_MIGRATIONS) == 5
     assert code_version(KERNEL_STORE_MIGRATIONS) == 6
 
     # Re-running when both targets already match target tuple is a clean noop (no new backups or stage swaps).
@@ -244,7 +244,7 @@ def test_two_target_orchestration_with_injected_sequences_and_noop(
         store_migrations=KERNEL_STORE_MIGRATIONS,
     )
     assert second.noop
-    assert second.policy_report.status == "skipped" and second.policy_report.from_version == 4
+    assert second.policy_report.status == "skipped" and second.policy_report.from_version == 5
     assert second.store_report.status == "skipped" and second.store_report.from_version == 6
     assert sorted((root_path / "backups").iterdir()) == backups_before
 
@@ -269,7 +269,7 @@ def test_two_target_orchestration_with_injected_sequences_and_noop(
         store_migrations=injected_store,
     )
     assert not inj_first.noop
-    assert inj_first.policy_report.status == "skipped" and inj_first.policy_report.from_version == 4
+    assert inj_first.policy_report.status == "skipped" and inj_first.policy_report.from_version == 5
     assert inj_first.store_report.status == "migrated"
     assert inj_first.store_report.from_version == 6 and inj_first.store_report.to_version == future_store_ver
 
@@ -282,20 +282,21 @@ def test_two_target_orchestration_with_injected_sequences_and_noop(
         store_migrations=injected_store,
     )
     assert inj_second.noop
-    assert inj_second.policy_report.status == "skipped" and inj_second.policy_report.from_version == 4
+    assert inj_second.policy_report.status == "skipped" and inj_second.policy_report.from_version == 5
     assert inj_second.store_report.status == "skipped" and inj_second.store_report.from_version == future_store_ver
     assert sorted((root_path / "backups").iterdir()) == backups_before_inj_noop
 
-    # Historical intermediate (2, 2)..(4, 3), the policy-first I3 pair (4, 4), and I3 (5, 4) all upgrade via
-    # migrate_offline to (store=6, policy=4).
+    # Historical (2, 2)..(4, 3), policy-first I3 (4, 4), I3 (5, 4), and SP2-2 (6, 4) upgrade to (store=6, policy=5).
     v2_policy_seq = KERNEL_POLICY_MIGRATIONS[:2]
     v3_policy_seq = KERNEL_POLICY_MIGRATIONS[:3]
+    v4_policy_seq = KERNEL_POLICY_MIGRATIONS[:4]
     v2_store_seq = KERNEL_STORE_MIGRATIONS[:2]
     v3_store_seq = KERNEL_STORE_MIGRATIONS[:3]
     v4_store_seq = KERNEL_STORE_MIGRATIONS[:4]
     v5_store_seq = KERNEL_STORE_MIGRATIONS[:5]
     assert code_version(v2_policy_seq) == 2
     assert code_version(v3_policy_seq) == 3
+    assert code_version(v4_policy_seq) == 4
     assert code_version(v2_store_seq) == 2
     assert code_version(v3_store_seq) == 3
     assert code_version(v4_store_seq) == 4
@@ -308,8 +309,11 @@ def test_two_target_orchestration_with_injected_sequences_and_noop(
         ("inter-s3-p3", v3_store_seq, v3_policy_seq),
         ("inter-s4-p2", v4_store_seq, v2_policy_seq),
         ("inter-s4-p3", v4_store_seq, v3_policy_seq),
-        ("inter-s4-p4", v4_store_seq, KERNEL_POLICY_MIGRATIONS),
-        ("inter-s5-p4", v5_store_seq, KERNEL_POLICY_MIGRATIONS),
+        ("inter-s4-p4", v4_store_seq, v4_policy_seq),
+        ("inter-s5-p4", v5_store_seq, v4_policy_seq),
+        ("inter-s6-p4", KERNEL_STORE_MIGRATIONS, v4_policy_seq),
+        ("inter-s4-p5", v4_store_seq, KERNEL_POLICY_MIGRATIONS),
+        ("inter-s5-p5", v5_store_seq, KERNEL_POLICY_MIGRATIONS),
     ):
         inter_root = trusted_tmp / case_name
         rt_inter = open_cloned_runtime(
@@ -342,9 +346,9 @@ def test_two_target_orchestration_with_injected_sequences_and_noop(
 
         seed_pol_ver = code_version(seed_policy_seq)
         seed_str_ver = code_version(seed_store_seq)
-        if seed_pol_ver < 4:
+        if seed_pol_ver < 5:
             assert inter_mig.policy_report.status == "migrated"
-            assert inter_mig.policy_report.from_version == seed_pol_ver and inter_mig.policy_report.to_version == 4
+            assert inter_mig.policy_report.from_version == seed_pol_ver and inter_mig.policy_report.to_version == 5
             assert inter_mig.policy_report.backup is not None
             verify_backup(
                 inter_mig.policy_report.backup,
@@ -355,7 +359,7 @@ def test_two_target_orchestration_with_injected_sequences_and_noop(
             )
         else:
             assert inter_mig.policy_report.status == "skipped"
-            assert inter_mig.policy_report.from_version == 4 and inter_mig.policy_report.to_version == 4
+            assert inter_mig.policy_report.from_version == 5 and inter_mig.policy_report.to_version == 5
 
         if seed_str_ver < 6:
             assert inter_mig.store_report.status == "migrated"
@@ -372,7 +376,7 @@ def test_two_target_orchestration_with_injected_sequences_and_noop(
             assert inter_mig.store_report.status == "skipped"
             assert inter_mig.store_report.from_version == 6 and inter_mig.store_report.to_version == 6
 
-        assert read_schema_info(DataRoot.at(inter_root).policy_db) == SchemaInfo(4, 4, inter_store_id)
+        assert read_schema_info(DataRoot.at(inter_root).policy_db) == SchemaInfo(5, 5, inter_store_id)
         assert read_schema_info(DataRoot.at(inter_root).store_db) == SchemaInfo(6, 6, inter_store_id)
         admitted_inter = admit_existing_pair(inter_root, inter_store_id, os_, purpose="serve")
         rt_inter2 = open_runtime_under_lease(admitted_inter)
@@ -611,7 +615,7 @@ def test_i2_pair_upgrades_to_i3_pair_preserving_authority_and_fencing_i2_binarie
     assert (report.policy_report.status, report.policy_report.from_version, report.policy_report.to_version) == (
         "migrated",
         3,
-        4,
+        5,
     )
     assert (report.store_report.status, report.store_report.from_version, report.store_report.to_version) == (
         "migrated",
@@ -619,7 +623,7 @@ def test_i2_pair_upgrades_to_i3_pair_preserving_authority_and_fencing_i2_binarie
         6,
     )
     data_root = DataRoot.at(root_path)
-    assert read_schema_info(data_root.policy_db) == SchemaInfo(4, 4, store_id)
+    assert read_schema_info(data_root.policy_db) == SchemaInfo(5, 5, store_id)
     assert read_schema_info(data_root.store_db) == SchemaInfo(6, 6, store_id)
 
     admitted = admit_existing_pair(root_path, store_id, os_, purpose="serve")

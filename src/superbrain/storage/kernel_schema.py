@@ -559,9 +559,24 @@ def _store_v6(db: sqlite3.Connection) -> None:
     apply_capture_store_v6(db)
 
 
+POLICY_V5_TABLES: frozenset[str] = frozenset(
+    {
+        "session_hmac_key",
+        "session_ref_bindings",
+    }
+)
+
+
+def _policy_v5(db: sqlite3.Connection) -> None:
+    from superbrain.storage._policy_sessions import apply_policy_v5
+
+    apply_policy_v5(db)
+
+
 POLICY_V2_MIGRATION = Migration(to_version=2, min_reader_version=2, apply=_policy_v2)
 POLICY_V3_MIGRATION = Migration(to_version=3, min_reader_version=3, apply=_policy_v3)
 POLICY_V4_MIGRATION = Migration(to_version=4, min_reader_version=4, apply=_policy_v4)
+POLICY_V5_MIGRATION = Migration(to_version=5, min_reader_version=5, apply=_policy_v5)
 STORE_V2_MIGRATION = Migration(to_version=2, min_reader_version=2, apply=_store_v2)
 STORE_V3_MIGRATION = Migration(to_version=3, min_reader_version=3, apply=_store_v3)
 STORE_V4_MIGRATION = Migration(to_version=4, min_reader_version=4, apply=_store_v4)
@@ -573,6 +588,7 @@ KERNEL_POLICY_MIGRATIONS: tuple[Migration, ...] = (
     POLICY_V2_MIGRATION,
     POLICY_V3_MIGRATION,
     POLICY_V4_MIGRATION,
+    POLICY_V5_MIGRATION,
 )
 KERNEL_STORE_MIGRATIONS: tuple[Migration, ...] = (
     *STORE_MIGRATIONS,

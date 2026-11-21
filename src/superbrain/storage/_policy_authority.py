@@ -22,7 +22,12 @@ from superbrain.core.kernel import (
 )
 from superbrain.ports.policy import IntentKind
 from superbrain.storage.identity import validate_policy_intent_payload
-from superbrain.storage.kernel_schema import KERNEL_POLICY_MIGRATIONS, POLICY_V2_TABLES, POLICY_V4_TABLES
+from superbrain.storage.kernel_schema import (
+    KERNEL_POLICY_MIGRATIONS,
+    POLICY_V2_TABLES,
+    POLICY_V4_TABLES,
+    POLICY_V5_TABLES,
+)
 from superbrain.storage.kinds import is_uuid
 from superbrain.storage.schema import code_version
 
@@ -55,7 +60,11 @@ def ensure_v2_tables(
             for row in db.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
             if isinstance(row[0], str)
         }
-        if not _REQUIRED_POLICY_TABLES <= tables or (target_sv >= 4 and not POLICY_V4_TABLES <= tables):
+        if (
+            not _REQUIRED_POLICY_TABLES <= tables
+            or (target_sv >= 4 and not POLICY_V4_TABLES <= tables)
+            or (target_sv >= 5 and not POLICY_V5_TABLES <= tables)
+        ):
             raise BrainError(ErrorCode.POLICY_UNAVAILABLE, "policy unavailable")
 
         raw_meta = db.execute("SELECT key, value FROM meta").fetchall()

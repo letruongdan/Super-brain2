@@ -12,6 +12,7 @@ from datetime import datetime
 
 from superbrain.application._future_notify import safe_set_result
 from superbrain.application.approvals import OperatorHandle
+from superbrain.application.continuity_worker import ContinuityWorkerCoordinator
 from superbrain.application.deadlines import Reservation
 from superbrain.application.dispatch import KernelToolDomain, PreparedEffect
 from superbrain.application.jobs import JobService
@@ -43,12 +44,15 @@ from superbrain.core.kernel import (
     StoredResult,
     ToolCommand,
     WorkerCommand,
+    WorkerCompleted,
+    WorkerFailed,
     WorkerUsage,
     WorkspaceBinding,
     WorkspaceRegistration,
 )
 from superbrain.core.wire import encode_envelope, make_success_envelope
 from superbrain.ports.clock import Clock, MonotonicClock
+from superbrain.ports.continuity import CONTINUITY_REFRESH_JOB_KIND
 from superbrain.ports.policy import Intent
 from superbrain.storage.idempotency import StagedKernelStore
 from superbrain.storage.runtime import Runtime
@@ -68,6 +72,7 @@ class DaemonTestHooks:
     before_bind: Callable[[Runtime], None] | None = None
     before_endpoint_publish: Callable[[Endpoint], None] | None = None
     after_endpoint_publish_before_final_tls_check: Callable[[Endpoint], None] | None = None
+    before_continuity_worker_commit: Callable[[Runtime], None] | None = None
     before_auth_gate_publish: Callable[[RequestAuthView], None] | None = None
     before_enter_commit: Callable[[Reservation | None], None] | None = None
     after_reserve_before_enqueue: Callable[[Reservation], None] | None = None
@@ -188,6 +193,15 @@ class _AdmittedOwnerSession(OwnerSession):
         self._drained_requests = 0
         self._worker_join_failed = False
         self._job_service.set_claim_commit_guard(self._admit_claim_commit)
+        cw_hook = hooks.before_continuity_worker_commit
+        self._continuity_worker = ContinuityWorkerCoordinator(
+            rt=rt,
+            job_service=job_service,
+            executor=executor,
+            clock=clock,
+            mono=monotonic_clock.monotonic_ns,
+            before_commit_hook=(lambda: cw_hook(self._rt)) if cw_hook is not None else None,
+        )
 
     @property
     def ready(self) -> Ready:
@@ -224,6 +238,7 @@ class _AdmittedOwnerSession(OwnerSession):
         if ready is not None:
             self._ready = ready
         self._bridge.rebind_stores(store=rt.store, policy=rt.policy, writer_epoch=rt.lease.epoch)
+        self._continuity_worker.rebind(rt=rt, job_service=job_service)
 
     @property
     def clock(self) -> Clock:
@@ -427,7 +442,20 @@ class _AdmittedOwnerSession(OwnerSession):
         return self._bridge.cancel_uncommitted_for_shutdown()
 
     def apply_worker_command(self, cmd: WorkerCommand) -> JobRecord | InvocationRecord:
-        self._job_service.apply_command(cmd)
+        if isinstance(cmd, WorkerCompleted):
+            spec = self._job_service.resolve_leased_spec(cmd.lease)
+            if spec is not None and spec.kind == CONTINUITY_REFRESH_JOB_KIND:
+                self._continuity_worker.commit_worker_completed(cmd, now=self._clock.now())
+            else:
+                self._job_service.apply_command(cmd)
+        elif isinstance(cmd, WorkerFailed):
+            spec = self._job_service.resolve_leased_spec(cmd.lease)
+            if spec is not None and spec.kind == CONTINUITY_REFRESH_JOB_KIND:
+                self._continuity_worker.handle_worker_failed(cmd, now=self._clock.now())
+            else:
+                self._job_service.apply_command(cmd)
+        else:
+            self._job_service.apply_command(cmd)
         if isinstance(cmd, WorkerUsage):
             inv = self._job_store.transact(lambda tx: tx.read_invocation(cmd.invocation_id))
             if inv is None:

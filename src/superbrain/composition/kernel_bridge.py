@@ -53,6 +53,7 @@ from superbrain.storage.capture_events import KernelCaptureStore
 from superbrain.storage.idempotency import KernelBlobStager, KernelIdempotencyStore, StrictKernelStore
 from superbrain.storage.policy_store import PolicyStore
 from superbrain.storage.send_attempts import KernelSendAttemptStore
+from superbrain.storage.sessions import bind_capture_batch_sessions
 from superbrain.storage.store import Store
 
 _T = TypeVar("_T")
@@ -573,20 +574,23 @@ class KernelBridge(KernelBlobStagePort):
         repo_pol = snap.repo_policies.get(command.repo_id)
         chk = snap.checkouts.get(command.checkout_id)
         if (
-            repo_pol is None
-            or chk is None
-            or snap.principals.get(live_p.principal_id) != live_p
+            repo_pol is None or chk is None or snap.principals.get(live_p.principal_id) != live_p
             or (live_p.principal_id, command.repo_id) not in snap.grants
-            or repo_pol.owner_id != live_p.owner_id
-            or chk.owner_id != live_p.owner_id
-            or chk.repo_id != command.repo_id
-            or chk.machine_id != live_p.machine_id
+            or repo_pol.owner_id != live_p.owner_id or chk.owner_id != live_p.owner_id
+            or chk.repo_id != command.repo_id or chk.machine_id != live_p.machine_id
         ):
             raise BrainError(ErrorCode.IDENTITY_MISMATCH, "principal identity mismatch")
         try:
+            bind_fn = (
+                lambda staged: bind_capture_batch_sessions(
+                    self._store, self._policy, staged,
+                    principal_id=live_p.principal_id, repo_id=command.repo_id,
+                    checkout_id=command.checkout_id, now=self._clock.now(),
+                )
+            ) if repo_pol.automatic_capture_enabled else None
             return self._capture_ingest.ingest_batch(
                 command, principal=live_p, repo_policy=repo_pol,
-                layer2_lookup=self._verified_layer2_tuple, deadline_ns=deadline_ns,
+                layer2_lookup=self._verified_layer2_tuple, deadline_ns=deadline_ns, before_commit=bind_fn,
             )
         finally:
             if self._on_capture_gaps_changed is not None:

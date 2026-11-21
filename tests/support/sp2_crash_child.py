@@ -5,10 +5,13 @@ Modes:
 - ``outbox-enqueue``: opens ``OutboxSpool`` at ``abs_target_path`` and enqueues an event payload.
 - ``capture-serve``: starts ``daemon_entry.serve_config_path`` for ``abs_target_path`` with the capture
   producer binding from ``abs_payload_json`` published to ``auth_gate`` prior to ``READY``.
+- ``session-bind``: binds a ``session_id`` into ``PolicyStore`` and projects ``SessionStore`` at ``abs_target_path``.
+- ``continuity-worker``: schedules/executes one ``continuity.refresh`` 3-phase cycle at ``abs_target_path``.
 """
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import os
 import shutil
@@ -17,7 +20,23 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-_MODES = ("outbox-enqueue", "capture-serve")
+_MODES = ("outbox-enqueue", "capture-serve", "session-bind", "continuity-worker")
+
+
+class _StaticClock:
+    def __init__(self, moment: dt.datetime) -> None:
+        self._now = moment.astimezone(dt.UTC)
+
+    def now(self) -> dt.datetime:
+        return self._now
+
+
+class _StaticMono:
+    def __init__(self, start_ns: int = 1_000_000_000) -> None:
+        self._now_ns = start_ns
+
+    def monotonic_ns(self) -> int:
+        return self._now_ns
 
 
 def _mark(tag: str, value: str) -> None:
@@ -102,6 +121,82 @@ def _run_capture_serve(config_path: Path, payload: dict[str, Any]) -> int:
         shutil.rmtree(scratch_base, ignore_errors=True)
 
 
+def _run_session_bind(data_root: Path, payload: dict[str, Any]) -> int:
+    from superbrain.adapters.os import os_adapters
+    from superbrain.composition.kernel_projections import kernel_store_extensions
+    from superbrain.storage.runtime import admit_existing_pair, open_runtime_under_lease
+
+    moment = dt.datetime.fromisoformat(str(payload["now_iso"]))
+    from superbrain.storage.sessions import SessionStore
+
+    clock = _StaticClock(moment)
+    adapters = os_adapters(clock=clock)
+    handlers, kinds = kernel_store_extensions()
+    rt = open_runtime_under_lease(
+        admit_existing_pair(data_root, str(payload["store_id"]), adapters, purpose="serve"),
+        handlers=handlers,
+        kinds=kinds,
+    )
+    try:
+        ss = SessionStore(rt.store, rt.policy)
+        rec = ss.bind_session(
+            principal_id=str(payload["principal_id"]),
+            repo_id=str(payload["repo_id"]),
+            checkout_id=str(payload["checkout_id"]),
+            harness_id=str(payload.get("harness_id", "claude-code")),
+            raw_session_id=str(payload["raw_session_id"]),
+            now=clock.now(),
+        )
+        sys.stdout.write(json.dumps({"session_ref": rec.session_ref}) + "\n")
+        sys.stdout.flush()
+    finally:
+        rt.close()
+    return 0
+
+
+def _run_continuity_worker(data_root: Path, payload: dict[str, Any]) -> int:
+    from superbrain.adapters.os import os_adapters
+    from superbrain.application.jobs import JobService
+    from superbrain.composition.kernel_projections import kernel_store_extensions
+    from superbrain.storage.idempotency import StagedKernelStore
+    from superbrain.storage.runtime import admit_existing_pair, open_runtime_under_lease
+    from superbrain.workers.executor import PRODUCTION_JOB_HANDLERS, JobExecutor
+
+    moment = dt.datetime.fromisoformat(str(payload["now_iso"]))
+    from superbrain.application.continuity_worker import ContinuityWorkerCoordinator
+    from superbrain.storage.sessions import SessionStore
+
+    clock = _StaticClock(moment)
+    mono = _StaticMono()
+    adapters = os_adapters(clock=clock, monotonic=mono)
+    handlers, kinds = kernel_store_extensions()
+    rt = open_runtime_under_lease(
+        admit_existing_pair(data_root, str(payload["store_id"]), adapters, purpose="serve"),
+        handlers=handlers,
+        kinds=kinds,
+    )
+    executor = JobExecutor(PRODUCTION_JOB_HANDLERS, mono.monotonic_ns)
+    executor.start()
+    try:
+        kstore = StagedKernelStore(rt.store, rt.policy, writer_epoch=rt.lease.epoch)
+        svc = JobService(kstore, kstore, rt.policy, clock, writer_epoch=rt.lease.epoch)
+        if payload.get("recover_stale"):
+            svc.recover(rt.lease.epoch)
+        coord = ContinuityWorkerCoordinator(
+            rt=rt, job_service=svc, executor=executor, clock=clock, mono=mono.monotonic_ns
+        )
+        if payload.get("enqueue"):
+            coord.enqueue_if_due(task_id=str(payload["task_id"]), now=clock.now())
+        coord.run_next(writer_epoch=rt.lease.epoch, now=clock.now())
+        handoff = SessionStore(rt.store, rt.policy).read_task_handoff(str(payload["task_id"]))
+        sys.stdout.write(json.dumps({"observed_ref": handoff.observed_ref if handoff else None}) + "\n")
+        sys.stdout.flush()
+    finally:
+        executor.close(5.0)
+        rt.close()
+    return 0
+
+
 def main(argv: list[str]) -> int:
     if len(argv) != 4 or argv[1] not in _MODES:
         _mark("DRIVER_ERROR", "usage")
@@ -137,6 +232,10 @@ def main(argv: list[str]) -> int:
     try:
         if mode == "outbox-enqueue":
             return _run_outbox_enqueue(target_path, payload)
+        if mode == "session-bind":
+            return _run_session_bind(target_path, payload)
+        if mode == "continuity-worker":
+            return _run_continuity_worker(target_path, payload)
         return _run_capture_serve(target_path, payload)
     except BrainError as err:
         owner_entry._write_stderr(err.code.value)

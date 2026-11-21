@@ -50,6 +50,9 @@ KNOWN_CRASHPOINTS: frozenset[str] = frozenset({
     # SP2-2: capture outbox + daemon ingest crashpoints
     "capture.outbox.after_write_before_fsync",
     "capture.daemon.after_commit_before_ack",
+    # SP2-3: dual-store session binding + 3-phase continuity worker crashpoints
+    "session.after_policy_bind_before_store_project",
+    "continuity.worker.before_owner_commit",
 })
 
 KNOWN_PAUSEPOINTS: frozenset[str] = KNOWN_CRASHPOINTS | {"writer.held"}

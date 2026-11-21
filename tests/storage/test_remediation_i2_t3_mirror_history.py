@@ -281,7 +281,7 @@ def test_exact_007_v1_register_entry_with_subject_opens_with_current_mirror(trus
 
     mig_cur = migrate_offline(DaemonConfig(1, root, store_id, base / "unused.pem", base / "unused.key"), adapters)
     assert mig_cur.policy_report.status == "migrated"
-    assert mig_cur.policy_report.from_version == 3 and mig_cur.policy_report.to_version == 4
+    assert mig_cur.policy_report.from_version == 3 and mig_cur.policy_report.to_version == 5
     assert mig_cur.store_report.status == "migrated"
     assert mig_cur.store_report.from_version == 3 and mig_cur.store_report.to_version == 6
 

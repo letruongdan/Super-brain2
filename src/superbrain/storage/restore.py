@@ -30,6 +30,7 @@ from superbrain.storage._policy_restore import (
     preview_policy_restore,
     stage_policy_restore_effects,
 )
+from superbrain.storage._policy_sessions import SessionPolicyRestoreStageHook
 from superbrain.storage._restore_epoch import (
     PENDING_RESTORE_TOMBSTONES_FILE,
     RESTORE_EPOCH_FILE,
@@ -426,6 +427,14 @@ def restore_policy(
                 raise sqlite_error("cannot migrate the staged policy store", exc) from exc
         _write_generation(staged, generation, os_, published=published)
         if target >= 4:
+            effective_hooks: Sequence[PolicyRestoreStageHook] = stage_hooks
+            if (
+                target >= 5
+                and live_carry_forward
+                and not allow_corrupt_live
+                and not any(isinstance(h, SessionPolicyRestoreStageHook) for h in stage_hooks)
+            ):
+                effective_hooks = (SessionPolicyRestoreStageHook(), *stage_hooks)
             stage_policy_restore_effects(
                 root,
                 staged,
@@ -434,7 +443,7 @@ def restore_policy(
                 now=now,
                 os_=os_,
                 live_carry_forward=live_carry_forward and not allow_corrupt_live,
-                stage_hooks=stage_hooks,
+                stage_hooks=effective_hooks,
             )
         crashpoint("restoring.policy.after_generation_persist")
 

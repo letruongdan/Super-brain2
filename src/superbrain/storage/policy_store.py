@@ -52,6 +52,7 @@ from superbrain.storage._policy_mutations import (
     record_policy_authorized_revocation,
     register_policy_authorized_workspace,
 )
+from superbrain.storage._policy_sessions import PolicySessionMixin
 from superbrain.storage.errors import sqlite_error
 from superbrain.storage.identity import validate_policy_intent_payload
 from superbrain.storage.kinds import CORE_KINDS, KindRegistry
@@ -120,7 +121,7 @@ def _decode_intent(row: Sequence[object]) -> Intent:
     return Intent(intent_id=intent_id, kind=intent_kind, payload=checked, created_at=created_at)
 
 
-class PolicyStore(PolicyAuthorityMixin, PolicyAccountingMixin):
+class PolicyStore(PolicyAuthorityMixin, PolicyAccountingMixin, PolicySessionMixin):
     """Implements ``PolicySource``. Obtain it with ``create`` or ``open``; ``close`` it when done."""
 
     def __init__(

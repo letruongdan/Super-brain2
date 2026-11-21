@@ -222,7 +222,7 @@ def test_migrate_from_4_3_to_5_4_preserves_existing_provider_invocation_rows(
         key_path=trusted_tmp / "unused.key",
     )
     rep = migrate_offline(cfg, os_)
-    assert (rep.policy_report.to_version, rep.store_report.to_version) == (4, 6)
+    assert (rep.policy_report.to_version, rep.store_report.to_version) == (5, 6)
 
     rt_after = reopen_kernel_job_runtime(root_path, store_id, os_)
     try:

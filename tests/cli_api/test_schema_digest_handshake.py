@@ -750,7 +750,7 @@ def test_capture_events_route_capability_separation_and_digest_gate_on_live_serv
     domain = TransportTestDomain(ws_a=ws_a)
     digest = load_catalog().schema_digest
 
-    with open_test_loopback_transport(tpl, name="sp2-1-capture", domain=domain) as h:
+    with open_test_loopback_transport(tpl, name="sp2-1-capture", domain=domain, job_handlers={}) as h:
         # Seed capture_producer and operator_cli credentials into policy & publish capabilities to AuthGate
         cap_cred_holder: list[Any] = []
         cli_cred_holder: list[Any] = []
