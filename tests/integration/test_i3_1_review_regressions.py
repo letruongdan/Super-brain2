@@ -55,7 +55,7 @@ from superbrain.core.kernel import (
     ResourceDigest,
     ShutdownState,
 )
-from superbrain.core.wire import make_error_envelope
+from superbrain.core.wire import load_catalog, make_error_envelope
 from superbrain.ports.os import OsAdapters
 from superbrain.storage.layout import DataRoot
 from tests.support.clock import FakeClock
@@ -308,13 +308,16 @@ def test_slow_ssh_verify_does_not_block_owner_loop(trusted_tmp: Path, monkeypatc
             assert verify_entered.wait(timeout=2.0)
             # While ssh-keygen is parked, OwnerLoop must still service deep health calls without timing out.
             health_probe = {
+                "schema_digest": load_catalog().schema_digest,
                 "tool": "get_health", "correlation_id": None, "selected_scope": None,
                 "arguments": {"schema_version": "2.0", "deep": True, "idempotency_key": "idem-deep-health-0001"},
             }
             health_raw = _post_loopback(ready, ca_pem, "/v2/tools/call", harness.token, health_probe, read_timeout=0.7)
             assert b"\r\n\r\n" in health_raw, "OwnerLoop was blocked while ssh-keygen verification waited"
+            assert health_raw.startswith(b"HTTP/1.1 200 ")
             health_env = _envelope(health_raw)
-            assert _error_code(health_env) != ErrorCode.INVALID_INPUT.value
+            # The fixture has no deep-health domain. Its typed reply proves the call reached the owner.
+            assert _error_code(health_env) == ErrorCode.CAPABILITY_UNAVAILABLE.value
             assert verify_threads and verify_threads[0] != "superbrain-owner-loop"
         finally:
             verify_release.set()
@@ -384,6 +387,7 @@ def test_expired_and_queued_past_deadline_operator_requests_do_not_mutate_policy
 
         monkeypatch.setattr(loop, "submit_reply", _spy_submit)
         health_arg = {
+            "schema_digest": load_catalog().schema_digest,
             "tool": "get_health", "correlation_id": None, "selected_scope": None,
             "arguments": {"schema_version": "2.0", "deep": True, "idempotency_key": "idem-deep-health-0002"},
         }
