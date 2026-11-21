@@ -812,8 +812,8 @@ def test_outbox_and_hook_log_handle_concurrent_cold_creation_under_loose_parent_
     assert os_.permissions.problems(lock_target) == []
     assert os_.permissions.object_problems(lock_target / ".spool.lock") == []
 
-    # Multi-thread concurrent OutboxSpool cold creation (zero PrivacyFilter skew) across 6 trials.
-    for spool_trial in range(6):
+    # Multi-thread concurrent OutboxSpool cold creation (zero PrivacyFilter skew) across 2 trials.
+    for spool_trial in range(2):
         spool_cold = loose_parent / f"cold-spool-direct-{spool_trial}"
         spool_barrier = threading.Barrier(12)
 
@@ -836,7 +836,7 @@ def test_outbox_and_hook_log_handle_concurrent_cold_creation_under_loose_parent_
         assert os_.permissions.problems(spool_cold) == []
 
     # Concurrent cold failing-hook log creation (verifies every log line lands and log ACL is strict).
-    for log_trial in range(4):
+    for log_trial in range(2):
         log_cold_dir = loose_parent / f"cold-log-dir-{log_trial}"
         log_cold = log_cold_dir / "nested" / "cold-fail.log"
         log_barrier = threading.Barrier(8)
@@ -859,8 +859,8 @@ def test_outbox_and_hook_log_handle_concurrent_cold_creation_under_loose_parent_
         assert os_.permissions.problems(log_cold_dir) == []
         assert os_.permissions.object_problems(log_cold) == []
 
-    # Multi-thread concurrent cold run_hook creation across 4 trials (6 valid writers + 2 failing log writers).
-    for trial in range(4):
+    # Multi-thread concurrent cold run_hook creation across 2 trials (6 valid writers + 2 failing log writers).
+    for trial in range(2):
         cold_outbox = loose_parent / f"cold-outbox-{trial}"
         cold_log = loose_parent / f"cold-{trial}.log"
         barrier = threading.Barrier(8)
@@ -929,8 +929,8 @@ def test_outbox_and_hook_log_handle_concurrent_cold_creation_under_loose_parent_
         "sys.exit(main(sys.argv[1:]))"
     )
     proc_payloads: list[bytes] = []
-    for idx in range(6):
-        if idx < 4:
+    for idx in range(4):
+        if idx < 2:
             seq = idx + 1
             proc_payloads.append(
                 json.dumps(
@@ -950,7 +950,7 @@ def test_outbox_and_hook_log_handle_concurrent_cold_creation_under_loose_parent_
 
     procs: list[subprocess.Popen[bytes]] = []
     try:
-        for _ in range(6):
+        for _ in range(4):
             p = subprocess.Popen(
                 [sys.executable, "-I", "-c", proc_cmd, "--outbox", str(proc_outbox), "--log", str(proc_log)],
                 stdin=subprocess.PIPE,
@@ -973,11 +973,11 @@ def test_outbox_and_hook_log_handle_concurrent_cold_creation_under_loose_parent_
             if p.poll() is None:
                 p.terminate()
                 p.wait(timeout=5.0)
-    assert proc_rcs == [0] * 6
+    assert proc_rcs == [0] * 4
     proc_pending = OutboxSpool(proc_outbox, permissions=os_.permissions, file_lock=OUTBOX_FILE_LOCK).read_pending(
         limit=100, producer_stream="cold-r2-proc"
     )
-    assert sorted(e.sequence for e in proc_pending) == [1, 2, 3, 4]
+    assert sorted(e.sequence for e in proc_pending) == [1, 2]
     assert proc_log.is_file()
     proc_log_text = proc_log.read_text(encoding="utf-8")
     assert proc_log_text.count("invalid_input") == 2

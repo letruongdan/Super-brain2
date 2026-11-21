@@ -944,33 +944,33 @@ def test_hook_entry_backlog_stays_within_budget_and_preserves_idempotency(truste
     # Stage 1: 500 frames across 2 streams
     dir_500 = trusted_tmp / "backlog-500"
     log_500 = trusted_tmp / "backlog-500.log"
-    _seed_outbox_frames(dir_500, os_.permissions, [("stream-r1-500-a", 250), ("stream-r1-500-b", 250)])
-    ev_251_bytes = json.dumps(
+    _seed_outbox_frames(dir_500, os_.permissions, [("stream-r1-500-a", 50), ("stream-r1-500-b", 450)])
+    ev_51_bytes = json.dumps(
         _base_event_dict(
-            event_id="ev-stream-r1-500-a-251",
+            event_id="ev-stream-r1-500-a-51",
             producer_stream="stream-r1-500-a",
-            sequence=251,
-            payload={"tool": "Read", "seq": 251},
+            sequence=51,
+            payload={"tool": "Read", "seq": 51},
         )
     ).encode()
     t0_500 = time.monotonic()
-    rc_500 = run_hook(ev_251_bytes, outbox_dir=dir_500, log_path=log_500, cap_ns=HOOK_HARD_CAP_NS)
+    rc_500 = run_hook(ev_51_bytes, outbox_dir=dir_500, log_path=log_500, cap_ns=HOOK_HARD_CAP_NS)
     elapsed_500 = time.monotonic() - t0_500
     assert rc_500 == 0
     assert elapsed_500 < 0.5, f"run_hook on 500-frame backlog took {elapsed_500:.3f}s"
     if log_500.exists():
         assert "deadline_exceeded" not in log_500.read_text(encoding="utf-8")
 
-    # Stage 2: 2,000 frames across 2 streams -> seq 1001 on stream-a (2,001st frame overall)
+    # Stage 2: 2,000 frames across 2 streams -> seq 51 on stream-a (2,001st frame overall)
     dir_2k = trusted_tmp / "backlog-2000"
     log_2k = trusted_tmp / "backlog-2000.log"
-    _seed_outbox_frames(dir_2k, os_.permissions, [("stream-r1-a", 1000), ("stream-r1-b", 1000)])
+    _seed_outbox_frames(dir_2k, os_.permissions, [("stream-r1-b", 1950), ("stream-r1-a", 50)])
     ev_next_bytes = json.dumps(
         _base_event_dict(
-            event_id="ev-stream-r1-a-1001",
+            event_id="ev-stream-r1-a-51",
             producer_stream="stream-r1-a",
-            sequence=1001,
-            payload={"tool": "Read", "seq": 1001},
+            sequence=51,
+            payload={"tool": "Read", "seq": 51},
         )
     ).encode()
     t0_2k = time.monotonic()
@@ -982,40 +982,41 @@ def test_hook_entry_backlog_stays_within_budget_and_preserves_idempotency(truste
         assert "deadline_exceeded" not in log_2k.read_text(encoding="utf-8")
 
     spool_2k = OutboxSpool(dir_2k, permissions=os_.permissions, file_lock=OUTBOX_FILE_LOCK)
-    pending_a = spool_2k.read_pending(limit=1024, producer_stream="stream-r1-a")
-    assert len(pending_a) == 1001
-    assert any(e.sequence == 1001 and e.entry_id == "ev-stream-r1-a-1001" for e in pending_a)
+    pending_a = spool_2k.read_pending(limit=64, producer_stream="stream-r1-a")
+    assert len(pending_a) == 51
+    assert any(e.sequence == 51 and e.entry_id == "ev-stream-r1-a-51" for e in pending_a)
 
-    # Duplicate & conflicting sequence detection must still hold under 2,000+ frames.
-    dup_rec = CaptureEventRecord(
-        event_id="ev-stream-r1-a-1000",
-        producer_stream="stream-r1-a",
-        sequence=1000,
-        harness_id="claude-code",
-        kind="tool_post",
-        recorded_at="2026-11-21T12:00:00Z",
-        payload={"tool": "Read", "seq": 1000},
-    )
-    assert spool_2k.enqueue_event(dup_rec) == "ev-stream-r1-a-1000"
+    # Duplicate & conflicting sequence detection must still hold on both streams under 2,000+ frames.
+    for target_stream, target_seq in (("stream-r1-a", 50), ("stream-r1-b", 1950)):
+        dup_rec = CaptureEventRecord(
+            event_id=f"ev-{target_stream}-{target_seq}",
+            producer_stream=target_stream,
+            sequence=target_seq,
+            harness_id="claude-code",
+            kind="tool_post",
+            recorded_at="2026-11-21T12:00:00Z",
+            payload={"tool": "Read", "seq": target_seq},
+        )
+        assert spool_2k.enqueue_event(dup_rec) == f"ev-{target_stream}-{target_seq}"
 
-    conflict_rec = CaptureEventRecord(
-        event_id="ev-stream-r1-a-1000",
-        producer_stream="stream-r1-a",
-        sequence=1000,
-        harness_id="claude-code",
-        kind="tool_post",
-        recorded_at="2026-11-21T12:00:00Z",
-        payload={"tool": "Write", "seq": 1000, "mutated": True},
-    )
-    with pytest.raises(BrainError) as exc_conf:
-        spool_2k.enqueue_event(conflict_rec)
-    assert exc_conf.value.code is ErrorCode.IDEMPOTENCY_CONFLICT
+        conflict_rec = CaptureEventRecord(
+            event_id=f"ev-{target_stream}-{target_seq}",
+            producer_stream=target_stream,
+            sequence=target_seq,
+            harness_id="claude-code",
+            kind="tool_post",
+            recorded_at="2026-11-21T12:00:00Z",
+            payload={"tool": "Write", "seq": target_seq, "mutated": True},
+        )
+        with pytest.raises(BrainError) as exc_conf:
+            spool_2k.enqueue_event(conflict_rec)
+        assert exc_conf.value.code is ErrorCode.IDEMPOTENCY_CONFLICT
 
     conflict_bytes = json.dumps(
         _base_event_dict(
-            event_id="ev-stream-r1-a-1000",
+            event_id="ev-stream-r1-a-50",
             producer_stream="stream-r1-a",
-            sequence=1000,
+            sequence=50,
             payload={"tool": "Write", "mutated": True},
         )
     ).encode()
