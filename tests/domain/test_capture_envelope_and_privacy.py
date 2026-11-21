@@ -537,8 +537,8 @@ def test_hook_entry_timeout_writes_hook_timeout_gap_and_exits_zero(trusted_tmp: 
 
     class _StallingSpool(OutboxSpool):
         def enqueue_event(self, record: CaptureEventRecord, *, deadline_ns: int | None = None) -> str:
-            # Simulate stalling disk I/O past HOOK_HARD_CAP_NS (no real sleep in gate).
-            now[0] += HOOK_HARD_CAP_NS + 50_000_000
+            # Simulate I/O stalling past work_deadline_ns inside HOOK_HARD_CAP_NS (no real sleep).
+            now[0] += HOOK_HARD_CAP_NS - 40_000_000
             return str(super().enqueue_event(record, deadline_ns=deadline_ns))
 
     def _factory(path: Path) -> OutboxSpool:
@@ -573,7 +573,7 @@ def test_hook_entry_timeout_writes_hook_timeout_gap_and_exits_zero(trusted_tmp: 
     # Unwritable outbox during timeout still fails soft with rc == 0 (never blocks harness).
     class _BrokenSpool(OutboxSpool):
         def enqueue_event(self, record: CaptureEventRecord, *, deadline_ns: int | None = None) -> str:
-            now[0] += HOOK_HARD_CAP_NS + 50_000_000
+            now[0] += HOOK_HARD_CAP_NS - 40_000_000
             raise BrainError(ErrorCode.DEADLINE_EXCEEDED, "deadline exceeded")
 
         def enqueue_gap(self, gap: ProducerCaptureGap, *, deadline_ns: int | None = None) -> str:
@@ -873,3 +873,257 @@ def test_outbox_wire_batch_limit_oversized_record_and_int64_sequence_bounds(trus
         with pytest.raises(BrainError) as exc_seq:
             normalize_capture_record(bad_seq_raw)
         assert exc_seq.value.code is ErrorCode.INVALID_INPUT
+
+
+def _seed_outbox_frames(
+    spool_dir: Path,
+    perms: Any,
+    counts_by_stream: list[tuple[str, int]],
+) -> None:
+    import hashlib
+    import zlib
+
+    from superbrain.core.canonical import canonical_json, digest_bytes
+    from superbrain.ports.capture import OUTBOX_RECORD_EVENT, CaptureEventRecord
+
+    streams_root = spool_dir / "streams"
+    streams_root.mkdir(parents=True, exist_ok=True)
+    perms.secure_directory(spool_dir)
+    perms.secure_directory(streams_root)
+
+    order = 0
+    first_frame: Path | None = None
+    for stream, count in counts_by_stream:
+        sdir = streams_root / hashlib.sha256(stream.encode("utf-8")).hexdigest()[:24]
+        sdir.mkdir(exist_ok=True)
+        perms.secure_directory(sdir)
+        for seq in range(1, count + 1):
+            order += 1
+            rec = CaptureEventRecord(
+                event_id=f"ev-{stream}-{seq}",
+                producer_stream=stream,
+                sequence=seq,
+                harness_id="claude-code",
+                kind="tool_post",
+                recorded_at="2026-11-21T12:00:00Z",
+                payload={"tool": "Read", "seq": seq},
+            )
+            payload_bytes = canonical_json(rec.to_dict())
+            payload_json = payload_bytes.decode("utf-8")
+            payload_digest = digest_bytes(payload_bytes)
+            core = {
+                "byte_size": len(payload_bytes),
+                "entry_id": rec.event_id,
+                "payload_digest": payload_digest,
+                "payload_json": payload_json,
+                "producer_stream": stream,
+                "record_kind": OUTBOX_RECORD_EVENT,
+                "sequence": seq,
+            }
+            core["frame_crc32"] = f"{zlib.crc32(canonical_json(core)) & 0xFFFFFFFF:08x}"
+            frame_bytes = canonical_json(core) + b"\n"
+            fpath = sdir / f"{order:016d}_{OUTBOX_RECORD_EVENT}_{seq:020d}.frame"
+            fpath.write_bytes(frame_bytes)
+            if sys.platform != "win32":
+                os.chmod(fpath, 0o600)
+            elif first_frame is None:
+                first_frame = fpath
+    if first_frame is not None:
+        assert perms.object_problems(first_frame) == []
+
+
+def test_hook_entry_backlog_stays_within_budget_and_preserves_idempotency(trusted_tmp: Path) -> None:
+    from superbrain.adapters.os import os_adapters
+    from superbrain.adapters.os.locks import OUTBOX_FILE_LOCK
+    from superbrain.composition.hook_entry import run_hook
+    from superbrain.ports.capture import HOOK_HARD_CAP_NS, CaptureEventRecord
+    from superbrain.storage.outbox import OutboxSpool
+
+    os_ = os_adapters()
+
+    # Stage 1: 500 frames across 2 streams
+    dir_500 = trusted_tmp / "backlog-500"
+    log_500 = trusted_tmp / "backlog-500.log"
+    _seed_outbox_frames(dir_500, os_.permissions, [("stream-r1-500-a", 250), ("stream-r1-500-b", 250)])
+    ev_251_bytes = json.dumps(
+        _base_event_dict(
+            event_id="ev-stream-r1-500-a-251",
+            producer_stream="stream-r1-500-a",
+            sequence=251,
+            payload={"tool": "Read", "seq": 251},
+        )
+    ).encode()
+    t0_500 = time.monotonic()
+    rc_500 = run_hook(ev_251_bytes, outbox_dir=dir_500, log_path=log_500, cap_ns=HOOK_HARD_CAP_NS)
+    elapsed_500 = time.monotonic() - t0_500
+    assert rc_500 == 0
+    assert elapsed_500 < 0.5, f"run_hook on 500-frame backlog took {elapsed_500:.3f}s"
+    if log_500.exists():
+        assert "deadline_exceeded" not in log_500.read_text(encoding="utf-8")
+
+    # Stage 2: 2,000 frames across 2 streams -> seq 1001 on stream-a (2,001st frame overall)
+    dir_2k = trusted_tmp / "backlog-2000"
+    log_2k = trusted_tmp / "backlog-2000.log"
+    _seed_outbox_frames(dir_2k, os_.permissions, [("stream-r1-a", 1000), ("stream-r1-b", 1000)])
+    ev_next_bytes = json.dumps(
+        _base_event_dict(
+            event_id="ev-stream-r1-a-1001",
+            producer_stream="stream-r1-a",
+            sequence=1001,
+            payload={"tool": "Read", "seq": 1001},
+        )
+    ).encode()
+    t0_2k = time.monotonic()
+    rc_2k = run_hook(ev_next_bytes, outbox_dir=dir_2k, log_path=log_2k, cap_ns=HOOK_HARD_CAP_NS)
+    elapsed_2k = time.monotonic() - t0_2k
+    assert rc_2k == 0
+    assert elapsed_2k < 0.5, f"run_hook on 2000-frame backlog took {elapsed_2k:.3f}s"
+    if log_2k.exists():
+        assert "deadline_exceeded" not in log_2k.read_text(encoding="utf-8")
+
+    spool_2k = OutboxSpool(dir_2k, permissions=os_.permissions, file_lock=OUTBOX_FILE_LOCK)
+    pending_a = spool_2k.read_pending(limit=1024, producer_stream="stream-r1-a")
+    assert len(pending_a) == 1001
+    assert any(e.sequence == 1001 and e.entry_id == "ev-stream-r1-a-1001" for e in pending_a)
+
+    # Duplicate & conflicting sequence detection must still hold under 2,000+ frames.
+    dup_rec = CaptureEventRecord(
+        event_id="ev-stream-r1-a-1000",
+        producer_stream="stream-r1-a",
+        sequence=1000,
+        harness_id="claude-code",
+        kind="tool_post",
+        recorded_at="2026-11-21T12:00:00Z",
+        payload={"tool": "Read", "seq": 1000},
+    )
+    assert spool_2k.enqueue_event(dup_rec) == "ev-stream-r1-a-1000"
+
+    conflict_rec = CaptureEventRecord(
+        event_id="ev-stream-r1-a-1000",
+        producer_stream="stream-r1-a",
+        sequence=1000,
+        harness_id="claude-code",
+        kind="tool_post",
+        recorded_at="2026-11-21T12:00:00Z",
+        payload={"tool": "Write", "seq": 1000, "mutated": True},
+    )
+    with pytest.raises(BrainError) as exc_conf:
+        spool_2k.enqueue_event(conflict_rec)
+    assert exc_conf.value.code is ErrorCode.IDEMPOTENCY_CONFLICT
+
+    conflict_bytes = json.dumps(
+        _base_event_dict(
+            event_id="ev-stream-r1-a-1000",
+            producer_stream="stream-r1-a",
+            sequence=1000,
+            payload={"tool": "Write", "mutated": True},
+        )
+    ).encode()
+    assert run_hook(conflict_bytes, outbox_dir=dir_2k, log_path=log_2k, cap_ns=HOOK_HARD_CAP_NS) == 0
+    assert "idempotency_conflict" in log_2k.read_text(encoding="utf-8")
+
+
+def test_hook_entry_clamps_fallback_gap_deadline_and_outbox_propagates_deadline(trusted_tmp: Path) -> None:
+    from superbrain.adapters.os import os_adapters
+    from superbrain.adapters.os.locks import OUTBOX_FILE_LOCK
+    from superbrain.composition.hook_entry import run_hook
+    from superbrain.ports.capture import CaptureEventRecord, ProducerCaptureGap
+    from superbrain.storage.outbox import OutboxSpool
+
+    os_ = os_adapters()
+
+    # Part A: Fallback gap_deadline_ns in run_hook must be clamped to <= start_ns + cap_ns.
+    def _run_clamp_case(remaining_before_gap_ns: int) -> None:
+        start_ns = 1_000_000_000
+        cap_ns = 100_000_000
+        hard_ceiling_ns = start_ns + cap_ns
+        now = [start_ns]
+        observed_gap_deadlines: list[int | None] = []
+        hook_dir = trusted_tmp / f"clamp-dir-{remaining_before_gap_ns}"
+        hook_log = trusted_tmp / f"clamp-{remaining_before_gap_ns}.log"
+
+        def _fake_mono() -> int:
+            return now[0]
+
+        class _ClampProbeSpool(OutboxSpool):
+            def enqueue_event(self, record: CaptureEventRecord, *, deadline_ns: int | None = None) -> str:
+                now[0] = hard_ceiling_ns - remaining_before_gap_ns
+                raise BrainError(ErrorCode.DEADLINE_EXCEEDED, "deadline exceeded")
+
+            def enqueue_gap(self, gap: ProducerCaptureGap, *, deadline_ns: int | None = None) -> str:
+                observed_gap_deadlines.append(deadline_ns)
+                if int(self._monotonic_ns()) >= (deadline_ns or 0):
+                    raise BrainError(ErrorCode.DEADLINE_EXCEEDED, "deadline exceeded")
+                return gap.gap_id
+
+        def _clamp_factory(path: Path) -> OutboxSpool:
+            return _ClampProbeSpool(
+                path, monotonic_ns=_fake_mono, permissions=os_.permissions, file_lock=OUTBOX_FILE_LOCK
+            )
+
+        raw_ev = json.dumps(_base_event_dict(event_id="evt-clamp-1", sequence=1)).encode()
+        rc = run_hook(
+            raw_ev,
+            outbox_dir=hook_dir,
+            log_path=hook_log,
+            monotonic_ns=_fake_mono,
+            spool_factory=_clamp_factory,
+            cap_ns=cap_ns,
+        )
+        assert rc == 0
+        assert hook_log.is_file() and "deadline_exceeded" in hook_log.read_text(encoding="utf-8")
+        if remaining_before_gap_ns > 0:
+            assert observed_gap_deadlines, "expected bounded fallback enqueue_gap when budget remains"
+        for g_deadline in observed_gap_deadlines:
+            assert g_deadline is not None
+            assert g_deadline <= hard_ceiling_ns, (
+                f"fallback gap deadline {g_deadline} overshot hard cap {hard_ceiling_ns}"
+            )
+
+    for rem_ns in (3_000_000, -5_000_000):
+        _run_clamp_case(rem_ns)
+
+    # Part B: OutboxSpool.enqueue_event propagates deadline_ns into scan/permission/pre-commit work.
+    dl_dir = trusted_tmp / "deadline-scan-dir"
+    _seed_outbox_frames(dl_dir, os_.permissions, [("stream-dl", 10)])
+    scan_now = [0]
+
+    class _SlowPerms:
+        def secure_directory(self, path: Path) -> None:
+            os_.permissions.secure_directory(path)
+
+        def secure_file(self, path: Path) -> None:
+            scan_now[0] += 40_000_000
+            os_.permissions.secure_file(path)
+
+        def problems(self, path: Path) -> Any:
+            scan_now[0] += 40_000_000
+            return os_.permissions.problems(path)
+
+        def object_problems(self, path: Path) -> Any:
+            scan_now[0] += 40_000_000
+            return os_.permissions.object_problems(path)
+
+    dl_spool = OutboxSpool(
+        dl_dir,
+        monotonic_ns=lambda: scan_now[0],
+        permissions=_SlowPerms(),
+        file_lock=OUTBOX_FILE_LOCK,
+    )
+    deadline_start = scan_now[0]
+    ev11 = CaptureEventRecord(
+        event_id="ev-dl-11",
+        producer_stream="stream-dl",
+        sequence=11,
+        harness_id="claude-code",
+        kind="tool_post",
+        recorded_at="2026-11-21T12:00:11Z",
+        payload={"tool": "Read", "seq": 11},
+    )
+    with pytest.raises(BrainError) as exc_dl:
+        dl_spool.enqueue_event(ev11, deadline_ns=deadline_start + 100_000_000)
+    assert exc_dl.value.code is ErrorCode.DEADLINE_EXCEEDED
+    committed = OutboxSpool(dl_dir, permissions=os_.permissions, file_lock=OUTBOX_FILE_LOCK).read_pending(
+        limit=20, producer_stream="stream-dl"
+    )
+    assert [e.sequence for e in committed] == list(range(1, 11))

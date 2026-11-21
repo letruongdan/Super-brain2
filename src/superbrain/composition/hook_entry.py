@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import stat
 import sys
 import time
 from collections.abc import Callable, Sequence
@@ -23,55 +22,20 @@ from superbrain.ports.capture import (
     HOOK_HARD_CAP_NS,
     CaptureEventRecord,
     ProducerCaptureGap,
+    default_outbox_dir_renamer,
+)
+from superbrain.storage._outbox_io import (
+    _O_BINARY,
+    _O_NOFOLLOW,
+    ensure_dir_tree_atomic,
+    ensure_secure_regular_file_atomic,
+    reject_links_upward,
+    thread_lock_for,
+    write_all_fd,
 )
 from superbrain.storage.outbox import OutboxSpool
 
 _MAX_STDIN_BYTES = 2 * 1024 * 1024
-_REPARSE_POINT = 0x400
-
-
-def _is_link(path: Path) -> bool:
-    try:
-        if path.is_symlink():
-            return True
-        st = os.lstat(path)
-    except (FileNotFoundError, NotADirectoryError):
-        return False
-    except OSError:
-        return True
-    return stat.S_ISLNK(st.st_mode) or bool(getattr(st, "st_file_attributes", 0) & _REPARSE_POINT)
-
-
-def _reject_link_chain(path: Path) -> bool:
-    cur = path if path.is_absolute() else path.absolute()
-    seen: set[Path] = set()
-    while cur not in seen:
-        seen.add(cur)
-        if _is_link(cur):
-            return True
-        parent = cur.parent
-        if parent == cur:
-            break
-        cur = parent
-    return False
-
-
-def _ensure_secure_log_parents(parent: Path, perms: object) -> bool:
-    secure_dir = getattr(perms, "secure_directory", None)
-    if secure_dir is None:
-        return False
-    missing: list[Path] = []
-    cur = parent if parent.is_absolute() else parent.absolute()
-    while not os.path.lexists(cur):
-        missing.append(cur)
-        nxt = cur.parent
-        if nxt == cur:
-            break
-        cur = nxt
-    for d in reversed(missing):
-        d.mkdir(mode=0o700, exist_ok=True)
-        secure_dir(d)
-    return True
 
 
 def _write_static_log(log_path: Path | None, *, phase: str, code: str) -> None:
@@ -79,37 +43,17 @@ def _write_static_log(log_path: Path | None, *, phase: str, code: str) -> None:
         return
     try:
         resolved = log_path if log_path.is_absolute() else log_path.absolute()
-        if _reject_link_chain(resolved):
-            return
+        reject_links_upward(resolved)
         perms = os_adapters().permissions
-        if not _ensure_secure_log_parents(resolved.parent, perms):
-            return
-        flags_new = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
-        try:
-            fd_new = os.open(resolved, flags_new, 0o600)
-        except FileExistsError:
-            if _is_link(resolved) or not stat.S_ISREG(os.lstat(resolved).st_mode):
-                return
-            if perms.object_problems(resolved):
-                return
-        else:
-            os.close(fd_new)
-            perms.secure_file(resolved)
-            if perms.object_problems(resolved):
-                return
-        flags_app = os.O_WRONLY | os.O_APPEND | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
-        fd = os.open(resolved, flags_app, 0o600)
-        try:
-            data = f"phase={phase} error.code={code}\n".encode()
-            view = memoryview(data)
-            written = 0
-            while written < len(data):
-                n = os.write(fd, view[written:])
-                if n <= 0:
-                    break
-                written += n
-        finally:
-            os.close(fd)
+        renamer = default_outbox_dir_renamer()
+        with thread_lock_for(resolved):
+            ensure_dir_tree_atomic(resolved.parent, perms, renamer, verify_existing=False)
+            ensure_secure_regular_file_atomic(resolved, perms)
+            fd = os.open(resolved, os.O_WRONLY | os.O_APPEND | _O_BINARY | _O_NOFOLLOW, 0o600)
+            try:
+                write_all_fd(fd, f"phase={phase} error.code={code}\n".encode())
+            finally:
+                os.close(fd)
     except (OSError, BrainError):
         pass
 
@@ -136,6 +80,7 @@ def run_hook(
     if type(cap_ns) is not int or cap_ns <= 0:
         _write_static_log(log_path, phase="hook", code=ErrorCode.INVALID_INPUT.value)
         return 0
+    hard_deadline_ns = start_ns + cap_ns
     reserve_ns = min(max(1, cap_ns // 10), 50_000_000)
     work_deadline_ns = start_ns + max(1, cap_ns - reserve_ns)
     normalized: CaptureEventRecord | ProducerCaptureGap | None = None
@@ -179,11 +124,15 @@ def run_hook(
             and isinstance(normalized, CaptureEventRecord)
             and raw_session_id not in normalized.producer_stream
         )
-        if err.code in (ErrorCode.DEADLINE_EXCEEDED, ErrorCode.STORAGE_FULL) and isinstance(
-            normalized, CaptureEventRecord
-        ) and raw_ok:
+        cur_ns = int(monotonic_ns())
+        if (
+            err.code in (ErrorCode.DEADLINE_EXCEEDED, ErrorCode.STORAGE_FULL)
+            and isinstance(normalized, CaptureEventRecord)
+            and raw_ok
+            and cur_ns < hard_deadline_ns
+        ):
             reason = "hook_timeout" if err.code is ErrorCode.DEADLINE_EXCEEDED else "outbox_full"
-            duration_ms = max(0, (int(monotonic_ns()) - start_ns) // 1_000_000)
+            duration_ms = max(0, (cur_ns - start_ns) // 1_000_000)
             gap = ProducerCaptureGap(
                 gap_id=f"gap-{new_id()}",
                 producer_stream=normalized.producer_stream,
@@ -193,7 +142,7 @@ def run_hook(
                 estimated_count=1,
                 duration_ms=duration_ms,
             )
-            gap_deadline_ns = int(monotonic_ns()) + reserve_ns
+            gap_deadline_ns = min(hard_deadline_ns, cur_ns + reserve_ns)
             try:
                 spool = _make_spool(outbox_dir, spool_factory)
                 spool.enqueue_gap(gap, deadline_ns=gap_deadline_ns)

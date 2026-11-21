@@ -322,8 +322,14 @@ class _BasePublisher:
         os.replace(src, dst)
 
     def _rename_dir(self, src: Path, dst: Path) -> None:
-        # The existence check is not atomic against another process; acceptable because the single
-        # writer holds the store lock (spec 5.5).
+        try:
+            _rename_noreplace(src, dst)
+            return
+        except FileExistsError:
+            raise
+        except OSError as err:
+            if err.errno not in (errno.ENOSYS, errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP, 95):
+                raise
         if os.path.lexists(dst):
             raise FileExistsError(errno.EEXIST, "target directory exists", str(dst))
         os.rename(src, dst)

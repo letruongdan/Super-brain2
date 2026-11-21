@@ -677,3 +677,343 @@ def test_outbox_frames_use_pure_lf_fail_closed_on_newlineless_frame_and_repair_a
     assert [e.sequence for e in repaired_entries] == [1, 2]
     assert tail_file.read_bytes() == committed_bytes
     assert list(repair_dir.rglob("*.part")) == []
+
+
+def test_outbox_and_hook_log_handle_concurrent_cold_creation_under_loose_parent_while_refusing_preexisting_insecure(
+    trusted_tmp: Path,
+) -> None:
+    import threading
+
+    from superbrain.adapters.os.locks import OUTBOX_FILE_LOCK
+    from superbrain.composition.hook_entry import run_hook
+    from superbrain.storage.outbox import OutboxSpool
+
+    os_ = os_adapters()
+    loose_parent = trusted_tmp / "loose-parent-r2"
+    loose_parent.mkdir()
+    if sys.platform == "win32":
+        from tests.support.winacl import grant
+
+        grant(loose_parent, "S-1-1-0", 0x120089, flags=0x3)
+    else:
+        os.chmod(loose_parent, 0o755)
+    assert os_.permissions.problems(loose_parent)
+
+    # Deterministic pipe-synchronized two-process TOCTOU cold races on dir and lockfile hardening.
+    def _run_pipe_cold_race(mode: str, target_dir: Path, stream: str) -> None:
+        proc_a_script = (
+            "import os, sys\n"
+            "from pathlib import Path\n"
+            "if os.name == 'posix': os.umask(0o022)\n"
+            "import superbrain.adapters.os\n"
+            "from superbrain.adapters.os import os_adapters\n"
+            "from superbrain.adapters.os.locks import OUTBOX_FILE_LOCK\n"
+            "from superbrain.ports.capture import CaptureEventRecord, default_outbox_permissions\n"
+            "from superbrain.storage.outbox import OutboxSpool\n"
+            "inner = default_outbox_permissions() or os_adapters().permissions\n"
+            "pause_mode = sys.argv[2]\n"
+            "class _PausePerms:\n"
+            "    def __init__(self) -> None:\n"
+            "        self._paused = False\n"
+            "    def _maybe_pause(self, kind: str) -> None:\n"
+            "        if kind == pause_mode and not self._paused:\n"
+            "            self._paused = True\n"
+            "            sys.stdout.write('READY\\n')\n"
+            "            sys.stdout.flush()\n"
+            "            assert sys.stdin.readline().strip() == 'CONTINUE'\n"
+            "    def secure_directory(self, path: Path) -> None:\n"
+            "        self._maybe_pause('dir')\n"
+            "        inner.secure_directory(path)\n"
+            "    def secure_file(self, path: Path) -> None:\n"
+            "        self._maybe_pause('file')\n"
+            "        inner.secure_file(path)\n"
+            "    def problems(self, path: Path):\n"
+            "        return inner.problems(path)\n"
+            "    def object_problems(self, path: Path):\n"
+            "        return inner.object_problems(path)\n"
+            "s = OutboxSpool(Path(sys.argv[1]), permissions=_PausePerms(), file_lock=OUTBOX_FILE_LOCK)\n"
+            "s.enqueue_event(CaptureEventRecord('ev-race-a', sys.argv[3], 1, 'claude-code', 'tool_post', "
+            "'2026-11-21T12:00:00Z', {'race': 'a'}))\n"
+        )
+        proc_b_script = (
+            "import os, sys\n"
+            "from pathlib import Path\n"
+            "if os.name == 'posix': os.umask(0o022)\n"
+            "import superbrain.adapters.os\n"
+            "from superbrain.adapters.os import os_adapters\n"
+            "from superbrain.adapters.os.locks import OUTBOX_FILE_LOCK\n"
+            "from superbrain.ports.capture import CaptureEventRecord, default_outbox_permissions\n"
+            "from superbrain.storage.outbox import OutboxSpool\n"
+            "inner = default_outbox_permissions() or os_adapters().permissions\n"
+            "s = OutboxSpool(Path(sys.argv[1]), permissions=inner, file_lock=OUTBOX_FILE_LOCK)\n"
+            "s.enqueue_event(CaptureEventRecord('ev-race-b', sys.argv[2], 2, 'claude-code', 'tool_post', "
+            "'2026-11-21T12:00:01Z', {'race': 'b'}))\n"
+        )
+        proc_a = subprocess.Popen(
+            [sys.executable, "-I", "-c", proc_a_script, str(target_dir), mode, stream],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=_clean_env(),
+        )
+        try:
+            assert proc_a.stdout is not None and proc_a.stdin is not None
+            ready = proc_a.stdout.readline().strip()
+            assert ready == "READY", (
+                f"proc_a failed before READY ({mode}): rc={proc_a.poll()} "
+                f"stderr={proc_a.stderr.read() if proc_a.stderr else ''}"
+            )
+            res_b = subprocess.run(
+                [sys.executable, "-I", "-c", proc_b_script, str(target_dir), stream],
+                input="",
+                text=True,
+                env=_clean_env(),
+                capture_output=True,
+                check=False,
+                timeout=10.0,
+            )
+            assert res_b.returncode == 0, f"proc_b failed during {mode} pause: {res_b.stderr}"
+            proc_a.stdin.write("CONTINUE\n")
+            proc_a.stdin.flush()
+            proc_a.stdin.close()
+            rc_a = proc_a.wait(timeout=10.0)
+            err_a = proc_a.stderr.read() if proc_a.stderr is not None else ""
+            assert rc_a == 0, f"proc_a failed ({mode}): {err_a}"
+        finally:
+            for pipe in (proc_a.stdin, proc_a.stdout, proc_a.stderr):
+                if pipe is not None:
+                    try:
+                        pipe.close()
+                    except OSError:
+                        pass
+            if proc_a.poll() is None:
+                proc_a.terminate()
+                try:
+                    proc_a.wait(timeout=5.0)
+                except subprocess.TimeoutExpired:
+                    proc_a.kill()
+                    proc_a.wait(timeout=5.0)
+
+    dir_target = loose_parent / "pipe-race-dir"
+    _run_pipe_cold_race("dir", dir_target, "pipe-dir-stream")
+    dir_entries = OutboxSpool(dir_target, permissions=os_.permissions, file_lock=OUTBOX_FILE_LOCK).read_pending(
+        limit=10, producer_stream="pipe-dir-stream"
+    )
+    assert sorted(e.sequence for e in dir_entries) == [1, 2]
+    assert os_.permissions.problems(dir_target) == []
+
+    lock_target = loose_parent / "pipe-race-lock"
+    _run_pipe_cold_race("file", lock_target, "pipe-lock-stream")
+    lock_entries = OutboxSpool(lock_target, permissions=os_.permissions, file_lock=OUTBOX_FILE_LOCK).read_pending(
+        limit=10, producer_stream="pipe-lock-stream"
+    )
+    assert sorted(e.sequence for e in lock_entries) == [1, 2]
+    assert os_.permissions.problems(lock_target) == []
+    assert os_.permissions.object_problems(lock_target / ".spool.lock") == []
+
+    # Multi-thread concurrent OutboxSpool cold creation (zero PrivacyFilter skew) across 6 trials.
+    for spool_trial in range(6):
+        spool_cold = loose_parent / f"cold-spool-direct-{spool_trial}"
+        spool_barrier = threading.Barrier(12)
+
+        def _spool_worker(
+            idx: int,
+            b: threading.Barrier = spool_barrier,
+            sd: Path = spool_cold,
+        ) -> str:
+            b.wait(timeout=10.0)
+            s = OutboxSpool(sd, permissions=os_.permissions, file_lock=OUTBOX_FILE_LOCK)
+            return s.enqueue_event(_mk_event(idx + 1, stream="cold-direct-r2", note=f"w-{idx}"))
+
+        with ThreadPoolExecutor(max_workers=12) as pool:
+            eids = [f.result(timeout=15.0) for f in [pool.submit(_spool_worker, i) for i in range(12)]]
+        assert len(eids) == 12
+        pending_direct = OutboxSpool(
+            spool_cold, permissions=os_.permissions, file_lock=OUTBOX_FILE_LOCK
+        ).read_pending(limit=50, producer_stream="cold-direct-r2")
+        assert sorted(e.sequence for e in pending_direct) == list(range(1, 13))
+        assert os_.permissions.problems(spool_cold) == []
+
+    # Concurrent cold failing-hook log creation (verifies every log line lands and log ACL is strict).
+    for log_trial in range(4):
+        log_cold_dir = loose_parent / f"cold-log-dir-{log_trial}"
+        log_cold = log_cold_dir / "nested" / "cold-fail.log"
+        log_barrier = threading.Barrier(8)
+
+        def _log_worker(
+            b: threading.Barrier = log_barrier,
+            ob: Path = loose_parent / f"cold-log-ob-{log_trial}",
+            lp: Path = log_cold,
+        ) -> int:
+            b.wait(timeout=10.0)
+            return run_hook(b"not json", outbox_dir=ob, log_path=lp)
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            log_rcs = [f.result(timeout=15.0) for f in [pool.submit(_log_worker) for _ in range(8)]]
+        assert log_rcs == [0] * 8
+        assert log_cold.is_file()
+        log_lines = [ln for ln in log_cold.read_text(encoding="utf-8").splitlines() if ln]
+        assert len(log_lines) == 8, f"lost static log lines under concurrent cold creation: {log_lines}"
+        assert all("invalid_input" in ln for ln in log_lines)
+        assert os_.permissions.problems(log_cold_dir) == []
+        assert os_.permissions.object_problems(log_cold) == []
+
+    # Multi-thread concurrent cold run_hook creation across 4 trials (6 valid writers + 2 failing log writers).
+    for trial in range(4):
+        cold_outbox = loose_parent / f"cold-outbox-{trial}"
+        cold_log = loose_parent / f"cold-{trial}.log"
+        barrier = threading.Barrier(8)
+
+        def _thread_worker(
+            idx: int,
+            b: threading.Barrier = barrier,
+            ob: Path = cold_outbox,
+            lp: Path = cold_log,
+            t: int = trial,
+        ) -> int:
+            b.wait(timeout=10.0)
+            if idx < 6:
+                seq = idx + 1
+                raw = json.dumps(
+                    {
+                        "event_id": f"ev-cold-{t}-{seq}",
+                        "producer_stream": "cold-r2-stream",
+                        "sequence": seq,
+                        "harness_id": "claude-code",
+                        "kind": "tool_post",
+                        "recorded_at": "2026-11-21T12:00:00Z",
+                        "payload": {"worker": seq},
+                    }
+                ).encode()
+            elif idx == 6:
+                raw = b"not json"
+            else:
+                raw = json.dumps(
+                    {
+                        "event_id": f"ev-cold-bad-{t}",
+                        "producer_stream": "cold-r2-stream",
+                        "sequence": 99,
+                        "harness_id": "claude-code",
+                        "kind": "tool_post",
+                        "recorded_at": "2026-11-21T12:00:00Z",
+                        "payload": {"note": "<private>UNCLOSED_R2_BAIT"},
+                    }
+                ).encode()
+            return run_hook(raw, outbox_dir=ob, log_path=lp)
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            rcs = [f.result(timeout=15.0) for f in [pool.submit(_thread_worker, i) for i in range(8)]]
+        assert rcs == [0] * 8
+        pending = OutboxSpool(cold_outbox, permissions=os_.permissions, file_lock=OUTBOX_FILE_LOCK).read_pending(
+            limit=100, producer_stream="cold-r2-stream"
+        )
+        assert sorted(e.sequence for e in pending) == [1, 2, 3, 4, 5, 6]
+        assert cold_log.is_file()
+        log_text = cold_log.read_text(encoding="utf-8")
+        assert log_text.count("invalid_input") == 2
+        assert "insecure_permissions" not in log_text
+        assert "UNCLOSED_R2_BAIT" not in log_text
+        assert os_.permissions.problems(cold_outbox) == []
+        assert os_.permissions.object_problems(cold_log) == []
+
+    # Cross-process concurrent cold creation via synchronized python -I hook_entry processes.
+    proc_outbox = loose_parent / "cold-outbox-proc"
+    proc_log = loose_parent / "cold-proc.log"
+    proc_cmd = (
+        "import os, sys; "
+        "os.umask(0o022) if os.name == 'posix' else None; "
+        "from superbrain.composition.hook_entry import main; "
+        "sys.stdout.write('READY\\n'); sys.stdout.flush(); "
+        "assert sys.stdin.buffer.readline() == b'GO\\n'; "
+        "sys.exit(main(sys.argv[1:]))"
+    )
+    proc_payloads: list[bytes] = []
+    for idx in range(6):
+        if idx < 4:
+            seq = idx + 1
+            proc_payloads.append(
+                json.dumps(
+                    {
+                        "event_id": f"ev-proc-{seq}",
+                        "producer_stream": "cold-r2-proc",
+                        "sequence": seq,
+                        "harness_id": "claude-code",
+                        "kind": "tool_post",
+                        "recorded_at": "2026-11-21T12:00:00Z",
+                        "payload": {"proc": seq},
+                    }
+                ).encode()
+            )
+        else:
+            proc_payloads.append(b"{corrupt")
+
+    procs: list[subprocess.Popen[bytes]] = []
+    try:
+        for _ in range(6):
+            p = subprocess.Popen(
+                [sys.executable, "-I", "-c", proc_cmd, "--outbox", str(proc_outbox), "--log", str(proc_log)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=_clean_env(),
+            )
+            procs.append(p)
+        for p in procs:
+            assert p.stdout is not None
+            assert p.stdout.readline().strip() == b"READY"
+        for p, payload in zip(procs, proc_payloads, strict=True):
+            assert p.stdin is not None
+            p.stdin.write(b"GO\n" + payload)
+            p.stdin.flush()
+            p.stdin.close()
+        proc_rcs = [p.wait(timeout=15.0) for p in procs]
+    finally:
+        for p in procs:
+            if p.poll() is None:
+                p.terminate()
+                p.wait(timeout=5.0)
+    assert proc_rcs == [0] * 6
+    proc_pending = OutboxSpool(proc_outbox, permissions=os_.permissions, file_lock=OUTBOX_FILE_LOCK).read_pending(
+        limit=100, producer_stream="cold-r2-proc"
+    )
+    assert sorted(e.sequence for e in proc_pending) == [1, 2, 3, 4]
+    assert proc_log.is_file()
+    proc_log_text = proc_log.read_text(encoding="utf-8")
+    assert proc_log_text.count("invalid_input") == 2
+    assert "insecure_permissions" not in proc_log_text
+    assert os_.permissions.problems(proc_outbox) == []
+    assert os_.permissions.object_problems(proc_log) == []
+
+    # Negative twins: pre-existing insecure outbox dir or log file under loose parent must fail closed.
+    pre_bad_outbox = loose_parent / "preexisting-insecure-outbox"
+    pre_bad_outbox.mkdir()
+    if sys.platform != "win32":
+        os.chmod(pre_bad_outbox, 0o755)
+    assert os_.permissions.problems(pre_bad_outbox)
+    with pytest.raises(BrainError) as exc_pre_dir:
+        OutboxSpool(pre_bad_outbox, permissions=os_.permissions, file_lock=OUTBOX_FILE_LOCK).read_pending(limit=10)
+    assert exc_pre_dir.value.code is ErrorCode.INSECURE_PERMISSIONS
+
+    good_diag_log = trusted_tmp / "pre-dir-diag.log"
+    valid_bytes = json.dumps(
+        {
+            "event_id": "ev-pre-bad-dir",
+            "producer_stream": "cold-r2-stream",
+            "sequence": 1,
+            "harness_id": "claude-code",
+            "kind": "tool_post",
+            "recorded_at": "2026-11-21T12:00:00Z",
+            "payload": {"k": "v"},
+        }
+    ).encode()
+    assert run_hook(valid_bytes, outbox_dir=pre_bad_outbox, log_path=good_diag_log) == 0
+    assert "insecure_permissions" in good_diag_log.read_text(encoding="utf-8")
+
+    pre_bad_log = loose_parent / "preexisting-insecure.log"
+    pre_bad_log.write_bytes(b"preexisting-sentinel\n")
+    if sys.platform != "win32":
+        os.chmod(pre_bad_log, 0o644)
+    assert os_.permissions.object_problems(pre_bad_log)
+    assert run_hook(b"not-json", outbox_dir=trusted_tmp / "outbox-for-bad-log", log_path=pre_bad_log) == 0
+    assert pre_bad_log.read_bytes() == b"preexisting-sentinel\n"

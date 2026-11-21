@@ -10,7 +10,7 @@ from superbrain.adapters.os.durable import publisher_for
 from superbrain.adapters.os.locks import OsLockFactory
 from superbrain.adapters.os.paths import OsPathSafety
 from superbrain.adapters.os.physical_fs import OsPhysicalFs
-from superbrain.ports.capture import register_outbox_permissions
+from superbrain.ports.capture import register_outbox_dir_renamer, register_outbox_permissions
 from superbrain.ports.clock import Clock, MonotonicClock
 from superbrain.ports.os import OsAdapters, PermissionGuard, PlatformTraits
 
@@ -28,6 +28,7 @@ else:
 
 
 register_outbox_permissions(_permission_guard())
+register_outbox_dir_renamer(publisher_for(sys.platform).rename_dir)
 
 
 def _default_windows_scratch_base() -> Path | None:

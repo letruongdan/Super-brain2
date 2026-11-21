@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -25,25 +25,18 @@ from superbrain.core.jsonvalue import JsonValue
 
 DEFAULT_OUTBOX_MAX_BYTES = 104_857_600
 """Default per-outbox disk cap (100 MiB = 104,857,600 bytes)."""
-
 MAX_CAPTURE_SEQUENCE = (1 << 63) - 1
 """Maximum valid capture sequence fitting signed 64-bit SQLite storage."""
-
 CAPTURE_WIRE_OVERHEAD_RESERVE_BYTES = 4096
 """Reserved bytes below ``MAX_WIRE_BODY_BYTES`` for loopback batch envelope metadata."""
-
 MAX_CAPTURE_ENTRY_BYTES = MAX_WIRE_BODY_BYTES - CAPTURE_WIRE_OVERHEAD_RESERVE_BYTES
 """Maximum canonical serialized bytes for any single capture record."""
-
 HOOK_TARGET_BUDGET_NS = 100_000_000
 """Warm hook target latency budget (100 ms)."""
-
 HOOK_HARD_CAP_NS = 2_000_000_000
 """Hard wall/monotonic cap for a single hook execution (2 s)."""
-
 MAX_CAPTURE_BATCH_EVENTS = 1024
 """Maximum entries allowed in a single capture ingest batch."""
-
 OUTBOX_RECORD_EVENT = "event"
 OUTBOX_RECORD_GAP = "capture_gap"
 
@@ -189,8 +182,11 @@ class OutboxFileLockPort(Protocol):
     def unlock_fd(self, fd: int) -> None: ...
 
 
+OutboxDirRenamer = Callable[[Path, Path], None]
+
 _DEFAULT_OUTBOX_FILE_LOCK: OutboxFileLockPort | None = None
 _DEFAULT_OUTBOX_PERMISSIONS: OutboxPermissionsPort | None = None
+_DEFAULT_OUTBOX_DIR_RENAMER: OutboxDirRenamer | None = None
 
 
 def register_outbox_file_lock(adapter: OutboxFileLockPort) -> None:
@@ -213,6 +209,17 @@ def register_outbox_permissions(adapter: OutboxPermissionsPort) -> None:
 def default_outbox_permissions() -> OutboxPermissionsPort | None:
     """Return the registered OS permission adapter, or ``None`` if OS adapters have not loaded."""
     return _DEFAULT_OUTBOX_PERMISSIONS
+
+
+def register_outbox_dir_renamer(renamer: OutboxDirRenamer) -> None:
+    """Register the process-wide atomic no-replace directory rename helper."""
+    global _DEFAULT_OUTBOX_DIR_RENAMER
+    _DEFAULT_OUTBOX_DIR_RENAMER = renamer
+
+
+def default_outbox_dir_renamer() -> OutboxDirRenamer | None:
+    """Return the registered atomic directory renamer, or ``None`` if OS adapters have not loaded."""
+    return _DEFAULT_OUTBOX_DIR_RENAMER
 
 
 @dataclass(frozen=True)
@@ -581,10 +588,10 @@ __all__ = [
     "HOOK_HARD_CAP_NS", "HOOK_TARGET_BUDGET_NS", "MAX_CAPTURE_BATCH_EVENTS",
     "MAX_CAPTURE_ENTRY_BYTES", "MAX_CAPTURE_SEQUENCE", "OUTBOX_RECORD_EVENT", "OUTBOX_RECORD_GAP",
     "CaptureBatchAck", "CaptureEventRecord", "CaptureHealthSnapshot",
-    "CapturePrivacyFilterPort", "CaptureStorePort", "OutboxEntry", "OutboxFileLockPort",
-    "OutboxPermissionsPort", "ProducerCaptureGap", "StagedCaptureEvent",
+    "CapturePrivacyFilterPort", "CaptureStorePort", "OutboxDirRenamer", "OutboxEntry",
+    "OutboxFileLockPort", "OutboxPermissionsPort", "ProducerCaptureGap", "StagedCaptureEvent",
     "assert_no_forbidden_capture_keys", "clone_json_mapping", "compute_contiguous_event_acked_through",
-    "default_outbox_file_lock", "default_outbox_permissions", "freeze_json_mapping",
-    "register_outbox_file_lock", "register_outbox_permissions", "require_capture_sequence",
-    "require_iso_utc_timestamp",
+    "default_outbox_dir_renamer", "default_outbox_file_lock", "default_outbox_permissions",
+    "freeze_json_mapping", "register_outbox_dir_renamer", "register_outbox_file_lock",
+    "register_outbox_permissions", "require_capture_sequence", "require_iso_utc_timestamp",
 ]
