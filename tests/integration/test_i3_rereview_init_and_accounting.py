@@ -16,6 +16,7 @@ from typing import Any
 import pytest
 
 from superbrain.adapters.os import os_adapters
+from superbrain.composition._init_recovery import compute_init_request_digest
 from superbrain.composition.init_entry import InitRequest, init_store
 from superbrain.core._kernel_approval import (
     RISK_POLICY_VERSION,
@@ -42,7 +43,6 @@ from tests.support import rereview_1d666f5 as rr
 from tests.support.clock import FakeClock
 from tests.support.fs import digest_tree
 from tests.support.inc2_fixture import open_kernel_job_runtime, reopen_kernel_job_runtime
-from tests.support.init_clone import init_store_cloned
 
 OWNER = "dan"
 MACHINE = "rereview-f3-f5"
@@ -247,10 +247,22 @@ def test_f3_completed_and_user_owned_stores_refuse_init_without_mutation(trusted
     clock = FakeClock(datetime(2026, 11, 20, 12, 0, tzinfo=UTC))
     os_ = os_adapters(clock=clock)
     done = _f3_request(trusted_tmp, os_, "f3-completed")
-    init_store_cloned(
-        os_, data_root=done.data_root, cfg_dir=done.config_dir, owner_id=done.owner_id,
-        machine_id=done.machine_id, signer=done.signer,
-    )
+    init_store(done, os_)
+    policy_db = done.data_root / "policy" / "policy.db"
+    with closing(sqlite3.connect(f"file:{policy_db.resolve().as_posix()}?mode=ro", uri=True)) as conn:
+        meta_row = conn.execute("SELECT value FROM meta WHERE key = 'init_bootstrap_state'").fetchone()
+        assert meta_row is not None
+        meta_state = json.loads(meta_row[0])
+        assert meta_state["status"] == "completed"
+        assert meta_state["config_dir"] == os.path.abspath(done.config_dir)
+        assert meta_state["request_digest"] == compute_init_request_digest(
+            owner_id=done.owner_id, machine_id=done.machine_id, signer=done.signer, config_dir=done.config_dir
+        )
+    snap_clean_data, snap_clean_cfg = digest_tree(done.data_root), digest_tree(done.config_dir)
+    with pytest.raises(BrainError) as clean_refused:
+        init_store(done, os_)
+    assert clean_refused.value.code is ErrorCode.INVALID_INPUT
+    assert digest_tree(done.data_root) == snap_clean_data and digest_tree(done.config_dir) == snap_clean_cfg
     stale = done.config_dir / ".init-bootstrap.json"
     stale.write_bytes(b'{"status":"in_progress","stale":true}\n')
     os_.permissions.secure_file(stale)

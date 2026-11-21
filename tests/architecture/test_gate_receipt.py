@@ -3147,3 +3147,82 @@ def test_worker_partition_sharded_pytest_avoids_sibling_key_error_and_aggregates
     assert agg_receipt["reasons"] == []
     assert agg_receipt["counts"]["passed"] == len(all_ids)
     assert sum(agg_receipt["counts"].values()) == len(all_ids)
+
+
+def test_aggregate_partition_receipts_refuses_when_evidence_write_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    aggregate_partition_receipts = getattr(gate, "aggregate_partition_receipts", None)
+    assert aggregate_partition_receipts is not None, "scripts.gate must export aggregate_partition_receipts"
+
+    workers_dir = tmp_path / "workers"
+    tc_part0 = [f"tests/storage/test_cas.py::test_case_{i}" for i in range(5)]
+    tc_part1 = [f"tests/storage/test_backup.py::test_case_{i}" for i in range(5)]
+    full_inventory = tc_part0 + tc_part1
+
+    _make_worker_attempt(workers_dir, 0, 2, 50.0, tc_part0, full_inventory=full_inventory)
+    _make_worker_attempt(workers_dir, 1, 2, 60.0, tc_part1, full_inventory=full_inventory)
+
+    orig_write_bytes = Path.write_bytes
+
+    def faulty_write_bytes(self: Path, data: bytes) -> int:
+        if self.name == "source.json" and self.parent.name.startswith("attempt-"):
+            raise OSError(errno.EIO, "Injected disk write failure for source.json")
+        return orig_write_bytes(self, data)
+
+    monkeypatch.setattr(Path, "write_bytes", faulty_write_bytes)
+
+    agg_ev = tmp_path / "agg_ev"
+    agg_ev.mkdir()
+    receipt, digest = aggregate_partition_receipts(
+        workers_dir, python="3.14", partition_count=2, evidence_dir=agg_ev
+    )
+
+    assert receipt["accepted"] is False
+    assert any(r.startswith("evidence: could not write source.json") for r in receipt.get("reasons", []))
+    assert receipt["evidence"]["manifest"] == {}
+
+    attempts = [p for p in agg_ev.iterdir() if p.is_dir() and p.name.startswith("attempt-")]
+    assert len(attempts) == 1, f"expected one attempt dir under {agg_ev}, found {attempts}"
+    agg_attempt = attempts[0]
+    on_disk_path = agg_attempt / "receipt.json"
+    assert on_disk_path.is_file()
+    on_disk_receipt = json.loads(on_disk_path.read_text(encoding="utf-8"))
+    assert on_disk_receipt["accepted"] is False
+    assert any(r.startswith("evidence: could not write source.json") for r in on_disk_receipt.get("reasons", []))
+    assert on_disk_receipt["evidence"]["manifest"] == {}
+    assert on_disk_receipt["receipt_digest"] == digest
+    payload = {k: v for k, v in on_disk_receipt.items() if k != "receipt_digest"}
+    assert digest_bytes(canonical_json(payload)) == digest
+    files = {p.relative_to(agg_attempt).as_posix() for p in agg_attempt.rglob("*") if p.is_file()}
+    assert files == {"receipt.json"}, f"unexpected artifact files on disk: {files}"
+
+    fake_repo = tmp_path / "fake_repo"
+    (fake_repo / "scripts").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(gate, "__file__", str(fake_repo / "scripts" / "gate.py"))
+    cli_ev = tmp_path / "cli_agg_ev"
+    cli_ev.mkdir()
+
+    cli_code = gate.main(
+        [
+            "aggregate",
+            "--python",
+            "3.14",
+            "--partition-count",
+            "2",
+            "--workers-dir",
+            str(workers_dir),
+            "--evidence-dir",
+            str(cli_ev),
+        ]
+    )
+    assert cli_code == 1
+
+    gate_dir = fake_repo / ".gate"
+    assert gate_dir.is_dir()
+    legacy_receipts = list(gate_dir.glob("*.json"))
+    assert len(legacy_receipts) == 1
+    cli_disk_receipt = json.loads(legacy_receipts[0].read_text(encoding="utf-8"))
+    assert cli_disk_receipt["accepted"] is False
+    assert any(r.startswith("evidence: could not write source.json") for r in cli_disk_receipt.get("reasons", []))
+

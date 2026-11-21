@@ -1816,6 +1816,7 @@ def aggregate_partition_receipts(
             "host": _host(),
         }),
     )
+    reasons.extend(ev.errors)
     reason_items: list[JsonValue] = list(reasons)
     time_items: list[JsonValue] = list(worker_times)
     agg_receipt: dict[str, JsonValue] = {
