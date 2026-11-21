@@ -9,6 +9,7 @@ import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
+from superbrain.adapters.os.locks import OUTBOX_FILE_LOCK
 from superbrain.application.privacy import PrivacyFilter
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.ids import new_id
@@ -37,7 +38,9 @@ def _write_static_log(log_path: Path | None, *, phase: str, code: str) -> None:
 
 
 def _make_spool(outbox_dir: Path, spool_factory: Callable[[Path], OutboxSpool] | None) -> OutboxSpool:
-    return spool_factory(outbox_dir) if spool_factory is not None else OutboxSpool(outbox_dir)
+    if spool_factory is not None:
+        return spool_factory(outbox_dir)
+    return OutboxSpool(outbox_dir, file_lock=OUTBOX_FILE_LOCK)
 
 
 def run_hook(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 
+from superbrain.adapters.os.locks import OUTBOX_FILE_LOCK  # noqa: F401
 from superbrain.cli_api.capture_client import CaptureClient
 from superbrain.cli_api.loopback import LoopbackTarget
 from superbrain.core.errors import BrainError, ErrorCode

@@ -7,7 +7,6 @@ import hashlib
 import json
 import os
 import stat
-import sys
 import threading
 import time
 import zlib
@@ -27,8 +26,10 @@ from superbrain.ports.capture import (
     CaptureBatchAck,
     CaptureEventRecord,
     OutboxEntry,
+    OutboxFileLockPort,
     OutboxPermissionsPort,
     ProducerCaptureGap,
+    default_outbox_file_lock,
 )
 
 _REPARSE_POINT = 0x400
@@ -69,12 +70,11 @@ def _check_safe_path_syntax(path: Path) -> None:
     raw = os.fspath(path)
     if not raw or "\x00" in raw or ".." in path.parts:
         raise BrainError(ErrorCode.UNSAFE_PATH, "unsafe outbox path")
-    if sys.platform == "win32":
-        if raw.startswith(("\\\\", "//")):
-            raise BrainError(ErrorCode.UNSAFE_PATH, "unsafe outbox path")
-        drive_colon = 1 if len(raw) >= 2 and raw[0].isalpha() and raw[1] == ":" else -1
-        if any(i != drive_colon for i, ch in enumerate(raw) if ch == ":"):
-            raise BrainError(ErrorCode.UNSAFE_PATH, "unsafe outbox path")
+    if raw.startswith(("\\\\", "//")):
+        raise BrainError(ErrorCode.UNSAFE_PATH, "unsafe outbox path")
+    drive_colon = 1 if len(raw) >= 2 and raw[0].isalpha() and raw[1] == ":" else -1
+    if any(i != drive_colon for i, ch in enumerate(raw) if ch == ":"):
+        raise BrainError(ErrorCode.UNSAFE_PATH, "unsafe outbox path")
 
 
 def _reject_links_upward(path: Path) -> None:
@@ -127,6 +127,7 @@ class OutboxSpool:
         max_bytes: int = DEFAULT_OUTBOX_MAX_BYTES,
         monotonic_ns: Callable[[], int] = time.monotonic_ns,
         permissions: OutboxPermissionsPort | None = None,
+        file_lock: OutboxFileLockPort | None = None,
     ) -> None:
         _check_safe_path_syntax(path)
         require_positive_int(max_bytes)
@@ -135,6 +136,7 @@ class OutboxSpool:
         self._max_bytes = max_bytes
         self._monotonic_ns = monotonic_ns
         self._permissions = permissions
+        self._file_lock = file_lock
         self._thread_lock = _thread_lock_for(self._root)
         self._ensure_layout_verified()
 
@@ -145,20 +147,20 @@ class OutboxSpool:
     def _secure_dir(self, directory: Path) -> None:
         if self._permissions is not None:
             self._permissions.secure_directory(directory)
-        elif sys.platform != "win32":
-            try:
-                os.chmod(directory, 0o700)
-            except OSError as err:
-                raise BrainError(ErrorCode.INSECURE_PERMISSIONS, f"cannot secure directory {directory}: {err}") from err
+            return
+        try:
+            os.chmod(directory, 0o700)
+        except OSError as err:
+            raise BrainError(ErrorCode.INSECURE_PERMISSIONS, f"cannot secure directory {directory}: {err}") from err
 
     def _secure_file(self, file_path: Path) -> None:
         if self._permissions is not None:
             self._permissions.secure_file(file_path)
-        elif sys.platform != "win32":
-            try:
-                os.chmod(file_path, 0o600)
-            except OSError as err:
-                raise BrainError(ErrorCode.INSECURE_PERMISSIONS, f"cannot secure file {file_path}: {err}") from err
+            return
+        try:
+            os.chmod(file_path, 0o600)
+        except OSError as err:
+            raise BrainError(ErrorCode.INSECURE_PERMISSIONS, f"cannot secure file {file_path}: {err}") from err
 
     def _ensure_dir(self, directory: Path) -> None:
         _reject_links_upward(directory)
@@ -183,8 +185,6 @@ class OutboxSpool:
 
     @staticmethod
     def _sync_dir(directory: Path) -> None:
-        if sys.platform == "win32":
-            return
         try:
             fd = os.open(directory, os.O_RDONLY)
         except OSError:
@@ -256,41 +256,27 @@ class OutboxSpool:
                 finally:
                     os.close(fd)
 
+    def _resolve_file_lock(self) -> OutboxFileLockPort | None:
+        return self._file_lock if self._file_lock is not None else default_outbox_file_lock()
+
     def _acquire_file_lock(self, fd: int, *, deadline_ns: int | None) -> bool:
+        adapter = self._resolve_file_lock()
+        if adapter is None:
+            return False
         while True:
             if deadline_ns is not None and int(self._monotonic_ns()) >= deadline_ns:
                 raise BrainError(ErrorCode.DEADLINE_EXCEEDED, "deadline exceeded")
             try:
-                if sys.platform == "win32":
-                    import msvcrt
-
-                    os.lseek(fd, 0, os.SEEK_SET)
-                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-                else:
-                    import fcntl
-
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                return True
+                if adapter.try_lock_fd(fd):
+                    return True
             except OSError as err:
-                if err.errno in (errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK, errno.EDEADLK):
-                    time.sleep(0.002)
-                    continue
                 raise _raise_storage_error(err, "cannot lock outbox") from err
+            time.sleep(0.002)
 
-    @staticmethod
-    def _release_file_lock(fd: int) -> None:
-        try:
-            if sys.platform == "win32":
-                import msvcrt
-
-                os.lseek(fd, 0, os.SEEK_SET)
-                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(fd, fcntl.LOCK_UN)
-        except OSError:
-            pass
+    def _release_file_lock(self, fd: int) -> None:
+        adapter = self._resolve_file_lock()
+        if adapter is not None:
+            adapter.unlock_fd(fd)
 
     def _iter_frame_paths(self, *, producer_stream: str | None = None) -> list[Path]:
         streams_root = self._root / _STREAMS_DIR

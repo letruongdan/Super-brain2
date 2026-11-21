@@ -53,42 +53,19 @@ EVENT_SOURCES: frozenset[str] = frozenset({"tool_observed", "unknown"})
 EVENT_SOURCE_VERIFICATIONS: frozenset[str] = frozenset({"verified_host", "unverified", "unavailable"})
 
 FORBIDDEN_CLIENT_CAPTURE_KEYS: frozenset[str] = frozenset(
-    {
-        "source",
-        "source_verification",
-        "exposure_evidence",
-        "session_id",
-        "raw_session_id",
-    }
+    {"source", "source_verification", "exposure_evidence", "session_id", "raw_session_id"}
 )
 
 _ISO_UTC_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?Z$")
 
 _EVENT_ALLOWED_KEYS: frozenset[str] = frozenset(
     {
-        "record_kind",
-        "event_id",
-        "producer_stream",
-        "sequence",
-        "harness_id",
-        "kind",
-        "recorded_at",
-        "payload",
-        "session_ref",
-        "source_metadata",
+        "record_kind", "event_id", "producer_stream", "sequence", "harness_id",
+        "kind", "recorded_at", "payload", "session_ref", "source_metadata",
     }
 )
 _GAP_ALLOWED_KEYS: frozenset[str] = frozenset(
-    {
-        "record_kind",
-        "gap_id",
-        "producer_stream",
-        "sequence",
-        "reason",
-        "recorded_at",
-        "estimated_count",
-        "duration_ms",
-    }
+    {"record_kind", "gap_id", "producer_stream", "sequence", "reason", "recorded_at", "estimated_count", "duration_ms"}
 )
 
 
@@ -184,6 +161,28 @@ class OutboxPermissionsPort(Protocol):
     def secure_file(self, path: Path) -> None: ...
 
     def problems(self, path: Path) -> Sequence[object]: ...
+
+
+class OutboxFileLockPort(Protocol):
+    """Non-blocking kernel file-lock adapter protocol for ``storage.outbox.OutboxSpool``."""
+
+    def try_lock_fd(self, fd: int) -> bool: ...
+
+    def unlock_fd(self, fd: int) -> None: ...
+
+
+_DEFAULT_OUTBOX_FILE_LOCK: OutboxFileLockPort | None = None
+
+
+def register_outbox_file_lock(adapter: OutboxFileLockPort) -> None:
+    """Register the process-wide OS file-lock adapter used by ``OutboxSpool`` by default."""
+    global _DEFAULT_OUTBOX_FILE_LOCK
+    _DEFAULT_OUTBOX_FILE_LOCK = adapter
+
+
+def default_outbox_file_lock() -> OutboxFileLockPort | None:
+    """Return the registered OS file-lock adapter, or ``None`` if OS adapters have not loaded."""
+    return _DEFAULT_OUTBOX_FILE_LOCK
 
 
 @dataclass(frozen=True)
@@ -592,8 +591,8 @@ __all__ = [
     "FORBIDDEN_CLIENT_CAPTURE_KEYS", "HOOK_HARD_CAP_NS", "HOOK_TARGET_BUDGET_NS",
     "MAX_CAPTURE_BATCH_EVENTS", "OUTBOX_RECORD_EVENT", "OUTBOX_RECORD_GAP",
     "CaptureBatchAck", "CaptureEventRecord", "CaptureHealthSnapshot",
-    "CapturePrivacyFilterPort", "CaptureStorePort", "OutboxEntry",
+    "CapturePrivacyFilterPort", "CaptureStorePort", "OutboxEntry", "OutboxFileLockPort",
     "OutboxPermissionsPort", "ProducerCaptureGap", "StagedCaptureEvent",
-    "assert_no_forbidden_capture_keys", "clone_json_mapping",
-    "compute_contiguous_event_acked_through", "freeze_json_mapping", "require_iso_utc_timestamp",
+    "assert_no_forbidden_capture_keys", "clone_json_mapping", "compute_contiguous_event_acked_through",
+    "default_outbox_file_lock", "freeze_json_mapping", "register_outbox_file_lock", "require_iso_utc_timestamp",
 ]
