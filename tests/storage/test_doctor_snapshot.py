@@ -481,7 +481,7 @@ def test_doctor_snapshot_groups_and_durability_tier(
     rep_disk_warn = run_doctor(
         rep.daemon_config_path,
         os_=os_,
-        limits=DoctorScanLimits(disk_warn_free_bytes=free_bytes + 1024 * 1024, disk_fail_free_bytes=1024),
+        limits=DoctorScanLimits(disk_warn_free_bytes=free_bytes + 1024 * 1024 * 1024, disk_fail_free_bytes=1024),
     )
     assert rep_disk_warn.overall_status == "warn"
     assert any(
@@ -493,8 +493,8 @@ def test_doctor_snapshot_groups_and_durability_tier(
         rep.daemon_config_path,
         os_=os_,
         limits=DoctorScanLimits(
-            disk_warn_free_bytes=free_bytes + 2 * 1024 * 1024,
-            disk_fail_free_bytes=free_bytes + 1024 * 1024,
+            disk_warn_free_bytes=free_bytes + 2 * 1024 * 1024 * 1024,
+            disk_fail_free_bytes=free_bytes + 1024 * 1024 * 1024,
         ),
     )
     assert rep_disk_fail.overall_status == "fail"
