@@ -298,7 +298,7 @@ _WHEEL_FIXTURE_FILES: frozenset[str] = frozenset(
 # 7 s with the mean JUnit file time from the Python 3.11 and 3.14 Windows runs.
 _HEAVY_FILE_COST_MS: dict[str, int] = {
     "tests/integration/test_apply_journal_crash_matrix.py": 65000,
-    "tests/integration/test_doctor_cli.py": 96000,
+    "tests/integration/test_doctor_cli.py": 102000,
     "tests/integration/test_doctor_fix.py": 120000,
     "tests/integration/test_doctor_jobs.py": 15534,
     "tests/integration/test_doctor_sp2_probes.py": 14054,
