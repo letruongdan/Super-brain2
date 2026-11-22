@@ -297,7 +297,7 @@ _WHEEL_FIXTURE_FILES: frozenset[str] = frozenset(
 # After the I3/SP2 merge (fb3d8d1), replace estimates whose local error is at least
 # 7 s with the mean JUnit file time from the Python 3.11 and 3.14 Windows runs.
 _HEAVY_FILE_COST_MS: dict[str, int] = {
-    "tests/integration/test_apply_journal_crash_matrix.py": 50615,
+    "tests/integration/test_apply_journal_crash_matrix.py": 58000,
     "tests/integration/test_doctor_cli.py": 52000,
     "tests/integration/test_doctor_fix.py": 120000,
     "tests/integration/test_doctor_jobs.py": 15534,
