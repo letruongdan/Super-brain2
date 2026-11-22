@@ -84,7 +84,12 @@ def build_tool_caller(
                 ca_pem=ca_pem,
                 leaf_cert_sha256=profile.leaf_cert_sha256,
             )
-            scope_for_call = None if tool == "get_health" else (selected.scope if selected is not None else None)
+            deep_health = tool == "get_health" and norm_args.get("deep") is True
+            scope_for_call = (
+                None
+                if (tool == "get_health" and not deep_health)
+                else (selected.scope if selected is not None else None)
+            )
             command = ToolCommand(
                 tool=tool,
                 arguments=norm_args,

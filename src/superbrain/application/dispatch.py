@@ -49,6 +49,7 @@ _STORED_KIND_ACTIONS: dict[str, str] = {
     "delivery_result": "prepare_task",
     "artifact_result": "get_artifact",
     "outcome_result": "record_outcome",
+    "doctor_run": "get_health",
 }
 
 

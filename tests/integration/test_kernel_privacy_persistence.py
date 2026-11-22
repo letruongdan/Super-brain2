@@ -557,10 +557,16 @@ def test_health_stays_shallow_under_owner_saturation(
                     "ledger", "p_fixture_domain_deliveries", EPISODE_TABLE, "p_jobs_state", "idempotency",
                 ))
 
-            before = totals()
-            _error(shim.call("get_health", {
+            deep_ok = _success(shim.call("get_health", {
                 "schema_version": "2.0", "deep": True, "idempotency_key": "privacy-deep-health-0001",
-            }), ErrorCode.CAPABILITY_UNAVAILABLE)
+            }))
+            assert deep_ok["ready"] is True and ("doctor_run_id" in deep_ok and "job_id" in deep_ok)
+            assert h.loop.wait_doctor_settled(timeout=WAIT_S)
+            before = totals()
+            _error(
+                shim.call("search_knowledge", {"schema_version": "2.0", "workspace_id": binding.repo_id, "query": "x"}),
+                ErrorCode.CAPABILITY_UNAVAILABLE,
+            )
             assert totals() == before
 
         cred_b = template.cred_b

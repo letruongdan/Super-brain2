@@ -1374,9 +1374,29 @@ def test_i2_to_sp2_daemon_upgrade_replays_read_acks_and_marks_store4_attempts_un
 
         assert not sp2_prep_log.exists() or sp2_prep_log.read_text(encoding="utf-8").strip() == ""
         with contextlib.closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)) as conn:
+            doc_job_ids = {
+                str(r[0])
+                for r in conn.execute("SELECT job_id FROM p_jobs_state WHERE kind = 'system.doctor'").fetchall()
+            }
+            doc_run_ids = {
+                str(json.loads(bytes(r[0]).decode("utf-8"))["doctor_run_id"])
+                for r in conn.execute("SELECT meta FROM ledger WHERE kind = 'doctor.run'").fetchall()
+            }
+            doc_holders = doc_job_ids | doc_run_ids
+            non_doctor_ledger = 0
+            for lkind, lmeta in conn.execute("SELECT kind, meta FROM ledger").fetchall():
+                if lkind == "doctor.run":
+                    continue
+                parsed_meta = json.loads(bytes(lmeta).decode("utf-8")) if lmeta else {}
+                if str(lkind).startswith("job.") and parsed_meta.get("job_id") in doc_job_ids:
+                    continue
+                if lkind == "cas.hold" and parsed_meta.get("holder_id") in doc_holders:
+                    continue
+                non_doctor_ledger += 1
             counts_after = {
-                tbl: int(conn.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0])
-                for tbl in ("idempotency", "ledger", "artifact_read_ack")
+                "idempotency": int(conn.execute("SELECT COUNT(*) FROM idempotency").fetchone()[0]),
+                "ledger": non_doctor_ledger,
+                "artifact_read_ack": int(conn.execute("SELECT COUNT(*) FROM artifact_read_ack").fetchone()[0]),
             }
         assert counts_after == counts_before
     finally:

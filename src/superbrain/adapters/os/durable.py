@@ -426,14 +426,14 @@ class _BasePublisher:
         except OSError as err:
             raise map_os_error(err, what) from err
 
-    def durability(self, directory: Path, env: Mapping[str, str]) -> DurabilityReport:
+    def _readonly_reasons(self, directory: Path, env: Mapping[str, str]) -> tuple[bool, tuple[str, ...]]:
         try:
             exists = directory.is_dir()
         except (OSError, RuntimeError) as err:
             reason = f"cannot inspect directory: {type(err).__name__}"
-            return DurabilityReport(DurabilityTier.PROCESS_CRASH, (reason,))
+            return False, (reason,)
         if not exists:
-            return DurabilityReport(DurabilityTier.PROCESS_CRASH, ("directory does not exist",))
+            return False, ("directory does not exist",)
         reasons: list[str] = []
         info = self._fs_info(directory)
         if info.remote:
@@ -443,6 +443,20 @@ class _BasePublisher:
         elif info.fs_type not in self._durable_fs:
             reasons.append(f"unknown filesystem {info.fs_type}")
         reasons.extend(_onedrive_reasons(directory, env))
+        return True, tuple(reasons)
+
+    def durability_readonly(self, directory: Path, env: Mapping[str, str]) -> DurabilityReport:
+        """Inspect filesystem durability metadata cleanly without creating or writing probe files."""
+        exists, reasons = self._readonly_reasons(directory, env)
+        if not exists or reasons:
+            return DurabilityReport(DurabilityTier.PROCESS_CRASH, reasons)
+        return DurabilityReport(DurabilityTier.POWER_LOSS, ())
+
+    def durability(self, directory: Path, env: Mapping[str, str]) -> DurabilityReport:
+        exists, base_reasons = self._readonly_reasons(directory, env)
+        if not exists:
+            return DurabilityReport(DurabilityTier.PROCESS_CRASH, base_reasons)
+        reasons = list(base_reasons)
         if not reasons:
             probe_reason = self._probe(directory)
             if probe_reason is not None:

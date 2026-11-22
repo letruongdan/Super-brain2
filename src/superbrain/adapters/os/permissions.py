@@ -16,6 +16,11 @@ _TRUSTED_INSTALLER_SID = "S-1-5-80-956008885-3418522649-1831038044-1853292631-22
 _INHERIT_ONLY_ACE = 0x08
 _NOT_FOUND_ERRORS = (2, 3)  # ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND
 _ORIG_PATH_IS_SYMLINK = Path.is_symlink
+_REPARSE_POINT = 0x400
+
+
+def _is_reparse_or_link(st: os.stat_result) -> bool:
+    return stat.S_ISLNK(st.st_mode) or bool(getattr(st, "st_file_attributes", 0) & _REPARSE_POINT)
 
 
 def _inspect_error(path: Path, err: BaseException) -> BrainError:
@@ -29,9 +34,23 @@ def _tree(root: Path) -> Iterator[Path]:
         raise _inspect_error(Path(err.filename or root), err)
 
     yield root
-    if root.is_symlink() or not root.is_dir():
+    try:
+        root_st = root.lstat()
+    except OSError:
+        root_st = None
+    if root.is_symlink() or (root_st is not None and _is_reparse_or_link(root_st)) or not root.is_dir():
         return
     for directory, dirnames, filenames in os.walk(root, onerror=fail):
+        kept_dirs: list[str] = []
+        for dname in dirnames:
+            cand = Path(directory) / dname
+            try:
+                if cand.is_symlink() or _is_reparse_or_link(cand.lstat()):
+                    continue
+            except OSError:
+                continue
+            kept_dirs.append(dname)
+        dirnames[:] = kept_dirs
         for name in (*dirnames, *filenames):
             yield Path(directory) / name
 
@@ -40,7 +59,11 @@ def _non_symlink_tree(root: Path) -> Iterator[Path]:
     """Yield non-symlink paths under ``root`` via ``scandir`` when ``Path.is_symlink`` is unpatched."""
     if Path.is_symlink is not _ORIG_PATH_IS_SYMLINK:
         for path in _tree(root):
-            if not path.is_symlink():
+            try:
+                st = path.lstat()
+            except OSError:
+                st = None
+            if not path.is_symlink() and (st is None or not _is_reparse_or_link(st)):
                 yield path
         return
     try:
@@ -49,7 +72,7 @@ def _non_symlink_tree(root: Path) -> Iterator[Path]:
         raise _inspect_error(root, err) from err
     except OSError as err:
         raise _inspect_error(root, err) from err
-    if stat.S_ISLNK(st.st_mode):
+    if _is_reparse_or_link(st):
         return
     yield root
     if not stat.S_ISDIR(st.st_mode):
@@ -64,8 +87,14 @@ def _non_symlink_tree(root: Path) -> Iterator[Path]:
                 for entry in it:
                     if entry.is_symlink():
                         continue
+                    try:
+                        est = entry.stat(follow_symlinks=False)
+                    except OSError as err:
+                        raise _inspect_error(Path(entry.path), err) from err
+                    if _is_reparse_or_link(est):
+                        continue
                     children.append(entry.path)
-                    if entry.is_dir(follow_symlinks=False):
+                    if stat.S_ISDIR(est.st_mode):
                         subdirs.append(entry.path)
         except OSError as err:
             raise _inspect_error(Path(err.filename or current), err) from err

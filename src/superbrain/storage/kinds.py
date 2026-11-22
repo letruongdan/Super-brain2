@@ -17,6 +17,7 @@ from enum import StrEnum
 
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.jsonvalue import JsonValue
+from superbrain.core.kernel import RetentionClass as RetentionClass
 
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 _OPAQUE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
@@ -26,14 +27,6 @@ _KIND_NAME = re.compile(r"[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+")
 _TIMESTAMP = re.compile(r"([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})(\.[0-9]{1,6})?Z")
 # INT is SQLite's signed 64-bit range, so every value a handler stores fits a column.
 _INT_MIN, _INT_MAX = -(2**63), 2**63 - 1
-
-
-class RetentionClass(StrEnum):
-    """How long a blob holder keeps its blob; the ``retention`` enum of ``cas.hold``."""
-
-    EVENT_PAYLOAD = "event_payload"
-    EVIDENCE = "evidence"
-    DURABLE = "durable"
 
 
 class FieldType(StrEnum):

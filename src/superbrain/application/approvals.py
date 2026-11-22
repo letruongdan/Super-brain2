@@ -15,7 +15,9 @@ from typing import Literal
 
 from superbrain.application._approvals_types import (
     BootstrapProposalHandler,
+    DoctorOperatorHandler,
     PendingApprovalCall,
+    PendingDoctorReportCall,
     PreparedOperatorCall,
     RestoreHandler,
     _invalid,
@@ -24,6 +26,8 @@ from superbrain.application._approvals_types import (
     _signer_json,
     _unauthenticated,
     prepare_bootstrap_call,
+    prepare_doctor_fix_call,
+    prepare_doctor_report_call,
     prepare_proposal_challenge,
 )
 from superbrain.application._approvals_types import (
@@ -48,9 +52,11 @@ from superbrain.ports.approval import ApprovalPolicyPort, SshApprovalVerifierPor
 
 __all__ = [
     "BootstrapProposalHandler",
+    "DoctorOperatorHandler",
     "OperatorHandle",
     "OperatorService",
     "PendingApprovalCall",
+    "PendingDoctorReportCall",
     "PreparedOperatorCall",
     "RestoreHandler",
 ]
@@ -89,6 +95,7 @@ class OperatorService:
         review_apply: ReviewApplyService | None = None,
         restore_handler: RestoreHandler | None = None,
         bootstrap_handler: BootstrapProposalHandler | None = None,
+        doctor_handler: DoctorOperatorHandler | None = None,
     ) -> None:
         self._policy = policy
         self._ssh_verifier = ssh_verifier
@@ -96,6 +103,7 @@ class OperatorService:
         self._review_apply = review_apply
         self._restore_handler = restore_handler
         self._bootstrap_handler = bootstrap_handler
+        self._doctor_handler = doctor_handler
 
     def rebind_authorities(self, policy: ApprovalPolicyPort, review_apply: ReviewApplyService | None) -> None:
         """Update the live policy authority and review-apply service after an online restore."""
@@ -113,6 +121,10 @@ class OperatorService:
         prepared = self.prepare_call(path, principal, body, token=token)
         if prepared.immediate is not None:
             return prepared.immediate
+        if prepared.pending_doctor is not None:
+            timeout_s = prepared.pending_doctor.wait_timeout_ms / 1000.0
+            self.verify_doctor(prepared.pending_doctor, timeout_s=timeout_s)
+            return self.commit_doctor(prepared.pending_doctor)
         assert prepared.pending is not None
         new_sign_count = self.verify_pending(prepared.pending)
         return self.commit_call(prepared.pending, new_sign_count=new_sign_count)
@@ -171,6 +183,10 @@ class OperatorService:
             )
         if path == "/v2/operator/restore":
             return self._prepare_restore(principal, token, body)
+        if path == "/v2/operator/doctor/report":
+            return prepare_doctor_report_call(principal, token, body, self._doctor_handler)
+        if path == "/v2/operator/doctor/fix":
+            return prepare_doctor_fix_call(principal, body, self._doctor_handler)
         if path in _DEFERRED_PATHS:
             raise BrainError(ErrorCode.CAPABILITY_UNAVAILABLE, "capability unavailable")
         raise BrainError(ErrorCode.NOT_FOUND, "not found")
@@ -246,6 +262,28 @@ class OperatorService:
             new_sign_count=new_sign_count,
         )
         return {"signer": _signer_json(record)}
+
+    def verify_doctor(self, pending_doctor: PendingDoctorReportCall, *, timeout_s: float) -> None:
+        """Phase 2 (off owner thread): wait up to ``timeout_s`` for background ``system.doctor`` completion."""
+        if self._doctor_handler is None or pending_doctor.ticket is None:
+            raise BrainError(ErrorCode.CAPABILITY_UNAVAILABLE, "capability unavailable")
+        self._doctor_handler.wait_report(
+            pending_doctor.ticket.job_id,
+            generation=pending_doctor.ticket.generation,
+            timeout_s=timeout_s,
+        )
+
+    def commit_doctor(self, pending_doctor: PendingDoctorReportCall) -> dict[str, JsonValue]:
+        """Phase 3 (owner thread): re-verify live caller credential + generation/epoch fences before reading DTO."""
+        self._verify_caller(pending_doctor.principal, pending_doctor.token)
+        if self._doctor_handler is None or pending_doctor.ticket is None:
+            raise BrainError(ErrorCode.CAPABILITY_UNAVAILABLE, "capability unavailable")
+        return self._doctor_handler.finish_report(
+            owner_id=pending_doctor.principal.owner_id,
+            job_id=pending_doctor.ticket.job_id,
+            generation=pending_doctor.ticket.generation,
+            writer_epoch=pending_doctor.ticket.writer_epoch,
+        )
 
     # --- internals -----------------------------------------------------------------------------------------------
 

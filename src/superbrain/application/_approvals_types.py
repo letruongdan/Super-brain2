@@ -140,9 +140,119 @@ class RestoreHandler(Protocol):
 
 
 @dataclass(frozen=True)
+class DoctorOperatorTicket:
+    """Owner-thread snapshot capturing doctor job identity and generation/epoch fences."""
+
+    job_id: str
+    generation: int
+    writer_epoch: int
+    checkout_root: Path | None = None
+    immediate: dict[str, JsonValue] | None = None
+
+
+@dataclass(frozen=True)
+class PendingDoctorReportCall:
+    """Validated `/v2/operator/doctor/report` call waiting off-owner for worker completion."""
+
+    principal: Principal
+    token: str | None = None
+    ticket: DoctorOperatorTicket | None = None
+    wait_timeout_ms: int = 10_000
+
+
+class DoctorOperatorHandler(Protocol):
+    """Composition-supplied background doctor enqueue/wait/read bridge for operator routes."""
+
+    def prepare_report(
+        self,
+        *,
+        owner_id: str,
+        checkout_root: Path | None = None,
+    ) -> DoctorOperatorTicket: ...
+
+    def wait_report(
+        self,
+        job_id: str,
+        *,
+        generation: int,
+        timeout_s: float,
+    ) -> None: ...
+
+    def finish_report(
+        self,
+        *,
+        owner_id: str,
+        job_id: str,
+        generation: int,
+        writer_epoch: int,
+    ) -> dict[str, JsonValue]: ...
+
+    def run_fix(
+        self,
+        *,
+        owner_id: str,
+        body: Mapping[str, JsonValue],
+    ) -> dict[str, JsonValue]: ...
+
+
+def prepare_doctor_fix_call(
+    principal: Principal,
+    body: Mapping[str, JsonValue],
+    doctor_handler: DoctorOperatorHandler | None,
+) -> PreparedOperatorCall:
+    """Validate and execute `/v2/operator/doctor/fix` under operator owner admission."""
+    if doctor_handler is None:
+        raise BrainError(ErrorCode.CAPABILITY_UNAVAILABLE, "capability unavailable")
+    return PreparedOperatorCall(immediate=doctor_handler.run_fix(owner_id=principal.owner_id, body=body))
+
+
+def prepare_doctor_report_call(
+    principal: Principal,
+    token: str | None,
+    body: Mapping[str, JsonValue],
+    doctor_handler: DoctorOperatorHandler | None,
+) -> PreparedOperatorCall:
+    """Validate `/v2/operator/doctor/report` body and enqueue or reuse an owner-isolated ``DoctorRun``."""
+    if not set(body) <= {"wait_timeout_ms", "checkout_root"}:
+        raise _invalid()
+    wait_timeout_ms = 10_000
+    if "wait_timeout_ms" in body:
+        raw_wait = body["wait_timeout_ms"]
+        if type(raw_wait) is not int or raw_wait < 0 or raw_wait > 10_000:
+            raise _invalid()
+        wait_timeout_ms = raw_wait
+    checkout_root: Path | None = None
+    if "checkout_root" in body:
+        raw_co = body["checkout_root"]
+        if raw_co is not None:
+            if not isinstance(raw_co, str) or not raw_co or "\x00" in raw_co:
+                raise _invalid()
+            parsed_co = Path(raw_co)
+            if ".." in parsed_co.parts:
+                raise BrainError(ErrorCode.UNSAFE_PATH, "unsafe path")
+            if not parsed_co.is_absolute():
+                raise _invalid()
+            checkout_root = parsed_co
+    if doctor_handler is None:
+        raise BrainError(ErrorCode.CAPABILITY_UNAVAILABLE, "capability unavailable")
+    ticket = doctor_handler.prepare_report(owner_id=principal.owner_id, checkout_root=checkout_root)
+    if ticket.immediate is not None:
+        return PreparedOperatorCall(immediate=ticket.immediate)
+    return PreparedOperatorCall(
+        pending_doctor=PendingDoctorReportCall(
+            principal=principal,
+            token=token,
+            ticket=ticket,
+            wait_timeout_ms=wait_timeout_ms,
+        )
+    )
+
+
+@dataclass(frozen=True)
 class PreparedOperatorCall:
     immediate: dict[str, JsonValue] | None = None
     pending: PendingApprovalCall | None = None
+    pending_doctor: PendingDoctorReportCall | None = None
 
 
 class BootstrapProposalHandler(Protocol):

@@ -10,7 +10,7 @@ an exception text or a decimal amount.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import datetime
 
 from superbrain.core.canonical import digest_bytes
@@ -159,12 +159,37 @@ class JobService:
 
     def lease_next(self, epoch: int, now: datetime) -> JobLease | None:
         """Lease the first due queued job in ``(retry_at, job_id)`` order; leasing never changes ``attempt``."""
+        return self._lease_first(epoch, now, lambda tx, dt: tx.due_jobs(dt, 1), emit_crashpoints=True)
+
+    def lease_next_for_kinds(
+        self,
+        epoch: int,
+        now: datetime,
+        kinds: Sequence[str],
+        *,
+        emit_crashpoints: bool = True,
+        exclude: bool = False,
+        commit_guard: Callable[[], bool] | None = None,
+    ) -> JobLease | None:
+        """Lease the first due queued job matching (or excluding) ``kinds`` in ``(retry_at, job_id)`` order."""
+        if type(emit_crashpoints) is not bool or type(exclude) is not bool:
+            raise _invalid()
+        kind_tuple = self._checked_kinds(kinds)
+        return self._lease_first(
+            epoch, now, lambda tx, dt: tx.due_jobs_by_kinds(dt, kind_tuple, 1, exclude=exclude),
+            emit_crashpoints=emit_crashpoints, commit_guard=commit_guard,
+        )
+
+    def _lease_first(
+        self, epoch: int, now: datetime, fetch: Callable[[KernelTx, datetime], tuple[JobRecord, ...]],
+        *, emit_crashpoints: bool, commit_guard: Callable[[], bool] | None = None,
+    ) -> JobLease | None:
         self._require_epoch(epoch)
         now_utc, _ = require_aware_utc(now)
-        guard = self._claim_commit_guard
+        guard = self._claim_commit_guard if commit_guard is None else commit_guard
 
         def lease(tx: KernelTx) -> JobLease | None:
-            due = tx.due_jobs(now_utc, 1)
+            due = fetch(tx, now_utc)
             if not due:
                 return None
             if guard is not None and not guard():
@@ -174,9 +199,38 @@ class JobService:
             return claimed
 
         claimed = self._store.transact(lease)
-        if claimed is not None:
+        if claimed is not None and emit_crashpoints:
             crashpoint("jobs.after_lease")
         return claimed
+
+    def cancel_jobs_by_kinds(self, kinds: Sequence[str]) -> tuple[str, ...]:
+        """Cancel all queued/leased/running jobs matching ``kinds`` under ``system:doctor`` (e.g. restore fence)."""
+        kind_tuple = self._checked_kinds(kinds)
+        _, now = require_aware_utc(self._clock.now())
+        cancelled: list[str] = []
+
+        def cancel_batch(tx: KernelTx) -> list[tuple[str, JobState]]:
+            rows = tx.active_jobs_by_kinds(kind_tuple, RECOVERY_BATCH)
+            done: list[tuple[str, JobState]] = []
+            for row in rows:
+                self._terminal(tx, row, JobState.CANCELLED, now, actor="system:doctor")
+                done.append((row.job_id, row.state))
+            return done
+
+        while True:
+            batch = self._store.transact(cancel_batch)
+            for job_id, prior in batch:
+                cancelled.append(job_id)
+                if prior is not JobState.QUEUED and self._cancel_signal is not None:
+                    self._cancel_signal(job_id)
+            if len(batch) < RECOVERY_BATCH:
+                return tuple(cancelled)
+
+    @staticmethod
+    def _checked_kinds(kinds: Sequence[str]) -> tuple[str, ...]:
+        if isinstance(kinds, (str, bytes)) or not isinstance(kinds, Sequence) or not (1 <= len(kinds) <= 32):
+            raise _invalid()
+        return tuple(require_opaque_id(kind, label="kind") for kind in kinds)
 
     def start(self, lease: JobLease) -> None:
         """``leased -> running`` under exactly ``lease``."""

@@ -167,12 +167,21 @@ Một dòng này là `I34CrashCase` trong `tests/support/inc3_i34_crash_cases.py
 |---|---|---|---|---|---|---|---|---|---|
 | `restoring.store.after_swap_before_effect_drain` | `restore-store` | Backup `store_full` chụp lúc Evidence `E` còn hạn; ở kho sống `E` còn được giữ (`DURABLE`), tới hiện tại `E` trong snapshot đã quá hạn; dựng xong `store/restore_epoch.json` mới và `pending_restore_tombstones.json` trong stage | `stage_and_swap` đã đổi tên `store/` -> `store.replaced-*` và công bố stage làm `store/` mới (mang `restore_epoch.json` tăng và `pending_restore_tombstones.json`); `policy.db` **chưa** nhận `TOMBSTONE` của `E` | Chưa | `open_runtime` / `open_runtime_under_lease` chạy `drain_published_restore_effects` trên đúng snapshot đã công bố **trước** khi mở đọc hay nhận Job: ghi `TOMBSTONE(E)` vào `policy.db`, reconcile vào `brain.db`, xóa file tạm; lần đọc đầu chặn `E`. Lần khởi động thứ hai với hook vẫn bật là no-op | Không bao giờ ghi tombstone trước swap (bảo vệ kho sống nếu chết trước hoán đổi), nhưng một khi đã swap thì hiệu ứng hết hạn luôn hoàn tất trước khi phục vụ | `restore-store@restoring.store.after_swap_before_effect_drain` | Có test từ wheel | Snapshot đã atomic rename + `READY` trước khi `writer.lock` tăng epoch; danh sách tombstone nằm sẵn bên trong `store/` vừa công bố nên restart đọc đúng bản đó và hoàn tất bước 7 |
 
+## Doctor `--fix` (SP1 đợt 4, I4-4)
+
+Hai dòng này là `I44CrashCase` trong `tests/support/inc4_crash_cases.py::I4_4_CRASH_CASES`, chạy từ wheel venv qua `tests/support/inc4_crash_child.py` với `python -I`.
+
+| Crashpoint | Operation | Trước | Sau crash | Đã ACK? | Phục hồi | Invariant | CrashCase | Tiến trình chết | Mất điện |
+|---|---|---|---|---|---|---|---|---|---|
+| `doctor.fix.before_projection_swap` | `doctor-fix-offline` | `p_cas_holders_` thiếu dòng holder so với ledger; `r_*` đã replay xong trong transaction chưa commit | `BEGIN IMMEDIATE` rollback sạch; không còn bảng `r_*`, ledger nguyên vẹn, `writer.lock` nhả | Chưa | Chạy lại `brain doctor --offline --fix` dựng lại `r_*` và hoán đổi sang `p_*` tới `ledger_projection_match=PASS` | Không để lộ bảng `r_*` dở dang hoặc làm mất dòng live khi chết trước hoán đổi | `doctor-fix-offline@doctor.fix.before_projection_swap` | Có test từ wheel | Dựng và hoán đổi `r_* -> p_*` nằm trọn trong một transaction SQLite `synchronous=FULL` |
+| `doctor.fix.after_log_rotate_stage` | `doctor-fix-offline` | `logs/brain.log` (> 1 MiB) và `logs/brain.log.1` tồn tại | Đã ghi `.rotate-state-<id>.json` (`phase="pending_move"`, size, digest) và dời `brain.log` sang `.brain.log.rotating-<id>`; `.1` chưa dịch; log mới có thể ghi thêm vào `brain.log` | Chưa | `rotate_logs` khôi phục `.rotate-state-<id>.json` + `.brain.log.rotating-<id>` trước: chuyển sang `phase="shifting"`, dịch `.1 -> .2` đúng một lần, đưa `.rotating-<id> -> brain.log.1`, giữ nguyên `brain.log` mới nếu có | Intent bền trước khi dời log; khôi phục không mất byte cũ hay mới và không dịch đôi `.1..N` | `doctor-fix-offline@doctor.fix.after_log_rotate_stage` | Có test từ wheel | Intent `.rotate-state-<id>.json` `write_new` + `sync_directory` trước `publish(brain.log, .rotating)` với `MOVEFILE_WRITE_THROUGH` / `fsync` |
+
 ## Bảo đảm của chính ma trận
 
 - `test_every_known_crashpoint_has_a_case_and_a_doc_row`: mỗi crashpoint đã đăng ký có đúng một ca (`CrashCase`, `KernelCrashCase`,
-  `I33CrashCase`, hoặc `I34CrashCase`) và đúng một dòng trong tài liệu này, không tên nào trùng.
+  `I33CrashCase`, `I34CrashCase`, hoặc `I44CrashCase`) và đúng một dòng trong tài liệu này, không tên nào trùng.
 - `test_registry_is_exactly_the_increment_1_names_plus_the_task_8_and_i3_names`: registry bằng đúng 19 tên đợt 1 cộng
-  10 tên Task 8 cộng 10 tên I3-3 cộng 1 tên I3-4 (tổng 40). 19 ca đợt 1 và 10 ca Task 8 giữ nguyên node ID.
+  10 tên Task 8 cộng 10 tên I3-3 cộng 1 tên I3-4 cộng 2 tên I4-4 (tổng 42). 19 ca đợt 1 và 10 ca Task 8 giữ nguyên node ID.
 - `test_kernel_cases_keep_operation_at_crashpoint_ids_and_all_run`: node ID `operation@crashpoint`, operation thuộc
   `serve`/`serve-fixture`/`migrate`/`serve-jobs`/`job-operation`. Crashpoint trên đường request của shim có trigger sau READY.
 - `test_crash_case`: mỗi ca phải chết với mã 86 **đúng** ở crashpoint của nó (`run_until_crash`).

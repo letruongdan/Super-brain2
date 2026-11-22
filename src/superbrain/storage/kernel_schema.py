@@ -280,6 +280,28 @@ KERNEL_JOB_KINDS: tuple[EntryKind, ...] = (
 """Task 5 Job/ProviderInvocation kinds (no DDL): reducers in ``storage.jobs`` build ``p_jobs_*`` and
 ``p_provider_invocations_*``. States, prior states and reasons are enums; decimal quantities live only in CAS."""
 
+KERNEL_DOCTOR_KINDS: tuple[EntryKind, ...] = (
+    EntryKind(
+        "doctor.run",
+        1,
+        {
+            "doctor_run_id": FieldType.UUID,
+            "owner_id": FieldType.OPAQUE_ID,
+            "report_digest": FieldType.DIGEST,
+            "overall_status": FieldType.ENUM,
+            "recorded_at": FieldType.TIMESTAMP,
+            "trigger": FieldType.ENUM,
+            "job_id": FieldType.UUID,
+        },
+        {
+            "overall_status": frozenset({"pass", "warn", "fail"}),
+            "trigger": frozenset({"startup", "schedule", "get_health", "cli", "fix", "manual"}),
+        },
+        nullable=frozenset({"job_id"}),
+    ),
+)
+"""SP1 Increment 4 durable doctor run record kind (metadata-only reference to bounded CAS DoctorRun JSON)."""
+
 
 def _policy_v2(db: sqlite3.Connection) -> None:
     """Policy store v2 DDL: principals, credentials, repo policies/grants, workspace registry, and request HMAC key."""

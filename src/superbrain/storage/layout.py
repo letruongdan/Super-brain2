@@ -81,6 +81,10 @@ class DataRoot:
         return self.store_dir / "staging"
 
     @property
+    def scratch_dir(self) -> Path:
+        return self.root / "scratch"
+
+    @property
     def endpoint_path(self) -> Path:
         return self.root / ENDPOINT_NAME
 

@@ -217,6 +217,8 @@ def policy_allows(
 
         if scope is None:
             return action in GLOBAL_SCOPELESS_ACTIONS
+        if action == "get_health" and scope.checkout_id is None:
+            return False
 
         repo_row = db.execute(
             "SELECT owner_id, provider_egress_enabled FROM repo_policy WHERE repo_id = ?",

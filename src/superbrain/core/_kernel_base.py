@@ -32,6 +32,14 @@ GLOBAL_SCOPELESS_ACTIONS: frozenset[str] = frozenset({"get_health", "get_job", "
 """Actions a principal may perform with ``scope=None``; the single source for core and storage authorization."""
 
 
+class RetentionClass(StrEnum):
+    """How long a blob holder keeps its blob; the ``retention`` enum of ``cas.hold``."""
+
+    EVENT_PAYLOAD = "event_payload"
+    EVIDENCE = "evidence"
+    DURABLE = "durable"
+
+
 def is_strict_int(value: object) -> bool:
     """True for ``int`` excluding ``bool``."""
     return type(value) is int

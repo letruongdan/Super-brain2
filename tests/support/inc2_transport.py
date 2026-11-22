@@ -688,6 +688,7 @@ def open_test_loopback_transport(
         # Start LoopbackServer
         server.start()
         server_started = True
+        loop.wait_doctor_settled(timeout=5.0)
 
         yield harness
     finally:

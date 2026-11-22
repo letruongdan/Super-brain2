@@ -142,6 +142,15 @@ class LockFactory(Protocol):
         ...
 
 
+class LockProbePort(Protocol):
+    def probe_held(self, path: Path) -> bool:
+        """Return True iff another process holds an exclusive writer lock on ``path`` without acquiring one.
+
+        Never creates or modifies ``path``; returns False if missing and raises ``UNSAFE_PATH`` on symlinks/links.
+        """
+        ...
+
+
 @dataclass(frozen=True)
 class PlatformTraits:
     sqlite_full_fsync: bool

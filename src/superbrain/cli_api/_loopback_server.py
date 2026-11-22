@@ -235,6 +235,16 @@ class LoopbackServer:
         for sock in socks:
             _abort_socket(sock)
 
+    def _live_ready(self) -> Ready:
+        rdy = self._owner.ready
+        if rdy is not None:
+            with self._lock:
+                if rdy.identity.writer_epoch > self._ready.identity.writer_epoch:
+                    self._ready = rdy
+            return rdy
+        with self._lock:
+            return self._ready
+
     def _is_quiesced(self) -> bool:
         with self._lock:
             return self._quiesced or self._stop_event.is_set()
@@ -513,7 +523,7 @@ class LoopbackServer:
             if not handle_identity_request(
                 ssl_sock,
                 reader,
-                self._ready,
+                self._live_ready(),
                 deadline_ns=ident_deadline_ns,
                 monotonic_ns=self._monotonic_ns,
             ):
@@ -526,7 +536,7 @@ class LoopbackServer:
             handled, op_clean = try_handle_operator_request(
                 ssl_sock,
                 reader,
-                self._ready,
+                self._live_ready,
                 auth_gate=lambda: self._owner.auth_gate,
                 operator=self._operator,
                 deadline_ns=tool_deadline_ns,
@@ -541,7 +551,7 @@ class LoopbackServer:
             command = read_admitted_tool_command(
                 ssl_sock,
                 reader,
-                self._ready,
+                self._live_ready,
                 deadline_ns=tool_deadline_ns,
                 monotonic_ns=self._monotonic_ns,
             )

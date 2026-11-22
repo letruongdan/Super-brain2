@@ -11,6 +11,7 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from datetime import datetime
 from functools import partial
 from typing import TypeVar
 
@@ -26,6 +27,7 @@ from superbrain.core.kernel import (
     LineageSet,
     MirrorCandidate,
     ObjectRef,
+    RetentionClass,
     SelectorPath,
     SelectorReason,
     SnapshotStatus,
@@ -40,13 +42,9 @@ from superbrain.storage.cas import ContentStore, held_digests
 from superbrain.storage.errors import sqlite_error
 from superbrain.storage.jobs import JobKernelTxReads
 from superbrain.storage.kernel_schema import KERNEL_WORKSPACE_KINDS
-from superbrain.storage.kinds import KindRegistry, RetentionClass, is_uuid
-from superbrain.storage.ledger import LedgerEntry, ProjectionHandler, Txn
-from superbrain.storage.send_attempts import (
-    insert_read_ack_row,
-    read_read_ack_by_receipt_row,
-    read_send_attempt_row,
-)
+from superbrain.storage.kinds import KindRegistry, is_uuid
+from superbrain.storage.ledger import LedgerEntry, ProjectionHandler, Txn, normalize_hold_args
+from superbrain.storage.send_attempts import insert_read_ack_row, read_read_ack_by_receipt_row, read_send_attempt_row
 from superbrain.storage.store import Store
 
 _T = TypeVar("_T")
@@ -378,11 +376,15 @@ class StoreKernelTx(JobKernelTxReads):
         meta: dict[str, JsonValue] = dict(record.meta)
         self._txn.append(record.kind, actor=record.actor, owner_id=None, meta=meta, refs=record.refs)
 
-    def hold_blob(self, data: bytes, *, holder_id: str) -> str:
+    def hold_blob(
+        self, data: bytes, *, holder_id: str,
+        retention: RetentionClass = RetentionClass.DURABLE, expires_at: datetime | str | None = None,
+    ) -> str:
+        norm_ret, norm_exp = normalize_hold_args(retention, expires_at)
         if not is_uuid(holder_id):
             raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
         digest = self._cas.put(data)
-        self._txn.hold(digest, _HOLDER_KIND, holder_id, RetentionClass.DURABLE, None)
+        self._txn.hold(digest, _HOLDER_KIND, holder_id, norm_ret, norm_exp)
         return digest
 
     def blob_restricted(self, digest: str) -> bool:
@@ -574,9 +576,8 @@ class StoreSourceRestrictions:
         if not held:  # I2-T3-R04: only the exact current hold (event, snapshot_id, descriptor_digest) proves it
             return False
         return (
-            ref.source.revision == 1
-            and not self._policy.is_quarantined(ref.source.digest)
-            and (self._store.cas.blob_intact(ref.source.digest))
+            ref.source.revision == 1 and not self._policy.is_quarantined(ref.source.digest)
+            and self._store.cas.blob_intact(ref.source.digest)
         )
 
     def _binding_resolves(self, ref: LineageRef) -> bool:

@@ -277,6 +277,8 @@ _WHEEL_FIXTURE_FILES: frozenset[str] = frozenset(
     {
         "tests/contract/test_mcp_v2_schema.py",
         "tests/integration/test_apply_journal_crash_matrix.py",
+        "tests/integration/test_doctor_cli.py",
+        "tests/integration/test_doctor_fix.py",
         "tests/integration/test_i3_wheel_e2e.py",
         "tests/integration/test_kernel_cli.py",
         "tests/integration/test_kernel_crash_recovery.py",
@@ -289,13 +291,18 @@ _WHEEL_FIXTURE_FILES: frozenset[str] = frozenset(
         "tests/integration/test_t9_benchmark_scratch.py",
     }
 )
-# Calibrated across all 181 collected test files using hosted windows-2022 CI measurements
+# Calibrated across all collected test files using hosted windows-2022 CI measurements
 # (run 44705523078 shard-0, baseline 035a4cd, and Azure 2.43x storage scaling for new/updated storage modules)
 # plus session wheel setup overhead across the two wheel shards. _WHEEL_SETUP_COST_MS=3000 and 300s budget intact.
 # After the I3/SP2 merge (fb3d8d1), replace estimates whose local error is at least
 # 7 s with the mean JUnit file time from the Python 3.11 and 3.14 Windows runs.
 _HEAVY_FILE_COST_MS: dict[str, int] = {
     "tests/integration/test_apply_journal_crash_matrix.py": 50615,
+    "tests/integration/test_doctor_cli.py": 52000,
+    "tests/integration/test_doctor_fix.py": 72000,
+    "tests/integration/test_doctor_jobs.py": 15534,
+    "tests/integration/test_doctor_sp2_probes.py": 14054,
+    "tests/storage/test_doctor_snapshot.py": 15928,
     "tests/integration/test_kernel_crash_recovery.py": 76704,
     "tests/storage/test_kernel_revocation.py": 20114,
     "tests/integration/test_kernel_native_receipt_contract.py": 35503,

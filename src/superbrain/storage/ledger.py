@@ -16,6 +16,7 @@ from superbrain.core.canonical import canonical_json
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.ids import new_id
 from superbrain.core.jsonvalue import JsonValue
+from superbrain.core.kernel import parse_canonical_utc, require_aware_utc
 from superbrain.ports.clock import Clock
 from superbrain.ports.policy import PolicyView
 from superbrain.storage.errors import sqlite_error
@@ -94,6 +95,22 @@ def cas_hold_meta(
         "retention": str(retention),
         "expires_at": None if expires_at is None else utc_timestamp(expires_at),
     }
+
+
+def normalize_hold_args(
+    retention: RetentionClass, expires_at: datetime | str | None
+) -> tuple[RetentionClass, datetime | None]:
+    """Validate and normalize ``hold_blob`` ``retention`` and optional ``expires_at`` (UTC datetime or ISO-8601)."""
+    if not isinstance(retention, RetentionClass):
+        raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+    if expires_at is None:
+        return retention, None
+    if isinstance(expires_at, str):
+        return retention, parse_canonical_utc(expires_at)
+    if isinstance(expires_at, datetime):
+        exp_utc, _ = require_aware_utc(expires_at)
+        return retention, exp_utc
+    raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
 
 
 def _malformed(sequence: object, what: str) -> BrainError:

@@ -287,3 +287,13 @@ def verify_server_tls_files(
         not_before=leaf_cert.not_valid_before_utc,
         not_after=leaf_cert.not_valid_after_utc,
     )
+
+
+def read_server_cert_leaf_sha256(cert_path: Path, os_: OsAdapters) -> str:
+    """Return lowercase hex SHA-256 of DER server leaf cert after owner/link/regular-file verification."""
+    cert_bytes = _read_owner_only_file(cert_path, os_)
+    try:
+        leaf_cert = x509.load_pem_x509_certificate(cert_bytes)
+    except (ValueError, TypeError) as err:
+        raise BrainError(ErrorCode.INVALID_INPUT, "invalid input") from err
+    return hashlib.sha256(leaf_cert.public_bytes(serialization.Encoding.DER)).hexdigest()

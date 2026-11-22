@@ -443,6 +443,8 @@ class AuthSnapshot:
             return False
         if scope is None:
             return action in GLOBAL_SCOPELESS_ACTIONS
+        if action == "get_health" and scope.checkout_id is None:
+            return False
         repo_pol = self.repo_policies.get(scope.repo_id)
         if repo_pol is None or repo_pol.owner_id != principal.owner_id:
             return False

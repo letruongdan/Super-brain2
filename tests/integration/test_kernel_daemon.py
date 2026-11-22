@@ -1946,9 +1946,22 @@ def test_get_job_uses_owner_scope(
             ).result(timeout=BOUND_WAIT_S)
             assert denied == {"ok": False, "error": {"code": "not_found", "message": "not found"}}
 
-        # 3. Deep health and all 6 business tools return capability_unavailable after auth/validation.
+        # 3. Deep health succeeds in production mode while all 6 business tools return capability_unavailable.
+        deep_health_res = loop.submit(
+            ToolCommand(
+                "get_health",
+                {"schema_version": "2.0", "deep": True, "idempotency_key": "idem-deep-health-0001"},
+                token=tok_dan,
+            ),
+            dl_ns,
+        ).result(timeout=BOUND_WAIT_S)
+        assert deep_health_res["ok"] is True
+        deep_data = cast(dict[str, JsonValue], deep_health_res["data"])
+        assert deep_data["ready"] is True
+        assert "doctor_run_id" in deep_data and "job_id" in deep_data
+        assert (deep_data["doctor_run_id"] is not None) or (deep_data["job_id"] is not None)
+
         unsupported_calls: tuple[tuple[str, dict[str, JsonValue], Scope | None], ...] = (
-            ("get_health", {"schema_version": "2.0", "deep": True, "idempotency_key": "idem-deep-health-0001"}, None),
             (
                 "prepare_task",
                 {

@@ -15,6 +15,7 @@ import subprocess
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
@@ -26,6 +27,7 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from superbrain.adapters.harness_config.markdown_blocks import merge_markdown_block
 from superbrain.adapters.harness_config.merger import SharedConfigMergerAdapter
 from superbrain.adapters.os import os_adapters
+from superbrain.adapters.os.daemon_config import read_client_endpoint
 from superbrain.application.journal_recovery import reconcile_and_classify_journals
 from superbrain.application.review_apply import ReviewApplyService, TargetWriteInput
 from superbrain.cli_api.operator import OPERATOR_PATHS
@@ -398,7 +400,12 @@ def test_online_operator_restore_route_auth_preview_and_immediate_effect(trusted
         signed_body = {**base, "approval": ssh_ap}
         done = _post_tls(ready, ca_pem, "/v2/operator/restore", cli_token, signed_body)
         assert done["ok"] is True and int(done["data"]["trust_generation"]) > int(ch["trust_generation"])
-        replay = _post_tls(ready, ca_pem, "/v2/operator/restore", cli_token, signed_body)
+        post_ep = read_client_endpoint(DataRoot.at(cfg.data_root).endpoint_path, os_)
+        assert post_ep.writer_epoch == int(done["data"]["new_epoch"]) > ready.identity.writer_epoch
+        post_ready = replace(ready, endpoint=post_ep, identity=post_ep.identity)
+        stale = _post_tls(ready, ca_pem, "/v2/operator/restore", cli_token, signed_body)
+        assert stale["ok"] is False and stale["error"]["code"] == ErrorCode.IDENTITY_MISMATCH.value
+        replay = _post_tls(post_ready, ca_pem, "/v2/operator/restore", cli_token, signed_body)
         assert replay["ok"] is False and replay["error"]["code"] in {
             ErrorCode.UNAUTHENTICATED.value,
             ErrorCode.REVISION_CONFLICT.value,

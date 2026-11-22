@@ -47,6 +47,9 @@ KNOWN_CRASHPOINTS: frozenset[str] = frozenset({
     "apply.after_policy_grant_ended",
     # I3-4: restore post-swap before effect drain crashpoint
     "restoring.store.after_swap_before_effect_drain",
+    # I4-4: doctor --fix safe-repair crashpoints
+    "doctor.fix.before_projection_swap",
+    "doctor.fix.after_log_rotate_stage",
 })
 
 KNOWN_PAUSEPOINTS: frozenset[str] = KNOWN_CRASHPOINTS | {"writer.held"}

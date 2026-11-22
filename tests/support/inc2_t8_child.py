@@ -74,6 +74,7 @@ def _serve(config_path: Path, *, mode: str, args: Sequence[str]) -> int:
 
     def _on_ready(ready: Ready, loop: OwnerLoop) -> None:
         shutil.rmtree(scratch_base, ignore_errors=True)
+        loop.wait_doctor_settled(timeout=5.0)
         if mode == "revoke-fixture":
             from tests.support.inc2_t8_job_child import revoke_on_owner
 

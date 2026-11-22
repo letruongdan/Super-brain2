@@ -218,19 +218,20 @@ def handle_identity_request(
 
 def _read_admitted_common(
     reader: FramedReader,
-    ready: Ready,
+    ready: Ready | Callable[[], Ready],
     *,
     is_operator: bool,
     auth_gate: Callable[[], AuthGate] | None,
     deadline_ns: int,
 ) -> tuple[RequestHead, str, Principal | None, bytes]:
     head = reader.read_request_head(deadline_ns)
-    _validate_common_headers(head, expected_port=ready.endpoint.port)
+    cur_ready = ready() if callable(ready) else ready
+    _validate_common_headers(head, expected_port=cur_ready.endpoint.port)
     target_ok = head.target in (OPERATOR_PATHS if is_operator else (TOOL_CALL_PATH, CAPTURE_EVENTS_PATH))
     if head.method != "POST" or not target_ok or head.content_length is None:
         raise _AdmissionRejectedError(400, ErrorCode.INVALID_INPUT, "invalid input")
     token = _extract_bearer_token(head)
-    _validate_identity_headers(head, ready)
+    _validate_identity_headers(head, cur_ready)
     principal = _admit_operator(token, auth_gate) if (is_operator and auth_gate is not None) else None
     body = reader.read_exact(head.content_length, deadline_ns)
     if reader.has_pipelined_bytes(deadline_ns):
@@ -241,7 +242,7 @@ def _read_admitted_common(
 def read_admitted_tool_command(
     sock: socket.socket,
     reader: FramedReader,
-    ready: Ready,
+    ready: Ready | Callable[[], Ready],
     *,
     deadline_ns: int,
     monotonic_ns: Callable[[], int],
@@ -281,7 +282,7 @@ def read_admitted_tool_command(
 def read_admitted_operator_request(
     sock: socket.socket,
     reader: FramedReader,
-    ready: Ready,
+    ready: Ready | Callable[[], Ready],
     *,
     auth_gate: Callable[[], AuthGate],
     deadline_ns: int,
@@ -354,7 +355,7 @@ def serve_operator(
 def try_handle_operator_request(
     ssl_sock: ssl.SSLSocket,
     reader: FramedReader,
-    ready: Ready,
+    ready: Ready | Callable[[], Ready],
     *,
     auth_gate: Callable[[], AuthGate],
     operator: OperatorExecutor | None,

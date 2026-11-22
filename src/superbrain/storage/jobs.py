@@ -24,6 +24,7 @@ from superbrain.core.kernel import (
     JobRecord,
     JobState,
     is_strict_int,
+    require_opaque_id,
 )
 from superbrain.ports.policy import PolicyView
 from superbrain.storage.cas import ContentStore, held_digests, read_held_blob_or_none
@@ -420,6 +421,33 @@ class JobKernelTxReads:
         return self._jobs(
             "state = 'queued' AND retry_at <= ? ORDER BY retry_at, job_id LIMIT ?",
             (utc_timestamp(now), _bounded(limit)),
+        )
+
+    @staticmethod
+    def _checked_kinds(kinds: Sequence[str]) -> tuple[str, ...]:
+        if isinstance(kinds, (str, bytes)) or not isinstance(kinds, Sequence) or not (1 <= len(kinds) <= 32):
+            raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+        return tuple(require_opaque_id(kind, label="kind") for kind in kinds)
+
+    def due_jobs_by_kinds(
+        self, now: datetime, kinds: Sequence[str], limit: int, *, exclude: bool = False
+    ) -> tuple[JobRecord, ...]:
+        bounded = _bounded(limit)
+        kind_tuple = self._checked_kinds(kinds)
+        op = "NOT IN" if exclude else "IN"
+        placeholders = ", ".join("?" for _ in kind_tuple)
+        return self._jobs(
+            f"state = 'queued' AND kind {op} ({placeholders}) AND retry_at <= ? ORDER BY retry_at, job_id LIMIT ?",
+            (*kind_tuple, utc_timestamp(now), bounded),
+        )
+
+    def active_jobs_by_kinds(self, kinds: Sequence[str], limit: int) -> tuple[JobRecord, ...]:
+        bounded = _bounded(limit)
+        kind_tuple = self._checked_kinds(kinds)
+        placeholders = ", ".join("?" for _ in kind_tuple)
+        return self._jobs(
+            f"state IN ('queued', 'leased', 'running') AND kind IN ({placeholders}) ORDER BY sequence, job_id LIMIT ?",
+            (*kind_tuple, bounded),
         )
 
     def stale_jobs(self, epoch: int, limit: int) -> tuple[JobRecord, ...]:

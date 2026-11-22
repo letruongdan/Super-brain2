@@ -158,6 +158,7 @@ class DaemonRestoreHandler(RestoreHandler):
             backend=ensure_maintenance_backend(),
         )
         rt.policy.consume_approval(message, signer_id=signer_id, channel=channel, new_sign_count=new_sign_count)
+        self._session.begin_restore_doctor_fence()
         if target == "store":
             return self._execute_store_restore(rt, backup, now_dt)
         return self._execute_policy_restore(rt, backup, now_dt)
@@ -181,6 +182,7 @@ class DaemonRestoreHandler(RestoreHandler):
                 raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
         job_service = self._rebind_live(new_rt)
         job_service.recover(new_rt.lease.epoch)
+        self._session.finish_restore_doctor_reconcile()
         if new_rt.store.schema_version >= 5 and new_rt.policy.schema_version >= 4:
             reconcile_and_classify_journals(
                 StoreProposalAdapter(new_rt.store, self._adapters),
@@ -306,7 +308,6 @@ class DaemonRestoreHandler(RestoreHandler):
             )
             publish_endpoint(rt.root, rt.lease, new_endpoint, self._adapters)
             new_ready = replace(self._session.ready, endpoint=new_endpoint, identity=new_endpoint.identity)
-        self._session.rebind_after_restore(rt=rt, job_store=job_store, job_service=job_service, ready=new_ready)
         snap = rt.policy.snapshot()
         has_active_cred = any(
             not cred.revoked and snap.principals.get(cred.principal.principal_id) == cred.principal
@@ -335,6 +336,7 @@ class DaemonRestoreHandler(RestoreHandler):
                 self._session.auth_gate.publish_view(view, health_meta=health_meta)
         else:
             self._session.auth_gate.invalidate()
+        self._session.rebind_after_restore(rt=rt, job_store=job_store, job_service=job_service, ready=new_ready)
         svc = self._operator.service()
         if svc is not None:
             svc.rebind_authorities(

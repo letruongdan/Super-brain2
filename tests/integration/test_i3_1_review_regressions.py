@@ -316,8 +316,11 @@ def test_slow_ssh_verify_does_not_block_owner_loop(trusted_tmp: Path, monkeypatc
             assert b"\r\n\r\n" in health_raw, "OwnerLoop was blocked while ssh-keygen verification waited"
             assert health_raw.startswith(b"HTTP/1.1 200 ")
             health_env = _envelope(health_raw)
-            # The fixture has no deep-health domain. Its typed reply proves the call reached the owner.
-            assert _error_code(health_env) == ErrorCode.CAPABILITY_UNAVAILABLE.value
+            # Production deep health is now supported and returns a live doctor_run_id or queued job_id.
+            assert health_env["ok"] is True
+            health_data = cast(dict[str, Any], health_env["data"])
+            assert health_data["ready"] is True
+            assert (health_data.get("doctor_run_id") is not None) or (health_data.get("job_id") is not None)
             assert verify_threads and verify_threads[0] != "superbrain-owner-loop"
         finally:
             verify_release.set()

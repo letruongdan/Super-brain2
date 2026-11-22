@@ -26,12 +26,14 @@ from superbrain.application.journal_recovery import reconcile_and_classify_journ
 from superbrain.application.owner_loop import AuthGate, OwnerLoop, OwnerSession
 from superbrain.application.review_apply import ReviewApplyService
 from superbrain.cli_api._loopback_server import LoopbackServer
+from superbrain.composition._daemon_doctor import DaemonDoctorRunner
 from superbrain.composition._daemon_restore import DaemonRestoreHandler, build_review_apply_service
 from superbrain.composition._daemon_session import (
     DaemonTestHooks,
     _AdmittedOwnerSession,
     _DaemonCompositeDomain,
 )
+from superbrain.composition._doctor_fix_wiring import DoctorFixHooks
 from superbrain.composition._endpoint import (
     BoundLoopbackListener,
     bind_loopback_listener,
@@ -62,6 +64,7 @@ from superbrain.core.kernel import (
     require_aware_utc,
 )
 from superbrain.ports.clock import Clock, MonotonicClock
+from superbrain.ports.doctor import CaptureDoctorProbePort, OutboxReplayPort, SupervisorControlPort
 from superbrain.ports.os import OsAdapters
 from superbrain.storage.idempotency import StagedKernelStore
 from superbrain.storage.jobs import has_legacy_incomplete_settled_projections
@@ -105,6 +108,7 @@ def _open_owner_session(
     hooks: DaemonTestHooks,
     on_listener_bound: Callable[[BoundLoopbackListener], None] | None,
     operator: OperatorHandle | None = None,
+    doctor_fix_hooks: DoctorFixHooks | None = None,
 ) -> _AdmittedOwnerSession:
     adapters = os_ if os_ is not None else os_adapters(clock=clock, monotonic=monotonic_clock)
     resolved_clock = clock if clock is not None else adapters.clock
@@ -128,6 +132,7 @@ def _open_owner_session(
     endpoint: Endpoint | None = None
     executor: JobExecutor | None = None
     auth_gate: AuthGate | None = None
+    doctor_runner: DaemonDoctorRunner | None = None
     try:
         if hooks.after_open_before_rebuild is not None:
             hooks.after_open_before_rebuild(rt)
@@ -265,7 +270,21 @@ def _open_owner_session(
 
         if executor is not None:
             executor.start()
-            owner_wake()
+
+        doctor_runner = DaemonDoctorRunner(
+            rt=rt,
+            job_store=job_store,
+            job_service=job_service,
+            adapters=adapters,
+            clock=resolved_clock,
+            tls_not_after=verified_tls.not_after,
+            clock_untrusted_fn=bridge.clock_untrusted,
+            prune_idempotency_fn=bridge.prune_expired,
+            wake_owner=owner_wake,
+            claim_guard=lambda: not session_box or session_box[0].doctor_claim_guard(),
+            fix_hooks=doctor_fix_hooks,
+        )
+        composite_domain.bind_doctor_runner(doctor_runner)
 
         ready = Ready(
             endpoint=endpoint,
@@ -288,8 +307,10 @@ def _open_owner_session(
             reply_meta_lock=reply_meta_lock,
             reply_meta=reply_meta,
             operator=operator,
+            doctor_runner=doctor_runner,
         )
         session_box.append(session)
+        owner_wake()
         if operator is not None:
             review_apply = build_review_apply_service(
                 rt.store,
@@ -314,6 +335,7 @@ def _open_owner_session(
                     os_=adapters,
                     review_apply=review_apply,
                     restore_handler=restore_handler,
+                    doctor_handler=doctor_runner,
                     expected_endpoint_path=rt.root.endpoint_path,
                     expected_leaf_cert_sha256=verified_tls.leaf_cert_sha256,
                     server_cert_path=verified_tls.cert_path,
@@ -321,6 +343,8 @@ def _open_owner_session(
             )
         return session
     except BaseException:
+        if doctor_runner is not None:
+            doctor_runner.close()
         if operator is not None:
             operator.unbind()
         if auth_gate is not None:
@@ -348,6 +372,7 @@ def create_daemon_owner_loop(
     hooks: DaemonTestHooks | None = None,
     on_listener_bound: Callable[[BoundLoopbackListener], None] | None = None,
     operator: OperatorHandle | None = None,
+    doctor_fix_hooks: DoctorFixHooks | None = None,
 ) -> OwnerLoop:
     """Construct an ``OwnerLoop`` wired to real admission, recovery, bridge, worker, and listener ports."""
     resolved_hooks = hooks if hooks is not None else DaemonTestHooks()
@@ -371,6 +396,7 @@ def create_daemon_owner_loop(
             hooks=resolved_hooks,
             on_listener_bound=on_listener_bound,
             operator=operator,
+            doctor_fix_hooks=doctor_fix_hooks,
         )
 
     return OwnerLoop(_factory)
@@ -433,16 +459,17 @@ def serve(
     domain: KernelToolDomain | None = None,
     job_handlers: Mapping[str, JobHandler] | None = None,
     hooks: DaemonTestHooks | None = None,
+    outbox_replay: OutboxReplayPort | None = None,
+    supervisor_control: SupervisorControlPort | None = None,
+    log_quiesce_hook: Callable[[], contextlib.AbstractContextManager[None]] | None = None,
+    capture_probe: CaptureDoctorProbePort | None = None,
+    config_path: Path | None = None,
 ) -> int:
     """Run the foreground kernel daemon lifecycle for ``config`` and return process exit status."""
     if not isinstance(config, DaemonConfig):
         raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
-    if (
-        isinstance(shutdown_grace_s, bool)
-        or not isinstance(shutdown_grace_s, (int, float))
-        or not math.isfinite(shutdown_grace_s)
-        or shutdown_grace_s <= 0
-    ):
+    bad_grace = isinstance(shutdown_grace_s, bool) or not isinstance(shutdown_grace_s, (int, float))
+    if bad_grace or not math.isfinite(shutdown_grace_s) or shutdown_grace_s <= 0:
         raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
 
     adapters = os_ if os_ is not None else os_adapters(clock=clock, monotonic=monotonic_clock)
@@ -450,16 +477,23 @@ def serve(
     resolved_mono = monotonic_clock if monotonic_clock is not None else adapters.monotonic
     bound_listeners: list[BoundLoopbackListener] = []
     operator_handle = OperatorHandle()
-
+    fix_deps = (config_path, outbox_replay, supervisor_control, log_quiesce_hook, capture_probe)
+    fix_hooks = (
+        DoctorFixHooks(
+            config_path=config_path,
+            outbox_replay=outbox_replay,
+            supervisor_control=supervisor_control,
+            log_quiesce_hook=log_quiesce_hook,
+            capture_probe=capture_probe,
+        )
+        if any(x is not None for x in fix_deps)
+        else None
+    )
     loop = create_daemon_owner_loop(
-        os_=adapters,
-        clock=resolved_clock,
-        monotonic_clock=resolved_mono,
-        domain=domain,
-        job_handlers=job_handlers,
-        hooks=hooks,
-        on_listener_bound=bound_listeners.append,
-        operator=operator_handle,
+        os_=adapters, clock=resolved_clock, monotonic_clock=resolved_mono,
+        domain=domain, job_handlers=job_handlers, hooks=hooks,
+        on_listener_bound=bound_listeners.append, operator=operator_handle,
+        doctor_fix_hooks=fix_hooks,
     )
     effective_stop = stop_event if stop_event is not None else threading.Event()
     with _signal_stop_guard(effective_stop) as signalled:
@@ -543,6 +577,10 @@ def serve_config_path(
     domain: KernelToolDomain | None = None,
     job_handlers: Mapping[str, JobHandler] | None = None,
     hooks: DaemonTestHooks | None = None,
+    outbox_replay: OutboxReplayPort | None = None,
+    supervisor_control: SupervisorControlPort | None = None,
+    log_quiesce_hook: Callable[[], contextlib.AbstractContextManager[None]] | None = None,
+    capture_probe: CaptureDoctorProbePort | None = None,
 ) -> int:
     """Read and validate ``DaemonConfig`` from ``config_path`` and execute ``serve(...)``."""
     if not isinstance(config_path, Path):
@@ -550,14 +588,8 @@ def serve_config_path(
     adapters = os_ if os_ is not None else os_adapters(clock=clock, monotonic=monotonic_clock)
     cfg = read_daemon_config(config_path, adapters)
     return serve(
-        cfg,
-        os_=adapters,
-        clock=clock,
-        monotonic_clock=monotonic_clock,
-        stop_event=stop_event,
-        shutdown_grace_s=shutdown_grace_s,
-        on_ready=on_ready,
-        domain=domain,
-        job_handlers=job_handlers,
-        hooks=hooks,
+        cfg, os_=adapters, clock=clock, monotonic_clock=monotonic_clock, stop_event=stop_event,
+        shutdown_grace_s=shutdown_grace_s, on_ready=on_ready, domain=domain, job_handlers=job_handlers,
+        hooks=hooks, outbox_replay=outbox_replay, supervisor_control=supervisor_control,
+        log_quiesce_hook=log_quiesce_hook, capture_probe=capture_probe, config_path=config_path,
     )

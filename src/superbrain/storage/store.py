@@ -473,7 +473,6 @@ class Store:
 
     def rebuild_projections(self) -> int:
         """Rebuild every projection from the ledger into ``r_`` tables, then swap them in; returns the entry count.
-
         It all runs in one write transaction, so a failure (such as an entry written by a newer handler, which is
         ``UNSUPPORTED_VERSION``) leaves the live tables untouched and no ``r_`` table behind.
         """
@@ -486,6 +485,7 @@ class Store:
                         db.execute(f"DROP TABLE {_quote(table)}")
                     _create_tables(db, handler, rebuild_prefix(handler))
                 count = _replay(db, self._handlers, self._policy, rebuild_prefix)
+                crashpoint("doctor.fix.before_projection_swap")
                 for handler in self._handlers:
                     _swap_in_rebuilt(db, handler)
             except sqlite3.Error as exc:

@@ -1534,3 +1534,4 @@ KERNEL_CRASH_CASES: tuple[KernelCrashCase, ...] = (
 
 from tests.support.inc3_crash_cases import I3_3_CRASH_CASES as I3_3_CRASH_CASES  # noqa: E402, F401
 from tests.support.inc3_i34_crash_cases import I3_4_CRASH_CASES as I3_4_CRASH_CASES  # noqa: E402, F401
+from tests.support.inc4_crash_cases import I4_4_CRASH_CASES as I4_4_CRASH_CASES  # noqa: E402, F401

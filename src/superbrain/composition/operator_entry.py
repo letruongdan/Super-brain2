@@ -16,6 +16,7 @@ from superbrain.adapters.auth.webauthn_verifier import WebAuthnApprovalVerifier,
 from superbrain.adapters.os import find_ssh_keygen, os_adapters
 from superbrain.application.approvals import (
     BootstrapProposalHandler,
+    DoctorOperatorHandler,
     OperatorHandle,
     OperatorService,
     PreparedOperatorCall,
@@ -154,6 +155,7 @@ def build_operator_service(
     review_apply: ReviewApplyService | None = None,
     restore_handler: RestoreHandler | None = None,
     bootstrap_handler: BootstrapProposalHandler | None = None,
+    doctor_handler: DoctorOperatorHandler | None = None,
     expected_endpoint_path: Path | None = None,
     expected_leaf_cert_sha256: str | None = None,
     server_cert_path: Path | None = None,
@@ -165,6 +167,7 @@ def build_operator_service(
         webauthn_verifier=webauthn_verifier if webauthn_verifier is not None else _LocalhostWebAuthnVerifier(),
         review_apply=review_apply,
         restore_handler=restore_handler,
+        doctor_handler=doctor_handler,
         bootstrap_handler=(
             bootstrap_handler
             if bootstrap_handler is not None
@@ -218,6 +221,29 @@ def make_operator_executor(
             prepared = _await_owner_future(owner.run_owner_action(_phase1), owner, monotonic_ns, deadline_ns)
             if prepared.immediate is not None:
                 return make_success_envelope(prepared.immediate)
+            if prepared.pending_doctor is not None:
+                pending_doc = prepared.pending_doctor
+                _check_live_budget(owner, monotonic_ns, deadline_ns)
+                service = handle.service()
+                if service is None:
+                    raise BrainError(ErrorCode.DAEMON_UNAVAILABLE, "daemon unavailable")
+                rem_s = (deadline_ns - int(monotonic_ns())) / 1_000_000_000.0
+                wait_s = min(pending_doc.wait_timeout_ms / 1000.0, max(0.0, rem_s - 0.5))
+                service.verify_doctor(pending_doc, timeout_s=wait_s)
+
+                _check_live_budget(owner, monotonic_ns, deadline_ns)
+
+                def _phase3_doctor() -> dict[str, JsonValue]:
+                    _check_live_budget(owner, monotonic_ns, deadline_ns)
+                    svc = handle.service()
+                    if svc is None:
+                        raise BrainError(ErrorCode.DAEMON_UNAVAILABLE, "daemon unavailable")
+                    return svc.commit_doctor(pending_doc)
+
+                committed_doc = _await_owner_future(
+                    owner.run_owner_action(_phase3_doctor), owner, monotonic_ns, deadline_ns
+                )
+                return make_success_envelope(committed_doc)
 
             pending = prepared.pending
             assert pending is not None
