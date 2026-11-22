@@ -299,7 +299,7 @@ _WHEEL_FIXTURE_FILES: frozenset[str] = frozenset(
 _HEAVY_FILE_COST_MS: dict[str, int] = {
     "tests/integration/test_apply_journal_crash_matrix.py": 50615,
     "tests/integration/test_doctor_cli.py": 52000,
-    "tests/integration/test_doctor_fix.py": 72000,
+    "tests/integration/test_doctor_fix.py": 120000,
     "tests/integration/test_doctor_jobs.py": 15534,
     "tests/integration/test_doctor_sp2_probes.py": 14054,
     "tests/storage/test_doctor_snapshot.py": 15928,
