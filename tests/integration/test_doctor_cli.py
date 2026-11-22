@@ -1331,7 +1331,7 @@ def test_operator_doctor_report_nonblocking_cutoff_and_cli_wait_ms(
                 monotonic_ns=real_mono.monotonic_ns,
             )
             elapsed = time.monotonic() - t0
-            assert probe_entered.is_set(), "doctor worker did not enter Phase 2 wait"
+            assert probe_entered.wait(timeout=BOUND_WAIT_S), "doctor worker did not enter Phase 2 wait"
             assert elapsed >= 0.08, f"wait_timeout_ms=100 returned too early ({elapsed:.3f}s)"
             assert cutoff_env.get("ok") is True, cutoff_env
             cutoff_data = cast(dict[str, Any], cutoff_env["data"])

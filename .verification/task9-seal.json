@@ -107,7 +107,7 @@
     "tests/integration/test_apply_journal_crash_matrix.py": "sha256:d87c0d3212d252e9fe5c12e9a7bf3dd5b157bf974d64c53c09abb70c87b453b6",
     "tests/integration/test_apply_journal_e2e.py": "sha256:b0391d4b65f359ea7fbf1bee488bd2361335d8df9702749eef954f3f3c03121c",
     "tests/integration/test_cli_init_and_authority.py": "sha256:7099cbb503745d0380f76be9ec5ebca806a304931fb17a8b2c8c51bdf30e6cb8",
-    "tests/integration/test_doctor_cli.py": "sha256:4b33e9ee41ef7e4bab81079e466172a3704f6054e5908c748d81485f9bf0681d",
+    "tests/integration/test_doctor_cli.py": "sha256:7d933e332b1ba09d2130a9704f71c2c85ba2d709ac4fd768661067d9bfdd6def",
     "tests/integration/test_doctor_fix.py": "sha256:0297d5a4d6200b3522ae551ec15e0bc1adbefbd3d91488cb3b6bfdf6b307822f",
     "tests/integration/test_doctor_jobs.py": "sha256:b3b15e587e9d11638d8a77ba70fe86f857d82ff7e949c58bfc58107de809e460",
     "tests/integration/test_doctor_sp2_probes.py": "sha256:ef5486a6a3406637446a81559d7c4500c8681e31112caa162b6988d95c5e4557",
