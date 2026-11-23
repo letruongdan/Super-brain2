@@ -927,7 +927,9 @@ def _probe_loopback_tls_ready(host: str, port: int, timeout_s: float) -> bool:
     ctx.verify_mode = ssl.CERT_NONE
     try:
         with socket.create_connection((host, port), timeout=step_timeout) as raw_sock:
-            with ctx.wrap_socket(raw_sock, server_hostname=host):
+            with ctx.wrap_socket(raw_sock, server_hostname=host) as s:
+                with contextlib.suppress(OSError):
+                    s.unwrap()
                 return True
     except (OSError, ssl.SSLError):
         return False
