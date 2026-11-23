@@ -36,7 +36,9 @@ from superbrain.ports.doctor import (
     SupervisorControlPort,
 )
 from superbrain.ports.os import OsAdapters
-from superbrain.storage._doctor_reader import read_doctor_snapshot
+from superbrain.storage._doctor_reader import (
+    read_doctor_snapshot as read_doctor_snapshot,  # patch seam for fix-recheck tests
+)
 from superbrain.storage._doctor_storage_probes import check_pair_projection_parity
 from superbrain.storage.layout import (
     DataRoot,
