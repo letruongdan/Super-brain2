@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import sys
+import threading
 import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -51,7 +52,19 @@ def _write_static_log(log_path: Path | None, *, phase: str, code: str) -> None:
             ensure_secure_regular_file_atomic(resolved, perms)
             fd = os.open(resolved, os.O_WRONLY | os.O_APPEND | _O_BINARY | _O_NOFOLLOW, 0o600)
             try:
-                write_all_fd(fd, f"phase={phase} error.code={code}\n".encode())
+                acquired = False
+                for _ in range(500):
+                    if OUTBOX_FILE_LOCK.try_lock_fd(fd):
+                        acquired = True
+                        break
+                    time.sleep(0.002)
+                if not acquired:
+                    return
+                try:
+                    os.lseek(fd, 0, os.SEEK_END)
+                    write_all_fd(fd, f"phase={phase} error.code={code}\n".encode())
+                finally:
+                    OUTBOX_FILE_LOCK.unlock_fd(fd)
             finally:
                 os.close(fd)
     except (OSError, BrainError):
@@ -162,18 +175,59 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--outbox", required=True, type=Path, help="Local outbox spool directory")
     parser.add_argument("--log", default=None, type=Path, help="Optional static diagnostic log file")
     parser.add_argument("--harness", default=None, help="Default harness_id when omitted by stdin payload")
+    start_ns = time.monotonic_ns()
     args = parser.parse_args(list(argv) if argv is not None else None)
-    try:
-        raw_bytes = sys.stdin.buffer.read(_MAX_STDIN_BYTES + 1)
-    except OSError:
-        _write_static_log(args.log, phase="hook_stdin", code=ErrorCode.IO_ERROR.value)
+    done = threading.Event()
+
+    def _body() -> None:
+        # The whole hook (stdin, filter, durable write) runs here so the watchdog bounds every step.
+        try:
+            try:
+                raw_bytes = sys.stdin.buffer.read(_MAX_STDIN_BYTES + 1)
+            except OSError:
+                _write_static_log(args.log, phase="hook_stdin", code=ErrorCode.IO_ERROR.value)
+                return
+            remaining_ns = HOOK_HARD_CAP_NS - (time.monotonic_ns() - start_ns)
+            if remaining_ns <= 0:
+                _write_static_log(args.log, phase="hook_stdin", code=ErrorCode.DEADLINE_EXCEEDED.value)
+                return
+            run_hook(
+                raw_bytes,
+                outbox_dir=args.outbox,
+                log_path=args.log,
+                default_harness_id=args.harness,
+                cap_ns=remaining_ns,
+            )
+        finally:
+            done.set()
+
+    threading.Thread(target=_body, name="superbrain-hook", daemon=True).start()
+    hard_deadline_ns = start_ns + HOOK_HARD_CAP_NS
+    log_deadline_ns = hard_deadline_ns - _WATCHDOG_EXIT_RESERVE_NS
+    if done.wait(max(0.0, (log_deadline_ns - time.monotonic_ns()) / 1e9)):
         return 0
-    return run_hook(
-        raw_bytes,
-        outbox_dir=args.outbox,
-        log_path=args.log,
-        default_harness_id=args.harness,
-    )
+    # Input never ended or I/O stalled: no identity is safe to record. The static log gets only what is left of
+    # the reserve on its own thread, then the process leaves at the cap whether or not the log finished; an
+    # interrupted outbox write is an ordinary crash.
+    logged = threading.Event()
+
+    def _log() -> None:
+        _write_static_log(args.log, phase="hook_watchdog", code=ErrorCode.DEADLINE_EXCEEDED.value)
+        logged.set()
+
+    threading.Thread(target=_log, name="superbrain-hook-log", daemon=True).start()
+    logged.wait(max(0.0, (hard_deadline_ns - _WATCHDOG_EXIT_MARGIN_NS - time.monotonic_ns()) / 1e9))
+    _hard_exit(0)
+    return 0
+
+
+_WATCHDOG_EXIT_RESERVE_NS = 150_000_000
+"""Part of the hard cap kept for the timeout log and process exit."""
+_WATCHDOG_EXIT_MARGIN_NS = 20_000_000
+
+
+def _hard_exit(code: int) -> None:
+    os._exit(code)
 
 
 if __name__ == "__main__":

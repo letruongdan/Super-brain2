@@ -3922,13 +3922,14 @@ def test_wheel_probe_builder_avoids_toctou_when_owner_jsonl_grows_mid_build(
                 cwd=chk_a,
                 extra_env=owner.client_readiness_env,
             ) as sess:
-                sess.send_frames_and_expect_response(mcp_init_frames(1))
+                sess.send_frames_and_expect_response(mcp_init_frames(1), timeout=10.0)
                 st = _utc_now_z()
                 resp = sess.send_frames_and_expect_response(
                     [
                         {"jsonrpc": "2.0", "method": "notifications/initialized"},
                         mcp_call_frame(2, "get_health", {"schema_version": "2.0"}),
-                    ]
+                    ],
+                    timeout=10.0,
                 )
                 en = _utc_now_z()
                 is_err, sc_health = _extract_mcp_structured(resp)
