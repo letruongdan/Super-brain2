@@ -122,7 +122,7 @@
     "tests/integration/test_i3_wheel_e2e.py": "sha256:bbf94ec9b93903a5a81085349f97d1b480a006768597f6600bb5a9a993dcf742",
     "tests/integration/test_kernel_cli.py": "sha256:c44185cc3c8c3f12040ad4de3094623177b1394c35776e61257c566a59a06fa9",
     "tests/integration/test_kernel_crash_recovery.py": "sha256:ac18d511afa9302d70ceebf6ba4e4b4b0d4cbf64e9ff51f2d81e1254fbf1c8f0",
-    "tests/integration/test_kernel_daemon.py": "sha256:4110beeb9a8231b64772c72e9f46d1699108eab83a2b06bf7f052c65751d337b",
+    "tests/integration/test_kernel_daemon.py": "sha256:e431134bbcf14caaf3aeacc1c068a17c1ba78bbf6649df1123d1834e7f5fd455",
     "tests/integration/test_kernel_native_receipt_contract.py": "sha256:e3303589bd5b00d7606b9d69e757b36747ff3524ebcca280541eaeb13cd12b56",
     "tests/integration/test_kernel_performance.py": "sha256:42af100cecac427169e1ad2cb286a82979c861722ff42133fd28b994c488561e",
     "tests/integration/test_kernel_privacy_persistence.py": "sha256:ce10a1ddd1d474cd3db1ea658d7e14b8bf300b72483f3c198ae42e8012ee1613",

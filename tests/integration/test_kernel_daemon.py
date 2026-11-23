@@ -1717,6 +1717,7 @@ def test_tls_expiring_health_uses_clock_and_no_io(
 
         # Allow initial daemon loop startup to settle before arming zero-I/O gate
         _shallow()
+        loop.run_owner_action(lambda: None).result(timeout=1.0)
         sql_count[0] = 0
 
         # Arm SQLite statement counter + forbid cert file reads during shallow health & TLS-expired gate.
