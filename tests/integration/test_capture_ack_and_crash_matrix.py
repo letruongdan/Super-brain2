@@ -731,10 +731,10 @@ def test_offline_store5_to_store6_migration_and_installed_hook_wheel(
         inc2_installed_env, "brain", ["migrate", "--offline", "--config", str(cfg_path)], cwd=cfg_dir
     )
     assert mig.returncode == 0, mig.stderr.decode(errors="replace")
-    assert read_schema_info(DataRoot.at(root_path).store_db) == SchemaInfo(6, 6, store_id)
+    assert read_schema_info(DataRoot.at(root_path).store_db) == SchemaInfo(7, 7, store_id)
     assert read_schema_info(DataRoot.at(root_path).policy_db) == SchemaInfo(5, 5, store_id)
-    assert read_restore_epoch(DataRoot.at(root_path), schema_version=6, os_=adapters) == 0
-    assert code_version(KERNEL_STORE_MIGRATIONS) == 6
+    assert read_restore_epoch(DataRoot.at(root_path), schema_version=7, os_=adapters) == 0
+    assert code_version(KERNEL_STORE_MIGRATIONS) == 7
 
     with contextlib.closing(open_readonly(DataRoot.at(root_path).store_db, scratch_dir=cfg_dir)) as conn:
         tables = {str(r[0]) for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
@@ -1242,3 +1242,152 @@ def test_drain_outbox_chunks_large_backlog_and_stops_on_mid_drain_policy_disable
         assert ack_rest.accepted_count == 7 - batch1_len
         assert spool2.total_bytes() == 0
         assert spool2.read_pending(limit=20, producer_stream=stream2) == []
+
+
+def _iso(dt_value: datetime) -> str:
+    return dt_value.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _owner(h: Any, fn: Any) -> Any:
+    def _act() -> Any:
+        session: Any = h.loop._session
+        assert session is not None
+        return fn(session)
+
+    return h.loop.run_owner_action(_act).result(timeout=5.0)
+
+
+def _wait_owner(h: Any, fn: Any, *, timeout_s: float = 20.0) -> Any:
+    deadline = time.monotonic() + timeout_s
+    pause = threading.Event()
+    while time.monotonic() < deadline:
+        value = _owner(h, fn)
+        if value:
+            return value
+        pause.wait(0.05)
+    raise AssertionError("condition not reached through the daemon's own loop")
+
+
+def test_acked_capture_schedules_continuity_refresh_through_the_daemon_and_after_restart(trusted_tmp: Path) -> None:
+    """Spec 7.4 / case 54 through the product path: committed capture events of a task's session schedule a
+    refresh at 20 events, a quiet session (< 20) is refreshed once 60 s pass, also across a daemon restart.
+    No test code calls the scheduler or the worker."""
+    from superbrain.cli_api.capture_client import CaptureClient
+    from superbrain.storage.sessions import SessionStore
+
+    tpl = get_shared_t7_transport_template()
+    ws_a = tpl.ws_a
+    assert ws_a is not None
+    stream = "sched-stream-1"
+    persisted_root = trusted_tmp / "persisted-sched-data"
+    clone_owner_only_tree(tpl.root, persisted_root)
+    domain = TransportTestDomain(ws_a=ws_a)
+    task_id = f"task-{new_id()}"
+    quiet_task_id = f"task-{new_id()}"
+
+    def _post(h: Any, cap_cred: Any, events: list[dict[str, Any]]) -> Any:
+        client = CaptureClient(h.open_client())
+        return client.post_batch(
+            h.make_target(),
+            CaptureBatchCommand(stream, ws_a.repo_id, ws_a.checkout_id, tuple(events), cap_cred.token),
+        )
+
+    def _events(h: Any, start: int, count: int, session_ref: str) -> list[dict[str, Any]]:
+        now = h.clock.now()
+        return [
+            _ev_dict(
+                seq,
+                stream,
+                {"tool": "Bash", "command": "pytest -q", "exit_code": seq % 2},
+                session_ref=session_ref,
+                recorded_at=_iso(now),
+            )
+            for seq in range(start, start + count)
+        ]
+
+    with _open_persisted_loopback_transport(
+        tpl, data_root=persisted_root, base_dir=trusted_tmp / "sched-h1", domain=domain
+    ) as h1:
+        cap_cred, _cli = _setup_capture_and_cli(h1, ws_a, stream=stream)
+
+        def _bind(session: Any) -> tuple[str, str, str]:
+            ss = SessionStore(session._rt.store, session._rt.policy)
+            refs = []
+            for raw in ("RAW_SCHED_TASK_SESSION", "RAW_SCHED_QUIET_SESSION", "RAW_SCHED_NO_TASK_SESSION"):
+                rec = ss.bind_session(
+                    principal_id=cap_cred.principal.principal_id,
+                    repo_id=ws_a.repo_id,
+                    checkout_id=ws_a.checkout_id,
+                    harness_id="claude-code",
+                    raw_session_id=raw,
+                    now=h1.clock.now(),
+                )
+                refs.append(rec.session_ref)
+            for tid, sref in ((task_id, refs[0]), (quiet_task_id, refs[1])):
+                ss.ensure_task_handoff(
+                    task_id=tid, repo_id=ws_a.repo_id, checkout_id=ws_a.checkout_id,
+                    session_ref=sref, now=h1.clock.now(),
+                )
+            return refs[0], refs[1], refs[2]
+
+        sref_task, sref_quiet, sref_no_task = _owner(h1, _bind)
+
+        # Negative twin: a session with no task gets its events stored but schedules nothing.
+        ack0 = _post(h1, cap_cred, _events(h1, 1, 25, sref_no_task))
+        assert ack0.accepted_count == 25
+
+        # 20 committed events of the task's session -> the daemon schedules and commits a refresh by itself.
+        ack1 = _post(h1, cap_cred, _events(h1, 26, 20, sref_task))
+        assert ack1.accepted_count == 20
+
+        def _refreshed(session: Any) -> Any:
+            ss = SessionStore(session._rt.store, session._rt.policy)
+            handoff = ss.read_task_handoff(task_id)
+            state = ss.get_continuity_worker_state(task_id)
+            if handoff is None or handoff.observed_ref is None or state is None:
+                return None
+            if state.active_job_id is not None or state.pending_job_id is not None:
+                return None
+            return handoff, state
+
+        handoff1, state1 = _wait_owner(h1, _refreshed)
+        assert handoff1.current_revision >= 1 and handoff1.observed_ref.startswith("sha256:")
+        assert state1.pending_event_count == 0
+
+        def _continuity_jobs(session: Any) -> list[tuple[str, str]]:
+            rows = session._rt.store._db.execute(
+                "SELECT job_id, state FROM p_jobs_state WHERE kind = 'continuity.refresh'"
+            ).fetchall()
+            return [(str(r[0]), str(r[1])) for r in rows]
+
+        jobs_after_20 = _owner(h1, _continuity_jobs)
+        assert len(jobs_after_20) == 1 and jobs_after_20[0][1] == "succeeded"
+
+        # Quiet session: 3 events stay pending (< 20, < 60 s); nothing is scheduled before the restart.
+        ack2 = _post(h1, cap_cred, _events(h1, 46, 3, sref_quiet))
+        assert ack2.accepted_count == 3
+        quiet_state = _owner(
+            h1, lambda s: SessionStore(s._rt.store, s._rt.policy).get_continuity_worker_state(quiet_task_id)
+        )
+        assert quiet_state is not None and quiet_state.pending_event_count == 3
+        assert quiet_state.pending_job_id is None and quiet_state.active_job_id is None
+        assert len(_owner(h1, _continuity_jobs)) == 1
+
+    # Restart on the same root; 61 s later the durable wake refreshes the quiet task with no new event.
+    with _open_persisted_loopback_transport(
+        tpl, data_root=persisted_root, base_dir=trusted_tmp / "sched-h2", domain=domain
+    ) as h2:
+        h2.clock.advance(timedelta(seconds=61))
+
+        def _quiet_refreshed(session: Any) -> Any:
+            ss = SessionStore(session._rt.store, session._rt.policy)
+            handoff = ss.read_task_handoff(quiet_task_id)
+            state = ss.get_continuity_worker_state(quiet_task_id)
+            if handoff is None or handoff.observed_ref is None or state is None or state.pending_event_count:
+                return None
+            return handoff
+
+        quiet_handoff = _wait_owner(h2, _quiet_refreshed)
+        assert quiet_handoff.current_revision >= 1
+        jobs_final = _owner(h2, _continuity_jobs)
+        assert len(jobs_final) == 2 and all(state == "succeeded" for _jid, state in jobs_final)

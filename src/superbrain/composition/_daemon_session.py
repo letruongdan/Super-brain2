@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import contextlib
 import logging
 import threading
 from collections.abc import Callable, Mapping
 from concurrent.futures import Future
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from superbrain.application._future_notify import safe_set_result
 from superbrain.application.approvals import OperatorHandle
@@ -17,6 +16,7 @@ from superbrain.application.deadlines import Reservation
 from superbrain.application.dispatch import KernelToolDomain, PreparedEffect
 from superbrain.application.jobs import JobService
 from superbrain.application.owner_loop import AuthGate, OwnerSession
+from superbrain.composition._daemon_job_recovery import UNREADABLE, LeasedAttempts
 from superbrain.composition._endpoint import BoundLoopbackListener, remove_own_endpoint
 from superbrain.composition.kernel_bridge import KernelBridge
 from superbrain.core.errors import BrainError, ErrorCode
@@ -60,6 +60,7 @@ from superbrain.workers.executor import JobExecutor, WorkItem
 
 _DAEMON_WORKER_ITEM_BUDGET_NS = 60_000_000_000
 _LOGGER = logging.getLogger(__name__)
+_CONTINUITY_SCAN_INTERVAL = timedelta(seconds=1)
 
 
 @dataclass(frozen=True)
@@ -177,6 +178,7 @@ class _AdmittedOwnerSession(OwnerSession):
         self._bridge = bridge
         self._job_store = job_store
         self._job_service = job_service
+        self._leased = LeasedAttempts(lambda: self._job_service)
         self._executor = executor
         self._listener = listener
         self._clock = clock
@@ -202,6 +204,8 @@ class _AdmittedOwnerSession(OwnerSession):
             mono=monotonic_clock.monotonic_ns,
             before_commit_hook=(lambda: cw_hook(self._rt)) if cw_hook is not None else None,
         )
+        self._next_continuity_scan: datetime | None = None
+        self._bridge.on_continuity_tasks = self._schedule_continuity_tasks
 
     @property
     def ready(self) -> Ready:
@@ -314,13 +318,20 @@ class _AdmittedOwnerSession(OwnerSession):
     def step_owner_work(self, *, allow_new_jobs: bool) -> bool:
         did_work = False
         if self._executor is not None:
+            self._leased.retry_unfinished()
             while (wcmd := self._executor.next_command(0.0)) is not None:
                 if self._bridge.reservations.expire_shutdown_if_due():
                     break
-                with contextlib.suppress(BrainError):
-                    self._job_service.apply_command(wcmd)
+                try:
+                    self._dispatch_worker_command(wcmd)
+                except BrainError as err:
+                    # The command is consumed: without a fenced retry the job would stay running with no work.
+                    _LOGGER.warning("daemon job completion failed (code=%s)", err.code.value)
+                    if err.code in UNREADABLE and isinstance(wcmd, (WorkerCompleted, WorkerFailed)):
+                        self._leased.retry(wcmd.lease)
                 did_work = True
             if allow_new_jobs:
+                self._scan_continuity_if_due()
                 did_work = self._claim_and_submit_job() or did_work
         if self._bridge.process_next_queued(block=False):
             did_work = True
@@ -375,7 +386,14 @@ class _AdmittedOwnerSession(OwnerSession):
                 return True
             if not self._can_start_claimed_job():
                 return True
-            self._job_service.start(lease)
+            if spec.kind == CONTINUITY_REFRESH_JOB_KIND:
+                run_spec = self._continuity_worker.admit_claimed(lease, spec, now=self._clock.now())
+                if run_spec is None:
+                    return True
+                self._leased.remember_spec(lease, spec)  # task and cutoff for the completion, without a re-read
+                spec = run_spec
+            else:
+                self._job_service.start(lease)
             item = WorkItem(
                 lease=lease,
                 spec=spec,
@@ -390,6 +408,8 @@ class _AdmittedOwnerSession(OwnerSession):
             if err.code is ErrorCode.POLICY_UNAVAILABLE:
                 self._auth_gate.invalidate()
             _LOGGER.warning("daemon job claim failed (code=%s)", err.code.value)
+            if err.code in UNREADABLE:
+                self._leased.retry(lease)  # leased but not handed to the worker: queue the attempt again
             return False
 
     def has_pending_owner_work(self) -> bool:
@@ -441,21 +461,40 @@ class _AdmittedOwnerSession(OwnerSession):
     def cancel_uncommitted_for_shutdown(self) -> int:
         return self._bridge.cancel_uncommitted_for_shutdown()
 
+    def _schedule_continuity_tasks(self, task_ids: tuple[str, ...]) -> None:
+        now = self._clock.now()
+        for task_id in task_ids:
+            try:
+                self._continuity_worker.enqueue_if_due(task_id=task_id, now=now)
+            except BrainError as err:
+                # The durable scan retries; the capture ACK already committed.
+                _LOGGER.warning("continuity schedule failed (code=%s)", err.code.value)
+
+    def _scan_continuity_if_due(self) -> None:
+        """Durable wake: committed-but-unsummarized events are rescheduled after a crash and at the 60 s mark."""
+        now = self._clock.now()
+        if self._next_continuity_scan is not None and now < self._next_continuity_scan:
+            return
+        self._next_continuity_scan = now + _CONTINUITY_SCAN_INTERVAL
+        try:
+            self._continuity_worker.enqueue_due(now=now)
+        except BrainError as err:
+            _LOGGER.warning("continuity scan failed (code=%s)", err.code.value)
+
+    def _dispatch_worker_command(self, cmd: WorkerCommand) -> None:
+        if isinstance(cmd, (WorkerCompleted, WorkerFailed)):
+            row = self._job_store.transact(lambda tx: tx.read_job(cmd.lease.job_id))
+            if row is not None and row.kind == CONTINUITY_REFRESH_JOB_KIND:
+                spec = self._leased.take_spec(cmd.lease) or self._job_service.job_spec(cmd.lease)
+                if isinstance(cmd, WorkerCompleted):
+                    self._continuity_worker.commit_worker_completed(cmd, now=self._clock.now(), spec=spec)
+                else:
+                    self._continuity_worker.handle_worker_failed(cmd, now=self._clock.now(), spec=spec)
+                return
+        self._job_service.apply_command(cmd)
+
     def apply_worker_command(self, cmd: WorkerCommand) -> JobRecord | InvocationRecord:
-        if isinstance(cmd, WorkerCompleted):
-            spec = self._job_service.resolve_leased_spec(cmd.lease)
-            if spec is not None and spec.kind == CONTINUITY_REFRESH_JOB_KIND:
-                self._continuity_worker.commit_worker_completed(cmd, now=self._clock.now())
-            else:
-                self._job_service.apply_command(cmd)
-        elif isinstance(cmd, WorkerFailed):
-            spec = self._job_service.resolve_leased_spec(cmd.lease)
-            if spec is not None and spec.kind == CONTINUITY_REFRESH_JOB_KIND:
-                self._continuity_worker.handle_worker_failed(cmd, now=self._clock.now())
-            else:
-                self._job_service.apply_command(cmd)
-        else:
-            self._job_service.apply_command(cmd)
+        self._dispatch_worker_command(cmd)
         if isinstance(cmd, WorkerUsage):
             inv = self._job_store.transact(lambda tx: tx.read_invocation(cmd.invocation_id))
             if inv is None:

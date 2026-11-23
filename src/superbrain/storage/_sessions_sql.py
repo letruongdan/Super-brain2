@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Mapping
+from collections.abc import Sequence
 from datetime import UTC, datetime
 
 from superbrain.core._kernel_base import require_opaque_id, require_sha256_digest
@@ -12,7 +12,6 @@ from superbrain.core.canonical import canonical_json
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.ports.continuity import (
     ContinuityWorkerState,
-    LongRunningCheckpoint,
     RecipientProfile,
     SessionRecord,
     SessionSegmentRecord,
@@ -41,10 +40,10 @@ def parse_iso_utc(timestamp: str) -> datetime:
 
 
 def require_ready(store: Store, policy: PolicyStore) -> None:
-    """Require store v6 and policy v5 before session/handoff operations."""
+    """Require store v7 and policy v5 before session/handoff operations."""
     store._check()
     policy._check()
-    if store.schema_version < 6 or policy.schema_version < 5:
+    if store.schema_version < 7 or policy.schema_version < 5:
         raise BrainError(ErrorCode.CAPABILITY_UNAVAILABLE, "capability unavailable")
 
 
@@ -159,15 +158,15 @@ def persist_long_running_checkpoint(
     *,
     task_id: str,
     session_ref: str,
-    long_running_raw: object,
+    long_running_source: object,
     saw_long_running_event: bool,
     stamp: str,
     new_id_fn: object,
 ) -> None:
-    """Update or clear durable ``long_running`` checkpoint row atomically in ``db``."""
-    if isinstance(long_running_raw, Mapping):
-        ckpt = LongRunningCheckpoint.from_dict(dict(long_running_raw))
-        encoded = canonical_json(ckpt.to_dict()).decode("utf-8")
+    """Update or clear the ``long_running`` checkpoint row; it stores only the source event ref (spec 7.4)."""
+    if isinstance(long_running_source, Sequence) and not isinstance(long_running_source, (str, bytes)):
+        stream, seq, event_id, digest = _checkpoint_source(list(long_running_source))
+        encoded = canonical_json({"source": [stream, seq, event_id, digest]}).decode("utf-8")
         db.execute(
             "DELETE FROM session_checkpoints WHERE task_id = ? AND checkpoint_kind = 'long_running'",
             (task_id,),
@@ -185,13 +184,26 @@ def persist_long_running_checkpoint(
         )
 
 
-def decode_checkpoint(payload_json: str) -> LongRunningCheckpoint:
-    """Validate and decode persisted ``LongRunningCheckpoint`` JSON."""
+def _checkpoint_source(raw: object) -> tuple[str, int, str, str]:
+    if (
+        not isinstance(raw, list)
+        or len(raw) != 4
+        or not isinstance(raw[0], str)
+        or type(raw[1]) is not int
+        or not isinstance(raw[2], str)
+        or not isinstance(raw[3], str)
+    ):
+        raise sqlite_error("corrupt long_running checkpoint source", sqlite3.DataError("bad source ref"))
+    return raw[0], raw[1], raw[2], raw[3]
+
+
+def decode_checkpoint_source(payload_json: str) -> tuple[str, int, str, str]:
+    """Validate and decode the source event ref of a persisted ``long_running`` checkpoint."""
     try:
         raw = json.loads(payload_json)
     except json.JSONDecodeError as exc:
         raise sqlite_error("corrupt long_running checkpoint JSON", sqlite3.DataError(str(exc))) from exc
-    return LongRunningCheckpoint.from_dict(raw)
+    return _checkpoint_source(raw.get("source") if isinstance(raw, dict) else None)
 
 
 def validate_session_binding_args(

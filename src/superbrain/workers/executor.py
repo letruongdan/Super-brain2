@@ -104,7 +104,7 @@ PRODUCTION_JOB_HANDLERS: Mapping[str, JobHandler] = MappingProxyType(
         "continuity.refresh": continuity_refresh_handler,
     }
 )
-"""Production capability registry: empty in Increment 2 (every domain is unavailable)."""
+"""Production capability registry: only deterministic SP2-3 continuity refresh is registered."""
 
 
 class JobExecutor:

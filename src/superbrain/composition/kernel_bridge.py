@@ -53,7 +53,7 @@ from superbrain.storage.capture_events import KernelCaptureStore
 from superbrain.storage.idempotency import KernelBlobStager, KernelIdempotencyStore, StrictKernelStore
 from superbrain.storage.policy_store import PolicyStore
 from superbrain.storage.send_attempts import KernelSendAttemptStore
-from superbrain.storage.sessions import bind_capture_batch_sessions
+from superbrain.storage.sessions import capture_continuity_hooks
 from superbrain.storage.store import Store
 
 _T = TypeVar("_T")
@@ -152,6 +152,7 @@ class KernelBridge(KernelBlobStagePort):
         self._on_owner_reply_ready = on_owner_reply_ready
         self._on_clock_untrusted_changed = on_clock_untrusted_changed
         self._on_capture_gaps_changed = on_capture_gaps_changed
+        self.on_continuity_tasks: Callable[[tuple[str, ...]], None] | None = None  # owner thread
         self._wire_stores(store, policy, writer_epoch)
         if recover_pending_on_init:
             self._send_attempts.recover_pending_attempts()
@@ -581,17 +582,17 @@ class KernelBridge(KernelBlobStagePort):
         ):
             raise BrainError(ErrorCode.IDENTITY_MISMATCH, "principal identity mismatch")
         try:
-            bind_fn = (
-                lambda staged: bind_capture_batch_sessions(
-                    self._store, self._policy, staged,
-                    principal_id=live_p.principal_id, repo_id=command.repo_id,
-                    checkout_id=command.checkout_id, now=self._clock.now(),
-                )
-            ) if repo_pol.automatic_capture_enabled else None
-            return self._capture_ingest.ingest_batch(
-                command, principal=live_p, repo_policy=repo_pol,
-                layer2_lookup=self._verified_layer2_tuple, deadline_ns=deadline_ns, before_commit=bind_fn,
+            bind_fn, link_fn, touched = capture_continuity_hooks(
+                self._store, self._policy, principal_id=live_p.principal_id, repo_id=command.repo_id,
+                checkout_id=command.checkout_id, now=self._clock.now(),
+            ) if repo_pol.automatic_capture_enabled else (None, None, [])
+            ack = self._capture_ingest.ingest_batch(
+                command, principal=live_p, repo_policy=repo_pol, layer2_lookup=self._verified_layer2_tuple,
+                deadline_ns=deadline_ns, before_commit=bind_fn, on_event_committed_in_tx=link_fn,
             )
+            if touched and self.on_continuity_tasks is not None:
+                self.on_continuity_tasks(tuple(touched))
+            return ack
         finally:
             if self._on_capture_gaps_changed is not None:
                 self._on_capture_gaps_changed(self._capture_store.has_gaps())

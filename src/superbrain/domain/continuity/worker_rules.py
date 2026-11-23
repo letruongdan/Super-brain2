@@ -12,7 +12,7 @@ from superbrain.core._kernel_base import is_strict_int, require_non_negative_int
 from superbrain.core.canonical import canonical_json, digest_bytes
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.jsonvalue import JsonValue
-from superbrain.domain.continuity.sessions import extract_long_running_checkpoint
+from superbrain.domain.continuity.sessions import extract_long_running_with_source
 from superbrain.ports.capture import CaptureEventRecord
 from superbrain.ports.continuity import (
     WORKER_EVENT_THRESHOLD,
@@ -127,6 +127,8 @@ def extract_observed_summary(events: Sequence[CaptureEventRecord]) -> ObservedSu
             long_running=None,
             item_count=0,
             source_events=(),
+            items=(),
+            long_running_source=None,
         )
 
     latest_high_seq = max(ev.sequence for ev in events)
@@ -138,28 +140,37 @@ def extract_observed_summary(events: Sequence[CaptureEventRecord]) -> ObservedSu
     user_corrections: list[str] = []
     seen_corrections: set[str] = set()
     source_events: list[tuple[str, int, str, str]] = []
+    items: list[tuple[str, str, str]] = []
 
     for ev in events:
         payload = ev.payload
         payload_digest = digest_bytes(canonical_json(payload))
         source_events.append((ev.producer_stream, ev.sequence, ev.event_id, payload_digest))
 
+        def _item(kind: str, ev: CaptureEventRecord = ev, digest: str = payload_digest) -> None:
+            ref = (kind, ev.event_id, digest)
+            if ref not in items:
+                items.append(ref)
+
         command = _extract_command_text(payload)
         exit_code = payload.get("exit_code")
         if command is not None and is_strict_int(exit_code):
             assert isinstance(exit_code, int)
             test_runs.append(TestRunSignal(command=command, exit_code=exit_code, recorded_at=ev.recorded_at))
+            _item("command_exit")
 
         raw_sig = payload.get("error_signature")
         if not isinstance(raw_sig, str) and ev.kind == "error":
             raw_sig = payload.get("signature")
         if isinstance(raw_sig, str) and raw_sig.strip():
             err_counts[raw_sig.strip()] += 1
+            _item("error")
 
         for fpath in _extract_edited_file_paths(ev):
             if fpath not in seen_files:
                 seen_files.add(fpath)
                 modified_files.append(fpath)
+            _item("file_changed")
 
         if ev.kind in _USER_PROMPT_KINDS or payload.get("role") == "user":
             raw_text = payload.get("text")
@@ -170,11 +181,21 @@ def extract_observed_summary(events: Sequence[CaptureEventRecord]) -> ObservedSu
                 if text and _CORRECTION_RE.search(text) is not None and text not in seen_corrections:
                     seen_corrections.add(text)
                     user_corrections.append(text)
+                if text:
+                    _item("user_message")
 
     error_signatures = tuple(
         ErrorSignatureSignal(signature=sig, count=cnt) for sig, cnt in err_counts.items()
     )
-    long_running = extract_long_running_checkpoint(events)
+    found_lr = extract_long_running_with_source(events)
+    long_running = None if found_lr is None else found_lr[0]
+    long_running_source: tuple[str, int, str, str] | None = None
+    if found_lr is not None:
+        lr_ev = found_lr[1]
+        lr_digest = digest_bytes(canonical_json(lr_ev.payload))
+        long_running_source = (lr_ev.producer_stream, lr_ev.sequence, lr_ev.event_id, lr_digest)
+        if ("long_running", lr_ev.event_id, lr_digest) not in items:
+            items.append(("long_running", lr_ev.event_id, lr_digest))
 
     return ObservedSummary(
         latest_high_seq=latest_high_seq,
@@ -186,6 +207,8 @@ def extract_observed_summary(events: Sequence[CaptureEventRecord]) -> ObservedSu
         long_running=long_running,
         item_count=len(events),
         source_events=tuple(source_events),
+        items=tuple(items),
+        long_running_source=long_running_source,
     )
 
 
@@ -212,7 +235,8 @@ def execute_continuity_refresh_payload(payload_bytes: bytes) -> bytes:
         records.append(CaptureEventRecord.from_dict(item))
 
     summary = extract_observed_summary(records)
-    return canonical_json(summary.to_dict())
+    # Only refs leave the worker: content stays with its source event and is rebuilt when served (spec 7.4).
+    return canonical_json(summary.to_refs_dict())
 
 
 __all__ = [

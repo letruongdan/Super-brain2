@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -15,6 +16,7 @@ from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.faults import crashpoint
 from superbrain.core.jsonvalue import JsonValue
 from superbrain.core.kernel import (
+    TERMINAL_JOB_STATES,
     JobErrorCode,
     JobLease,
     JobOutcome,
@@ -37,6 +39,8 @@ from superbrain.ports.continuity import (
 from superbrain.ports.kernel import KernelBlobStagePort, KernelTx
 
 _DEFAULT_WORKER_BUDGET_NS = 5_000_000_000
+# Reads that failed say nothing about the batch: the job is retried and the batch keeps its cutoff.
+_UNREADABLE = frozenset({ErrorCode.IO_ERROR, ErrorCode.STORE_BUSY, ErrorCode.STORAGE_FULL})
 _DEFAULT_WAIT_S = 5.0
 
 
@@ -81,6 +85,8 @@ class PreparedContinuityCommit:
     observed_bytes: bytes
     observed_summary: dict[str, JsonValue]
     source_events: tuple[tuple[str, int, str, str], ...]
+    cutoff_order: int = 0
+    """Last event order pinned in the job: everything up to it was considered, live or not."""
 
 
 def continuity_refresh_handler(spec: JobSpec, ctx: WorkerJobContext) -> tuple[ObjectRef, ...]:
@@ -100,6 +106,15 @@ def continuity_refresh_handler(spec: JobSpec, ctx: WorkerJobContext) -> tuple[Ob
 
 def _parse_iso_utc(timestamp: str) -> datetime:
     return datetime.fromisoformat(timestamp[:-1] + "+00:00").astimezone(UTC)
+
+
+def _cutoff_from_payload(payload: bytes) -> int:
+    try:
+        raw = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return 0
+    value = raw.get("cutoff_order") if isinstance(raw, Mapping) else None
+    return value if type(value) is int and value > 0 else 0
 
 
 def _task_id_from_payload(payload: bytes) -> str | None:
@@ -156,6 +171,7 @@ class ContinuityWorkerCoordinator:
         self._blob_stager = blob_stager if blob_stager is not None else job_service._stager
         self._explicit_adapter = store_adapter
         self._cstore = self._build_store(rt, store_adapter)
+        self._scan_cursor: tuple[str, str] | None = None
 
     @staticmethod
     def _build_store(rt: object, explicit: ContinuityStorePort | None) -> ContinuityStorePort:
@@ -185,23 +201,42 @@ class ContinuityWorkerCoordinator:
         cmd: WorkerCompleted,
         *,
         now: datetime,
+        spec: JobSpec | None = None,
     ) -> ContinuityCommitOutcome | None:
         """Phase 3 commit path when ``OwnerLoop`` drains a completed ``continuity.refresh`` command."""
-        spec = self._job_service.resolve_leased_spec(cmd.lease)
-        task_id = _task_id_from_payload(spec.payload) if spec is not None else None
+        resolved_spec = spec if spec is not None else self._job_service.job_spec(cmd.lease)
+        task_id = _task_id_from_payload(resolved_spec.payload)
         if task_id is None:
             self._job_service.apply_command(cmd)
             return None
-        prepared = self.prepare_from_completed(task_id=task_id, lease=cmd.lease, cmd=cmd)
+        try:
+            prepared = self.prepare_from_completed(
+                task_id=task_id, lease=cmd.lease, cmd=cmd, cutoff_order=_cutoff_from_payload(resolved_spec.payload)
+            )
+        except BrainError as err:
+            if err.code is not ErrorCode.INTEGRITY_FAILURE:
+                raise
+            # Unusable worker output must end the job; otherwise it stays running and blocks the task.
+            self._job_service.complete(cmd.lease, JobOutcome.failure(JobErrorCode.HANDLER_FAILED, retryable=False))
+            self._cstore.clear_inflight_job_on_skip(task_id, cmd.lease.job_id, now=now)
+            return None
         return self.commit_prepared(prepared, now=now)
 
-    def handle_worker_failed(self, cmd: WorkerFailed, *, now: datetime) -> None:
+    def handle_worker_failed(
+        self,
+        cmd: WorkerFailed,
+        *,
+        now: datetime,
+        spec: JobSpec | None = None,
+    ) -> None:
         """Forward failure to ``JobService`` and clear inflight marker if ``continuity.refresh`` ended."""
-        spec = self._job_service.resolve_leased_spec(cmd.lease)
-        task_id = _task_id_from_payload(spec.payload) if spec is not None else None
+        resolved_spec = spec if spec is not None else self._job_service.job_spec(cmd.lease)
+        task_id = _task_id_from_payload(resolved_spec.payload)
         self._job_service.apply_command(cmd)
-        if task_id is not None and not cmd.retryable:
-            self._cstore.clear_inflight_job_on_skip(task_id, cmd.lease.job_id, now=now)
+        if task_id is not None:
+            after = self._job_service._store.transact(lambda tx: tx.read_job(cmd.lease.job_id))
+            if after is not None and after.state in TERMINAL_JOB_STATES:
+                self._cstore.clear_inflight_job_on_skip(task_id, cmd.lease.job_id, now=now)
 
     def _next_deadline_ns(self) -> int:
         base = self._mono() if self._mono is not None else 0
@@ -213,7 +248,13 @@ class ContinuityWorkerCoordinator:
         wstate = self._cstore.get_continuity_worker_state(task_id)
         if wstate is None:
             return None
-        in_flight = wstate.active_job_id is not None or wstate.pending_job_id is not None
+        in_flight = False
+        for marked in {j for j in (wstate.active_job_id, wstate.pending_job_id) if j is not None}:
+            if self._job_is_live(marked):
+                in_flight = True
+            else:
+                # The job row is the truth; a crash between ending a job and clearing its marker leaves it stale.
+                self._cstore.clear_inflight_job_on_skip(task_id, marked, now=now)
         if not self._cstore.check_automatic_capture_enabled(wstate.repo_id):
             return None
         first_dt = _parse_iso_utc(wstate.first_pending_event_at) if wstate.first_pending_event_at else None
@@ -236,9 +277,16 @@ class ContinuityWorkerCoordinator:
             checkout_id=wstate.checkout_id,
         )
         self._blob_stager.stage_blob(payload_bytes)
-        job_ref = self._job_service._store.transact(lambda tx: self._job_service.enqueue(tx, spec))
-        self._cstore.reserve_pending_job(task_id, job_ref.job_id, now=now)
-        return job_ref.job_id
+        def _enqueue_and_reserve(tx: KernelTx) -> str:
+            job_id = self._job_service.enqueue(tx, spec).job_id
+            self._cstore.reserve_pending_job_in_tx(tx, task_id, job_id)
+            return job_id
+
+        return self._job_service._store.transact(_enqueue_and_reserve)
+
+    def _job_is_live(self, job_id: str) -> bool:
+        row = self._job_service._store.transact(lambda tx: tx.read_job(job_id))
+        return row is not None and row.state not in TERMINAL_JOB_STATES
 
     def prepare_from_completed(
         self,
@@ -246,6 +294,7 @@ class ContinuityWorkerCoordinator:
         task_id: str,
         lease: JobLease,
         cmd: WorkerCompleted,
+        cutoff_order: int = 0,
     ) -> PreparedContinuityCommit:
         """Consume Phase 2 RAM output emitted by ``continuity_refresh_handler``."""
         if not cmd.result_refs:
@@ -265,6 +314,7 @@ class ContinuityWorkerCoordinator:
             observed_bytes=obs_bytes,
             observed_summary=obs_summary,
             source_events=sources,
+            cutoff_order=cutoff_order,
         )
 
     def claim_and_execute(self, *, writer_epoch: int, now: datetime) -> PreparedContinuityCommit | None:
@@ -275,23 +325,26 @@ class ContinuityWorkerCoordinator:
         lease = self._job_service.lease_next(writer_epoch, now)
         if lease is None:
             return None
-        spec = self._job_service.resolve_leased_spec(lease)
-        if spec is None or spec.kind != CONTINUITY_REFRESH_JOB_KIND:
+        try:
+            spec = self._job_service.resolve_leased_spec(lease)
+        except BrainError as err:
+            if err.code not in _UNREADABLE:
+                raise
+            self._job_service.retry_attempt(lease)  # leased, payload unreadable: queue the same attempt again
+            return None
+        if spec is None:
+            return None
+        if spec.kind != CONTINUITY_REFRESH_JOB_KIND:
+            # I2 contract: a kind this coordinator cannot run fails instead of staying leased.
+            self._job_service.start(lease)
+            self._job_service.complete(lease, JobOutcome.failure(JobErrorCode.HANDLER_UNAVAILABLE, retryable=False))
+            return None
+        run_spec = self.admit_claimed(lease, spec, now=now)
+        if run_spec is None:
             return None
         task_id = _task_id_from_payload(spec.payload)
-        if task_id is None:
-            self._job_service.start(lease)
-            self._job_service.complete(lease, JobOutcome.failure(JobErrorCode.INVALID_PAYLOAD, retryable=False))
-            return None
-        if spec.repo_id is not None and not self._cstore.check_automatic_capture_enabled(spec.repo_id):
-            self._job_service.start(lease)
-            self._job_service.complete(lease, JobOutcome.failure(JobErrorCode.HANDLER_FAILED, retryable=False))
-            self._cstore.clear_inflight_job_on_skip(task_id, lease.job_id, now=now)
-            return None
-
-        self._job_service.start(lease)
-        self._cstore.mark_job_running(task_id, lease.job_id, now=now)
-        self._executor.submit_work(lease, spec, deadline_ns=self._next_deadline_ns())
+        assert task_id is not None
+        self._executor.submit_work(lease, run_spec, deadline_ns=self._next_deadline_ns())
 
         while True:
             cmd = self._executor.next_command(_DEFAULT_WAIT_S)
@@ -300,13 +353,75 @@ class ContinuityWorkerCoordinator:
             if isinstance(cmd, WorkerCompleted):
                 if cmd.lease != lease:
                     continue
-                return self.prepare_from_completed(task_id=task_id, lease=lease, cmd=cmd)
+                return self.prepare_from_completed(
+                    task_id=task_id, lease=lease, cmd=cmd, cutoff_order=_cutoff_from_payload(spec.payload)
+                )
             if isinstance(cmd, WorkerFailed):
                 if cmd.lease != lease:
                     continue
-                self._job_service.apply_command(cmd)
-                self._cstore.clear_inflight_job_on_skip(task_id, lease.job_id, now=now)
+                self.handle_worker_failed(cmd, now=now, spec=spec)
                 return None
+
+    def admit_claimed(self, lease: JobLease, spec: JobSpec, *, now: datetime) -> JobSpec | None:
+        """Phase 1 for a leased ``continuity.refresh`` job, shared by every claim path.
+
+        Returns, after ``start``, the spec the worker runs: the stored refs resolved in memory to the source
+        events still live at ``now``. Otherwise fails the job terminally, clears the task's inflight marker
+        and returns ``None``.
+        """
+        task_id = _task_id_from_payload(spec.payload)
+        repo_id: str | None = None
+        run_payload: bytes | None = None
+        enabled = False
+        if task_id is not None:
+            try:
+                _, repo_id, _ = self._cstore.read_task_owner(task_id)
+                run_payload = self._cstore.resolve_refresh_sources(spec.payload, now=now)
+                enabled = self._cstore.check_automatic_capture_enabled(repo_id)
+            except BrainError as err:
+                if err.code in _UNREADABLE:
+                    self._job_service.start(lease)
+                    self._retry_later(lease, task_id, now=now)
+                    return None
+                if err.code not in (ErrorCode.NOT_FOUND, ErrorCode.INVALID_INPUT):
+                    raise
+        if task_id is None or repo_id is None or run_payload is None:
+            self._job_service.start(lease)
+            self._job_service.complete(lease, JobOutcome.failure(JobErrorCode.INVALID_PAYLOAD, retryable=False))
+            return None
+        if not enabled:
+            self._job_service.start(lease)
+            self._job_service.complete(lease, JobOutcome.failure(JobErrorCode.HANDLER_FAILED, retryable=False))
+            self._cstore.clear_inflight_job_on_skip(task_id, lease.job_id, now=now)
+            return None
+        self._job_service.start(lease)
+        self._cstore.mark_job_running(task_id, lease.job_id, now=now)
+        return dataclasses.replace(spec, payload=run_payload)
+
+    def _retry_later(self, lease: JobLease, task_id: str, *, now: datetime) -> None:
+        """Retry the running attempt through the job lifecycle; the task keeps its batch, cutoff and marker.
+
+        Once retries are exhausted the job ends (dead letter) and only the marker is released, so the still-pending
+        events are scheduled again by a new job.
+        """
+        self._job_service.complete(lease, JobOutcome.failure(JobErrorCode.HANDLER_FAILED, retryable=True))
+        after = self._job_service._store.transact(lambda tx: tx.read_job(lease.job_id))
+        if after is not None and after.state in TERMINAL_JOB_STATES:
+            self._cstore.clear_inflight_job_on_skip(task_id, lease.job_id, now=now)
+
+    def enqueue_due(self, *, now: datetime, limit: int = 50) -> int:
+        """Durable wake: schedule tasks whose committed events reached 20 or waited 60 s.
+
+        Each call reads the next page after a rotating cursor, so a page held by tasks that cannot move (capture
+        disabled, job in flight) never hides the tasks behind it; a short page wraps to the start.
+        """
+        page = self._cstore.refresh_candidate_tasks(limit, self._scan_cursor)
+        self._scan_cursor = page[-1] if len(page) == limit else None
+        scheduled = 0
+        for _first_at, task_id in page:
+            if self.enqueue_if_due(task_id=task_id, now=now) is not None:
+                scheduled += 1
+        return scheduled
 
     def commit_prepared(
         self,
@@ -319,18 +434,37 @@ class ContinuityWorkerCoordinator:
             self._before_commit_hook()
         crashpoint("continuity.worker.before_owner_commit")
 
-        _, repo_id, _ = self._cstore.read_task_owner(prepared.task_id)
-        if not self._cstore.check_automatic_capture_enabled(repo_id):
+        try:
+            _, repo_id, _ = self._cstore.read_task_owner(prepared.task_id)
+            enabled = self._cstore.check_automatic_capture_enabled(repo_id)
+            restricted = enabled and self._cstore.has_restricted_blobs_for_events(
+                prepared.task_id, prepared.source_events
+            )
+        except BrainError as err:
+            if err.code not in _UNREADABLE:
+                raise
+            self._retry_later(prepared.lease, prepared.task_id, now=now)
+            return None
+        if not enabled:
             self._job_service.complete(
                 prepared.lease, JobOutcome.failure(JobErrorCode.HANDLER_FAILED, retryable=False)
             )
             self._cstore.clear_inflight_job_on_skip(prepared.task_id, prepared.lease.job_id, now=now)
             return None
-        if self._cstore.has_restricted_blobs_for_events(prepared.source_events):
+        if restricted:
             self._job_service.complete(
                 prepared.lease, JobOutcome.failure(JobErrorCode.HANDLER_FAILED, retryable=False)
             )
             self._cstore.clear_inflight_job_on_skip(prepared.task_id, prepared.lease.job_id, now=now)
+            return None
+
+        if not prepared.source_events:
+            # Nothing in the pinned batch is still live: close the batch at its cutoff without an empty revision.
+            def _close_batch(tx: KernelTx, row: JobRecord, outcome: JobOutcome) -> None:
+                _ = (row, outcome)
+                self._cstore.close_refresh_batch_in_tx(tx, task_id=prepared.task_id, cutoff_order=prepared.cutoff_order)
+
+            self._job_service.complete(prepared.lease, prepared.outcome, on_complete_in_tx=_close_batch)
             return None
 
         # Publish observed summary bytes into CAS strictly before starting the SQLite commit tx (C2).
@@ -349,6 +483,7 @@ class ContinuityWorkerCoordinator:
                     observed_summary=prepared.observed_summary,
                     now=now,
                     dirty_followup_fn=None,
+                    cutoff_order=prepared.cutoff_order,
                 )
             )
 
@@ -392,10 +527,29 @@ class ContinuityWorkerCoordinator:
         )
 
 
+
+def sweep_legacy_continuity_copies(job_service: JobService, cstore: ContinuityStorePort) -> int:
+    """Release content copies a ``778e451``-shaped store left behind and fail jobs that would still read them.
+
+    Runs on store open before ``READY`` (and after an online restore); each job is one ledger transaction, so a
+    crash leaves the rest of the list for the next open.
+    """
+    job_ids = sorted({job_id for job_id, _digest in cstore.legacy_sweep_rows()})
+    for job_id in job_ids:
+
+        def _sweep(tx: KernelTx, job_id: str = job_id) -> None:
+            job_service.retire_superseded_in_tx(tx, job_id)
+            cstore.clear_legacy_sweep_in_tx(tx, job_id)
+
+        job_service._store.transact(_sweep)
+    return len(job_ids)
+
+
 __all__ = [
     "ContinuityExecutorPort",
     "ContinuityWorkerCoordinator",
     "PreparedContinuityCommit",
     "WorkerJobContext",
     "continuity_refresh_handler",
+    "sweep_legacy_continuity_copies",
 ]

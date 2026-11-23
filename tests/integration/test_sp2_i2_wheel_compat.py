@@ -239,7 +239,7 @@ def _seed_daemon_root(scratch: Path, label: str, *, frozen_i2: bool) -> _LiveWhe
     adapters = os_adapters(clock=clock)
 
     extensions, kinds = kernel_store_extensions()
-    store_version, policy_version = (4, 3) if frozen_i2 else (6, 5)
+    store_version, policy_version = (4, 3) if frozen_i2 else (7, 5)
     rt = open_runtime(
         data_root,
         adapters,
@@ -1284,7 +1284,7 @@ def test_i2_to_sp2_daemon_upgrade_replays_read_acks_and_marks_store4_attempts_un
         assert migration.returncode == 0, migration.stderr
         from superbrain.storage.schema import read_schema_info
 
-        for path, expected in ((db_path, 6), (data_root / "policy" / "policy.db", 5)):
+        for path, expected in ((db_path, 7), (data_root / "policy" / "policy.db", 5)):
             info = read_schema_info(path)
             assert info is not None and info.store_id == i2.store_id and info.schema_version == expected
 

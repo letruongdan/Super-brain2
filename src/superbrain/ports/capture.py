@@ -7,7 +7,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from superbrain.core._json_parse import MAX_WIRE_BODY_BYTES
 from superbrain.core._kernel_base import (
@@ -266,6 +266,7 @@ class CaptureStorePort(Protocol):
         events: Sequence[StagedCaptureEvent],
         gaps: Sequence[ProducerCaptureGap],
         now: datetime,
+        on_event_committed_in_tx: Callable[[Any, StagedCaptureEvent], None] | None = None,
     ) -> CaptureBatchAck: ...
 
     def mark_daemon_gap_closed(

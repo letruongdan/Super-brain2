@@ -7,6 +7,7 @@ import sqlite3
 from datetime import UTC, datetime
 
 from superbrain.core.ids import new_id
+from superbrain.storage._continuity_schema import apply_continuity_store_v7
 from superbrain.storage._proposal_schema import (
     KERNEL_PROPOSAL_KINDS as KERNEL_PROPOSAL_KINDS,
 )
@@ -559,12 +560,7 @@ def _store_v6(db: sqlite3.Connection) -> None:
     apply_capture_store_v6(db)
 
 
-POLICY_V5_TABLES: frozenset[str] = frozenset(
-    {
-        "session_hmac_key",
-        "session_ref_bindings",
-    }
-)
+POLICY_V5_TABLES: frozenset[str] = frozenset({"session_hmac_key", "session_ref_bindings"})
 
 
 def _policy_v5(db: sqlite3.Connection) -> None:
@@ -582,6 +578,8 @@ STORE_V3_MIGRATION = Migration(to_version=3, min_reader_version=3, apply=_store_
 STORE_V4_MIGRATION = Migration(to_version=4, min_reader_version=4, apply=_store_v4)
 STORE_V5_MIGRATION = Migration(to_version=5, min_reader_version=5, apply=_store_v5)
 STORE_V6_MIGRATION = Migration(to_version=6, min_reader_version=6, apply=_store_v6)
+# Store v7: session and continuity tables over every known store v6 shape (_continuity_schema).
+STORE_V7_MIGRATION = Migration(to_version=7, min_reader_version=7, apply=apply_continuity_store_v7)
 
 KERNEL_POLICY_MIGRATIONS: tuple[Migration, ...] = (
     *POLICY_MIGRATIONS,
@@ -597,4 +595,5 @@ KERNEL_STORE_MIGRATIONS: tuple[Migration, ...] = (
     STORE_V4_MIGRATION,
     STORE_V5_MIGRATION,
     STORE_V6_MIGRATION,
+    STORE_V7_MIGRATION,
 )

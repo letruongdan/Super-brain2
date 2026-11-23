@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import datetime
 from typing import cast
 
@@ -526,7 +526,7 @@ def bind_capture_batch_sessions(
     now: datetime,
 ) -> None:
     """Bind non-null ``session_ref`` values from an authorized capture batch into both stores."""
-    if policy.schema_version < 5 or store.schema_version < 6:
+    if policy.schema_version < 5 or store.schema_version < 7:
         return
     sessions = SessionStore(store, policy)
     for ev in staged_events:
@@ -543,6 +543,38 @@ def bind_capture_batch_sessions(
             )
 
 
+def capture_continuity_hooks(
+    store: Store,
+    policy: PolicyStore,
+    *,
+    principal_id: str,
+    repo_id: str,
+    checkout_id: str,
+    now: datetime,
+) -> tuple[Callable[[Sequence[object]], None], Callable[[sqlite3.Connection, object], None], list[str]]:
+    """Session binding before a capture commit, task linking inside it, and the tasks that got events."""
+    touched: list[str] = []
+    sessions = SessionStore(store, policy)
+
+    def bind(staged: Sequence[object]) -> None:
+        bind_capture_batch_sessions(
+            store, policy, staged, principal_id=principal_id, repo_id=repo_id, checkout_id=checkout_id, now=now
+        )
+
+    def link(db: sqlite3.Connection, staged: object) -> None:
+        task_id = sessions.link_committed_event_in_tx(
+            db,
+            event=staged.record,  # type: ignore[attr-defined]
+            payload_digest=staged.payload_digest,  # type: ignore[attr-defined]
+            repo_id=repo_id,
+            checkout_id=checkout_id,
+        )
+        if task_id is not None and task_id not in touched:
+            touched.append(task_id)
+
+    return bind, link, touched
+
+
 def _session_store_factory(store: object, policy: object) -> ContinuityStorePort:
     return cast(ContinuityStorePort, SessionStore(cast(Store, store), cast(PolicyStore, policy)))
 
@@ -552,4 +584,5 @@ register_continuity_store_factory(_session_store_factory)
 __all__ = [
     "SessionStore",
     "bind_capture_batch_sessions",
+    "capture_continuity_hooks",
 ]

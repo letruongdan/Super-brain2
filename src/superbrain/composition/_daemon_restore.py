@@ -10,6 +10,7 @@ from typing import Literal
 
 from superbrain.adapters.harness_config.merger import SharedConfigMergerAdapter
 from superbrain.application.approvals import OperatorHandle, RestoreHandler
+from superbrain.application.continuity_worker import sweep_legacy_continuity_copies
 from superbrain.application.jobs import JobService
 from superbrain.application.journal_recovery import reconcile_and_classify_journals
 from superbrain.application.maintenance import (
@@ -49,6 +50,7 @@ from superbrain.storage.restore import (
     restore_store,
 )
 from superbrain.storage.runtime import Runtime
+from superbrain.storage.sessions import SessionStore
 from superbrain.storage.store import Store
 from superbrain.workers.executor import JobExecutor
 
@@ -181,6 +183,8 @@ class DaemonRestoreHandler(RestoreHandler):
             if has_legacy_incomplete_settled_projections(new_rt.store, new_rt.lease):
                 raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
         job_service = self._rebind_live(new_rt)
+        if new_rt.store.schema_version >= 7 and new_rt.policy.schema_version >= 5:
+            sweep_legacy_continuity_copies(job_service, SessionStore(new_rt.store, new_rt.policy))
         job_service.recover(new_rt.lease.epoch)
         if new_rt.store.schema_version >= 5 and new_rt.policy.schema_version >= 4:
             reconcile_and_classify_journals(

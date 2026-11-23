@@ -116,10 +116,10 @@ def test_two_schema_upgrade_restarts_between_swaps(trusted_tmp: Path, os_: OsAda
     assert resumed.policy_report.status == "skipped"
     assert resumed.policy_report.from_version == 5 and resumed.policy_report.to_version == 5
     assert resumed.store_report.status == "migrated"
-    assert resumed.store_report.from_version == 1 and resumed.store_report.to_version == 6
+    assert resumed.store_report.from_version == 1 and resumed.store_report.to_version == 7
     assert resumed.store_report.report is not None
     store_info = read_schema_info(data_root.store_db)
-    assert store_info is not None and store_info.schema_version == 6 and store_info.min_reader_version == 6
+    assert store_info is not None and store_info.schema_version == 7 and store_info.min_reader_version == 7
 
     # Pre-migration v1 backups taken for both policy and store remain verifiable with v1 migrations.
     backups = sorted(data_root.backups_dir.iterdir())
@@ -230,9 +230,9 @@ def test_two_target_orchestration_with_injected_sequences_and_noop(
     assert first.policy_report.status == "migrated"
     assert first.policy_report.from_version == 1 and first.policy_report.to_version == 5
     assert first.store_report.status == "migrated"
-    assert first.store_report.from_version == 1 and first.store_report.to_version == 6
+    assert first.store_report.from_version == 1 and first.store_report.to_version == 7
     assert code_version(KERNEL_POLICY_MIGRATIONS) == 5
-    assert code_version(KERNEL_STORE_MIGRATIONS) == 6
+    assert code_version(KERNEL_STORE_MIGRATIONS) == 7
 
     # Re-running when both targets already match target tuple is a clean noop (no new backups or stage swaps).
     backups_before = sorted((root_path / "backups").iterdir())
@@ -245,7 +245,7 @@ def test_two_target_orchestration_with_injected_sequences_and_noop(
     )
     assert second.noop
     assert second.policy_report.status == "skipped" and second.policy_report.from_version == 5
-    assert second.store_report.status == "skipped" and second.store_report.from_version == 6
+    assert second.store_report.status == "skipped" and second.store_report.from_version == 7
     assert sorted((root_path / "backups").iterdir()) == backups_before
 
     # Injected future store migration sequence (to_version = code_version + 1) upgrades store only and then noops.
@@ -271,7 +271,7 @@ def test_two_target_orchestration_with_injected_sequences_and_noop(
     assert not inj_first.noop
     assert inj_first.policy_report.status == "skipped" and inj_first.policy_report.from_version == 5
     assert inj_first.store_report.status == "migrated"
-    assert inj_first.store_report.from_version == 6 and inj_first.store_report.to_version == future_store_ver
+    assert inj_first.store_report.from_version == 7 and inj_first.store_report.to_version == future_store_ver
 
     backups_before_inj_noop = sorted((root_path / "backups").iterdir())
     clock.advance(timedelta(seconds=5))
@@ -361,9 +361,9 @@ def test_two_target_orchestration_with_injected_sequences_and_noop(
             assert inter_mig.policy_report.status == "skipped"
             assert inter_mig.policy_report.from_version == 5 and inter_mig.policy_report.to_version == 5
 
-        if seed_str_ver < 6:
+        if seed_str_ver < 7:
             assert inter_mig.store_report.status == "migrated"
-            assert inter_mig.store_report.from_version == seed_str_ver and inter_mig.store_report.to_version == 6
+            assert inter_mig.store_report.from_version == seed_str_ver and inter_mig.store_report.to_version == 7
             assert inter_mig.store_report.backup is not None
             verify_backup(
                 inter_mig.store_report.backup,
@@ -374,10 +374,10 @@ def test_two_target_orchestration_with_injected_sequences_and_noop(
             )
         else:
             assert inter_mig.store_report.status == "skipped"
-            assert inter_mig.store_report.from_version == 6 and inter_mig.store_report.to_version == 6
+            assert inter_mig.store_report.from_version == 7 and inter_mig.store_report.to_version == 7
 
         assert read_schema_info(DataRoot.at(inter_root).policy_db) == SchemaInfo(5, 5, inter_store_id)
-        assert read_schema_info(DataRoot.at(inter_root).store_db) == SchemaInfo(6, 6, inter_store_id)
+        assert read_schema_info(DataRoot.at(inter_root).store_db) == SchemaInfo(7, 7, inter_store_id)
         admitted_inter = admit_existing_pair(inter_root, inter_store_id, os_, purpose="serve")
         rt_inter2 = open_runtime_under_lease(admitted_inter)
         rt_inter2.close()
@@ -620,11 +620,11 @@ def test_i2_pair_upgrades_to_i3_pair_preserving_authority_and_fencing_i2_binarie
     assert (report.store_report.status, report.store_report.from_version, report.store_report.to_version) == (
         "migrated",
         4,
-        6,
+        7,
     )
     data_root = DataRoot.at(root_path)
     assert read_schema_info(data_root.policy_db) == SchemaInfo(5, 5, store_id)
-    assert read_schema_info(data_root.store_db) == SchemaInfo(6, 6, store_id)
+    assert read_schema_info(data_root.store_db) == SchemaInfo(7, 7, store_id)
 
     admitted = admit_existing_pair(root_path, store_id, os_, purpose="serve")
     rt2 = open_runtime_under_lease(admitted)

@@ -183,7 +183,7 @@ def open_runtime(
         else:
             store = Store.create(root, lease, os_, policy, handlers, registry, migrations=store_migrations)
         policy.mark_store_published()
-        if store.schema_version >= 6 and policy.schema_version >= 5:
+        if store.schema_version >= 7 and policy.schema_version >= 5:
             SessionStore(store, policy).reconcile_missing_sessions()
     except BaseException as err:
         try:
@@ -549,7 +549,7 @@ def open_runtime_under_lease(
         registry = kinds if kinds is not None else KindRegistry(())
         store = Store.open(root, lease, os_, policy, handlers, registry, migrations=store_migrations)
         policy.mark_store_published()
-        if store.schema_version >= 6 and policy.schema_version >= 5:
+        if store.schema_version >= 7 and policy.schema_version >= 5:
             SessionStore(store, policy).reconcile_missing_sessions()
     except BaseException as err:
         try:

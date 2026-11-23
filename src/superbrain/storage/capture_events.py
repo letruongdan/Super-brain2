@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from typing import Any
 
 from superbrain.core._kernel_base import require_opaque_id
 from superbrain.core._kernel_dispatch import require_aware_utc
@@ -289,8 +290,13 @@ class KernelCaptureStore(CaptureStorePort):
         events: Sequence[StagedCaptureEvent],
         gaps: Sequence[ProducerCaptureGap],
         now: datetime,
+        on_event_committed_in_tx: Callable[[Any, StagedCaptureEvent], None] | None = None,
     ) -> CaptureBatchAck:
-        """Stage event payloads in CAS outside TX, then commit events/gaps/holds/watermarks atomically."""
+        """Stage event payloads in CAS outside TX, then commit events/gaps/holds/watermarks atomically.
+
+        ``on_event_committed_in_tx`` runs inside the same transaction for each newly committed event (never for a
+        dedup), so whatever it derives commits or rolls back with the event.
+        """
         self._require_v6()
         require_opaque_id(producer_stream, label="producer_stream")
         require_opaque_id(repo_id, label="repo_id")
@@ -387,6 +393,8 @@ class KernelCaptureStore(CaptureStorePort):
                         ev.record.session_ref, canonical_json(ev.record.source_metadata), committed_at,
                     ),
                 )
+                if on_event_committed_in_tx is not None:
+                    on_event_committed_in_tx(txn.db, ev)
                 cur_events[seq] = ident
                 newly_covered.add(seq)
                 accepted_count += 1

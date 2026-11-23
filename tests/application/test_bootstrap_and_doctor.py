@@ -596,7 +596,7 @@ def test_doctor_strictly_readonly_and_surfaces_handover_states_drift_and_locks(
     snap_checkout_before = digest_tree(checkout)
 
     report = doctor_entry.run_doctor(cfg_path, checkout_root=checkout, os_=os_)
-    assert report.schema.store_version == 6 and report.schema.policy_version == 5
+    assert report.schema.store_version == 7 and report.schema.policy_version == 5
     assert report.restore_epoch == 0
     assert report.trust_generation is not None and report.trust_generation >= 3
     assert report.signer_reset_recorded is True
@@ -613,7 +613,7 @@ def test_doctor_strictly_readonly_and_surfaces_handover_states_drift_and_locks(
     out_json = json.loads(capfd.readouterr().out)
     assert out_json["ok"] is True
     d = out_json["data"]
-    assert d["schema"]["store_version"] == 6 and d["schema"]["policy_version"] == 5
+    assert d["schema"]["store_version"] == 7 and d["schema"]["policy_version"] == 5
     assert d["signer_reset_recorded"] is True
     assert d["terminal_channel_eligible"] is False
     assert len(d["unresolved_accounting_locks"]) >= 1

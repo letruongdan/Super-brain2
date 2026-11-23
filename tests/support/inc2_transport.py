@@ -607,7 +607,11 @@ def open_test_loopback_transport(
     hooks: DaemonTestHooks | None = None,
     job_handlers: Mapping[str, JobHandler] | None = None,
 ) -> Iterator[TransportHarness]:
-    """Teardown-safe context manager running OwnerLoop + LoopbackServer on real sockets."""
+    """Teardown-safe context manager running OwnerLoop + LoopbackServer on real sockets.
+
+    No job handlers unless passed: the template's queued jobs would otherwise be claimed (and failed under the I2
+    contract) while transport oracles compare durable state.
+    """
     case_dir = make_trusted_test_dir(f"t6b3-{name}")
     data_root = case_dir / "data"
     clone_owner_only_tree(template.root, data_root)
@@ -631,7 +635,7 @@ def open_test_loopback_transport(
         clock=clock,
         monotonic_clock=mono_clock,
         domain=domain,
-        job_handlers=job_handlers,
+        job_handlers={} if job_handlers is None else job_handlers,
         hooks=effective_hooks,
         on_listener_bound=bound_listeners.append,
     )

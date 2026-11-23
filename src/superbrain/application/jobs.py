@@ -189,6 +189,23 @@ class JobService:
         self._store.transact(start)
         crashpoint("jobs.after_running")
 
+    def retry_attempt(self, lease: JobLease) -> bool:
+        """Queue the attempt held by ``lease`` again (or dead-letter it at the last attempt) when the owner could not
+        finish handling it, from ``leased`` or ``running``; ``False`` when the lease no longer holds the job."""
+        self._require_current(lease)
+        now_utc, now = require_aware_utc(self._clock.now())
+
+        def retry(tx: KernelTx) -> bool:
+            row = tx.read_job(lease.job_id)
+            if row is None or not (row.matches(lease, JobState.LEASED) or row.matches(lease, JobState.RUNNING)):
+                return False
+            exhausted = row.attempt >= MAX_JOB_ATTEMPTS
+            retry_at = now if exhausted else require_aware_utc(now_utc + retry_backoff(row.attempt))[1]
+            self._retry_or_dead_letter(tx, row, JobErrorCode.HANDLER_FAILED, retry_at=retry_at, now=now)
+            return True
+
+        return self._store.transact(retry)
+
     def job_spec(self, lease: JobLease) -> JobSpec:
         """The immutable ``JobSpec`` (payload read from CAS) the owner hands to the worker for ``lease``."""
         self._require_current(lease)
@@ -410,6 +427,14 @@ class JobService:
         return JobState.CANCELLED
 
     # --- recovery and retention ---------------------------------------------------------------------------------
+
+    def retire_superseded_in_tx(self, tx: KernelTx, job_id: str) -> None:
+        """Fail a non-terminal job whose payload format a store migration superseded (system sweep)."""
+        row = tx.read_job(job_id)
+        if row is None or row.state in TERMINAL_JOB_STATES:
+            return
+        _, now = require_aware_utc(self._clock.now())
+        self._terminal(tx, row, JobState.FAILED, now, reason=JobErrorCode.INVALID_PAYLOAD)
 
     def recover(self, epoch: int) -> RecoveryCounts:
         """Recover jobs and invocations of epochs older than ``epoch`` in bounded batches, resumably.

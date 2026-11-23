@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -1128,3 +1129,126 @@ def test_hook_entry_clamps_fallback_gap_deadline_and_outbox_propagates_deadline(
         limit=20, producer_stream="stream-dl"
     )
     assert [e.sequence for e in committed] == list(range(1, 11))
+
+
+def _spawn_hook(outbox_dir: Path, log_path: Path) -> subprocess.Popen[bytes]:
+    return subprocess.Popen(
+        [
+            sys.executable,
+            "-I",
+            "-m",
+            "superbrain.composition.hook_entry",
+            "--outbox",
+            str(outbox_dir),
+            "--log",
+            str(log_path),
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=_clean_hook_env(),
+    )
+
+
+def test_hook_entry_hard_cap_covers_stdin_that_never_ends(trusted_tmp: Path) -> None:
+    """Spec 7.1: the hook hands control back within the 2 s hard cap even when its input never reaches EOF."""
+    outbox_dir = trusted_tmp / "outbox-open-stdin"
+    log_path = trusted_tmp / "hook-open-stdin.log"
+    t0 = time.monotonic()
+    proc = _spawn_hook(outbox_dir, log_path)
+    try:
+        assert proc.stdin is not None
+        proc.stdin.write(b'{"partial": ')  # some bytes, never EOF
+        proc.stdin.flush()
+        try:
+            rc = proc.wait(timeout=10.0)
+        except subprocess.TimeoutExpired:
+            pytest.fail("hook still blocked on an open stdin 10 s after start (2 s hard cap)")
+        elapsed = time.monotonic() - t0
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        if proc.stdin is not None:
+            proc.stdin.close()
+    assert rc == 0
+    # 2 s cap measured from main(), plus interpreter start-up; far below the 10 s wait.
+    assert elapsed < 3.5, f"hook waited {elapsed:.2f} s on an open stdin"
+    assert "phase=hook_watchdog error.code=deadline_exceeded" in log_path.read_text(encoding="utf-8")
+
+
+def test_hook_entry_slow_input_with_normal_eof_is_still_enqueued(trusted_tmp: Path) -> None:
+    """Positive twin: input that arrives late but within the cap is captured normally."""
+    from superbrain.adapters.os import os_adapters
+    from superbrain.adapters.os.locks import OUTBOX_FILE_LOCK
+    from superbrain.storage.outbox import OutboxSpool
+
+    outbox_dir = trusted_tmp / "outbox-slow-stdin"
+    log_path = trusted_tmp / "hook-slow-stdin.log"
+    raw = json.dumps(_base_event_dict(event_id="evt-slow-1", payload={"note": "late but fine"})).encode()
+    proc = _spawn_hook(outbox_dir, log_path)
+    try:
+        assert proc.stdin is not None
+        threading.Event().wait(0.3)
+        proc.stdin.write(raw)
+        proc.stdin.close()
+        rc = proc.wait(timeout=10.0)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+    assert rc == 0
+    spool = OutboxSpool(outbox_dir, permissions=os_adapters().permissions, file_lock=OUTBOX_FILE_LOCK)
+    pending = spool.read_pending(limit=10)
+    assert [entry.entry_id for entry in pending] == ["evt-slow-1"]
+    assert not log_path.exists() or "hook_watchdog" not in log_path.read_text(encoding="utf-8")
+
+
+_SLOW_LOG_WRAPPER = """
+import sys, time
+from pathlib import Path
+import superbrain.composition.hook_entry as he
+real = he._write_static_log
+def slow(*a, **k):
+    time.sleep(1.3)
+    real(*a, **k)
+he._write_static_log = slow
+Path(sys.argv[1]).write_text(repr(time.monotonic()), encoding="utf-8")
+he.main(sys.argv[2:])
+"""
+
+
+def test_hook_entry_hard_cap_includes_a_stalled_timeout_log(trusted_tmp: Path) -> None:
+    """Spec 7.1: the hard cap covers the exit path too; a log sink that does not progress cannot extend it."""
+    outbox_dir = trusted_tmp / "outbox-slow-log"
+    log_path = trusted_tmp / "hook-slow-log.log"
+    stamp = trusted_tmp / "main-start.txt"
+    proc = subprocess.Popen(
+        [
+            sys.executable, "-I", "-c", _SLOW_LOG_WRAPPER, str(stamp),
+            "--outbox", str(outbox_dir), "--log", str(log_path),
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=_clean_hook_env(),
+    )
+    try:
+        assert proc.stdin is not None
+        proc.stdin.write(b'{"partial": ')  # never EOF
+        proc.stdin.flush()
+        try:
+            rc = proc.wait(timeout=10.0)
+        except subprocess.TimeoutExpired:
+            pytest.fail("hook still running 10 s after start")
+        ended = time.monotonic()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        if proc.stdin is not None:
+            proc.stdin.close()
+    assert rc == 0
+    elapsed = ended - float(stamp.read_text(encoding="utf-8"))
+    # 2 s cap from main(); the slack only covers process teardown, far below the 1.3 s stalled log.
+    assert elapsed < 2.3, f"hook left {elapsed:.2f} s after main() with a stalled log sink"

@@ -19,6 +19,7 @@ from superbrain.adapters.os import os_adapters
 from superbrain.adapters.os.daemon_config import read_daemon_config
 from superbrain.adapters.os.tls_material import verify_server_tls_files
 from superbrain.application.approvals import OperatorHandle
+from superbrain.application.continuity_worker import sweep_legacy_continuity_copies
 from superbrain.application.deadlines import Reservation
 from superbrain.application.dispatch import KernelToolDomain
 from superbrain.application.jobs import JobService
@@ -68,6 +69,7 @@ from superbrain.storage.idempotency import StagedKernelStore
 from superbrain.storage.jobs import has_legacy_incomplete_settled_projections
 from superbrain.storage.proposals import PolicyApplyAuthority, StoreProposalAdapter
 from superbrain.storage.runtime import admit_existing_pair, open_runtime_under_lease
+from superbrain.storage.sessions import SessionStore
 from superbrain.workers.executor import PRODUCTION_JOB_HANDLERS, JobExecutor, JobHandler
 
 __all__ = [
@@ -152,6 +154,8 @@ def _open_owner_session(
 
         if hooks.before_job_recover is not None:
             hooks.before_job_recover(rt)
+        if rt.store.schema_version >= 7 and rt.policy.schema_version >= 5:
+            sweep_legacy_continuity_copies(job_service, SessionStore(rt.store, rt.policy))
         job_service.recover(rt.lease.epoch)
         if rt.store.schema_version >= 5 and rt.policy.schema_version >= 4:
             reconcile_and_classify_journals(
