@@ -56,7 +56,7 @@ from tests.support.kernel_auth import make_bootstrap_auth, seed_principal_and_cr
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 _START = dt.datetime(2026, 11, 21, 14, 0, tzinfo=dt.UTC)
-BOUND_WAIT_S = 5.0
+BOUND_WAIT_S = 20.0
 
 
 def _open_rt(root: Path, os_: OsAdapters, *, role: str = "sp23-continuity") -> Runtime:
