@@ -12,6 +12,8 @@ digests follow the same canonical-JSON rules as the rest of the code base.
 from __future__ import annotations
 
 import argparse
+import compileall
+import contextlib
 import json
 import math
 import os
@@ -299,13 +301,13 @@ _WHEEL_FIXTURE_FILES: frozenset[str] = frozenset(
 # (evidence/batch2-diag-v19, commits 75d4dc8, 1a81253, and batch 2-5 optimizations).
 # Replaces estimates whose local error is >= 3s with the measured JUnit file time.
 _HEAVY_FILE_COST_MS: dict[str, int] = {
-    "tests/integration/test_kernel_crash_recovery.py": 103460,
-    "tests/integration/test_apply_journal_crash_matrix.py": 96668,
-    "tests/integration/test_kernel_native_receipt_contract.py": 55398,
+    "tests/integration/test_kernel_crash_recovery.py": 118000,
+    "tests/integration/test_apply_journal_crash_matrix.py": 112000,
+    "tests/integration/test_kernel_native_receipt_contract.py": 65000,
     "tests/integration/test_kernel_daemon.py": 51158,
+    "tests/integration/test_sp2_i2_wheel_compat.py": 48000,
     "tests/integration/test_i3_rereview_init_and_accounting.py": 42072,
-    "tests/integration/test_sp2_i2_wheel_compat.py": 41300,
-    "tests/integration/test_capture_ack_and_crash_matrix.py": 37749,
+    "tests/integration/test_capture_ack_and_crash_matrix.py": 42000,
     "tests/application/test_continuity_worker_scheduling.py": 34267,
     "tests/architecture/test_gate_receipt.py": 31872,
     "tests/integration/test_i3_wheel_e2e.py": 31000,
@@ -1321,6 +1323,20 @@ def run_gate(
                 extra.append(f"uv sync failed ({error or ('timed out' if code is None else code)})")
                 log.append(output)
             else:
+                py_exe = worktree / ".venv" / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
+                if py_exe.is_file():
+                    with contextlib.suppress(Exception):
+                        subprocess.run(
+                            [str(py_exe), "-m", "compileall", "src", "tests", "-q"],
+                            cwd=worktree,
+                            check=False,
+                            timeout=30,
+                        )
+                elif (worktree / "tests").is_dir():
+                    with contextlib.suppress(Exception):
+                        compileall.compile_dir(worktree / "tests", quiet=1)
+                        if (worktree / "src").is_dir():
+                            compileall.compile_dir(worktree / "src", quiet=1)
                 job_began = time.monotonic()
                 deadline = job_began + TEST_JOB_BUDGET_S
                 halted: str | None = None  # why no further step of the test job may start
