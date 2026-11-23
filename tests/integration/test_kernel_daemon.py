@@ -1709,6 +1709,16 @@ def test_tls_expiring_health_uses_clock_and_no_io(
         tok_a = _daemon_template.cred_a.token
         tok_b = _daemon_template.cred_b.token
 
+        def _shallow(token: str = tok_a) -> CallResult:
+            return loop.submit(
+                ToolCommand("get_health", {"schema_version": "2.0"}, token=token),
+                mono.now + TOTAL_REQUEST_BUDGET_NS,
+            ).result(timeout=1.0)
+
+        # Allow initial daemon loop startup to settle before arming zero-I/O gate
+        _shallow()
+        sql_count[0] = 0
+
         # Arm SQLite statement counter + forbid cert file reads during shallow health & TLS-expired gate.
         arm_sql[0] = True
         from superbrain.adapters.os import tls_material
@@ -1721,12 +1731,6 @@ def test_tls_expiring_health_uses_clock_and_no_io(
             return orig_read_tls(path, os_)
 
         monkeypatch.setattr(tls_material, "_read_owner_only_file", _spy_read_tls)
-
-        def _shallow(token: str = tok_a) -> CallResult:
-            return loop.submit(
-                ToolCommand("get_health", {"schema_version": "2.0"}, token=token),
-                mono.now + TOTAL_REQUEST_BUDGET_NS,
-            ).result(timeout=1.0)
 
         # 1. > 30 days remaining -> ready=True, degraded_codes=[].
         clock.set(not_after - dt.timedelta(days=30, seconds=1))

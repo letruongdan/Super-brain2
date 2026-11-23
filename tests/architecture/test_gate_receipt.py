@@ -296,7 +296,7 @@ def test_parse_junit_maps_real_pytest_output_to_collected_node_ids(tmp_path: Pat
     (project / "pkg").mkdir(parents=True)
     (project / "pkg" / "test_sample.py").write_text(textwrap.dedent(SAMPLE_PROJECT), encoding="utf-8")
     junit = tmp_path / "junit.xml"
-    base = [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "--rootdir", str(project)]
+    base = [sys.executable, "-I", "-m", "pytest", "-p", "no:cacheprovider", "--rootdir", str(project)]
     collected = subprocess.run(
         [*base, "--collect-only", "-q"], cwd=project, capture_output=True, text=True, check=False, timeout=120
     )
@@ -481,7 +481,7 @@ def test_run_kills_a_process_that_exceeds_its_timeout(tmp_path: Path) -> None:
     marker = tmp_path / "survived.txt"
     code = f"import time; time.sleep(6); open({str(marker)!r}, 'w').write('x')"
     began = time.monotonic()
-    exit_code, _, _ = gate.run([sys.executable, "-c", code], cwd=tmp_path, timeout_s=1.0)
+    exit_code, _, _ = gate.run([sys.executable, "-I", "-c", code], cwd=tmp_path, timeout_s=1.0)
     assert exit_code is None
     assert time.monotonic() - began < 5
     time.sleep(6)
@@ -2558,7 +2558,7 @@ def test_win32_job_object_lifecycle_and_non_win32_graceful_noop(monkeypatch: pyt
     # 1. Non-win32 platform returns None and close is a clean no-op.
     with monkeypatch.context() as mp:
         mp.setattr(sys, "platform", "linux")
-        fake_proc = subprocess.Popen([sys.executable, "-c", "pass"])
+        fake_proc = subprocess.Popen([sys.executable, "-I", "-c", "pass"])
         try:
             assert assign_fn(fake_proc) is None
             close_fn(None, terminate=True)
@@ -2572,7 +2572,7 @@ def test_win32_job_object_lifecycle_and_non_win32_graceful_noop(monkeypatch: pyt
 
     # 3. On Windows, assigning a real process returns an integer job handle and closing terminates cleanly.
     if sys.platform == "win32":
-        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"])
+        proc = subprocess.Popen([sys.executable, "-I", "-c", "import time; time.sleep(10)"])
         job = None
         try:
             job = assign_fn(proc)

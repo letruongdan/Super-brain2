@@ -7,12 +7,14 @@ import dataclasses
 import datetime as dt
 import hashlib
 import json
+import os
 import socket
 import sqlite3
 import ssl
 import subprocess
 import sys
 import tarfile
+import tempfile
 import threading
 import time
 from collections.abc import Iterator, Mapping
@@ -52,8 +54,8 @@ from tests.support.inc2_fixture import (
     InstalledEnv,
     _clean_subprocess_env,
     _cleanup_dir,
+    _interprocess_lock,
     _make_trusted_session_dir,
-    ensure_template_base,
 )
 from tests.support.inc2_transport import read_raw_http_response, register_workspace_direct
 from tests.support.kernel_auth import (
@@ -88,12 +90,46 @@ def _run_offline(cmd: list[str], *, cwd: Path, extra_env: Mapping[str, str] | No
     return completed.stdout
 
 
-@pytest.fixture(scope="session")
-def frozen_i2_installed_env(tmp_path_factory: pytest.TempPathFactory) -> Iterator[InstalledEnv]:
-    """Build an offline wheel + venv from frozen baseline commit 035a4cdc5936155982e5172602213353d4bbb6c4."""
-    scratch = _make_trusted_session_dir("i2-wheel-", tmp_path_factory)
-    try:
-        cache_dir = ensure_template_base() / f"frozen-i2-{FROZEN_I2_COMMIT[:12]}"
+_CACHED_FROZEN_I2_ENV: InstalledEnv | None = None
+
+
+def get_cached_frozen_i2_installed_env() -> InstalledEnv:
+    global _CACHED_FROZEN_I2_ENV
+    if _CACHED_FROZEN_I2_ENV is not None and _CACHED_FROZEN_I2_ENV.venv_python.is_file():
+        return _CACHED_FROZEN_I2_ENV
+
+    cache_base = Path(os.environ.get("LOCALAPPDATA", tempfile.gettempdir())) / "superbrain-tests" / "wheel-cache"
+    cache_base.mkdir(parents=True, exist_ok=True)
+    if sys.platform == "win32":
+        from superbrain.adapters.os.permissions import WindowsPermissionGuard
+
+        WindowsPermissionGuard().secure_directory(cache_base)
+
+    cache_dir = cache_base / f"frozen-i2-py{sys.version_info.major}.{sys.version_info.minor}-{FROZEN_I2_COMMIT[:12]}"
+    lock_file = cache_base / f"frozen-i2-py{sys.version_info.major}.{sys.version_info.minor}.lock"
+    ready_file = cache_dir / "ready.json"
+
+    with _interprocess_lock(lock_file):
+        if ready_file.is_file():
+            try:
+                data = json.loads(ready_file.read_text(encoding="utf-8"))
+                venv_dir = Path(data["venv_dir"])
+                venv_python = Path(data["venv_python"])
+                wheel_path = Path(data["wheel_path"])
+                schema_path = Path(data["source_schema_path"])
+                if venv_python.is_file() and wheel_path.is_file() and schema_path.is_file():
+                    _CACHED_FROZEN_I2_ENV = InstalledEnv(
+                        venv_dir=venv_dir,
+                        venv_python=venv_python,
+                        wheel_path=wheel_path,
+                        source_schema_path=schema_path,
+                        source_schema_sha256=data["source_schema_sha256"],
+                    )
+                    return _CACHED_FROZEN_I2_ENV
+            except (json.JSONDecodeError, KeyError, OSError):
+                pass
+
+        cache_dir.mkdir(parents=True, exist_ok=True)
         src_dir = cache_dir / "src-i2"
         cached_wheels = list(cache_dir.glob("super_brain2-*.whl")) if cache_dir.is_dir() else []
         cached_schema = src_dir / "schemas" / "mcp-tools-v2.json"
@@ -102,8 +138,7 @@ def frozen_i2_installed_env(tmp_path_factory: pytest.TempPathFactory) -> Iterato
             frozen_schema_path = cached_schema
             frozen_schema_sha256 = hashlib.sha256(frozen_schema_path.read_bytes()).hexdigest()
         else:
-            cache_dir.mkdir(parents=True, exist_ok=True)
-            tar_path = scratch / "frozen-i2.tar"
+            tar_path = cache_dir / "frozen-i2.tar"
             src_dir.mkdir(parents=True, exist_ok=True)
             subprocess.run(
                 [
@@ -150,7 +185,7 @@ def frozen_i2_installed_env(tmp_path_factory: pytest.TempPathFactory) -> Iterato
             assert len(wheels) == 1, f"expected 1 wheel, found {wheels}"
             wheel_path = wheels[0]
 
-        venv_dir = scratch / "venv"
+        venv_dir = cache_dir / "venv"
 
         _run_offline(
             [
@@ -162,6 +197,7 @@ def frozen_i2_installed_env(tmp_path_factory: pytest.TempPathFactory) -> Iterato
                 "--offline",
                 "--no-dev",
                 "--no-install-project",
+                "--compile-bytecode",
                 "--python",
                 sys.executable,
             ],
@@ -179,11 +215,12 @@ def frozen_i2_installed_env(tmp_path_factory: pytest.TempPathFactory) -> Iterato
                 "--offline",
                 "--no-deps",
                 "--link-mode=copy",
+                "--compile-bytecode",
                 "--python",
                 str(venv_python),
                 str(wheel_path),
             ],
-            cwd=scratch,
+            cwd=cache_dir,
         )
 
         purelib_dir = Path(
@@ -203,18 +240,34 @@ def frozen_i2_installed_env(tmp_path_factory: pytest.TempPathFactory) -> Iterato
         )
         _run_offline(
             [str(venv_python), "-m", "compileall", "-q", str(purelib_dir)],
-            cwd=scratch,
+            cwd=cache_dir,
         )
 
-        yield InstalledEnv(
+        ready_file.write_text(
+            json.dumps({
+                "venv_dir": str(venv_dir),
+                "venv_python": str(venv_python),
+                "wheel_path": str(wheel_path),
+                "source_schema_path": str(frozen_schema_path),
+                "source_schema_sha256": frozen_schema_sha256,
+            }),
+            encoding="utf-8",
+        )
+
+        _CACHED_FROZEN_I2_ENV = InstalledEnv(
             venv_dir=venv_dir,
             venv_python=venv_python,
             wheel_path=wheel_path,
             source_schema_path=frozen_schema_path,
             source_schema_sha256=frozen_schema_sha256,
         )
-    finally:
-        _cleanup_dir(scratch)
+        return _CACHED_FROZEN_I2_ENV
+
+
+@pytest.fixture(scope="session")
+def frozen_i2_installed_env(tmp_path_factory: pytest.TempPathFactory) -> Iterator[InstalledEnv]:
+    """Build an offline wheel + venv from frozen baseline commit (reusing cached environment)."""
+    yield get_cached_frozen_i2_installed_env()
 
 
 @dataclasses.dataclass(frozen=True)

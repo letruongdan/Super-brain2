@@ -55,17 +55,31 @@ _BATCH = 1000  # below the filter's 1024-item array limit
 _SUFFIXES = ("", " ü")  # ASCII text, and text with a non-ASCII character elsewhere
 
 
-def _components(path: str) -> list[str]:
-    return [part for part in _SEPARATOR.split(path.lower()) if part and part != "."]
+@functools.cache
+def _components(path: str) -> tuple[str, ...]:
+    return tuple(part for part in _SEPARATOR.split(path.lower()) if part and part != ".")
+
+
+@functools.cache
+def _pattern_chains(patterns: tuple[str, ...]) -> tuple[tuple[str, ...], ...]:
+    return tuple(_components(p) for p in patterns)
+
+
+@functools.cache
+def _match_part(p: str, g: str) -> bool:
+    if "*" not in g and "?" not in g and "[" not in g:
+        return p == g
+    return fnmatch.fnmatchcase(p, g)
 
 
 @functools.cache
 def _spec_blocked(spelling: str, patterns: tuple[str, ...]) -> bool:
     parts = _components(spelling)
-    for pattern in patterns:
-        chain = _components(pattern)
-        for start in range(len(parts) - len(chain) + 1):
-            if all(fnmatch.fnmatchcase(p, g) for p, g in zip(parts[start : start + len(chain)], chain, strict=True)):
+    len_parts = len(parts)
+    for chain in _pattern_chains(patterns):
+        len_chain = len(chain)
+        for start in range(len_parts - len_chain + 1):
+            if all(_match_part(p, g) for p, g in zip(parts[start : start + len_chain], chain, strict=True)):
                 return True
     return False
 
@@ -89,8 +103,9 @@ def _token_outcomes(token: str, patterns: tuple[str, ...]) -> frozenset[str] | N
     return outcomes or None
 
 
-def _expected(text: str, patterns: tuple[str, ...]) -> tuple[set[str], int]:
-    """Every acceptable filtered form of ``text`` and the exact number of redactions."""
+@functools.cache
+def _expected_cached(text: str, patterns: tuple[str, ...]) -> tuple[frozenset[str], int]:
+    """Every acceptable filtered form of ``text`` and the exact number of redactions (cached frozenset)."""
     pieces: list[frozenset[str] | set[str]] = []
     cursor = count = 0
     for match in _TOKEN.finditer(text):
@@ -100,31 +115,47 @@ def _expected(text: str, patterns: tuple[str, ...]) -> tuple[set[str], int]:
         pieces.append(outcomes or {match.group(0)})
         cursor = match.end()
     pieces.append({text[cursor:]})
-    return {"".join(parts) for parts in itertools.product(*pieces)}, count
+    return frozenset("".join(parts) for parts in itertools.product(*pieces)), count
 
 
-def _wrappers(chars: str, *, inner: int, full: bool) -> list[str]:
+def _expected(text: str, patterns: tuple[str, ...]) -> tuple[set[str], int]:
+    """Every acceptable filtered form of ``text`` and the exact number of redactions."""
+    forms, count = _expected_cached(text, patterns)
+    return set(forms), count
+
+
+@functools.cache
+def _wrappers(chars: str, *, inner: int, full: bool) -> tuple[str, ...]:
     """No wrapper, each character, each pair; ``inner`` is the index of a pair's character next to the token."""
     pairs = (a + b for a in chars for b in chars)
-    return ["", *chars, *(pair for pair in pairs if full or pair[inner] not in _BOUNDARY)]
+    return ("", *chars, *(pair for pair in pairs if full or pair[inner] not in _BOUNDARY))
+
+
+@functools.cache
+def _wrapped_tuple(base: str, *, full: bool = False) -> tuple[str, ...]:
+    leads = _wrappers(LEAD, inner=1, full=full)
+    trails = _wrappers(TRAIL, inner=0, full=full)
+    return tuple(f"see {lead}{base}{trail} now" for lead in leads for trail in trails)
 
 
 def _wrapped(base: str, *, full: bool = False) -> Iterator[str]:
     """``base`` bare and inside the combinations of 0-2 leading and 0-2 trailing wrapper characters."""
-    for lead in _wrappers(LEAD, inner=1, full=full):
-        for trail in _wrappers(TRAIL, inner=0, full=full):
-            yield f"see {lead}{base}{trail} now"
+    return iter(_wrapped_tuple(base, full=full))
 
 
+@functools.cache
 def _policy(patterns: tuple[str, ...]) -> FilterPolicy:
     return FilterPolicy(blocked_path_patterns=patterns, entropy_min_length=4096)  # entropy cannot mask a miss
+
+
+_REUSABLE_FILTER = PrivacyFilter()
 
 
 def _apply(texts: list[str], policy: FilterPolicy) -> tuple[list[str], int]:
     got: list[str] = []
     redacted = 0
     for start in range(0, len(texts), _BATCH):
-        safe = PrivacyFilter().apply({"items": list(texts[start : start + _BATCH]), "ok": "safe prose kept"}, policy)
+        safe = _REUSABLE_FILTER.apply({"items": list(texts[start : start + _BATCH]), "ok": "safe prose kept"}, policy)
         assert isinstance(safe.value, dict) and safe.value["ok"] == "safe prose kept"  # positive control
         assert safe.stripped_keys_count == 0
         items = safe.value["items"]
@@ -140,7 +171,7 @@ def _check(
     policy = _policy(patterns)
     for suffix in suffixes:
         batch = [text + suffix for text in texts]
-        expected = [_expected(text, patterns) for text in batch]
+        expected = [_expected_cached(text, patterns) for text in batch]
         for text, (_forms, count) in zip(batch, expected, strict=True):
             assert (count >= 1) is want_blocked, f"oracle fixture is on the wrong side: {text!r}"
         got, redacted = _apply(batch, policy)

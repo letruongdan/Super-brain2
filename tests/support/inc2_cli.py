@@ -921,7 +921,7 @@ def is_writer_lock_held(data_root: Path) -> bool:
 
 def _probe_loopback_tls_ready(host: str, port: int, timeout_s: float) -> bool:
     """Return whether ``(host, port)`` accepts TCP and completes a TLS handshake within ``timeout_s``."""
-    step_timeout = min(max(timeout_s, 0.05), 0.5)
+    step_timeout = min(max(timeout_s, 0.1), 5.0)
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
@@ -1029,7 +1029,9 @@ class InstalledServeProcess:
                 except (BrainError, OSError) as err:
                     last_err = err
                 else:
-                    if _probe_loopback_tls_ready(ep.host, ep.port, deadline - time.perf_counter()):
+                    if _probe_loopback_tls_ready(
+                        ep.host, ep.port, min(max(deadline - time.perf_counter(), 1.0), 5.0)
+                    ):
                         self.snapshot_descendant_pids()
                         return ep
                     last_err = OSError("loopback TLS listener not yet accepting handshakes")
@@ -1387,7 +1389,6 @@ class InstalledMcpPipeSession:
             )
         if self._write_error is not None:
             raise self._write_error
-        self._snapshot_descendant_identities()
         try:
             raw_line = self._lines.get(timeout=timeout)
         except queue.Empty as err:

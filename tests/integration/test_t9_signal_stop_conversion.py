@@ -120,7 +120,7 @@ MODES = ["converts", "repeated", "during_exit", "no_leak", "worker_thread"]
 def test_stop_signal_conversion(mode: str, signame: str) -> None:
     try:
         proc = subprocess.run(
-            [sys.executable, "-c", CHILD, mode, signame], capture_output=True, text=True, timeout=15.0
+            [sys.executable, "-I", "-c", CHILD, mode, signame], capture_output=True, text=True, timeout=15.0
         )
     except subprocess.TimeoutExpired as exc:  # backstop: faulthandler should have ended the child at 6 s
         pytest.fail(f"{mode}/{signame}: child still running after 15 s (killed): {exc.stderr!r}")

@@ -46,6 +46,7 @@ from superbrain.workers.executor import PRODUCTION_JOB_HANDLERS, JobContext, Job
 from tests.support.clock import FakeClock
 from tests.support.inc2_fixture import (
     FIXTURE_JOB_KIND,
+    ensure_template_base,
     kernel_job_service,
     open_kernel_job_runtime,
     reopen_kernel_job_runtime,
@@ -58,8 +59,50 @@ _START = dt.datetime(2026, 11, 21, 14, 0, tzinfo=dt.UTC)
 BOUND_WAIT_S = 5.0
 
 
-def _open_rt(root: Path, os_: OsAdapters, *, role: str) -> Runtime:
-    return open_kernel_job_runtime(root, os_, role=role)
+def _open_rt(root: Path, os_: OsAdapters, *, role: str = "sp23-continuity") -> Runtime:
+    del role
+    return open_kernel_job_runtime(root, os_, role="sp23-continuity")
+
+
+_LOOP_TLS_CACHE: dict[str, tuple[Path, Path]] = {}
+
+
+def _create_loop_cfg(
+    root: Path,
+    store_id: str,
+    tls_dir: Path,
+    clock: FakeClock,
+    os_: OsAdapters,
+) -> DaemonConfig:
+    del tls_dir
+    cached = _LOOP_TLS_CACHE.get(store_id)
+    if cached is not None and cached[0].is_file() and cached[1].is_file():
+        return DaemonConfig(1, root, store_id, cached[0], cached[1])
+
+    target_dir = ensure_template_base() / f"loop-tls-{store_id}"
+    if not (target_dir / "server.pem").is_file():
+        tls = create_store_tls(
+            store_id,
+            target_dir,
+            make_bootstrap_auth(
+                store_id=store_id,
+                owner_id="dan",
+                action="provision_tls",
+                subject_id=store_id,
+                trust_generation=1,
+                expires_at=clock.now() + dt.timedelta(days=365),
+                destination=target_dir,
+            ),
+            clock,
+            os_,
+        )
+        _LOOP_TLS_CACHE[store_id] = (tls.cert_path, tls.key_path)
+        return DaemonConfig(1, root, store_id, tls.cert_path, tls.key_path)
+
+    cert_path = target_dir / "server.pem"
+    key_path = target_dir / "server.key"
+    _LOOP_TLS_CACHE[store_id] = (cert_path, key_path)
+    return DaemonConfig(1, root, store_id, cert_path, key_path)
 
 
 def _ev(
@@ -347,22 +390,7 @@ def test_worker_before_owner_commit_race_and_base_revision_zero_cases_39_53(
     finally:
         rt_more.close()
 
-    tls = create_store_tls(
-        sid,
-        trusted_tmp / "ol-tls",
-        make_bootstrap_auth(
-            store_id=sid,
-            owner_id="dan",
-            action="provision_tls",
-            subject_id=sid,
-            trust_generation=1,
-            expires_at=clock.now() + dt.timedelta(hours=4),
-            destination=trusted_tmp / "ol-tls",
-        ),
-        clock,
-        os_,
-    )
-    cfg = DaemonConfig(1, root_race, sid, tls.cert_path, tls.key_path)
+    cfg = _create_loop_cfg(root_race, sid, trusted_tmp / "ol-tls", clock, os_)
 
     agent_ref_2 = digest_bytes(b"agent-patch-v2-concurrent")
     hook_fired = threading.Event()
@@ -860,30 +888,6 @@ def test_liveness_300s_1800s_crash_watermarks_and_ended_session_resumed_case_40(
         rt.close()
 
 
-def _create_loop_cfg(
-    root: Path,
-    store_id: str,
-    tls_dir: Path,
-    clock: FakeClock,
-    os_: OsAdapters,
-) -> DaemonConfig:
-    tls = create_store_tls(
-        store_id,
-        tls_dir,
-        make_bootstrap_auth(
-            store_id=store_id,
-            owner_id="dan",
-            action="provision_tls",
-            subject_id=store_id,
-            trust_generation=1,
-            expires_at=clock.now() + dt.timedelta(hours=4),
-            destination=tls_dir,
-        ),
-        clock,
-        os_,
-    )
-    return DaemonConfig(1, root, store_id, tls.cert_path, tls.key_path)
-
 
 def _wait_for_terminal_job(loop: OwnerLoop, job_id: str, *, timeout_s: float = BOUND_WAIT_S) -> JobRecord:
     deadline = time.monotonic() + timeout_s
@@ -899,7 +903,7 @@ def _wait_for_terminal_job(loop: OwnerLoop, job_id: str, *, timeout_s: float = B
         rec = loop.run_owner_action(_read).result(timeout=timeout_s)
         if rec is not None and rec.state in (JobState.SUCCEEDED, JobState.FAILED, JobState.CANCELLED):
             return rec
-        pause.wait(0.02)
+        pause.wait(0.05)
     raise TimeoutError(f"timed out waiting for job {job_id} to reach terminal state")
 
 

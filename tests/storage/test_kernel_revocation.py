@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import atexit
 import datetime as dt
 import shutil
 import subprocess
@@ -28,7 +27,7 @@ from tests.storage.conftest import StaticPolicy, StoreFactory, maintenance_lease
 from tests.support.bounded_worker import BoundedJsonWorker
 from tests.support.clock import FakeClock
 from tests.support.fs import digest_tree
-from tests.support.inc2_fixture import open_cloned_runtime
+from tests.support.inc2_fixture import _interprocess_lock, open_cloned_runtime
 from tests.support.kernel_auth import make_bootstrap_auth, seed_principal_and_credential
 
 
@@ -1575,41 +1574,64 @@ def _ensure_historical_v2_src(
         _HIST_V2_SRC_CACHE[key] = (None, non_shallow)
         return None, non_shallow
 
-    hist_base = Path(tempfile.mkdtemp(prefix="sb2-hist-6a67b38-"))
-    atexit.register(shutil.rmtree, hist_base, ignore_errors=True)
-    try:
-        hist_zip = hist_base / "hist.zip"
-        arch_proc = subprocess.run(
-            ["git", "archive", "--format=zip", f"--output={hist_zip}", hist_commit, "src"],
-            cwd=repo_root,
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        assert arch_proc.returncode == 0, arch_proc.stderr
-        hist_dir = hist_base / "tree"
-        hist_dir.mkdir()
-        os_.permissions.secure_directory(hist_dir)
-        with zipfile.ZipFile(hist_zip) as zf:
-            for member in zf.infolist():
-                member_path = Path(member.filename)
-                member_parts = member_path.parts
-                assert (
-                    bool(member_parts)
-                    and member_parts[0] == "src"
-                    and ".." not in member_parts
-                    and not member_path.is_absolute()
-                    and not member_path.drive
-                ), f"unsafe zip entry: {member.filename}"
-            zf.extractall(hist_dir)
-        hist_zip.unlink(missing_ok=True)
-        hist_src = hist_dir / "src"
-        assert (hist_src / "superbrain" / "__init__.py").is_file()
-        _HIST_V2_SRC_CACHE[key] = (hist_src, non_shallow)
-        return hist_src, non_shallow
-    except BaseException:
-        shutil.rmtree(hist_base, ignore_errors=True)
-        raise
+    import os
+    cache_root = (
+        Path(os.environ.get("LOCALAPPDATA", tempfile.gettempdir()))
+        / "superbrain-tests"
+        / "hist-src"
+        / hist_commit
+    )
+    cached_src = cache_root / "tree" / "src"
+    if (cached_src / "superbrain" / "__init__.py").is_file():
+        _HIST_V2_SRC_CACHE[key] = (cached_src, non_shallow)
+        return cached_src, non_shallow
+
+    cache_root.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = cache_root.parent / f"{hist_commit}.lock"
+    with _interprocess_lock(lock_file):
+        if (cached_src / "superbrain" / "__init__.py").is_file():
+            _HIST_V2_SRC_CACHE[key] = (cached_src, non_shallow)
+            return cached_src, non_shallow
+
+        hist_base = Path(tempfile.mkdtemp(prefix=f"sb2-stage-hist-{hist_commit[:8]}-", dir=cache_root.parent))
+        try:
+            hist_zip = hist_base / "hist.zip"
+            arch_proc = subprocess.run(
+                ["git", "archive", "--format=zip", f"--output={hist_zip}", hist_commit, "src"],
+                cwd=repo_root,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            assert arch_proc.returncode == 0, arch_proc.stderr
+            hist_dir = hist_base / "tree"
+            hist_dir.mkdir()
+            os_.permissions.secure_directory(hist_dir)
+            with zipfile.ZipFile(hist_zip) as zf:
+                for member in zf.infolist():
+                    member_path = Path(member.filename)
+                    member_parts = member_path.parts
+                    assert (
+                        bool(member_parts)
+                        and member_parts[0] == "src"
+                        and ".." not in member_parts
+                        and not member_path.is_absolute()
+                        and not member_path.drive
+                    ), f"unsafe zip entry: {member.filename}"
+                zf.extractall(hist_dir)
+            hist_zip.unlink(missing_ok=True)
+            hist_src = hist_dir / "src"
+            assert (hist_src / "superbrain" / "__init__.py").is_file()
+            cache_root.mkdir(parents=True, exist_ok=True)
+            target_tree = cache_root / "tree"
+            if target_tree.exists():
+                shutil.rmtree(target_tree, ignore_errors=True)
+            shutil.move(str(hist_dir), str(target_tree))
+        finally:
+            shutil.rmtree(hist_base, ignore_errors=True)
+        assert (cached_src / "superbrain" / "__init__.py").is_file()
+        _HIST_V2_SRC_CACHE[key] = (cached_src, non_shallow)
+        return cached_src, non_shallow
 
 
 def test_historical_v2_writer_is_fenced_before_policy_mutation_across_migrate_and_restore(
@@ -1837,7 +1859,7 @@ def test_historical_v2_writer_is_fenced_before_policy_mutation_across_migrate_an
         os_.permissions.secure_file(driver_path)
 
         hist_worker = BoundedJsonWorker(
-            [sys.executable, str(driver_path), str(hist_src), str(repo_root)],
+            [sys.executable, "-I", str(driver_path), str(hist_src), str(repo_root)],
             cwd=repo_root,
             stderr_path=trusted_tmp / "hist_6a67b38_worker.stderr.log",
             label="historical worker",
@@ -2843,7 +2865,7 @@ def test_historical_restore_policy_cannot_strip_main_store_fence_before_authorit
         os_.permissions.secure_file(driver_path)
 
         r4_worker = BoundedJsonWorker(
-            [sys.executable, str(driver_path), str(hist_src), str(repo_root)],
+            [sys.executable, "-I", str(driver_path), str(hist_src), str(repo_root)],
             cwd=repo_root,
             stderr_path=trusted_tmp / "hist_r4_6a67b38_worker.stderr.log",
             label="historical r4 worker",

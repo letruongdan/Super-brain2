@@ -11,7 +11,7 @@ import time
 from collections.abc import Mapping
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
-from functools import partial
+from functools import cache, partial
 from pathlib import Path
 from typing import Any, cast
 
@@ -946,11 +946,17 @@ def _extract_mcp_structured(resp_frame: Mapping[str, JsonValue]) -> tuple[bool, 
     return is_err, structured
 
 
+@cache
 def _git_head_sha() -> str:
     repo = Path(__file__).resolve().parents[2]
     res = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True, check=False)
     sha = res.stdout.strip()
     return sha if len(sha) == 40 and all(c in "0123456789abcdef" for c in sha) else "b" * 40
+
+
+@cache
+def _wheel_digest(wheel_path: Path) -> str:
+    return digest_bytes(wheel_path.read_bytes())
 
 
 def _build_wheel_probe_and_obs(
@@ -982,8 +988,7 @@ def _build_wheel_probe_and_obs(
     expected_alias: str | None = None,
 ) -> tuple[NativeConnectionProbe, ObserverRegistration, ObservationSet]:
     source_commit = _git_head_sha()
-    shim_bytes = env.wheel_path.read_bytes()
-    shim_build_digest = digest_bytes(shim_bytes)
+    shim_build_digest = _wheel_digest(env.wheel_path)
     cfg_digest = digest_bytes(config_path.read_bytes())
     prof_digest = digest_bytes(profile_path.read_bytes())
     schema_digest = digest_bytes(schema_copy_path.read_bytes())
@@ -1048,7 +1053,7 @@ def _build_wheel_probe_and_obs(
     art_dir = evidence_root / f"artifacts-{call_id}"
     art_dir.mkdir(parents=True, exist_ok=True)
     shim_copy_path = art_dir / "shim-build.whl"
-    shim_copy_path.write_bytes(shim_bytes)
+    shutil.copyfile(env.wheel_path, shim_copy_path)
     owner_ready_copy = art_dir / "owner-ready.json"
     owner_events_copy = art_dir / "owner-events.jsonl"
     sock_obs_copy = art_dir / "socket-observations.jsonl"

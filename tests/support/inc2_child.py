@@ -73,7 +73,7 @@ def inc2_child_env(overrides: Mapping[str, str] | None = None) -> dict[str, str]
 
 def inc2_child_command(operation: str, config_path: Path, extra_args: Sequence[str] = ()) -> list[str]:
     """Construct the ``sys.executable -I`` command line targeting ``inc2_child.py``."""
-    return [sys.executable, "-I", "-c", _RUNPY, str(INC2_CHILD_PATH), operation, str(config_path), *extra_args]
+    return [sys.executable, "-I", str(INC2_CHILD_PATH), operation, str(config_path), *extra_args]
 
 
 def _win32_handle_creation_ticks(handle: int) -> int | None:
