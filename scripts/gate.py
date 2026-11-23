@@ -301,8 +301,8 @@ _WHEEL_FIXTURE_FILES: frozenset[str] = frozenset(
 # Replaces estimates whose local error is >= 3s with the measured JUnit file time.
 _HEAVY_FILE_COST_MS: dict[str, int] = {
     "tests/integration/test_apply_journal_crash_matrix.py": 74000,
-    "tests/integration/test_sp2_i2_wheel_compat.py": 62000,
-    "tests/integration/test_kernel_crash_recovery.py": 58000,
+    "tests/integration/test_sp2_i2_wheel_compat.py": 72000,
+    "tests/integration/test_kernel_crash_recovery.py": 64000,
     "tests/integration/test_kernel_daemon.py": 57173,
     "tests/integration/test_i3_rereview_init_and_accounting.py": 45784,
     "tests/integration/test_capture_ack_and_crash_matrix.py": 44630,
