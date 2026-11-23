@@ -53,6 +53,7 @@ from tests.support.inc2_fixture import (
     _clean_subprocess_env,
     _cleanup_dir,
     _make_trusted_session_dir,
+    ensure_template_base,
 )
 from tests.support.inc2_transport import read_raw_http_response, register_workspace_direct
 from tests.support.kernel_auth import (
@@ -92,57 +93,64 @@ def frozen_i2_installed_env(tmp_path_factory: pytest.TempPathFactory) -> Iterato
     """Build an offline wheel + venv from frozen baseline commit 035a4cdc5936155982e5172602213353d4bbb6c4."""
     scratch = _make_trusted_session_dir("i2-wheel-", tmp_path_factory)
     try:
-        tar_path = scratch / "frozen-i2.tar"
-        src_dir = scratch / "src-i2"
-        src_dir.mkdir(parents=True, exist_ok=True)
-        subprocess.run(
-            [
-                "git",
-                "-C",
-                str(REPO_ROOT),
-                "archive",
-                "--format=tar",
-                "--output",
-                str(tar_path),
-                FROZEN_I2_COMMIT,
-            ],
-            check=True,
-            capture_output=True,
-            timeout=60.0,
-        )
-        with tarfile.open(tar_path, "r:") as tf:
-            if hasattr(tarfile, "data_filter"):
-                tf.extractall(src_dir, filter="data")
-            else:
-                tf.extractall(src_dir)
-        tar_path.unlink(missing_ok=True)
+        cache_dir = ensure_template_base() / f"frozen-i2-{FROZEN_I2_COMMIT[:12]}"
+        src_dir = cache_dir / "src-i2"
+        cached_wheels = list(cache_dir.glob("super_brain2-*.whl")) if cache_dir.is_dir() else []
+        cached_schema = src_dir / "schemas" / "mcp-tools-v2.json"
+        if cached_wheels and cached_schema.is_file():
+            wheel_path = cached_wheels[0]
+            frozen_schema_path = cached_schema
+            frozen_schema_sha256 = hashlib.sha256(frozen_schema_path.read_bytes()).hexdigest()
+        else:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            tar_path = scratch / "frozen-i2.tar"
+            src_dir.mkdir(parents=True, exist_ok=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(REPO_ROOT),
+                    "archive",
+                    "--format=tar",
+                    "--output",
+                    str(tar_path),
+                    FROZEN_I2_COMMIT,
+                ],
+                check=True,
+                capture_output=True,
+                timeout=60.0,
+            )
+            with tarfile.open(tar_path, "r:") as tf:
+                if hasattr(tarfile, "data_filter"):
+                    tf.extractall(src_dir, filter="data")
+                else:
+                    tf.extractall(src_dir)
+            tar_path.unlink(missing_ok=True)
 
-        frozen_schema_path = src_dir / "schemas" / "mcp-tools-v2.json"
-        assert frozen_schema_path.is_file()
-        frozen_schema_sha256 = hashlib.sha256(frozen_schema_path.read_bytes()).hexdigest()
+            frozen_schema_path = src_dir / "schemas" / "mcp-tools-v2.json"
+            assert frozen_schema_path.is_file()
+            frozen_schema_sha256 = hashlib.sha256(frozen_schema_path.read_bytes()).hexdigest()
 
-        dist_dir = scratch / "dist"
-        dist_dir.mkdir()
+            _run_offline(
+                [
+                    "uv",
+                    "build",
+                    "--wheel",
+                    "--no-build-isolation",
+                    "--offline",
+                    "--python",
+                    sys.executable,
+                    "--out-dir",
+                    str(cache_dir),
+                    str(src_dir),
+                ],
+                cwd=src_dir,
+            )
+            wheels = sorted(cache_dir.glob("super_brain2-*.whl"))
+            assert len(wheels) == 1, f"expected 1 wheel, found {wheels}"
+            wheel_path = wheels[0]
+
         venv_dir = scratch / "venv"
-
-        _run_offline(
-            [
-                "uv",
-                "build",
-                "--wheel",
-                "--no-build-isolation",
-                "--offline",
-                "--python",
-                sys.executable,
-                "--out-dir",
-                str(dist_dir),
-                str(src_dir),
-            ],
-            cwd=src_dir,
-        )
-        wheels = sorted(dist_dir.glob("super_brain2-*.whl"))
-        assert len(wheels) == 1, f"expected 1 wheel, found {wheels}"
-        wheel_path = wheels[0]
 
         _run_offline(
             [
@@ -192,6 +200,10 @@ def frozen_i2_installed_env(tmp_path_factory: pytest.TempPathFactory) -> Iterato
             'import os; os.environ.get("SUPERBRAIN_TEST_SOCKET_READINESS") '
             'and __import__("_superbrain_test_readiness").install()\n',
             encoding="utf-8",
+        )
+        _run_offline(
+            [str(venv_python), "-m", "compileall", "-q", str(purelib_dir)],
+            cwd=scratch,
         )
 
         yield InstalledEnv(

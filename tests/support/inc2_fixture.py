@@ -238,6 +238,10 @@ def open_inc2_installed_env(scratch: Path) -> Iterator[InstalledEnv]:
         'and __import__("_superbrain_test_readiness").install()\n',
         encoding="utf-8",
     )
+    _run_checked(
+        [str(venv_python), "-m", "compileall", "-q", str(purelib_dir)],
+        cwd=scratch,
+    )
 
     yield InstalledEnv(
         venv_dir=venv_dir,

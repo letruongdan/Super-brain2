@@ -86,7 +86,7 @@ from tests.support.inc2_cli import (
     write_daemon_config_file,
     write_owner_only_bytes,
 )
-from tests.support.inc2_fixture import InstalledEnv, open_cloned_runtime
+from tests.support.inc2_fixture import InstalledEnv, ensure_template_base, open_cloned_runtime
 from tests.support.inc2_t8_job_cases import (
     cancel_args,
     expect_cancel,
@@ -876,6 +876,20 @@ def shim_health_and_job(
 # --- kernel seeds --------------------------------------------------------------------------------------------------
 
 
+_DAEMON_TPL_INFO: tuple[int, dict[str, list[tuple[object, ...]]]] | None = None
+
+
+def _get_daemon_root_info(tpl: TransportTemplate) -> tuple[int, dict[str, list[tuple[object, ...]]]]:
+    global _DAEMON_TPL_INFO
+    if _DAEMON_TPL_INFO is None:
+        epoch = lock_epoch(tpl.root)
+        scratch = tpl.root.parent / "ro-scratch-tpl"
+        snapshot = store_rows(tpl.root, scratch)
+        assert snapshot["ledger"], "the seeded root must hold ACKed ledger entries"
+        _DAEMON_TPL_INFO = (epoch, snapshot)
+    return _DAEMON_TPL_INFO
+
+
 def _seed_daemon_root(ctx: KernelCrashContext, *, stale_endpoint: bool) -> KernelSeed:
     """A clone of the session's admitted (store 4, policy 3) template: credentials, workspaces, two ACKed jobs."""
     tpl = ctx.template
@@ -888,7 +902,7 @@ def _seed_daemon_root(ctx: KernelCrashContext, *, stale_endpoint: bool) -> Kerne
         cert_path=tpl.tls.cert_path,
         key_path=tpl.tls.key_path,
     )
-    epoch = lock_epoch(data_root)
+    epoch, snapshot = _get_daemon_root_info(tpl)
     stale = None
     if stale_endpoint:
         stale = Endpoint(
@@ -900,8 +914,6 @@ def _seed_daemon_root(ctx: KernelCrashContext, *, stale_endpoint: bool) -> Kerne
             instance_id=new_id(),
         )
         write_owner_only_bytes(DataRoot.at(data_root).endpoint_path, stale.encode_canonical())
-    snapshot = store_rows(data_root, ctx.case_dir / "ro-scratch")
-    assert snapshot["ledger"], "the seeded root must hold ACKed ledger entries"
     return KernelSeed(data_root, config, tpl.store_id, epoch, snapshot, stale)
 
 
@@ -913,14 +925,36 @@ def seed_daemon_root(ctx: KernelCrashContext) -> KernelSeed:
     return _seed_daemon_root(ctx, stale_endpoint=False)
 
 
-def seed_legacy_pair(ctx: KernelCrashContext) -> KernelSeed:
-    """An increment 1 pair at (store 2, policy 2): two durable blobs, a quarantine intent applied to the store, an
-    active credential, and TLS material for its own store id."""
+@dataclass(frozen=True)
+class _LegacyPairTemplate:
+    data_root: Path
+    tls_dir: Path
+    store_id: str
+    token: str
+    snapshot: dict[str, list[tuple[object, ...]]]
+    cert_name: str
+    key_name: str
+    ca_cert_name: str
+    leaf_cert_sha256: str
+    lock_epoch: int
+
+
+_LEGACY_PAIR_TEMPLATE: _LegacyPairTemplate | None = None
+
+
+def _get_legacy_pair_template() -> _LegacyPairTemplate:
+    global _LEGACY_PAIR_TEMPLATE
+    if _LEGACY_PAIR_TEMPLATE is not None and _LEGACY_PAIR_TEMPLATE.data_root.is_dir():
+        return _LEGACY_PAIR_TEMPLATE
+    import uuid
+
+    tpl_base = ensure_template_base() / f"legacy-pair-tpl-{uuid.uuid4().hex}"
+    tpl_base.mkdir(parents=True, exist_ok=True)
     clock = FakeClock(dt.datetime.now(dt.UTC).replace(microsecond=0) - dt.timedelta(minutes=5))
     adapters = os_adapters(clock=clock)
-    data_root = ctx.case_dir / "data"
+    tpl_data = tpl_base / "data"
     rt = open_cloned_runtime(
-        data_root,
+        tpl_data,
         adapters,
         role="crash-v2",
         store_migrations=KERNEL_STORE_MIGRATIONS[:2],
@@ -937,6 +971,7 @@ def seed_legacy_pair(ctx: KernelCrashContext) -> KernelSeed:
         store_id, generation = rt.store.store_id, rt.policy.trust_generation()
     finally:
         rt.close()
+    tpl_tls = tpl_base / "tls"
     auth = make_bootstrap_auth(
         store_id=store_id,
         owner_id="dan",
@@ -944,29 +979,61 @@ def seed_legacy_pair(ctx: KernelCrashContext) -> KernelSeed:
         subject_id=store_id,
         trust_generation=generation,
         expires_at=clock.now() + dt.timedelta(hours=2),
-        destination=ctx.case_dir / "tls",
+        destination=tpl_tls,
     )
-    tls = create_store_tls(store_id, ctx.case_dir / "tls", auth, clock, adapters)
+    tls = create_store_tls(store_id, tpl_tls, auth, clock, adapters)
+    snapshot = pair_rows(tpl_data, tpl_base / "ro-scratch")
+    assert snapshot["intents"] and snapshot["quarantine"] and snapshot["credential"] and snapshot["ledger"]
+    _LEGACY_PAIR_TEMPLATE = _LegacyPairTemplate(
+        data_root=tpl_data,
+        tls_dir=tpl_tls,
+        store_id=store_id,
+        token=credential.token,
+        snapshot=snapshot,
+        cert_name=tls.cert_path.name,
+        key_name=tls.key_path.name,
+        ca_cert_name=tls.ca_cert_path.name,
+        leaf_cert_sha256=tls.leaf_cert_sha256,
+        lock_epoch=lock_epoch(tpl_data),
+    )
+    return _LEGACY_PAIR_TEMPLATE
+
+
+def seed_legacy_pair(ctx: KernelCrashContext) -> KernelSeed:
+    """An increment 1 pair at (store 2, policy 2): two durable blobs, a quarantine intent applied to the store, an
+    active credential, and TLS material for its own store id."""
+    tpl = _get_legacy_pair_template()
+    data_root = ctx.case_dir / "data"
+    clone_owner_only_tree(tpl.data_root, data_root)
+    clone_owner_only_tree(tpl.tls_dir, ctx.case_dir / "tls")
+    cert_path = ctx.case_dir / "tls" / tpl.cert_name
+    key_path = ctx.case_dir / "tls" / tpl.key_name
+    ca_cert_path = ctx.case_dir / "tls" / tpl.ca_cert_name
+
     config = write_daemon_config_file(
         ctx.case_dir / "daemon-config.json",
         data_root=data_root,
-        expected_store_id=store_id,
-        cert_path=tls.cert_path,
-        key_path=tls.key_path,
+        expected_store_id=tpl.store_id,
+        cert_path=cert_path,
+        key_path=key_path,
     )
-    credential_file = write_credential_file(ctx.case_dir / "client" / "legacy-credential.txt", credential.token)
+    credential_file = write_credential_file(ctx.case_dir / "client" / "legacy-credential.txt", tpl.token)
     write_client_profile_file(
         ctx.case_dir / "client" / "legacy-health-profile.json",
         endpoint_path=DataRoot.at(data_root).endpoint_path,
-        expected_store_id=store_id,
-        ca_file=tls.ca_cert_path,
-        leaf_cert_sha256=tls.leaf_cert_sha256,
+        expected_store_id=tpl.store_id,
+        ca_file=ca_cert_path,
+        leaf_cert_sha256=tpl.leaf_cert_sha256,
         credential_file=credential_file,
     )
     assert schema_versions(data_root) == (2, 2)
-    snapshot = pair_rows(data_root, ctx.case_dir / "ro-scratch")
-    assert snapshot["intents"] and snapshot["quarantine"] and snapshot["credential"] and snapshot["ledger"]
-    return KernelSeed(data_root, config, store_id, lock_epoch(data_root), snapshot)
+    assert (
+        tpl.snapshot["intents"]
+        and tpl.snapshot["quarantine"]
+        and tpl.snapshot["credential"]
+        and tpl.snapshot["ledger"]
+    )
+    return KernelSeed(data_root, config, tpl.store_id, tpl.lock_epoch, tpl.snapshot)
 
 
 # --- kernel expectations -------------------------------------------------------------------------------------------
@@ -1190,14 +1257,50 @@ def open_fixture_runtime(data_root: Path, store_id: str) -> Runtime:
     )
 
 
-def seed_fixture_root(ctx: KernelCrashContext) -> KernelSeed:
-    """The admitted template plus the fixture scenario (three artifacts of ``ws-a``), seeded before any daemon."""
+@dataclass(frozen=True)
+class _FixtureRootTemplate:
+    data_root: Path
+    lock_epoch: int
+    snapshot: dict[str, list[tuple[object, ...]]]
+
+
+_FIXTURE_ROOT_TEMPLATE: _FixtureRootTemplate | None = None
+
+
+def _get_fixture_root_template(tpl: TransportTemplate) -> _FixtureRootTemplate:
+    global _FIXTURE_ROOT_TEMPLATE
+    if _FIXTURE_ROOT_TEMPLATE is not None and _FIXTURE_ROOT_TEMPLATE.data_root.is_dir():
+        return _FIXTURE_ROOT_TEMPLATE
+    import uuid
+
     from tests.support.inc2_kernel_domain import FixtureKernelDomain
     from tests.support.inc2_t8_domain import seed_scenario
 
+    fixture_base = ensure_template_base() / f"fixture-tpl-{uuid.uuid4().hex}"
+    fixture_data = fixture_base / "data"
+    clone_owner_only_tree(tpl.root, fixture_data)
+    rt = open_fixture_runtime(fixture_data, tpl.store_id)
+    try:
+        seed_scenario(FixtureKernelDomain(store=rt.store, policy=rt.policy, clock=rt.os_.clock), rt)
+    finally:
+        rt.close()
+    snapshot = fixture_rows(fixture_data, fixture_base / "ro-scratch")
+    assert snapshot["ledger"] and len(snapshot["artifacts"]) == 3, "the scenario was not seeded"
+    assert snapshot["deliveries"] == [] and snapshot["idempotency"] == [] and snapshot["task_bindings"] == []
+    _FIXTURE_ROOT_TEMPLATE = _FixtureRootTemplate(
+        data_root=fixture_data,
+        lock_epoch=lock_epoch(fixture_data),
+        snapshot=snapshot,
+    )
+    return _FIXTURE_ROOT_TEMPLATE
+
+
+def seed_fixture_root(ctx: KernelCrashContext) -> KernelSeed:
+    """The admitted template plus the fixture scenario (three artifacts of ``ws-a``), seeded before any daemon."""
     tpl = ctx.template
+    fixture_tpl = _get_fixture_root_template(tpl)
     data_root = ctx.case_dir / "data"
-    clone_owner_only_tree(tpl.root, data_root)
+    clone_owner_only_tree(fixture_tpl.data_root, data_root)
     config = write_daemon_config_file(
         ctx.case_dir / "daemon-config.json",
         data_root=data_root,
@@ -1205,15 +1308,7 @@ def seed_fixture_root(ctx: KernelCrashContext) -> KernelSeed:
         cert_path=tpl.tls.cert_path,
         key_path=tpl.tls.key_path,
     )
-    rt = open_fixture_runtime(data_root, tpl.store_id)
-    try:
-        seed_scenario(FixtureKernelDomain(store=rt.store, policy=rt.policy, clock=rt.os_.clock), rt)
-    finally:
-        rt.close()
-    snapshot = fixture_rows(data_root, ctx.case_dir / "ro-scratch")
-    assert snapshot["ledger"] and len(snapshot["artifacts"]) == 3, "the scenario was not seeded"
-    assert snapshot["deliveries"] == [] and snapshot["idempotency"] == [] and snapshot["task_bindings"] == []
-    return KernelSeed(data_root, config, tpl.store_id, lock_epoch(data_root), snapshot)
+    return KernelSeed(data_root, config, tpl.store_id, fixture_tpl.lock_epoch, fixture_tpl.snapshot)
 
 
 def _ws_profile(ctx: KernelCrashContext, seed: KernelSeed, name: str, token: str) -> Path:
