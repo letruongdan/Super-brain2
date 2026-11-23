@@ -1373,9 +1373,12 @@ def run_gate(
                         except ValueError as err:
                             extra.append(f"inventory: {err}")
 
+                mypy_cmd = ["mypy"]
+                if (repo / ".mypy_cache").is_dir():
+                    mypy_cmd.extend(["--cache-dir", str(repo / ".mypy_cache")])
                 commands: dict[str, list[str]] = {
                     "ruff": _uv(worktree, python, "ruff", "check", "src", "tests", "scripts"),
-                    "mypy": _uv(worktree, python, "mypy"),
+                    "mypy": _uv(worktree, python, *mypy_cmd),
                     "lint-imports": _uv(worktree, python, "lint-imports"),
                     "pytest": _uv(worktree, python, "pytest", f"--junitxml={junit}", "-q", "-rfEX"),
                 }
