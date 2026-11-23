@@ -296,21 +296,19 @@ _WHEEL_FIXTURE_FILES: frozenset[str] = frozenset(
 # plus session wheel setup overhead across the two wheel shards. _WHEEL_SETUP_COST_MS=3000 and 300s budget intact.
 # After the I3/SP2 merge (fb3d8d1), replace estimates whose local error is at least
 # 7 s with the mean JUnit file time from the Python 3.11 and 3.14 Windows runs.
-# Recalibrated on 2026-11-23 from Python 3.11 and 3.14 Windows diagnostic gate runs
-# (evidence/batch2-diag-v22, commits 4011200, 1a81253, and batch 2-5 optimizations).
-# Replaces estimates whose local error is >= 3s with the measured JUnit file time.
+# Recalibrated on 2026-11-24 from Python 3.11 and 3.14 Windows diagnostic gate runs
+# (evidence/final-gate, commits d0ae4ab, and wheel-cache ACL scan fix).
+# Replaces estimates whose local error is >= 3s with the measured JUnit file time,
+# and balances wheel suites across Shards 0-1 and non-wheel suites across Shards 2-5.
 _HEAVY_FILE_COST_MS: dict[str, int] = {
+    "tests/integration/test_apply_journal_crash_matrix.py": 75000,
     "tests/integration/test_kernel_crash_recovery.py": 66275,
-    "tests/integration/test_kernel_daemon.py": 57173,
+    "tests/integration/test_sp2_i2_wheel_compat.py": 60000,
     "tests/integration/test_kernel_native_receipt_contract.py": 55252,
     "tests/integration/test_i3_wheel_e2e.py": 46108,
-    "tests/integration/test_i3_rereview_init_and_accounting.py": 45784,
-    "tests/integration/test_apply_journal_crash_matrix.py": 45200,
-    "tests/integration/test_sp2_i2_wheel_compat.py": 38300,
-    "tests/application/test_continuity_worker_scheduling.py": 36877,
+    "tests/integration/test_kernel_daemon.py": 34230,
     "tests/integration/test_capture_ack_and_crash_matrix.py": 33111,
     "tests/integration/test_restore_and_migration_i3.py": 32629,
-    "tests/storage/test_kernel_revocation.py": 31958,
     "tests/application/test_t8_review_p01_r2_edge_globs.py": 30615,
     "tests/architecture/test_gate_receipt.py": 30592,
     "tests/integration/test_kernel_cli.py": 29864,
@@ -320,12 +318,15 @@ _HEAVY_FILE_COST_MS: dict[str, int] = {
     "tests/storage/test_restore.py": 25014,
     "tests/storage/test_runtime.py": 24584,
     "tests/domain/test_capture_envelope_and_privacy.py": 23782,
+    "tests/integration/test_i3_rereview_init_and_accounting.py": 22900,
     "tests/storage/test_backup.py": 21196,
     "tests/integration/test_kernel_shim.py": 19075,
     "tests/storage/test_kernel_migration.py": 18104,
+    "tests/application/test_continuity_worker_scheduling.py": 17690,
     "tests/contract/test_mcp_v2_schema.py": 16939,
     "tests/storage/test_ledger.py": 16630,
     "tests/integration/test_i3_rereview_bootstrap_and_handoff.py": 16534,
+    "tests/storage/test_kernel_revocation.py": 16230,
     "tests/storage/test_cas.py": 15511,
     "tests/storage/test_remediation_i2_t3_lineage.py": 14651,
     "tests/storage/test_remediation_i2_t5.py": 13946,
