@@ -12,7 +12,7 @@ from pathlib import Path
 
 from superbrain.core._kernel_approval import Layer2State, SignerRecord
 from superbrain.core.canonical import digest_bytes
-from superbrain.core.errors import BrainError, ErrorCode
+from superbrain.core.errors import BrainError, ErrorCode, describe_exception
 from superbrain.core.proposals import ChangeProposal, ProposalStatus, ProposalTarget
 from superbrain.ports.doctor import (
     CaptureDoctorProbePort,
@@ -87,7 +87,7 @@ def _read_pending_tombstones(root: DataRoot, os_: OsAdapters) -> DoctorPendingTo
         )
     except (BrainError, OSError, UnicodeDecodeError, ValueError) as exc:
         return DoctorPendingTombstones(
-            present=True, restore_epoch=None, expired_holders_count=0, corrupt_error=str(exc)
+            present=True, restore_epoch=None, expired_holders_count=0, corrupt_error=describe_exception(exc)
         )
 
 
@@ -101,7 +101,7 @@ def _is_safe_path(path: Path, os_: OsAdapters, errors: list[str], label: str) ->
                 return False
         return True
     except (BrainError, OSError) as exc:
-        errors.append(f"{label}: {exc}")
+        errors.append(f"{label}: {describe_exception(exc)}")
         return False
 
 
@@ -219,7 +219,7 @@ def _read_policy_state(
                 )
         return trust_gen, reset_rec, signers, term_ok, tuple(harnesses), tuple(locks), tuple(intents)
     except (BrainError, sqlite3.Error, ValueError) as exc:
-        errors.append(f"policy read error: {exc}")
+        errors.append(f"policy read error: {describe_exception(exc)}")
         return None, False, (), False, (), (), ()
     finally:
         if opened is not None:
@@ -370,7 +370,7 @@ def _read_store_proposals(
             _inspect_single_target(prop, target, os_, drifts)
         return tuple(pending), tuple(drifts), tuple(incomplete_journals)
     except (BrainError, sqlite3.Error, OSError, ValueError) as exc:
-        errors.append(f"store proposal read error: {exc}")
+        errors.append(f"store proposal read error: {describe_exception(exc)}")
         return tuple(pending), tuple(drifts), tuple(incomplete_journals)
     finally:
         if opened is not None:
@@ -457,7 +457,7 @@ def read_doctor_snapshot(
                     ensure_readable(store_info, KERNEL_STORE_MIGRATIONS)
                     store_readable = True
             except BrainError as exc:
-                errors.append(f"store schema read error: {exc}")
+                errors.append(f"store schema read error: {describe_exception(exc)}")
         if policy_ok:
             try:
                 policy_info = read_schema_info(db_layout.policy_db, scratch_dir=scratch, db=policy_conn)
@@ -465,14 +465,14 @@ def read_doctor_snapshot(
                     ensure_readable(policy_info, KERNEL_POLICY_MIGRATIONS)
                     policy_readable = True
             except BrainError as exc:
-                errors.append(f"policy schema read error: {exc}")
+                errors.append(f"policy schema read error: {describe_exception(exc)}")
 
         restore_epoch: int | None = None
         if store_ok and store_readable and store_info is not None:
             try:
                 restore_epoch = read_restore_epoch(db_layout, schema_version=store_info.schema_version, os_=os_)
             except BrainError as exc:
-                errors.append(f"restore_epoch error: {exc}")
+                errors.append(f"restore_epoch error: {describe_exception(exc)}")
 
         if policy_ok and policy_readable:
             trust_gen, reset_rec, signers, term_ok, l2_statuses, locks, turn_intents = _read_policy_state(

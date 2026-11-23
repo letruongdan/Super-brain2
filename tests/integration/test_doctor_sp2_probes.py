@@ -22,7 +22,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Iterator, Mapping
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
@@ -533,6 +533,24 @@ class _StubSupervisorControl(SupervisorControlPort):
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class _ReceiptHarness(CaptureHarnessDoctorStatus):
+    """Native capture status carrying the receipt that binds it to host, platform, Layer-2 config and checkout."""
+
+    receipt: Mapping[str, Any] | None = None
+
+
+def _bound_receipt(harness_id: str, host_version: str, config_digest: str, ws: Any) -> dict[str, Any]:
+    """Native receipt bound to this run: host, ``sys.platform``, the harness's Layer-2 entry and the checkout scope."""
+    return {
+        "host": harness_id,
+        "os": sys.platform,
+        "host_version": host_version,
+        "config_digest": config_digest,
+        "run_scope": {"repo_id": ws.repo_id, "checkout_id": ws.checkout_id},
+    }
+
+
 def test_sp2_probe_module_exports_constants_and_adapter_metrics(trusted_tmp: Path) -> None:
     """Verify SP2 probe constants, re-exports, aggregation, latest timestamp, and provenance detail."""
     sp2 = _sp2_mod()
@@ -753,7 +771,7 @@ def test_m1_all_five_surfaces_end_to_end_daemon_mcp_operator_and_cli(trusted_tmp
     def _dynamic_snap(_root: Path) -> CaptureDoctorSnapshot:
         return CaptureDoctorSnapshot(
             harnesses=(
-                CaptureHarnessDoctorStatus(
+                _ReceiptHarness(
                     harness_id="claude-code",
                     last_event_at="2026-11-21T19:01:00Z",
                     active_layer="hook",
@@ -761,8 +779,9 @@ def test_m1_all_five_surfaces_end_to_end_daemon_mcp_operator_and_cli(trusted_tmp
                     capture_gaps=live_state["gaps"],
                     dead_letters=live_state["dead"],
                     receipt_kind="native",
+                    receipt=_bound_receipt("claude-code", "2.1.0", digest_bytes(b"claude-hooks-v1"), ws_a),
                 ),
-                CaptureHarnessDoctorStatus(
+                _ReceiptHarness(
                     harness_id="codex",
                     last_event_at="2026-11-21T19:02:00Z",
                     active_layer="hook",
@@ -770,6 +789,7 @@ def test_m1_all_five_surfaces_end_to_end_daemon_mcp_operator_and_cli(trusted_tmp
                     capture_gaps=0,
                     dead_letters=0,
                     receipt_kind="native",
+                    receipt=_bound_receipt("codex", "0.55.0", digest_bytes(b"codex-hooks-v1"), ws_a),
                 ),
             ),
             available=True,
@@ -908,12 +928,33 @@ def test_m1_all_five_surfaces_end_to_end_daemon_mcp_operator_and_cli(trusted_tmp
             "status"
         ] in {"WARN", "FAIL"}
 
+        # I4-R4-01: store-wide get_health(deep=True) never answers with the checkout-scoped run above; the
+        # degradation reaches deep health through a store-wide (no checkout) run.
+        op_deg_store = _call_operator_json(
+            ready.endpoint,
+            store_id=rep.store_id,
+            ca_pem=ca_pem,
+            leaf_sha256=leaf_sha256,
+            token=cli_token,
+            path="/v2/operator/doctor/report",
+            body={"wait_timeout_ms": 5000},
+            monotonic_ns=real_mono.monotonic_ns,
+        )
+        assert op_deg_store.get("ok") is True, op_deg_store
+        op_deg_store_data = cast(dict[str, Any], op_deg_store["data"])
+        assert op_deg_store_data["overall_status"] in {"warn", "fail"}
+        assert _check_dict_by(cast(list[Mapping[str, Any]], op_deg_store_data["checks"]), "capture", "probe")[
+            "status"
+        ] in {"WARN", "FAIL"}
+
         health_deg_env = _validate_get_health_envelope(
             caller("get_health", {"schema_version": "2.0", "deep": True, "idempotency_key": "idem_m1_e2e_health_02"})
         )
         assert health_deg_env["ok"] is True
         health_deg = cast(dict[str, JsonValue], health_deg_env["data"])
         assert health_deg["doctor_run_id"] != health_data["doctor_run_id"]
+        assert health_deg["doctor_run_id"] == op_deg_store_data["doctor_run_id"], health_deg
+        assert health_deg["doctor_run_id"] != op_deg_data["doctor_run_id"], "deep health named a checkout run"
         assert "capture.probe" in cast(list[str], health_deg["degraded_codes"])
 
         # /v2/operator/doctor/fix triggers outbox_replay and rechecked_checks reflects restored capture.probe PASS!
@@ -983,25 +1024,43 @@ def test_m1_fixture_vs_native_receipt_provenance(trusted_tmp: Path) -> None:
     clock = FakeClock(_base_utc_now())
     rep, cfg, _priv, _ca, _sha, _cli, os_ = _init_store_with_tls(trusted_tmp / "provenance", clock)
     checkout = trusted_tmp / "co"
-    checkout.mkdir()
-    os_.permissions.secure_directory(checkout)
+    home_dir = trusted_tmp / "home"
+    for d in (checkout, home_dir):
+        d.mkdir()
+        os_.permissions.secure_directory(d)
 
     rt = reopen_kernel_job_runtime(cfg.data_root, rep.store_id, os_)
+    live_writer_epoch = rt.lease.epoch  # writer generation a live get_health(deep=true) reports
     try:
-        seed_principal_and_credential(rt.policy, owner_id=OWNER_DAN, harness_id="claude-code", machine_id=MACHINE_ID)
+        cred = seed_principal_and_credential(
+            rt.policy, owner_id=OWNER_DAN, harness_id="claude-code", machine_id=MACHINE_ID
+        )
+        ws = register_workspace_direct(
+            rt, clock, cred.principal, alias="ws-prov", checkout_dir=checkout, remote="https://ex/prov.git"
+        )
         rt.policy.set_layer2_state(
             harness_id="claude-code",
             host_version="2.1.0",
             config_digest=digest_bytes(b"cfg"),
             state=Layer2State.VERIFIED,
         )
+        _apply_clean_bootstrap(
+            rt,
+            store_id=rep.store_id,
+            signer_id=rep.signer.signer_id,
+            owner_id=OWNER_DAN,
+            checkout=checkout,
+            home_dir=home_dir,
+            os_=os_,
+        )
     finally:
         rt.close()
+    claude_receipt = _bound_receipt("claude-code", "2.1.0", digest_bytes(b"cfg"), ws)
 
     healthy_dh: dict[str, JsonValue] = {
         "ready": True,
         "store_id": rep.store_id,
-        "writer_epoch": 1,
+        "writer_epoch": live_writer_epoch,
         "schema_version": 5,
         "policy_schema_version": 4,
         "degraded_codes": [],
@@ -1071,7 +1130,7 @@ def test_m1_fixture_vs_native_receipt_provenance(trusted_tmp: Path) -> None:
     def _mixed_snap(_root: Path) -> CaptureDoctorSnapshot:
         return CaptureDoctorSnapshot(
             harnesses=(
-                CaptureHarnessDoctorStatus(
+                _ReceiptHarness(
                     harness_id="claude-code",
                     last_event_at="2026-11-21T19:15:00Z",
                     active_layer="hook",
@@ -1079,6 +1138,7 @@ def test_m1_fixture_vs_native_receipt_provenance(trusted_tmp: Path) -> None:
                     capture_gaps=0,
                     dead_letters=0,
                     receipt_kind="native",
+                    receipt=claude_receipt,
                 ),
                 CaptureHarnessDoctorStatus(
                     harness_id="codex",
@@ -1112,7 +1172,7 @@ def test_m1_fixture_vs_native_receipt_provenance(trusted_tmp: Path) -> None:
     def _native_snap(_root: Path) -> CaptureDoctorSnapshot:
         return CaptureDoctorSnapshot(
             harnesses=(
-                CaptureHarnessDoctorStatus(
+                _ReceiptHarness(
                     harness_id="claude-code",
                     last_event_at="2026-11-21T19:17:00Z",
                     active_layer="hook",
@@ -1120,6 +1180,7 @@ def test_m1_fixture_vs_native_receipt_provenance(trusted_tmp: Path) -> None:
                     capture_gaps=0,
                     dead_letters=0,
                     receipt_kind="native",
+                    receipt=claude_receipt,
                 ),
             ),
             available=True,
@@ -1156,6 +1217,7 @@ def test_m1_missing_unhealthy_timeout_and_bogus_pass_coercion(trusted_tmp: Path)
     os_.permissions.secure_directory(checkout)
 
     rt = reopen_kernel_job_runtime(cfg.data_root, rep.store_id, os_)
+    live_writer_epoch = rt.lease.epoch  # writer generation a live get_health(deep=true) reports
     try:
         seed_principal_and_credential(rt.policy, owner_id=OWNER_DAN, harness_id="claude-code", machine_id=MACHINE_ID)
         rt.policy.set_layer2_state(
@@ -1170,7 +1232,7 @@ def test_m1_missing_unhealthy_timeout_and_bogus_pass_coercion(trusted_tmp: Path)
     healthy_dh: dict[str, JsonValue] = {
         "ready": True,
         "store_id": rep.store_id,
-        "writer_epoch": 1,
+        "writer_epoch": live_writer_epoch,
         "schema_version": 5,
         "policy_schema_version": 4,
         "degraded_codes": [],
@@ -1354,10 +1416,13 @@ def test_m1_host_invalidation_layer2_states_and_missing_harness_credential(trust
     clock = FakeClock(_base_utc_now())
     rep, cfg, _priv, _ca, _sha, _cli, os_ = _init_store_with_tls(trusted_tmp / "layer2-inv", clock)
     checkout = trusted_tmp / "co"
-    checkout.mkdir()
-    os_.permissions.secure_directory(checkout)
+    home_dir = trusted_tmp / "home"
+    for d in (checkout, home_dir):
+        d.mkdir()
+        os_.permissions.secure_directory(d)
 
     rt = reopen_kernel_job_runtime(cfg.data_root, rep.store_id, os_)
+    live_writer_epoch = rt.lease.epoch  # writer generation a live get_health(deep=true) reports
     try:
         cred_claude = seed_principal_and_credential(
             rt.policy, owner_id=OWNER_DAN, harness_id="claude-code", machine_id=MACHINE_ID
@@ -1377,13 +1442,27 @@ def test_m1_host_invalidation_layer2_states_and_missing_harness_credential(trust
             config_digest=digest_bytes(b"codex-v1"),
             state=Layer2State.VERIFIED,
         )
+        ws = register_workspace_direct(
+            rt, clock, cred_claude.principal, alias="ws-l2", checkout_dir=checkout, remote="https://ex/l2.git"
+        )
+        _apply_clean_bootstrap(
+            rt,
+            store_id=rep.store_id,
+            signer_id=rep.signer.signer_id,
+            owner_id=OWNER_DAN,
+            checkout=checkout,
+            home_dir=home_dir,
+            os_=os_,
+        )
     finally:
         rt.close()
+    claude_receipt = _bound_receipt("claude-code", "2.1.0", digest_bytes(b"claude-v1"), ws)
+    codex_receipt = _bound_receipt("codex", "0.55.0", digest_bytes(b"codex-v1"), ws)
 
     healthy_dh: dict[str, JsonValue] = {
         "ready": True,
         "store_id": rep.store_id,
-        "writer_epoch": 1,
+        "writer_epoch": live_writer_epoch,
         "schema_version": 5,
         "policy_schema_version": 4,
         "degraded_codes": [],
@@ -1395,7 +1474,7 @@ def test_m1_host_invalidation_layer2_states_and_missing_harness_credential(trust
     def _healthy_native_snap(_r: Path) -> CaptureDoctorSnapshot:
         return CaptureDoctorSnapshot(
             harnesses=(
-                CaptureHarnessDoctorStatus(
+                _ReceiptHarness(
                     harness_id="claude-code",
                     last_event_at="2026-11-21T19:20:00Z",
                     active_layer="hook",
@@ -1403,8 +1482,9 @@ def test_m1_host_invalidation_layer2_states_and_missing_harness_credential(trust
                     capture_gaps=0,
                     dead_letters=0,
                     receipt_kind="native",
+                    receipt=claude_receipt,
                 ),
-                CaptureHarnessDoctorStatus(
+                _ReceiptHarness(
                     harness_id="codex",
                     last_event_at="2026-11-21T19:20:00Z",
                     active_layer="hook",
@@ -1412,6 +1492,7 @@ def test_m1_host_invalidation_layer2_states_and_missing_harness_credential(trust
                     capture_gaps=0,
                     dead_letters=0,
                     receipt_kind="native",
+                    receipt=codex_receipt,
                 ),
             ),
             available=True,
@@ -1432,7 +1513,7 @@ def test_m1_host_invalidation_layer2_states_and_missing_harness_credential(trust
     inv_probe = sp2.build_sp2_capture_probe(
         lambda _r: CaptureDoctorSnapshot(
             harnesses=(
-                CaptureHarnessDoctorStatus(
+                _ReceiptHarness(
                     harness_id="claude-code",
                     last_event_at="2026-11-21T19:20:00Z",
                     active_layer="hook",
@@ -1441,6 +1522,7 @@ def test_m1_host_invalidation_layer2_states_and_missing_harness_credential(trust
                     dead_letters=0,
                     receipt_kind="native",
                     host_invalidated=True,
+                    receipt=claude_receipt,
                 ),
             ),
             available=True,
@@ -1596,6 +1678,7 @@ def test_m1_incomplete_journal_drift_permissions_deep_health_and_cross_owner_che
         os_.permissions.secure_directory(d)
 
     rt = reopen_kernel_job_runtime(cfg.data_root, rep.store_id, os_)
+    live_writer_epoch = rt.lease.epoch  # writer generation a live get_health(deep=true) reports
     try:
         cred_claude_a = seed_principal_and_credential(
             rt.policy, owner_id=OWNER_DAN, harness_id="claude-code", machine_id=MACHINE_ID
@@ -1654,36 +1737,43 @@ def test_m1_incomplete_journal_drift_permissions_deep_health_and_cross_owner_che
     finally:
         rt.close()
 
-    def _healthy_native_snap(_r: Path) -> CaptureDoctorSnapshot:
-        return CaptureDoctorSnapshot(
-            harnesses=(
-                CaptureHarnessDoctorStatus(
-                    harness_id="claude-code",
-                    last_event_at="2026-11-21T19:30:00Z",
-                    active_layer="hook",
-                    outbox_backlog=0,
-                    capture_gaps=0,
-                    dead_letters=0,
-                    receipt_kind="native",
+    def _healthy_native_snap_for(ws: Any) -> Callable[[Path], CaptureDoctorSnapshot]:
+        def _snap(_r: Path) -> CaptureDoctorSnapshot:
+            return CaptureDoctorSnapshot(
+                harnesses=(
+                    _ReceiptHarness(
+                        harness_id="claude-code",
+                        last_event_at="2026-11-21T19:30:00Z",
+                        active_layer="hook",
+                        outbox_backlog=0,
+                        capture_gaps=0,
+                        dead_letters=0,
+                        receipt_kind="native",
+                        receipt=_bound_receipt("claude-code", "2.1.0", digest_bytes(b"claude-iso"), ws),
+                    ),
+                    _ReceiptHarness(
+                        harness_id="codex",
+                        last_event_at="2026-11-21T19:30:00Z",
+                        active_layer="hook",
+                        outbox_backlog=0,
+                        capture_gaps=0,
+                        dead_letters=0,
+                        receipt_kind="native",
+                        receipt=_bound_receipt("codex", "0.55.0", digest_bytes(b"codex-iso"), ws),
+                    ),
                 ),
-                CaptureHarnessDoctorStatus(
-                    harness_id="codex",
-                    last_event_at="2026-11-21T19:30:00Z",
-                    active_layer="hook",
-                    outbox_backlog=0,
-                    capture_gaps=0,
-                    dead_letters=0,
-                    receipt_kind="native",
-                ),
-            ),
-            available=True,
-        )
+                available=True,
+            )
 
-    healthy_probe = sp2.build_sp2_capture_probe(_healthy_native_snap, require_native_receipts=True)
+        return _snap
+
+    healthy_probe = sp2.build_sp2_capture_probe(_healthy_native_snap_for(ws_a), require_native_receipts=True)
+    # Receipts bound to checkout_b's own scope, so m1_b stays negative for checkout_b's drift, not a scope mismatch.
+    probe_b = sp2.build_sp2_capture_probe(_healthy_native_snap_for(ws_b), require_native_receipts=True)
     healthy_dh: dict[str, JsonValue] = {
         "ready": True,
         "store_id": rep.store_id,
-        "writer_epoch": 1,
+        "writer_epoch": live_writer_epoch,
         "schema_version": 5,
         "policy_schema_version": 4,
         "degraded_codes": [],
@@ -1707,7 +1797,7 @@ def test_m1_incomplete_journal_drift_permissions_deep_health_and_cross_owner_che
         rep.daemon_config_path,
         checkout_root=checkout_b,
         os_=os_,
-        capture_probe=healthy_probe,
+        capture_probe=probe_b,
         deep_health=healthy_dh,
         require_native_receipts=True,
     )
@@ -2146,7 +2236,7 @@ def test_m1_incomplete_journal_drift_permissions_deep_health_and_cross_owner_che
         v_m1 = sp2.evaluate_m1_surfaces(
             v_rep,
             variant,
-            capture_snapshot=_healthy_native_snap(cfg.data_root),
+            capture_snapshot=_healthy_native_snap_for(ws_a)(cfg.data_root),
             deep_health=healthy_dh,
             require_native_receipts=True,
         )
@@ -2173,8 +2263,10 @@ def test_m1_outbox_replay_gap_isolation_idempotency_quarantine_and_zero_secret_l
     )
     root = DataRoot.at(cfg.data_root)
     checkout = trusted_tmp / "co"
-    checkout.mkdir()
-    os_.permissions.secure_directory(checkout)
+    home_dir = trusted_tmp / "home"
+    for d in (checkout, home_dir):
+        d.mkdir()
+        os_.permissions.secure_directory(d)
 
     rt = reopen_kernel_job_runtime(cfg.data_root, rep.store_id, os_)
     try:
@@ -2187,8 +2279,21 @@ def test_m1_outbox_replay_gap_isolation_idempotency_quarantine_and_zero_secret_l
             config_digest=digest_bytes(b"claude-outbox"),
             state=Layer2State.VERIFIED,
         )
+        ws = register_workspace_direct(
+            rt, clock, cred_claude.principal, alias="ws-outbox", checkout_dir=checkout, remote="https://ex/outbox.git"
+        )
+        _apply_clean_bootstrap(
+            rt,
+            store_id=rep.store_id,
+            signer_id=rep.signer.signer_id,
+            owner_id=OWNER_DAN,
+            checkout=checkout,
+            home_dir=home_dir,
+            os_=os_,
+        )
     finally:
         rt.close()
+    claude_receipt = _bound_receipt("claude-code", "2.1.0", digest_bytes(b"claude-outbox"), ws)
 
     # Stateful SP2 outbox simulation:
     # Phase 0: Events {1, 3} + CaptureGap(4) ready; Event 2 delayed on spool -> contiguous=1, gap_acked=(4,), pending=1.
@@ -2256,7 +2361,7 @@ def test_m1_outbox_replay_gap_isolation_idempotency_quarantine_and_zero_secret_l
     def _live_capture_snap(_root: Path) -> CaptureDoctorSnapshot:
         return CaptureDoctorSnapshot(
             harnesses=(
-                CaptureHarnessDoctorStatus(
+                _ReceiptHarness(
                     harness_id="claude-code",
                     last_event_at="2026-11-21T19:40:00Z",
                     active_layer="hook",
@@ -2264,6 +2369,7 @@ def test_m1_outbox_replay_gap_isolation_idempotency_quarantine_and_zero_secret_l
                     capture_gaps=int(spool_state["gaps"]),
                     dead_letters=0,
                     receipt_kind="native",
+                    receipt=claude_receipt,
                 ),
             ),
             available=True,
@@ -2400,6 +2506,21 @@ def test_m1_outbox_replay_gap_isolation_idempotency_quarantine_and_zero_secret_l
             label="clean_operator_report_text",
         )
         _assert_no_raw_secrets(fix3["data"], scanner=scanner, secrets=(), label="clean_operator_fix")
+        # I4-R4-01: store-wide get_health(deep=True) only answers with a store-wide DoctorRun, so the clean run it
+        # reports (and that is quarantined below) must also be refreshed without a checkout scope.
+        clean_store_rep = _call_operator_json(
+            ready.endpoint,
+            store_id=rep.store_id,
+            ca_pem=ca_pem,
+            leaf_sha256=leaf_sha256,
+            token=cli_token,
+            path="/v2/operator/doctor/report",
+            body={"wait_timeout_ms": 5000},
+            monotonic_ns=real_mono.monotonic_ns,
+        )
+        assert clean_store_rep["ok"] is True and clean_store_rep["data"]["overall_status"] == "pass", clean_store_rep
+        assert clean_store_rep["data"]["doctor_run_id"] != clean_rep["data"]["doctor_run_id"]
+        _assert_no_raw_secrets(clean_store_rep["data"], scanner=scanner, secrets=(), label="clean_store_report")
 
         idem_replay_key = "idem_quar_replay_sp2_01"
         h_before = _validate_get_health_envelope(
@@ -2428,8 +2549,10 @@ def test_m1_outbox_replay_gap_isolation_idempotency_quarantine_and_zero_secret_l
         _assert_no_raw_secrets(m1_clean, scanner=scanner, secrets=(), label="clean_run_m1_handover")
         quar_run_id = cast(str, h_before_data["doctor_run_id"])
         assert isinstance(quar_run_id, str) and quar_run_id
+        assert quar_run_id == clean_store_rep["data"]["doctor_run_id"], (h_before_data, clean_store_rep["data"])
 
     quar_run_digest, _quar_doc = _read_latest_doctor_run_doc(root)
+    assert _quar_doc.get("checkout_root") is None, "the quarantined run must be the store-wide run deep health named"
 
     # Seed canary secrets in CAS + log, plus QUARANTINE on DoctorRun and TOMBSTONE on secret CAS holder.
     s_ghp = "ghp_I45CanarySecretToken9988776655abcd"

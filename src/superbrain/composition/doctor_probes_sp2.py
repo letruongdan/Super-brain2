@@ -191,7 +191,10 @@ class Sp2CaptureProbeAdapter(CaptureDoctorProbePort):
                 "Re-verify host bootstrap and capture hooks.",
             )
 
-        provenance, nat_ok = _classify_provenance(snap, None)
+        # Kind only (native vs fixture): binding receipts to platform, host, config and checkout needs the run's
+        # scope and Layer-2 state, which only ``evaluate_m1_surfaces`` has.
+        provenance, _bound = _classify_provenance(snap, None)
+        nat_ok = provenance == "native"
         counts = (
             f"harnesses={len(harnesses)}, receipt_provenance={provenance}, "
             f"outbox_backlog={total_backlog}, capture_gaps={total_gaps}, dead_letters={total_dead}"
@@ -272,9 +275,19 @@ def _eval_deep_health(
     run_id = deep_health.get("doctor_run_id")
     if not isinstance(run_id, str) or not run_id or deep_health.get("job_id") is not None:
         return _surface_entry(surf, "WARN", "doctor_run_pending", "get_health(deep=true) run incomplete", scanner)
+    # Bind the response to the inspected store and writer generation; missing identity on either side never binds.
     store_id = deep_health.get("store_id")
-    if isinstance(store_id, str) and snapshot.store_id is not None and store_id != snapshot.store_id:
+    if not isinstance(store_id, str) or not store_id or not snapshot.store_id:
+        return _surface_entry(surf, "WARN", "deep_health_unbound", "deep health store identity unverified", scanner)
+    if store_id != snapshot.store_id:
         return _surface_entry(surf, "FAIL", "store_id_mismatch", "get_health(deep=true) store_id mismatch", scanner)
+    epoch = deep_health.get("writer_epoch")
+    live_epoch = snapshot.daemon_stats.writer_epoch if snapshot.daemon_stats is not None else None
+    if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch <= 0 or live_epoch is None:
+        return _surface_entry(surf, "WARN", "deep_health_unbound", "deep health writer epoch unverified", scanner)
+    if epoch != live_epoch:
+        detail = "get_health(deep=true) writer_epoch differs from writer.lock"
+        return _surface_entry(surf, "WARN", "writer_epoch_mismatch", detail, scanner)
     age_s = deep_health.get("age_s")
     bad_age = isinstance(age_s, bool) or not isinstance(age_s, (int, float)) or not math.isfinite(float(age_s))
     if bad_age or float(cast(float, age_s)) < 0.0 or float(cast(float, age_s)) > 900.0:
@@ -416,7 +429,15 @@ def _eval_bootstrap_drift(
     if snapshot.pending_proposals:
         cnt = len(snapshot.pending_proposals)
         state = _pick_worse(state, "WARN", "pending_proposals_present", f"{cnt} pending proposal(s)")
-    if applied_count is not None and applied_count == 0:
+    if applied_count is None:
+        state = _pick_worse(
+            state,
+            "WARN",
+            "bootstrap_evidence_unverified",
+            "no registered checkout to verify applied bootstrap against",
+            "Pass the registered checkout (--checkout) to verify its applied bootstrap.",
+        )
+    elif applied_count == 0:
         state = _pick_worse(
             state,
             "WARN",

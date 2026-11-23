@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-import contextlib
 import os
 import shutil
-import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 from superbrain.application._privacy_canary import KernelPrivacyScanner
@@ -17,7 +15,6 @@ from superbrain.composition._daemon_health import (
     RETENTION_POLICY,
     build_doctor_run_bytes,
     health_status_fields,
-    iter_owner_doctor_ledger,
     load_committed_doctor_run_dto,
 )
 from superbrain.core._json_parse import parse_json
@@ -31,14 +28,15 @@ from superbrain.core.kernel import (
     KernelRecord,
     ObjectRef,
     RetentionClass,
-    parse_canonical_utc,
     require_aware_utc,
     result_descriptor,
 )
 from superbrain.ports.doctor import DoctorSnapshot
 from superbrain.ports.kernel import KernelTx
 from superbrain.ports.os import OsAdapters
+from superbrain.storage.backup import snapshot_live_db_pair
 from superbrain.storage.idempotency import StagedKernelStore
+from superbrain.storage.layout import DataRoot
 from superbrain.storage.policy_store import PolicyStore
 from superbrain.storage.restore import read_restore_epoch
 from superbrain.storage.retention import default_expiry
@@ -48,15 +46,12 @@ DOCTOR_ACTOR = "system:doctor"
 VALID_DOCTOR_TRIGGERS = frozenset({"startup", "schedule", "get_health", "cli", "fix", "manual"})
 
 
-def resolve_store_owner(policy: PolicyStore) -> str:
-    """Resolve authoritative owner_id for background scheduled ``system.doctor`` jobs."""
-    owner = policy.store_owner()
-    if owner is not None:
-        return owner
-    snap = policy.snapshot()
-    if snap.principals:
-        return sorted(p.owner_id for p in snap.principals.values())[0]
-    return "system"
+def resolve_store_owner(policy: PolicyStore) -> str | None:
+    """The store's authoritative owner for background ``system.doctor`` jobs, or ``None`` when none is pinned.
+
+    A background run is never attributed to a guessed owner: without a pinned owner nothing is scheduled.
+    """
+    return policy.store_owner()
 
 
 @dataclass(frozen=True)
@@ -67,52 +62,8 @@ class _CompletedDoctorProbe:
     trigger: str
     checkout_root: Path | None
     snapshot: DoctorSnapshot | None
-    scratch_dir: Path | None = None
-    fence_store_id: str | None = None
-    fence_writer_epoch: int | None = None
-    fence_restore_epoch: int | None = None
-    fence_trust_generation: int | None = None
-
-
-def find_latest_intact_doctor_run(
-    rt: Runtime,
-    owner_id: str,
-    now: datetime,
-    *,
-    max_age: timedelta,
-) -> tuple[str, str, datetime] | None:
-    """Return ``(doctor_run_id, report_digest, recorded_at)`` of latest intact, unquarantined run within max_age."""
-    now_utc, _ = require_aware_utc(now)
-    try:
-        entries = iter_owner_doctor_ledger(rt, owner_id=owner_id, limit=64)
-    except sqlite3.Error:
-        return None
-    for meta, refs in entries:
-        run_id = meta.get("doctor_run_id")
-        rec_str = meta.get("recorded_at")
-        digest = meta.get("report_digest")
-        if (
-            not isinstance(run_id, str)
-            or not isinstance(rec_str, str)
-            or not isinstance(digest, str)
-            or not refs
-            or refs[0] != digest
-        ):
-            continue
-        try:
-            rec_at = parse_canonical_utc(rec_str)
-        except BrainError:
-            continue
-        if not (timedelta(0) <= now_utc - rec_at <= max_age):
-            continue
-        if (
-            rt.policy.is_quarantined(digest)
-            or rt.policy.is_tombstoned("event", run_id)
-            or not rt.store.cas.blob_intact(digest)
-        ):
-            continue
-        return run_id, digest, rec_at
-    return None
+    fences: DoctorFences
+    transient: bool = False
 
 
 def parse_doctor_payload(payload: bytes) -> tuple[str, Path | None]:
@@ -275,72 +226,66 @@ def read_doctor_job_outcome_dto(
     raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
 
 
-def create_doctor_scratch_snapshot(
-    rt: Runtime,
-    job_id: str,
-    adapters: OsAdapters,
-) -> tuple[Path, str, int, int, int]:
-    """Take an isolated, consistent point-in-time SQLite snapshot on the owner thread before worker execution."""
-    snap_dir = rt.root.scratch_dir / f"doctor-snap-{job_id}"
-    snap_dir.mkdir(parents=True, exist_ok=True)
-    adapters.permissions.secure_directory(snap_dir)
-    store_dir = snap_dir / "store"
-    store_dir.mkdir(parents=True, exist_ok=True)
-    rt.store.snapshot_db(store_dir / "brain.db")
-    policy_dir = snap_dir / "policy"
-    policy_dir.mkdir(parents=True, exist_ok=True)
-    rt.policy.snapshot_db(policy_dir / "policy.db")
-    with contextlib.suppress(OSError):
-        with open(rt.root.lock_path, "rb") as fh:
-            fh.seek(1)
-            raw_slots = fh.read(512)
-        (snap_dir / rt.root.lock_path.name).write_bytes(b"\x00" + raw_slots)
-    if os.path.lexists(rt.root.endpoint_path):
-        with contextlib.suppress(OSError):
-            shutil.copy2(rt.root.endpoint_path, snap_dir / rt.root.endpoint_path.name)
-    if os.path.lexists(rt.root.restore_epoch_path):
-        with contextlib.suppress(OSError):
-            shutil.copy2(rt.root.restore_epoch_path, store_dir / rt.root.restore_epoch_path.name)
-    if os.path.lexists(rt.root.pending_restore_tombstones_path):
-        with contextlib.suppress(OSError):
-            shutil.copy2(
-                rt.root.pending_restore_tombstones_path,
-                store_dir / rt.root.pending_restore_tombstones_path.name,
-            )
-    if os.path.lexists(rt.root.cas_dir):
-        shutil.copytree(rt.root.cas_dir, store_dir / "cas", dirs_exist_ok=True)
-    fence_store_id = rt.store.store_id
-    fence_writer_epoch = rt.lease.epoch
-    fence_restore_epoch = (
-        read_restore_epoch(rt.root, schema_version=rt.store.schema_version, os_=adapters)
-        if rt.store.schema_version >= 5
-        else 0
-    )
-    fence_trust_gen = rt.policy.trust_generation()
-    return snap_dir, fence_store_id, fence_writer_epoch, fence_restore_epoch, fence_trust_gen
+@dataclass(frozen=True)
+class DoctorFences:
+    """Live identity a doctor result was measured against; a commit is refused once any of them drifts."""
+
+    store_id: str
+    writer_epoch: int
+    restore_epoch: int
+    trust_generation: int
 
 
-def verify_doctor_snapshot_fences(
-    rt: Runtime,
-    adapters: OsAdapters,
-    *,
-    fence_store_id: str | None,
-    fence_writer_epoch: int | None,
-    fence_restore_epoch: int | None,
-    fence_trust_generation: int | None,
-) -> bool:
-    """Verify that live fences have not drifted between snapshot time and commit time."""
-    if fence_store_id is not None and rt.store.store_id != fence_store_id:
-        return False
-    if fence_writer_epoch is not None and rt.lease.epoch != fence_writer_epoch:
-        return False
-    current_restore_epoch = (
-        read_restore_epoch(rt.root, schema_version=rt.store.schema_version, os_=adapters)
-        if rt.store.schema_version >= 5
-        else 0
+def capture_doctor_fences(rt: Runtime, adapters: OsAdapters) -> DoctorFences:
+    """Owner thread, bounded: read the fences a later snapshot must still match at commit time."""
+    return DoctorFences(
+        store_id=rt.store.store_id,
+        writer_epoch=rt.lease.epoch,
+        restore_epoch=(
+            read_restore_epoch(rt.root, schema_version=rt.store.schema_version, os_=adapters)
+            if rt.store.schema_version >= 5
+            else 0
+        ),
+        trust_generation=rt.policy.trust_generation(),
     )
-    if fence_restore_epoch is not None and current_restore_epoch != fence_restore_epoch:
-        return False
-    if fence_trust_generation is not None and rt.policy.trust_generation() != fence_trust_generation:
-        return False
-    return True
+
+
+DOCTOR_SNAPSHOT_PAIR_ATTEMPTS = 3
+
+
+def build_worker_db_snapshot(root: DataRoot, tag: str, adapters: OsAdapters) -> Path:
+    """Worker thread: snapshot only what the reader takes from ``db_root`` (both databases and the store markers).
+
+    CAS, logs and daemon state are read from the live root, so they are never copied. The two databases are copied
+    as one consistent pair (``snapshot_live_db_pair``); after ``DOCTOR_SNAPSHOT_PAIR_ATTEMPTS`` pairs split by a
+    concurrent commit this raises a retryable ``STORE_BUSY`` rather than report on two moments that never
+    coexisted. On failure the partial directory is removed before the error propagates.
+    """
+    snap_dir = root.scratch_dir / f"doctor-snap-{tag}"
+    snap = DataRoot.at(snap_dir)
+    try:
+        snap_dir.mkdir(parents=True, exist_ok=False)
+        adapters.permissions.secure_directory(snap_dir)
+        for dest_db in (snap.store_db, snap.policy_db):
+            dest_db.parent.mkdir()
+        for _ in range(DOCTOR_SNAPSHOT_PAIR_ATTEMPTS):
+            if snapshot_live_db_pair(root.store_db, root.policy_db, snap.store_db, snap.policy_db, adapters):
+                break
+        else:
+            raise BrainError(ErrorCode.STORE_BUSY, "store busy")
+        for marker, dest in (
+            (root.restore_epoch_path, snap.restore_epoch_path),
+            (root.pending_restore_tombstones_path, snap.pending_restore_tombstones_path),
+        ):
+            if os.path.lexists(marker):
+                # follow_symlinks=False: a link stays a link, so the reader rejects it as it would on the live root.
+                shutil.copyfile(marker, dest, follow_symlinks=False)
+    except BaseException:
+        shutil.rmtree(snap_dir, ignore_errors=True)
+        raise
+    return snap_dir
+
+
+def verify_doctor_snapshot_fences(rt: Runtime, adapters: OsAdapters, fences: DoctorFences) -> bool:
+    """Verify that live fences have not drifted between fence capture and commit time."""
+    return capture_doctor_fences(rt, adapters) == fences

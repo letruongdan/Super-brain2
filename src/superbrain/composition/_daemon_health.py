@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import sqlite3
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -182,25 +183,58 @@ def enqueue_doctor_tx(
     )
 
 
+LEDGER_PAGE_ROWS = 64
+LEDGER_SCAN_CAP = 4096
+
+
 def iter_owner_doctor_ledger(
-    rt: Runtime, *, owner_id: str, limit: int = 128
-) -> list[tuple[dict[str, object], list[object]]]:
-    """Read newest ``doctor.run`` ledger entries belonging to ``owner_id`` read-only."""
+    rt: Runtime,
+    *,
+    owner_id: str,
+    current_epoch_only: bool = False,
+    job_id: str | None = None,
+) -> Iterator[tuple[dict[str, object], list[object]]]:
+    """Yield ``owner_id``'s ``doctor.run`` ledger entries newest first, read-only, page by page.
+
+    The owner (and optionally the job, and the current writer epoch, which every valid run must carry) is filtered in
+    SQL, so other owners' entries never use up the scan. Paging stops when the caller stops iterating; past
+    ``LEDGER_SCAN_CAP`` matching rows it raises ``STORE_BUSY`` instead of silently giving up.
+    """
+    clauses = ["kind = 'doctor.run'", "json_extract(CAST(meta AS TEXT), '$.owner_id') = ?"]
+    params: list[object] = [owner_id]
+    if current_epoch_only:
+        clauses.append("writer_epoch = ?")
+        params.append(rt.lease.epoch)
+    if job_id is not None:
+        clauses.append("json_extract(CAST(meta AS TEXT), '$.job_id') = ?")
+        params.append(job_id)
+    where = " AND ".join(clauses)
+    scanned = 0
+    before: int | None = None
     with contextlib.closing(open_readonly(rt.root.store_db)) as conn:
-        rows = conn.execute(
-            "SELECT meta, refs FROM ledger WHERE kind = 'doctor.run' ORDER BY sequence DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
-    out: list[tuple[dict[str, object], list[object]]] = []
-    for raw_meta, raw_refs in rows:
-        try:
-            meta = json.loads(bytes(raw_meta).decode("utf-8"))
-            refs = json.loads(bytes(raw_refs).decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            continue
-        if isinstance(meta, dict) and meta.get("owner_id") == owner_id and isinstance(refs, list):
-            out.append((meta, refs))
-    return out
+        while True:
+            if before is None:
+                page_where, page_params = where, (*params, LEDGER_PAGE_ROWS)
+            else:
+                page_where, page_params = f"{where} AND sequence < ?", (*params, before, LEDGER_PAGE_ROWS)
+            rows = conn.execute(
+                f"SELECT sequence, meta, refs FROM ledger WHERE {page_where} ORDER BY sequence DESC LIMIT ?",
+                page_params,
+            ).fetchall()
+            if not rows:
+                return
+            for seq, raw_meta, raw_refs in rows:
+                scanned += 1
+                if scanned > LEDGER_SCAN_CAP:
+                    raise BrainError(ErrorCode.STORE_BUSY, "doctor run scan limit reached")
+                before = int(seq)
+                try:
+                    meta = json.loads(bytes(raw_meta).decode("utf-8"))
+                    refs = json.loads(bytes(raw_refs).decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+                if isinstance(meta, dict) and meta.get("owner_id") == owner_id and isinstance(refs, list):
+                    yield meta, refs
 
 
 def _valid_run_header(
@@ -250,50 +284,90 @@ def verify_doctor_run_fences(rt: Runtime, doc: Mapping[str, JsonValue], *, owner
     )
 
 
+def doctor_scope_key(checkout_root: str | Path | None) -> str | None:
+    """The comparison key of a doctor scope: ``None`` is store-wide, otherwise the checkout path as the OS compares it.
+
+    Two spellings of one directory (case, separators, trailing separator on Windows) are one scope. The stored
+    ``checkout_root`` keeps the caller's spelling; only comparisons go through this key.
+    """
+    if checkout_root is None:
+        return None
+    return os.path.normcase(os.path.normpath(str(checkout_root)))
+
+
+def _doc_scope_matches(doc: Mapping[str, JsonValue], scope_key: str | None) -> bool:
+    raw = doc.get("checkout_root")
+    if raw is None:
+        return scope_key is None
+    return isinstance(raw, str) and bool(raw) and doctor_scope_key(raw) == scope_key
+
+
 def find_latest_valid_doctor_run(
-    rt: Runtime, owner_id: str, now: datetime
+    rt: Runtime, owner_id: str, now: datetime, *, checkout_root: str | Path | None
 ) -> tuple[RecentDoctorRun, dict[str, JsonValue]] | None:
+    """The newest fenced, intact ``doctor.run`` of scope ``(owner_id, checkout_root)``; ``None`` is store-wide."""
     now_utc, _ = require_aware_utc(now)
+    scope_key = doctor_scope_key(checkout_root)
     try:
-        entries = iter_owner_doctor_ledger(rt, owner_id=owner_id, limit=64)
+        for meta, refs in iter_owner_doctor_ledger(rt, owner_id=owner_id, current_epoch_only=True):
+            hdr = _valid_run_header(meta, refs, now_utc)
+            if hdr is None:
+                continue
+            run_id, digest, _job_id, rec_at = hdr
+            if (
+                rt.policy.is_quarantined(digest)
+                or rt.policy.is_tombstoned("event", run_id)
+                or not rt.store.cas.blob_intact(digest)
+            ):
+                continue
+            doc = _read_doctor_run_cas_doc(rt, run_id=run_id, digest=digest, now_utc=now_utc)
+            if doc is None or not verify_doctor_run_fences(rt, doc, owner_id=owner_id):
+                continue
+            if not _doc_scope_matches(doc, scope_key):
+                continue
+            return RecentDoctorRun(doctor_run_id=run_id, report_digest=digest, recorded_at=rec_at), doc
     except sqlite3.Error:
         return None
-    for meta, refs in entries:
-        hdr = _valid_run_header(meta, refs, now_utc)
-        if hdr is None:
-            continue
-        run_id, digest, _job_id, rec_at = hdr
-        if (
-            rt.policy.is_quarantined(digest)
-            or rt.policy.is_tombstoned("event", run_id)
-            or not rt.store.cas.blob_intact(digest)
-        ):
-            continue
-        doc = _read_doctor_run_cas_doc(rt, run_id=run_id, digest=digest, now_utc=now_utc)
-        if doc is None or not verify_doctor_run_fences(rt, doc, owner_id=owner_id):
-            continue
-        return RecentDoctorRun(doctor_run_id=run_id, report_digest=digest, recorded_at=rec_at), doc
     return None
 
 
-def find_fresh_doctor_run(rt: Runtime, owner_id: str, now: datetime) -> RecentDoctorRun | None:
-    """Return the latest non-quarantined, intact ``doctor.run`` entry for ``owner_id`` within freshness."""
-    res = find_latest_valid_doctor_run(rt, owner_id, now)
-    if res is None:
-        return None
-    latest_run, _ = res
-    now_utc, _ = require_aware_utc(now)
-    return latest_run if (now_utc - latest_run.recorded_at <= DOCTOR_FRESHNESS_WINDOW) else None
+ACTIVE_DOCTOR_SCAN = 100
+_NO_SCOPE = object()
 
 
-def _find_active_owner_doctor_job(job_store: StagedKernelStore, owner_id: str) -> str | None:
+def doctor_payload_scope(payload: bytes) -> str | None | object:
+    """The ``checkout_root`` scope stored in a ``system.doctor`` job payload; ``_NO_SCOPE`` when unreadable."""
     try:
-        rows = job_store.transact(lambda tx: tx.active_jobs_by_kinds((DOCTOR_JOB_KIND,), 100))
+        parsed = parse_json(payload)
     except BrainError:
+        return _NO_SCOPE
+    if not isinstance(parsed, dict):
+        return _NO_SCOPE
+    raw = parsed.get("checkout_root")
+    if raw is None:
         return None
+    return raw if isinstance(raw, str) and raw else _NO_SCOPE
+
+
+def find_active_doctor_job(
+    rt: Runtime, job_store: StagedKernelStore, *, owner_id: str, checkout_root: str | Path | None
+) -> str | None:
+    """The queued/leased/running ``system.doctor`` job of scope ``(owner_id, checkout_root)``, read from durable data.
+
+    Every path that enqueues a doctor job dedups through this one function, so one scope holds at most one slot
+    whatever process, restore or trigger created it. Past ``ACTIVE_DOCTOR_SCAN`` active jobs it refuses
+    (``STORE_BUSY``) rather than enqueue a duplicate it could not rule out.
+    """
+    scope_key = doctor_scope_key(checkout_root)
+    rows = job_store.transact(lambda tx: tx.active_jobs_by_kinds((DOCTOR_JOB_KIND,), ACTIVE_DOCTOR_SCAN))
     for row in rows:
-        if row.owner_id == owner_id:
+        if row.owner_id != owner_id:
+            continue
+        scope = doctor_payload_scope(rt.store.cas.read(row.payload_digest))
+        if (scope is None or isinstance(scope, str)) and doctor_scope_key(scope) == scope_key:
             return row.job_id
+    if len(rows) >= ACTIVE_DOCTOR_SCAN:
+        raise BrainError(ErrorCode.STORE_BUSY, "too many active doctor jobs")
     return None
 
 
@@ -310,10 +384,10 @@ def prepare_deep_health(
     assert exp_at is not None
     result_id = new_id()
 
-    latest_res = find_latest_valid_doctor_run(rt, owner_id, now_utc)
+    latest_res = find_latest_valid_doctor_run(rt, owner_id, now_utc, checkout_root=None)
     latest_run = latest_res[0] if latest_res is not None else None
     is_fresh = latest_run is not None and (now_utc - latest_run.recorded_at <= DOCTOR_FRESHNESS_WINDOW)
-    existing_job_id = _find_active_owner_doctor_job(job_store, owner_id)
+    existing_job_id = find_active_doctor_job(rt, job_store, owner_id=owner_id, checkout_root=None)
 
     target_job_id = existing_job_id if existing_job_id is not None else new_id()
     if is_fresh and existing_job_id is None:
@@ -445,6 +519,8 @@ def render_deep_health(
             raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
         if not verify_doctor_run_fences(rt, run_doc, owner_id=principal.owner_id):
             raise BrainError(ErrorCode.REVISION_CONFLICT, "revision conflict")
+        if not _doc_scope_matches(run_doc, None):
+            raise BrainError(ErrorCode.REVISION_CONFLICT, "revision conflict")
         rec_raw = run_doc.get("recorded_at")
         if not isinstance(rec_raw, str):
             raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
@@ -540,27 +616,26 @@ def find_fresh_doctor_run_dto(
 ) -> dict[str, JsonValue] | None:
     """Return fresh completed ``DoctorRun`` DTO iff writer_epoch, restore_epoch, trust_generation and checkout match."""
     now_utc, _ = require_aware_utc(now)
-    expected_co = str(checkout_root) if checkout_root is not None else None
+    scope_key = doctor_scope_key(checkout_root)
     try:
-        entries = iter_owner_doctor_ledger(rt, owner_id=owner_id, limit=64)
+        for meta, refs in iter_owner_doctor_ledger(rt, owner_id=owner_id, current_epoch_only=True):
+            hdr = _valid_run_header(meta, refs, now_utc)
+            if hdr is None:
+                continue
+            run_id, digest, job_id, rec_at = hdr
+            if now_utc - rec_at > DOCTOR_OPERATOR_WINDOW:
+                continue
+            try:
+                doc = _read_doctor_run_cas_doc(rt, run_id=run_id, digest=digest, now_utc=now_utc)
+            except BrainError:
+                return None
+            if doc is None or not verify_doctor_run_fences(rt, doc, owner_id=owner_id):
+                continue
+            if not _doc_scope_matches(doc, scope_key) or not isinstance(doc.get("report"), Mapping):
+                continue
+            return doctor_run_dto_from_doc(doc, doctor_run_id=run_id, job_id=job_id)
     except sqlite3.Error:
         return None
-    for meta, refs in entries:
-        hdr = _valid_run_header(meta, refs, now_utc)
-        if hdr is None:
-            continue
-        run_id, digest, job_id, rec_at = hdr
-        if now_utc - rec_at > DOCTOR_OPERATOR_WINDOW:
-            continue
-        try:
-            doc = _read_doctor_run_cas_doc(rt, run_id=run_id, digest=digest, now_utc=now_utc)
-        except BrainError:
-            return None
-        if doc is None or not verify_doctor_run_fences(rt, doc, owner_id=owner_id):
-            continue
-        if doc.get("checkout_root") != expected_co or not isinstance(doc.get("report"), Mapping):
-            continue
-        return doctor_run_dto_from_doc(doc, doctor_run_id=run_id, job_id=job_id)
     return None
 
 
@@ -574,7 +649,7 @@ def load_committed_doctor_run_dto(
 ) -> dict[str, JsonValue]:
     """Load an owner's committed ``DoctorRun`` DTO from ledger + held CAS blob."""
     now_utc, _ = require_aware_utc(now)
-    for meta, refs in iter_owner_doctor_ledger(rt, owner_id=owner_id, limit=128):
+    for meta, refs in iter_owner_doctor_ledger(rt, owner_id=owner_id, job_id=job_id):
         if doctor_run_id is not None and meta.get("doctor_run_id") != doctor_run_id:
             continue
         if meta.get("job_id") != job_id:

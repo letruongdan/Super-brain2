@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import cast
 
-from superbrain.core.errors import BrainError
+from superbrain.core.errors import BrainError, describe_exception
 from superbrain.ports.doctor import (
     MAX_LIST_FINDINGS_PER_GROUP,
     DoctorRetentionStats,
@@ -174,7 +174,7 @@ def _collect_cas_digests(cas_dir: Path, errors: list[str]) -> list[tuple[str, Pa
     try:
         shards = sorted(os.scandir(cas_dir), key=lambda e: e.name)
     except OSError as exc:
-        errors.append(f"cas directory scan error: {exc}")
+        errors.append(f"cas directory scan error: {describe_exception(exc)}")
         return items
     for shard_ent in shards:
         shard_path = Path(shard_ent.path)
@@ -189,7 +189,7 @@ def _collect_cas_digests(cas_dir: Path, errors: list[str]) -> list[tuple[str, Pa
         try:
             blobs = sorted(os.scandir(shard_path), key=lambda e: e.name)
         except OSError as exc:
-            errors.append(f"cas shard {shard_ent.name} scan error: {exc}")
+            errors.append(f"cas shard {shard_ent.name} scan error: {describe_exception(exc)}")
             continue
         for blob_ent in blobs:
             bpath = Path(blob_ent.path)
@@ -228,8 +228,8 @@ def _check_sqlite_integrity(
             int_details.append(f"{label}: {'; '.join(res[:2])}")
         return ok
     except (BrainError, sqlite3.Error, OSError) as exc:
-        int_details.append(f"{label} integrity error: {exc}")
-        errors.append(f"{label} integrity check failed: {exc}")
+        int_details.append(f"{label} integrity error: {describe_exception(exc)}")
+        errors.append(f"{label} integrity check failed: {describe_exception(exc)}")
         return False
     finally:
         if opened is not None:
@@ -256,7 +256,7 @@ def _sample_cas_blobs(
             if actual != dig:
                 cas_mismatches.append(f"cas digest mismatch {dig} != {actual}")
         except (BrainError, OSError) as exc:
-            cas_mismatches.append(f"cas read error {dig}: {exc}")
+            cas_mismatches.append(f"cas read error {dig}: {describe_exception(exc)}")
         sampled_blobs += 1
         sampled_bytes += bsize
     if cas_mismatches:
@@ -289,7 +289,7 @@ def _probe_latest_backup(
             if ent.is_dir(follow_symlinks=False):
                 candidates.append((sort_key, ep))
     except OSError as exc:
-        msg = f"cannot list backups: {exc}"
+        msg = f"cannot list backups: {describe_exception(exc)}"
         errors.append(msg)
         return None, None, False, msg
     if not candidates:
@@ -322,7 +322,7 @@ def _probe_latest_backup(
         bak_detail = f"verified {latest_dir.name} (age={int(bak_age_s)}s)"
     except (BrainError, OSError, ValueError) as exc:
         bak_valid = False
-        bak_detail = f"backup {latest_dir.name} invalid: {exc}"
+        bak_detail = f"backup {latest_dir.name} invalid: {describe_exception(exc)}"
         errors.append(bak_detail)
     return bak_id, bak_age_s, bak_valid, bak_detail
 
@@ -409,7 +409,7 @@ def probe_storage_and_retention(
                     if str(kind) not in ("recovery_grant_opened", "recovery_grant_ended")
                 ]
         except (BrainError, sqlite3.Error, OSError) as exc:
-            errors.append(f"policy read error: {exc}")
+            errors.append(f"policy read error: {describe_exception(exc)}")
         finally:
             if opened_pdb is not None:
                 opened_pdb.close()
@@ -462,7 +462,7 @@ def probe_storage_and_retention(
                         grace_released_digests.add(meta_obj["digest"])
         except (BrainError, sqlite3.Error, OSError) as exc:
             ledger_match = False
-            ledger_detail = f"ledger parity error: {exc}"
+            ledger_detail = f"ledger parity error: {describe_exception(exc)}"
             errors.append(ledger_detail)
         finally:
             if opened_sdb is not None:
@@ -495,7 +495,7 @@ def probe_storage_and_retention(
     try:
         disk_free = int(shutil.disk_usage(root.root).free)
     except OSError as exc:
-        disk_error = f"disk usage unavailable: {exc}"
+        disk_error = f"disk usage unavailable: {describe_exception(exc)}"
 
     dur_tier = "power_loss_durable"
     dur_detail = "power_loss_durable"
@@ -506,7 +506,7 @@ def probe_storage_and_retention(
         dur_tier = drep.tier.value
         dur_detail = dur_tier if not drep.reasons else f"{dur_tier}: {'; '.join(drep.reasons)}"
     except (BrainError, OSError, RuntimeError) as exc:
-        dur_error = f"durability probe unavailable: {exc}"
+        dur_error = f"durability probe unavailable: {describe_exception(exc)}"
         dur_tier = "unavailable"
         dur_detail = dur_error
 

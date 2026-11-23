@@ -32,8 +32,10 @@ Findings covered:
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import sys
+import threading
 from dataclasses import dataclass, replace
 from datetime import timedelta
 from pathlib import Path
@@ -58,6 +60,7 @@ from superbrain.ports.doctor import (
 from superbrain.ports.os import OsAdapters
 from superbrain.storage._doctor_reader import StorageDoctorReader
 from superbrain.storage.backup import create_policy_backup, create_store_backup, verify_backup
+from superbrain.storage.cas import blob_path
 from superbrain.storage.kernel_schema import KERNEL_POLICY_MIGRATIONS, KERNEL_STORE_MIGRATIONS
 from superbrain.storage.layout import DataRoot
 from tests.integration.test_doctor_jobs import (
@@ -68,6 +71,7 @@ from tests.integration.test_doctor_jobs import (
     _init_doctor_root,
     _post_tls,
     _restore_msg,
+    _ro_db,
     _running_serve,
     _ssh_sig_b64,
     _validate_envelope,
@@ -149,7 +153,22 @@ def _run_online_restore_helper(
 # =============================================================================
 
 
-def test_p1_doctor_run_freshness_boundaries_24h(trusted_tmp: Path) -> None:
+def _active_store_wide_doctor_jobs(root: DataRoot) -> list[tuple[str, str | None]]:
+    """``(job_id, trigger)`` of queued/leased/running store-wide (checkout null) ``system.doctor`` jobs."""
+    with _ro_db(root.store_db) as conn:
+        rows = conn.execute(
+            "SELECT job_id, payload_digest FROM p_jobs_state WHERE kind = 'system.doctor' "
+            "AND state IN ('queued', 'leased', 'running') ORDER BY rowid"
+        ).fetchall()
+    out: list[tuple[str, str | None]] = []
+    for job_id, digest in rows:
+        payload = json.loads(blob_path(root.cas_dir, str(digest)).read_bytes().decode("utf-8"))
+        if payload.get("checkout_root") is None:
+            out.append((str(job_id), payload.get("trigger")))
+    return out
+
+
+def test_p1_doctor_run_freshness_boundaries_24h(trusted_tmp: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Invariant: get_health(deep=True) returns latest DoctorRun and its age (age_s).
 
     A new job is enqueued (job_id non-null) ONLY if DoctorRun is absent, older than 24h
@@ -158,14 +177,18 @@ def test_p1_doctor_run_freshness_boundaries_24h(trusted_tmp: Path) -> None:
 
     Boundaries tested over TLS loopback using FakeClock:
       - 16 minutes (now = t0 + 16m): doctor_run_id present, age_s = 960.0, job_id = None.
-      - Exactly 24 hours (now = t0 + 24h): doctor_run_id present, age_s = 86400.0, job_id = None.
+      - Exactly 24 hours (now = t0 + 24h): doctor_run_id present, age_s = 86400.0 (exact 24h is fresh).
+        The background schedule is due at elapsed >= 24h (I4-R4-02, plan line 37), so the store-wide
+        scheduled job is already active: job_id is that job, never a second deep-health job.
       - 24 hours + 1 second (now = t0 + 24h + 1s): doctor_run_id present, age_s = 86401.0,
-        job_id is non-null (newly enqueued job ID).
+        job_id is non-null: the same single store-wide slot.
+    The scheduled run is held inside its doctor read so it cannot replace the startup run mid-test.
     """
     t0 = _base_utc_now()
     clock = FakeClock(t0)
     mono = FakeMonotonicClock(1_000_000_000)
     rep, cfg, _priv, ca_pem, leaf_sha256, _cli, os_ = _init_doctor_root(trusted_tmp / "f1-freshness", clock)
+    root = DataRoot.at(cfg.data_root)
 
     rt = reopen_kernel_job_runtime(cfg.data_root, rep.store_id, os_)
     try:
@@ -173,6 +196,35 @@ def test_p1_doctor_run_freshness_boundaries_24h(trusted_tmp: Path) -> None:
     finally:
         rt.close()
 
+    hold, release = threading.Event(), threading.Event()
+    orig_read = StorageDoctorReader.read_snapshot
+
+    def _held_read(self_r: Any, *a: Any, **kw: Any) -> Any:
+        if hold.is_set():
+            release.wait(timeout=BOUND_WAIT_S * 6)
+        return orig_read(self_r, *a, **kw)
+
+    monkeypatch.setattr(StorageDoctorReader, "read_snapshot", _held_read)
+    try:
+        _p1_freshness_boundaries(t0, clock, mono, rep, cfg, ca_pem, leaf_sha256, os_, cred_dan, root, hold, release)
+    finally:
+        release.set()
+
+
+def _p1_freshness_boundaries(
+    t0: Any,
+    clock: FakeClock,
+    mono: FakeMonotonicClock,
+    rep: Any,
+    cfg: Any,
+    ca_pem: str,
+    leaf_sha256: str,
+    os_: OsAdapters,
+    cred_dan: Any,
+    root: DataRoot,
+    hold: threading.Event,
+    release: threading.Event,
+) -> None:
     with _running_serve(cfg, os_=os_, clock=clock, mono=mono) as (ready, loop):
         assert loop.wait_doctor_settled(timeout=BOUND_WAIT_S)
 
@@ -233,8 +285,10 @@ def test_p1_doctor_run_freshness_boundaries_24h(trusted_tmp: Path) -> None:
 
         # ---------------------------------------------------------------------
         # Boundary 2: Exactly 24 hours (now = t0 + 24h)
-        # Expected: doctor_run_id present, age_s = 86400.0, job_id = None (exact 24h is fresh)
+        # Expected: doctor_run_id present, age_s = 86400.0 (exact 24h is fresh); job_id is the active
+        # store-wide scheduled job (schedule due at elapsed >= 24h, I4-R4-02).
         # ---------------------------------------------------------------------
+        hold.set()
         clock.set(t0 + timedelta(hours=24))
         res_24h = _validate_envelope(
             "get_health",
@@ -254,8 +308,12 @@ def test_p1_doctor_run_freshness_boundaries_24h(trusted_tmp: Path) -> None:
             f"Expected fresh doctor_run_id at exact 24h, got {data_24h.get('doctor_run_id')}"
         )
         assert data_24h.get("age_s") == 86400.0, f"Expected age_s=86400.0 at 24h, got {data_24h.get('age_s')}"
-        assert data_24h.get("job_id") is None, (
-            f"Expected job_id=None at exact 24h, got {data_24h.get('job_id')}"
+        sched_jobs = _active_store_wide_doctor_jobs(root)
+        assert len(sched_jobs) == 1 and sched_jobs[0][1] == "schedule", (
+            f"Expected exactly one active store-wide scheduled job at exact 24h, got {sched_jobs}"
+        )
+        assert data_24h.get("job_id") == sched_jobs[0][0], (
+            f"Expected job_id of the active scheduled store-wide job at exact 24h, got {data_24h.get('job_id')}"
         )
 
         # ---------------------------------------------------------------------
@@ -286,6 +344,11 @@ def test_p1_doctor_run_freshness_boundaries_24h(trusted_tmp: Path) -> None:
         assert data_24h_1s.get("job_id") is not None, (
             "Expected newly enqueued job_id non-null at 24h+1s (stale run)"
         )
+        assert data_24h_1s.get("job_id") == sched_jobs[0][0], (
+            f"Expected the single store-wide slot at 24h+1s, got {data_24h_1s.get('job_id')}"
+        )
+        assert _active_store_wide_doctor_jobs(root) == sched_jobs, "deep health enqueued a second store-wide job"
+        release.set()
 
 
 # =============================================================================
@@ -638,6 +701,7 @@ def test_p2_sp2_m1_bootstrap_requires_applied_evidence(trusted_tmp: Path) -> Non
     os_.permissions.secure_directory(checkout_no_boot)
 
     rt = reopen_kernel_job_runtime(cfg.data_root, rep.store_id, os_)
+    live_writer_epoch = rt.lease.epoch  # writer generation a live get_health(deep=true) reports
     try:
         cred = seed_principal_and_credential(
             rt.policy, owner_id=OWNER_DAN, harness_id="claude-code", machine_id=MACHINE_ID
@@ -657,7 +721,7 @@ def test_p2_sp2_m1_bootstrap_requires_applied_evidence(trusted_tmp: Path) -> Non
     healthy_dh: dict[str, JsonValue] = {
         "ready": True,
         "store_id": rep.store_id,
-        "writer_epoch": 1,
+        "writer_epoch": live_writer_epoch,
         "schema_version": 5,
         "policy_schema_version": 4,
         "degraded_codes": [],
@@ -717,6 +781,7 @@ def test_p2_sp2_m1_native_capture_receipt_verification(trusted_tmp: Path) -> Non
     host_name = "claude-code"
 
     rt = reopen_kernel_job_runtime(cfg.data_root, rep.store_id, os_)
+    live_writer_epoch = rt.lease.epoch  # writer generation a live get_health(deep=true) reports
     try:
         cred = seed_principal_and_credential(rt.policy, owner_id=OWNER_DAN, harness_id=host_name, machine_id=MACHINE_ID)
         ws_clean = register_workspace_direct(
@@ -746,7 +811,7 @@ def test_p2_sp2_m1_native_capture_receipt_verification(trusted_tmp: Path) -> Non
     healthy_dh: dict[str, JsonValue] = {
         "ready": True,
         "store_id": rep.store_id,
-        "writer_epoch": 1,
+        "writer_epoch": live_writer_epoch,
         "schema_version": 5,
         "policy_schema_version": 4,
         "degraded_codes": [],

@@ -12,15 +12,22 @@ from collections.abc import Callable, Mapping
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from superbrain.application._approvals_types import DoctorOperatorHandler, DoctorOperatorTicket
+from superbrain.application._approvals_types import (
+    DoctorFixTicket,
+    DoctorOperatorHandler,
+    DoctorOperatorTicket,
+    FixOwnerRunner,
+)
+from superbrain.application._doctor_fix import parse_fix_request_body
 from superbrain.application._privacy_canary import KernelPrivacyScanner
 from superbrain.application.dispatch import PreparedEffect
 from superbrain.application.jobs import JobService
 from superbrain.composition._daemon_doctor_commit import (
+    DoctorFences,
     _CompletedDoctorProbe,
+    build_worker_db_snapshot,
+    capture_doctor_fences,
     commit_doctor_run_snapshot,
-    create_doctor_scratch_snapshot,
-    find_latest_intact_doctor_run,
     parse_doctor_payload,
     read_doctor_job_outcome_dto,
     resolve_store_owner,
@@ -29,14 +36,18 @@ from superbrain.composition._daemon_doctor_commit import (
 from superbrain.composition._daemon_health import (
     DOCTOR_JOB_KIND,
     enqueue_doctor_tx,
+    find_active_doctor_job,
     find_fresh_doctor_run_dto,
+    find_latest_valid_doctor_run,
     prepare_deep_health,
     render_deep_health,
 )
 from superbrain.composition._doctor_fix_wiring import (
     DoctorFixHooks,
     fresh_report_matches_live_state,
+    run_fix_store_action,
     run_online_doctor_fix,
+    validate_fix_checkout,
 )
 from superbrain.core.canonical import canonical_json
 from superbrain.core.errors import BrainError, ErrorCode
@@ -59,13 +70,19 @@ from superbrain.ports.kernel import KernelTx
 from superbrain.ports.os import OsAdapters
 from superbrain.storage._doctor_reader import StorageDoctorReader
 from superbrain.storage.idempotency import StagedKernelStore
+from superbrain.storage.layout import DataRoot
 from superbrain.storage.retention import expire_due
 from superbrain.storage.runtime import Runtime
 
 DOCTOR_SCHEDULE_INTERVAL = timedelta(hours=24)
 _MAX_FINISHED_CACHE = 256
+_TRANSIENT_COMMIT_CODES = frozenset({ErrorCode.STORE_BUSY, ErrorCode.FILESYSTEM_BUSY})
 _LOGGER = logging.getLogger(__name__)
 
+
+
+def _due(last: datetime, now_utc: datetime) -> bool:
+    return now_utc - last >= DOCTOR_SCHEDULE_INTERVAL
 
 
 class DaemonDoctorRunner(DoctorOperatorHandler):
@@ -116,11 +133,9 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
         self._workers: set[threading.Thread] = set()
         self._waiters: list[threading.Event] = []
         self._finished_jobs: dict[str, tuple[str, str | None]] = {}
-        self._job_checkouts: dict[str, str | None] = {}
 
     def _record_finished_locked(self, job_id: str, status: str, doctor_run_id: str | None) -> None:
         self._finished_jobs[job_id] = (status, doctor_run_id)
-        self._job_checkouts.pop(job_id, None)
         while len(self._finished_jobs) > _MAX_FINISHED_CACHE:
             oldest = next(iter(self._finished_jobs))
             del self._finished_jobs[oldest]
@@ -147,7 +162,6 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
             self._active_token = None
             self._active_lease = None
             self._completed = None
-            self._job_checkouts.clear()
             self._rt = rt
             self._job_store = job_store
             self._job_service = job_service
@@ -230,8 +244,7 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
                 self._startup_due
                 or self._active_token is not None
                 or self._completed is not None
-                or (now_utc - self._last_scheduled_at > DOCTOR_SCHEDULE_INTERVAL)
-                or (now_utc - self._last_gc_at > DOCTOR_SCHEDULE_INTERVAL)
+                or self._maintenance_due_locked(now_utc)
             )
             if not busy and not self._has_active_doctor_job():
                 return True
@@ -279,11 +292,13 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
         with self._lock:
             if self._startup_due or self._active_token is not None or self._completed is not None:
                 return False
-            if (now_utc - self._last_scheduled_at > DOCTOR_SCHEDULE_INTERVAL) or (
-                now_utc - self._last_gc_at > DOCTOR_SCHEDULE_INTERVAL
-            ):
+            if self._maintenance_due_locked(now_utc):
                 return False
         return not self._has_active_doctor_job()
+
+    def _maintenance_due_locked(self, now_utc: datetime) -> bool:
+        """Background work is due once a full interval has elapsed (``>=``), the one rule settle and schedule share."""
+        return _due(self._last_scheduled_at, now_utc) or _due(self._last_gc_at, now_utc)
 
     def _has_active_doctor_job(self) -> bool:
         try:
@@ -305,32 +320,53 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
             enqueue_doctor_tx(tx, job_id=job_id, owner_id=owner_id, payload_bytes=payload_bytes, retry_at=now_str)
 
         self._job_store.transact(enqueue)
-        with self._lock:
-            self._job_checkouts[job_id] = co_str
-            while len(self._job_checkouts) > _MAX_FINISHED_CACHE:
-                oldest = next(iter(self._job_checkouts))
-                del self._job_checkouts[oldest]
         return job_id
+
+    def _schedule_store_run(self, trigger: str) -> bool | None:
+        """Enqueue a background run for the store owner's ``(owner, None)`` scope unless that slot is taken.
+
+        ``True`` enqueued, ``False`` nothing to do (slot taken or no pinned owner), ``None`` the attempt failed and
+        must be retried: the caller keeps the work due instead of deferring it a whole interval.
+        """
+        owner_id = resolve_store_owner(self._rt.policy)
+        if owner_id is None:
+            _LOGGER.info("doctor %s run skipped: store has no pinned owner", trigger)  # a normal fresh-store state
+            return False
+        try:
+            if find_active_doctor_job(self._rt, self._job_store, owner_id=owner_id, checkout_root=None) is not None:
+                return False
+            self._enqueue_system_doctor_job(owner_id, trigger)
+        except BrainError as err:
+            _LOGGER.warning("doctor %s run not scheduled (code=%s)", trigger, err.code.value)
+            return None
+        return True
 
     def _run_maintenance_and_schedule(self) -> bool:
         now_utc, _ = require_aware_utc(self._clock.now())
         did_work = False
 
         if self._startup_due:
-            self._startup_due = False
-            owner_id = resolve_store_owner(self._rt.policy)
-            latest = find_latest_intact_doctor_run(
-                self._rt, owner_id, now_utc, max_age=DOCTOR_SCHEDULE_INTERVAL
-            )
-            if latest is None and not self._has_active_doctor_job():
-                self._enqueue_system_doctor_job(owner_id, "startup")
-                did_work = True
-            elif latest is not None:
-                self._last_scheduled_at = latest[2]
             self._last_gc_at = now_utc
-            return did_work
+            # Same fence set and scope as deep health: only a store-wide run of this store, writer epoch, restore
+            # epoch and trust generation counts as a recent self-check.
+            owner_id = resolve_store_owner(self._rt.policy)
+            latest = (
+                find_latest_valid_doctor_run(self._rt, owner_id, now_utc, checkout_root=None)
+                if owner_id is not None
+                else None
+            )
+            if latest is not None and not _due(latest[0].recorded_at, now_utc):
+                self._startup_due = False
+                self._last_scheduled_at = latest[0].recorded_at
+                return False
+            outcome = self._schedule_store_run("startup")
+            if outcome is None:
+                return False  # still due: the next tick retries the self-check
+            self._startup_due = False
+            self._last_scheduled_at = now_utc
+            return outcome
 
-        if now_utc - self._last_gc_at > DOCTOR_SCHEDULE_INTERVAL:
+        if _due(self._last_gc_at, now_utc):
             try:
                 expire_due(self._rt.store, self._rt.policy, now_utc)
                 self._rt.store.cas.collect_garbage(now=now_utc)
@@ -344,11 +380,11 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
                 if err.code is ErrorCode.STORE_BUSY:
                     self._last_gc_at = now_utc
 
-        if now_utc - self._last_scheduled_at > DOCTOR_SCHEDULE_INTERVAL:
-            self._last_scheduled_at = now_utc
-            if not self._has_active_doctor_job():
-                owner_id = resolve_store_owner(self._rt.policy)
-                self._enqueue_system_doctor_job(owner_id, "schedule")
+        if _due(self._last_scheduled_at, now_utc):
+            outcome = self._schedule_store_run("schedule")
+            if outcome is not None:  # a failed attempt stays due and is retried on the next tick
+                self._last_scheduled_at = now_utc
+            if outcome:
                 did_work = True
 
         return did_work
@@ -384,118 +420,158 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
             _LOGGER.warning("doctor job start failed (code=%s)", err.code.value)
             return False
 
-        trigger, checkout_root = parse_doctor_payload(spec.payload)
         token = object()
         with self._lock:
             if self._stopping or self._closed or self._generation != gen:
+                # A generation bump comes from restore or shutdown, whose reconcile/teardown cancels this job.
                 return False
             self._active_token = token
             self._active_lease = lease
 
+        # From here the slot is held: every failure must release it and end the job (_abandon_launch).
+        thread: threading.Thread | None = None
         try:
-            snap_dir, f_sid, f_wep, f_rep, f_tgen = create_doctor_scratch_snapshot(
-                self._rt, lease.job_id, self._adapters
+            trigger, checkout_root = parse_doctor_payload(spec.payload)
+            fences = capture_doctor_fences(self._rt, self._adapters)
+            root = self._rt.root
+            owner_id = spec.owner_id
+            thread = threading.Thread(
+                target=self._run_worker,
+                args=(lease, token, gen, owner_id, trigger, checkout_root, fences, root),
+                name=f"doctor-worker-{lease.job_id[:8]}",
+                daemon=True,
             )
-        except Exception as exc:  # noqa: BLE001
-            _LOGGER.warning("failed creating doctor scratch snapshot on owner thread: %r", exc)
-            return False
-
-        expected_store_id = self._rt.store.store_id
-        adapters = self._adapters
-        scanner = self._scanner
-        capture_probe = self._fix_hooks.capture_probe
-        owner_id = spec.owner_id
-
-        def _worker() -> None:
-            snap: DoctorSnapshot | None = None
-            try:
-                if checkout_root is not None:
-                    adapters.paths.reject_unsafe_path(str(checkout_root))
-                    if os.path.lexists(checkout_root):
-                        adapters.paths.reject_links(checkout_root)
-                snap = StorageDoctorReader(adapters).read_snapshot(
-                    self._rt.root.root,
-                    db_root=snap_dir,
-                    checkout_root=checkout_root,
-                    expected_store_id=expected_store_id,
-                    privacy_scanner=scanner,
-                    capture_probe=capture_probe,
-                )
-            except Exception:  # noqa: BLE001 - convert worker exception into failed job outcome safely
-                _LOGGER.warning("doctor snapshot reader failed in background worker")
-                snap = None
-            cur = threading.current_thread()
             with self._lock:
-                self._workers.discard(cur)
+                self._workers.add(thread)
+            thread.start()
+        except Exception:  # noqa: BLE001 - any launch failure (I/O, thread creation) ends the job, never the loop
+            if thread is not None:
+                with self._lock:
+                    self._workers.discard(thread)
+            self._abandon_launch(lease, token, gen)
+        return True
+
+    def _abandon_launch(self, lease: JobLease, token: object, gen: int) -> None:
+        """Owner thread: release a claimed slot whose worker never started and fail its job durably."""
+        _LOGGER.warning("doctor worker launch failed (job=%s)", lease.job_id[:8])
+        with self._lock:
+            if self._active_token is token:
+                self._active_token, self._active_lease = None, None
+            current = self._generation == gen
+        if current:
+            with contextlib.suppress(BrainError):
+                self._job_service.complete(lease, JobOutcome.failure(JobErrorCode.HANDLER_FAILED, retryable=False))
+            with self._lock:
+                if self._generation == gen:
+                    self._record_finished_locked(lease.job_id, "failed", None)
+        self._notify_waiters()
+
+    def _run_worker(
+        self,
+        lease: JobLease,
+        token: object,
+        gen: int,
+        owner_id: str,
+        trigger: str,
+        checkout_root: Path | None,
+        fences: DoctorFences,
+        root: DataRoot,
+    ) -> None:
+        """Worker thread: take the minimal DB snapshot, read it, and hand the result back to the owner."""
+        adapters = self._adapters
+        snap: DoctorSnapshot | None = None
+        snap_dir: Path | None = None
+        transient = False
+        try:
+            if checkout_root is not None:
+                adapters.paths.reject_unsafe_path(str(checkout_root))
+                if os.path.lexists(checkout_root):
+                    adapters.paths.reject_links(checkout_root)
+            snap_dir = build_worker_db_snapshot(root, lease.job_id, adapters)
+            snap = StorageDoctorReader(adapters).read_snapshot(
+                root.root,
+                db_root=snap_dir,
+                checkout_root=checkout_root,
+                expected_store_id=fences.store_id,
+                privacy_scanner=self._scanner,
+                capture_probe=self._fix_hooks.capture_probe,
+            )
+        except BrainError as err:
+            _LOGGER.warning("doctor snapshot reader failed in background worker (code=%s)", err.code.value)
+            snap = None
+            transient = err.code is ErrorCode.STORE_BUSY  # the live pair kept changing: retry later, not fail
+        except Exception:  # noqa: BLE001 - convert worker exception into failed job outcome safely
+            _LOGGER.warning("doctor snapshot reader failed in background worker")
+            snap = None
+        finally:
+            if snap_dir is not None:
+                shutil.rmtree(snap_dir, ignore_errors=True)
+            with self._lock:
+                self._workers.discard(threading.current_thread())
                 if self._generation == gen and self._active_token is token:
                     self._completed = _CompletedDoctorProbe(
-                        generation=gen, lease=lease, owner_id=owner_id, trigger=trigger,
-                        checkout_root=checkout_root, snapshot=snap, scratch_dir=snap_dir,
-                        fence_store_id=f_sid, fence_writer_epoch=f_wep,
-                        fence_restore_epoch=f_rep, fence_trust_generation=f_tgen,
+                        generation=gen,
+                        lease=lease,
+                        owner_id=owner_id,
+                        trigger=trigger,
+                        checkout_root=checkout_root,
+                        snapshot=snap,
+                        fences=fences,
+                        transient=transient,
                     )
             self._wake_owner()
 
-        thread = threading.Thread(target=_worker, name=f"doctor-worker-{lease.job_id[:8]}", daemon=True)
+    def _end_failed(self, completed: _CompletedDoctorProbe, *, retryable: bool) -> None:
+        """Owner thread: end a probe that cannot commit; a retryable failure requeues the same job with backoff."""
         with self._lock:
-            self._workers.add(thread)
-        thread.start()
-        return True
+            current = not (self._stopping or self._closed) and completed.generation == self._generation
+        if current:
+            with contextlib.suppress(BrainError):
+                self._job_service.complete(
+                    completed.lease, JobOutcome.failure(JobErrorCode.HANDLER_FAILED, retryable=retryable)
+                )
+            if not retryable:
+                with self._lock:
+                    if completed.generation == self._generation:
+                        self._record_finished_locked(completed.lease.job_id, "failed", None)
+        self._notify_waiters()
 
     def _commit_completed(self, completed: _CompletedDoctorProbe) -> None:
+        with self._lock:
+            if self._stopping or self._closed or completed.generation != self._generation:
+                return  # restore reconcile or shutdown teardown ends this job
+        if completed.lease.writer_epoch != self._rt.lease.epoch:
+            self._notify_waiters()  # no longer this writer's job; lease recovery ends it
+            return
+        if completed.snapshot is None:
+            self._end_failed(completed, retryable=completed.transient)
+            return
+        if not verify_doctor_snapshot_fences(self._rt, self._adapters, completed.fences):
+            # Measured against an identity that no longer holds: rerun on a fresh snapshot instead of dropping it.
+            self._end_failed(completed, retryable=True)
+            return
+
+        def _is_stale() -> bool:
+            with self._lock:
+                return self._stopping or self._closed or completed.generation != self._generation
+
         try:
-            with self._lock:
-                if self._stopping or self._closed or completed.generation != self._generation:
-                    return
-            if completed.lease.writer_epoch != self._rt.lease.epoch:
-                return
-            if not verify_doctor_snapshot_fences(
-                self._rt, self._adapters,
-                fence_store_id=completed.fence_store_id,
-                fence_writer_epoch=completed.fence_writer_epoch,
-                fence_restore_epoch=completed.fence_restore_epoch,
-                fence_trust_generation=completed.fence_trust_generation,
-            ):
-                return
+            doctor_run_id = commit_doctor_run_snapshot(
+                rt=self._rt, job_store=self._job_store, scanner=self._scanner,
+                lease=completed.lease, owner_id=completed.owner_id, trigger=completed.trigger,
+                checkout_root=completed.checkout_root, snapshot=completed.snapshot, now=self._clock.now(),
+                tls_not_after=self._tls_not_after, clock_untrusted=self._clock_untrusted_fn(),
+                is_stale_fn=_is_stale,
+            )
+        except BrainError as err:
+            # A busy store is transient: the same job reruns with backoff and its waiters keep waiting.
+            self._end_failed(completed, retryable=err.code in _TRANSIENT_COMMIT_CODES)
+            return
 
-            if completed.snapshot is None:
-                with contextlib.suppress(BrainError):
-                    self._job_service.complete(
-                        completed.lease,
-                        JobOutcome.failure(JobErrorCode.HANDLER_FAILED, retryable=False),
-                    )
-                with self._lock:
-                    if completed.generation == self._generation:
-                        self._record_finished_locked(completed.lease.job_id, "failed", None)
-                self._notify_waiters()
-                return
-
-            def _is_stale() -> bool:
-                with self._lock:
-                    return self._stopping or self._closed or completed.generation != self._generation
-
-            try:
-                doctor_run_id = commit_doctor_run_snapshot(
-                    rt=self._rt, job_store=self._job_store, scanner=self._scanner,
-                    lease=completed.lease, owner_id=completed.owner_id, trigger=completed.trigger,
-                    checkout_root=completed.checkout_root, snapshot=completed.snapshot, now=self._clock.now(),
-                    tls_not_after=self._tls_not_after, clock_untrusted=self._clock_untrusted_fn(),
-                    is_stale_fn=_is_stale,
-                )
-            except BrainError:
-                with self._lock:
-                    if completed.generation == self._generation:
-                        self._record_finished_locked(completed.lease.job_id, "failed", None)
-                self._notify_waiters()
-                return
-
-            with self._lock:
-                self._record_finished_locked(completed.lease.job_id, "succeeded", doctor_run_id)
-                self._fix_dirty = False
-            self._notify_waiters()
-        finally:
-            if completed.scratch_dir is not None:
-                shutil.rmtree(completed.scratch_dir, ignore_errors=True)
+        with self._lock:
+            self._record_finished_locked(completed.lease.job_id, "succeeded", doctor_run_id)
+            self._fix_dirty = False
+        self._notify_waiters()
 
     def prepare_report(self, *, owner_id: str, checkout_root: Path | None = None) -> DoctorOperatorTicket:
         """Phase 1 (owner thread): reuse fresh ``DoctorRun`` or enqueue/join ``system.doctor`` for ``owner_id``."""
@@ -526,13 +602,7 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
                 immediate=fresh,
             )
         co_str = str(checkout_root) if checkout_root is not None else None
-        job_id: str | None = None
-        active = self._job_store.transact(lambda tx: tx.active_jobs_by_kinds((DOCTOR_JOB_KIND,), 100))
-        with self._lock:
-            for row in active:
-                if row.owner_id == owner_id and self._job_checkouts.get(row.job_id) == co_str:
-                    job_id = row.job_id
-                    break
+        job_id = find_active_doctor_job(self._rt, self._job_store, owner_id=owner_id, checkout_root=co_str)
         if job_id is None:
             job_id = self._enqueue_system_doctor_job(owner_id, "cli", checkout_root=checkout_root)
         self._claim_and_launch_worker()
@@ -571,14 +641,84 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
             job_id=job_id, cached_outcome=outcome, now=self._clock.now(),
         )
 
-    def run_fix(self, *, owner_id: str, body: Mapping[str, JsonValue]) -> dict[str, JsonValue]:
-        """Owner thread: validate and execute safe §13 repairs against the running daemon runtime."""
-        _ = owner_id
+    def prepare_fix(self, *, owner_id: str, body: Mapping[str, JsonValue]) -> DoctorFixTicket:
+        """Phase 1 (owner thread, bounded): validate the request and pin the generation it runs under.
+
+        Every fix action changes the whole store (permissions, logs, projections, policy, daemon), so the operator
+        must be the store's pinned owner; any other owner sees ``NOT_FOUND`` and nothing runs.
+        """
+        store_owner = self._rt.policy.store_owner()
+        if store_owner is None or owner_id != store_owner:
+            raise BrainError(ErrorCode.NOT_FOUND, "not found")
+        actions, checkout_root = parse_fix_request_body(body)
+        validate_fix_checkout(checkout_root, self._adapters)
         with self._lock:
             if self._stopping or self._closed:
                 raise BrainError(ErrorCode.DAEMON_UNAVAILABLE, "daemon unavailable")
+            # Any fix may change what a cached DoctorRun measured.
+            self._fix_dirty = True
+            return DoctorFixTicket(
+                generation=self._generation,
+                store_id=self._rt.store.store_id,
+                actions=actions,
+                explicit_actions="actions" in body,
+                checkout_root=checkout_root,
+            )
+
+    def execute_fix(
+        self,
+        ticket: DoctorFixTicket,
+        *,
+        should_stop: Callable[[], bool],
+        run_on_owner: FixOwnerRunner,
+    ) -> dict[str, JsonValue]:
+        """Phase 2 (off owner thread): filesystem repairs and the recheck run here; store repairs go to the owner.
+
+        Stops between steps once ``should_stop`` (the request cutoff) fires or the runtime changes generation, and
+        returns ``status: interrupted`` with each action's definite state. Nothing of this fix runs afterwards.
+        """
+        with self._lock:
+            root = self._rt.root
+
+        def _stop() -> bool:
+            with self._lock:
+                if self._stopping or self._closed or self._generation != ticket.generation:
+                    return True
+            return should_stop()
+
+        def _live_rt() -> Runtime:
+            # Owner thread, at the moment the step starts (not when it was queued): a step that waited past the
+            # cutoff, a restore or a shutdown never runs.
+            if _stop():
+                raise BrainError(ErrorCode.REVISION_CONFLICT, "revision conflict")
+            with self._lock:
+                return self._rt
+
+        def _store_action(name: str) -> dict[str, JsonValue]:
+            return run_on_owner(
+                lambda: run_fix_store_action(
+                    _live_rt(),
+                    name,
+                    explicit_actions=ticket.explicit_actions,
+                    adapters=self._adapters,
+                    hooks=self._fix_hooks,
+                )
+            )
+
+        def _authorize() -> None:
+            run_on_owner(_live_rt)
+
         result = run_online_doctor_fix(
-            self._rt, body, adapters=self._adapters, hooks=self._fix_hooks, privacy_scanner=self._scanner,
+            root,
+            store_id=ticket.store_id,
+            actions=ticket.actions,
+            checkout_root=ticket.checkout_root,
+            adapters=self._adapters,
+            hooks=self._fix_hooks,
+            privacy_scanner=self._scanner,
+            should_stop=_stop,
+            run_store_action=_store_action,
+            authorize=_authorize,
         )
         with self._lock:
             self._fix_dirty = True

@@ -117,6 +117,15 @@ def check_daemon(snap: DoctorSnapshot, b: CheckBuilder) -> None:
             detail=d.endpoint_detail,
             remediation="Remove unsafe endpoint.json link before starting the daemon.",
         )
+    elif d.endpoint_present and not d.writer_lock_held:
+        b.add(
+            "daemon",
+            "daemon.writer_lock",
+            "WARN",
+            reason="stale_endpoint",
+            detail="endpoint.json present while writer.lock is not held (daemon exited uncleanly)",
+            remediation="Start the daemon (it replaces endpoint.json) or remove the stale endpoint.json.",
+        )
     elif d.writer_lock_held:
         b.add(
             "daemon",

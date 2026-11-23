@@ -301,6 +301,7 @@ _HEAVY_FILE_COST_MS: dict[str, int] = {
     "tests/integration/test_doctor_cli.py": 102000,
     "tests/integration/test_doctor_fix.py": 120000,
     "tests/integration/test_doctor_jobs.py": 15534,
+    "tests/integration/test_i4_owner_thread_remediation.py": 20000,
     "tests/integration/test_doctor_sp2_probes.py": 14054,
     "tests/storage/test_doctor_snapshot.py": 15928,
     "tests/integration/test_kernel_crash_recovery.py": 76704,

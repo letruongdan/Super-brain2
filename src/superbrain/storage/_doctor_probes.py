@@ -9,7 +9,7 @@ import threading
 from pathlib import Path
 
 from superbrain.core.canonical import digest_bytes
-from superbrain.core.errors import BrainError
+from superbrain.core.errors import BrainError, describe_exception
 from superbrain.ports.doctor import (
     MAX_LIST_FINDINGS_PER_GROUP,
     CaptureDoctorProbePort,
@@ -56,7 +56,7 @@ def check_permissions_strict(
             ancestor_problems.append(str(p))
             perm_problems.append(str(p))
     except (BrainError, OSError) as exc:
-        errors.append(f"ancestor permission check error: {exc}")
+        errors.append(f"ancestor permission check error: {describe_exception(exc)}")
 
     # Detect any link/reparse points under data_root without ever descending into their targets.
     if os.path.lexists(root.root) and not is_link_entry(root.root):
@@ -67,7 +67,7 @@ def check_permissions_strict(
                 with os.scandir(cur) as it:
                     entries = sorted(it, key=lambda e: e.name)
             except OSError as exc:
-                errors.append(f"directory scan error at {cur.name}: {exc}")
+                errors.append(f"directory scan error at {cur.name}: {describe_exception(exc)}")
                 continue
             for entry in entries:
                 epath = Path(entry.path)
@@ -80,7 +80,7 @@ def check_permissions_strict(
                 try:
                     est = entry.stat(follow_symlinks=False)
                 except OSError as exc:
-                    errors.append(f"stat error at {epath.name}: {exc}")
+                    errors.append(f"stat error at {epath.name}: {describe_exception(exc)}")
                     continue
                 if stat.S_ISDIR(est.st_mode):
                     stack.append(epath)
@@ -94,7 +94,7 @@ def check_permissions_strict(
                 if root.backups_dir == p.path or root.backups_dir in p.path.parents:
                     backup_problems.append(text)
         except (BrainError, OSError) as exc:
-            errors.append(f"permission check error: {exc}")
+            errors.append(f"permission check error: {describe_exception(exc)}")
 
     if os.path.lexists(root.backups_dir) and not is_link_entry(root.backups_dir):
         try:
@@ -105,7 +105,7 @@ def check_permissions_strict(
                 if s not in perm_problems:
                     perm_problems.append(s)
         except (BrainError, OSError) as exc:
-            msg = f"backup permission error: {exc}"
+            msg = f"backup permission error: {describe_exception(exc)}"
             backup_problems.append(msg)
             errors.append(msg)
 
@@ -125,11 +125,14 @@ def probe_daemon_state(root: DataRoot, os_: OsAdapters, errors: list[str]) -> Do
         errors.append(lock_error)
     else:
         probe_fn = getattr(os_.locks, "probe_held", None)
-        if callable(probe_fn):
+        if not callable(probe_fn):
+            lock_error = "writer.lock probe unavailable"
+            errors.append(lock_error)
+        else:
             try:
                 lock_held = bool(probe_fn(root.lock_path))
             except BrainError as exc:
-                lock_error = f"writer.lock probe failed: {exc}"
+                lock_error = f"writer.lock probe failed: {describe_exception(exc)}"
                 errors.append(lock_error)
         try:
             with open(root.lock_path, "rb") as fh:
@@ -138,7 +141,7 @@ def probe_daemon_state(root: DataRoot, os_: OsAdapters, errors: list[str]) -> Do
             slot, _ = _read_slots(raw)
             writer_epoch = slot.writer_epoch
         except (BrainError, OSError) as exc:
-            lock_error = f"writer.lock payload invalid: {exc}"
+            lock_error = f"writer.lock payload invalid: {describe_exception(exc)}"
             errors.append(lock_error)
 
     ep_present = os.path.lexists(root.endpoint_path)
@@ -213,8 +216,8 @@ def probe_identity_and_jev(
             missing_harness_credentials=missing,
         )
     except (BrainError, sqlite3.Error, OSError) as exc:
-        errors.append(f"identity stats error: {exc}")
-        ident = DoctorIdentityStats(error=str(exc))
+        errors.append(f"identity stats error: {describe_exception(exc)}")
+        ident = DoctorIdentityStats(error=describe_exception(exc))
     finally:
         if opened_pdb is not None:
             opened_pdb.close()
@@ -229,7 +232,7 @@ def probe_identity_and_jev(
                 row = sdb.execute("SELECT COUNT(*) FROM p_provider_invocations_state").fetchone()
                 inv_count = int(row[0]) if row is not None else 0
         except (BrainError, sqlite3.Error, OSError) as exc:
-            errors.append(f"jev passive inspection error: {exc}")
+            errors.append(f"jev passive inspection error: {describe_exception(exc)}")
         finally:
             if opened_sdb is not None:
                 opened_sdb.close()

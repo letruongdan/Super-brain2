@@ -263,6 +263,14 @@ def format_doctor_dict_text(raw: Mapping[str, JsonValue]) -> str:
     """Format a doctor report JSON mapping as concise human-readable diagnostics without secrets."""
     if raw.get("status") == "running" and isinstance(raw.get("job_id"), str):
         return f"Doctor status: running\nJob ID: {clip_report_str(str(raw['job_id']))}\n"
+    if raw.get("status") == "interrupted":
+        fix = raw.get("fix")
+        acts = fix.get("actions") if isinstance(fix, Mapping) else None
+        lines = ["Doctor fix status: interrupted at the request cutoff; rerun to finish"]
+        for act in acts if isinstance(acts, list) else []:
+            if isinstance(act, Mapping):
+                lines.append(f"  {_format_str(act.get('action'))}: {_format_str(act.get('status'))}")
+        return "\n".join(lines) + "\n"
     sch = raw.get("schema")
     sch_map = sch if isinstance(sch, Mapping) else {}
     tomb = raw.get("pending_restore_tombstones")

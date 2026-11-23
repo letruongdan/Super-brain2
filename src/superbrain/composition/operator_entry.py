@@ -38,6 +38,8 @@ __all__ = ["build_operator_service", "make_default_bootstrap_handler", "make_ope
 
 _T = TypeVar("_T")
 _SLICE_S = 0.005
+# A doctor fix stops this long before the request deadline so its "interrupted" answer still reaches the client.
+DOCTOR_FIX_CUTOFF_RESERVE_NS = 500_000_000
 
 
 def _verified_ssh_scratch_dir(adapters: OsAdapters) -> Path:
@@ -221,6 +223,23 @@ def make_operator_executor(
             prepared = _await_owner_future(owner.run_owner_action(_phase1), owner, monotonic_ns, deadline_ns)
             if prepared.immediate is not None:
                 return make_success_envelope(prepared.immediate)
+            if prepared.pending_fix is not None:
+                pending_fix = prepared.pending_fix
+                service = handle.service()
+                if service is None:
+                    raise BrainError(ErrorCode.DAEMON_UNAVAILABLE, "daemon unavailable")
+                cutoff_ns = deadline_ns - DOCTOR_FIX_CUTOFF_RESERVE_NS
+
+                def _fix_should_stop() -> bool:
+                    return owner.is_stopping or int(monotonic_ns()) >= cutoff_ns
+
+                def _fix_on_owner(fn: Callable[[], _T]) -> _T:
+                    # ``fn`` re-checks ``_fix_should_stop`` when the owner starts it, not when it was queued.
+                    return _await_owner_future(owner.run_owner_action(fn), owner, monotonic_ns, deadline_ns)
+
+                return make_success_envelope(
+                    service.execute_doctor_fix(pending_fix, should_stop=_fix_should_stop, run_on_owner=_fix_on_owner)
+                )
             if prepared.pending_doctor is not None:
                 pending_doc = prepared.pending_doctor
                 _check_live_budget(owner, monotonic_ns, deadline_ns)

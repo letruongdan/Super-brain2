@@ -11,7 +11,7 @@ from pathlib import Path
 from superbrain.application._doctor_checks import clip_report_str
 from superbrain.application._log_rotate import rotate_logs
 from superbrain.application.doctor import DoctorReport
-from superbrain.core.errors import BrainError, ErrorCode
+from superbrain.core.errors import BrainError, ErrorCode, describe_exception
 from superbrain.core.jsonvalue import JsonValue
 from superbrain.ports.doctor import (
     MAX_LOG_BYTES,
@@ -23,6 +23,8 @@ from superbrain.ports.os import OsAdapters, PhysicalObjectId
 __all__ = [
     "SAFE_FIX_ACTIONS",
     "SAFE_FIX_ACTION_SET",
+    "FixInterrupted",
+    "build_interrupted_fix_response",
     "build_fix_response",
     "ensure_no_links_in_tree",
     "execute_post_open_fixes",
@@ -50,7 +52,8 @@ def _is_link(path: Path, os_: OsAdapters) -> bool:
     except FileNotFoundError:
         return False
     except OSError as exc:
-        raise BrainError(ErrorCode.INSECURE_PERMISSIONS, f"cannot inspect {path}: {exc}") from exc
+        detail = f"cannot inspect {path.name}: {describe_exception(exc)}"
+        raise BrainError(ErrorCode.INSECURE_PERMISSIONS, detail) from exc
     if stat.S_ISLNK(st.st_mode) or bool(getattr(st, "st_file_attributes", 0) & _REPARSE_POINT):
         return True
     if os_.physical is not None:
@@ -77,7 +80,8 @@ def ensure_no_links_in_tree(root: Path, os_: OsAdapters) -> tuple[list[Path], li
             with os.scandir(current) as it:
                 entries = sorted(it, key=lambda e: e.name)
         except OSError as exc:
-            raise BrainError(ErrorCode.INSECURE_PERMISSIONS, f"cannot list {current}: {exc}") from exc
+            detail = f"cannot list {current.name}: {describe_exception(exc)}"
+            raise BrainError(ErrorCode.INSECURE_PERMISSIONS, detail) from exc
         for entry in entries:
             epath = Path(entry.path)
             if entry.is_symlink() or _is_link(epath, os_):
@@ -85,7 +89,8 @@ def ensure_no_links_in_tree(root: Path, os_: OsAdapters) -> tuple[list[Path], li
             try:
                 est = entry.stat(follow_symlinks=False)
             except OSError as exc:
-                raise BrainError(ErrorCode.INSECURE_PERMISSIONS, f"cannot stat {epath}: {exc}") from exc
+                detail = f"cannot stat {epath.name}: {describe_exception(exc)}"
+                raise BrainError(ErrorCode.INSECURE_PERMISSIONS, detail) from exc
             if stat.S_ISDIR(est.st_mode):
                 dirs.append(epath)
                 stack.append(epath)
@@ -94,9 +99,19 @@ def ensure_no_links_in_tree(root: Path, os_: OsAdapters) -> tuple[list[Path], li
     return dirs, files
 
 
-def _verify_and_secure(path: Path, *, is_dir: bool, pre_id: PhysicalObjectId | None, os_: OsAdapters) -> int:
+def _verify_and_secure(
+    path: Path,
+    *,
+    is_dir: bool,
+    pre_id: PhysicalObjectId | None,
+    os_: OsAdapters,
+    may_write: Callable[[], bool] | None = None,
+) -> int | None:
+    """Repair one entry; ``None`` when ``may_write`` refused the write this entry needed (nothing was changed)."""
     if not os_.permissions.object_problems(path):
         return 0
+    if may_write is not None and not may_write():
+        return None
     if os_.physical is not None:
         cur_id = os_.physical.stat_physical_identity(path)
         if cur_id is None or cur_id.is_link or cur_id != pre_id:
@@ -110,8 +125,27 @@ def _verify_and_secure(path: Path, *, is_dir: bool, pre_id: PhysicalObjectId | N
     return 1
 
 
-def tighten_data_root_permissions(roots: Sequence[Path], os_: OsAdapters) -> tuple[int, str]:
-    """Verify non-symlink identity on every node strictly inside ``roots`` and repair owner-only permissions."""
+class FixInterrupted(Exception):  # noqa: N818 - a stop signal, not an error
+    """A repair stopped at a step boundary because its caller's cutoff fired; ``changed`` steps were applied."""
+
+    def __init__(self, changed: int) -> None:
+        super().__init__("fix interrupted")
+        self.changed = changed
+
+
+def tighten_data_root_permissions(
+    roots: Sequence[Path],
+    os_: OsAdapters,
+    *,
+    should_stop: Callable[[], bool] | None = None,
+    may_write: Callable[[], bool] | None = None,
+) -> tuple[int, str]:
+    """Verify non-symlink identity on every node strictly inside ``roots`` and repair owner-only permissions.
+
+    ``should_stop`` is checked before every node and ``may_write`` immediately before every entry that needs a
+    change; once either refuses, the walk raises ``FixInterrupted`` without touching another node, so the caller can
+    report exactly how far the repair went.
+    """
     seen: set[str] = set()
     unique_roots: list[Path] = []
     for item in roots:
@@ -135,14 +169,16 @@ def tighten_data_root_permissions(roots: Sequence[Path], os_: OsAdapters) -> tup
                 raise BrainError(ErrorCode.UNSAFE_PATH, f"unsafe link: {f}")
             all_files.append((f, ident))
 
+    # Second file pass catches any child whose ACL reset during parent directory DACL update on Windows.
+    steps = [(d, True, i) for d, i in all_dirs] + [(f, False, i) for f, i in all_files] * 2
     changed = 0
-    for d, pre_id in all_dirs:
-        changed += _verify_and_secure(d, is_dir=True, pre_id=pre_id, os_=os_)
-    for f, pre_id in all_files:
-        changed += _verify_and_secure(f, is_dir=False, pre_id=pre_id, os_=os_)
-    # Second pass catches any child whose ACL reset during parent directory DACL update on Windows.
-    for f, pre_id in all_files:
-        changed += _verify_and_secure(f, is_dir=False, pre_id=pre_id, os_=os_)
+    for path, is_dir, pre_id in steps:
+        if should_stop is not None and should_stop():
+            raise FixInterrupted(changed)
+        step = _verify_and_secure(path, is_dir=is_dir, pre_id=pre_id, os_=os_, may_write=may_write)
+        if step is None:
+            raise FixInterrupted(changed)
+        changed += step
 
     if changed > 0:
         return changed, f"restricted {changed} insecure entry/entries to owner-only"
@@ -303,6 +339,20 @@ def run_external_fix_ports(
                 changed=1 if sres.restarted else 0,
             )
     return outcomes
+
+
+def build_interrupted_fix_response(
+    ordered_actions: tuple[str, ...],
+    outcomes_by_name: Mapping[str, dict[str, JsonValue]],
+) -> dict[str, JsonValue]:
+    """The fix stopped at its cutoff: every requested action with its definite state, and no recheck."""
+    return {
+        "status": "interrupted",
+        "fix": {
+            "actions": [outcomes_by_name[name] for name in ordered_actions if name in outcomes_by_name],
+            "rechecked_checks": [],
+        },
+    }
 
 
 def build_fix_response(

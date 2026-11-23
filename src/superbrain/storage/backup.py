@@ -355,6 +355,48 @@ def _recover_and_snapshot(source: Path, copy: Path, snapshot: Path, os_: OsAdapt
         db.close()
 
 
+def _open_live_readonly(source: Path) -> sqlite3.Connection:
+    """A private ``mode=ro`` reader on the WAL database ``source``; never ``immutable`` (unsafe with a live writer)."""
+    try:
+        return sqlite3.connect(f"{source.absolute().as_uri()}?mode=ro", uri=True, isolation_level=None)
+    except sqlite3.Error as exc:
+        raise sqlite_error(f"cannot open {source.name} read-only", exc) from exc
+
+
+def _data_version(db: sqlite3.Connection, name: str) -> int:
+    try:
+        return int(db.execute("PRAGMA data_version").fetchone()[0])
+    except sqlite3.Error as exc:
+        raise sqlite_error(f"cannot read the data version of {name}", exc) from exc
+
+
+def snapshot_live_db_pair(first: Path, second: Path, first_dest: Path, second_dest: Path, os_: OsAdapters) -> bool:
+    """Snapshot two live WAL databases into the new files ``*_dest`` as one pair, off the writer's thread.
+
+    Each copy is one committed state of its database. ``first`` is copied, then ``second``, while a reader on
+    ``first`` watches ``PRAGMA data_version``: if anything committed to ``first`` from before its copy until after
+    ``second``'s copy, the pair may mix two moments, so both files are removed and False is returned (the caller
+    retries or degrades). True means ``first`` was unchanged throughout, so the pair is the state at ``second``'s
+    copy. ``second`` is opened only for its own copy and nothing is pinned, so the writer is never blocked.
+    """
+    db = _open_live_readonly(first)
+    try:
+        before = _data_version(db, first.name)
+        _snapshot_db(db, first_dest, os_)
+        second_db = _open_live_readonly(second)
+        try:
+            _snapshot_db(second_db, second_dest, os_)
+        finally:
+            second_db.close()
+        consistent = _data_version(db, first.name) == before
+    finally:
+        db.close()
+    if not consistent:
+        for dest in (first_dest, second_dest):
+            dest.unlink(missing_ok=True)
+    return consistent
+
+
 def _snapshot_closed_db(source: Path, work: Path, snapshot: Path, os_: OsAdapters) -> None:
     """Snapshot the closed database ``source`` without opening it, through a recovered copy in the private
     directory ``work``. ``work`` is removed whether this succeeds or fails; a failure to remove it after another

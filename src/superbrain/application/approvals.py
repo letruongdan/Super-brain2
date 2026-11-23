@@ -11,12 +11,14 @@ import inspect
 import threading
 from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Literal
+from typing import Literal, TypeVar
 
 from superbrain.application._approvals_types import (
     BootstrapProposalHandler,
     DoctorOperatorHandler,
+    FixOwnerRunner,
     PendingApprovalCall,
+    PendingDoctorFixCall,
     PendingDoctorReportCall,
     PreparedOperatorCall,
     RestoreHandler,
@@ -49,6 +51,14 @@ from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.jsonvalue import JsonValue
 from superbrain.core.kernel import Principal
 from superbrain.ports.approval import ApprovalPolicyPort, SshApprovalVerifierPort, WebAuthnApprovalVerifierPort
+
+_R = TypeVar("_R")
+
+
+def _run_inline(fn: Callable[[], _R]) -> _R:
+    """``FixOwnerRunner`` for the direct ``handle`` path, which already runs on the owner."""
+    return fn()
+
 
 __all__ = [
     "BootstrapProposalHandler",
@@ -125,6 +135,8 @@ class OperatorService:
             timeout_s = prepared.pending_doctor.wait_timeout_ms / 1000.0
             self.verify_doctor(prepared.pending_doctor, timeout_s=timeout_s)
             return self.commit_doctor(prepared.pending_doctor)
+        if prepared.pending_fix is not None:
+            return self.execute_doctor_fix(prepared.pending_fix, should_stop=lambda: False, run_on_owner=_run_inline)
         assert prepared.pending is not None
         new_sign_count = self.verify_pending(prepared.pending)
         return self.commit_call(prepared.pending, new_sign_count=new_sign_count)
@@ -186,7 +198,7 @@ class OperatorService:
         if path == "/v2/operator/doctor/report":
             return prepare_doctor_report_call(principal, token, body, self._doctor_handler)
         if path == "/v2/operator/doctor/fix":
-            return prepare_doctor_fix_call(principal, body, self._doctor_handler)
+            return prepare_doctor_fix_call(principal, token, body, self._doctor_handler)
         if path in _DEFERRED_PATHS:
             raise BrainError(ErrorCode.CAPABILITY_UNAVAILABLE, "capability unavailable")
         raise BrainError(ErrorCode.NOT_FOUND, "not found")
@@ -271,6 +283,32 @@ class OperatorService:
             pending_doctor.ticket.job_id,
             generation=pending_doctor.ticket.generation,
             timeout_s=timeout_s,
+        )
+
+    def execute_doctor_fix(
+        self,
+        pending_fix: PendingDoctorFixCall,
+        *,
+        should_stop: Callable[[], bool],
+        run_on_owner: FixOwnerRunner,
+    ) -> dict[str, JsonValue]:
+        """Phase 2 (off owner thread): run the admitted fix until done or until ``should_stop`` (the cutoff).
+
+        Every step the fix sends to the owner first re-verifies the caller's live credential there, so a credential
+        revoked after phase 1 stops the fix before its next write.
+        """
+        if self._doctor_handler is None:
+            raise BrainError(ErrorCode.CAPABILITY_UNAVAILABLE, "capability unavailable")
+
+        def _checked_on_owner(fn: Callable[[], _R]) -> _R:
+            def _step() -> _R:
+                self._verify_caller(pending_fix.principal, pending_fix.token)
+                return fn()
+
+            return run_on_owner(_step)
+
+        return self._doctor_handler.execute_fix(
+            pending_fix.ticket, should_stop=should_stop, run_on_owner=_checked_on_owner
         )
 
     def commit_doctor(self, pending_doctor: PendingDoctorReportCall) -> dict[str, JsonValue]:

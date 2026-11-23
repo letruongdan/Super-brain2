@@ -5,10 +5,10 @@ from __future__ import annotations
 import base64
 import binascii
 import inspect
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import Literal, Protocol, TypeVar
 
 from superbrain.application.review_apply import ReviewApplyService
 from superbrain.core._kernel_approval import (
@@ -26,6 +26,14 @@ from superbrain.core.jsonvalue import JsonValue
 from superbrain.core.kernel import Principal
 from superbrain.core.proposals import ApplyJournal, ChangeProposal
 from superbrain.ports.approval import ApprovalPolicyPort
+
+_R = TypeVar("_R")
+
+
+class FixOwnerRunner(Protocol):
+    """Runs one step of a fix on the owner thread within the request deadline and returns its result."""
+
+    def __call__(self, fn: Callable[[], _R], /) -> _R: ...
 
 
 def _invalid() -> BrainError:
@@ -160,6 +168,26 @@ class PendingDoctorReportCall:
     wait_timeout_ms: int = 10_000
 
 
+@dataclass(frozen=True)
+class DoctorFixTicket:
+    """Validated `/v2/operator/doctor/fix` request pinned to the runtime generation it was admitted under."""
+
+    generation: int
+    store_id: str
+    actions: tuple[str, ...]
+    explicit_actions: bool
+    checkout_root: Path | None = None
+
+
+@dataclass(frozen=True)
+class PendingDoctorFixCall:
+    """A fix whose filesystem repairs and recheck run off the owner thread, bounded by the request cutoff."""
+
+    principal: Principal
+    token: str | None
+    ticket: DoctorFixTicket
+
+
 class DoctorOperatorHandler(Protocol):
     """Composition-supplied background doctor enqueue/wait/read bridge for operator routes."""
 
@@ -187,23 +215,33 @@ class DoctorOperatorHandler(Protocol):
         writer_epoch: int,
     ) -> dict[str, JsonValue]: ...
 
-    def run_fix(
+    def prepare_fix(
         self,
         *,
         owner_id: str,
         body: Mapping[str, JsonValue],
+    ) -> DoctorFixTicket: ...
+
+    def execute_fix(
+        self,
+        ticket: DoctorFixTicket,
+        *,
+        should_stop: Callable[[], bool],
+        run_on_owner: FixOwnerRunner,
     ) -> dict[str, JsonValue]: ...
 
 
 def prepare_doctor_fix_call(
     principal: Principal,
+    token: str | None,
     body: Mapping[str, JsonValue],
     doctor_handler: DoctorOperatorHandler | None,
 ) -> PreparedOperatorCall:
-    """Validate and execute `/v2/operator/doctor/fix` under operator owner admission."""
+    """Validate `/v2/operator/doctor/fix` on the owner thread; the repairs themselves run off it (phase 2)."""
     if doctor_handler is None:
         raise BrainError(ErrorCode.CAPABILITY_UNAVAILABLE, "capability unavailable")
-    return PreparedOperatorCall(immediate=doctor_handler.run_fix(owner_id=principal.owner_id, body=body))
+    ticket = doctor_handler.prepare_fix(owner_id=principal.owner_id, body=body)
+    return PreparedOperatorCall(pending_fix=PendingDoctorFixCall(principal=principal, token=token, ticket=ticket))
 
 
 def prepare_doctor_report_call(
@@ -253,6 +291,7 @@ class PreparedOperatorCall:
     immediate: dict[str, JsonValue] | None = None
     pending: PendingApprovalCall | None = None
     pending_doctor: PendingDoctorReportCall | None = None
+    pending_fix: PendingDoctorFixCall | None = None
 
 
 class BootstrapProposalHandler(Protocol):

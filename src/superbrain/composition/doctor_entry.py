@@ -259,12 +259,17 @@ def _execute_cli_doctor(parsed: _ParsedDoctorCli, adapters: OsAdapters) -> dict[
     root = DataRoot.at(data_root)
     endpoint_exists = os.path.lexists(endpoint_path)
     probe_fn = getattr(adapters.locks, "probe_held", None)
-    writer_held = bool(probe_fn(root.lock_path)) if callable(probe_fn) else False
+    if not callable(probe_fn):
+        # Without a lock probe nobody can tell whether a daemon owns the store; never assume it does not.
+        raise BrainError(ErrorCode.CAPABILITY_UNAVAILABLE, "capability unavailable")
+    writer_held = bool(probe_fn(root.lock_path))
 
     if parsed.offline:
         if parsed.fix:
             raise BrainError(ErrorCode.DAEMON_UNAVAILABLE, "daemon unavailable")
-        if endpoint_exists or writer_held:
+        # writer.lock is the source of truth: an endpoint.json left by a crashed daemon does not block the
+        # explicitly requested offline read, and the report flags it as stale.
+        if writer_held:
             raise BrainError(ErrorCode.STORE_BUSY, "store busy")
         if parsed.is_profile and profile.workspace is not None and parsed.checkout_root is not None:
             verify_launch_checkout(profile.workspace.checkout_path, parsed.checkout_root, adapters)

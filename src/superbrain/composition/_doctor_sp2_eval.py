@@ -6,6 +6,7 @@ import contextlib
 import json
 import os
 import sqlite3
+import sys
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Literal
@@ -94,29 +95,26 @@ def classify_capture_provenance(
     if not healthy:
         return "native", False
 
+    # Fail closed: every binding must be present and equal; missing evidence on either side never verifies.
+    if expected_scope is None:
+        return "native", False
     l2_by_harness = {entry.harness_id: entry for entry in layer2_harnesses}
     for h in capture_snapshot.harnesses:
-        if not hasattr(h, "receipt"):
-            continue
         receipt = getattr(h, "receipt", None)
-        if receipt is None or not isinstance(receipt, Mapping):
+        if not isinstance(receipt, Mapping):
             return "native", False
-        host = receipt.get("host")
-        if host is not None and host != h.harness_id:
+        if receipt.get("host") != h.harness_id or receipt.get("os") != sys.platform:
             return "native", False
         l2 = l2_by_harness.get(h.harness_id)
-        if l2 is not None:
-            if l2.host_version is not None and receipt.get("host_version") != l2.host_version:
-                return "native", False
-            if l2.config_digest is not None and receipt.get("config_digest") != l2.config_digest:
-                return "native", False
+        if l2 is None or l2.host_version is None or l2.config_digest is None:
+            return "native", False
+        if receipt.get("host_version") != l2.host_version or receipt.get("config_digest") != l2.config_digest:
+            return "native", False
         run_scope = receipt.get("run_scope")
         if not isinstance(run_scope, Mapping):
             return "native", False
-        if expected_scope is not None:
-            if run_scope.get("repo_id") != expected_scope.get("repo_id"):
-                return "native", False
-            if run_scope.get("checkout_id") != expected_scope.get("checkout_id"):
+        for key in ("repo_id", "checkout_id"):
+            if not run_scope.get(key) or run_scope.get(key) != expected_scope.get(key):
                 return "native", False
 
     return "native", True

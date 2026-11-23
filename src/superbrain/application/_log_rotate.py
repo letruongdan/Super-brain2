@@ -14,7 +14,7 @@ from contextlib import AbstractContextManager
 from pathlib import Path
 from typing import Any
 
-from superbrain.core.errors import BrainError, ErrorCode
+from superbrain.core.errors import BrainError, ErrorCode, describe_exception
 from superbrain.core.faults import crashpoint
 from superbrain.core.ids import new_id
 from superbrain.ports.doctor import MAX_LOG_BYTES
@@ -57,7 +57,7 @@ def _map_busy_or_io(exc: OSError, what: str) -> BrainError:
     winerr = getattr(exc, "winerror", None)
     if (isinstance(winerr, int) and winerr in _BUSY_WINERRORS) or exc.errno in (errno.EBUSY, errno.EACCES):
         return BrainError(ErrorCode.FILESYSTEM_BUSY, f"filesystem busy while {what}")
-    return BrainError(ErrorCode.IO_ERROR, f"I/O error while {what}: {exc}")
+    return BrainError(ErrorCode.IO_ERROR, f"I/O error while {what}: {describe_exception(exc)}")
 
 
 def _sha256_file(path: Path) -> tuple[int, str]:
@@ -68,6 +68,21 @@ def _sha256_file(path: Path) -> tuple[int, str]:
             while chunk := fh.read(65536):
                 total += len(chunk)
                 h.update(chunk)
+    except OSError as exc:
+        raise _map_busy_or_io(exc, f"reading {path.name}") from exc
+    return total, h.hexdigest()
+
+
+def _sha256_prefix(path: Path, size: int) -> tuple[int, str]:
+    """``(total_size, digest of the first size bytes)``; bytes appended after the digest are kept, not judged."""
+    h = hashlib.sha256()
+    total = 0
+    try:
+        with open(path, "rb") as fh:
+            while chunk := fh.read(65536):
+                if total < size:
+                    h.update(chunk[: size - total])
+                total += len(chunk)
     except OSError as exc:
         raise _map_busy_or_io(exc, f"reading {path.name}") from exc
     return total, h.hexdigest()
@@ -175,7 +190,22 @@ def _finish_shifting(
     os_.publisher.sync_directory(logs_dir)
 
 
-def _recover_interrupted_rotations(logs_dir: Path, os_: OsAdapters) -> bool:
+class RotationStopped(Exception):  # noqa: N818 - a stop signal, not an error
+    """The write gate closed before a rotation step started; ``recovered`` interrupted rotations were finished."""
+
+    def __init__(self, recovered: int) -> None:
+        super().__init__("log rotation stopped")
+        self.recovered = recovered
+
+
+def _open_gate(may_write: Callable[[], bool] | None, recovered: int) -> None:
+    if may_write is not None and not may_write():
+        raise RotationStopped(recovered)
+
+
+def _recover_interrupted_rotations(
+    logs_dir: Path, os_: OsAdapters, may_write: Callable[[], bool] | None = None
+) -> bool:
     state_files: dict[str, Path] = {}
     rotating_files: dict[str, Path] = {}
     with os.scandir(logs_dir) as it:
@@ -193,7 +223,7 @@ def _recover_interrupted_rotations(logs_dir: Path, os_: OsAdapters) -> bool:
     if orphan_rotating:
         raise BrainError(ErrorCode.INTEGRITY_FAILURE, f"orphaned staged log rotation: {orphan_rotating[0]}")
 
-    recovered = False
+    finished = 0
     for rot_id in sorted(state_files):
         state_file = state_files[rot_id]
         state = _parse_state(state_file)
@@ -201,19 +231,23 @@ def _recover_interrupted_rotations(logs_dir: Path, os_: OsAdapters) -> bool:
             raise BrainError(ErrorCode.INTEGRITY_FAILURE, f"rotation state id mismatch in {state_file.name}")
         rotating = logs_dir / f"{_ROTATING_PREFIX}{rot_id}"
         if os.path.lexists(rotating):
+            # A writer that appended after the digest was taken leaves a longer file: its recorded prefix must
+            # still match, and the extra bytes travel with it into brain.log.1.
             r_size, r_digest = _sha256_file(rotating)
-            if r_size != state["size"] or r_digest != str(state["digest"]).removeprefix("sha256:"):
+            if r_size > state["size"]:
+                r_size, r_digest = _sha256_prefix(rotating, int(state["size"]))
+            if r_size < state["size"] or r_digest != str(state["digest"]).removeprefix("sha256:"):
                 raise BrainError(ErrorCode.INTEGRITY_FAILURE, f"staged log digest/size mismatch: {rotating.name}")
+        _open_gate(may_write, finished)  # every check of this journal is done; the next line writes
+        if os.path.lexists(rotating):
             _finish_shifting(logs_dir, state_file, state, rotating, os_)
-            recovered = True
         elif state["phase"] == "shifting":
             _finish_shifting(logs_dir, state_file, state, rotating, os_)
-            recovered = True
         else:
             os.unlink(state_file)
             os_.publisher.sync_directory(logs_dir)
-            recovered = True
-    return recovered
+        finished += 1
+    return finished > 0
 
 
 def rotate_logs(
@@ -223,8 +257,14 @@ def rotate_logs(
     max_bytes: int = MAX_LOG_BYTES,
     force: bool = False,
     quiesce_hook: Callable[[], AbstractContextManager[None]] | None = None,
+    may_write: Callable[[], bool] | None = None,
 ) -> tuple[bool, str]:
-    """Recover any interrupted rotation and atomically rotate oversized ``brain.log`` without losing bytes."""
+    """Recover any interrupted rotation and atomically rotate oversized ``brain.log`` without losing bytes.
+
+    ``may_write`` is asked immediately before each write group starts (each recovered journal, then the new
+    rotation's journal), after all of that group's reads and checks; when it returns ``False`` the rotation raises
+    ``RotationStopped`` and nothing further is written. Every group leaves a journal the next run can finish.
+    """
     scope = quiesce_hook() if quiesce_hook is not None else contextlib.nullcontext()
     with scope:
         if not os.path.lexists(logs_dir):
@@ -234,7 +274,7 @@ def rotate_logs(
             for entry in it:
                 _require_non_link(Path(entry.path), os_)
 
-        recovered = _recover_interrupted_rotations(logs_dir, os_)
+        recovered = _recover_interrupted_rotations(logs_dir, os_, may_write)
         active = logs_dir / _ACTIVE_NAME
         if not os.path.lexists(active):
             return recovered, "recovered interrupted rotation" if recovered else "no active brain.log"
@@ -255,6 +295,7 @@ def rotate_logs(
 
         rot_id = new_id()
         size, digest = _sha256_file(active)
+        _open_gate(may_write, int(recovered))
         state_file = logs_dir / f"{_STATE_PREFIX}{rot_id}{_STATE_SUFFIX}"
         rotating = logs_dir / f"{_ROTATING_PREFIX}{rot_id}"
         state_payload: dict[str, Any] = {
