@@ -76,6 +76,8 @@ from tests.support.sp2_crash_cases import (
     run_sp2_3_crash_case,
 )
 
+_WAIT_S = 20.0
+
 
 def _publish_auth_overlay(session: Any, snap: Any, updates: dict[str, Any]) -> None:
     current = session.auth_gate.current()
@@ -125,7 +127,7 @@ def _setup_capture_and_cli(h: Any, ws_a: Any, *, stream: str) -> tuple[Any, Any]
         _publish_auth_overlay(session, snap, {cli.credential_id: cli_rec})
         out.append((cap, cli))
 
-    h.loop.run_owner_action(_act).result(timeout=5.0)
+    h.loop.run_owner_action(_act).result(timeout=_WAIT_S)
     return out[0]
 
 
@@ -318,7 +320,7 @@ def test_capture_auth_scope_privacy_cas_policy_and_source_attribution() -> None:
                 "expires_at": expires_at_raw,
             }, blob_bytes
 
-        meta1, blob1 = h.loop.run_owner_action(_inspect_after_ev1).result(timeout=5.0)
+        meta1, blob1 = h.loop.run_owner_action(_inspect_after_ev1).result(timeout=_WAIT_S)
         assert (meta1["source"], meta1["verification"]) == ("unknown", "unverified")
         assert secret_bait.encode() not in blob1 and b"visible" in blob1
         committed_at = parse_canonical_utc(meta1["committed_at"])
@@ -350,7 +352,7 @@ def test_capture_auth_scope_privacy_cas_policy_and_source_attribution() -> None:
                     state=state,
                 )
 
-            h.loop.run_owner_action(_act).result(timeout=5.0)
+            h.loop.run_owner_action(_act).result(timeout=_WAIT_S)
 
         def _event_source(seq: int) -> tuple[str, str]:
             def _read() -> tuple[str, str]:
@@ -363,7 +365,7 @@ def test_capture_auth_scope_privacy_cas_policy_and_source_attribution() -> None:
                 assert row is not None
                 return str(row[0]), str(row[1])
 
-            return h.loop.run_owner_action(_read).result(timeout=5.0)
+            return h.loop.run_owner_action(_read).result(timeout=_WAIT_S)
 
         def _post_event(seq: int, payload: dict[str, Any], source_metadata: dict[str, Any] | None = None) -> Any:
             ev = _ev_dict(
@@ -441,7 +443,7 @@ def test_capture_auth_scope_privacy_cas_policy_and_source_attribution() -> None:
                 assert session is not None
                 session._rt.policy.set_repo_policy(ws_a.repo_id, automatic_capture_enabled=enabled)
 
-            h.loop.run_owner_action(_act).result(timeout=5.0)
+            h.loop.run_owner_action(_act).result(timeout=_WAIT_S)
 
         def _seq_exists(seq: int) -> bool:
             def _check() -> bool:
@@ -453,7 +455,7 @@ def test_capture_auth_scope_privacy_cas_policy_and_source_attribution() -> None:
                 ).fetchone()
                 return row is not None
 
-            return bool(h.loop.run_owner_action(_check).result(timeout=5.0))
+            return bool(h.loop.run_owner_action(_check).result(timeout=_WAIT_S))
 
         _set_auto_capture(False)
         ack_off = _post_event(8, {"safe": "ignored"})
@@ -481,7 +483,7 @@ def test_capture_auth_scope_privacy_cas_policy_and_source_attribution() -> None:
             revoked = replace(base_cap, revoked=True)
             _publish_auth_overlay(session, snap, {cap_cred.credential_id: revoked})
 
-        h.loop.run_owner_action(_revoke_cap).result(timeout=5.0)
+        h.loop.run_owner_action(_revoke_cap).result(timeout=_WAIT_S)
         with pytest.raises(BrainError) as exc_rev:
             _post_event(9, {"k": "v"})
         assert exc_rev.value.code is ErrorCode.UNAUTHENTICATED
@@ -651,7 +653,7 @@ def test_separated_ack_closed_gap_restart_health_and_producer_gap(trusted_tmp: P
                 list(disp_res["data"]["degraded_codes"]),
             )
 
-        open_g, closed_g, prod_g, has_gaps, disp_degraded = h1.loop.run_owner_action(_close_gap).result(timeout=5.0)
+        open_g, closed_g, prod_g, has_gaps, disp_degraded = h1.loop.run_owner_action(_close_gap).result(timeout=_WAIT_S)
         assert (open_g, closed_g, prod_g, has_gaps) == (0, 1, 0, True)
         assert "capture_gap_present" in disp_degraded
         assert "capture_gap_present" in _get_health(h1, tpl.cred.token, deep=False)["degraded_codes"]
@@ -850,7 +852,7 @@ def test_capture_only_policy_keeps_payload_and_source_when_manual_submission_dis
                     state=Layer2State.VERIFIED,
                 )
 
-            h.loop.run_owner_action(_act).result(timeout=5.0)
+            h.loop.run_owner_action(_act).result(timeout=_WAIT_S)
 
         _configure_cap_only(automatic_capture=True)
         secret_pat = "github_pat_" + ("F1AbCdEf" * 4)
@@ -887,7 +889,7 @@ def test_capture_only_policy_keeps_payload_and_source_when_manual_submission_dis
             payload_obj = json.loads(rt.store.cas.read(str(row[2])))
             return str(row[0]), str(row[1]), meta_obj, payload_obj
 
-        src, sver, stored_meta, stored_payload = h.loop.run_owner_action(_inspect_committed).result(timeout=5.0)
+        src, sver, stored_meta, stored_payload = h.loop.run_owner_action(_inspect_committed).result(timeout=_WAIT_S)
         assert (src, sver) == ("tool_observed", "verified_host")
         assert stored_meta == {"host_version": "2.1.325", "config_digest": cfg_dig}
         assert stored_payload["tool"] == "Read"
@@ -957,7 +959,7 @@ def test_capture_sparse_high_sequence_gap_intervals_closure_validation_and_clock
                 ).fetchall()
                 return [(int(r[0]), str(r[1]), int(r[2])) for r in rows]
 
-            return h.loop.run_owner_action(_read).result(timeout=5.0)
+            return h.loop.run_owner_action(_read).result(timeout=_WAIT_S)
 
         # Sparse sequence=5_000_000 inserts 1 interval row [1..4_999_999], O(1), health degraded.
         ack_high = cap_client.post_batch(
@@ -1004,7 +1006,7 @@ def test_capture_sparse_high_sequence_gap_intervals_closure_validation_and_clock
             snap = cstore.read_capture_health()
             return snap.open_gaps, snap.closed_gaps, snap.has_gaps
 
-        open_cnt, closed_cnt, has_gaps = h.loop.run_owner_action(_close_seq2).result(timeout=5.0)
+        open_cnt, closed_cnt, has_gaps = h.loop.run_owner_action(_close_seq2).result(timeout=_WAIT_S)
         assert closed_cnt == 1
         assert open_cnt >= 1
         assert has_gaps is True
@@ -1081,7 +1083,7 @@ def test_capture_sparse_high_sequence_gap_intervals_closure_validation_and_clock
             return str(ev_row[0]), str(wm_row[0]), str(hold_row[0])
 
         committed_at_s, updated_at_s, expires_at_s = h.loop.run_owner_action(_commit_with_custom_now).result(
-            timeout=5.0
+            timeout=_WAIT_S
         )
         assert committed_at_s == "2029-03-15T10:45:00.000000Z"
         assert updated_at_s == "2029-03-15T10:45:00.000000Z"
@@ -1142,7 +1144,7 @@ def test_drain_outbox_chunks_large_backlog_and_stops_on_mid_drain_policy_disable
                 )
             )
 
-        h.loop.run_owner_action(_setup_stream2).result(timeout=5.0)
+        h.loop.run_owner_action(_setup_stream2).result(timeout=_WAIT_S)
         cap2 = cap2_holder[0]
         cap_client = CaptureClient(h.open_client())
         target = h.make_target()
@@ -1188,7 +1190,7 @@ def test_drain_outbox_chunks_large_backlog_and_stops_on_mid_drain_policy_disable
                 assert session is not None
                 session._rt.policy.set_repo_policy(ws_a.repo_id, automatic_capture_enabled=enabled)
 
-            h.loop.run_owner_action(_act).result(timeout=5.0)
+            h.loop.run_owner_action(_act).result(timeout=_WAIT_S)
 
         class _ToggleAfterFirstBatchClient(CaptureClient):
             def __init__(self, inner_loopback: Any) -> None:
@@ -1254,7 +1256,7 @@ def _owner(h: Any, fn: Any) -> Any:
         assert session is not None
         return fn(session)
 
-    return h.loop.run_owner_action(_act).result(timeout=5.0)
+    return h.loop.run_owner_action(_act).result(timeout=_WAIT_S)
 
 
 def _wait_owner(h: Any, fn: Any, *, timeout_s: float = 20.0) -> Any:

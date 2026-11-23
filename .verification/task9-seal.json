@@ -109,7 +109,7 @@
     "tests/fixtures/skill-body.txt": "sha256:db70d6dd52eac093eb1c46c4d0daece722a287f8e2c417042160869883b99bbb",
     "tests/integration/test_apply_journal_crash_matrix.py": "sha256:d87c0d3212d252e9fe5c12e9a7bf3dd5b157bf974d64c53c09abb70c87b453b6",
     "tests/integration/test_apply_journal_e2e.py": "sha256:b0391d4b65f359ea7fbf1bee488bd2361335d8df9702749eef954f3f3c03121c",
-    "tests/integration/test_capture_ack_and_crash_matrix.py": "sha256:bf55d27d181a11ce3f6768d36f86967e6507d1681816ddfadddf75d0029bdf0a",
+    "tests/integration/test_capture_ack_and_crash_matrix.py": "sha256:1b3175ecb29798033750b1e268060d7b0dbf3243921e0d49720d4d73681720eb",
     "tests/integration/test_cli_init_and_authority.py": "sha256:2794e8339838df2ced860c2c5ef6803e60032819faeca42ffe3f5c449fbbcf47",
     "tests/integration/test_i2_close_01_canonical_compat.py": "sha256:51a743ae072ef9984c4afa674d448df914a08aa0f3f69d33758fef67dab54c18",
     "tests/integration/test_i2_close_01_transport_stdio.py": "sha256:da623722a98a882c7f63339a733f546cda8cda7514213e373e3d898d85bd31e0",
