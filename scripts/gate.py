@@ -12,6 +12,7 @@ digests follow the same canonical-JSON rules as the rest of the code base.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import math
 import os
@@ -299,44 +300,44 @@ _WHEEL_FIXTURE_FILES: frozenset[str] = frozenset(
 # (evidence/batch2-diag-v19, commits 75d4dc8, 1a81253, and batch 2-5 optimizations).
 # Replaces estimates whose local error is >= 3s with the measured JUnit file time.
 _HEAVY_FILE_COST_MS: dict[str, int] = {
-    "tests/integration/test_kernel_crash_recovery.py": 95886,
-    "tests/integration/test_apply_journal_crash_matrix.py": 88322,
-    "tests/integration/test_sp2_i2_wheel_compat.py": 68902,
-    "tests/integration/test_kernel_native_receipt_contract.py": 52840,
+    "tests/integration/test_kernel_crash_recovery.py": 104516,
+    "tests/integration/test_apply_journal_crash_matrix.py": 96271,
+    "tests/integration/test_sp2_i2_wheel_compat.py": 75103,
+    "tests/integration/test_kernel_native_receipt_contract.py": 57596,
+    "tests/integration/test_capture_ack_and_crash_matrix.py": 49907,
     "tests/integration/test_kernel_daemon.py": 49000,
-    "tests/integration/test_capture_ack_and_crash_matrix.py": 45786,
-    "tests/integration/test_i3_wheel_e2e.py": 42830,
+    "tests/integration/test_i3_wheel_e2e.py": 46685,
     "tests/integration/test_i3_rereview_init_and_accounting.py": 38548,
-    "tests/integration/test_kernel_cli.py": 31407,
+    "tests/integration/test_kernel_cli.py": 34234,
     "tests/storage/test_kernel_revocation.py": 30717,
     "tests/application/test_continuity_worker_scheduling.py": 30576,
     "tests/application/test_t8_review_p01_r2_edge_globs.py": 30083,
+    "tests/integration/test_restore_and_migration_i3.py": 30083,
     "tests/architecture/test_gate_receipt.py": 29317,
     "tests/storage/test_crash_matrix.py": 28945,
     "tests/integration/test_t9_signal_stop_conversion.py": 28625,
-    "tests/integration/test_restore_and_migration_i3.py": 27599,
     "tests/application/test_t8_review_p01_wrapped_paths.py": 27374,
     "tests/storage/test_restore.py": 27121,
     "tests/storage/test_runtime.py": 25256,
+    "tests/integration/test_kernel_shim.py": 22584,
     "tests/domain/test_capture_envelope_and_privacy.py": 21708,
     "tests/storage/test_backup.py": 21124,
-    "tests/integration/test_kernel_shim.py": 20719,
+    "tests/contract/test_mcp_v2_schema.py": 20324,
     "tests/storage/test_kernel_migration.py": 18808,
-    "tests/contract/test_mcp_v2_schema.py": 18646,
     "tests/integration/test_i3_rereview_bootstrap_and_handoff.py": 16799,
+    "tests/integration/test_kernel_receipts.py": 15890,
     "tests/storage/test_ledger.py": 15727,
     "tests/storage/test_remediation_i2_t5.py": 14648,
-    "tests/integration/test_kernel_receipts.py": 14578,
     "tests/storage/test_cas.py": 13571,
     "tests/integration/test_sp2_store_v7_shape_and_refs.py": 12572,
     "tests/integration/test_kernel_transport.py": 12390,
     "tests/integration/test_sp2_daemon_leased_attempt_retry.py": 11976,
     "tests/storage/test_remediation_i2_t3_lineage.py": 11898,
+    "tests/integration/test_kernel_privacy_persistence.py": 10642,
     "tests/integration/test_sp2_continuity_authority_read_errors.py": 10455,
     "tests/storage/test_kernel_idempotency.py": 10219,
     "tests/storage/test_outbox_durability_and_limits.py": 9974,
     "tests/storage/test_recovery_grant_and_turn_intent.py": 9927,
-    "tests/integration/test_kernel_privacy_persistence.py": 9763,
     "tests/integration/test_kernel_performance.py": 9678,
     "tests/storage/test_reconcile.py": 9531,
     "tests/application/test_kernel_send_attempts.py": 9444,
@@ -370,6 +371,7 @@ _HEAVY_FILE_COST_MS: dict[str, int] = {
     "tests/storage/test_remediation_c01_wal_admission.py": 4483,
     "tests/architecture/test_imports.py": 4340,
     "tests/application/test_i3_3_review_regressions.py": 4326,
+    "tests/integration/test_t9_benchmark_scratch.py": 4292,
     "tests/integration/test_i2_close_01_wire_replay.py": 4285,
     "tests/architecture/test_remediation_c06_gate_xpass.py": 4251,
     "tests/storage/test_i3_4_storage_regressions.py": 4236,
@@ -377,7 +379,6 @@ _HEAVY_FILE_COST_MS: dict[str, int] = {
     "tests/application/test_t8_review_p01_n04_short_spellings.py": 4132,
     "tests/application/test_t8_review_p01_n01_linear.py": 4112,
     "tests/application/test_kernel_deadlines.py": 3975,
-    "tests/integration/test_t9_benchmark_scratch.py": 3938,
     "tests/application/test_i3_2_journal_regressions.py": 3902,
     "tests/storage/test_kernel_jobs.py": 3833,
     "tests/storage/test_policy_accounting.py": 3739,
@@ -481,8 +482,8 @@ _HEAVY_FILE_COST_MS: dict[str, int] = {
     "tests/adapters/test_shared_config_mergers.py": 33,
     "tests/integration/test_t8_review_20261112_perf_replay.py": 32,
     "tests/application/test_t8_closure_prequeue.py": 26,
-    "tests/application/test_t8_review_p02_rule_gates.py": 25,
     "tests/application/test_kernel_lineage.py": 25,
+    "tests/application/test_t8_review_p02_rule_gates.py": 25,
     "tests/support/test_fs.py": 24,
     "tests/core/test_approval_message.py": 21,
     "tests/core/test_canonical.py": 19,
@@ -1357,6 +1358,15 @@ def run_gate(
                 extra.append(f"uv sync failed ({error or ('timed out' if code is None else code)})")
                 log.append(output)
             else:
+                py_exe = worktree / ".venv" / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
+                if py_exe.is_file():
+                    with contextlib.suppress(Exception):
+                        subprocess.run(
+                            [str(py_exe), "-m", "compileall", "-j", "0", "src", "tests", "-q"],
+                            cwd=worktree,
+                            check=False,
+                            timeout=30,
+                        )
                 job_began = time.monotonic()
                 deadline = job_began + TEST_JOB_BUDGET_S
                 halted: str | None = None  # why no further step of the test job may start
