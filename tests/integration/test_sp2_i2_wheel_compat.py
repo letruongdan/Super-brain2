@@ -31,7 +31,6 @@ from superbrain.core.errors import ErrorCode
 from superbrain.core.kernel import Endpoint, WorkspaceBinding
 from superbrain.core.wire import load_catalog, parse_json
 from superbrain.storage.kernel_schema import KERNEL_POLICY_MIGRATIONS, KERNEL_STORE_MIGRATIONS
-from superbrain.storage.runtime import open_runtime
 from tests.support.clock import FakeClock
 from tests.support.inc2_cli import (
     InstalledServeProcess,
@@ -56,6 +55,7 @@ from tests.support.inc2_fixture import (
     _cleanup_dir,
     _interprocess_lock,
     _make_trusted_session_dir,
+    open_cloned_runtime,
 )
 from tests.support.inc2_transport import read_raw_http_response, register_workspace_direct
 from tests.support.kernel_auth import (
@@ -305,9 +305,10 @@ def _seed_daemon_root(scratch: Path, label: str, *, frozen_i2: bool) -> _LiveWhe
 
     extensions, kinds = kernel_store_extensions()
     store_version, policy_version = (4, 3) if frozen_i2 else (7, 5)
-    rt = open_runtime(
+    rt = open_cloned_runtime(
         data_root,
         adapters,
+        role=f"wheel-compat-{'i2' if frozen_i2 else 'sp2'}",
         handlers=extensions,
         kinds=kinds,
         store_migrations=tuple(m for m in KERNEL_STORE_MIGRATIONS if m.to_version <= store_version),

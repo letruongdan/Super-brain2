@@ -5,8 +5,10 @@ from __future__ import annotations
 import contextlib
 import datetime as dt
 import json
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 
 import pytest
@@ -91,18 +93,73 @@ def _capture(ctx: KernelCrashContext, seed: KernelSeed) -> JobEvidence:
         return JobEvidence(JobRow(*row), invocations, tuple(events))
 
 
+@dataclass(frozen=True)
+class _JobSeedTemplate:
+    root: Path
+    lock_epoch: int
+    snapshot: dict[str, list[tuple[object, ...]]]
+    notes: dict[str, object]
+
+
+_JOB_SEED_TEMPLATES: dict[str, _JobSeedTemplate] = {}
+
+
+def _get_job_seed_template(ctx: KernelCrashContext) -> _JobSeedTemplate:
+    tpl = ctx.template
+    existing = _JOB_SEED_TEMPLATES.get(tpl.store_id)
+    if existing is not None and existing.root.is_dir():
+        return existing
+    from tests.support.crash_cases import lock_epoch, store_rows
+    from tests.support.inc2_fixture import ensure_template_base
+
+    tpl_dir = ensure_template_base() / f"job-seed-tpl-{uuid.uuid4().hex}"
+    tpl_dir.mkdir(parents=True, exist_ok=True)
+    tpl_root = tpl_dir / "jobs"
+    clone_owner_only_tree(tpl.root, tpl_root)
+    clock = FakeClock(tpl.base_time)
+    rt = reopen_kernel_job_runtime(tpl_root, tpl.store_id, os_adapters(clock=clock))
+    try:
+        service, staged = kernel_job_service(rt, clock)
+        assert tpl.global_job_id is not None and tpl.scoped_job_id is not None and tpl.ws_a is not None
+        service.cancel(tpl.global_job_id, tpl.cred.principal, selected_scope=None)
+        scope = Scope(tpl.ws_a.repo_id, tpl.ws_a.checkout_id)
+        service.cancel(tpl.scoped_job_id, tpl.cred.principal, selected_scope=scope)
+        job = enqueue_job(service, staged, owner_id=tpl.cred.principal.owner_id, kind=T8_JOB_KIND)
+        notes: dict[str, object] = {
+            "job_id": job.job_id,
+            "attempt": 1,
+            "principal_id": tpl.cred.principal.principal_id,
+        }
+    finally:
+        rt.close()
+    snapshot = store_rows(tpl_root, tpl_dir / "jobs-read")
+    res = _JobSeedTemplate(
+        root=tpl_root,
+        lock_epoch=lock_epoch(tpl_root),
+        snapshot=snapshot,
+        notes=notes,
+    )
+    _JOB_SEED_TEMPLATES[tpl.store_id] = res
+    return res
+
+
 def seed_job(ctx: KernelCrashContext, *, attempt: int = 1, enqueue: bool = True) -> KernelSeed:
     """Clone the ACKed template, terminalize its jobs and optionally enqueue one new due test job."""
     from tests.support.crash_cases import KernelSeed, lock_epoch, store_rows
 
     tpl = ctx.template
     root = ctx.case_dir / "jobs"
-    clone_owner_only_tree(tpl.root, root)
     cfg = ctx.case_dir / "jobs-config.json"
     write_daemon_config_file(
         cfg, data_root=root, expected_store_id=tpl.store_id,
         cert_path=tpl.tls.cert_path, key_path=tpl.tls.key_path,
     )
+    if attempt == 1 and enqueue:
+        job_tpl = _get_job_seed_template(ctx)
+        clone_owner_only_tree(job_tpl.root, root)
+        return KernelSeed(root, cfg, tpl.store_id, job_tpl.lock_epoch, job_tpl.snapshot, notes=dict(job_tpl.notes))
+
+    clone_owner_only_tree(tpl.root, root)
     clock = FakeClock(tpl.base_time)
     rt = reopen_kernel_job_runtime(root, tpl.store_id, os_adapters(clock=clock))
     notes: dict[str, object] = {}

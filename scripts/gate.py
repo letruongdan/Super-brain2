@@ -300,11 +300,10 @@ _WHEEL_FIXTURE_FILES: frozenset[str] = frozenset(
 # (evidence/batch2-diag-v22, commits 4011200, 1a81253, and batch 2-5 optimizations).
 # Replaces estimates whose local error is >= 3s with the measured JUnit file time.
 _HEAVY_FILE_COST_MS: dict[str, int] = {
-    "tests/integration/test_kernel_crash_recovery.py": 92974,
     "tests/integration/test_apply_journal_crash_matrix.py": 88326,
-    "tests/integration/test_sp2_i2_wheel_compat.py": 72545,
     "tests/integration/test_kernel_native_receipt_contract.py": 60151,
     "tests/integration/test_kernel_daemon.py": 55038,
+    "tests/integration/test_kernel_crash_recovery.py": 52720,
     "tests/integration/test_i3_wheel_e2e.py": 51409,
     "tests/integration/test_capture_ack_and_crash_matrix.py": 44630,
     "tests/integration/test_i3_rereview_init_and_accounting.py": 42955,
@@ -312,6 +311,7 @@ _HEAVY_FILE_COST_MS: dict[str, int] = {
     "tests/integration/test_kernel_cli.py": 34312,
     "tests/application/test_continuity_worker_scheduling.py": 34117,
     "tests/architecture/test_gate_receipt.py": 33861,
+    "tests/integration/test_sp2_i2_wheel_compat.py": 33380,
     "tests/storage/test_crash_matrix.py": 33215,
     "tests/integration/test_restore_and_migration_i3.py": 32699,
     "tests/storage/test_restore.py": 29649,
