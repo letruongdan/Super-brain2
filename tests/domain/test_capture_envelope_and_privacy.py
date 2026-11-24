@@ -885,7 +885,7 @@ def _seed_outbox_frames(
     import zlib
 
     from superbrain.core.canonical import canonical_json, digest_bytes
-    from superbrain.ports.capture import OUTBOX_RECORD_EVENT, CaptureEventRecord
+    from superbrain.ports.capture import OUTBOX_RECORD_EVENT
 
     streams_root = spool_dir / "streams"
     streams_root.mkdir(parents=True, exist_ok=True)
@@ -900,21 +900,25 @@ def _seed_outbox_frames(
         perms.secure_directory(sdir)
         for seq in range(1, count + 1):
             order += 1
-            rec = CaptureEventRecord(
-                event_id=f"ev-{stream}-{seq}",
-                producer_stream=stream,
-                sequence=seq,
-                harness_id="claude-code",
-                kind="tool_post",
-                recorded_at="2026-11-21T12:00:00Z",
-                payload={"tool": "Read", "seq": seq},
-            )
-            payload_bytes = canonical_json(rec.to_dict())
+            ev_id = f"ev-{stream}-{seq}"
+            rec_dict = {
+                "record_kind": "event",
+                "event_id": ev_id,
+                "producer_stream": stream,
+                "sequence": seq,
+                "harness_id": "claude-code",
+                "kind": "tool_post",
+                "recorded_at": "2026-11-21T12:00:00Z",
+                "payload": {"tool": "Read", "seq": seq},
+                "session_ref": None,
+                "source_metadata": {},
+            }
+            payload_bytes = canonical_json(rec_dict)
             payload_json = payload_bytes.decode("utf-8")
             payload_digest = digest_bytes(payload_bytes)
             core = {
                 "byte_size": len(payload_bytes),
-                "entry_id": rec.event_id,
+                "entry_id": ev_id,
                 "payload_digest": payload_digest,
                 "payload_json": payload_json,
                 "producer_stream": stream,
@@ -924,7 +928,8 @@ def _seed_outbox_frames(
             core["frame_crc32"] = f"{zlib.crc32(canonical_json(core)) & 0xFFFFFFFF:08x}"
             frame_bytes = canonical_json(core) + b"\n"
             fpath = sdir / f"{order:016d}_{OUTBOX_RECORD_EVENT}_{seq:020d}.frame"
-            fpath.write_bytes(frame_bytes)
+            with open(fpath, "wb", buffering=0) as f:
+                f.write(frame_bytes)
             if sys.platform != "win32":
                 os.chmod(fpath, 0o600)
             elif first_frame is None:
