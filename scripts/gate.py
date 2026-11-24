@@ -306,6 +306,7 @@ _HEAVY_FILE_COST_MS: dict[str, int] = {
     "tests/integration/test_i4_f4_f8_remediation.py": 70510,
     "tests/integration/test_i4_r3_remediation.py": 75620,
     "tests/integration/test_i4_r4_remediation.py": 45260,
+    "tests/integration/test_i4_r5_legacy_job_replay.py": 22110,
     "tests/integration/test_i4_rereview_remediation.py": 44560,
     "tests/integration/test_i4_review_remediation.py": 9770,
     "tests/integration/test_doctor_sp2_probes.py": 20210,

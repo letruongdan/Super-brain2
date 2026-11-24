@@ -443,8 +443,35 @@ def prepare_deep_health(
     return PreparedEffect(blobs=blobs, apply=apply_effect)
 
 
+def _require_store_wide_doctor_job(
+    rt: Runtime, job_store: StagedKernelStore, job_id: str, *, owner_id: str
+) -> None:
+    """``job_id`` must be a durable ``system.doctor`` job of ``owner_id`` whose payload scope is store-wide.
+
+    A stored descriptor is not trusted for this: an older binary could record a job picked by owner alone. Any state
+    is accepted, since a replay returns the same answer and a job's scope never changes.
+    """
+    row = job_store.transact(lambda tx: tx.read_job(job_id))
+    if row is None or row.owner_id != owner_id:
+        raise BrainError(ErrorCode.NOT_FOUND, "not found")
+    if row.kind != DOCTOR_JOB_KIND:
+        raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
+    try:
+        payload = rt.store.cas.read(row.payload_digest)
+    except BrainError as err:
+        if err.code is ErrorCode.QUARANTINED:
+            raise
+        raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure") from err
+    scope = doctor_payload_scope(payload)
+    if scope is not None and not isinstance(scope, str):
+        raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
+    if scope is not None:
+        raise BrainError(ErrorCode.REVISION_CONFLICT, "revision conflict")
+
+
 def render_deep_health(
     rt: Runtime,
+    job_store: StagedKernelStore,
     result: StoredResult,
     principal: Principal,
     *,
@@ -503,6 +530,7 @@ def render_deep_health(
     job_id = desc.get("job_id")
     if job_id is not None:
         require_uuid(job_id)
+        _require_store_wide_doctor_job(rt, job_store, cast(str, job_id), owner_id=principal.owner_id)
     doctor_run_id = desc.get("doctor_run_id")
 
     if doctor_run_id is not None:

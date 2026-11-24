@@ -735,6 +735,6 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
         """Render ``get_health(deep=True)`` from CAS descriptor & live policy/quarantine/clock checks."""
         _ = selected_scope
         return render_deep_health(
-            self._rt, result, principal, now=self._clock.now(),
+            self._rt, self._job_store, result, principal, now=self._clock.now(),
             tls_not_after=self._tls_not_after, clock_untrusted_fn=self._clock_untrusted_fn,
         )
