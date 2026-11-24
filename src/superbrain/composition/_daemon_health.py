@@ -16,6 +16,7 @@ from superbrain.application._doctor_checks import clip_report_str
 from superbrain.application.dispatch import PreparedEffect
 from superbrain.application.doctor import DoctorReport
 from superbrain.core._json_parse import parse_json
+from superbrain.core._kernel_jobs import JobRecord
 from superbrain.core.canonical import canonical_json
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.ids import new_id
@@ -359,14 +360,25 @@ def find_active_doctor_job(
     (``STORE_BUSY``) rather than enqueue a duplicate it could not rule out.
     """
     scope_key = doctor_scope_key(checkout_root)
-    rows = job_store.transact(lambda tx: tx.active_jobs_by_kinds((DOCTOR_JOB_KIND,), ACTIVE_DOCTOR_SCAN))
-    for row in rows:
-        if row.owner_id != owner_id:
-            continue
-        scope = doctor_payload_scope(rt.store.cas.read(row.payload_digest))
-        if (scope is None or isinstance(scope, str)) and doctor_scope_key(scope) == scope_key:
-            return row.job_id
-    if len(rows) >= ACTIVE_DOCTOR_SCAN:
+
+    def scan(tx: KernelTx) -> tuple[int, str | None]:
+        rows = tx.active_jobs_by_kinds((DOCTOR_JOB_KIND,), ACTIVE_DOCTOR_SCAN)
+        for row in rows:
+            if row.owner_id != owner_id:
+                continue
+            # Only the job's own live hold proves its scope; a job that lost it never owns the slot.
+            payload = tx.read_held_blob(row.payload_digest, holder_id=row.job_id)
+            if payload is None:
+                continue
+            scope = doctor_payload_scope(payload)
+            if (scope is None or isinstance(scope, str)) and doctor_scope_key(scope) == scope_key:
+                return len(rows), row.job_id
+        return len(rows), None
+
+    scanned, found = job_store.transact(scan)
+    if found is not None:
+        return found
+    if scanned >= ACTIVE_DOCTOR_SCAN:
         raise BrainError(ErrorCode.STORE_BUSY, "too many active doctor jobs")
     return None
 
@@ -451,17 +463,21 @@ def _require_store_wide_doctor_job(
     A stored descriptor is not trusted for this: an older binary could record a job picked by owner alone. Any state
     is accepted, since a replay returns the same answer and a job's scope never changes.
     """
-    row = job_store.transact(lambda tx: tx.read_job(job_id))
+    def read(tx: KernelTx) -> tuple[JobRecord | None, bytes | None]:
+        row = tx.read_job(job_id)
+        if row is None:
+            return None, None
+        return row, tx.read_held_blob(row.payload_digest, holder_id=row.job_id)
+
+    row, payload = job_store.transact(read)
     if row is None or row.owner_id != owner_id:
         raise BrainError(ErrorCode.NOT_FOUND, "not found")
     if row.kind != DOCTOR_JOB_KIND:
         raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
-    try:
-        payload = rt.store.cas.read(row.payload_digest)
-    except BrainError as err:
-        if err.code is ErrorCode.QUARANTINED:
-            raise
-        raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure") from err
+    if rt.policy.is_quarantined(row.payload_digest):
+        raise BrainError(ErrorCode.QUARANTINED, "quarantined")
+    if payload is None:  # the job's own hold is gone (released, tombstoned) or the blob is not intact
+        raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
     scope = doctor_payload_scope(payload)
     if scope is not None and not isinstance(scope, str):
         raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
