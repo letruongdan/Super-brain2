@@ -509,6 +509,52 @@ def test_hook_entry_privacy_rejection_exits_zero_with_zero_leaks_and_static_log(
     assert "invalid_input" in log_text
 
 
+def test_hook_entry_static_log_concurrency_lock_and_stderr_warning(trusted_tmp: Path) -> None:
+    """Verifies _write_static_log serialization under concurrency, bounded lock wait, and stderr drop warning."""
+    import io
+    import threading
+
+    from superbrain.adapters.os.locks import OUTBOX_FILE_LOCK
+    from superbrain.composition.hook_entry import _write_static_log
+
+    log_path = trusted_tmp / "concurrent_static.log"
+
+    # Part 1: Concurrent writers must all land without collision
+    def _worker(idx: int) -> None:
+        _write_static_log(log_path, phase="test_phase", code=f"code_{idx}")
+
+    threads = [threading.Thread(target=_worker, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    lines = [ln for ln in log_path.read_text(encoding="utf-8").splitlines() if ln]
+    assert len(lines) == 8, f"expected 8 lines, got: {lines}"
+    assert all("phase=test_phase" in ln for ln in lines)
+
+    # Part 2: Lock acquisition timeout emits warning to stderr and drops line cleanly
+    fd = os.open(log_path, os.O_RDWR)
+    assert OUTBOX_FILE_LOCK.try_lock_fd(fd), "failed to acquire external lock for test"
+    old_stderr = sys.stderr
+    sys.stderr = capture = io.StringIO()
+    try:
+        t0 = time.monotonic()
+        _write_static_log(log_path, phase="timeout_phase", code="timeout_code")
+        elapsed = time.monotonic() - t0
+    finally:
+        sys.stderr = old_stderr
+        OUTBOX_FILE_LOCK.unlock_fd(fd)
+        os.close(fd)
+
+    err_text = capture.getvalue()
+    assert (
+        "superbrain.hook_entry: dropped log line phase=timeout_phase error.code=timeout_code (lock timeout)\n"
+        in err_text
+    )
+    assert elapsed < 0.2, f"bounded wait exceeded expected deadline: {elapsed:.3f}s"
+
+
 def test_hook_entry_timeout_writes_hook_timeout_gap_and_exits_zero(trusted_tmp: Path) -> None:
     from superbrain.composition.hook_entry import run_hook
     from superbrain.ports.capture import (
@@ -885,7 +931,33 @@ def _seed_outbox_frames(
     import zlib
 
     from superbrain.core.canonical import canonical_json, digest_bytes
-    from superbrain.ports.capture import OUTBOX_RECORD_EVENT
+    from superbrain.ports.capture import OUTBOX_RECORD_EVENT, CaptureEventRecord
+
+    # Assert handwritten frame dict matches CaptureEventRecord.to_dict() schema (W4)
+    sample_rec = CaptureEventRecord(
+        event_id="ev-sample-1",
+        producer_stream="sample-stream",
+        sequence=1,
+        harness_id="claude-code",
+        kind="tool_post",
+        recorded_at="2026-11-21T12:00:00Z",
+        payload={"tool": "Read", "seq": 1},
+        session_ref=None,
+        source_metadata={},
+    )
+    sample_dict = {
+        "record_kind": "event",
+        "event_id": "ev-sample-1",
+        "producer_stream": "sample-stream",
+        "sequence": 1,
+        "harness_id": "claude-code",
+        "kind": "tool_post",
+        "recorded_at": "2026-11-21T12:00:00Z",
+        "payload": {"tool": "Read", "seq": 1},
+        "session_ref": None,
+        "source_metadata": {},
+    }
+    assert sample_dict == sample_rec.to_dict()
 
     streams_root = spool_dir / "streams"
     streams_root.mkdir(parents=True, exist_ok=True)
