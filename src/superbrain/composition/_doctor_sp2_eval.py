@@ -6,11 +6,11 @@ import contextlib
 import json
 import os
 import sqlite3
-import sys
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Literal
 
+from superbrain.adapters.os import host_platform
 from superbrain.core._kernel_approval import Layer2State
 from superbrain.core.jsonvalue import JsonValue
 from superbrain.ports.doctor import (
@@ -103,7 +103,7 @@ def classify_capture_provenance(
         receipt = getattr(h, "receipt", None)
         if not isinstance(receipt, Mapping):
             return "native", False
-        if receipt.get("host") != h.harness_id or receipt.get("os") != sys.platform:
+        if receipt.get("host") != h.harness_id or receipt.get("os") != host_platform():
             return "native", False
         l2 = l2_by_harness.get(h.harness_id)
         if l2 is None or l2.host_version is None or l2.config_digest is None:
