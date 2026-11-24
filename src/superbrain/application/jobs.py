@@ -274,11 +274,20 @@ class JobService:
         and leave the job leased, unless ``fail_missing_payload`` (the doctor runner) fails it with ``INVALID_PAYLOAD``;
         with that flag a permanent fault raised by the read (``_PERMANENT_PAYLOAD_FAULT``) fails the job the same way.
         """
+        return self._resolve_claimed_spec(lease, JobState.LEASED, fail_missing_payload=fail_missing_payload)
+
+    def resolve_started_doctor_spec(self, lease: JobLease) -> JobSpec | None:
+        """Resume an already committed doctor start; settle unusable payloads under the running lease."""
+        return self._resolve_claimed_spec(lease, JobState.RUNNING, fail_missing_payload=True)
+
+    def _resolve_claimed_spec(
+        self, lease: JobLease, state: JobState, *, fail_missing_payload: bool
+    ) -> JobSpec | None:
         self._require_current(lease)
         now_utc, now = require_aware_utc(self._clock.now())
 
         def resolve(tx: KernelTx) -> JobSpec | None:
-            row = self._fenced(tx, lease, JobState.LEASED)
+            row = self._fenced(tx, lease, state)
             if tx.holder_tombstoned(row.job_id) or tx.blob_restricted(row.payload_digest):
                 self._terminal(tx, row, JobState.FAILED, now, reason=JobErrorCode.INVALID_PAYLOAD)
                 return None

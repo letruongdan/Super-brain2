@@ -54,11 +54,13 @@ from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.ids import new_id
 from superbrain.core.jsonvalue import JsonValue
 from superbrain.core.kernel import (
+    TERMINAL_JOB_STATES,
     Call,
     CallContext,
     JobErrorCode,
     JobLease,
     JobOutcome,
+    JobRecord,
     JobSpec,
     JobState,
     Principal,
@@ -251,6 +253,7 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
                 self._startup_due
                 or self._active_token is not None
                 or self._completed is not None
+                or self._pending_lease is not None
                 or self._maintenance_due_locked(now_utc)
             )
             if not busy and not self._has_active_doctor_job():
@@ -297,7 +300,12 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
     def _is_settled_now(self) -> bool:
         now_utc, _ = require_aware_utc(self._clock.now())
         with self._lock:
-            if self._startup_due or self._active_token is not None or self._completed is not None:
+            if (
+                self._startup_due
+                or self._active_token is not None
+                or self._completed is not None
+                or self._pending_lease is not None
+            ):
                 return False
             if self._maintenance_due_locked(now_utc):
                 return False
@@ -420,25 +428,16 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
                 return False
 
         try:
-            spec = self._job_service.resolve_leased_spec(lease, fail_missing_payload=True)
-            if spec is None:
-                self._record_settled_at_claim(lease.job_id, gen)
-                return True
-            self._job_service.start(lease)
+            spec = self._resolve_claim(lease, gen, reconcile=pending is not None)
         except BrainError as err:
-            if err.code is ErrorCode.REVISION_CONFLICT:
-                # A retried lease may have moved on because an earlier write committed but reported an error.
-                spec = self._adopt_started(lease) if pending is not None else None
-                if spec is None:
-                    self._record_settled_at_claim(lease.job_id, gen)
-                    return True
-            else:
-                _LOGGER.warning("doctor job start failed (code=%s)", err.code.value)
-                # The lease is still ours: keep it so the next step settles or starts it in this writer epoch.
-                with self._lock:
-                    if self._generation == gen and not (self._stopping or self._closed):
-                        self._pending_lease = lease
-                return False
+            _LOGGER.warning("doctor claim unresolved (code=%s)", err.code.value)
+            # Keep responsibility until a durable read confirms this lease has been resolved or replaced.
+            with self._lock:
+                if self._generation == gen and not (self._stopping or self._closed):
+                    self._pending_lease = lease
+            return False
+        if spec is None:
+            return True
 
         token = object()
         with self._lock:
@@ -471,26 +470,36 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
             self._abandon_launch(lease, token, gen)
         return True
 
-    def _adopt_started(self, lease: JobLease) -> JobSpec | None:
-        """The spec of a retried lease whose ``start`` committed despite reporting an error (job ``running``)."""
-        try:
+    def _resolve_claim(self, lease: JobLease, gen: int, *, reconcile: bool) -> JobSpec | None:
+        """Resolve a new claim or check the durable state after an uncertain write."""
+        already_started = False
+        if reconcile:
             row = self._job_store.transact(lambda tx: tx.read_job(lease.job_id))
-            if row is None or not row.matches(lease, JobState.RUNNING):
+            if row is None:
                 return None
-            return self._job_service.job_spec(lease)
-        except BrainError:
-            return None  # shortcut: a running job we cannot read is left to epoch recovery, as before R8
+            already_started = row.matches(lease, JobState.RUNNING)
+            if not already_started and not row.matches(lease, JobState.LEASED):
+                self._record_settled_at_claim(row, gen)
+                return None
 
-    def _record_settled_at_claim(self, job_id: str, gen: int) -> None:
-        """A job the claim settled without running: answer its waiters once the committed state is terminal."""
-        try:
-            row = self._job_store.transact(lambda tx: tx.read_job(job_id))
-        except BrainError:
-            row = None  # waiters fall back to the store read in finish_report
-        if row is not None and row.state in (JobState.FAILED, JobState.DEAD_LETTER):
+        if already_started:
+            spec = self._job_service.resolve_started_doctor_spec(lease)
+        else:
+            spec = self._job_service.resolve_leased_spec(lease, fail_missing_payload=True)
+            if spec is not None:
+                self._job_service.start(lease)
+        if spec is None:
+            row = self._job_store.transact(lambda tx: tx.read_job(lease.job_id))
+            if row is not None:
+                self._record_settled_at_claim(row, gen)
+        return spec
+
+    def _record_settled_at_claim(self, row: JobRecord, gen: int) -> None:
+        """Publish only terminal outcomes observed in the durable store."""
+        if row.state in TERMINAL_JOB_STATES:
             with self._lock:
                 if self._generation == gen:
-                    self._record_finished_locked(job_id, "failed", None)
+                    self._record_finished_locked(row.job_id, row.state.value, None)
         self._notify_waiters()
 
     def _abandon_launch(self, lease: JobLease, token: object, gen: int) -> None:
