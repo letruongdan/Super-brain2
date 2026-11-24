@@ -479,12 +479,12 @@ def test_junit_temp_file_is_removed(tmp_path: Path, monkeypatch: pytest.MonkeyPa
 
 def test_run_kills_a_process_that_exceeds_its_timeout(tmp_path: Path) -> None:
     marker = tmp_path / "survived.txt"
-    code = f"import time; time.sleep(6); open({str(marker)!r}, 'w').write('x')"
+    code = f"import time; time.sleep(1.2); open({str(marker)!r}, 'w').write('x')"
     began = time.monotonic()
-    exit_code, _, _ = gate.run([sys.executable, "-I", "-c", code], cwd=tmp_path, timeout_s=1.0)
+    exit_code, _, _ = gate.run([sys.executable, "-I", "-c", code], cwd=tmp_path, timeout_s=0.2)
     assert exit_code is None
-    assert time.monotonic() - began < 5
-    time.sleep(6)
+    assert time.monotonic() - began < 2.0
+    time.sleep(1.2)
     assert not marker.exists()
 
 

@@ -31,6 +31,7 @@ from tests.application.test_t8_review_p01_wrapped_paths import (
     _check,
     _expected,
     _policy,
+    _redaction_count,
     _spec_blocked,
     _wrapped,
 )
@@ -131,7 +132,7 @@ def test_p01_r2_glob_edge_near_miss_stays_with_a_blocked_twin(pattern: str, toke
     patterns = (pattern,)
     kept: list[str] = []
     for token in tokens:
-        texts = [text for text in _wrapped(token) if _expected(text, patterns)[1] == 0]
+        texts = [text for text in _wrapped(token) if _redaction_count(text, patterns) == 0]
         assert len(texts) >= 43, f"near miss {token!r} is blocked under most wrappers; pick another fixture"
         kept += texts
     for suffix in _SUFFIXES:

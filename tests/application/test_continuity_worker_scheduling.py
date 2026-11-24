@@ -303,6 +303,8 @@ def test_worker_before_owner_commit_race_and_base_revision_zero_cases_39_53(
 
     # Seed root, session, task, and initial 20 events.
     rt_seed = _open_rt(root_race, os_, role="sp23-loop-race")
+    exec2 = JobExecutor(PRODUCTION_JOB_HANDLERS, mono.monotonic_ns)
+    exec2.start()
     try:
         sid = rt_seed.policy.store_id
         _cred, ws, sref, task_id = _seed_session_and_task(rt_seed, clock, trusted_tmp / "chk-loop-race")
@@ -323,24 +325,17 @@ def test_worker_before_owner_commit_race_and_base_revision_zero_cases_39_53(
                 ),
                 now=clock.now(),
             )
-    finally:
-        rt_seed.close()
 
-    # Step 1 (Case 53): worker commits first (current_revision > 0, handoff_revision == 0, source="inferred")
-    # -> agent's first patch using base_revision=0 succeeds with zero revision_conflict.
-    rt2 = reopen_kernel_job_runtime(root_race, sid, os_)
-    exec2 = JobExecutor(PRODUCTION_JOB_HANDLERS, mono.monotonic_ns)
-    exec2.start()
-    try:
-        ss2 = SessionStore(rt2.store, rt2.policy)
-        svc2, _ = kernel_job_service(rt2, clock)
+        # Step 1 (Case 53): worker commits first (current_revision > 0, handoff_revision == 0, source="inferred")
+        # -> agent's first patch using base_revision=0 succeeds with zero revision_conflict.
+        svc2, _ = kernel_job_service(rt_seed, clock)
         coord_first = ContinuityWorkerCoordinator(
-            rt=rt2, job_service=svc2, executor=exec2, clock=clock, mono=mono.monotonic_ns
+            rt=rt_seed, job_service=svc2, executor=exec2, clock=clock, mono=mono.monotonic_ns
         )
         assert coord_first.enqueue_if_due(task_id=task_id, now=clock.now()) is not None
-        assert coord_first.run_next(writer_epoch=rt2.lease.epoch, now=clock.now()) is True
+        assert coord_first.run_next(writer_epoch=rt_seed.lease.epoch, now=clock.now()) is True
 
-        h_inferred = ss2.read_task_handoff(task_id)
+        h_inferred = ss_seed.read_task_handoff(task_id)
         assert h_inferred is not None
         assert h_inferred.observed_ref is not None
         assert h_inferred.handoff_revision == 0
@@ -348,7 +343,7 @@ def test_worker_before_owner_commit_race_and_base_revision_zero_cases_39_53(
         assert h_inferred.task_state_source == "inferred"
 
         agent_ref_1 = digest_bytes(b"agent-patch-v1")
-        h_agent1 = ss2.apply_agent_handoff_patch(
+        h_agent1 = ss_seed.apply_agent_handoff_patch(
             task_id=task_id,
             repo_id=ws.repo_id,
             checkout_id=ws.checkout_id,
@@ -360,19 +355,10 @@ def test_worker_before_owner_commit_race_and_base_revision_zero_cases_39_53(
         assert h_agent1.handoff_revision == 1
         assert h_agent1.agent_ref == agent_ref_1
         assert h_agent1.observed_ref == h_inferred.observed_ref
-    finally:
-        exec2.close(BOUND_WAIT_S)
-        rt2.close()
 
-    # Step 2 (Case 39 on real OwnerLoop + before_owner_commit hook):
-    # Enqueue 20 new events, start real OwnerLoop with PRODUCTION_JOB_HANDLERS, trigger continuity refresh,
-    # pause before Phase 3 owner commit to inject concurrent agent patch (agent_ref_2, handoff_revision=2),
-    # then verify Phase 3 preserves live agent_ref_2 with handoff_revision unchanged == 2 and zero conflicts!
-    rt_more = reopen_kernel_job_runtime(root_race, sid, os_)
-    try:
-        ss_more = SessionStore(rt_more.store, rt_more.policy)
+        # Enqueue 20 new events for Step 2 before closing seed runtime.
         for seq in range(21, 41):
-            ss_more.record_session_event(
+            ss_seed.record_session_event(
                 session_ref=sref,
                 repo_id=ws.repo_id,
                 checkout_id=ws.checkout_id,
@@ -388,7 +374,13 @@ def test_worker_before_owner_commit_race_and_base_revision_zero_cases_39_53(
                 now=clock.now(),
             )
     finally:
-        rt_more.close()
+        exec2.close(BOUND_WAIT_S)
+        rt_seed.close()
+
+    # Step 2 (Case 39 on real OwnerLoop + before_owner_commit hook):
+    # Real OwnerLoop schedules the 20 pending events (durable wake), runs all three phases,
+    # pauses before Phase 3 owner commit to inject concurrent agent patch (agent_ref_2, handoff_revision=2),
+    # then verify Phase 3 preserves live agent_ref_2 with handoff_revision unchanged == 2 and zero conflicts!
 
     cfg = _create_loop_cfg(root_race, sid, trusted_tmp / "ol-tls", clock, os_)
 
@@ -576,48 +568,37 @@ def test_four_policy_combinations_and_claim_plus_commit_recheck_case_59(trusted_
     mono = FakeMonotonicClock()
     os_ = os_adapters(clock=clock, monotonic=mono)
 
-    # 1. All 4 combinations of (automatic_capture_enabled, manual_submission_enabled).
-    for auto_cap, manual_sub in (
-        (True, True),
-        (True, False),
-        (False, True),
-        (False, False),
-    ):
-        case_dir = trusted_tmp / f"pol-{int(auto_cap)}-{int(manual_sub)}"
-        rt = _open_rt(case_dir, os_, role=f"sp23-p-{int(auto_cap)}-{int(manual_sub)}")
-        exec_ = JobExecutor(PRODUCTION_JOB_HANDLERS, mono.monotonic_ns)
-        exec_.start()
-        try:
-            _cred, ws, sref, task_id = _seed_session_and_task(
-                rt, clock, trusted_tmp / f"chk-p-{int(auto_cap)}-{int(manual_sub)}"
-            )
-            rt.policy.set_repo_policy(
-                ws.repo_id,
-                automatic_capture_enabled=auto_cap,
-                manual_submission_enabled=manual_sub,
-            )
-            ss = SessionStore(rt.store, rt.policy)
-            svc, _ = kernel_job_service(rt, clock)
-            coord = ContinuityWorkerCoordinator(
-                rt=rt, job_service=svc, executor=exec_, clock=clock, mono=mono.monotonic_ns
-            )
-
-            # Manual handoff patch checks manual_submission_enabled when submitted via coordinator/manual path.
-            agent_ref = digest_bytes(f"manual-{auto_cap}-{manual_sub}".encode())
-            if manual_sub:
-                h_man = coord.submit_manual_handoff_patch(
-                    task_id=task_id,
-                    repo_id=ws.repo_id,
-                    checkout_id=ws.checkout_id,
-                    session_ref=sref,
-                    base_revision=0,
-                    agent_ref=agent_ref,
-                    now=clock.now(),
+    exec_ = JobExecutor(PRODUCTION_JOB_HANDLERS, mono.monotonic_ns)
+    exec_.start()
+    try:
+        # 1. All 4 combinations of (automatic_capture_enabled, manual_submission_enabled).
+        for auto_cap, manual_sub in (
+            (True, True),
+            (True, False),
+            (False, True),
+            (False, False),
+        ):
+            case_dir = trusted_tmp / f"pol-{int(auto_cap)}-{int(manual_sub)}"
+            rt = _open_rt(case_dir, os_, role=f"sp23-p-{int(auto_cap)}-{int(manual_sub)}")
+            try:
+                _cred, ws, sref, task_id = _seed_session_and_task(
+                    rt, clock, trusted_tmp / f"chk-p-{int(auto_cap)}-{int(manual_sub)}"
                 )
-                assert h_man.agent_ref == agent_ref
-            else:
-                with pytest.raises(BrainError) as man_denied:
-                    coord.submit_manual_handoff_patch(
+                rt.policy.set_repo_policy(
+                    ws.repo_id,
+                    automatic_capture_enabled=auto_cap,
+                    manual_submission_enabled=manual_sub,
+                )
+                ss = SessionStore(rt.store, rt.policy)
+                svc, _ = kernel_job_service(rt, clock)
+                coord = ContinuityWorkerCoordinator(
+                    rt=rt, job_service=svc, executor=exec_, clock=clock, mono=mono.monotonic_ns
+                )
+
+                # Manual handoff patch checks manual_submission_enabled when submitted via coordinator/manual path.
+                agent_ref = digest_bytes(f"manual-{auto_cap}-{manual_sub}".encode())
+                if manual_sub:
+                    h_man = coord.submit_manual_handoff_patch(
                         task_id=task_id,
                         repo_id=ws.repo_id,
                         checkout_id=ws.checkout_id,
@@ -626,83 +607,93 @@ def test_four_policy_combinations_and_claim_plus_commit_recheck_case_59(trusted_
                         agent_ref=agent_ref,
                         now=clock.now(),
                     )
-                assert man_denied.value.code is ErrorCode.CAPABILITY_UNAVAILABLE
+                    assert h_man.agent_ref == agent_ref
+                else:
+                    with pytest.raises(BrainError) as man_denied:
+                        coord.submit_manual_handoff_patch(
+                            task_id=task_id,
+                            repo_id=ws.repo_id,
+                            checkout_id=ws.checkout_id,
+                            session_ref=sref,
+                            base_revision=0,
+                            agent_ref=agent_ref,
+                            now=clock.now(),
+                        )
+                    assert man_denied.value.code is ErrorCode.CAPABILITY_UNAVAILABLE
 
+                for seq in range(1, 21):
+                    ss.record_session_event(
+                        session_ref=sref,
+                        repo_id=ws.repo_id,
+                        checkout_id=ws.checkout_id,
+                        task_id=task_id,
+                        producer_stream="stream-pol",
+                        event=_ev(seq, session_ref=sref, recorded_at=clock.now(), stream="stream-pol"),
+                        now=clock.now(),
+                    )
+
+                enq = coord.enqueue_if_due(task_id=task_id, now=clock.now())
+                if auto_cap:
+                    assert enq is not None
+                    assert coord.run_next(writer_epoch=rt.lease.epoch, now=clock.now()) is True
+                    h_after = ss.read_task_handoff(task_id)
+                    assert h_after is not None and h_after.observed_ref is not None
+                    if not manual_sub:
+                        # Capture-only (True, False): inferred handoff exists without manual patch!
+                        assert h_after.agent_ref is None
+                        assert h_after.handoff_revision == 0
+                        assert h_after.task_state_source == "inferred"
+                else:
+                    assert enq is None
+                    h_after = ss.read_task_handoff(task_id)
+                    assert h_after is not None and h_after.observed_ref is None
+            finally:
+                rt.close()
+
+        # 2. Case 59: runtime toggle automatic_capture_enabled True -> False BEFORE Claim AND BETWEEN Claim & Commit!
+        rt_flip = _open_rt(trusted_tmp / "pol-flip", os_, role="sp23-flip")
+        try:
+            _cred, ws, sref, task_id = _seed_session_and_task(rt_flip, clock, trusted_tmp / "chk-flip")
+            rt_flip.policy.set_repo_policy(ws.repo_id, automatic_capture_enabled=True, manual_submission_enabled=True)
+            ss = SessionStore(rt_flip.store, rt_flip.policy)
+            svc, _ = kernel_job_service(rt_flip, clock)
+            coord = ContinuityWorkerCoordinator(
+                rt=rt_flip, job_service=svc, executor=exec_, clock=clock, mono=mono.monotonic_ns
+            )
+
+            # Enqueue while automatic_capture_enabled=True, then flip to False BEFORE Claim.
             for seq in range(1, 21):
                 ss.record_session_event(
                     session_ref=sref,
                     repo_id=ws.repo_id,
                     checkout_id=ws.checkout_id,
                     task_id=task_id,
-                    producer_stream="stream-pol",
-                    event=_ev(seq, session_ref=sref, recorded_at=clock.now(), stream="stream-pol"),
+                    producer_stream="stream-f1",
+                    event=_ev(seq, session_ref=sref, recorded_at=clock.now(), stream="stream-f1"),
                     now=clock.now(),
                 )
+            jid_pre_claim = coord.enqueue_if_due(task_id=task_id, now=clock.now())
+            assert jid_pre_claim is not None
+            rt_flip.policy.set_repo_policy(ws.repo_id, automatic_capture_enabled=False, manual_submission_enabled=True)
+            assert coord.run_next(writer_epoch=rt_flip.lease.epoch, now=clock.now()) is False
+            h_pre = ss.read_task_handoff(task_id)
+            assert h_pre is not None and h_pre.observed_ref is None
 
-            enq = coord.enqueue_if_due(task_id=task_id, now=clock.now())
-            if auto_cap:
-                assert enq is not None
-                assert coord.run_next(writer_epoch=rt.lease.epoch, now=clock.now()) is True
-                h_after = ss.read_task_handoff(task_id)
-                assert h_after is not None and h_after.observed_ref is not None
-                if not manual_sub:
-                    # Capture-only (True, False): inferred handoff exists without manual patch!
-                    assert h_after.agent_ref is None
-                    assert h_after.handoff_revision == 0
-                    assert h_after.task_state_source == "inferred"
-            else:
-                assert enq is None
-                h_after = ss.read_task_handoff(task_id)
-                assert h_after is not None and h_after.observed_ref is None
+            # Re-enable, execute Claim + Phase 2 Worker, then flip automatic_capture_enabled=False BEFORE Commit!
+            rt_flip.policy.set_repo_policy(ws.repo_id, automatic_capture_enabled=True, manual_submission_enabled=True)
+            jid_mid = coord.enqueue_if_due(task_id=task_id, now=clock.now())
+            assert jid_mid is not None
+            prepared = coord.claim_and_execute(writer_epoch=rt_flip.lease.epoch, now=clock.now())
+            assert prepared is not None
+            rt_flip.policy.set_repo_policy(ws.repo_id, automatic_capture_enabled=False, manual_submission_enabled=True)
+            committed = coord.commit_prepared(prepared, now=clock.now())
+            assert committed is None
+            h_final = ss.read_task_handoff(task_id)
+            assert h_final is not None and h_final.observed_ref is None
         finally:
-            exec_.close(BOUND_WAIT_S)
-            rt.close()
-
-    # 2. Case 59: runtime toggle automatic_capture_enabled True -> False BEFORE Claim AND BETWEEN Claim & Commit!
-    rt_flip = _open_rt(trusted_tmp / "pol-flip", os_, role="sp23-flip")
-    exec_flip = JobExecutor(PRODUCTION_JOB_HANDLERS, mono.monotonic_ns)
-    exec_flip.start()
-    try:
-        _cred, ws, sref, task_id = _seed_session_and_task(rt_flip, clock, trusted_tmp / "chk-flip")
-        rt_flip.policy.set_repo_policy(ws.repo_id, automatic_capture_enabled=True, manual_submission_enabled=True)
-        ss = SessionStore(rt_flip.store, rt_flip.policy)
-        svc, _ = kernel_job_service(rt_flip, clock)
-        coord = ContinuityWorkerCoordinator(
-            rt=rt_flip, job_service=svc, executor=exec_flip, clock=clock, mono=mono.monotonic_ns
-        )
-
-        # Enqueue while automatic_capture_enabled=True, then flip to False BEFORE Claim.
-        for seq in range(1, 21):
-            ss.record_session_event(
-                session_ref=sref,
-                repo_id=ws.repo_id,
-                checkout_id=ws.checkout_id,
-                task_id=task_id,
-                producer_stream="stream-f1",
-                event=_ev(seq, session_ref=sref, recorded_at=clock.now(), stream="stream-f1"),
-                now=clock.now(),
-            )
-        jid_pre_claim = coord.enqueue_if_due(task_id=task_id, now=clock.now())
-        assert jid_pre_claim is not None
-        rt_flip.policy.set_repo_policy(ws.repo_id, automatic_capture_enabled=False, manual_submission_enabled=True)
-        assert coord.run_next(writer_epoch=rt_flip.lease.epoch, now=clock.now()) is False
-        h_pre = ss.read_task_handoff(task_id)
-        assert h_pre is not None and h_pre.observed_ref is None
-
-        # Re-enable, execute Claim + Phase 2 Worker, then flip automatic_capture_enabled=False BEFORE Commit!
-        rt_flip.policy.set_repo_policy(ws.repo_id, automatic_capture_enabled=True, manual_submission_enabled=True)
-        jid_mid = coord.enqueue_if_due(task_id=task_id, now=clock.now())
-        assert jid_mid is not None
-        prepared = coord.claim_and_execute(writer_epoch=rt_flip.lease.epoch, now=clock.now())
-        assert prepared is not None
-        rt_flip.policy.set_repo_policy(ws.repo_id, automatic_capture_enabled=False, manual_submission_enabled=True)
-        committed = coord.commit_prepared(prepared, now=clock.now())
-        assert committed is None
-        h_final = ss.read_task_handoff(task_id)
-        assert h_final is not None and h_final.observed_ref is None
+            rt_flip.close()
     finally:
-        exec_flip.close(BOUND_WAIT_S)
-        rt_flip.close()
+        exec_.close(BOUND_WAIT_S)
 
 
 def test_liveness_300s_1800s_crash_watermarks_and_ended_session_resumed_case_40(

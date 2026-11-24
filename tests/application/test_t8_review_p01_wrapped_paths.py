@@ -125,6 +125,12 @@ def _expected(text: str, patterns: tuple[str, ...]) -> tuple[set[str], int]:
 
 
 @functools.cache
+def _redaction_count(text: str, patterns: tuple[str, ...]) -> int:
+    """The exact number of redactions in ``text`` under ``patterns`` (fast scalar oracle)."""
+    return sum(1 for match in _TOKEN.finditer(text) if _token_outcomes(match.group(0), patterns) is not None)
+
+
+@functools.cache
 def _wrappers(chars: str, *, inner: int, full: bool) -> tuple[str, ...]:
     """No wrapper, each character, each pair; ``inner`` is the index of a pair's character next to the token."""
     pairs = (a + b for a in chars for b in chars)
@@ -231,7 +237,7 @@ def test_p01_reported_wrapped_token_is_redacted_and_keeps_its_wrapper(
 ) -> None:
     # In each of these texts exactly one spelling is blocked, so the result is fixed by §14.2.
     assert _expected(text + suffix, (pattern,)) == ({expected + suffix}, 1)
-    safe = PrivacyFilter().apply({"note": text + suffix, "ok": "safe prose kept"}, _policy((pattern,)))
+    safe = _REUSABLE_FILTER.apply({"note": text + suffix, "ok": "safe prose kept"}, _policy((pattern,)))
     assert safe.value == {"note": expected + suffix, "ok": "safe prose kept"}
     assert safe.redacted_count == 1 and safe.stripped_keys_count == 0
 
@@ -282,7 +288,7 @@ def test_p01_near_miss_stays_under_every_wrapper_combination_with_a_blocked_twin
     patterns = (pattern,)
     kept: list[str] = []
     for token in tokens:
-        texts = [text for text in _wrapped(token) if _expected(text, patterns)[1] == 0]
+        texts = [text for text in _wrapped(token) if _redaction_count(text, patterns) == 0]
         assert len(texts) >= 43, f"near miss {token!r} is blocked under most wrappers; pick another fixture"
         kept += texts
     for suffix in _SUFFIXES:
