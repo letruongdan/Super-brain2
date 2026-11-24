@@ -59,6 +59,7 @@ from superbrain.core.kernel import (
     JobErrorCode,
     JobLease,
     JobOutcome,
+    JobSpec,
     JobState,
     Principal,
     Scope,
@@ -426,13 +427,18 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
             self._job_service.start(lease)
         except BrainError as err:
             if err.code is ErrorCode.REVISION_CONFLICT:
-                return True
-            _LOGGER.warning("doctor job start failed (code=%s)", err.code.value)
-            # The lease is still ours: keep it so the next step settles or starts it in this writer epoch.
-            with self._lock:
-                if self._generation == gen and not (self._stopping or self._closed):
-                    self._pending_lease = lease
-            return False
+                # A retried lease may have moved on because an earlier write committed but reported an error.
+                spec = self._adopt_started(lease) if pending is not None else None
+                if spec is None:
+                    self._record_settled_at_claim(lease.job_id, gen)
+                    return True
+            else:
+                _LOGGER.warning("doctor job start failed (code=%s)", err.code.value)
+                # The lease is still ours: keep it so the next step settles or starts it in this writer epoch.
+                with self._lock:
+                    if self._generation == gen and not (self._stopping or self._closed):
+                        self._pending_lease = lease
+                return False
 
         token = object()
         with self._lock:
@@ -464,6 +470,16 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
                     self._workers.discard(thread)
             self._abandon_launch(lease, token, gen)
         return True
+
+    def _adopt_started(self, lease: JobLease) -> JobSpec | None:
+        """The spec of a retried lease whose ``start`` committed despite reporting an error (job ``running``)."""
+        try:
+            row = self._job_store.transact(lambda tx: tx.read_job(lease.job_id))
+            if row is None or not row.matches(lease, JobState.RUNNING):
+                return None
+            return self._job_service.job_spec(lease)
+        except BrainError:
+            return None  # shortcut: a running job we cannot read is left to epoch recovery, as before R8
 
     def _record_settled_at_claim(self, job_id: str, gen: int) -> None:
         """A job the claim settled without running: answer its waiters once the committed state is terminal."""

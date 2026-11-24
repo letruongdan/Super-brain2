@@ -95,6 +95,10 @@ def _row_fence(row: JobRecord) -> dict[str, JsonValue]:
 
 # A blob read that may succeed later; anything else about an unreadable payload is permanent.
 _TRANSIENT_PAYLOAD_READ = frozenset({ErrorCode.IO_ERROR, ErrorCode.FILESYSTEM_BUSY, ErrorCode.STORAGE_FULL})
+# Raised by a payload read/verify when the stored entry itself is broken; retrying the same payload cannot help.
+_PERMANENT_PAYLOAD_FAULT = frozenset(
+    {ErrorCode.INTEGRITY_FAILURE, ErrorCode.UNSAFE_PATH, ErrorCode.INSECURE_PERMISSIONS}
+)
 
 class JobService:
     """Owner-side job state machine over one admitted store at ``writer_epoch`` (the only writer of jobs)."""
@@ -267,7 +271,8 @@ class JobService:
         A job that can no longer read its payload through its own hold (tombstoned, restricted, or its hold released
         while the bytes are intact) fails with ``INVALID_PAYLOAD``. A transient failure in any payload read is retried
         with backoff up to the attempt cap, then dead-lettered. Missing or corrupt bytes raise ``INTEGRITY_FAILURE``
-        and leave the job leased, unless ``fail_missing_payload`` (the doctor runner) fails it with ``INVALID_PAYLOAD``.
+        and leave the job leased, unless ``fail_missing_payload`` (the doctor runner) fails it with ``INVALID_PAYLOAD``;
+        with that flag a permanent fault raised by the read (``_PERMANENT_PAYLOAD_FAULT``) fails the job the same way.
         """
         self._require_current(lease)
         now_utc, now = require_aware_utc(self._clock.now())
@@ -282,14 +287,18 @@ class JobService:
                 payload = tx.read_held_blob(row.payload_digest, holder_id=row.job_id)
                 intact = payload is not None or tx.blob_present(row.payload_digest)
             except BrainError as err:
-                if err.code not in _TRANSIENT_PAYLOAD_READ:
+                if fail_missing_payload and err.code in _PERMANENT_PAYLOAD_FAULT:
+                    # The read itself proved the stored payload unusable (wrong entry type, link, permissions).
+                    payload, intact = None, False
+                elif err.code not in _TRANSIENT_PAYLOAD_READ:
                     raise
-                exhausted = row.attempt >= MAX_JOB_ATTEMPTS
-                retry_at = now if exhausted else require_aware_utc(now_utc + retry_backoff(row.attempt))[1]
-                self._retry_or_dead_letter(
-                    tx, row, JobErrorCode.HANDLER_UNAVAILABLE, retry_at=retry_at, now=now
-                )
-                return None
+                else:
+                    exhausted = row.attempt >= MAX_JOB_ATTEMPTS
+                    retry_at = now if exhausted else require_aware_utc(now_utc + retry_backoff(row.attempt))[1]
+                    self._retry_or_dead_letter(
+                        tx, row, JobErrorCode.HANDLER_UNAVAILABLE, retry_at=retry_at, now=now
+                    )
+                    return None
             if payload is None:
                 if not intact and not fail_missing_payload:
                     # Missing or corrupt bytes are an integrity alarm, kept loud: the caller sees INTEGRITY_FAILURE.

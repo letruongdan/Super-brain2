@@ -312,6 +312,7 @@ _HEAVY_FILE_COST_MS: dict[str, int] = {
     "tests/integration/test_i4_r7_leased_payload_settlement.py": 15402,
     "tests/integration/test_i4_r8_blob_verify_transient.py": 7000,
     "tests/integration/test_i4_r8_doctor_integrity_settle.py": 9000,
+    "tests/integration/test_i4_r9_doctor_payload_fault_classification.py": 11000,
     "tests/integration/test_i4_rereview_remediation.py": 26900,
     "tests/integration/test_i4_review_remediation.py": 9770,
     "tests/integration/test_doctor_sp2_probes.py": 20210,
