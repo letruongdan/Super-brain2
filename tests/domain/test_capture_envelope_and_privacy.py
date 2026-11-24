@@ -1132,6 +1132,8 @@ def test_hook_entry_clamps_fallback_gap_deadline_and_outbox_propagates_deadline(
 
 
 def _spawn_hook(outbox_dir: Path, log_path: Path) -> subprocess.Popen[bytes]:
+    import superbrain.composition.hook_entry  # noqa: F401
+
     return subprocess.Popen(
         [
             sys.executable,

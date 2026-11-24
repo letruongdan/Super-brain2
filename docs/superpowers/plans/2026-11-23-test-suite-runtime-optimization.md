@@ -71,9 +71,9 @@ Kỹ thuật **cấm**: giảm parametrize, gộp ca biên, nới timeout làm �
 
 **Files:** không đổi file repo; script ở Phụ lục A đặt ngoài repo.
 
-- [ ] **Step 1:** Tạo worktree tách rời tại commit nền (commit SP2-3 cuối cùng được duyệt; hiện là `e4f4163`) trong `C:/Users/letru/sb2-trusted-local/gate-temp/`. Đặt `LOCALAPPDATA=C:/Users/letru/sb2-trusted-local`, `TEMP`/`TMP` vào `gate-temp`.
-- [ ] **Step 2:** Chạy Phụ lục A cho 3.14 rồi 3.11, ghi `timings.json` và JUnit vào `evidence/opt-baseline-<ngày>/`.
-- [ ] **Step 3:** Ghi vào ledger: tổng JUnit, từng shard, phần trước pytest, danh sách test fail dưới tải (nếu có).
+- [x] **Step 1:** Tạo worktree tách rời tại commit nền (commit SP2-3 cuối cùng được duyệt; hiện là `e4f4163`) trong `C:/Users/letru/sb2-trusted-local/gate-temp/`. Đặt `LOCALAPPDATA=C:/Users/letru/sb2-trusted-local`, `TEMP`/`TMP` vào `gate-temp`.
+- [x] **Step 2:** Chạy Phụ lục A cho 3.14 rồi 3.11, ghi `timings.json` và JUnit vào `evidence/opt-baseline-<ngày>/`.
+- [x] **Step 3:** Ghi vào ledger: tổng JUnit, từng shard, phần trước pytest, danh sách test fail dưới tải (nếu có).
 
 **Nghiệm thu Task 0:** có JUnit đủ 6 shard cho cả hai Python; tổng và từng file được ghi kèm đường dẫn file bằng chứng.
 

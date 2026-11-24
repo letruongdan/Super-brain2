@@ -21,9 +21,9 @@ from __future__ import annotations
 
 import pytest
 
-from superbrain.application.privacy import PrivacyFilter
 from superbrain.core.kernel import DEFAULT_BLOCKED_PATH_PATTERNS
 from tests.application.test_t8_review_p01_wrapped_paths import (
+    _REUSABLE_FILTER,
     _SUFFIXES,
     LEAD,
     TRAIL,
@@ -91,7 +91,7 @@ def test_p01_r2_glob_edge_token_is_redacted_and_keeps_the_other_wrappers(
 ) -> None:
     # Exactly one spelling of the token is blocked here, so the result is fixed by §14.2.
     assert _expected(text + suffix, (pattern,)) == ({expected + suffix}, 1)
-    safe = PrivacyFilter().apply({"note": text + suffix, "ok": "safe prose kept"}, _policy((pattern,)))
+    safe = _REUSABLE_FILTER.apply({"note": text + suffix, "ok": "safe prose kept"}, _policy((pattern,)))
     assert safe.value == {"note": expected + suffix, "ok": "safe prose kept"}
     assert safe.redacted_count == 1 and safe.stripped_keys_count == 0
 

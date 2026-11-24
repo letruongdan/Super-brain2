@@ -903,7 +903,7 @@ def _wait_for_terminal_job(loop: OwnerLoop, job_id: str, *, timeout_s: float = B
         rec = loop.run_owner_action(_read).result(timeout=timeout_s)
         if rec is not None and rec.state in (JobState.SUCCEEDED, JobState.FAILED, JobState.CANCELLED):
             return rec
-        pause.wait(0.05)
+        pause.wait(0.005)
     raise TimeoutError(f"timed out waiting for job {job_id} to reach terminal state")
 
 

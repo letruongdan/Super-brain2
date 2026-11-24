@@ -1374,7 +1374,7 @@ class InstalledMcpPipeSession:
         self,
         chunks: Sequence[bytes],
         *,
-        timeout: float = 2.0,
+        timeout: float = 10.0,
         require_alive_after: bool = True,
     ) -> dict[str, JsonValue]:
         """Write raw byte chunks to open ``stdin``, flush each, and wait for one response line."""
@@ -1414,7 +1414,7 @@ class InstalledMcpPipeSession:
         self,
         frames: Sequence[Mapping[str, JsonValue]],
         *,
-        timeout: float = 2.0,
+        timeout: float = 10.0,
     ) -> dict[str, JsonValue]:
         """Encode ``frames`` with LF, send on open ``stdin``, and return the single decoded response frame."""
         return self.write_chunks_and_expect_response([encode_stdio_frames(frames)], timeout=timeout)

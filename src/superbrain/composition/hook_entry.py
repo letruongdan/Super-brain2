@@ -22,7 +22,6 @@ from superbrain.domain.capture.privacy_gate import CapturePrivacyGate
 from superbrain.ports.capture import (
     HOOK_HARD_CAP_NS,
     CaptureEventRecord,
-    OutboxPermissionsPort,
     ProducerCaptureGap,
     default_outbox_dir_renamer,
 )
@@ -38,22 +37,6 @@ from superbrain.storage._outbox_io import (
 from superbrain.storage.outbox import OutboxSpool
 
 _MAX_STDIN_BYTES = 2 * 1024 * 1024
-_PERMISSIONS: OutboxPermissionsPort | None = None
-_DEFAULT_GATE: CapturePrivacyGate | None = None
-
-
-def _get_permissions() -> OutboxPermissionsPort:
-    global _PERMISSIONS
-    if _PERMISSIONS is None:
-        _PERMISSIONS = os_adapters().permissions
-    return _PERMISSIONS
-
-
-def _get_default_gate() -> CapturePrivacyGate:
-    global _DEFAULT_GATE
-    if _DEFAULT_GATE is None:
-        _DEFAULT_GATE = CapturePrivacyGate(PrivacyFilter())
-    return _DEFAULT_GATE
 
 
 def _write_static_log(log_path: Path | None, *, phase: str, code: str) -> None:
@@ -62,20 +45,24 @@ def _write_static_log(log_path: Path | None, *, phase: str, code: str) -> None:
     try:
         resolved = log_path if log_path.is_absolute() else log_path.absolute()
         reject_links_upward(resolved)
-        perms = _get_permissions()
+        perms = os_adapters().permissions
         renamer = default_outbox_dir_renamer()
         with thread_lock_for(resolved):
             ensure_dir_tree_atomic(resolved.parent, perms, renamer, verify_existing=False)
             ensure_secure_regular_file_atomic(resolved, perms)
             fd = os.open(resolved, os.O_WRONLY | os.O_APPEND | _O_BINARY | _O_NOFOLLOW, 0o600)
             try:
-                acquired = False
-                for _ in range(500):
+                locked = False
+                for _ in range(25):
                     if OUTBOX_FILE_LOCK.try_lock_fd(fd):
-                        acquired = True
+                        locked = True
                         break
-                    time.sleep(0.002)
-                if not acquired:
+                    time.sleep(0.001)
+                if not locked:
+                    sys.stderr.write(
+                        f"superbrain.hook_entry: dropped log line phase={phase} error.code={code} (lock timeout)\n"
+                    )
+                    sys.stderr.flush()
                     return
                 try:
                     os.lseek(fd, 0, os.SEEK_END)
@@ -91,7 +78,7 @@ def _write_static_log(log_path: Path | None, *, phase: str, code: str) -> None:
 def _make_spool(outbox_dir: Path, spool_factory: Callable[[Path], OutboxSpool] | None) -> OutboxSpool:
     if spool_factory is not None:
         return spool_factory(outbox_dir)
-    return OutboxSpool(outbox_dir, permissions=_get_permissions(), file_lock=OUTBOX_FILE_LOCK)
+    return OutboxSpool(outbox_dir, permissions=os_adapters().permissions, file_lock=OUTBOX_FILE_LOCK)
 
 
 def run_hook(
@@ -128,10 +115,7 @@ def run_hook(
         if int(monotonic_ns()) >= work_deadline_ns:
             raise BrainError(ErrorCode.DEADLINE_EXCEEDED, "deadline exceeded")
 
-        if monotonic_ns is time.monotonic_ns:
-            gate = _get_default_gate()
-        else:
-            gate = CapturePrivacyGate(PrivacyFilter(monotonic_ns=monotonic_ns), monotonic_ns=monotonic_ns)
+        gate = CapturePrivacyGate(PrivacyFilter(monotonic_ns=monotonic_ns), monotonic_ns=monotonic_ns)
         if isinstance(normalized, ProducerCaptureGap):
             validated_gap = gate.validate_gap(
                 normalized,

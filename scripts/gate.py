@@ -12,7 +12,6 @@ digests follow the same canonical-JSON rules as the rest of the code base.
 from __future__ import annotations
 
 import argparse
-import contextlib
 import json
 import math
 import os
@@ -294,50 +293,49 @@ _WHEEL_FIXTURE_FILES: frozenset[str] = frozenset(
 # Calibrated across all 181 collected test files using hosted windows-2022 CI measurements
 # (run 44705523078 shard-0, baseline 035a4cd, and Azure 2.43x storage scaling for new/updated storage modules)
 # plus session wheel setup overhead across the two wheel shards. _WHEEL_SETUP_COST_MS=3000 and 300s budget intact.
-# After the I3/SP2 merge (fb3d8d1), replace estimates whose local error is at least
-# 7 s with the mean JUnit file time from the Python 3.11 and 3.14 Windows runs.
-# Recalibrated on 2026-11-24 from Python 3.14 Windows gate run
-# (evidence/final-gate/attempt-20261124T001957755913Z-23391fbd, commit 2ed49d0).
-# Equalizes all 6 shards to 253-256s estimated load based on empirical 3-wheel runtimes.
+# Recalibrated on 2026-11-24 from Python 3.14 and 3.11 Windows diagnostic runs
+# (evidence/diag-remediate-clean/py3.14 and py3.11) for all files with error >= 3 s.
+# Shards balance within 7.0% on 3.14 (136.8-147.0s) and 7.9% on 3.11 (144.3-156.6s).
 _HEAVY_FILE_COST_MS: dict[str, int] = {
-    "tests/integration/test_kernel_crash_recovery.py": 107396,
-    "tests/integration/test_apply_journal_crash_matrix.py": 102264,
-    "tests/integration/test_sp2_i2_wheel_compat.py": 79619,
-    "tests/integration/test_kernel_native_receipt_contract.py": 54190,
+    "tests/integration/test_kernel_crash_recovery.py": 90002,
+    "tests/integration/test_apply_journal_crash_matrix.py": 70959,
     "tests/integration/test_kernel_daemon.py": 53468,
-    "tests/integration/test_kernel_cli.py": 49538,
-    "tests/integration/test_i3_wheel_e2e.py": 44999,
+    "tests/integration/test_sp2_i2_wheel_compat.py": 51143,
+    "tests/integration/test_kernel_native_receipt_contract.py": 44747,
     "tests/integration/test_i3_rereview_init_and_accounting.py": 42794,
+    "tests/integration/test_kernel_cli.py": 38217,
+    "tests/integration/test_i3_wheel_e2e.py": 37323,
     "tests/application/test_continuity_worker_scheduling.py": 35568,
-    "tests/integration/test_restore_and_migration_i3.py": 34401,
-    "tests/integration/test_capture_ack_and_crash_matrix.py": 34086,
-    "tests/integration/test_t9_signal_stop_conversion.py": 31320,
-    "tests/architecture/test_gate_receipt.py": 30830,
-    "tests/storage/test_kernel_revocation.py": 28590,
-    "tests/storage/test_restore.py": 28482,
-    "tests/storage/test_runtime.py": 28075,
+    "tests/storage/test_kernel_revocation.py": 33868,
+    "tests/application/test_t8_review_p01_wrapped_paths.py": 32615,
     "tests/storage/test_crash_matrix.py": 27990,
+    "tests/integration/test_capture_ack_and_crash_matrix.py": 27096,
+    "tests/architecture/test_gate_receipt.py": 26863,
     "tests/application/test_t8_review_p01_r2_edge_globs.py": 26617,
-    "tests/application/test_t8_review_p01_wrapped_paths.py": 22302,
-    "tests/integration/test_kernel_shim.py": 21599,
+    "tests/integration/test_restore_and_migration_i3.py": 24314,
+    "tests/integration/test_t9_signal_stop_conversion.py": 22257,
+    "tests/storage/test_runtime.py": 22188,
+    "tests/storage/test_restore.py": 20423,
     "tests/domain/test_capture_envelope_and_privacy.py": 19101,
     "tests/storage/test_kernel_migration.py": 18311,
-    "tests/contract/test_mcp_v2_schema.py": 18066,
     "tests/storage/test_backup.py": 17889,
+    "tests/integration/test_sp2_store_v7_shape_and_refs.py": 17063,
+    "tests/integration/test_sp2_daemon_leased_attempt_retry.py": 16688,
+    "tests/integration/test_kernel_shim.py": 16373,
     "tests/storage/test_ledger.py": 16128,
     "tests/integration/test_kernel_receipts.py": 16072,
     "tests/storage/test_remediation_i2_t5.py": 15996,
     "tests/integration/test_i3_rereview_bootstrap_and_handoff.py": 15416,
     "tests/storage/test_cas.py": 13289,
     "tests/integration/test_kernel_transport.py": 13128,
-    "tests/storage/test_outbox_durability_and_limits.py": 13093,
+    "tests/integration/test_sp2_store_v7_migration.py": 12261,
+    "tests/contract/test_mcp_v2_schema.py": 12212,
     "tests/storage/test_remediation_i2_t3_lineage.py": 11578,
     "tests/storage/test_recovery_grant_and_turn_intent.py": 10847,
-    "tests/integration/test_sp2_store_v7_shape_and_refs.py": 10628,
-    "tests/integration/test_sp2_daemon_leased_attempt_retry.py": 10389,
     "tests/integration/test_kernel_privacy_persistence.py": 10200,
     "tests/integration/test_cli_init_and_authority.py": 9687,
     "tests/integration/test_sp2_continuity_authority_read_errors.py": 9457,
+    "tests/storage/test_outbox_durability_and_limits.py": 9087,
     "tests/application/test_bootstrap_and_doctor.py": 9003,
     "tests/storage/test_remediation_c02_r6_restore_marker.py": 8821,
     "tests/integration/test_t9_socket_readiness.py": 8774,
@@ -347,12 +345,9 @@ _HEAVY_FILE_COST_MS: dict[str, int] = {
     "tests/support/test_bounded_worker.py": 8463,
     "tests/storage/test_remediation_i2_os01.py": 7997,
     "tests/storage/test_migrate.py": 7993,
-    "tests/storage/test_reconcile.py": 7954,
     "tests/application/test_t8_review_p01_r3_spellings.py": 7632,
     "tests/storage/test_writer.py": 7476,
     "tests/application/test_i3_5_bootstrap_doctor_regressions.py": 7474,
-    "tests/architecture/test_t9_ci_checkout_bytes.py": 7265,
-    "tests/integration/test_sp2_store_v7_migration.py": 7260,
     "tests/storage/test_remediation_i2_t3_mirror_history.py": 7108,
     "tests/storage/test_restore_epoch_and_expiry.py": 7025,
     "tests/architecture/test_remediation_c06_gate_xpass.py": 6667,
@@ -367,6 +362,7 @@ _HEAVY_FILE_COST_MS: dict[str, int] = {
     "tests/storage/test_kernel_identity.py": 5337,
     "tests/integration/test_i3_1_review_regressions.py": 4912,
     "tests/adapters/test_durable.py": 4862,
+    "tests/storage/test_reconcile.py": 4846,
     "tests/storage/test_policy_accounting.py": 4830,
     "tests/integration/test_i2_close_01_transport_stdio.py": 4829,
     "tests/integration/test_review_apply_cli_and_operator.py": 4656,
@@ -377,6 +373,7 @@ _HEAVY_FILE_COST_MS: dict[str, int] = {
     "tests/storage/test_kernel_jobs.py": 4111,
     "tests/integration/test_kernel_serve_signal_lifecycle.py": 4075,
     "tests/storage/test_remediation_c01_r4_reading_leftovers.py": 3968,
+    "tests/architecture/test_t9_ci_checkout_bytes.py": 3890,
     "tests/architecture/test_remediation_c08_r13_unavailable_drive.py": 3875,
     "tests/integration/test_i2_close_01_wire_replay.py": 3775,
     "tests/integration/test_i3_4_restore_regressions.py": 3681,
@@ -1350,7 +1347,7 @@ def run_gate(
         if start is not None:
             code, output, _, error = step(
                 "uv-sync",
-                ["uv", "sync", "--locked", "--compile-bytecode", "--project", str(worktree), "--python", python],
+                ["uv", "sync", "--locked", "--project", str(worktree), "--python", python],
                 worktree,
                 SYNC_TIMEOUT_S,
             )
@@ -1358,15 +1355,6 @@ def run_gate(
                 extra.append(f"uv sync failed ({error or ('timed out' if code is None else code)})")
                 log.append(output)
             else:
-                py_exe = worktree / ".venv" / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
-                if py_exe.is_file():
-                    with contextlib.suppress(Exception):
-                        subprocess.run(
-                            [str(py_exe), "-m", "compileall", "-j", "0", "src", "tests", "-q"],
-                            cwd=worktree,
-                            check=False,
-                            timeout=30,
-                        )
                 job_began = time.monotonic()
                 deadline = job_began + TEST_JOB_BUDGET_S
                 halted: str | None = None  # why no further step of the test job may start
@@ -1419,12 +1407,9 @@ def run_gate(
                         except ValueError as err:
                             extra.append(f"inventory: {err}")
 
-                mypy_cmd = ["mypy"]
-                if (repo / ".mypy_cache").is_dir():
-                    mypy_cmd.extend(["--cache-dir", str(repo / ".mypy_cache")])
                 commands: dict[str, list[str]] = {
                     "ruff": _uv(worktree, python, "ruff", "check", "src", "tests", "scripts"),
-                    "mypy": _uv(worktree, python, *mypy_cmd),
+                    "mypy": _uv(worktree, python, "mypy"),
                     "lint-imports": _uv(worktree, python, "lint-imports"),
                     "pytest": _uv(worktree, python, "pytest", f"--junitxml={junit}", "-q", "-rfEX"),
                 }

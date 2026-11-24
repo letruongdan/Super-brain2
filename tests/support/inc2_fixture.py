@@ -8,11 +8,9 @@ most once per pytest session rather than per test. No fixture flags exist in ``s
 from __future__ import annotations
 
 import atexit
-import contextlib
 import datetime as dt
 import hashlib
 import ipaddress
-import json
 import os
 import shutil
 import sqlite3
@@ -21,7 +19,6 @@ import subprocess
 import sys
 import tempfile
 import threading
-import time
 import uuid
 import warnings
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -164,211 +161,104 @@ def _run_checked(
 
 
 @contextmanager
-def _interprocess_lock(lock_path: Path) -> Iterator[None]:
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(lock_path, "a+b") as f:
-        if sys.platform == "win32":
-            import msvcrt
-
-            f.seek(0)
-            while True:
-                try:
-                    msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
-                    break
-                except OSError:
-                    time.sleep(0.05)
-            try:
-                yield
-            finally:
-                f.seek(0)
-                with contextlib.suppress(OSError):
-                    msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
-        else:
-            import fcntl
-
-            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                with contextlib.suppress(OSError):
-                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-
-
-def _repo_fingerprint() -> str:
-    try:
-        head = subprocess.check_output(
-            ["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=5.0,
-        ).strip()
-        diff = subprocess.check_output(
-            ["git", "-C", str(REPO_ROOT), "status", "--porcelain"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=5.0,
-        ).strip()
-        if diff:
-            return f"{head}-{hashlib.sha256(diff.encode('utf-8')).hexdigest()[:8]}"
-        return head
-    except (subprocess.SubprocessError, OSError):
-        content = (REPO_ROOT / "pyproject.toml").read_bytes() + (REPO_ROOT / "uv.lock").read_bytes()
-        return hashlib.sha256(content).hexdigest()[:16]
-
-
-_CACHED_INC2_ENV: InstalledEnv | None = None
-
-
-def get_cached_inc2_installed_env() -> InstalledEnv:
-    global _CACHED_INC2_ENV
-    if _CACHED_INC2_ENV is not None and _CACHED_INC2_ENV.venv_python.is_file():
-        return _CACHED_INC2_ENV
-
+def open_inc2_installed_env(scratch: Path) -> Iterator[InstalledEnv]:
+    """Build and install a wheel in caller-owned scratch, reusable by the explicit benchmark."""
     assert SOURCE_SCHEMA_PATH.is_file(), f"missing canonical schema file: {SOURCE_SCHEMA_PATH}"
     source_schema_sha256 = hashlib.sha256(SOURCE_SCHEMA_PATH.read_bytes()).hexdigest()
 
-    cache_base = Path(os.environ.get("LOCALAPPDATA", tempfile.gettempdir())) / "superbrain-tests" / "wheel-cache"
-    cache_base.mkdir(parents=True, exist_ok=True)
-    if sys.platform == "win32":
-        from superbrain.adapters.os.permissions import WindowsPermissionGuard
+    dist_dir = scratch / "dist"
+    dist_dir.mkdir()
+    venv_dir = scratch / "venv"
 
-        WindowsPermissionGuard().secure_directory(cache_base)
+    _run_checked(
+        [
+            "uv",
+            "build",
+            "--wheel",
+            "--no-build-isolation",
+            "--offline",
+            "--python",
+            sys.executable,
+            "--out-dir",
+            str(dist_dir),
+            str(REPO_ROOT),
+        ],
+        cwd=REPO_ROOT,
+    )
+    wheels = sorted(dist_dir.glob("super_brain2-*.whl"))
+    if len(wheels) != 1:
+        raise RuntimeError(f"expected exactly 1 built super_brain2 wheel, found {wheels}")
+    wheel_path = wheels[0]
 
-    fp = _repo_fingerprint()
-    env_dir = cache_base / f"sp2-py{sys.version_info.major}.{sys.version_info.minor}-{fp}"
-    lock_file = cache_base / f"sp2-py{sys.version_info.major}.{sys.version_info.minor}.lock"
-    ready_file = env_dir / "ready.json"
+    _run_checked(
+        [
+            "uv",
+            "sync",
+            "--project",
+            str(REPO_ROOT),
+            "--locked",
+            "--offline",
+            "--no-dev",
+            "--no-install-project",
+            "--compile-bytecode",
+            "--python",
+            sys.executable,
+        ],
+        cwd=REPO_ROOT,
+        extra_env={"UV_PROJECT_ENVIRONMENT": str(venv_dir)},
+    )
+    venv_python = venv_dir / "Scripts" / "python.exe" if sys.platform == "win32" else venv_dir / "bin" / "python"
 
-    with _interprocess_lock(lock_file):
-        if ready_file.is_file():
-            try:
-                data = json.loads(ready_file.read_text(encoding="utf-8"))
-                venv_dir = Path(data["venv_dir"])
-                venv_python = Path(data["venv_python"])
-                wheel_path = Path(data["wheel_path"])
-                if venv_python.is_file() and wheel_path.is_file():
-                    _CACHED_INC2_ENV = InstalledEnv(
-                        venv_dir=venv_dir,
-                        venv_python=venv_python,
-                        wheel_path=wheel_path,
-                        source_schema_path=SOURCE_SCHEMA_PATH,
-                        source_schema_sha256=source_schema_sha256,
-                    )
-                    return _CACHED_INC2_ENV
-            except (json.JSONDecodeError, KeyError, OSError):
-                pass
+    _run_checked(
+        [
+            "uv",
+            "pip",
+            "install",
+            "--offline",
+            "--no-deps",
+            "--link-mode=copy",
+            "--compile-bytecode",
+            "--python",
+            str(venv_python),
+            str(wheel_path),
+        ],
+        cwd=scratch,
+    )
 
-        env_dir.mkdir(parents=True, exist_ok=True)
-        dist_dir = env_dir / "dist"
-        dist_dir.mkdir(exist_ok=True)
-        venv_dir = env_dir / "venv"
-
-        _run_checked(
-            [
-                "uv",
-                "build",
-                "--wheel",
-                "--no-build-isolation",
-                "--offline",
-                "--python",
-                sys.executable,
-                "--out-dir",
-                str(dist_dir),
-                str(REPO_ROOT),
-            ],
-            cwd=REPO_ROOT,
-        )
-        wheels = sorted(dist_dir.glob("super_brain2-*.whl"))
-        if len(wheels) != 1:
-            raise RuntimeError(f"expected exactly 1 built super_brain2 wheel, found {wheels}")
-        wheel_path = wheels[0]
-
-        _run_checked(
-            [
-                "uv",
-                "sync",
-                "--project",
-                str(REPO_ROOT),
-                "--locked",
-                "--offline",
-                "--no-dev",
-                "--no-install-project",
-                "--compile-bytecode",
-                "--python",
-                sys.executable,
-            ],
-            cwd=REPO_ROOT,
-            extra_env={"UV_PROJECT_ENVIRONMENT": str(venv_dir)},
-        )
-        venv_python = (
-            venv_dir / "Scripts" / "python.exe" if sys.platform == "win32" else venv_dir / "bin" / "python"
-        )
-
-        _run_checked(
-            [
-                "uv",
-                "pip",
-                "install",
-                "--offline",
-                "--no-deps",
-                "--link-mode=copy",
-                "--compile-bytecode",
-                "--python",
-                str(venv_python),
-                str(wheel_path),
-            ],
-            cwd=env_dir,
-        )
-
-        purelib_dir = Path(
-            subprocess.check_output(
-                [str(venv_python), "-I", "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"],
-                text=True,
-                encoding="utf-8",
-                timeout=30.0,
-            ).strip()
-        )
-        hook_src = Path(__file__).resolve().with_name("_socket_readiness_hook.py").read_bytes()
-        (purelib_dir / "_superbrain_test_readiness.py").write_bytes(hook_src)
-        (purelib_dir / "_superbrain_test_readiness.pth").write_text(
-            'import os; os.environ.get("SUPERBRAIN_TEST_SOCKET_READINESS") '
-            'and __import__("_superbrain_test_readiness").install()\n',
+    purelib_dir = Path(
+        subprocess.check_output(
+            [str(venv_python), "-I", "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"],
+            text=True,
             encoding="utf-8",
-        )
-        _run_checked(
-            [str(venv_python), "-m", "compileall", "-q", str(purelib_dir)],
-            cwd=env_dir,
-        )
+            timeout=30.0,
+        ).strip()
+    )
+    hook_src = Path(__file__).resolve().with_name("_socket_readiness_hook.py").read_bytes()
+    (purelib_dir / "_superbrain_test_readiness.py").write_bytes(hook_src)
+    (purelib_dir / "_superbrain_test_readiness.pth").write_text(
+        'import os; os.environ.get("SUPERBRAIN_TEST_SOCKET_READINESS") '
+        'and __import__("_superbrain_test_readiness").install()\n',
+        encoding="utf-8",
+    )
 
-        ready_file.write_text(
-            json.dumps({
-                "venv_dir": str(venv_dir),
-                "venv_python": str(venv_python),
-                "wheel_path": str(wheel_path),
-            }),
-            encoding="utf-8",
-        )
-
-        _CACHED_INC2_ENV = InstalledEnv(
-            venv_dir=venv_dir,
-            venv_python=venv_python,
-            wheel_path=wheel_path,
-            source_schema_path=SOURCE_SCHEMA_PATH,
-            source_schema_sha256=source_schema_sha256,
-        )
-        return _CACHED_INC2_ENV
-
-
-@contextmanager
-def open_inc2_installed_env(scratch: Path) -> Iterator[InstalledEnv]:
-    """Yield an installed wheel environment, reusing the shared cached environment if available."""
-    yield get_cached_inc2_installed_env()
+    yield InstalledEnv(
+        venv_dir=venv_dir,
+        venv_python=venv_python,
+        wheel_path=wheel_path,
+        source_schema_path=SOURCE_SCHEMA_PATH,
+        source_schema_sha256=source_schema_sha256,
+    )
 
 
 @pytest.fixture(scope="session")
 def inc2_installed_env(tmp_path_factory: pytest.TempPathFactory) -> Iterator[InstalledEnv]:
-    """Build the project wheel once per session (or reuse cached) and yield."""
-    yield get_cached_inc2_installed_env()
+    """Build the project wheel once per session and clean its isolated scratch afterwards."""
+    scratch = _make_trusted_session_dir("inc2-wheel", tmp_path_factory)
+    try:
+        with open_inc2_installed_env(scratch) as installed:
+            yield installed
+    finally:
+        _cleanup_dir(scratch)
 
 
 @pytest.fixture(scope="session")
