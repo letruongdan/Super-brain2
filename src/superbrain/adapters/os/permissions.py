@@ -27,11 +27,31 @@ def _inspect_error(path: Path, err: BaseException) -> BrainError:
     return BrainError(ErrorCode.INSECURE_PERMISSIONS, f"cannot inspect permissions of {path}: {err}")
 
 
+def vanished_below(path: Path, root: Path) -> bool:
+    """``path`` lies strictly below a walk's ``root`` and no longer exists: it was removed after it was listed.
+
+    A removed entry grants nobody access, so a permission walk skips it; the walk's own root never counts. Only
+    "not found" counts as removed: an entry that cannot be looked up for any other reason is still checked.
+    """
+    if os.path.abspath(path) == os.path.abspath(root):
+        return False
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
 def _tree(root: Path) -> Iterator[Path]:
     """``root`` and everything below it, without following links; unreadable directories raise."""
 
     def fail(err: OSError) -> None:
-        raise _inspect_error(Path(err.filename or root), err)
+        failed = Path(err.filename or root)
+        if isinstance(err, FileNotFoundError) and vanished_below(failed, root):
+            return
+        raise _inspect_error(failed, err)
 
     yield root
     try:
@@ -89,6 +109,8 @@ def _non_symlink_tree(root: Path) -> Iterator[Path]:
                         continue
                     try:
                         est = entry.stat(follow_symlinks=False)
+                    except FileNotFoundError:
+                        continue  # removed after it was listed
                     except OSError as err:
                         raise _inspect_error(Path(entry.path), err) from err
                     if _is_reparse_or_link(est):
@@ -97,7 +119,10 @@ def _non_symlink_tree(root: Path) -> Iterator[Path]:
                     if stat.S_ISDIR(est.st_mode):
                         subdirs.append(entry.path)
         except OSError as err:
-            raise _inspect_error(Path(err.filename or current), err) from err
+            failed = Path(err.filename or current)
+            if isinstance(err, FileNotFoundError) and vanished_below(failed, root):
+                continue
+            raise _inspect_error(failed, err) from err
         for child in children:
             yield Path(child)
         stack.extend(reversed(subdirs))
@@ -124,7 +149,14 @@ if sys.platform != "win32":
                 raise BrainError(ErrorCode.INSECURE_PERMISSIONS, f"cannot restrict {path}: {err}") from err
 
         def problems(self, root: Path) -> list[PermissionProblem]:
-            return [problem for path in _tree(root) for problem in self.object_problems(path)]
+            found: list[PermissionProblem] = []
+            for path in _tree(root):
+                try:
+                    found.extend(self.object_problems(path))
+                except BrainError:
+                    if not vanished_below(path, root):
+                        raise
+            return found
 
         def object_problems(self, path: Path) -> list[PermissionProblem]:
             try:
@@ -300,7 +332,12 @@ if sys.platform == "win32":
             allowed = {user, _SYSTEM_SID}
             found: list[PermissionProblem] = []
             for path in _non_symlink_tree(root):
-                reason = self._entry_problem(path, user, allowed)
+                try:
+                    reason = self._entry_problem(path, user, allowed)
+                except BrainError:
+                    if vanished_below(path, root):
+                        continue
+                    raise
                 if reason:
                     found.append(PermissionProblem(path, reason))
             return found

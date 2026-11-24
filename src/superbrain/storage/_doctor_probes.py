@@ -42,6 +42,17 @@ __all__ = [
 ]
 
 
+def _not_found(path: Path) -> bool:
+    """Only "not found" means removed; any other lookup failure is still reported."""
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
 def check_permissions_strict(
     root: DataRoot,
     os_: OsAdapters,
@@ -66,6 +77,11 @@ def check_permissions_strict(
             try:
                 with os.scandir(cur) as it:
                     entries = sorted(it, key=lambda e: e.name)
+            except FileNotFoundError as exc:
+                if cur != root.root and _not_found(cur):
+                    continue  # removed after it was listed: no entry left to judge
+                errors.append(f"directory scan error at {cur.name}: {describe_exception(exc)}")
+                continue
             except OSError as exc:
                 errors.append(f"directory scan error at {cur.name}: {describe_exception(exc)}")
                 continue
@@ -79,6 +95,8 @@ def check_permissions_strict(
                     continue
                 try:
                     est = entry.stat(follow_symlinks=False)
+                except FileNotFoundError:
+                    continue  # removed after it was listed
                 except OSError as exc:
                     errors.append(f"stat error at {epath.name}: {describe_exception(exc)}")
                     continue

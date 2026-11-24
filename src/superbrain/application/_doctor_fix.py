@@ -46,6 +46,22 @@ SAFE_FIX_ACTION_SET: frozenset[str] = frozenset(SAFE_FIX_ACTIONS)
 _REPARSE_POINT = 0x400
 
 
+def _vanished_below(path: Path, root: Path) -> bool:
+    """``path`` lies strictly below the walk's ``root`` and is not found: removed after it was listed.
+
+    Any other lookup failure is not "removed", so the entry keeps failing closed.
+    """
+    if os.path.abspath(path) == os.path.abspath(root):
+        return False
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
 def _is_link(path: Path, os_: OsAdapters) -> bool:
     try:
         st = os.lstat(path)
@@ -79,6 +95,11 @@ def ensure_no_links_in_tree(root: Path, os_: OsAdapters) -> tuple[list[Path], li
         try:
             with os.scandir(current) as it:
                 entries = sorted(it, key=lambda e: e.name)
+        except FileNotFoundError as exc:
+            if _vanished_below(current, root):
+                continue  # removed after it was listed
+            detail = f"cannot list {current.name}: {describe_exception(exc)}"
+            raise BrainError(ErrorCode.INSECURE_PERMISSIONS, detail) from exc
         except OSError as exc:
             detail = f"cannot list {current.name}: {describe_exception(exc)}"
             raise BrainError(ErrorCode.INSECURE_PERMISSIONS, detail) from exc
@@ -88,6 +109,8 @@ def ensure_no_links_in_tree(root: Path, os_: OsAdapters) -> tuple[list[Path], li
                 raise BrainError(ErrorCode.UNSAFE_PATH, f"unsafe link inside data root: {epath}")
             try:
                 est = entry.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                continue  # removed after it was listed
             except OSError as exc:
                 detail = f"cannot stat {epath.name}: {describe_exception(exc)}"
                 raise BrainError(ErrorCode.INSECURE_PERMISSIONS, detail) from exc
@@ -106,22 +129,43 @@ def _verify_and_secure(
     pre_id: PhysicalObjectId | None,
     os_: OsAdapters,
     may_write: Callable[[], bool] | None = None,
+    walk_root: Path | None = None,
 ) -> int | None:
-    """Repair one entry; ``None`` when ``may_write`` refused the write this entry needed (nothing was changed)."""
-    if not os_.permissions.object_problems(path):
-        return 0
+    """Repair one entry; ``None`` when ``may_write`` refused the write this entry needed (nothing was changed).
+
+    An entry strictly below ``walk_root`` that was removed after the walk listed it needs no repair (``0``); one
+    that still exists and cannot be inspected or repaired keeps failing closed.
+    """
+
+    def vanished() -> bool:
+        return walk_root is not None and _vanished_below(path, walk_root)
+
+    try:
+        if not os_.permissions.object_problems(path):
+            return 0
+    except BrainError:
+        if vanished():
+            return 0
+        raise
     if may_write is not None and not may_write():
         return None
     if os_.physical is not None:
         cur_id = os_.physical.stat_physical_identity(path)
+        if cur_id is None and vanished():
+            return 0
         if cur_id is None or cur_id.is_link or cur_id != pre_id:
             raise BrainError(ErrorCode.UNSAFE_PATH, f"target identity changed before ACL repair: {path}")
     elif _is_link(path, os_):
         raise BrainError(ErrorCode.UNSAFE_PATH, f"target replaced by link: {path}")
-    if is_dir:
-        os_.permissions.secure_directory(path)
-    else:
-        os_.permissions.secure_file(path)
+    try:
+        if is_dir:
+            os_.permissions.secure_directory(path)
+        else:
+            os_.permissions.secure_file(path)
+    except BrainError:
+        if vanished():
+            return 0
+        raise
     return 1
 
 
@@ -154,28 +198,30 @@ def tighten_data_root_permissions(
             seen.add(norm)
             unique_roots.append(Path(norm))
 
-    all_dirs: list[tuple[Path, PhysicalObjectId | None]] = []
-    all_files: list[tuple[Path, PhysicalObjectId | None]] = []
+    all_dirs: list[tuple[Path, PhysicalObjectId | None, Path]] = []
+    all_files: list[tuple[Path, PhysicalObjectId | None, Path]] = []
     for base in unique_roots:
         dirs, files = ensure_no_links_in_tree(base, os_)
         for d in dirs:
             ident = os_.physical.stat_physical_identity(d) if os_.physical is not None else None
             if ident is not None and ident.is_link:
                 raise BrainError(ErrorCode.UNSAFE_PATH, f"unsafe link: {d}")
-            all_dirs.append((d, ident))
+            all_dirs.append((d, ident, base))
         for f in files:
             ident = os_.physical.stat_physical_identity(f) if os_.physical is not None else None
             if ident is not None and ident.is_link:
                 raise BrainError(ErrorCode.UNSAFE_PATH, f"unsafe link: {f}")
-            all_files.append((f, ident))
+            all_files.append((f, ident, base))
 
     # Second file pass catches any child whose ACL reset during parent directory DACL update on Windows.
-    steps = [(d, True, i) for d, i in all_dirs] + [(f, False, i) for f, i in all_files] * 2
+    steps = [(d, True, i, b) for d, i, b in all_dirs] + [(f, False, i, b) for f, i, b in all_files] * 2
     changed = 0
-    for path, is_dir, pre_id in steps:
+    for path, is_dir, pre_id, base in steps:
         if should_stop is not None and should_stop():
             raise FixInterrupted(changed)
-        step = _verify_and_secure(path, is_dir=is_dir, pre_id=pre_id, os_=os_, may_write=may_write)
+        step = _verify_and_secure(
+            path, is_dir=is_dir, pre_id=pre_id, os_=os_, may_write=may_write, walk_root=base
+        )
         if step is None:
             raise FixInterrupted(changed)
         changed += step
