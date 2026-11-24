@@ -261,13 +261,13 @@ class JobService:
 
         return self._store.transact(read)
 
-    def resolve_leased_spec(self, lease: JobLease) -> JobSpec | None:
+    def resolve_leased_spec(self, lease: JobLease, *, fail_missing_payload: bool = False) -> JobSpec | None:
         """Read ``JobSpec`` for a ``LEASED`` job, or settle the job in the same transaction and return ``None``.
 
         A job that can no longer read its payload through its own hold (tombstoned, restricted, or its hold released
         while the bytes are intact) fails with ``INVALID_PAYLOAD``. A transient failure in any payload read is retried
-        with backoff up to the attempt cap, then dead-lettered. Missing or corrupt bytes still raise
-        ``INTEGRITY_FAILURE``.
+        with backoff up to the attempt cap, then dead-lettered. Missing or corrupt bytes raise ``INTEGRITY_FAILURE``
+        and leave the job leased, unless ``fail_missing_payload`` (the doctor runner) fails it with ``INVALID_PAYLOAD``.
         """
         self._require_current(lease)
         now_utc, now = require_aware_utc(self._clock.now())
@@ -291,7 +291,7 @@ class JobService:
                 )
                 return None
             if payload is None:
-                if not intact:
+                if not intact and not fail_missing_payload:
                     # Missing or corrupt bytes are an integrity alarm, kept loud: the caller sees INTEGRITY_FAILURE.
                     raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
                 # Intact bytes this job no longer holds: its payload is gone for good, so it can never run.

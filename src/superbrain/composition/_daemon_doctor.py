@@ -59,6 +59,7 @@ from superbrain.core.kernel import (
     JobErrorCode,
     JobLease,
     JobOutcome,
+    JobState,
     Principal,
     Scope,
     StoredResult,
@@ -133,6 +134,7 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
         self._workers: set[threading.Thread] = set()
         self._waiters: list[threading.Event] = []
         self._finished_jobs: dict[str, tuple[str, str | None]] = {}
+        self._pending_lease: JobLease | None = None  # claimed doctor lease whose settle/start must be retried
 
     def _record_finished_locked(self, job_id: str, status: str, doctor_run_id: str | None) -> None:
         self._finished_jobs[job_id] = (status, doctor_run_id)
@@ -145,6 +147,7 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
         with self._lock:
             self._generation += 1
             self._active_token, self._active_lease, self._completed = None, None, None
+            self._pending_lease = None
             self._wait_cond.notify_all()
         self._notify_waiters()
 
@@ -162,6 +165,7 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
             self._active_token = None
             self._active_lease = None
             self._completed = None
+            self._pending_lease = None
             self._rt = rt
             self._job_store = job_store
             self._job_service = job_service
@@ -181,6 +185,7 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
             self._startup_due = False
             self._generation += 1
             self._active_token, self._active_lease, self._completed = None, None, None
+            self._pending_lease = None
         self._notify_waiters()
 
     @property
@@ -213,6 +218,7 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
         with self._lock:
             self._closed, self._stopping, self._generation = True, True, self._generation + 1
             self._active_token, self._active_lease, self._completed = None, None, None
+            self._pending_lease = None
         self._notify_waiters()
         if not self._rt.store.closed and not self._rt.policy.closed:
             with contextlib.suppress(BrainError):
@@ -394,30 +400,38 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
             if self._stopping or self._closed or self._active_token is not None:
                 return False
             gen = self._generation
+            pending, self._pending_lease = self._pending_lease, None
 
-        try:
-            lease = self._job_service.lease_next_for_kinds(
-                self._rt.lease.epoch,
-                self._clock.now(),
-                (DOCTOR_JOB_KIND,),
-                emit_crashpoints=False,
-                commit_guard=self._claim_guard if self._claim_guard is not None else self._can_claim_doctor,
-            )
-        except BrainError as err:
-            _LOGGER.warning("doctor lease failed (code=%s)", err.code.value)
-            return False
+        lease = pending
         if lease is None:
-            return False
+            try:
+                lease = self._job_service.lease_next_for_kinds(
+                    self._rt.lease.epoch,
+                    self._clock.now(),
+                    (DOCTOR_JOB_KIND,),
+                    emit_crashpoints=False,
+                    commit_guard=self._claim_guard if self._claim_guard is not None else self._can_claim_doctor,
+                )
+            except BrainError as err:
+                _LOGGER.warning("doctor lease failed (code=%s)", err.code.value)
+                return False
+            if lease is None:
+                return False
 
         try:
-            spec = self._job_service.resolve_leased_spec(lease)
+            spec = self._job_service.resolve_leased_spec(lease, fail_missing_payload=True)
             if spec is None:
+                self._record_settled_at_claim(lease.job_id, gen)
                 return True
             self._job_service.start(lease)
         except BrainError as err:
             if err.code is ErrorCode.REVISION_CONFLICT:
                 return True
             _LOGGER.warning("doctor job start failed (code=%s)", err.code.value)
+            # The lease is still ours: keep it so the next step settles or starts it in this writer epoch.
+            with self._lock:
+                if self._generation == gen and not (self._stopping or self._closed):
+                    self._pending_lease = lease
             return False
 
         token = object()
@@ -450,6 +464,18 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
                     self._workers.discard(thread)
             self._abandon_launch(lease, token, gen)
         return True
+
+    def _record_settled_at_claim(self, job_id: str, gen: int) -> None:
+        """A job the claim settled without running: answer its waiters once the committed state is terminal."""
+        try:
+            row = self._job_store.transact(lambda tx: tx.read_job(job_id))
+        except BrainError:
+            row = None  # waiters fall back to the store read in finish_report
+        if row is not None and row.state in (JobState.FAILED, JobState.DEAD_LETTER):
+            with self._lock:
+                if self._generation == gen:
+                    self._record_finished_locked(job_id, "failed", None)
+        self._notify_waiters()
 
     def _abandon_launch(self, lease: JobLease, token: object, gen: int) -> None:
         """Owner thread: release a claimed slot whose worker never started and fail its job durably."""
