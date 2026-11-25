@@ -150,6 +150,7 @@ class _CompiledPolicy:
     max_words: int
     prefixes: frozenset[str]
     contained: tuple[str, ...]
+    contained_re: re.Pattern[str] | None
     candidate: re.Pattern[str]
     entropy_thresh: float
     entropy_min_distinct: float
@@ -173,6 +174,7 @@ def _compile_policy(policy: FilterPolicy) -> _CompiledPolicy:
     max_words = max((len(_key_words(k)) for k in policy.sensitive_keys), default=1)
     prefixes = frozenset(name[:i] for name in sensitive for i in range(1, len(name) + 1))
     contained = tuple(sorted(name for name in sensitive if len(name) >= _CONTAINMENT_MIN))
+    contained_re = re.compile("|".join(re.escape(name) for name in contained)) if contained else None
     candidate = re.compile(rf"[\x21-\x7e]{{{policy.entropy_min_length},}}")
     entropy_thresh = 2 ** -(policy.entropy_min_bits + 1e-12)
     entropy_min_distinct = 2 ** (policy.entropy_min_bits - 1e-12)
@@ -195,6 +197,7 @@ def _compile_policy(policy: FilterPolicy) -> _CompiledPolicy:
         max_words=max_words,
         prefixes=prefixes,
         contained=contained,
+        contained_re=contained_re,
         candidate=candidate,
         entropy_thresh=entropy_thresh,
         entropy_min_distinct=entropy_min_distinct,
@@ -228,6 +231,7 @@ class _Run(_TextScans):
         self._max_words = compiled.max_words
         self._prefixes = compiled.prefixes
         self._contained = compiled.contained
+        self._contained_re = compiled.contained_re
         self._candidate = compiled.candidate
         self._entropy_thresh = compiled.entropy_thresh
         self._entropy_min_distinct = compiled.entropy_min_distinct
@@ -301,27 +305,32 @@ class _Run(_TextScans):
         """
         words = _key_words(key)
         word_count = len(words)
+        contained_re = self._contained_re
+        prefixes = self._prefixes
+        sensitive = self._sensitive
+        max_words = self._max_words
         for start, word in enumerate(words):
             if (
-                len(word) >= _CONTAINMENT_MIN
+                contained_re is not None
+                and len(word) >= _CONTAINMENT_MIN
                 and word not in _BENIGN_CONTAINING_WORDS
-                and any(name in word for name in self._contained)
+                and contained_re.search(word) is not None
             ):
                 return True
-            if word not in self._prefixes:
+            if word not in prefixes:
                 continue
-            if word not in self._sensitive and (
-                start + 1 == word_count or word + words[start + 1] not in self._prefixes
+            if word not in sensitive and (
+                start + 1 == word_count or word + words[start + 1] not in prefixes
             ):
                 continue
             joined = ""
-            for size in range(1, min(self._max_words, len(words) - start) + 1):
+            for size in range(1, min(max_words, word_count - start) + 1):
                 joined += words[start + size - 1]
-                if joined not in self._prefixes:
+                if joined not in prefixes:
                     break
-                if joined not in self._sensitive:
+                if joined not in sensitive:
                     continue
-                following = words[start + size] if start + size < len(words) else None
+                following = words[start + size] if start + size < word_count else None
                 if following is None or following not in _BENIGN_NEXT_WORDS.get(joined, frozenset()):
                     return True
         return False

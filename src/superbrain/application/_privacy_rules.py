@@ -89,6 +89,9 @@ class _Deadline(Exception):
 
 def _key_words(key: str) -> list[str]:
     """NFKC + casefold words of a key, split at separators, camelCase, acronym->Camel and letter<->digit."""
+    if key.isascii():
+        folded = _WORD_BOUNDARY.sub(" ", key).lower()
+        return [word for word in _KEY_WORD_SPLIT.split(folded) if word]
     normalized = unicodedata.normalize("NFKC", key)
     return [word for word in _KEY_WORD_SPLIT.split(_WORD_BOUNDARY.sub(" ", normalized).casefold()) if word]
 
