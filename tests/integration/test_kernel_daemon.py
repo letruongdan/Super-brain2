@@ -1703,6 +1703,7 @@ def test_tls_expiring_health_uses_clock_and_no_io(
         monotonic_clock=mono,
         domain=domain,
         hooks=DaemonTestHooks(before_bind=_capture_sql_trace),
+        job_handlers={},
     )
     try:
         ready = loop.start(cfg)
