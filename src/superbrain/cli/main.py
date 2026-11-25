@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import contextlib
-import json
 import os
 import signal
-import subprocess
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -26,6 +24,8 @@ def _write_stderr(code: str) -> None:
 
 
 def _write_json_error(code: ErrorCode) -> None:
+    import json
+
     payload = json.dumps(
         {"ok": False, "error": {"code": code.value, "message": safe_wire_message(code)}},
         sort_keys=True,
@@ -368,6 +368,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 pass
     try:
         try:
+            import subprocess
+
             proc = subprocess.Popen(cmd, shell=False)
         except OSError:
             _write_stderr(ErrorCode.IO_ERROR.value)

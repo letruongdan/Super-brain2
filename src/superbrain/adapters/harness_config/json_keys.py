@@ -12,8 +12,8 @@ from superbrain.adapters.harness_config._common import (
     invalid_config,
     revision_conflict,
 )
+from superbrain.core._json_parse import parse_json
 from superbrain.core.jsonvalue import JsonValue
-from superbrain.core.wire import parse_json
 from superbrain.ports.proposals import MergeOutput
 
 __all__ = ["merge_json_keys", "merge_json_multi_keys", "remove_json_keys"]

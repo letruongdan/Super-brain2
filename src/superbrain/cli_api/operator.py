@@ -11,11 +11,11 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 
 from superbrain.application.owner_loop import AuthGate
+from superbrain.core._json_parse import parse_json
 from superbrain.core._kernel_approval import CLI_HARNESS_ID
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.jsonvalue import JsonValue
 from superbrain.core.kernel import CallResult, Principal
-from superbrain.core.wire import parse_json
 
 __all__ = [
     "OPERATOR_PATHS",

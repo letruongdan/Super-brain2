@@ -2,42 +2,20 @@
 
 from __future__ import annotations
 
-import json
 import os
 import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from superbrain.adapters.os import os_adapters
-from superbrain.adapters.os.daemon_config import (
-    read_client_ca,
-    read_client_credential,
-    read_client_endpoint,
-    read_client_profile,
-    read_daemon_config,
-)
-from superbrain.adapters.os.tls_material import read_server_cert_leaf_sha256
-from superbrain.adapters.os.workspaces import verify_launch_checkout
-from superbrain.application.doctor import (
-    DoctorReport,
-    KernelPrivacyScanner,
-    format_doctor_dict_text,
-    inspect_doctor_snapshot,
-)
-from superbrain.cli_api.loopback import LoopbackTarget
-from superbrain.composition._operator_client import (
-    call_operator_target,
-    write_error_code,
-    write_json_error,
-)
-from superbrain.composition.init_entry import CLI_CREDENTIAL_NAME
 from superbrain.core.errors import BrainError, ErrorCode, brain_error_wire_message
 from superbrain.core.jsonvalue import JsonValue
-from superbrain.ports.doctor import CaptureDoctorProbePort, DoctorScanLimits, PrivacyScannerPort
-from superbrain.ports.os import OsAdapters
-from superbrain.storage._doctor_reader import read_doctor_snapshot
-from superbrain.storage.layout import DataRoot
+
+if TYPE_CHECKING:
+    from superbrain.application.doctor import DoctorReport
+    from superbrain.ports.doctor import CaptureDoctorProbePort, DoctorScanLimits, PrivacyScannerPort
+    from superbrain.ports.os import OsAdapters
 
 __all__ = ["main", "run_doctor", "run_doctor_cli"]
 
@@ -155,6 +133,11 @@ def run_doctor(
     limits: DoctorScanLimits | None = None,
 ) -> DoctorReport:
     """Inspect storage + checkout state strictly read-only and return a ``DoctorReport``."""
+    from superbrain.adapters.os import os_adapters
+    from superbrain.adapters.os.daemon_config import read_client_profile, read_daemon_config
+    from superbrain.application.doctor import KernelPrivacyScanner, inspect_doctor_snapshot
+    from superbrain.storage._doctor_reader import read_doctor_snapshot
+
     adapters = os_ if os_ is not None else os_adapters()
     scanner: PrivacyScannerPort = privacy_scanner if privacy_scanner is not None else KernelPrivacyScanner()
     if is_profile:
@@ -210,6 +193,10 @@ def _call_online_doctor(
     cred_path: Path,
     leaf_sha256: str,
 ) -> dict[str, JsonValue]:
+    from superbrain.adapters.os.daemon_config import read_client_ca, read_client_credential, read_client_endpoint
+    from superbrain.cli_api.loopback import LoopbackTarget
+    from superbrain.composition._operator_client import call_operator_target
+
     ca_pem = read_client_ca(ca_path, adapters)
     token = read_client_credential(cred_path, adapters)
     endpoint = read_client_endpoint(endpoint_path, adapters)
@@ -232,7 +219,25 @@ def _call_online_doctor(
     return dict(data)
 
 
+def _verify_profile_checkout(
+    checkout_path: Path,
+    override_checkout: Path,
+    adapters: OsAdapters,
+) -> None:
+    from superbrain.adapters.os.workspaces import verify_launch_checkout
+
+    verify_launch_checkout(checkout_path, override_checkout, adapters)
+
+
 def _execute_cli_doctor(parsed: _ParsedDoctorCli, adapters: OsAdapters) -> dict[str, JsonValue]:
+    from superbrain.adapters.os.daemon_config import (
+        CLI_CREDENTIAL_NAME,
+        read_client_endpoint,
+        read_client_profile,
+        read_daemon_config,
+    )
+    from superbrain.storage.layout import DataRoot
+
     if parsed.is_profile:
         profile = read_client_profile(parsed.source_path, adapters)
         data_root = profile.endpoint_path.parent
@@ -272,7 +277,7 @@ def _execute_cli_doctor(parsed: _ParsedDoctorCli, adapters: OsAdapters) -> dict[
         if writer_held:
             raise BrainError(ErrorCode.STORE_BUSY, "store busy")
         if parsed.is_profile and profile.workspace is not None and parsed.checkout_root is not None:
-            verify_launch_checkout(profile.workspace.checkout_path, parsed.checkout_root, adapters)
+            _verify_profile_checkout(profile.workspace.checkout_path, parsed.checkout_root, adapters)
         _validate_checkout(resolved_checkout, adapters)
         return run_doctor(
             parsed.source_path,
@@ -285,7 +290,7 @@ def _execute_cli_doctor(parsed: _ParsedDoctorCli, adapters: OsAdapters) -> dict[
         if writer_held or parsed.fix:
             raise BrainError(ErrorCode.DAEMON_UNAVAILABLE, "daemon unavailable")
         if parsed.is_profile and profile.workspace is not None and parsed.checkout_root is not None:
-            verify_launch_checkout(profile.workspace.checkout_path, parsed.checkout_root, adapters)
+            _verify_profile_checkout(profile.workspace.checkout_path, parsed.checkout_root, adapters)
         _validate_checkout(resolved_checkout, adapters)
         return run_doctor(
             parsed.source_path,
@@ -295,12 +300,14 @@ def _execute_cli_doctor(parsed: _ParsedDoctorCli, adapters: OsAdapters) -> dict[
         ).to_dict()
 
     if parsed.is_profile and profile.workspace is not None and parsed.checkout_root is not None:
-        verify_launch_checkout(profile.workspace.checkout_path, parsed.checkout_root, adapters)
+        _verify_profile_checkout(profile.workspace.checkout_path, parsed.checkout_root, adapters)
     _validate_checkout(resolved_checkout, adapters)
 
     if profile_pin is not None:
         leaf_sha256 = profile_pin
     else:
+        from superbrain.adapters.os.tls_material import read_server_cert_leaf_sha256
+
         assert cfg_cert_path is not None
         leaf_sha256 = read_server_cert_leaf_sha256(cfg_cert_path, adapters)
     endpoint = read_client_endpoint(endpoint_path, adapters)
@@ -322,12 +329,16 @@ def _execute_cli_doctor(parsed: _ParsedDoctorCli, adapters: OsAdapters) -> dict[
 
 def run_doctor_cli(args: list[str], *, os_: OsAdapters | None = None) -> int:
     """Parse ``brain doctor`` CLI flags, route online or offline fail-closed, and emit JSON or text."""
+    from superbrain.composition._operator_client import write_error_code, write_json_error
+
     parsed = _parse_args(args)
     if parsed is None:
         if "--json" in args[1:]:
             write_json_error(ErrorCode.INVALID_INPUT)
         write_error_code(ErrorCode.INVALID_INPUT)
         return 2
+    from superbrain.adapters.os import os_adapters
+
     adapters = os_ if os_ is not None else os_adapters()
     try:
         result_data = _execute_cli_doctor(parsed, adapters)
@@ -337,8 +348,12 @@ def run_doctor_cli(args: list[str], *, os_: OsAdapters | None = None) -> int:
         write_error_code(err.code)
         return 1
     if parsed.as_json:
+        import json
+
         sys.stdout.write(json.dumps({"ok": True, "data": result_data}, sort_keys=True) + "\n")
     else:
+        from superbrain.application.doctor import format_doctor_dict_text
+
         sys.stdout.write(format_doctor_dict_text(result_data))
     sys.stdout.flush()
     return 0

@@ -18,6 +18,9 @@ from typing import Any
 
 from superbrain.adapters.os import os_adapters
 from superbrain.adapters.os.daemon_config import (
+    CLI_CREDENTIAL_NAME as CLI_CREDENTIAL_NAME,
+)
+from superbrain.adapters.os.daemon_config import (
     publish_new_owner_file,
     read_client_credential,
     read_daemon_config,
@@ -61,7 +64,6 @@ __all__ = ["InitReport", "InitRequest", "ResetReport", "init_store", "main", "re
 ensure_maintenance_backend()
 
 DAEMON_CONFIG_NAME = "daemon.json"
-CLI_CREDENTIAL_NAME = "cli.credential"
 TLS_DIR_NAME = "tls"
 _BOOTSTRAP_ISSUER = "owner:local-bootstrap"
 _BOOTSTRAP_TTL = timedelta(minutes=10)

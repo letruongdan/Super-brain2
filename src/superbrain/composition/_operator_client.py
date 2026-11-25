@@ -7,6 +7,7 @@ import os
 import sys
 from collections.abc import Mapping
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from superbrain.adapters.os import os_adapters
 from superbrain.adapters.os.daemon_config import (
@@ -15,11 +16,13 @@ from superbrain.adapters.os.daemon_config import (
     read_client_endpoint,
     read_client_profile,
 )
-from superbrain.cli_api.loopback import LoopbackClient, LoopbackTarget
 from superbrain.core.client_profile import ClientProfile
 from superbrain.core.errors import BrainError, ErrorCode, safe_wire_message
 from superbrain.core.jsonvalue import JsonValue
 from superbrain.ports.os import OsAdapters
+
+if TYPE_CHECKING:
+    from superbrain.cli_api.loopback import LoopbackTarget
 
 __all__ = [
     "OperatorEndpointClient",
@@ -40,6 +43,8 @@ def call_operator_target(
     os_: OsAdapters | None = None,
 ) -> dict[str, JsonValue]:
     """Issue a pinned loopback operator request against ``target`` using bearer ``token``."""
+    from superbrain.cli_api.loopback import LoopbackClient
+
     adapters = os_ if os_ is not None else os_adapters()
     client = LoopbackClient(monotonic_ns=adapters.monotonic.monotonic_ns)
     return client.call_operator(target, path, json.dumps(body).encode("utf-8"), token)
@@ -49,6 +54,8 @@ class OperatorEndpointClient:
     """Bound loopback operator caller backed by a validated client profile."""
 
     def __init__(self, profile_path: Path, os_: OsAdapters | None = None) -> None:
+        from superbrain.cli_api.loopback import LoopbackTarget
+
         self._adapters = os_ if os_ is not None else os_adapters()
         if not os.path.lexists(profile_path):
             raise BrainError(ErrorCode.NOT_FOUND, "profile not found")

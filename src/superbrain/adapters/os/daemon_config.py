@@ -11,6 +11,10 @@ from pathlib import Path
 from typing import Any, cast
 
 from superbrain.adapters.os.durable import map_os_error
+from superbrain.core._json_parse import parse_json
+from superbrain.core._kernel_auth import DaemonConfig, parse_bearer_token
+from superbrain.core._kernel_base import require_opaque_id, require_workspace_alias
+from superbrain.core._kernel_daemon import Endpoint
 from superbrain.core.client_profile import (
     CLIENT_PROFILE_VERSION,
     ClientProfile,
@@ -18,15 +22,9 @@ from superbrain.core.client_profile import (
 )
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.ids import new_id
-from superbrain.core.kernel import (
-    DaemonConfig,
-    Endpoint,
-    parse_bearer_token,
-    require_opaque_id,
-    require_workspace_alias,
-)
-from superbrain.core.wire import parse_json
 from superbrain.ports.os import NoReplacePublisher, OsAdapters
+
+CLI_CREDENTIAL_NAME = "cli.credential"
 
 MAX_DAEMON_CONFIG_BYTES = 65_536
 MAX_CLIENT_PROFILE_BYTES = 65_536
