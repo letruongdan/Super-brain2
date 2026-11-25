@@ -324,6 +324,33 @@
 
 ---
 
+### Finding SP2-1D20C1C-P2 (P2): Bỏ Qua Kiểm Tra Quyền Thư Mục Đích Xuất Hiện Sau `_scan_outbox` (`outbox.py:428-436`)
+
+1. **Invariant.** Thư mục gốc `streams` và thư mục stream đích phải luôn qua kiểm tra liên kết và quyền `owner-only` ở chính điểm chuẩn bị đích ghi trước khi publish bất kỳ frame nào, không phụ thuộc chúng có tồn tại lúc `_scan_outbox` quét hay mới xuất hiện sau đó.
+2. **Sibling sweep.**
+   - `src/superbrain/storage/outbox.py` (`_enqueue_record`, dùng chung cho cả `enqueue_event` và `enqueue_gap`): loại bỏ hai nhánh `if not os.path.lexists(...)`, khôi phục gọi vô điều kiện `ensure_dir_tree_atomic(streams_root, ...)` và `ensure_dir_tree_atomic(sdir, ...)` (vẫn giữ mở `.part` 1 lần trong `_atomic_publish_frame`).
+   - Các sibling đã kiểm: `_locked` (gọi vô điều kiện `ensure_dir_tree_atomic(self._root, ...)` và `ensure_secure_regular_file_atomic`), `_iter_frame_paths` / `_collect_regular_frames` / `_decode_frame_file` (đều gọi `verify_owner_only`).
+   - `tests/storage/test_outbox_durability_and_limits.py::test_outbox_rejects_preexisting_insecure_directory_and_symlinked_stream_frame`: bổ sung kiểm tra hai ca độc lập cho `streams` và `sdir` xuất hiện ngay sau `_scan_outbox` với quyền không an toàn qua cả `enqueue_event` và `enqueue_gap` -> bắt buộc trả `INSECURE_PERMISSIONS` và ghi 0 frame.
+   - Bằng chứng (`evidence/v11-outbox-bugproof/`):
+     - **RED trên `1d20c1c` (`red_post_scan_bypass.log`):** `CASE1_RED_BYPASS: returned=ev-1 frames=1` và `CASE2_RED_BYPASS: returned=gap-1 frames=1`.
+     - **GREEN & Mutant:** toàn bộ `test_outbox_durability_and_limits.py` + `test_capture_envelope_and_privacy.py` pass trên Windows, và mutation nhánh `1d20c1c` (`lexists`) fail ở chính assertion mới này.
+3. **Lens table.**
+   | Lens | Status | Reason |
+   |---|---|---|
+   | Crash between two durable steps | holds | Giữ nguyên `.part` Atomic Publish Atomicity (`O_RDWR | O_CREAT | O_EXCL` -> `fsync` -> `os.replace`). |
+   | Restore, rollback and migration rewind state | not applicable | Đường ghi outbox cục bộ, không thuộc restore/migration. |
+   | Old binaries, old data, version fences | holds | Giữ nguyên cấu trúc frame và layout outbox. |
+   | Every path to the same invariant | fixed here | `_enqueue_record` áp dụng chung cho cả `enqueue_event` và `enqueue_gap`; kiểm cả `streams_root` lẫn `sdir`. |
+   | Concurrency, shutdown and cutoffs | holds | Chạy cùng `check_deadline=dl_check` trong `self._locked`. |
+   | Authority, identity and scope | fixed here | Không publish frame nếu `streams_root` hoặc `sdir` vừa xuất hiện không đạt `owner-only`. |
+   | Fail closed at limits and on the unknown | fixed here | Từ chối ngay `INSECURE_PERMISSIONS` / `UNSAFE_PATH` với 0 byte/frame ghi vào đích. |
+   | What actually left, and to whom | fixed here | Ngăn rò rỉ frame vào thư mục quyền hở (`frames == []`). |
+   | The world outside the daemon | fixed here | Bịt lỗ hổng TOCTOU nếu tác nhân ngoài tạo `streams` hoặc `sdir` giữa `_scan_outbox` và `_atomic_publish_frame`. |
+   | Evidence and oracles | fixed here | Đủ RED (`red_post_scan_bypass.log`), GREEN (`test_outbox_durability_and_limits.py`), và mutant `lexists` FAIL. |
+   | The document agrees with itself | fixed here | Cập nhật bảng A1–A7 và ghi nhận kết quả 5/5 `final-remediate-gate-v11` + chuẩn bị `v12`. |
+
+---
+
 ### Finding W4 (P3): Khóa Schema Dict Seed Outbox (`test_capture_envelope_and_privacy.py:991`)
 
 #### 1. Invariant
@@ -451,7 +478,14 @@ Kiểm tra inventory bằng `gate.parse_collected`:
 - **Python 3.14 Lượt 2 (giữ nguyên làm hồ sơ):** `accepted=False`, `test_job_seconds = 262.570 s`, `3413 passed, 1 failed` (`test_hook_entry_subprocess_enqueues_sanitized_stays_within_budget_and_imports_minimal` `106,909,200 ns` > `100 ms`).
 - **Python 3.14 Lượt 2 clean:** `accepted=True`, `test_job_seconds = 252.712 s`, JUnit `<testsuite>` = `1193.220 s`, spread `11.0%`, `3414 passed, 56 skipped, 0 failed`.
 
-### Bước tiếp theo ngay sau commit vá SP2-V10-01/02/03:
-1. Kiểm `ruff`, `mypy`, `lint-imports`, `green_focused_314.log`, và bằng chứng `evidence/v10-p1-p2-bugproof/` trên commit sạch của `remediate-runtime-opt` (`tree_is_clean == True`).
-2. Chạy gate **`final-remediate-gate-v11`** trên commit sạch mới (`--shards 6`, Python 3.11 × 2 và Python 3.14 × 3 để chứng minh A4 3/3 đạt dưới tải).
+### Kết quả gate `final-remediate-gate-v11` trên `1d20c1c` (`--shards 6`, cache wheel lạnh):
+- **Python 3.11 Lượt 1:** `accepted=True`, `test_job_seconds = 209.400 s`, JUnit `<testsuite>` = `995.453 s`, spread `7.0%`, `3414 passed, 56 skipped, 0 failed`.
+- **Python 3.11 Lượt 2:** `accepted=True`, `test_job_seconds = 226.769 s`, JUnit `<testsuite>` = `1086.081 s`, spread `6.6%`, `3414 passed, 56 skipped, 0 failed`.
+- **Python 3.14 Lượt 1:** `accepted=True`, `test_job_seconds = 268.681 s`, JUnit `<testsuite>` = `1285.512 s`, spread `10.2%`, `3414 passed, 56 skipped, 0 failed`.
+- **Python 3.14 Lượt 2:** `accepted=True`, `test_job_seconds = 254.726 s`, JUnit `<testsuite>` = `1199.362 s`, spread `11.6%`, `3414 passed, 56 skipped, 0 failed`.
+- **Python 3.14 Lượt 3:** `accepted=True`, `test_job_seconds = 246.807 s`, JUnit `<testsuite>` = `1161.141 s`, spread `11.8%`, `3414 passed, 56 skipped, 0 failed`.
+
+### Bước tiếp theo ngay sau commit vá P2 `outbox.py` & `test_outbox_durability_and_limits.py`:
+1. Kiểm `ruff`, `mypy`, `lint-imports`, `test_outbox_durability_and_limits.py`, `test_capture_envelope_and_privacy.py`, và bằng chứng `evidence/v11-outbox-bugproof/` trên commit sạch của `remediate-runtime-opt` (`tree_is_clean == True`).
+2. Chạy lại full gate **`final-remediate-gate-v12`** (`--shards 6`, Python 3.11 × 2 và Python 3.14 × 2) trên commit sạch mới.
 3. Bàn giao cho Reviewer độc lập (Codex) thẩm định delta + phê duyệt reseal `.verification/task9-seal.json` (giữ digest cũ `ca08c25897c9765e249261fcb08c9e775a57dd508a08d942ccc8a4c12641150e`), rồi chạy `test_lock.py check` + gate xác nhận cuối trên commit đã có seal hợp lệ.

@@ -585,6 +585,84 @@ def test_outbox_rejects_preexisting_insecure_directory_and_symlinked_stream_fram
         )
     assert exc_link.value.code is ErrorCode.UNSAFE_PATH
 
+    # Post-scan newly appearing streams root or target stream dir must still pass owner-only verification
+    # before publishing any frame (both enqueue_event and enqueue_gap share _enqueue_record).
+    from superbrain.ports.capture import ProducerCaptureGap
+    from superbrain.storage._outbox_io import stream_dir_key
+
+    class _InsecureOnDirPerms:
+        def __init__(self, base: Any, target: Path) -> None:
+            self._base = base
+            self._target = target.resolve()
+
+        def secure_directory(self, path: Path) -> None:
+            self._base.secure_directory(path)
+
+        def secure_file(self, path: Path) -> None:
+            self._base.secure_file(path)
+
+        def problems(self, path: Path) -> list[str]:
+            if path.resolve() == self._target:
+                return ["world_writable"]
+            return list(self._base.problems(path))
+
+        def object_problems(self, path: Path) -> list[str]:
+            return self.problems(path)
+
+    ob_post_streams = trusted_tmp / "post-scan-insecure-streams"
+    ob_post_streams.mkdir()
+    os_.permissions.secure_directory(ob_post_streams)
+    evil_streams = ob_post_streams / "streams"
+    sp_post1 = OutboxSpool(
+        ob_post_streams,
+        permissions=_InsecureOnDirPerms(os_.permissions, evil_streams),
+        file_lock=OUTBOX_FILE_LOCK,
+    )
+    orig_scan1 = sp_post1._scan_outbox
+
+    def _create_streams_post_scan(**kw: Any) -> Any:
+        res = orig_scan1(**kw)
+        evil_streams.mkdir(exist_ok=True)
+        return res
+
+    monkeypatch.setattr(sp_post1, "_scan_outbox", _create_streams_post_scan)
+    with pytest.raises(BrainError) as exc_post_streams:
+        sp_post1.enqueue_event(_mk_event(1, stream="s-post-1"))
+    assert exc_post_streams.value.code is ErrorCode.INSECURE_PERMISSIONS
+    assert list(ob_post_streams.rglob("*.frame")) == []
+
+    ob_post_sdir = trusted_tmp / "post-scan-insecure-sdir"
+    (ob_post_sdir / "streams").mkdir(parents=True)
+    os_.permissions.secure_directory(ob_post_sdir)
+    os_.permissions.secure_directory(ob_post_sdir / "streams")
+    evil_sdir = ob_post_sdir / "streams" / stream_dir_key("s-post-gap")
+    sp_post2 = OutboxSpool(
+        ob_post_sdir,
+        permissions=_InsecureOnDirPerms(os_.permissions, evil_sdir),
+        file_lock=OUTBOX_FILE_LOCK,
+    )
+    orig_scan2 = sp_post2._scan_outbox
+
+    def _create_sdir_post_scan(**kw: Any) -> Any:
+        res = orig_scan2(**kw)
+        evil_sdir.mkdir(exist_ok=True)
+        return res
+
+    monkeypatch.setattr(sp_post2, "_scan_outbox", _create_sdir_post_scan)
+    gap = ProducerCaptureGap(
+        gap_id="gap-post-1",
+        producer_stream="s-post-gap",
+        sequence=1,
+        reason="hook_timeout",
+        recorded_at="2026-11-25T12:00:00Z",
+        estimated_count=1,
+        duration_ms=50,
+    )
+    with pytest.raises(BrainError) as exc_post_sdir:
+        sp_post2.enqueue_gap(gap)
+    assert exc_post_sdir.value.code is ErrorCode.INSECURE_PERMISSIONS
+    assert list(ob_post_sdir.rglob("*.frame")) == []
+
 
 def test_outbox_frames_use_pure_lf_fail_closed_on_newlineless_frame_and_repair_atomically(
     trusted_tmp: Path, monkeypatch: pytest.MonkeyPatch

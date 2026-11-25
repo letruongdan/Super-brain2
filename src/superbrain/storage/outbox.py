@@ -426,11 +426,9 @@ class OutboxSpool:
             if used + len(frame_bytes) > self._max_bytes:
                 raise BrainError(ErrorCode.STORAGE_FULL, "storage full")
             streams_root = self._root / _STREAMS_DIR
-            if not os.path.lexists(streams_root):
-                ensure_dir_tree_atomic(streams_root, perms, renamer, check_deadline=dl_check)
+            ensure_dir_tree_atomic(streams_root, perms, renamer, check_deadline=dl_check)
             sdir = streams_root / stream_key
-            if not os.path.lexists(sdir):
-                ensure_dir_tree_atomic(sdir, perms, renamer, check_deadline=dl_check)
+            ensure_dir_tree_atomic(sdir, perms, renamer, check_deadline=dl_check)
             base = f"{highest_order + 1:016d}_{record_kind}_{sequence:020d}"
             self._atomic_publish_frame(
                 sdir / f"{base}{_FRAME_SUFFIX}",
