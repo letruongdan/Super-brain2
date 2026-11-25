@@ -112,8 +112,10 @@ Hai dòng của Task 8.2 nằm trên đường request nên crash phải đến 
 composition owner với `FixtureKernelDomain` bind trên owner thread (store mở với projection fixture), driver in thêm
 `MODULE` và `SCHEMA` để test đối chiếu module và digest schema đóng gói với venv/checkout. Khi daemon `READY`, test
 chụp trạng thái bền rồi gửi một `prepare_task` có `task_id` và `idempotency_key` tường minh qua `brain-mcp` đã cài;
-test đòi `CRASHPOINT_HIT <tên>` và mã thoát 86 sau `READY`, và frame của shim cũ là lỗi `daemon_unavailable` với
-`_meta.superbrain/request_may_have_run=true` (đã gửi, không có success).
+test đòi `CRASHPOINT_HIT <tên>` và mã thoát 86 sau `READY`, và frame của shim cũ là một trong hai envelope
+uncertain tách biệt: hoặc lỗi mất kết nối sau POST (`daemon_unavailable` kèm `_meta.superbrain/request_may_have_run=true`),
+hoặc nếu pha `COMMITTING` vượt ngưỡng cutoff `1.475 ms` theo mục 6.5 trước khi thoát 86 thì là `commit_outcome_unknown`
+(không gắn `_meta` vận chuyển, khớp đặc tả shim T7a).
 
 | Crashpoint | Operation | Trước | Sau crash | Đã ACK? | Phục hồi | Invariant | CrashCase | Tiến trình chết | Mất điện |
 |---|---|---|---|---|---|---|---|---|---|

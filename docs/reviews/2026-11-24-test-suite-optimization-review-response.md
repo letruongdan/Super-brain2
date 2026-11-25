@@ -199,6 +199,75 @@
 
 ---
 
+### Finding Reseal2-P2a (P2): Vòng Đời Kết Nối Trong Ca Đối Chứng Lookup PID (`test_kernel_native_receipt_contract.py`)
+
+#### 1. Invariant
+> Mọi ca đối chứng khẳng định định danh tiến trình client từ bộ quan sát socket bất đồng bộ phải giữ kết nối TCP còn sống tới khi pha lookup nhìn thấy 4-tuple và chốt timestamp trước lúc đóng socket, không phụ thuộc vào tốc độ chạy đua giữa luồng HTTP trả nhanh và thread pool quan sát.
+
+#### 2. Sibling sweep
+- `tests/integration/test_kernel_native_receipt_contract.py`:
+  - Thêm context helper `_hold_lookup_before_reply(monkeypatch, native_owner)` dùng cục bộ trong `with` cho từng ca đối chứng: theo dõi `_lookup_loopback_client_pid` theo từng `(client_port, listen_port)` để ghi `(pid, saw_ns)` và mở khóa `_release_owner_reply` / `_write_200_best_effort` ngay trước khi server flush response & đóng socket.
+  - `test_t9_r02_handshake_independent_of_collector_latency`:
+    - **Part 1 (`corr-r02-pos`):** chạy trong `_hold_lookup_before_reply`, kiểm đủ `owner_call` và `socket_observation` (`observation_status == "ok"`, `client_pid == os.getpid()`, `client_started_at == daemon_started_at`, `started_at <= observed_at <= ended_at`, `so["ended_at"] >= ev1[0]["ended_at"]`, và `saw_ns <= flush_ns` trên tuple nhìn thấy). Context thoát hoàn toàn trước Part 2 & Part 3.
+    - **Part 2 (`corr-r02-held`):** giữ nguyên không prewait (`worker_entered_event` trong 5 ms, trả lời `< 0.25 s`, suy biến `observation_incomplete`).
+    - **Part 3 (`corr-r02-deadline`):** giữ đồng hồ thực kiểm cutoff 250 ms < 500 ms mà không chặn reply; khẳng định `res_deadline["ok"] is True` và `t_deadline_elapsed < 0.25`, đồng thời fail closed khi kiểm receipt (`"ok"` khớp PID/start_time hoặc `"observation_incomplete"` với `client_pid is None` dưới nghẽn 6 shard).
+  - **Sibling sửa cùng lỗi:** `test_owner_driver_non_release_error_quiesced_and_timeout_logging` Part 1 (`corr-submit-boom`, dòng 2961) và Part 2 (`corr-quiesced`, dòng 3000) cùng dùng `_write_200_best_effort` trả nhanh `get_health` bị lỗi tương tự Part 1 -> bọc hai lượt này bằng `_hold_lookup_before_reply` (nhả trước Call 3 `corr-timeout-none` và Call 4 `_boom_pid`).
+  - Các sibling khác đã kiểm (đã đồng bộ sẵn hoặc kiểm kịch bản đóng/lỗi): `test_t9_r02_socket_observation_lifetime_and_post_close_lookup_rejection` (`_wait_live_lookup_before_reply`), `test_t9_r02_tls_close_before_worker_return_and_ready_port_mismatch` (`_wait_live_before_reply`), `tests/support/inc2_native_owner.py` (giữ nguyên collector không prewait).
+- Bằng chứng thực nghiệm (`C:\Users\letru\sb2-trusted-local\evidence\v9-p2-bugproof\`):
+  - **RED (`red_p2a_siblings.log`):** chèn trễ 50 ms mô phỏng nghẽn CPU vào `_lookup_loopback_client_pid` trước khi sửa -> cả dòng 2961 (`corr-submit-boom`) và dòng 5517 (`corr-r02-pos`) FAIL (`assert None == os.getpid()`, `RED_P2A_RC=1`).
+  - **GREEN (`green_p2a_50ms_delay_314.log`, `green_p2a_5x_50ms_311.log`):** với cùng trễ 50 ms, 3.14 pass (`2 passed in 2.17s`), 3.11 pass liên tiếp 5/5 lượt.
+  - **Mutation (`mut_p2a_null_pid.log`):** ép lookup trả `None` -> FAIL ngay tại dòng `assert ev1[0]["client_pid"] == os.getpid()` (`MUT_P2A_NULL_PID_RC=1`).
+
+#### 3. Lens table
+| Lens | Status | Reason |
+|---|---|---|
+| Crash between two durable steps | not applicable | Kiểm telemetry TCP/TLS bộ nhớ RAM của `LoopbackServer` và collector. |
+| Restore, rollback and migration rewind state | not applicable | Không thao tác store/migration. |
+| Old binaries, old data, version fences | holds | Chạy trên template transport chuẩn của T7/T9. |
+| Every path to the same invariant | fixed here | Vá đồng bộ Part 1 (`_release_owner_reply`), Part 3 (`corr-r02-deadline`) và hai sibling `_write_200_best_effort` (`corr-submit-boom`, `corr-quiesced`). |
+| Concurrency, shutdown and cutoffs | fixed here | Chờ lookup xong chỉ trong phạm vi context ca đối chứng theo đúng cặp port `(client_port, listen_port)`; Part 2/Part 3 vẫn chạy hoàn toàn không prewait. |
+| Authority, identity and scope | holds | Vẫn kiểm khớp `client_pid == os.getpid()` và `client_started_at == daemon_started_at`. |
+| Fail closed at limits and on the unknown | fixed here | Part 3 không chấp nhận trộn `"ok"` với `pid=None` hay `"observation_incomplete"` với PID khác `None`; Part 2 giữ `observation_incomplete`. |
+| What actually left, and to whom | holds | Đối chiếu `owner_call` và `socket_observation` khớp `connection_id` và `response_flushed_ok=True`. |
+| The world outside the daemon | fixed here | Giữ kết nối TCP sống tới lúc `GetExtendedTcpTable` sighting xong để phản ánh đúng ca đối chứng trên Windows dưới tải 6 shard. |
+| Evidence and oracles | fixed here | Đủ RED (`red_p2a_siblings.log`), GREEN dưới trễ 50 ms (3.14 & 3.11 × 5) và mutation `None` PID FAIL (`MUT_P2A_NULL_PID_RC=1`). |
+| The document agrees with itself | fixed here | Docstring/comment trong `test_kernel_native_receipt_contract.py` và bảng A1–A7 khớp hành vi mới. |
+
+---
+
+### Finding Reseal2-P2b (P2): Tách Hai Nhánh Envelope Uncertain Theo Đặc Tả §6.5 (`crash_cases.py`, `sp1-crash-table.md`)
+
+#### 1. Invariant
+> Khi một request đang trong pha `COMMITTING` bị gián đoạn trước lúc nhận success, client shim phải nhận đúng một trong hai envelope uncertain tách biệt — mất kết nối sau POST (`daemon_unavailable` kèm `_meta.superbrain/request_may_have_run=true`) hoặc vượt cutoff `1.475 ms` trong pha commit theo mục 6.5 (`commit_outcome_unknown` không kèm `_meta` vận chuyển) — và mọi khẳng định crashpoint/bền/replay phía sau vẫn giữ nguyên.
+
+#### 2. Sibling sweep
+- `tests/support/crash_cases.py` (`assert_uncertain`, dùng cho cả `expect_crash_before_commit` dòng 1514 và `expect_crash_after_commit` dòng 1587):
+  - Tách thành hai helper xác minh chặt chẽ theo từng nhánh: `_assert_transport_uncertain` (yêu cầu `error.code == "daemon_unavailable"`, `message == "daemon unavailable"`, `_meta == {"superbrain/request_may_have_run": True}`) và `_assert_in_commit_cutoff_unknown` (yêu cầu `error.code == "commit_outcome_unknown"`, `message == "commit outcome unknown"`, `"_meta" not in result` — đúng chuẩn shim `stdio.py` & `tests/mcp/test_stdio.py:1001`). Mọi mã khác (kể cả `deadline_exceeded` / `store_busy` trước commit) đều fail; đồng thời `run_kernel_case` vẫn đòi `assert_request_crashed` (`CRASHPOINT_HIT <tên>` + exit 86), 0 commit (`before_commit`) / 1 commit (`after_commit_before_response`), và retry đúng `idempotency_key` replay chuẩn theo policy hiện tại.
+- `tests/integration/test_kernel_privacy_persistence.py` (`_call_idempotent_with_uncertain_retry`, dòng 190): cập nhật sibling helper thử lại 1 lần khi nghẽn host > 1.5–2 s để nhận diện cả hai envelope uncertain hợp lệ (giữ nguyên ca `drop_episode` dòng 375 kiểm trực tiếp `_meta` cho `BrokenPipeError`).
+- `docs/design/sp1-crash-table.md` (dòng 115–118): đồng bộ mô tả hai envelope tách biệt (mất kết nối sau POST vs cutoff `1.475 ms` trong pha `COMMITTING` theo mục 6.5), giữ nguyên đòi hỏi `CRASHPOINT_HIT`, exit 86, 1 commit và replay.
+- Sibling đã kiểm không cần đổi: `src/superbrain/mcp/stdio.py`, `tests/mcp/test_stdio.py:986-1009`, `tests/integration/test_kernel_shim.py:1751, 1978` (đều phân biệt đúng `commit_outcome_unknown` không `_meta` với `ToolCallUncertain` có `_meta`).
+- Bằng chứng thực nghiệm (`C:\Users\letru\sb2-trusted-local\evidence\v9-p2-bugproof\`):
+  - **RED (`red_p2b.log`):** `assert_uncertain` cũ gặp `commit_outcome_unknown` (không `_meta`) bị `AssertionError` ở dòng 1428 (`EXIT=1`).
+  - **4 Mutants + Oracle (`green_and_mutants_p2b.log`):** reject cả `daemon_unavailable` thiếu `_meta`, `commit_outcome_unknown` mang `_meta` giả, `deadline_exceeded` trước commit, và `_meta.request_may_have_run=False`.
+  - **E2E Real-Shim Pausepoint (`green_p2b_real_shim_commit_unknown.log`):** bật `SUPERBRAIN_CRASHPOINT=kernel.after_commit_before_response` + `SUPERBRAIN_PAUSEPOINT=kernel.after_commit_before_response` thả sau `1.65 s` -> `brain-mcp` thật nhận `{'code': 'commit_outcome_unknown', 'message': 'commit outcome unknown'}` (`HAS_META= False`), tiến trình con vẫn thoát 86 với `CRASHPOINT_HIT kernel.after_commit_before_response`, kiểm 1 delivery/idempotency/event bền và replay `brain-mcp`/`brain mcp` **PASS** (`1 passed in 16.12s`).
+
+#### 3. Lens table
+| Lens | Status | Reason |
+|---|---|---|
+| Crash between two durable steps | fixed here | `before_commit` vẫn buộc 0 commit, `after_commit_before_response` buộc đúng 1 commit + replay duy nhất dưới mọi nhánh uncertain. |
+| Restore, rollback and migration rewind state | holds | Vẫn qua kiểm tra `tighten_policy_offline` (quarantine + revoke) trước khi replay. |
+| Old binaries, old data, version fences | holds | Chạy driver wheel thực `-I` qua `brain-mcp` và `brain mcp`. |
+| Every path to the same invariant | fixed here | Đồng bộ `crash_cases.py` (`before_commit` & `after_commit_before_response`), `test_kernel_privacy_persistence.py` (`_call_idempotent_with_uncertain_retry`), `sp1-crash-table.md`. |
+| Concurrency, shutdown and cutoffs | fixed here | Phản ánh chính xác nhánh arbiter `1.475 ms` ở pha `COMMITTING` (§6.5) song hành đường crash socket drop trước cutoff. |
+| Authority, identity and scope | holds | Replay vẫn bị từ chối `UNAUTHENTICATED` trên credential đã thu hồi của cùng principal. |
+| Fail closed at limits and on the unknown | fixed here | Không nới lỏng `_pre_commit_refusal`; cấm `daemon_unavailable` thiếu `_meta` và cấm `commit_outcome_unknown` mang `_meta` sai hợp đồng. |
+| What actually left, and to whom | holds | Redacted artifact digest vẫn không rò rỉ trong payload replay. |
+| The world outside the daemon | holds | Xử lý trung thực biến động trễ ổ đĩa/CPU 6 shard trên Windows mà không hạ ngưỡng cutoff sản phẩm. |
+| Evidence and oracles | fixed here | Đủ RED, 4 mutants FAIL, và E2E real-shim pausepoint 1.65 s với `commit_outcome_unknown` -> PASS toàn bộ kiểm tra bền & replay. |
+| The document agrees with itself | fixed here | Cập nhật `sp1-crash-table.md` dòng 115–118 khớp §6.5, `stdio.py` T7a và `tests/mcp/test_stdio.py:1001`. |
+
+---
+
 ### Finding W4 (P3): Khóa Schema Dict Seed Outbox (`test_capture_envelope_and_privacy.py:991`)
 
 #### 1. Invariant
@@ -281,10 +350,10 @@ Kiểm tra inventory bằng `gate.parse_collected`:
 | `tests/integration/test_sp2_i2_wheel_compat.py` + `tests/support/inc2_fixture.py` | 2 = 2 | Khôi phục `len(wheels)==1` & SHA-256 | Kiểm thực wheel I2 vs SP2 + `py=194 pyc=194` trên 3.14/3.11 | Pass trong `v11` (3.14 & 3.11) | **Đạt** (62.2 → 29.6 s) | Đạt |
 | `tests/application/test_t8_review_p01_{wrapped_paths,r2_edge_globs,r3_spellings}.py` + `_privacy_scan.py` | 64=64, 73=73 | Giữ nguyên 100% wrapper/glob | Kiểm tương đương `[a-z]+` IGNORECASE trên 3.11 & 3.14 (`0x130, 0x131, 0x17f, 0x212a`) | Pass trong `v10`, `v11` (3.14 & 3.11) | **Đạt** (19.5→8.3, 22.9→10.9 s) | Đạt |
 | `tests/integration/test_kernel_daemon.py` | 36 = 36 | Giữ nguyên + spy cutoff & wait/join Reseal-P2 (`grace_s=0.55 < 0.85`) | **+0.40s PROBE & REOPEN-DEADLINE MUTATION KILLED** (`evidence/daemon-cutoff-bugproof/`), `36 passed in 21.79s` | Pass trong `v6`–`v8` + kiểm sau vá Reseal-P2 | No-Go (-18.7 s; 36 ca daemon thực) | Đạt |
-| `tests/integration/{test_t9_client_sighting,test_kernel_native_receipt_contract,test_t9_socket_readiness}.py` | Không đổi | Giữ nguyên `< 0.10 s` & `< collector_timeout_s` | Reset mốc đồng hồ ngay sau `open_client`; `test_t9_r02` dùng `250 ms < collector_timeout_s (500 ms)` tránh jitter TLS 6 shard | Pass trên 3.14 & 3.11 | Đạt | Đạt |
+| `tests/integration/{test_t9_client_sighting,test_kernel_native_receipt_contract,test_t9_socket_readiness}.py` | Không đổi | Giữ nguyên `< 0.10 s`, `< collector_timeout_s`, `client_pid == os.getpid()`, `observation_status == "ok"` | Reseal2-P2a: `_hold_lookup_before_reply` + sibling `2961/3000` + `corr-r02-deadline`; RED/GREEN 50ms/NULL-PID MUTANT (`evidence/v9-p2-bugproof/`) | Pass 3.14 & 3.11 × 5 (trễ 50 ms) | Đạt | Đạt |
 | `tests/application/test_remediation_i2_t5_worker.py` | Không đổi | Giữ nguyên `wait_cancelled` & `seen_attempts == [1, 2]` | Đồng bộ timeout chờ hủy `0.3` -> `BOUND_WAIT_S` với toàn bộ 8 sibling `wait_cancelled` | Đã kiểm cục bộ + gate 3.14/3.11 | Không tăng khi hủy ngay | Đạt |
-| `tests/integration/test_kernel_privacy_persistence.py` | Không đổi | Giữ nguyên toàn bộ assert privacy & `drop_episode` trực tiếp | Retry 1 lần đúng `idempotency_key` nếu `CLIENT_TOOL_BUDGET_NS` 2 s gặp nghẽn CPU >2 s | Đã kiểm cục bộ + gate 3.14/3.11 | Không đổi khi không stall | Đạt |
-| `tests/support/crash_cases.py` + `tests/storage/{test_backup,test_reconcile,test_restore,test_crash_matrix}.py` | Không đổi | Không đổi | `test_matrix_detects_a_removed_crashpoint` pass + mutation cô lập `Store.store_content` bị bắt tại `test_reconcile.py:61,71` | Pass trong `v11` (3.14 & 3.11) | **Đạt** (`test_crash_matrix` 36.9→21.0 s) | Đạt |
+| `tests/integration/test_kernel_privacy_persistence.py` | Không đổi | Giữ nguyên toàn bộ assert privacy & `drop_episode` trực tiếp | Retry 1 lần đúng `idempotency_key` cho cả post-POST `daemon_unavailable` (`_meta`) lẫn §6.5 `commit_outcome_unknown` | Pass full file trong `green_suites_314.log` (`63 passed`) | Không đổi khi không stall | Đạt |
+| `tests/support/crash_cases.py` + `docs/design/sp1-crash-table.md` + `tests/storage/{test_backup,test_reconcile,test_restore,test_crash_matrix}.py` | Không đổi | Tách 2 nhánh uncertain trong `assert_uncertain` | Reseal2-P2b: RED/4-mutant/E2E pausepoint `commit_outcome_unknown` (`evidence/v9-p2-bugproof/`) + `test_matrix_detects_a_removed_crashpoint` | Pass 3.14 & 3.11 (`green_suites_314.log`, `green_focused_311.log`) | **Đạt** (`test_crash_matrix` 36.9→21.0 s) | Đạt |
 | `tests/storage/{test_runtime,test_kernel_revocation,test_ledger,test_remediation_c02_lost_main_db,test_flush_routing,test_remediation_c01_wal_admission,test_remediation_c01_r4_reading_leftovers}.py` | Không đổi | Không đổi | Không đổi đường test migration/version fence/sync spy | Pass trong `v10`, `v11` (3.14 & 3.11) | `test_runtime`, `test_restore`, `test_ledger` đạt | Đạt |
 | `tests/support/crash_child.py` | Không đổi | Không đổi | Sửa `from __future__ import annotations` cho 3.11 | Pass trong `v10`, `v11` (3.14 & 3.11) | Hỗ trợ T01/T02 | Đạt |
 
@@ -311,7 +380,15 @@ Kiểm tra inventory bằng `gate.parse_collected`:
 - **Python 3.14 Lượt 1:** `accepted=True`, `test_job_seconds = 235.173 s` (`< 275 s`), JUnit `<testsuite>` = **`1118.863 s`** (`<= 1200 s`), độ lệch shard `8.7%`, `3414 passed, 56 skipped, 0 failed`.
 - **Python 3.14 Lượt 2:** `accepted=True`, `test_job_seconds = 236.985 s` (`< 275 s`), JUnit `<testsuite>` = **`1110.450 s`** (`<= 1200 s`), độ lệch shard `9.2%`, `3414 passed, 56 skipped, 0 failed`.
 
-### Chạy gate xác nhận sau khi vá oracle shutdown Reseal-P2:
-1. Lưu commit sửa oracle shutdown (`tests/integration/test_kernel_daemon.py`) + tài liệu đối chiếu này lên nhánh `remediate-runtime-opt` (`tree_is_clean(repo) == True`).
-2. Chạy `scripts.gate --shards 6` (cache wheel lạnh, 3.11 × 2 và 3.14 × 2) vào `C:\Users\letru\sb2-trusted-local\evidence\final-remediate-gate-v9\`.
-3. Kiểm tra lại `ruff check src tests scripts`, `mypy`, `lint-imports` và bàn giao cho Reviewer độc lập duyệt 29 tệp + reseal `.verification/task9-seal.json`.
+### Kết quả gate `final-remediate-gate-v9` trên `e9bb521ef` (`--shards 6`, cache wheel lạnh):
+- **Python 3.11 Lượt 1:** `accepted=True`, `test_job_seconds = 240.515 s`, JUnit `<testsuite>` = `1153.353 s`, spread `6.9%`, `3414 passed, 56 skipped, 0 failed`.
+- **Python 3.11 Lượt 2 (giữ nguyên làm hồ sơ):** `accepted=False`, `test_job_seconds = 244.172 s`, `3413 passed, 1 failed` (`test_t9_r02_handshake_independent_of_collector_latency` — đã vá ở **Reseal2-P2a**).
+- **Python 3.11 Lượt chạy lại sạch:** `accepted=True`, `test_job_seconds = 246.531 s`, JUnit `<testsuite>` = `1197.435 s`, spread `6.8%`, `3414 passed, 56 skipped, 0 failed`.
+- **Python 3.14 Lượt 1:** `accepted=True`, `test_job_seconds = 248.071 s`, JUnit `<testsuite>` = `1161.379 s`, spread `10.6%`, `3414 passed, 56 skipped, 0 failed`.
+- **Python 3.14 Lượt 2 (giữ nguyên làm hồ sơ):** `accepted=False`, `test_job_seconds = 245.166 s`, `3413 passed, 1 failed` (`test_replay_after_response_loss_through_real_shim[serve-fixture@kernel.after_commit_before_response]` — đã vá ở **Reseal2-P2b**).
+- **Python 3.14 Lượt chạy lại sạch:** `accepted=True`, `test_job_seconds = 251.562 s`, JUnit `<testsuite>` = `1189.461 s`, spread `10.4%`, `3414 passed, 56 skipped, 0 failed`.
+
+### Bước tiếp theo ngay sau commit vá Reseal2-P2a & Reseal2-P2b:
+1. Kiểm `ruff`, `mypy`, `lint-imports`, `green_suites_314.log` (`63 passed`), `green_focused_311.log` (`4 passed`), và toàn bộ bằng chứng `evidence/v9-p2-bugproof/` trên commit sạch của `remediate-runtime-opt` (`tree_is_clean == True`).
+2. Bàn giao cho Reviewer độc lập (Codex) thẩm định delta + phê duyệt reseal `.verification/task9-seal.json` (giữ digest cũ).
+3. Chạy xác nhận gate cuối trên chính commit sạch đã được reseal (`test_lock.py check` exit 0 + `scripts.gate --shards 6` cho 3.11 × 2 và 3.14 × 2).

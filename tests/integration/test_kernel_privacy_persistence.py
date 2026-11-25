@@ -188,18 +188,23 @@ def _external_connections(monkeypatch: pytest.MonkeyPatch) -> list[str]:
 
 
 def _call_idempotent_with_uncertain_retry(shim: Shim, tool: str, args: dict[str, JsonValue]) -> dict[str, Any]:
-    """Retry once with the same idempotency_key if a >2 s host stall triggers uncertain transport timeout."""
+    """Retry once with the same idempotency_key on post-POST transport uncertainty or spec 6.5 commit cutoff."""
     assert "idempotency_key" in args
     reply = shim.call(tool, args)
     meta = reply.get("_meta")
     err = reply.get("structuredContent", {}).get("error") if isinstance(reply.get("structuredContent"), dict) else None
-    if (
-        reply.get("isError") is True
-        and isinstance(meta, dict)
+    transport_uncertain = (
+        isinstance(meta, dict)
         and meta.get("superbrain/request_may_have_run") is True
         and isinstance(err, dict)
         and err.get("code") == ErrorCode.DAEMON_UNAVAILABLE.value
-    ):
+    )
+    commit_cutoff_unknown = (
+        isinstance(err, dict)
+        and err.get("code") == ErrorCode.COMMIT_OUTCOME_UNKNOWN.value
+        and "_meta" not in reply
+    )
+    if reply.get("isError") is True and (transport_uncertain or commit_cutoff_unknown):
         reply = shim.call(tool, args)
     return _success(reply)
 

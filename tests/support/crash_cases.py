@@ -21,7 +21,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -1421,13 +1421,36 @@ def content(result: dict[str, JsonValue]) -> dict[str, JsonValue]:
     return sc
 
 
+def _assert_transport_uncertain(result: dict[str, JsonValue], error: Mapping[str, JsonValue]) -> None:
+    """Post-POST transport drop: ``daemon_unavailable`` with ``_meta.superbrain/request_may_have_run=True``."""
+    assert error.get("code") == ErrorCode.DAEMON_UNAVAILABLE.value, result
+    assert error.get("message") == "daemon unavailable", result
+    assert result.get("_meta") == {"superbrain/request_may_have_run": True}, result
+
+
+def _assert_in_commit_cutoff_unknown(result: dict[str, JsonValue], error: Mapping[str, JsonValue]) -> None:
+    """Spec 6.5 in-commit cutoff before process exit: ``commit_outcome_unknown`` without transport ``_meta``."""
+    assert error.get("code") == ErrorCode.COMMIT_OUTCOME_UNKNOWN.value, result
+    assert error.get("message") == "commit outcome unknown", result
+    assert "_meta" not in result, result
+
+
 def assert_uncertain(result: dict[str, JsonValue]) -> None:
-    """The old shim sent the request and got no success: an uncertain ``daemon_unavailable`` tool error."""
+    """The old shim sent an in-commit request and got either post-POST transport loss
+    (``daemon_unavailable`` + ``_meta.superbrain/request_may_have_run=True``) or spec 6.5 in-commit
+    deadline cutoff (``commit_outcome_unknown`` without transport ``_meta``)."""
     assert result.get("isError") is True, result
-    meta = result.get("_meta")
-    assert isinstance(meta, dict) and meta.get("superbrain/request_may_have_run") is True, result
-    error = content(result).get("error")
-    assert isinstance(error, dict) and error.get("code") == ErrorCode.DAEMON_UNAVAILABLE.value, result
+    sc = content(result)
+    assert sc.get("ok") is False, result
+    error = sc.get("error")
+    assert isinstance(error, dict), result
+    code = error.get("code")
+    if code == ErrorCode.DAEMON_UNAVAILABLE.value:
+        _assert_transport_uncertain(result, error)
+    elif code == ErrorCode.COMMIT_OUTCOME_UNKNOWN.value:
+        _assert_in_commit_cutoff_unknown(result, error)
+    else:
+        raise AssertionError(f"unexpected non-uncertain trigger result: {result!r}")
 
 
 def ok_data(result: dict[str, JsonValue]) -> dict[str, JsonValue]:

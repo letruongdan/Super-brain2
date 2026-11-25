@@ -7,8 +7,10 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from functools import cache, partial
@@ -2883,6 +2885,83 @@ def test_native_verifier_rejects_null_response_digest(trusted_tmp: Path) -> None
     assert verify_same_daemon(roundtripped_null, roundtripped_second_null) is False
 
 
+@contextmanager
+def _hold_lookup_before_reply(
+    monkeypatch: pytest.MonkeyPatch,
+    native_owner: Any,
+) -> Iterator[list[dict[str, Any]]]:
+    """Keep the connection live on the server reply boundary until async observer lookup finishes."""
+    from superbrain.cli_api import _loopback_server
+
+    lock = threading.Lock()
+    done_by_tuple: dict[tuple[int, int], threading.Event] = {}
+    sightings: list[dict[str, Any]] = []
+
+    def _event_for(peer_port: int, listen_port: int) -> threading.Event:
+        key = (int(peer_port), int(listen_port))
+        with lock:
+            ev = done_by_tuple.get(key)
+            if ev is None:
+                ev = threading.Event()
+                done_by_tuple[key] = ev
+            return ev
+
+    orig_lookup = native_owner._lookup_loopback_client_pid
+    orig_release = _loopback_server.LoopbackServer._release_owner_reply
+    orig_best_effort = _loopback_server.LoopbackServer._write_200_best_effort
+
+    def _tracked_lookup(client_port: int, listen_port: int, **kwargs: Any) -> int | None:
+        pid: int | None = None
+        try:
+            pid = orig_lookup(client_port, listen_port, **kwargs)
+            return pid
+        finally:
+            saw_ns = time.monotonic_ns()
+            with lock:
+                sightings.append(
+                    {
+                        "client_port": int(client_port),
+                        "listen_port": int(listen_port),
+                        "pid": pid,
+                        "saw_ns": saw_ns,
+                    }
+                )
+            _event_for(client_port, listen_port).set()
+
+    def _wait_for_sock_lookup(ssl_sock: Any) -> None:
+        port_pair: tuple[int, int] | None = None
+        try:
+            peer = ssl_sock.getpeername()
+            local = ssl_sock.getsockname()
+            port_pair = (int(peer[1]), int(local[1]))
+        except OSError:
+            port_pair = None
+        if port_pair is not None and port_pair[0] > 0 and port_pair[1] > 0:
+            assert _event_for(*port_pair).wait(timeout=2.0), (
+                f"observer lookup did not finish before server reply on {port_pair}"
+            )
+            flush_ns = time.monotonic_ns()
+            with lock:
+                for rec in reversed(sightings):
+                    if (rec["client_port"], rec["listen_port"]) == port_pair:
+                        rec.setdefault("flush_ns", flush_ns)
+                        break
+
+    def _held_release(self: Any, ssl_sock: Any, reply: Any, tool_deadline_ns: int) -> None:
+        _wait_for_sock_lookup(ssl_sock)
+        orig_release(self, ssl_sock, reply, tool_deadline_ns)
+
+    def _held_best_effort(self: Any, ssl_sock: Any, body: bytes, deadline_ns: int) -> None:
+        _wait_for_sock_lookup(ssl_sock)
+        orig_best_effort(self, ssl_sock, body, deadline_ns)
+
+    with monkeypatch.context() as mp:
+        mp.setattr(native_owner, "_lookup_loopback_client_pid", _tracked_lookup)
+        mp.setattr(_loopback_server.LoopbackServer, "_release_owner_reply", _held_release)
+        mp.setattr(_loopback_server.LoopbackServer, "_write_200_best_effort", _held_best_effort)
+        yield sightings
+
+
 def test_owner_driver_non_release_error_quiesced_and_timeout_logging(
     trusted_tmp: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2936,7 +3015,7 @@ def test_owner_driver_non_release_error_quiesced_and_timeout_logging(
                 del command, deadline_ns
                 raise BrainError(ErrorCode.DAEMON_UNAVAILABLE, "daemon unavailable")
 
-            with monkeypatch.context() as mp:
+            with monkeypatch.context() as mp, _hold_lookup_before_reply(monkeypatch, native_owner):
                 mp.setattr(h.loop, "submit_reply", _submit_boom)
                 res_err = h.open_client(monotonic_ns=client_clock.monotonic_ns).call(
                     target,
@@ -2975,7 +3054,7 @@ def test_owner_driver_non_release_error_quiesced_and_timeout_logging(
                         return True
                 return orig_is_quiesced()
 
-            with monkeypatch.context() as mp:
+            with monkeypatch.context() as mp, _hold_lookup_before_reply(monkeypatch, native_owner):
                 mp.setattr(h.server, "_is_quiesced", _quiesced_post_admission)
                 res_q = h.open_client(monotonic_ns=client_clock.monotonic_ns).call(
                     target,
@@ -5498,24 +5577,53 @@ def test_t9_r02_handshake_independent_of_collector_latency(
             target = h.make_target()
 
             # 1. Positive twin: immediate lookup while connection is live -> obs_status ok, client_pid matched.
-            res_pos = h.open_client(monotonic_ns=client_clock.monotonic_ns).call(
-                target,
-                ToolCommand(
-                    tool="get_health",
-                    arguments={"schema_version": "2.0"},
-                    token=tpl.cred.token,
-                    selected_scope=None,
-                    correlation_id="corr-r02-pos",
-                ),
-            )
+            with _hold_lookup_before_reply(monkeypatch, native_owner) as pos_sightings:
+                res_pos = h.open_client(monotonic_ns=client_clock.monotonic_ns).call(
+                    target,
+                    ToolCommand(
+                        tool="get_health",
+                        arguments={"schema_version": "2.0"},
+                        token=tpl.cred.token,
+                        selected_scope=None,
+                        correlation_id="corr-r02-pos",
+                    ),
+                )
             assert res_pos.get("ok") is True
-            ev1 = [r for r in _drain_and_join_workers() if r.get("event") == "owner_call"]
+            items1 = _drain_and_join_workers()
+            ev1 = [r for r in items1 if r.get("event") == "owner_call"]
+            so1 = [
+                r
+                for r in items1
+                if r.get("event") == "socket_observation" and r.get("connection_id") == ev1[0].get("connection_id")
+            ]
             assert len(ev1) == 1
             assert ev1[0]["tool_name"] == "get_health"
             assert ev1[0]["response_flushed_ok"] is True
             if sys.platform == "win32":
                 assert ev1[0]["client_pid"] == os.getpid()
+                assert ev1[0]["client_started_at"] == daemon_started_at
                 assert ev1[0]["observation_status"] == "ok"
+                assert len(so1) == 1
+                assert so1[0]["observation_status"] == "ok"
+                assert so1[0]["client_pid"] == os.getpid()
+                assert so1[0]["client_started_at"] == daemon_started_at
+                started_at = so1[0].get("started_at")
+                observed_at = so1[0].get("observed_at")
+                so_ended_at = so1[0].get("ended_at")
+                oc_ended_at = ev1[0].get("ended_at")
+                assert isinstance(started_at, str)
+                assert isinstance(observed_at, str)
+                assert isinstance(so_ended_at, str)
+                assert isinstance(oc_ended_at, str)
+                assert started_at <= observed_at <= so_ended_at
+                assert so_ended_at >= oc_ended_at
+                assert any(
+                    rec["client_port"] == ev1[0]["client_port"]
+                    and rec["pid"] == os.getpid()
+                    and "flush_ns" in rec
+                    and rec["saw_ns"] <= rec["flush_ns"]
+                    for rec in pos_sightings
+                ), pos_sightings
             assert hook_state["pending_count"]() == 0
 
             # 2. Held lookup: lookup sleeps 300ms, but connection worker must NOT wait for it.
@@ -5582,6 +5690,7 @@ def test_t9_r02_handshake_independent_of_collector_latency(
                 return client_start_ns + (time.monotonic_ns() - t_call_start[0])
 
             client = h.open_client(monotonic_ns=_controlled_clock)
+            t_deadline_wall = time.monotonic()
             t_call_start[0] = time.monotonic_ns()
             res_deadline = client.call(
                 target,
@@ -5594,11 +5703,20 @@ def test_t9_r02_handshake_independent_of_collector_latency(
                 ),
                 deadline_ns=tight_deadline_ns,
             )
+            t_deadline_elapsed = time.monotonic() - t_deadline_wall
             assert res_deadline.get("ok") is True
+            assert t_deadline_elapsed < 0.25, f"Near-deadline call waited on observer: {t_deadline_elapsed:.3f}s"
             ev3 = [r for r in _drain_and_join_workers() if r.get("event") == "owner_call"]
             assert len(ev3) == 1
             assert ev3[0]["response_flushed_ok"] is True
             if sys.platform == "win32":
-                assert ev3[0]["observation_status"] == "ok"
+                # Part 3 has no lookup-completion gate so near-deadline call timing stays pure; under heavy
+                # scheduler contention async lookup may finish after socket close and must fail closed.
+                if ev3[0]["observation_status"] == "ok":
+                    assert ev3[0]["client_pid"] == os.getpid()
+                    assert ev3[0]["client_started_at"] == daemon_started_at
+                else:
+                    assert ev3[0]["observation_status"] == "observation_incomplete"
+                    assert ev3[0]["client_pid"] is None
     finally:
         hook_state["uninstall"]()
