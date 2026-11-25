@@ -226,7 +226,11 @@ def generation_of(data_root: Path) -> int:
 
 
 def policy_backup_of(data_root: Path) -> Path:
-    rt = open_runtime(data_root, os_adapters())
+    rt = (
+        open_cloned_runtime(data_root, os_adapters(), role="restore-polbak")
+        if _is_fresh_seed_target(data_root)
+        else open_runtime(data_root, os_adapters())
+    )
     try:
         return create_policy_backup(rt.policy, rt.os_, now())
     finally:
@@ -383,7 +387,7 @@ def test_restore_reapplies_newer_tombstone_and_quarantine(trusted_tmp: Path, clo
 
 
 def test_restore_keeps_lock_object_identity(trusted_tmp: Path) -> None:
-    open_runtime(trusted_tmp, os_adapters()).close()
+    open_cloned_runtime(trusted_tmp, os_adapters(), role="restore-lock").close()
     lock = trusted_tmp / "writer.lock"
     before = file_identity(lock)
     restore_once(trusted_tmp)
@@ -414,7 +418,7 @@ def test_unverifiable_full_backup_is_not_restored(trusted_tmp: Path) -> None:  #
 
 
 def test_restore_of_wrong_store_is_refused_before_touching_store_dir(trusted_tmp: Path, other_backup: Path) -> None:
-    open_runtime(trusted_tmp / "r", os_adapters()).close()
+    open_cloned_runtime(trusted_tmp / "r", os_adapters(), role="restore-wrong").close()
     with maintenance_lease(trusted_tmp / "r") as (root, lease):
         before = digest_tree(root.store_dir)
         policy = PolicyStore.open(root, lease, os_adapters())
@@ -492,7 +496,7 @@ def test_after_policy_restore_new_runtime_binds_new_policy(trusted_tmp: Path, cl
 
 def test_policy_restore_of_another_store_is_refused(trusted_tmp: Path, clock: FakeClock) -> None:
     path = policy_backup_of(trusted_tmp / "other")
-    open_runtime(trusted_tmp / "r", os_adapters()).close()
+    open_cloned_runtime(trusted_tmp / "r", os_adapters(), role="restore-other-pol").close()
     with maintenance_lease(trusted_tmp / "r") as (root, lease):
         before = digest_tree(root.policy_dir)
         with pytest.raises(BrainError) as e:

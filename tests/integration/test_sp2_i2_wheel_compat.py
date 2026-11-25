@@ -179,15 +179,21 @@ def frozen_i2_installed_env(tmp_path_factory: pytest.TempPathFactory) -> Iterato
 
         purelib_dir = Path(
             subprocess.check_output(
-                [str(venv_python), "-I", "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"],
+                [
+                    str(venv_python),
+                    "-I",
+                    "-c",
+                    "import compileall, pathlib, sysconfig; "
+                    "p = sysconfig.get_path('purelib'); "
+                    "ok = compileall.compile_dir(pathlib.Path(p) / 'superbrain', quiet=1); "
+                    "print(p); "
+                    "raise SystemExit(0 if ok else 1)",
+                ],
+                cwd=scratch,
                 text=True,
                 encoding="utf-8",
-                timeout=30.0,
+                timeout=60.0,
             ).strip()
-        )
-        _run_offline(
-            [str(venv_python), "-I", "-m", "compileall", "-q", "-j", "0", str(purelib_dir / "superbrain")],
-            cwd=scratch,
         )
         hook_src = (REPO_ROOT / "tests" / "support" / "_socket_readiness_hook.py").read_bytes()
         (purelib_dir / "_superbrain_test_readiness.py").write_bytes(hook_src)

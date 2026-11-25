@@ -32,6 +32,9 @@ from superbrain.application._privacy_rules import (
 # ``\s`` and ``str.isspace`` agree (one Unicode whitespace table). Only ASCII letters lowercase to the letters of
 # "private" (checked over every code point), so these classes equal a match on the lowercased text. Two blank
 # runs are never adjacent (a ``/`` sits between them), which keeps long blank runs linear.
+# Outside ASCII, only these four code points match ``[a-z]`` under ``re.IGNORECASE``.
+_NON_ASCII_RE_IGNORECASE = ("\u0130", "\u0131", "\u017f", "\u212a")
+
 _PRIVATE_WORD = "[pP][rR][iI][vV][aA][tT][eE]"
 _PRIVATE_START = rf"<\s*(?:/\s*)?{_PRIVATE_WORD}"
 _PRIVATE_MARK = re.compile(_PRIVATE_START)
@@ -338,14 +341,14 @@ class _TextScans:
             text = self._path_token.sub(self._blocked_path, text)
         return text
 
-    def _redact_generic(self, text: str, ascii_text: bool, has_deadline: bool) -> str:
-        lowered: str | None = text.lower() if ascii_text else None
-        reusable = self._reusable_lower if ascii_text else True
+    def _redact_generic(self, text: str, fold_safe: bool, has_deadline: bool) -> str:
+        lowered: str | None = text.lower() if fold_safe else None
+        reusable = self._reusable_lower if fold_safe else True
         if _gate_open(_AUTH_HEADER, text, lowered):
             new = self._sub(_AUTH_HEADER, rf"\1\2{REDACTED}", text)
             if new != text:
                 text = new
-                if ascii_text and not reusable:
+                if fold_safe and not reusable:
                     lowered = new.lower()
         if has_deadline:
             self.tick()
@@ -353,32 +356,32 @@ class _TextScans:
             new = _AUTH_SCHEME.sub(self._auth_scheme, text)
             if new != text:
                 text = new
-                if ascii_text and not reusable:
+                if fold_safe and not reusable:
                     lowered = new.lower()
         for pattern in _FIXED_TOKENS:
             if _gate_open(pattern, text, lowered):
                 new = self._sub(pattern, REDACTED, text)
                 if new != text:
                     text = new
-                    if ascii_text and not reusable:
+                    if fold_safe and not reusable:
                         lowered = new.lower()
             if has_deadline:
                 self.tick()
         new = self._userinfo(text)
         if new != text:
             text = new
-            if ascii_text and not reusable:
+            if fold_safe and not reusable:
                 lowered = new.lower()
         if _gate_open(_KEY_VALUE_SECRET, text, lowered):
             new = self._sub(_KEY_VALUE_SECRET, rf"\1\2{REDACTED}", text)
             if new != text:
                 text = new
-                if ascii_text and not reusable:
+                if fold_safe and not reusable:
                     lowered = new.lower()
         if has_deadline:
             self.tick()
         # The cheap candidate scan keeps the full component matcher as the authority.
-        if self._path_scan and (lowered is None or self._path_prefilter.matches(lowered)):
+        if self._path_scan and self._path_prefilter.matches(lowered if lowered is not None else text.lower()):
             text = self._path_token.sub(self._blocked_path, text)
         return text
 
@@ -398,11 +401,11 @@ class _TextScans:
             self.tick()
         if "-----BEGIN " in text:
             text = self._pem(text)
-        ascii_text = text.isascii()
-        if ascii_text and self._shipped_scans_ok:
+        fold_safe = text.isascii() or not any(ch in text for ch in _NON_ASCII_RE_IGNORECASE)
+        if fold_safe and self._shipped_scans_ok:
             text = self._redact_ascii_fast(text, has_deadline)
-        else:  # lowered=None on non-ASCII text; patched rules also use generic _gate_open
-            text = self._redact_generic(text, ascii_text, has_deadline)
+        else:  # lowered=None when non-ASCII case-fold diverges; patched rules also use generic _gate_open
+            text = self._redact_generic(text, fold_safe, has_deadline)
         if has_deadline:
             self.tick()
         if entropy:

@@ -5,6 +5,8 @@ Started through ``runpy`` under ``python -I``: it imports only ``superbrain`` an
 to stdout and exits 1; success exits 0. Later tasks add the operations their tests need to ``OPERATIONS``.
 """
 
+from __future__ import annotations
+
 import sqlite3
 import sys
 from collections.abc import Callable, Sequence

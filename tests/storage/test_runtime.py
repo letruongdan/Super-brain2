@@ -19,6 +19,7 @@ from superbrain.storage.store import Store
 from tests.storage.conftest import DEMO_KINDS, CounterProjection, counter, maintenance_lease
 from tests.support.crash import run_child
 from tests.support.fs import digest_tree
+from tests.support.inc2_fixture import open_cloned_runtime
 
 STORE_V2 = (*STORE_MIGRATIONS, Migration(to_version=2, min_reader_version=1, apply=lambda db: None))
 
@@ -39,7 +40,7 @@ def writer_is_free(data_root: Path) -> bool:
 
 
 def test_policy_generation_below_lock_hwm_is_raised_above_it(trusted_tmp: Path) -> None:
-    rt = open_runtime(trusted_tmp, os_adapters())
+    rt = open_cloned_runtime(trusted_tmp, os_adapters(), role="runtime-test")
     assert rt.policy.trust_generation() == 1
     rt.lease.raise_trust_hwm(10)
     rt.close()
@@ -78,7 +79,13 @@ def test_missing_policy_store_next_to_an_existing_store_is_refused_before_creati
 
 
 def test_runtime_forwards_handlers_and_kinds(trusted_tmp: Path) -> None:
-    rt = open_runtime(trusted_tmp / "r", os_adapters(), handlers=[CounterProjection()], kinds=KindRegistry(DEMO_KINDS))
+    rt = open_cloned_runtime(
+        trusted_tmp / "r",
+        os_adapters(),
+        role="runtime-test",
+        handlers=[CounterProjection()],
+        kinds=KindRegistry(DEMO_KINDS),
+    )
     with rt.store.transaction() as t:
         t.append("demo.count", actor="user:cli", owner_id="dan", meta={"n": 1})
     assert counter(rt.store) == 1
@@ -152,7 +159,7 @@ def test_close_is_ordered_and_idempotent(trusted_tmp: Path, monkeypatch: pytest.
 
 
 def test_runtime_holds_the_writer_lock(trusted_tmp: Path) -> None:
-    rt = open_runtime(trusted_tmp / "r", os_adapters())
+    rt = open_cloned_runtime(trusted_tmp / "r", os_adapters(), role="runtime-test")
     try:
         assert run_child("acquire_writer", trusted_tmp / "r").error_code == ErrorCode.WRITER_HELD.value
     finally:
@@ -171,7 +178,7 @@ def test_maintenance_lease_opens_no_database(trusted_tmp: Path) -> None:
 
 @pytest.mark.parametrize("failing", ["store", "policy"])
 def test_failed_close_keeps_the_writer_lock(trusted_tmp: Path, monkeypatch: pytest.MonkeyPatch, failing: str) -> None:
-    rt = open_runtime(trusted_tmp / "r", os_adapters())
+    rt = open_cloned_runtime(trusted_tmp / "r", os_adapters(), role="runtime-test")
     handle = rt.store if failing == "store" else rt.policy
     monkeypatch.setattr(handle, "close", raising(BrainError(ErrorCode.IO_ERROR, "injected")))
     with pytest.raises(BrainError, match="injected"):
@@ -221,7 +228,7 @@ def test_missing_policy_store_is_refused_before_any_subdirectory_is_created(trus
 
 
 def test_releasing_the_lease_under_open_stores_is_refused(trusted_tmp: Path) -> None:
-    rt = open_runtime(trusted_tmp / "r", os_adapters(), kinds=KindRegistry(DEMO_KINDS))
+    rt = open_cloned_runtime(trusted_tmp / "r", os_adapters(), role="runtime-test", kinds=KindRegistry(DEMO_KINDS))
     try:
         with pytest.raises(AssertionError, match="open handles"):
             rt.lease.release()
@@ -235,7 +242,7 @@ def test_releasing_the_lease_under_open_stores_is_refused(trusted_tmp: Path) -> 
 
 
 def test_stores_refuse_work_once_their_lease_was_released(trusted_tmp: Path) -> None:
-    rt = open_runtime(trusted_tmp / "r", os_adapters(), kinds=KindRegistry(DEMO_KINDS))
+    rt = open_cloned_runtime(trusted_tmp / "r", os_adapters(), role="runtime-test", kinds=KindRegistry(DEMO_KINDS))
     for name in ("store", "policy"):
         rt.lease.unregister_handle(name)  # the only way around the release guard: forge a closed bookkeeping
     rt.lease.release()
@@ -281,7 +288,7 @@ def assert_refused_before_creating(data_root: Path, root: DataRoot) -> None:
 
 
 def test_missing_data_store_next_to_policy_intents_is_refused(trusted_tmp: Path) -> None:
-    rt = open_runtime(trusted_tmp / "r", os_adapters())
+    rt = open_cloned_runtime(trusted_tmp / "r", os_adapters(), role="runtime-test")
     try:
         rt.policy.record_intent(IntentKind.TOMBSTONE, {"holder_kind": "event", "holder_id": E1})
     finally:
@@ -291,7 +298,7 @@ def test_missing_data_store_next_to_policy_intents_is_refused(trusted_tmp: Path)
 
 @pytest.mark.parametrize("kind", ["store", "store_full"])
 def test_missing_data_store_next_to_a_complete_store_backup_is_refused(trusted_tmp: Path, kind: str) -> None:
-    rt = open_runtime(trusted_tmp / "r", os_adapters())
+    rt = open_cloned_runtime(trusted_tmp / "r", os_adapters(), role="runtime-test")
     try:
         if kind == "store":
             create_store_backup(rt.store, rt.os_, NOW)

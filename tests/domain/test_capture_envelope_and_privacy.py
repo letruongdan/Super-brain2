@@ -509,10 +509,15 @@ def test_hook_entry_privacy_rejection_exits_zero_with_zero_leaks_and_static_log(
     assert "invalid_input" in log_text
 
 
-def test_hook_entry_static_log_preserves_concurrent_lines_without_stderr(trusted_tmp: Path) -> None:
-    """Concurrent multi-thread and multi-process cold log appends never lose lines, stall, or emit stderr."""
+def test_hook_entry_static_log_preserves_concurrent_lines_without_stderr(
+    trusted_tmp: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Concurrent multi-thread, multi-process, and lock-contended log appends preserve lines with zero stderr."""
     from superbrain.adapters.os import os_adapters
+    from superbrain.adapters.os.locks import OUTBOX_FILE_LOCK
     from superbrain.composition.hook_entry import _write_static_log, run_hook
+    from superbrain.ports.capture import default_outbox_dir_renamer
+    from superbrain.storage._outbox_io import ensure_dir_tree_atomic, ensure_secure_regular_file_atomic
 
     os_ = os_adapters()
 
@@ -550,7 +555,7 @@ def test_hook_entry_static_log_preserves_concurrent_lines_without_stderr(trusted
         "sys.stdout.write('READY\\n'); sys.stdout.flush(); "
         "assert sys.stdin.buffer.readline() == b'GO\\n'; "
         "assert main(['--outbox', str(outbox), '--log', str(log)]) == 0; "
-        "assert all(run_hook(b'{bad', outbox_dir=outbox, log_path=log) == 0 for _ in range(4))"
+        "assert all(run_hook(b'{bad', outbox_dir=outbox, log_path=log) == 0 for _ in range(25))"
     )
     procs: list[subprocess.Popen[bytes]] = []
     t0 = time.monotonic()
@@ -585,11 +590,31 @@ def test_hook_entry_static_log_preserves_concurrent_lines_without_stderr(trusted
                 p.wait(timeout=5.0)
     elapsed = time.monotonic() - t0
     proc_lines = proc_log.read_text(encoding="utf-8").splitlines()
-    assert proc_lines == ["phase=hook error.code=invalid_input"] * 20
+    assert proc_lines == ["phase=hook error.code=invalid_input"] * 104
     assert os_.permissions.object_problems(proc_log) == []
     assert elapsed < 10.0
 
-    # Part 3: Fail-closed target check (existing directory as log target) exits 0 without crashing.
+    # Part 3: External OUTBOX_FILE_LOCK holder never stalls, drops lines, or writes to stderr.
+    held_log = trusted_tmp / "lock_held.log"
+    ensure_dir_tree_atomic(held_log.parent, os_.permissions, default_outbox_dir_renamer(), verify_existing=False)
+    held_log.write_bytes(b"seed\n")
+    ensure_secure_regular_file_atomic(held_log, os_.permissions)
+    held_fd = os.open(held_log, os.O_RDWR, 0o600)
+    try:
+        assert OUTBOX_FILE_LOCK.try_lock_fd(held_fd)
+        capsys.readouterr()
+        assert run_hook(b"{bad", outbox_dir=proc_outbox, log_path=held_log) == 0
+        captured = capsys.readouterr()
+        assert captured.err == "", f"unexpected stderr under lock contention: {captured.err!r}"
+    finally:
+        OUTBOX_FILE_LOCK.unlock_fd(held_fd)
+        os.close(held_fd)
+    assert held_log.read_text(encoding="utf-8").splitlines() == [
+        "seed",
+        "phase=hook error.code=invalid_input",
+    ]
+
+    # Part 4: Fail-closed target check (existing directory as log target) exits 0 without crashing.
     dir_target = trusted_tmp / "log_is_dir"
     dir_target.mkdir()
     assert run_hook(b"{bad", outbox_dir=proc_outbox, log_path=dir_target) == 0

@@ -845,9 +845,10 @@ def test_workspace_register_replay_binds_immutable_original_subject_after_move(
     # POLICY_UNAVAILABLE on KernelPolicyPort (register_authorized_workspace, snapshot) and
     # INTEGRITY_FAILURE on PolicySource.intents() / Store.reconcile_policy().
     def verify_corrupt_ws_payload(case_label: str, mutate_fn: Callable[[dict[str, JsonValue]], None]) -> None:
-        rt_bad = open_runtime(
+        rt_bad = open_cloned_runtime(
             trusted_tmp / f"ws-corrupt-payload-{case_label}",
             os_,
+            role="krev-cur",
             store_migrations=KERNEL_STORE_MIGRATIONS,
             policy_migrations=KERNEL_POLICY_MIGRATIONS,
         )
@@ -1027,9 +1028,10 @@ def test_opaque_principal_id_revocation_blocks_credential_and_survives_restore(
 
     # Genuinely corrupt stored principal_id values in credential still fail closed with POLICY_UNAVAILABLE.
     for idx, corrupt_principal_id in enumerate(("bad principal id", "", "p" * 129, 12345)):
-        rt_bad = open_runtime(
+        rt_bad = open_cloned_runtime(
             trusted_tmp / f"corrupt-cred-principal-{idx}",
             os_,
+            role="krev-cur",
             store_migrations=KERNEL_STORE_MIGRATIONS,
             policy_migrations=KERNEL_POLICY_MIGRATIONS,
         )

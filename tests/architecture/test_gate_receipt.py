@@ -2123,7 +2123,10 @@ def test_gate_wheel_fixture_files_and_weights_stay_aligned_with_tests() -> None:
     tests_root = repo_root / "tests"
     discovered: set[str] = set()
     for path in sorted(tests_root.rglob("test_*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        text = path.read_text(encoding="utf-8")
+        if "inc2_installed_env" not in text:
+            continue
+        tree = ast.parse(text, filename=str(path))
         rel = path.relative_to(repo_root).as_posix()
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):

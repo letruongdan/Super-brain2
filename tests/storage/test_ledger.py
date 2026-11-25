@@ -103,7 +103,10 @@ def callers_of(name: str, root: Path) -> set[str]:
                 visit(child, scope, in_function, where)
 
     for path in sorted(root.rglob("*.py")):
-        visit(ast.parse(path.read_text(encoding="utf-8")), [], False, path.as_posix())
+        text = path.read_text(encoding="utf-8")
+        if name not in text and "\\" not in text:
+            continue
+        visit(ast.parse(text), [], False, path.as_posix())
     return found
 
 

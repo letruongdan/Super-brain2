@@ -190,9 +190,27 @@ def _check(
     texts: list[str], patterns: tuple[str, ...], *, want_blocked: bool, suffixes: tuple[str, ...] = _SUFFIXES
 ) -> None:
     policy = _policy(patterns)
+    base_expected: list[tuple[frozenset[str], int]] | None = None
     for suffix in suffixes:
         batch = [text + suffix for text in texts]
-        expected = [_expected_cached(text, patterns) for text in batch]
+        if not suffix:
+            if base_expected is None:
+                base_expected = [_expected_cached(text, patterns) for text in texts]
+            expected = base_expected
+        elif suffix[0].isspace() and _expected_cached(suffix, patterns) == (frozenset({suffix}), 0):
+            if base_expected is None:
+                base_expected = [_expected_cached(text, patterns) for text in texts]
+            expected = [
+                (
+                    frozenset({next(iter(forms)) + suffix})
+                    if len(forms) == 1
+                    else frozenset(form + suffix for form in forms),
+                    count,
+                )
+                for forms, count in base_expected
+            ]
+        else:
+            expected = [_expected_cached(text, patterns) for text in batch]
         for text, (_forms, count) in zip(batch, expected, strict=True):
             assert (count >= 1) is want_blocked, f"oracle fixture is on the wrong side: {text!r}"
         got, redacted = _apply(batch, policy)

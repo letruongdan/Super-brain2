@@ -137,6 +137,7 @@ from tests.support.inc2_fixture import (
     open_kernel_job_runtime,
     reopen_kernel_job_runtime,
 )
+from tests.support.inc2_transport import FakeMonotonicClock
 from tests.support.kernel_auth import (
     SeededCredential,
     make_bootstrap_auth,
@@ -5156,7 +5157,8 @@ def test_stop_applies_shared_cutoff_to_arbiter_join_and_reports_overrun_when_arb
     # Part A: Arbiter callback blocked past shared stop() cutoff -> bounded return + ShutdownState.OVERRUN.
     root_a, _, cfg_a = _instantiate_case(trusted_tmp, "r03-arbiter-join-overrun", _daemon_template)
     clock_a = FakeClock(base_now)
-    adapters_a = os_adapters(clock=clock_a)
+    mono_a = FakeMonotonicClock()
+    adapters_a = os_adapters(clock=clock_a, monotonic=mono_a)
 
     rt_seed_a = reopen_kernel_job_runtime(root_a, _daemon_template.store_id, adapters_a)
     try:
@@ -5188,7 +5190,7 @@ def test_stop_applies_shared_cutoff_to_arbiter_join_and_reports_overrun_when_arb
         owner_held_a.set()
         return release_owner_a.wait(BOUND_WAIT_S)
 
-    loop_a = create_daemon_owner_loop(os_=adapters_a, clock=clock_a)
+    loop_a = create_daemon_owner_loop(os_=adapters_a, clock=clock_a, monotonic_clock=mono_a)
     first_rep: ShutdownReport | None = None
     second_rep: ShutdownReport | None = None
     third_rep: ShutdownReport | None = None
@@ -5208,6 +5210,7 @@ def test_stop_applies_shared_cutoff_to_arbiter_join_and_reports_overrun_when_arb
             adapters_a.monotonic.monotonic_ns() + TOTAL_REQUEST_BUDGET_NS,
         )
         expiring_fut_a.add_done_callback(_on_arbiter_done_a)
+        mono_a.advance(TOTAL_REQUEST_BUDGET_NS + 1)
         assert arbiter_cb_entered.wait(timeout=2.5), "deadline arbiter did not settle expiring get_job"
         assert arbiter_cb_threads and all(arbiter_cb_threads[0] is not t for t in (caller_thread, owner_thread_a))
         assert arbiter_cb_envs[0]["ok"] is False
@@ -5218,11 +5221,11 @@ def test_stop_applies_shared_cutoff_to_arbiter_join_and_reports_overrun_when_arb
 
         with ThreadPoolExecutor(max_workers=3) as pool:
             stop_started = time.monotonic()
-            first_stop_fut = pool.submit(loop_a.stop, grace_s=1.30)
+            first_stop_fut = pool.submit(loop_a.stop, grace_s=0.35)
             _wait_until(lambda: loop_a.ready is None, desc="first stop caller to lock shared cutoff")
             second_stop_fut = pool.submit(loop_a.stop, grace_s=3.0)
             try:
-                pre_release_deadline = stop_started + 1.65
+                pre_release_deadline = stop_started + 0.85
                 try:
                     first_rep = first_stop_fut.result(
                         timeout=max(0.01, pre_release_deadline - time.monotonic())
@@ -5294,7 +5297,8 @@ def test_stop_applies_shared_cutoff_to_arbiter_join_and_reports_overrun_when_arb
     # Part B: Positive control — arbiter callback releases within remaining shared cutoff -> ShutdownState.STOPPED.
     root_b, _, cfg_b = _instantiate_case(trusted_tmp, "r03-arbiter-join-stopped", _daemon_template)
     clock_b = FakeClock(base_now + dt.timedelta(minutes=1))
-    adapters_b = os_adapters(clock=clock_b)
+    mono_b = FakeMonotonicClock()
+    adapters_b = os_adapters(clock=clock_b, monotonic=mono_b)
 
     rt_seed_b = reopen_kernel_job_runtime(root_b, _daemon_template.store_id, adapters_b)
     try:
@@ -5323,7 +5327,7 @@ def test_stop_applies_shared_cutoff_to_arbiter_join_and_reports_overrun_when_arb
         owner_held_b.set()
         return release_owner_b.wait(BOUND_WAIT_S)
 
-    loop_b = create_daemon_owner_loop(os_=adapters_b, clock=clock_b)
+    loop_b = create_daemon_owner_loop(os_=adapters_b, clock=clock_b, monotonic_clock=mono_b)
     try:
         loop_b.start(cfg_b)
         owner_thread_b = loop_b.run_owner_action(threading.current_thread).result(timeout=1.0)
@@ -5335,6 +5339,7 @@ def test_stop_applies_shared_cutoff_to_arbiter_join_and_reports_overrun_when_arb
             adapters_b.monotonic.monotonic_ns() + TOTAL_REQUEST_BUDGET_NS,
         )
         expiring_fut_b.add_done_callback(_on_arbiter_done_b)
+        mono_b.advance(TOTAL_REQUEST_BUDGET_NS + 1)
         assert arbiter_cb_entered_b.wait(timeout=2.5), "Part B arbiter callback did not fire"
         assert arbiter_cb_threads_b and all(arbiter_cb_threads_b[0] is not t for t in (caller_thread, owner_thread_b))
 
@@ -5376,7 +5381,8 @@ def test_stop_applies_shared_cutoff_to_arbiter_join_and_reports_overrun_when_arb
     # Part C: Foreground serve() waits for both owner & arbiter exit on OVERRUN and returns exit code 1.
     root_c, _, cfg_c = _instantiate_case(trusted_tmp, "r03-arbiter-serve-overrun", _daemon_template)
     clock_c = FakeClock(base_now + dt.timedelta(minutes=2))
-    adapters_c = os_adapters(clock=clock_c)
+    mono_c = FakeMonotonicClock()
+    adapters_c = os_adapters(clock=clock_c, monotonic=mono_c)
 
     rt_seed_c = reopen_kernel_job_runtime(root_c, _daemon_template.store_id, adapters_c)
     try:
@@ -5442,6 +5448,7 @@ def test_stop_applies_shared_cutoff_to_arbiter_join_and_reports_overrun_when_arb
             adapters_c.monotonic.monotonic_ns() + TOTAL_REQUEST_BUDGET_NS,
         )
         expiring_fut_c.add_done_callback(_on_arbiter_done_c)
+        mono_c.advance(TOTAL_REQUEST_BUDGET_NS + 1)
         assert arbiter_cb_entered_c.wait(timeout=2.5), "Part C arbiter callback did not fire"
         assert arbiter_cb_threads_c and all(arbiter_cb_threads_c[0] is not t for t in (caller_thread, owner_thread_c))
 
