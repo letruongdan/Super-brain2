@@ -20,21 +20,56 @@ Tài liệu vận hành cho lệnh tự chẩn đoán (SP1 đợt 4, đặc tả
 
 ## 2. Đọc báo cáo
 
-Mỗi mục check có các trường `group`, `name`, `status` (`PASS`, `WARN` hoặc `FAIL`), `reason`, `detail` và `remediation`. Khi một check thiếu adapter, thiếu bằng chứng native hay chạm giới hạn quét, nó trả `WARN` kèm `reason` riêng, không bao giờ trả `PASS`.
+Mỗi mục check có các trường `group`, `name`, `status` (`PASS`, `WARN` hoặc `FAIL`), `reason`, `detail` và `remediation`. Khi một check thiếu bằng chứng native xác minh, phát hiện drift/lỗi quyền hay chạm giới hạn quét, nó trả `WARN` hoặc `FAIL` kèm `reason` riêng, không bao giờ làm giả `PASS`. Khi chạy bare CLI chưa nối adapter SP2, `capture.probe` ghi `sp2_not_wired`; trên `run_m1_handover_probe` và `--fix replay_outbox`, thiếu adapter trả `WARN`/`capability_unavailable`.
 
 | Nhóm | Mã check |
 |---|---|
 | daemon | `daemon.schema_version`, `daemon.writer_lock` |
-| storage | `storage.sqlite_integrity`, `storage.wal_size`, `storage.durability`, `storage.disk_space`, `storage.ledger_projection_match`, `storage.orphan_blobs`, `storage.policy_reconcile`, `storage.accounting_locks`, `storage.active_turn_intents`, `storage.incomplete_journals`, `storage.latest_backup` |
+| storage | `storage.sqlite_integrity`, `storage.wal_size`, `storage.cas_sample`, `storage.orphan_blobs`, `storage.ledger_projection_match`, `storage.policy_reconcile`, `storage.disk_space`, `storage.latest_backup`, `storage.durability`, `storage.accounting_locks`, `storage.pending_restore_tombstones`, `storage.active_turn_intents`, `storage.incomplete_journals` |
 | permissions | `permissions.tree` (quyền rộng, link, reparse point) |
 | identity | `identity.signers`, `identity.credentials` |
 | privacy | `privacy.canaries`, `privacy.rescan` |
 | retention | `retention.tombstones` |
-| harness | `harness.bootstrap_drift`, `harness.proposals`, trạng thái lớp 2 |
+| harness | `harness.layer2`, `harness.proposals`, `harness.bootstrap_drift` |
 | capture | `capture.probe` (số liệu do SP2 cấp qua adapter) |
-| chưa có khả năng | `index.status`, `skill.status`, `lessons.status`, `jev.passive`: trả trạng thái chưa có khả năng, theo SP3–SP5 |
+| chưa có khả năng | `index.status`, `skill.status`, `lessons.status` (hoãn SP3–SP4), `jev.passive` |
 
 `get_health(deep=true)` (MCP) chỉ trả trạng thái và ref đã lọc của DoctorRun toàn kho gần nhất. Nếu run đó cũ hơn 24 giờ, nó xếp hoặc gắn vào một job và trả `job_id`. Muốn xem báo cáo đầy đủ thì cần quyền operator.
+
+### Mẫu output đã lọc (`brain doctor --config <ABS> --json`)
+
+Mọi chuỗi trong report (`detail`, `remediation`, `layer2_harnesses`, `permission_problems`…) đều đi qua bộ lọc privacy trước khi xuất ra CLI/operator:
+
+```json
+{
+  "ok": true,
+  "data": {
+    "overall_status": "PASS",
+    "store_id": "store_01...",
+    "data_root": "<ABS_DATA_ROOT>",
+    "schema": {"store": 5, "policy": 4},
+    "restore_epoch": 0,
+    "trust_generation": 1,
+    "signer_reset_recorded": false,
+    "terminal_channel_eligible": false,
+    "signers": [{"owner_id": "dan", "channel": "ssh_key", "fingerprint": "sha256:..."}],
+    "layer2_harnesses": [],
+    "bootstrap_drifts": [],
+    "pending_proposals": [],
+    "unresolved_accounting_locks": [],
+    "active_turn_intents": [],
+    "incomplete_journals": [],
+    "permission_problems": [],
+    "integrity_errors": [],
+    "checks": [
+      {"group": "daemon", "name": "daemon.writer_lock", "status": "PASS", "reason": "stopped_cleanly", "detail": "daemon stopped cleanly (epoch=1, endpoint.json absent (daemon stopped))", "remediation": null},
+      {"group": "storage", "name": "storage.cas_sample", "status": "PASS", "reason": "ok", "detail": "verified 0/0 CAS blobs (0B)", "remediation": null},
+      {"group": "permissions", "name": "permissions.tree", "status": "PASS", "reason": "ok", "detail": "owner-only tree and ancestors verified", "remediation": null}
+    ],
+    "remediations": []
+  }
+}
+```
 
 ## 3. Thao tác sửa an toàn
 

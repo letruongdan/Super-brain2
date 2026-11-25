@@ -72,6 +72,7 @@ _WORD_BOUNDARY = re.compile(
     r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])|(?<=[A-Za-z])(?=[0-9])|(?<=[0-9])(?=[A-Za-z])"
 )
 _KEY_WORD_SPLIT = re.compile(r"[^0-9a-z]+")
+_ASCII_WORD_SPLIT = re.compile(r"[0-9]+|[A-Z]+(?![a-z])|[A-Z]?[a-z]+")
 _ID_SEGMENTS = re.compile(r"[._-]")
 _BENIGN_NEXT_WORDS: dict[str, frozenset[str]] = {
     "token": frozenset({"estimator", "estimate", "budget", "count", "counts", "limit", "usage", "total"}),
@@ -92,6 +93,9 @@ class _Deadline(Exception):
 
 def _key_words(key: str) -> list[str]:
     """NFKC + casefold words of a key, split at separators, camelCase, acronym->Camel and letter<->digit."""
+    if key.isascii():
+        words = _ASCII_WORD_SPLIT.findall(key)
+        return words if key.islower() else [word.lower() for word in words]
     normalized = unicodedata.normalize("NFKC", key)
     return [word for word in _KEY_WORD_SPLIT.split(_WORD_BOUNDARY.sub(" ", normalized).casefold()) if word]
 
