@@ -358,15 +358,12 @@ class OutboxSpool:
         fd = -1
         committed = False
         try:
-            fd = os.open(part_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_BINARY | _O_NOFOLLOW, 0o600)
+            fd = os.open(part_path, os.O_RDWR | os.O_CREAT | os.O_EXCL | _O_BINARY | _O_NOFOLLOW, 0o600)
             write_all_fd(fd, frame_bytes)
-            os.close(fd)
-            fd = -1
             perms.secure_file(part_path)
             self._check_deadline(deadline_ns)
             if crashpoint_name is not None:
                 maybe_crashpoint(crashpoint_name)
-            fd = os.open(part_path, os.O_RDWR | _O_BINARY | _O_NOFOLLOW)
             os.fsync(fd)
             os.close(fd)
             fd = -1
@@ -429,9 +426,11 @@ class OutboxSpool:
             if used + len(frame_bytes) > self._max_bytes:
                 raise BrainError(ErrorCode.STORAGE_FULL, "storage full")
             streams_root = self._root / _STREAMS_DIR
-            ensure_dir_tree_atomic(streams_root, perms, renamer, check_deadline=dl_check)
+            if not os.path.lexists(streams_root):
+                ensure_dir_tree_atomic(streams_root, perms, renamer, check_deadline=dl_check)
             sdir = streams_root / stream_key
-            ensure_dir_tree_atomic(sdir, perms, renamer, check_deadline=dl_check)
+            if not os.path.lexists(sdir):
+                ensure_dir_tree_atomic(sdir, perms, renamer, check_deadline=dl_check)
             base = f"{highest_order + 1:016d}_{record_kind}_{sequence:020d}"
             self._atomic_publish_frame(
                 sdir / f"{base}{_FRAME_SUFFIX}",

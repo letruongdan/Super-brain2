@@ -210,7 +210,7 @@
   - `test_t9_r02_handshake_independent_of_collector_latency`:
     - **Part 1 (`corr-r02-pos`):** chạy trong `_hold_lookup_before_reply`, kiểm đủ `owner_call` và `socket_observation` (`observation_status == "ok"`, `client_pid == os.getpid()`, `client_started_at == daemon_started_at`, `started_at <= observed_at <= ended_at`, `so["ended_at"] >= ev1[0]["ended_at"]`, và `saw_ns <= flush_ns` trên tuple nhìn thấy). Context thoát hoàn toàn trước Part 2 & Part 3.
     - **Part 2 (`corr-r02-held`):** giữ nguyên không prewait (`worker_entered_event` trong 5 ms, trả lời `< 0.25 s`, suy biến `observation_incomplete`).
-    - **Part 3 (`corr-r02-deadline`):** giữ đồng hồ thực kiểm cutoff 250 ms < 500 ms mà không chặn reply; khẳng định `res_deadline["ok"] is True` và `t_deadline_elapsed < 0.25`, đồng thời fail closed khi kiểm receipt (`"ok"` khớp PID/start_time hoặc `"observation_incomplete"` với `client_pid is None` dưới nghẽn 6 shard).
+    - **Part 3 (`corr-r02-deadline`):** khôi phục ngân sách **100 ms** ban đầu (`tight_deadline_ns = client_start_ns + 100_000_000`, `t_deadline_elapsed < 0.10 s`, đồng bộ `t_call_start[0]` ngay trước `client.call`) để bắt hồi quy vùng `[100, 250) ms`, cộng kiểm **Part 2b (`corr-r02-missing-pid`)** cho ca PID thiếu/mất trước chuyển trạng thái; giữ nguyên fail closed trên `ev3` (`"ok"` + khớp `(os.getpid(), daemon_started_at)` hoặc `"observation_incomplete"` + `client_pid=None`).
   - **Sibling sửa cùng lỗi:** `test_owner_driver_non_release_error_quiesced_and_timeout_logging` Part 1 (`corr-submit-boom`, dòng 2961) và Part 2 (`corr-quiesced`, dòng 3000) cùng dùng `_write_200_best_effort` trả nhanh `get_health` bị lỗi tương tự Part 1 -> bọc hai lượt này bằng `_hold_lookup_before_reply` (nhả trước Call 3 `corr-timeout-none` và Call 4 `_boom_pid`).
   - Các sibling khác đã kiểm (đã đồng bộ sẵn hoặc kiểm kịch bản đóng/lỗi): `test_t9_r02_socket_observation_lifetime_and_post_close_lookup_rejection` (`_wait_live_lookup_before_reply`), `test_t9_r02_tls_close_before_worker_return_and_ready_port_mismatch` (`_wait_live_before_reply`), `tests/support/inc2_native_owner.py` (giữ nguyên collector không prewait).
 - Bằng chứng thực nghiệm (`C:\Users\letru\sb2-trusted-local\evidence\v9-p2-bugproof\`):
@@ -265,6 +265,62 @@
 | The world outside the daemon | holds | Xử lý trung thực biến động trễ ổ đĩa/CPU 6 shard trên Windows mà không hạ ngưỡng cutoff sản phẩm. |
 | Evidence and oracles | fixed here | Đủ RED, 4 mutants FAIL, và E2E real-shim pausepoint 1.65 s với `commit_outcome_unknown` -> PASS toàn bộ kiểm tra bền & replay. |
 | The document agrees with itself | fixed here | Cập nhật `sp1-crash-table.md` dòng 115–118 khớp §6.5, `stdio.py` T7a và `tests/mcp/test_stdio.py:1001`. |
+
+---
+
+### Finding SP2-V10-01 & SP2-V10-02 & SP2-V10-03 (Khép Biên Bản Thẩm Định v10 `f5eab59`)
+
+#### Finding SP2-V10-01 (P1): Khôi phục oracle near-deadline `100 ms` & kiểm PID thiếu/mất (`test_kernel_native_receipt_contract.py:5683`)
+1. **Invariant.** Thử nghiệm near-deadline phải giữ nguyên ngân sách hành vi đã pin (`100 ms` từ thời điểm bắt đầu lời gọi kiểm soát đồng hồ), bắt mọi hồi quy trong vùng `[100, 250) ms`, đồng thời chứng minh collector độc lập handshake và fail closed khi PID thiếu hoặc mất.
+2. **Sibling sweep.**
+   - `tests/integration/test_kernel_native_receipt_contract.py::test_t9_r02_handshake_independent_of_collector_latency`: khôi phục `100_000_000` ns (`100 ms`) + `assert t_deadline_elapsed < 0.10`, giữ `t_call_start[0]` đồng bộ ngay trước `client.call`; thêm **Part 2b (`corr-r02-missing-pid`)** khóa chuyển đổi `client_pid=None` -> `observation_status="observation_incomplete"` khi lookup trả `None` mà vẫn giữ response `ok=True`; giữ `client_pid is None` ở Part 2 (`corr-r02-held`).
+   - Đồng bộ toàn bộ mô tả tài liệu từ `250 ms` về `100 ms` tại bảng A1–A7 và mục Reseal2-P2a phía trên.
+   - Kiểm chứng (`evidence/v10-p1-p2-bugproof/`): `mut_v10_01_110ms_band.log` chèn trễ `115 ms` vào handshake -> FAIL (`V10_01_110MS_RC=1`), xác nhận vùng `[100, 250) ms` được bảo vệ lại.
+3. **Lens table.**
+   | Lens | Status | Reason |
+   |---|---|---|
+   | Crash between two durable steps | not applicable | Kiểm tra vòng đời socket/clock bộ nhớ RAM. |
+   | Restore, rollback and migration rewind state | not applicable | Không thao tác store/migration. |
+   | Old binaries, old data, version fences | holds | Dùng template T7/T9 và wire command `get_health`. |
+   | Every path to the same invariant | fixed here | Bao phủ ca live (`corr-r02-pos`), bị giữ (`corr-r02-held`), thiếu/mất PID (`corr-r02-missing-pid`) và near-deadline `100 ms` (`corr-r02-deadline`). |
+   | Concurrency, shutdown and cutoffs | fixed here | Không nới budget `100 ms`; chứng minh collector không chặn worker trong 5 ms và handshake < 100 ms. |
+   | Authority, identity and scope | holds | Khớp `client_pid == os.getpid()` và `client_started_at == daemon_started_at` ở ca live. |
+   | Fail closed at limits and on the unknown | fixed here | Part 2b & Part 3 không cho phép `observation_status="ok"` khi `client_pid is None`. |
+   | What actually left, and to whom | holds | Kiểm `response_flushed_ok=True` trên cả `owner_call` và `socket_observation`. |
+   | The world outside the daemon | holds | Đồng bộ điểm bắt đầu đồng hồ ngay sát `client.call` trên socket đã làm ấm từ Part 1–2. |
+   | Evidence and oracles | fixed here | Probe `115 ms` fail (`V10_01_110MS_RC=1`); không đổi inventory `3470` node ID. |
+   | The document agrees with itself | fixed here | Xóa mọi dấu tích `250 ms` khỏi review-response để thống nhất `100 ms`. |
+
+#### Finding SP2-V10-02 (P2): Toàn vẹn từng dòng log khi append ghi ngắn hoặc lỗi giữa chừng (`physical_fs.py`, `hook_entry.py`, `test_capture_envelope_and_privacy.py`)
+1. **Invariant.** Mọi bản ghi tĩnh append vào log qua adapter không đi theo liên kết phải xuống đĩa như một record nguyên vẹn không xen byte giữa các luồng/tiến trình kể cả khi lần ghi đầu bị ngắn hoặc lỗi giữa chừng, có chặn trên thời gian khóa và giữ nguyên rào chặn `no-follow`/hard cap.
+2. **Sibling sweep.**
+   - `src/superbrain/adapters/os/physical_fs.py`:
+     - Cả `_win_atomic_append_no_follow` (`LockFileEx` trên sentinel `[0x7FFFFFFF_FFFFFFFF]` với quyền `FILE_APPEND_DATA | FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE`, không xin `FILE_WRITE_DATA` khi mở handle append) lẫn `_posix_atomic_append_no_follow` (`fcntl.lockf(..., LOCK_EX | LOCK_NB, 1, _POSIX_APPEND_LOCK_OFFSET)` dùng byte-range sentinel độc lập `OUTBOX_FILE_LOCK` `flock`, lặp lại `EINTR`), cùng `_append_thread_lock(path)` theo tiến trình và `_validate_append_timeout(timeout_s)` kiểm tra hữu hạn không âm.
+     - Ghi nhận `initial_size` dưới khóa độc quyền; nếu lỗi xảy ra sau khi đã ghi > 0 byte (`ERROR_DISK_FULL`/`ENOSPC` -> `STORAGE_FULL`, short write `<= 0` hoặc lỗi I/O khác -> `IO_ERROR`), roll back về `initial_size` (`SetFilePointerEx` + `SetEndOfFile` có đối chiếu cùng object ID vật lý và không là reparse point trên Windows; `os.ftruncate` trên POSIX) trước khi mở khóa và ném ngoại lệ gốc.
+   - `src/superbrain/composition/hook_entry.py`: truyền `timeout_s=0.25` (và `timeout_s=0.05` trong `_log` watchdog để không vượt `_WATCHDOG_EXIT_RESERVE_NS` `150 ms`).
+   - `tests/domain/test_capture_envelope_and_privacy.py` (`Part 4`): bổ sung kiểm tra 2 tiến trình ghi xen khi `_WRITE_FILE` đầu ghi 6 byte, timeout khi lock bị giữ, rollback `STORAGE_FULL` giữa chừng, từ chối thư mục/thiếu file/`_REPARSE_POINT`/`ELOOP`/timeout âm/dữ liệu rỗng, và kiểm nhánh `_posix_atomic_append_no_follow` (`EINTR` + `ENOSPC` rollback + `lockf`).
+   - Bằng chứng (`evidence/v10-p1-p2-bugproof/`):
+     - **RED trên `f5eab59` (`red_v10_02_f5eab59_interleave.log`):** `['seed', 'phase=phase=second error.code=io_error', 'first error.code=io_error']` (`EXIT=1`).
+     - **GREEN (`green_focused_314.log`):** `52 passed, 1 skipped in 14.71s`.
+     - **Mutants (`mut_v10_02_no_lock.log`, `mut_v10_02_no_rollback.log`):** vô hiệu hóa `LockFileEx` (`MUT_V10_02_NOLOCK_RC=1`) và vô hiệu hóa rollback (`MUT_V10_02_NO_ROLLBACK_RC=1`) đều bị Part 4 bắt đứng.
+3. **Lens table.**
+   | Lens | Status | Reason |
+   |---|---|---|
+   | Crash between two durable steps | fixed here | Ghi nhận `initial_size` và rollback phần dở khi lỗi `STORAGE_FULL`/`IO_ERROR` giữa chừng dưới khóa độc quyền. |
+   | Restore, rollback and migration rewind state | not applicable | Log chẩn đoán tĩnh của hook, không thuộc store/policy restore. |
+   | Old binaries, old data, version fences | holds | Giữ nguyên định dạng `phase=<phase> error.code=<code>\n`. |
+   | Every path to the same invariant | fixed here | Thống nhất lock toàn record + rollback trên cả Windows (`LockFileEx` + `SetEndOfFile`), POSIX (`lockf` + `ftruncate`), và luồng nội bộ (`_append_thread_lock`). |
+   | Concurrency, shutdown and cutoffs | fixed here | Chờ lock có chặn trên `timeout_s`; `_log` watchdog giữ `timeout_s=0.05` trong ngưỡng `2 s` hard cap. |
+   | Authority, identity and scope | holds | Mở file hiện hữu với `_FILE_FLAGS_NOFOLLOW` / `O_NOFOLLOW`, kiểm `_REPARSE_POINT` / `S_ISLNK` / `S_ISREG` trước cả khi `data` rỗng. |
+   | Fail closed at limits and on the unknown | fixed here | Timeout âm/`NaN`/`bool`, lock hết hạn, thư mục, symlink, hoặc disk full đều fail closed với đúng `ErrorCode` và không để dòng gãy. |
+   | What actually left, and to whom | holds | Chỉ ghi chuỗi tĩnh `phase` + `error.code`, 0 byte payload hay stderr. |
+   | The world outside the daemon | fixed here | Không bị process khác ghi đan xen giữa hai `WriteFile`/`os.write` và không đụng `OUTBOX_FILE_LOCK` byte 0 trên cả Windows lẫn POSIX. |
+   | Evidence and oracles | fixed here | Đủ RED tái hiện đúng xen byte trên `f5eab59`, GREEN Windows + POSIX sim, và 2 mutant FAIL (`no_lock`, `no_rollback`). |
+   | The document agrees with itself | fixed here | Đã đối chiếu toàn bộ caller (`hook_entry.py` dòng 51, 198) và tài liệu phản hồi này. |
+
+#### Optimization phụ trợ cho `SP2-V10-03` (`outbox.py`)
+- Loại bỏ mở/đóng file `.part` 2 lần trong `_atomic_publish_frame` (mở `O_RDWR | O_CREAT | O_EXCL`, `write_all_fd`, `secure_file`, `maybe_crashpoint`, `os.fsync`) và bỏ gọi lặp `ensure_dir_tree_atomic` trên `streams_root` / `sdir` khi thư mục đã tồn tại và vừa qua kiểm tra `verify_owner_only` ở `_scan_outbox` ngay trên cùng khối `_locked`.
+- Giữ nguyên `< 100 ms` (`HOOK_TARGET_BUDGET_NS`) và kiểm `5/5` pass (`0.88–0.94s` toàn test trong `green_v10_03_hook_5x.log`).
 
 ---
 
@@ -345,12 +401,12 @@ Kiểm tra inventory bằng `gate.parse_collected`:
 
 | File đã sửa | A1 (Inventory) | A2 (Assert giữ nguyên) | A3 (Mutation / Bug-proof) | A4 (Tải 6 shard 3.14 & 3.11) | A5/A6 (Thời gian) | A7 (Lint / Type / LF) |
 |---|---|---|---|---|---|---|
-| `tests/domain/test_capture_envelope_and_privacy.py` + `hook_entry.py` | 21 → 22 (+1 test W1) | Giữ nguyên + W4 assert | **RED/GREEN/MUTATION KILLED** (`evidence/v4-bugproof/`) | Pass trong `v10`, `v11` (3.14 & 3.11) | **Đạt 3.14** (27.2 → 17.5 s) | Đạt |
+| `tests/domain/test_capture_envelope_and_privacy.py` + `hook_entry.py` + `physical_fs.py` + `outbox.py` | 21 → 22 (+1 test W1) | Giữ nguyên `< 100 ms` & `2 s` hard cap | **RED/GREEN/MUTATION KILLED** (`evidence/v4-bugproof/`, `evidence/v10-p1-p2-bugproof/`): ngắn/xen byte, no-lock, no-rollback | Pass `5/5` (`0.88–0.94s`) + kiểm `v11` (3.14 × 3, 3.11 × 2) | **Đạt 3.14** (27.2 → 17.5 s) | Đạt |
 | `tests/architecture/test_gate_receipt.py` + `scripts/gate.py` | 153 = 153 | Giữ nguyên + oracle cây tiến trình W3/P2 | **PROBE/GREEN/3-MUTATION KILLED** (`evidence/w3-bugproof/`), `153 passed in 11.25s` | Pass trong `v10`, `v11` (3.14 & 3.11) | **Đạt** (39.1 → 19.9 s) | Đạt |
 | `tests/integration/test_sp2_i2_wheel_compat.py` + `tests/support/inc2_fixture.py` | 2 = 2 | Khôi phục `len(wheels)==1` & SHA-256 | Kiểm thực wheel I2 vs SP2 + `py=194 pyc=194` trên 3.14/3.11 | Pass trong `v11` (3.14 & 3.11) | **Đạt** (62.2 → 29.6 s) | Đạt |
 | `tests/application/test_t8_review_p01_{wrapped_paths,r2_edge_globs,r3_spellings}.py` + `_privacy_scan.py` | 64=64, 73=73 | Giữ nguyên 100% wrapper/glob | Kiểm tương đương `[a-z]+` IGNORECASE trên 3.11 & 3.14 (`0x130, 0x131, 0x17f, 0x212a`) | Pass trong `v10`, `v11` (3.14 & 3.11) | **Đạt** (19.5→8.3, 22.9→10.9 s) | Đạt |
-| `tests/integration/test_kernel_daemon.py` | 36 = 36 | Giữ nguyên + spy cutoff & wait/join Reseal-P2 (`grace_s=0.55 < 0.85`) | **+0.40s PROBE & REOPEN-DEADLINE MUTATION KILLED** (`evidence/daemon-cutoff-bugproof/`), `36 passed in 21.79s` | Pass trong `v6`–`v8` + kiểm sau vá Reseal-P2 | No-Go (-18.7 s; 36 ca daemon thực) | Đạt |
-| `tests/integration/{test_t9_client_sighting,test_kernel_native_receipt_contract,test_t9_socket_readiness}.py` | Không đổi | Giữ nguyên `< 0.10 s`, `< collector_timeout_s`, `client_pid == os.getpid()`, `observation_status == "ok"` | Reseal2-P2a: `_hold_lookup_before_reply` + sibling `2961/3000` + `corr-r02-deadline`; RED/GREEN 50ms/NULL-PID MUTANT (`evidence/v9-p2-bugproof/`) | Pass 3.14 & 3.11 × 5 (trễ 50 ms) | Đạt | Đạt |
+| `tests/integration/test_kernel_daemon.py` | 36 = 36 | Giữ nguyên + spy cutoff & wait/join Reseal-P2 (`grace_s=0.55 < 0.85`) | **+0.40s PROBE & REOPEN-DEADLINE MUTATION KILLED** (`evidence/daemon-cutoff-bugproof/`), `36 passed in 21.79s` | Pass trong `v6`–`v10` | No-Go (-18.7 s; 36 ca daemon thực) | Đạt |
+| `tests/integration/{test_t9_client_sighting,test_kernel_native_receipt_contract,test_t9_socket_readiness}.py` | Không đổi | Khôi phục **`< 0.10 s` (`100 ms`)**, `< collector_timeout_s`, `client_pid == os.getpid()`, `observation_status == "ok"` | Reseal2-P2a + SP2-V10-01 (`corr-r02-missing-pid` + `115 ms` mutant FAIL `V10_01_110MS_RC=1`, `evidence/v10-p1-p2-bugproof/`) | Pass 3.14 & 3.11 (`v10` 5/5 + kiểm `v11`) | Đạt | Đạt |
 | `tests/application/test_remediation_i2_t5_worker.py` | Không đổi | Giữ nguyên `wait_cancelled` & `seen_attempts == [1, 2]` | Đồng bộ timeout chờ hủy `0.3` -> `BOUND_WAIT_S` với toàn bộ 8 sibling `wait_cancelled` | Đã kiểm cục bộ + gate 3.14/3.11 | Không tăng khi hủy ngay | Đạt |
 | `tests/integration/test_kernel_privacy_persistence.py` | Không đổi | Giữ nguyên toàn bộ assert privacy & `drop_episode` trực tiếp | Retry 1 lần đúng `idempotency_key` cho cả post-POST `daemon_unavailable` (`_meta`) lẫn §6.5 `commit_outcome_unknown` | Pass full file trong `green_suites_314.log` (`63 passed`) | Không đổi khi không stall | Đạt |
 | `tests/support/crash_cases.py` + `docs/design/sp1-crash-table.md` + `tests/storage/{test_backup,test_reconcile,test_restore,test_crash_matrix}.py` | Không đổi | Tách 2 nhánh uncertain trong `assert_uncertain` | Reseal2-P2b: RED/4-mutant/E2E pausepoint `commit_outcome_unknown` (`evidence/v9-p2-bugproof/`) + `test_matrix_detects_a_removed_crashpoint` | Pass 3.14 & 3.11 (`green_suites_314.log`, `green_focused_311.log`) | **Đạt** (`test_crash_matrix` 36.9→21.0 s) | Đạt |
@@ -388,7 +444,14 @@ Kiểm tra inventory bằng `gate.parse_collected`:
 - **Python 3.14 Lượt 2 (giữ nguyên làm hồ sơ):** `accepted=False`, `test_job_seconds = 245.166 s`, `3413 passed, 1 failed` (`test_replay_after_response_loss_through_real_shim[serve-fixture@kernel.after_commit_before_response]` — đã vá ở **Reseal2-P2b**).
 - **Python 3.14 Lượt chạy lại sạch:** `accepted=True`, `test_job_seconds = 251.562 s`, JUnit `<testsuite>` = `1189.461 s`, spread `10.4%`, `3414 passed, 56 skipped, 0 failed`.
 
-### Bước tiếp theo ngay sau commit vá Reseal2-P2a & Reseal2-P2b:
-1. Kiểm `ruff`, `mypy`, `lint-imports`, `green_suites_314.log` (`63 passed`), `green_focused_311.log` (`4 passed`), và toàn bộ bằng chứng `evidence/v9-p2-bugproof/` trên commit sạch của `remediate-runtime-opt` (`tree_is_clean == True`).
-2. Bàn giao cho Reviewer độc lập (Codex) thẩm định delta + phê duyệt reseal `.verification/task9-seal.json` (giữ digest cũ).
-3. Chạy xác nhận gate cuối trên chính commit sạch đã được reseal (`test_lock.py check` exit 0 + `scripts.gate --shards 6` cho 3.11 × 2 và 3.14 × 2).
+### Kết quả gate `final-remediate-gate-v10` trên `f5eab59` (`--shards 6`, cache wheel lạnh):
+- **Python 3.11 Lượt 1:** `accepted=True`, `test_job_seconds = 210.174 s`, JUnit `<testsuite>` = `998.733 s`, spread `7.1%`, `3414 passed, 56 skipped, 0 failed`.
+- **Python 3.11 Lượt 2:** `accepted=True`, `test_job_seconds = 235.088 s`, JUnit `<testsuite>` = `1129.073 s`, spread `10.3%`, `3414 passed, 56 skipped, 0 failed`.
+- **Python 3.14 Lượt 1:** `accepted=True`, `test_job_seconds = 247.945 s`, JUnit `<testsuite>` = `1186.564 s`, spread `10.8%`, `3414 passed, 56 skipped, 0 failed`.
+- **Python 3.14 Lượt 2 (giữ nguyên làm hồ sơ):** `accepted=False`, `test_job_seconds = 262.570 s`, `3413 passed, 1 failed` (`test_hook_entry_subprocess_enqueues_sanitized_stays_within_budget_and_imports_minimal` `106,909,200 ns` > `100 ms`).
+- **Python 3.14 Lượt 2 clean:** `accepted=True`, `test_job_seconds = 252.712 s`, JUnit `<testsuite>` = `1193.220 s`, spread `11.0%`, `3414 passed, 56 skipped, 0 failed`.
+
+### Bước tiếp theo ngay sau commit vá SP2-V10-01/02/03:
+1. Kiểm `ruff`, `mypy`, `lint-imports`, `green_focused_314.log`, và bằng chứng `evidence/v10-p1-p2-bugproof/` trên commit sạch của `remediate-runtime-opt` (`tree_is_clean == True`).
+2. Chạy gate **`final-remediate-gate-v11`** trên commit sạch mới (`--shards 6`, Python 3.11 × 2 và Python 3.14 × 3 để chứng minh A4 3/3 đạt dưới tải).
+3. Bàn giao cho Reviewer độc lập (Codex) thẩm định delta + phê duyệt reseal `.verification/task9-seal.json` (giữ digest cũ `ca08c25897c9765e249261fcb08c9e775a57dd508a08d942ccc8a4c12641150e`), rồi chạy `test_lock.py check` + gate xác nhận cuối trên commit đã có seal hợp lệ.

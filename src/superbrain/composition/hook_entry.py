@@ -37,7 +37,13 @@ from superbrain.storage.outbox import OutboxSpool
 _MAX_STDIN_BYTES = 2 * 1024 * 1024
 
 
-def _write_static_log(log_path: Path | None, *, phase: str, code: str) -> None:
+def _write_static_log(
+    log_path: Path | None,
+    *,
+    phase: str,
+    code: str,
+    timeout_s: float = 0.25,
+) -> None:
     if log_path is None:
         return
     try:
@@ -48,7 +54,7 @@ def _write_static_log(log_path: Path | None, *, phase: str, code: str) -> None:
         with thread_lock_for(resolved):
             ensure_dir_tree_atomic(resolved.parent, perms, renamer, verify_existing=False)
             ensure_secure_regular_file_atomic(resolved, perms)
-            atomic_append_no_follow(resolved, f"phase={phase} error.code={code}\n".encode())
+            atomic_append_no_follow(resolved, f"phase={phase} error.code={code}\n".encode(), timeout_s=timeout_s)
     except (OSError, BrainError):
         pass
 
@@ -194,7 +200,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     logged = threading.Event()
 
     def _log() -> None:
-        _write_static_log(args.log, phase="hook_watchdog", code=ErrorCode.DEADLINE_EXCEEDED.value)
+        _write_static_log(args.log, phase="hook_watchdog", code=ErrorCode.DEADLINE_EXCEEDED.value, timeout_s=0.05)
         logged.set()
 
     threading.Thread(target=_log, name="superbrain-hook-log", daemon=True).start()

@@ -614,6 +614,219 @@ def test_hook_entry_static_log_preserves_concurrent_lines_without_stderr(
         "phase=hook error.code=invalid_input",
     ]
 
+    # Part 4 (SP2-V10-02): Short write across multiple WriteFile/os.write syscalls never interleaves
+    # with another process appending to the same log, and partial failures roll back cleanly.
+    from superbrain.adapters.os import physical_fs
+    from superbrain.core.errors import BrainError, ErrorCode
+
+    if sys.platform == "win32":
+        import ctypes
+
+        interleave_log = trusted_tmp / "short_write_interleave.log"
+        interleave_log.write_bytes(b"seed\n")
+        ensure_secure_regular_file_atomic(interleave_log, os_.permissions)
+
+        orig_write_file = physical_fs._WRITE_FILE
+        second_proc_cmd = (
+            "import pathlib, sys; "
+            "from superbrain.adapters.os.physical_fs import atomic_append_no_follow; "
+            "atomic_append_no_follow(pathlib.Path(sys.argv[1]), b'phase=second error.code=io_error\\n', timeout_s=1.0)"
+        )
+        second_proc_box: list[subprocess.Popen[bytes]] = []
+        write_calls = 0
+
+        def _short_first_write(handle: Any, buf_ptr: Any, nbytes: Any, out_ptr: Any, ov: Any) -> Any:
+            nonlocal write_calls
+            write_calls += 1
+            if write_calls == 1 and int(nbytes) > 6:
+                ok = orig_write_file(handle, buf_ptr, 6, out_ptr, ov)
+                proc_b = subprocess.Popen(
+                    [sys.executable, "-I", "-c", second_proc_cmd, str(interleave_log)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=_clean_hook_env(),
+                )
+                second_proc_box.append(proc_b)
+                time.sleep(0.05)  # Give Process B time to contend on the log before chunk 2 finishes
+                return ok
+            return orig_write_file(handle, buf_ptr, nbytes, out_ptr, ov)
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(physical_fs, "_WRITE_FILE", _short_first_write)
+            physical_fs.atomic_append_no_follow(
+                interleave_log, b"phase=first error.code=io_error\n", timeout_s=1.0
+            )
+        assert len(second_proc_box) == 1
+        rc_b = second_proc_box[0].wait(timeout=10.0)
+        assert rc_b == 0, second_proc_box[0].stderr.read() if second_proc_box[0].stderr else rc_b
+        assert interleave_log.read_text(encoding="utf-8").splitlines() == [
+            "seed",
+            "phase=first error.code=io_error",
+            "phase=second error.code=io_error",
+        ]
+
+        # Bounded timeout raises IO_ERROR without interleaving when lock stays held.
+        held_rec_log = trusted_tmp / "held_record_lock.log"
+        held_rec_log.write_bytes(b"seed\n")
+        ensure_secure_regular_file_atomic(held_rec_log, os_.permissions)
+        h_lock = physical_fs._CREATE_FILE_W(
+            str(held_rec_log),
+            physical_fs._FILE_APPEND_DATA_AND_LOCK,
+            physical_fs._FILE_SHARE_ALL,
+            None,
+            physical_fs._OPEN_EXISTING,
+            physical_fs._FILE_FLAGS_NOFOLLOW,
+            None,
+        )
+        ov_hold = physical_fs._WinOverlapped()
+        ov_hold.Offset = physical_fs._LOCK_SENTINEL_OFFSET_LOW
+        ov_hold.OffsetHigh = physical_fs._LOCK_SENTINEL_OFFSET_HIGH
+        assert physical_fs._LOCK_FILE_EX(
+            h_lock,
+            physical_fs._LOCKFILE_EXCLUSIVE_LOCK | physical_fs._LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            1,
+            0,
+            ctypes.byref(ov_hold),
+        )
+        try:
+            with pytest.raises(BrainError) as err_timeout:
+                physical_fs.atomic_append_no_follow(
+                    held_rec_log, b"phase=blocked error.code=io_error\n", timeout_s=0.02
+                )
+            assert err_timeout.value.code is ErrorCode.IO_ERROR
+        finally:
+            physical_fs._UNLOCK_FILE_EX(h_lock, 0, 1, 0, ctypes.byref(ov_hold))
+            physical_fs._CLOSE_HANDLE(h_lock)
+        assert held_rec_log.read_text(encoding="utf-8") == "seed\n"
+
+        # Partial write failure (STORAGE_FULL after first 6-byte chunk) rolls back half-written bytes.
+        rollback_log = trusted_tmp / "partial_rollback.log"
+        rollback_log.write_bytes(b"seed\n")
+        ensure_secure_regular_file_atomic(rollback_log, os_.permissions)
+        rb_calls = 0
+
+        def _fail_second_chunk_full(handle: Any, buf_ptr: Any, nbytes: Any, out_ptr: Any, ov: Any) -> Any:
+            nonlocal rb_calls
+            rb_calls += 1
+            if rb_calls == 1 and int(nbytes) > 6:
+                return orig_write_file(handle, buf_ptr, 6, out_ptr, ov)
+            ctypes.set_last_error(physical_fs._WIN_ERROR_DISK_FULL)
+            return 0
+
+        with pytest.MonkeyPatch.context() as mp, pytest.raises(BrainError) as err_full:
+            mp.setattr(physical_fs, "_WRITE_FILE", _fail_second_chunk_full)
+            physical_fs.atomic_append_no_follow(rollback_log, b"phase=half error.code=io_error\n")
+        assert err_full.value.code is ErrorCode.STORAGE_FULL
+        assert rollback_log.read_text(encoding="utf-8") == "seed\n"
+
+    # Guard & POSIX branch checks: directory refused, malformed timeout refused, empty data leaves unchanged,
+    # and POSIX _posix_atomic_append_no_follow rolls back partial writes via ftruncate under flock/lockf.
+    dir_target = trusted_tmp / "not_a_log_file"
+    dir_target.mkdir()
+    with pytest.raises(BrainError) as err_dir:
+        physical_fs.atomic_append_no_follow(dir_target, b"phase=x error.code=io_error\n")
+    assert err_dir.value.code in (ErrorCode.INTEGRITY_FAILURE, ErrorCode.IO_ERROR)
+
+    missing_log = trusted_tmp / "does_not_exist.log"
+    with pytest.raises(BrainError) as err_missing:
+        physical_fs.atomic_append_no_follow(missing_log, b"phase=x error.code=io_error\n")
+    assert err_missing.value.code is ErrorCode.IO_ERROR
+
+    empty_log = trusted_tmp / "empty_append.log"
+    empty_log.write_bytes(b"seed\n")
+    physical_fs.atomic_append_no_follow(empty_log, b"")
+    assert empty_log.read_bytes() == b"seed\n"
+
+    # Simulated symlink / reparse point check across POSIX ELOOP and Win32 _REPARSE_POINT.
+    import errno
+
+    if sys.platform == "win32":
+        orig_get_info = physical_fs._GET_FILE_INFO_BY_HANDLE
+
+        def _fake_reparse_info(handle: Any, info_ptr: Any) -> Any:
+            ok = orig_get_info(handle, info_ptr)
+            if ok:
+                info_ptr._obj.dwFileAttributes |= physical_fs._REPARSE_POINT
+            return ok
+
+        with pytest.MonkeyPatch.context() as mp, pytest.raises(BrainError) as err_rep:
+            mp.setattr(physical_fs, "_GET_FILE_INFO_BY_HANDLE", _fake_reparse_info)
+            physical_fs.atomic_append_no_follow(empty_log, b"phase=x error.code=io_error\n")
+        assert err_rep.value.code is ErrorCode.UNSAFE_PATH
+    class _FakeFcntl:
+        LOCK_EX = 2
+        LOCK_NB = 4
+        LOCK_UN = 8
+
+        @staticmethod
+        def lockf(_fd: int, op: int, _len: int = 0, _start: int = 0) -> None:
+            fake_lock_ops.append(op)
+
+    fake_lock_ops: list[int] = []
+    with pytest.MonkeyPatch.context() as mp, pytest.raises(BrainError) as err_eloop:
+        mp.setitem(sys.modules, "fcntl", _FakeFcntl)
+        mp.setattr(os, "open", lambda *_a, **_kw: (_ for _ in ()).throw(OSError(errno.ELOOP, "symlink")))
+        physical_fs._posix_atomic_append_no_follow(empty_log, b"phase=x error.code=io_error\n", timeout_ns=10_000_000)
+    assert err_eloop.value.code is ErrorCode.UNSAFE_PATH
+
+    with pytest.raises(BrainError) as err_bad_to:
+        physical_fs.atomic_append_no_follow(empty_log, b"phase=x error.code=io_error\n", timeout_s=-1.0)
+    assert err_bad_to.value.code is ErrorCode.INVALID_INPUT
+
+    # Cross-platform check of _posix_atomic_append_no_follow logic (fake fcntl + short write + EINTR + ENOSPC rollback).
+    posix_log = trusted_tmp / "posix_sim.log"
+    posix_log.write_bytes(b"seed\n")
+    fake_lock_ops.clear()
+
+    real_os_write = os.write
+    real_ftruncate = getattr(os, "ftruncate", None)
+    orig_read_writes = 0
+
+    def _fake_posix_write(fd: int, buf: Any) -> int:
+        nonlocal orig_read_writes
+        orig_read_writes += 1
+        raw = bytes(buf)
+        if orig_read_writes == 1:
+            return real_os_write(fd, raw[:6])
+        if orig_read_writes == 2:
+            raise OSError(errno.EINTR, "interrupted")
+        return real_os_write(fd, raw)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setitem(sys.modules, "fcntl", _FakeFcntl)
+        mp.setattr(os, "write", _fake_posix_write)
+        physical_fs._posix_atomic_append_no_follow(
+            posix_log, b"phase=posix error.code=io_error\n", timeout_ns=100_000_000
+        )
+    assert posix_log.read_text(encoding="utf-8").splitlines() == [
+        "seed",
+        "phase=posix error.code=io_error",
+    ]
+    assert _FakeFcntl.LOCK_EX | _FakeFcntl.LOCK_NB in fake_lock_ops and _FakeFcntl.LOCK_UN in fake_lock_ops
+
+    if real_ftruncate is not None:
+        rb_posix_calls = 0
+
+        def _fake_posix_enospc(fd: int, buf: Any) -> int:
+            nonlocal rb_posix_calls
+            rb_posix_calls += 1
+            if rb_posix_calls == 1:
+                return real_os_write(fd, bytes(buf)[:6])
+            raise OSError(errno.ENOSPC, "no space left on device")
+
+        with pytest.MonkeyPatch.context() as mp, pytest.raises(BrainError) as err_posix_full:
+            mp.setitem(sys.modules, "fcntl", _FakeFcntl)
+            mp.setattr(os, "write", _fake_posix_enospc)
+            physical_fs._posix_atomic_append_no_follow(
+                posix_log, b"phase=torn error.code=io_error\n", timeout_ns=100_000_000
+            )
+        assert err_posix_full.value.code is ErrorCode.STORAGE_FULL
+        assert posix_log.read_text(encoding="utf-8").splitlines() == [
+            "seed",
+            "phase=posix error.code=io_error",
+        ]
+
     # Part 4: Fail-closed target check (existing directory as log target) exits 0 without crashing.
     dir_target = trusted_tmp / "log_is_dir"
     dir_target.mkdir()

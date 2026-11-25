@@ -4,10 +4,15 @@ from __future__ import annotations
 
 import errno
 import hashlib
+import importlib
+import math
 import os
 import stat
 import sys
+import threading
+import time
 from pathlib import Path
+from typing import Any
 
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.proposals import normalize_proposal_rel_path, validate_journal_id
@@ -25,6 +30,30 @@ _REPARSE_POINT = 0x400
 _DIR_ATTR = 0x10
 _WIN_NOT_FOUND = frozenset({2, 3})
 _WIN_ERROR_DISK_FULL = 112
+_WIN_ERROR_LOCK_VIOLATION = 33
+_DEFAULT_APPEND_LOCK_TIMEOUT_S = 0.5
+_APPEND_LOCK_POLL_S = 0.001
+_APPEND_THREAD_LOCKS_GUARD = threading.Lock()
+_APPEND_THREAD_LOCKS: dict[str, threading.Lock] = {}
+
+
+def _append_thread_lock(path: Path) -> threading.Lock:
+    key = os.path.normcase(os.path.abspath(os.fspath(path)))
+    with _APPEND_THREAD_LOCKS_GUARD:
+        lock = _APPEND_THREAD_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _APPEND_THREAD_LOCKS[key] = lock
+        return lock
+
+
+def _validate_append_timeout(timeout_s: float) -> int:
+    if isinstance(timeout_s, bool) or not isinstance(timeout_s, (int, float)) or not math.isfinite(timeout_s):
+        raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+    if timeout_s < 0:
+        raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+    return int(timeout_s * 1_000_000_000)
+
 
 if sys.platform == "win32":
     import ctypes
@@ -33,10 +62,17 @@ if sys.platform == "win32":
     _KERNEL32 = ctypes.WinDLL("kernel32", use_last_error=True)
     _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
     _OPEN_EXISTING = 3
-    _FILE_APPEND_DATA_SYNC = 0x0004 | 0x00100000  # FILE_APPEND_DATA | SYNCHRONIZE (no FILE_WRITE_DATA -> atomic EOF)
+    # FILE_APPEND_DATA | FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE:
+    # preserves kernel atomic-EOF writes (no FILE_WRITE_DATA) while allowing LockFileEx.
+    _FILE_APPEND_DATA_AND_LOCK = 0x0004 | 0x0001 | 0x0080 | 0x00100000
+    _FILE_WRITE_DATA_SYNC = 0x0002 | 0x0080 | 0x00100000
     _FILE_SHARE_ALL = 0x1 | 0x2 | 0x4
     _FILE_FLAGS_NOFOLLOW = 0x02000000 | 0x00200000  # BACKUP_SEMANTICS | OPEN_REPARSE_POINT
     _FILE_ID_INFO_CLASS = 18
+    _LOCKFILE_FAIL_IMMEDIATELY = 0x1
+    _LOCKFILE_EXCLUSIVE_LOCK = 0x2
+    _LOCK_SENTINEL_OFFSET_LOW = 0xFFFFFFFF
+    _LOCK_SENTINEL_OFFSET_HIGH = 0x7FFFFFFF
 
     class _Filetime(ctypes.Structure):
         _fields_ = [("dwLowDateTime", wintypes.DWORD), ("dwHighDateTime", wintypes.DWORD)]
@@ -58,6 +94,22 @@ if sys.platform == "win32":
     class _FileIdInfo(ctypes.Structure):
         _fields_ = [("VolumeSerialNumber", ctypes.c_uint64), ("FileId", ctypes.c_ubyte * 16)]
 
+    class _WinOverlapped(ctypes.Structure):
+        class _OffsetUnion(ctypes.Union):
+            class _OffsetStruct(ctypes.Structure):
+                _fields_ = [("Offset", wintypes.DWORD), ("OffsetHigh", wintypes.DWORD)]
+
+            _anonymous_ = ("_s",)
+            _fields_ = [("_s", _OffsetStruct), ("Pointer", ctypes.c_void_p)]
+
+        _anonymous_ = ("_u",)
+        _fields_ = [
+            ("Internal", ctypes.c_void_p),
+            ("InternalHigh", ctypes.c_void_p),
+            ("_u", _OffsetUnion),
+            ("hEvent", wintypes.HANDLE),
+        ]
+
     _CREATE_FILE_W = _KERNEL32.CreateFileW
     _CREATE_FILE_W.argtypes = [
         wintypes.LPCWSTR,
@@ -78,6 +130,34 @@ if sys.platform == "win32":
     _GET_FILE_INFO_BY_HANDLE_EX = _KERNEL32.GetFileInformationByHandleEx
     _GET_FILE_INFO_BY_HANDLE_EX.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
     _GET_FILE_INFO_BY_HANDLE_EX.restype = wintypes.BOOL
+    _GET_FILE_SIZE_EX = _KERNEL32.GetFileSizeEx
+    _GET_FILE_SIZE_EX.argtypes = [wintypes.HANDLE, ctypes.POINTER(ctypes.c_int64)]
+    _GET_FILE_SIZE_EX.restype = wintypes.BOOL
+    _SET_FILE_POINTER_EX = _KERNEL32.SetFilePointerEx
+    _SET_FILE_POINTER_EX.argtypes = [wintypes.HANDLE, ctypes.c_int64, ctypes.POINTER(ctypes.c_int64), wintypes.DWORD]
+    _SET_FILE_POINTER_EX.restype = wintypes.BOOL
+    _SET_END_OF_FILE = _KERNEL32.SetEndOfFile
+    _SET_END_OF_FILE.argtypes = [wintypes.HANDLE]
+    _SET_END_OF_FILE.restype = wintypes.BOOL
+    _LOCK_FILE_EX = _KERNEL32.LockFileEx
+    _LOCK_FILE_EX.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.POINTER(_WinOverlapped),
+    ]
+    _LOCK_FILE_EX.restype = wintypes.BOOL
+    _UNLOCK_FILE_EX = _KERNEL32.UnlockFileEx
+    _UNLOCK_FILE_EX.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.POINTER(_WinOverlapped),
+    ]
+    _UNLOCK_FILE_EX.restype = wintypes.BOOL
     _WRITE_FILE = _KERNEL32.WriteFile
     _WRITE_FILE.argtypes = [
         wintypes.HANDLE,
@@ -88,10 +168,39 @@ if sys.platform == "win32":
     ]
     _WRITE_FILE.restype = wintypes.BOOL
 
-    def _win_atomic_append_no_follow(path: Path, data: bytes) -> None:
+    def _win_rollback_partial_append(path: Path, expected_bh: _ByHandleFileInfo, initial_size: int) -> None:
+        ht = _CREATE_FILE_W(
+            str(path),
+            _FILE_WRITE_DATA_SYNC,
+            _FILE_SHARE_ALL,
+            None,
+            _OPEN_EXISTING,
+            _FILE_FLAGS_NOFOLLOW,
+            None,
+        )
+        if ht == _INVALID_HANDLE_VALUE or not ht:
+            return
+        try:
+            bh_cur = _ByHandleFileInfo()
+            if not _GET_FILE_INFO_BY_HANDLE(ht, ctypes.byref(bh_cur)):
+                return
+            if bh_cur.dwFileAttributes & (_REPARSE_POINT | _DIR_ATTR):
+                return
+            if (bh_cur.dwVolumeSerialNumber, bh_cur.nFileIndexHigh, bh_cur.nFileIndexLow) != (
+                expected_bh.dwVolumeSerialNumber,
+                expected_bh.nFileIndexHigh,
+                expected_bh.nFileIndexLow,
+            ):
+                return
+            if _SET_FILE_POINTER_EX(ht, initial_size, None, 0):
+                _SET_END_OF_FILE(ht)
+        finally:
+            _CLOSE_HANDLE(ht)
+
+    def _win_atomic_append_no_follow(path: Path, data: bytes, *, timeout_ns: int) -> None:
         handle = _CREATE_FILE_W(
             str(path),
-            _FILE_APPEND_DATA_SYNC,
+            _FILE_APPEND_DATA_AND_LOCK,
             _FILE_SHARE_ALL,
             None,
             _OPEN_EXISTING,
@@ -103,6 +212,10 @@ if sys.platform == "win32":
             if err_code == _WIN_ERROR_DISK_FULL:
                 raise BrainError(ErrorCode.STORAGE_FULL, "storage full")
             raise BrainError(ErrorCode.IO_ERROR, f"cannot open {path} for atomic append: winerror {err_code}")
+        locked = False
+        ov = _WinOverlapped()
+        ov.Offset = _LOCK_SENTINEL_OFFSET_LOW
+        ov.OffsetHigh = _LOCK_SENTINEL_OFFSET_HIGH
         try:
             bh = _ByHandleFileInfo()
             if not _GET_FILE_INFO_BY_HANDLE(handle, ctypes.byref(bh)):
@@ -114,27 +227,56 @@ if sys.platform == "win32":
                 raise BrainError(ErrorCode.INTEGRITY_FAILURE, f"target is a directory: {path}")
             if not data:
                 return
+            deadline_ns = time.monotonic_ns() + timeout_ns
+            while True:
+                if _LOCK_FILE_EX(
+                    handle,
+                    _LOCKFILE_EXCLUSIVE_LOCK | _LOCKFILE_FAIL_IMMEDIATELY,
+                    0,
+                    1,
+                    0,
+                    ctypes.byref(ov),
+                ):
+                    locked = True
+                    break
+                err_code = ctypes.get_last_error()
+                if err_code != _WIN_ERROR_LOCK_VIOLATION:
+                    raise BrainError(ErrorCode.IO_ERROR, f"cannot lock {path} for atomic append: winerror {err_code}")
+                if time.monotonic_ns() >= deadline_ns:
+                    raise BrainError(ErrorCode.IO_ERROR, f"timed out locking {path} for atomic append")
+                time.sleep(_APPEND_LOCK_POLL_S)
+
+            size_box = ctypes.c_int64(0)
+            has_initial_size = bool(_GET_FILE_SIZE_EX(handle, ctypes.byref(size_box)))
+            initial_size = int(size_box.value)
             total = len(data)
             buf = ctypes.create_string_buffer(data, total)
             written = 0
-            while written < total:
-                chunk_written = wintypes.DWORD(0)
-                ok = _WRITE_FILE(
-                    handle,
-                    ctypes.c_void_p(ctypes.addressof(buf) + written),
-                    total - written,
-                    ctypes.byref(chunk_written),
-                    None,
-                )
-                if not ok:
-                    err_code = ctypes.get_last_error()
-                    if err_code == _WIN_ERROR_DISK_FULL:
-                        raise BrainError(ErrorCode.STORAGE_FULL, "storage full")
-                    raise BrainError(ErrorCode.IO_ERROR, f"cannot append to {path}: winerror {err_code}")
-                if chunk_written.value <= 0:
-                    raise BrainError(ErrorCode.IO_ERROR, f"short write while appending to {path}")
-                written += chunk_written.value
+            try:
+                while written < total:
+                    chunk_written = wintypes.DWORD(0)
+                    ok = _WRITE_FILE(
+                        handle,
+                        ctypes.c_void_p(ctypes.addressof(buf) + written),
+                        total - written,
+                        ctypes.byref(chunk_written),
+                        None,
+                    )
+                    if not ok:
+                        err_code = ctypes.get_last_error()
+                        if err_code == _WIN_ERROR_DISK_FULL:
+                            raise BrainError(ErrorCode.STORAGE_FULL, "storage full")
+                        raise BrainError(ErrorCode.IO_ERROR, f"cannot append to {path}: winerror {err_code}")
+                    if chunk_written.value <= 0:
+                        raise BrainError(ErrorCode.IO_ERROR, f"short write while appending to {path}")
+                    written += chunk_written.value
+            except Exception:
+                if written > 0 and has_initial_size:
+                    _win_rollback_partial_append(path, bh, initial_size)
+                raise
         finally:
+            if locked:
+                _UNLOCK_FILE_EX(handle, 0, 1, 0, ctypes.byref(ov))
             _CLOSE_HANDLE(handle)
 
     def _win_stat_physical(path: Path) -> PhysicalObjectId | None:
@@ -183,11 +325,12 @@ def stat_physical_identity(path: Path) -> PhysicalObjectId | None:
     )
 
 
-def atomic_append_no_follow(path: Path, data: bytes) -> None:
-    """Append ``data`` atomically at EOF without following symlinks or reparse points."""
-    if sys.platform == "win32":
-        _win_atomic_append_no_follow(path, data)
-        return
+_POSIX_APPEND_LOCK_OFFSET = 1_073_741_824  # 1 GiB sentinel range for whole-record POSIX lockf
+
+
+def _posix_atomic_append_no_follow(path: Path, data: bytes, *, timeout_ns: int) -> None:
+    fcntl: Any = importlib.import_module("fcntl")
+
     flags = os.O_WRONLY | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
     eloop = getattr(errno, "ELOOP", None)
     try:
@@ -200,6 +343,7 @@ def atomic_append_no_follow(path: Path, data: bytes) -> None:
         if err.errno == errno.EISDIR:
             raise BrainError(ErrorCode.INTEGRITY_FAILURE, f"target is a directory: {path}") from err
         raise BrainError(ErrorCode.IO_ERROR, f"cannot open {path} for atomic append: {err}") from err
+    locked = False
     try:
         st = os.fstat(fd)
         if stat.S_ISLNK(st.st_mode):
@@ -208,20 +352,68 @@ def atomic_append_no_follow(path: Path, data: bytes) -> None:
             raise BrainError(ErrorCode.INTEGRITY_FAILURE, f"target is a directory: {path}")
         if not stat.S_ISREG(st.st_mode):
             raise BrainError(ErrorCode.INTEGRITY_FAILURE, f"path {path} is not a regular file")
+        if not data:
+            return
+        deadline_ns = time.monotonic_ns() + timeout_ns
+        while True:
+            try:
+                fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB, 1, _POSIX_APPEND_LOCK_OFFSET)
+                locked = True
+                break
+            except OSError as err:
+                if err.errno == errno.EINTR:
+                    continue
+                if err.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
+                    raise BrainError(ErrorCode.IO_ERROR, f"cannot lock {path} for atomic append: {err}") from err
+            if time.monotonic_ns() >= deadline_ns:
+                raise BrainError(ErrorCode.IO_ERROR, f"timed out locking {path} for atomic append")
+            time.sleep(_APPEND_LOCK_POLL_S)
+
+        initial_size = os.fstat(fd).st_size
         view = memoryview(data)
         written = 0
-        while written < len(data):
-            try:
-                n = os.write(fd, view[written:])
-            except OSError as err:
-                if err.errno in (errno.ENOSPC, errno.EDQUOT):
-                    raise BrainError(ErrorCode.STORAGE_FULL, "storage full") from err
-                raise BrainError(ErrorCode.IO_ERROR, f"cannot append to {path}: {err}") from err
-            if n <= 0:
-                raise BrainError(ErrorCode.IO_ERROR, f"short write while appending to {path}")
-            written += n
+        try:
+            while written < len(data):
+                try:
+                    n = os.write(fd, view[written:])
+                except OSError as err:
+                    if err.errno == errno.EINTR:
+                        continue
+                    if err.errno in (errno.ENOSPC, errno.EDQUOT):
+                        raise BrainError(ErrorCode.STORAGE_FULL, "storage full") from err
+                    raise BrainError(ErrorCode.IO_ERROR, f"cannot append to {path}: {err}") from err
+                if n <= 0:
+                    raise BrainError(ErrorCode.IO_ERROR, f"short write while appending to {path}")
+                written += n
+        except Exception:
+            if written > 0:
+                try:
+                    os.ftruncate(fd, initial_size)
+                except OSError:
+                    pass
+            raise
     finally:
+        if locked:
+            try:
+                fcntl.lockf(fd, fcntl.LOCK_UN, 1, _POSIX_APPEND_LOCK_OFFSET)
+            except OSError:
+                pass
         os.close(fd)
+
+
+def atomic_append_no_follow(
+    path: Path,
+    data: bytes,
+    *,
+    timeout_s: float = _DEFAULT_APPEND_LOCK_TIMEOUT_S,
+) -> None:
+    """Append ``data`` atomically as one un-interleaved record without following symlinks/reparse points."""
+    timeout_ns = _validate_append_timeout(timeout_s)
+    with _append_thread_lock(path):
+        if sys.platform == "win32":
+            _win_atomic_append_no_follow(path, data, timeout_ns=timeout_ns)
+            return
+        _posix_atomic_append_no_follow(path, data, timeout_ns=timeout_ns)
 
 
 def _nearest_existing(path: Path) -> Path:
