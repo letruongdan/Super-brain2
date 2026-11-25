@@ -1,5 +1,6 @@
 """The gate receipt accepts only a complete, source-bound, fully-accounted run."""
 
+import ast
 import errno
 import inspect
 import json
@@ -16,7 +17,7 @@ import tempfile
 import textwrap
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -2312,37 +2313,86 @@ def test_shard_files_staggers_storage_vs_non_storage_io(monkeypatch: pytest.Monk
         ), groups2[shard_idx]
 
 
-def test_gate_wheel_fixture_files_and_weights_stay_aligned_with_tests() -> None:
-    import ast
+def _extract_usefixtures_names(node: ast.Call) -> Iterator[str]:
+    for arg in node.args:
+        items = (
+            arg.value.elts
+            if isinstance(arg, ast.Starred) and isinstance(arg.value, (ast.Tuple, ast.List))
+            else [arg]
+        )
+        for item in items:
+            if isinstance(item, ast.Constant) and isinstance(item.value, str):
+                yield item.value
 
-    assert gate.TEST_JOB_BUDGET_S == 300.0
-    repo_root = Path(__file__).resolve().parents[2]
-    tests_root = repo_root / "tests"
+
+def _discover_wheel_fixture_files(tests_root: Path, *, repo_root: Path | None = None) -> set[str]:
+    base = repo_root if repo_root is not None else tests_root.parent
     discovered: set[str] = set()
     for path in sorted(tests_root.rglob("test_*.py")):
-        text = path.read_text(encoding="utf-8")
-        if "inc2_installed_env" not in text:
-            continue
-        tree = ast.parse(text, filename=str(path))
-        rel = path.relative_to(repo_root).as_posix()
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        rel = path.relative_to(base).as_posix()
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 args = [arg.arg for arg in (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs)]
                 if "inc2_installed_env" in args:
                     discovered.add(rel)
-            elif isinstance(node, ast.Call):
-                if isinstance(node.func, ast.Attribute) and node.func.attr == "usefixtures":
-                    for arg in node.args:
-                        if isinstance(arg, ast.Constant) and arg.value == "inc2_installed_env":
-                            discovered.add(rel)
+            elif isinstance(node, ast.Call) and (
+                (isinstance(node.func, ast.Attribute) and node.func.attr == "usefixtures")
+                or (isinstance(node.func, ast.Name) and node.func.id == "usefixtures")
+            ):
+                if "inc2_installed_env" in _extract_usefixtures_names(node):
+                    discovered.add(rel)
+    return discovered
 
-    wheel_cfg = getattr(gate, "_WHEEL_FIXTURE_FILES", None)
-    assert wheel_cfg is not None, "scripts.gate must define _WHEEL_FIXTURE_FILES"
-    configured = set(wheel_cfg)
+
+def _assert_wheel_fixture_files_aligned(
+    configured: set[str], tests_root: Path, *, repo_root: Path | None = None
+) -> set[str]:
+    discovered = _discover_wheel_fixture_files(tests_root, repo_root=repo_root)
     assert configured == discovered, (
         f"_WHEEL_FIXTURE_FILES out of sync with tests using inc2_installed_env: "
         f"missing={sorted(discovered - configured)}, stale={sorted(configured - discovered)}"
     )
+    return discovered
+
+
+def test_gate_wheel_fixture_files_and_weights_stay_aligned_with_tests(tmp_path: Path) -> None:
+    assert gate.TEST_JOB_BUDGET_S == 300.0
+    repo_root = Path(__file__).resolve().parents[2]
+    tests_root = repo_root / "tests"
+    wheel_cfg = getattr(gate, "_WHEEL_FIXTURE_FILES", None)
+    assert wheel_cfg is not None, "scripts.gate must define _WHEEL_FIXTURE_FILES"
+    configured = set(wheel_cfg)
+    _assert_wheel_fixture_files_aligned(configured, tests_root, repo_root=repo_root)
+
+    # Guard against raw-text substring prefilters skipping valid normalized Python literals or aliases.
+    syn_root = tmp_path / "syn"
+    syn_tests = syn_root / "tests"
+    syn_tests.mkdir(parents=True)
+    (syn_tests / "test_adj_literal.py").write_text(
+        'import pytest\n\n@pytest.mark.usefixtures("inc2_installed_" "env")\ndef test_adj() -> None:\n    pass\n',
+        encoding="utf-8",
+    )
+    (syn_tests / "test_direct_usefixtures.py").write_text(
+        'from pytest import mark\nusefixtures = mark.usefixtures\npytestmark = usefixtures("inc2_installed_" "env")\n\n'
+        "def test_mod() -> None:\n    pass\n",
+        encoding="utf-8",
+    )
+    (syn_tests / "test_param.py").write_text(
+        "def test_p(inc2_installed_env: object) -> None:\n    pass\n",
+        encoding="utf-8",
+    )
+    (syn_tests / "test_comment_only.py").write_text(
+        "# inc2_installed_env\ndef test_c() -> None:\n    pass\n",
+        encoding="utf-8",
+    )
+    assert _discover_wheel_fixture_files(syn_tests, repo_root=syn_root) == {
+        "tests/test_adj_literal.py",
+        "tests/test_direct_usefixtures.py",
+        "tests/test_param.py",
+    }
+    with pytest.raises(AssertionError, match=r"tests/test_adj_literal\.py"):
+        _assert_wheel_fixture_files_aligned(set(), syn_tests, repo_root=syn_root)
     heavy_cfg = getattr(gate, "_HEAVY_FILE_COST_MS", None)
     assert isinstance(heavy_cfg, dict) and heavy_cfg, "scripts.gate must define _HEAVY_FILE_COST_MS"
     for rel_path in configured | set(heavy_cfg):

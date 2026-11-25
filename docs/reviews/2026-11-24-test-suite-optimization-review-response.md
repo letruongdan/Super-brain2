@@ -492,7 +492,36 @@ Kiểm tra inventory bằng `gate.parse_collected`:
 - **Python 3.14 Lượt 2:** `accepted=True`, `test_job_seconds = 251.667 s`, JUnit `<testsuite>` = `1187.557 s`, `3414 passed, 56 skipped, 0 failed`.
 - **Sửa tối ưu tiếp theo (`privacy.py` `_sensitive_key`):** Thêm prefilter chính xác `_sensitive_sub_re` trên chuỗi ASCII `[0-9a-z]` (`translate(_ASCII_LOWER_TABLE, _ASCII_NON_ALNUM_BYTES)`) cho `key.isascii() and len(key) >= 128` (chỉ khi không có bất kỳ substring nhạy cảm nào mới trả `False` ngay; mọi trường hợp khớp vẫn đi qua trọn vẹn `_key_words` + word-window + benign rules), giảm `"a1"*30_000` trên Python 3.11 từ `22.60 ms` xuống `2.78 ms` (`296 passed in 0.47s`).
 
-### Bước tiếp theo ngay sau commit vá `_sensitive_key`:
-1. Kiểm `ruff`, `mypy`, `lint-imports`, `test_kernel_privacy.py`, `test_t8_privacy_performance_equivalence.py` trên commit sạch của `remediate-runtime-opt`.
-2. Chạy full gate **`final-remediate-gate-v13`** (`--shards 6`, Python 3.11 × 2 và Python 3.14 × 2) trên commit sạch mới.
+### Kết quả gate `final-remediate-gate-v13` trên `958a683b` (`--shards 6`, cache wheel lạnh):
+- **Python 3.11 Lượt 1:** `accepted=True`, `test_job_seconds = 237.297 s`, JUnit `<testsuite>` = `1141.038 s`, spread `8.9%`, `3414 passed, 56 skipped, 0 failed`.
+- **Python 3.11 Lượt 2:** `accepted=True`, `test_job_seconds = 248.817 s`, JUnit `<testsuite>` = `1185.962 s`, spread `7.9%`, `3414 passed, 56 skipped, 0 failed`.
+- **Python 3.14 Lượt 1:** `accepted=True`, `test_job_seconds = 253.025 s`, JUnit `<testsuite>` = `1172.515 s`, spread `11.8%`, `3414 passed, 56 skipped, 0 failed`.
+- **Python 3.14 Lượt 2:** `accepted=True`, `test_job_seconds = 251.923 s`, JUnit `<testsuite>` = `1165.746 s`, spread `11.9%`, `3414 passed, 56 skipped, 0 failed`.
+
+### Fix note · `SP2-958A683-P2` (Loại bỏ prefilter substring thô trước `ast.parse` ở các oracle kiểm tra AST)
+
+1. **Invariant.** Mọi oracle kiểm tra mã nguồn Python theo cú pháp hợp lệ (tên fixture, tham chiếu biểu tượng hoặc hằng chuỗi đã chuẩn hóa lúc parse) phải phân tích toàn bộ tệp bằng AST thay vì bỏ qua tệp theo substring thô của source text.
+2. **Sibling sweep.**
+   - `tests/architecture/test_gate_receipt.py` (`_discover_wheel_fixture_files`, `_assert_wheel_fixture_files_aligned`, `test_gate_wheel_fixture_files_and_weights_stay_aligned_with_tests`): bỏ `if "inc2_installed_env" not in text: continue`, parse mọi `test_*.py` bằng `ast.parse`, hỗ trợ cả `ast.Attribute(attr="usefixtures")` lẫn `ast.Name(id="usefixtures")` (bao gồm `*tuple`/`*list`), và bổ sung cặp ca dương/âm tổng hợp (`"inc2_installed_" "env"`, `usefixtures(...)` trực tiếp, tham số hàm, và comment-only).
+   - `tests/storage/test_ledger.py` (`callers_of`, `test_callers_of_sees_methods_functions_aliases_and_module_level`): phát hiện lỗi cùng lớp từ tối ưu trước (`if name not in text and "\\" not in text: continue` làm `callers_of` bỏ sót `getattr(x, "_tar" "get")()` vì không có `\` lẫn chuỗi liền nhau). Đã gỡ hoàn toàn prefilter để parse mọi `*.py` bằng `ast.parse` và bổ sung ca `"_tar" "get"` cùng comment-only.
+   - Đã quét toàn bộ các `ast.parse` khác trong `tests/` (`tests/architecture/test_imports.py`, `test_t8_review_w02_canonical_payload_source.py`, `test_remediation_i2_os01.py`, `tests/storage/test_kernel_workspaces.py`, `tests/application/test_kernel_job_worker.py`, `tests/support/test_bounded_worker.py`, `tests/support/test_crash_harness.py`): đều không có substring prefilter trước `ast.parse`.
+3. **Lens table.**
+
+| Lens | Kết quả | Lý do |
+|---|---|---|
+| 1. Crash giữa hai bước bền vững | Not applicable | Các oracle chỉ đọc và parse AST tĩnh các tệp kiểm thử/mã nguồn. |
+| 2. Restore, rollback & migration | Not applicable | Không chạm dữ liệu kho, snapshot hay trạng thái di trú. |
+| 3. Old binaries, old data, version fences | Not applicable | Không đổi schema hay wire format. |
+| 4. Mọi đường đi tới cùng invariant | Fixed here | Sửa cả `_discover_wheel_fixture_files` (hỗ trợ literal liền nhau, direct `usefixtures`, `*args`, tham số hàm) và sibling `callers_of` trong `test_ledger.py`. |
+| 5. Concurrency, shutdown & cutoffs | Holds | Không thêm luồng/khóa; parse đầy đủ toàn bộ tệp vẫn giữ nguyên ngưỡng ngân sách 300 s. |
+| 6. Authority, identity & scope | Holds | Vẫn giữ nguyên `.verification/task9-seal.json` để reviewer độc lập kiểm tra trước khi cấp seal mới. |
+| 7. Fail closed | Fixed here | Oracle thất bại (fail) khi thiếu khai báo `inc2_installed_env` hợp lệ ở bất kỳ spelling Python chuẩn hóa nào, không pass nhầm khi prefilter bỏ qua tệp. |
+| 8. Dữ liệu thực sự ra ngoài | Not applicable | Kiểm kê tĩnh nội bộ không xuất payload hay log ngoại tuyến. |
+| 9. Thế giới bên ngoài daemon | Holds | Kiểm chứng bằng parser AST chuẩn của Python và collector/marker thật của pytest. |
+| 10. Bằng chứng & oracles | Fixed here | Có RED trên `958a683` (`red_958a683.log`), GREEN trên Python 3.11 & 3.14, kiểm chứng node ID giữ nguyên `3470` và diệt được mutant chèn lại prefilter. |
+| 11. Tài liệu nhất quán | Holds | Giữ nguyên yêu cầu A2/A3 và bảo toàn chứng từ v11/v12/v13 trong bản phản hồi review. |
+
+### Bước tiếp theo ngay sau commit vá AST prefilter:
+1. Kiểm `ruff`, `mypy`, `lint-imports`, `test_gate_receipt.py`, `test_ledger.py` và đối chứng Python 3.11 + 3.14 (`GREEN` + diệt mutant) trên commit sạch mới.
+2. Chạy full gate **`final-remediate-gate-v14`** (`--shards 6`, Python 3.11 × 2 và Python 3.14 × 2) trên commit sạch mới.
 3. Bàn giao cho Reviewer độc lập (Codex) thẩm định delta + phê duyệt reseal `.verification/task9-seal.json` (giữ digest cũ `ca08c25897c9765e249261fcb08c9e775a57dd508a08d942ccc8a4c12641150e`), rồi chạy `test_lock.py check` + gate xác nhận cuối trên commit đã có seal hợp lệ.
