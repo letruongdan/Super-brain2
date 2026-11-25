@@ -24,9 +24,11 @@ from superbrain.core.errors import BrainError
 from superbrain.storage.cas import RetentionClass
 from superbrain.storage.layout import DataRoot
 from superbrain.storage.runtime import open_runtime
+from superbrain.storage.schema import POLICY_MIGRATIONS, STORE_MIGRATIONS
 from tests.storage.test_remediation_c01_wal_admission import commit_in_wal_then_crash
 from tests.support.crash import CHILD_TIMEOUT, CRASH_EXIT
 from tests.support.fs import digest_tree
+from tests.support.inc2_fixture import open_cloned_runtime
 from tests.support.platform import posix_only, windows_only
 
 PAYLOAD = b"c01 round 4: normal data next to a reader leftover"
@@ -73,7 +75,13 @@ def leftovers(db: Path) -> list[str]:
 
 def seeded_root(data_root: Path) -> tuple[DataRoot, str, str]:
     """A data root with one held payload; returns ``(root, digest, store_id)``."""
-    rt = open_runtime(data_root, os_adapters())
+    rt = open_cloned_runtime(
+        data_root,
+        os_adapters(),
+        role="c01r4-v1",
+        store_migrations=STORE_MIGRATIONS,
+        policy_migrations=POLICY_MIGRATIONS,
+    )
     try:
         digest = rt.store.store_content(PAYLOAD, "event", HOLDER, RetentionClass.EVENT_PAYLOAD, None)
         store_id = rt.store.store_id
