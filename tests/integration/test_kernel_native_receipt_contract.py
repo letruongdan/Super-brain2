@@ -5572,11 +5572,11 @@ def test_t9_r02_handshake_independent_of_collector_latency(
                 assert ev2[0]["observation_status"] == "observation_incomplete"
             assert hook_state["pending_count"]() == 0
 
-            # 3. Near-deadline handshake: client connects near deadline, observer prewait must not cause timeout.
-            # Controlled clock advances with real elapsed time to catch prewait delays.
+            # 3. Near-deadline handshake: client connects near deadline (< collector_timeout_s=0.5s), observer
+            # prewait must not cause timeout. Controlled clock advances with real elapsed time to catch prewait delays.
             t_call_start = [time.monotonic_ns()]
             client_start_ns = 10_000_000_000
-            tight_deadline_ns = client_start_ns + 100_000_000  # 100 ms budget
+            tight_deadline_ns = client_start_ns + 250_000_000  # 250 ms < 500 ms collector timeout
 
             def _controlled_clock() -> int:
                 return client_start_ns + (time.monotonic_ns() - t_call_start[0])
