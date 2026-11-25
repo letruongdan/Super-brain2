@@ -113,7 +113,7 @@ class OwnerSession(Protocol):
 @runtime_checkable
 class _DoctorOwnerSession(Protocol):
     def poll_doctor_settled(self, wake_event: threading.Event) -> bool: ...
-    def next_doctor_retry_wait_s(self) -> float | None: ...
+    def next_doctor_wake_wait_s(self) -> float | None: ...
 
 
 OwnerSessionFactory = Callable[[DaemonConfig, Callable[[], None], Callable[[], None]], OwnerSession]
@@ -589,7 +589,7 @@ class OwnerLoop:
                     _WORKER_IDLE_POLL_S if (session.has_job_handlers and not self._stopping) else None
                 )
                 doctor_wait_s = (
-                    session.next_doctor_retry_wait_s()
+                    session.next_doctor_wake_wait_s()
                     if (not self._stopping and isinstance(session, _DoctorOwnerSession))
                     else None
                 )

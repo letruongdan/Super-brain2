@@ -86,6 +86,7 @@ _MAX_FINISHED_CACHE = 256
 _TRANSIENT_COMMIT_CODES = frozenset({ErrorCode.STORE_BUSY, ErrorCode.FILESYSTEM_BUSY})
 _SETTLE_RETRY_S = 0.2  # initial delay before retrying a failed startup/schedule/claim/settlement pass
 _MAX_RETRY_S = 1.0  # bounded retry backoff ceiling across sustained transient store/OS failures
+_MAX_SCHEDULE_WAIT_S = min(604_800.0, float(threading.TIMEOUT_MAX) - 1.0)  # cap above 24h without OS wait overflow
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -238,10 +239,18 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
         tls_not_after: datetime | None = None,
     ) -> None:
         """Bind new runtime/stores post-restore and invalidate any pre-restore probes."""
+        now_utc: datetime | None = None
+        try:
+            now_utc, _ = require_aware_utc(self._clock.now())
+        except BrainError:
+            now_utc = None
         with self._lock:
             self._generation += 1
             self._drop_inflight_locked()
             self._finished_jobs.clear()
+            if now_utc is not None:
+                self._last_scheduled_at = now_utc
+                self._last_gc_at = now_utc
             self._rt = rt
             self._job_store = job_store
             self._job_service = job_service
@@ -338,6 +347,27 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
                 if (wait := lane.active_wait_s(self._generation, now_mono)) is not None
             ]
             return min(waits) if waits else None
+
+    def next_schedule_wait_s(self) -> float | None:
+        """Seconds until the next periodic maintenance/doctor check, or ``None`` if startup/retry owns wakeups."""
+        with self._lock:
+            if self._stopping or self._closed or self._startup_due or self._maint_retry.pending:
+                return None
+        try:
+            now_utc, _ = require_aware_utc(self._clock.now())
+        except BrainError:
+            return _MAX_RETRY_S
+        with self._lock:
+            if self._stopping or self._closed or self._startup_due or self._maint_retry.pending:
+                return None
+            next_due_utc = min(self._last_scheduled_at, self._last_gc_at) + DOCTOR_SCHEDULE_INTERVAL
+            due_in_s = max(0.0, (next_due_utc - now_utc).total_seconds())
+            return min(due_in_s, _MAX_SCHEDULE_WAIT_S)
+
+    def next_wake_wait_s(self) -> float | None:
+        """Seconds until the owner loop must next wake for retries or due periodic doctor/GC maintenance."""
+        waits = [w for w in (self.next_retry_wait_s(), self.next_schedule_wait_s()) if w is not None]
+        return min(waits) if waits else None
 
     def step(self, *, allow_new_jobs: bool) -> bool:
         """Advance background doctor work and 24h maintenance on the owner thread."""
@@ -483,9 +513,10 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
             return None
         return True
 
-    def _finish_maint_attempt(self) -> None:
+    def _finish_maint_attempt(self, gen: int) -> None:
         with self._lock:
-            self._maint_retry.finish_if_settled()
+            if self._generation == gen and not (self._stopping or self._closed):
+                self._maint_retry.finish_if_settled()
 
     def _run_maintenance_and_schedule(self) -> bool:
         with self._lock:
@@ -493,11 +524,16 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
                 return False
             gen = self._generation
             self._maint_retry.begin_attempt(gen)
+            startup_due = self._startup_due
+            last_gc_at = self._last_gc_at
+            last_scheduled_at = self._last_scheduled_at
         now_utc, _ = require_aware_utc(self._clock.now())
         did_work = False
 
-        if self._startup_due:
-            self._last_gc_at = now_utc
+        if startup_due:
+            with self._lock:
+                if self._generation == gen and not (self._stopping or self._closed):
+                    self._last_gc_at = now_utc
             # Same fence set and scope as deep health: only a store-wide run of this store, writer epoch, restore
             # epoch and trust generation counts as a recent self-check.
             try:
@@ -516,48 +552,58 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
                 self._arm_maint_retry(gen)
                 return False
             if latest is not None and not _due(latest[0].recorded_at, now_utc):
-                self._startup_due = False
-                self._last_scheduled_at = latest[0].recorded_at
-                self._finish_maint_attempt()
+                with self._lock:
+                    if self._generation == gen and not (self._stopping or self._closed):
+                        self._startup_due = False
+                        self._last_scheduled_at = latest[0].recorded_at
+                        self._maint_retry.finish_if_settled()
                 return False
             outcome = self._schedule_store_run("startup")
             if outcome is None:
                 self._arm_maint_retry(gen)
                 return False  # still due: owner-loop retry backoff wakes even on a doctor-only daemon
-            self._startup_due = False
-            self._last_scheduled_at = now_utc
-            self._finish_maint_attempt()
+            with self._lock:
+                if self._generation == gen and not (self._stopping or self._closed):
+                    self._startup_due = False
+                    self._last_scheduled_at = now_utc
+                    self._maint_retry.finish_if_settled()
             return outcome
 
-        if _due(self._last_gc_at, now_utc):
+        if _due(last_gc_at, now_utc):
             try:
                 expire_due(self._rt.store, self._rt.policy, now_utc)
                 self._rt.store.cas.collect_garbage(now=now_utc)
                 for _ in range(10):
                     if self._prune_idempotency_fn(now_utc, 100) < 100:
                         break
-                self._last_gc_at = now_utc
+                with self._lock:
+                    if self._generation == gen and not (self._stopping or self._closed):
+                        self._last_gc_at = now_utc
                 did_work = True
             except BrainError as err:
                 _LOGGER.warning("debounced maintenance failed (code=%s)", err.code.value)
                 if err.code is ErrorCode.STORE_BUSY:
-                    self._last_gc_at = now_utc
+                    with self._lock:
+                        if self._generation == gen and not (self._stopping or self._closed):
+                            self._last_gc_at = now_utc
                 else:
                     self._arm_maint_retry(gen)
             except sqlite3.Error:
                 _LOGGER.warning("debounced maintenance failed (code=sqlite_error)")
                 self._arm_maint_retry(gen)
 
-        if _due(self._last_scheduled_at, now_utc):
+        if _due(last_scheduled_at, now_utc):
             outcome = self._schedule_store_run("schedule")
             if outcome is not None:  # a failed attempt stays due and is retried on the next due pass
-                self._last_scheduled_at = now_utc
+                with self._lock:
+                    if self._generation == gen and not (self._stopping or self._closed):
+                        self._last_scheduled_at = now_utc
             else:
                 self._arm_maint_retry(gen)
             if outcome:
                 did_work = True
 
-        self._finish_maint_attempt()
+        self._finish_maint_attempt(gen)
         return did_work
 
     def _claim_and_launch_worker(self) -> bool:
@@ -831,10 +877,11 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
                 # Measured against an identity that no longer holds: rerun on a fresh snapshot instead of dropping it.
                 self._end_failed(completed, retryable=True)
                 return
+            commit_utc, _ = require_aware_utc(self._clock.now())
             doctor_run_id = commit_doctor_run_snapshot(
                 rt=self._rt, job_store=self._job_store, scanner=self._scanner,
                 lease=completed.lease, owner_id=completed.owner_id, trigger=completed.trigger,
-                checkout_root=completed.checkout_root, snapshot=completed.snapshot, now=self._clock.now(),
+                checkout_root=completed.checkout_root, snapshot=completed.snapshot, now=commit_utc,
                 tls_not_after=self._tls_not_after, clock_untrusted=self._clock_untrusted_fn(),
                 is_stale_fn=_is_stale,
             )
@@ -848,9 +895,21 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
             self._end_failed(completed, retryable=True)
             return
 
+        advance_schedule = False
+        if completed.checkout_root is None and completed.trigger not in {"startup", "schedule"}:
+            with contextlib.suppress(BrainError, sqlite3.Error):
+                advance_schedule = resolve_store_owner(self._rt.policy) == completed.owner_id
         with self._lock:
-            self._record_finished_locked(completed.lease.job_id, "succeeded", doctor_run_id)
-            self._fix_dirty = False
+            if completed.generation == self._generation and not (self._stopping or self._closed):
+                self._record_finished_locked(completed.lease.job_id, "succeeded", doctor_run_id)
+                self._fix_dirty = False
+                if (
+                    advance_schedule
+                    and not self._startup_due
+                    and not self._maint_retry.pending
+                    and commit_utc > self._last_scheduled_at
+                ):
+                    self._last_scheduled_at = commit_utc
         self._notify_waiters()
 
     def prepare_report(self, *, owner_id: str, checkout_root: Path | None = None) -> DoctorOperatorTicket:

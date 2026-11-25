@@ -311,7 +311,7 @@ _HEAVY_FILE_COST_MS: dict[str, int] = {
     "tests/architecture/test_gate_receipt.py": 23278,
     "tests/integration/test_i3_wheel_e2e.py": 22626,
     "tests/integration/test_i4_rereview_remediation.py": 20242,
-    "tests/integration/test_i4_a1_a2_job_lifecycle.py": 50280,
+    "tests/integration/test_i4_a1_a2_job_lifecycle.py": 62300,
     "tests/integration/test_i4_r4_remediation.py": 20018,
     "tests/storage/test_kernel_revocation.py": 18657,
     "tests/integration/test_doctor_sp2_probes.py": 18137,

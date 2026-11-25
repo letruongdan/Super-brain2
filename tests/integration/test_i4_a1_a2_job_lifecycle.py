@@ -34,8 +34,10 @@ from typing import Any, cast
 
 import pytest
 
+from superbrain.adapters.os import os_adapters
 from superbrain.adapters.os.daemon_config import read_client_endpoint
 from superbrain.application.jobs import JobService
+from superbrain.application.owner_loop import OwnerLoop
 from superbrain.composition import _daemon_doctor
 from superbrain.composition._daemon_doctor import DaemonDoctorRunner
 from superbrain.composition._daemon_health import (
@@ -53,8 +55,9 @@ from superbrain.storage._doctor_reader import StorageDoctorReader
 from superbrain.storage.backup import create_store_backup
 from superbrain.storage.cas import blob_path
 from superbrain.storage.idempotency import StagedKernelStore
+from superbrain.storage.layout import DataRoot
 from superbrain.workers.executor import JobHandler
-from tests.integration.test_doctor_jobs import BOUND_WAIT_S, OWNER_DAN, _ro_db
+from tests.integration.test_doctor_jobs import BOUND_WAIT_S, OWNER_DAN, _init_doctor_root, _ro_db
 from tests.integration.test_i4_f4_f8_remediation import (
     OTHER_OWNER,
     _doctor_jobs,
@@ -1368,3 +1371,421 @@ def test_p2_9_cross_lane_retry_deadlines_remain_independent(
             "handler_failed",
         )
         assert _durable(env, job_id) == expected
+
+
+# ---------------------------------------------------------------------------
+# P2 R5 (v2): Single-wait idle periodic schedule, GC, dedup, clock jump & reset
+# ---------------------------------------------------------------------------
+
+
+def _spy_owner_pokes(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Count external ``OwnerLoop.run_owner_action`` and ``wait_doctor_settled`` pokes."""
+    from superbrain.application.owner_loop import OwnerLoop
+
+    pokes = [0]
+    orig_run = OwnerLoop.run_owner_action
+    orig_wait = OwnerLoop.wait_doctor_settled
+
+    def _run(self: OwnerLoop, *args: Any, **kwargs: Any) -> Any:
+        pokes[0] += 1
+        return orig_run(self, *args, **kwargs)
+
+    def _wait(self: OwnerLoop, *args: Any, **kwargs: Any) -> bool:
+        pokes[0] += 1
+        return bool(orig_wait(self, *args, **kwargs))
+
+    monkeypatch.setattr(OwnerLoop, "run_owner_action", _run)
+    monkeypatch.setattr(OwnerLoop, "wait_doctor_settled", _wait)
+    return pokes
+
+
+def _job_tuple(root: DataRoot, job_id: str) -> tuple[str, int, str | None]:
+    with _ro_db(root.store_db) as conn:
+        row = conn.execute("SELECT state, attempt, reason FROM p_jobs_state WHERE job_id = ?", (job_id,)).fetchone()
+    assert row is not None, f"job {job_id} has no durable row"
+    return str(row[0]), int(row[1]), None if row[2] is None else str(row[2])
+
+
+def _assert_clean_stop(d: _Daemon) -> None:
+    t0 = time.monotonic()
+    report = d.loop.stop(grace_s=2.0)
+    elapsed = time.monotonic() - t0
+    assert report.state is ShutdownState.STOPPED, report
+    assert report.error_code is None, report
+    assert elapsed < 1.0, f"stop() took {elapsed:.3f}s"
+
+
+@pytest.mark.parametrize("mode", ["real_clock_short_interval", "single_wait_24h_no_fast_poll"])
+def test_p2_10_idle_periodic_schedule_uses_single_wait_without_fast_poll_or_timers(
+    trusted_tmp: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    """Idle doctor-only daemon runs periodic schedule via one bounded wait to due time (no fast poll or timers)."""
+    real_os = os_adapters()
+    _rep, cfg, _priv, _ca_pem, _leaf, _cli_token, _adapters = _init_doctor_root(
+        trusted_tmp / f"p2-10-{mode}", cast(Any, real_os.clock), os_=real_os
+    )
+    root = DataRoot.at(cfg.data_root)
+    pokes = _spy_owner_pokes(monkeypatch)
+
+    if mode == "real_clock_short_interval":
+        monkeypatch.setattr(_daemon_doctor, "DOCTOR_SCHEDULE_INTERVAL", timedelta(seconds=0.45))
+        t_start = time.monotonic()
+        with _serve(cfg, os_=real_os, clock=cast(Any, real_os.clock), mono=cast(Any, real_os.monotonic)) as d:
+            session = cast(Any, d.loop)._session
+            assert session is not None and session.has_job_handlers is False
+
+            assert _wait_until(lambda: len(_doctor_runs(root)) >= 1, WAKE_BUDGET_S), (
+                f"P2.10 ({mode}): startup DoctorRun did not complete: {_doctor_jobs(root)}"
+            )
+            startup_runs = _doctor_runs(root)
+            assert len(startup_runs) == 1 and startup_runs[0].get("trigger") == "startup"
+            if time.monotonic() - t_start < 0.30:
+                time.sleep(0.08)
+                assert len(_doctor_runs(root)) == 1, "P2.10: periodic schedule fired before 0.45s interval"
+
+            assert _wait_until(lambda: len(_doctor_runs(root)) >= 2, WAKE_BUDGET_S), (
+                f"P2.10 ({mode}): idle doctor-only daemon never self-triggered periodic DoctorRun: "
+                f"{_doctor_jobs(root)}"
+            )
+            runs = _doctor_runs(root)
+            assert len(runs) == 2 and runs[1].get("trigger") == "schedule", runs
+            assert _job_tuple(root, str(runs[1]["job_id"])) == ("succeeded", 1, None)
+            assert pokes[0] == 0
+            _assert_clean_stop(d)
+        return
+
+    orig_timer_init = threading.Timer.__init__
+    timers_created = [0]
+
+    def _counted_timer_init(self: threading.Timer, *args: Any, **kwargs: Any) -> None:
+        timers_created[0] += 1
+        orig_timer_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(threading.Timer, "__init__", _counted_timer_init)
+
+    with _serve(cfg, os_=real_os, clock=cast(Any, real_os.clock), mono=cast(Any, real_os.monotonic)) as d:
+        session = cast(Any, d.loop)._session
+        assert session is not None and session.has_job_handlers is False
+        assert d.loop.wait_doctor_settled(timeout=BOUND_WAIT_S) is True
+        assert len(_doctor_runs(root)) == 1
+
+        owner_wake = cast(threading.Event, cast(Any, d.loop)._owner_wake)
+        orig_wake_wait = owner_wake.wait
+        captured_timeouts: list[float | None] = []
+        wait_entered = threading.Event()
+        count_steps = threading.Event()
+        step_calls = [0]
+
+        def _spied_wait(timeout: float | None = None) -> bool:
+            captured_timeouts.append(timeout)
+            wait_entered.set()
+            return orig_wake_wait(timeout=timeout)
+
+        session_obj = cast(Any, d.loop)._session
+        orig_step = session_obj.step_owner_work
+
+        def _spied_step(*, allow_new_jobs: bool) -> bool:
+            if count_steps.is_set():
+                step_calls[0] += 1
+            return cast(bool, orig_step(allow_new_jobs=allow_new_jobs))
+
+        monkeypatch.setattr(owner_wake, "wait", _spied_wait)
+        monkeypatch.setattr(session_obj, "step_owner_work", _spied_step)
+        d.loop.run_owner_action(lambda: None).result(timeout=BOUND_WAIT_S)
+        assert wait_entered.wait(timeout=BOUND_WAIT_S)
+
+        count_steps.set()
+        time.sleep(1.0)
+
+        assert timers_created[0] == 0, f"P2.10 ({mode}): Timer threads must not be created ({timers_created[0]})"
+        assert captured_timeouts, "P2.10: no idle owner wait observed"
+        idle_timeout = captured_timeouts[-1]
+        assert idle_timeout is not None and idle_timeout > 86_000.0, (
+            f"P2.10 ({mode}): expected single 24h wait (>86000s), got {idle_timeout!r}"
+        )
+        assert step_calls[0] <= 1, f"P2.10 ({mode}): idle owner loop fast-polled ({step_calls[0]} steps in 1.0s)"
+        assert len(_doctor_runs(root)) == 1
+        _assert_clean_stop(d)
+
+
+@pytest.mark.parametrize("path", ["periodic_store_busy_cadence", "periodic_gc_reclaim_on_idle"])
+def test_p2_11_idle_periodic_retry_cadence_and_debounced_gc(
+    trusted_tmp: Path, monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    """Periodic schedule STORE_BUSY retries at bounded cadence without pokes, and idle GC reclaims aged orphans."""
+    import os
+
+    from superbrain.storage.cas import ContentStore
+    from tests.support.inc2_fixture import reopen_kernel_job_runtime
+
+    real_os = os_adapters()
+    rep, cfg, _priv, _ca_pem, _leaf, _cli_token, _adapters = _init_doctor_root(
+        trusted_tmp / f"p2-11-{path}", cast(Any, real_os.clock), os_=real_os
+    )
+    root = DataRoot.at(cfg.data_root)
+    monkeypatch.setattr(_daemon_doctor, "DOCTOR_SCHEDULE_INTERVAL", timedelta(seconds=0.45))
+    pokes = _spy_owner_pokes(monkeypatch)
+
+    if path == "periodic_store_busy_cadence":
+        lookup_calls = [0]
+        periodic_attempts = [0]
+        first_periodic_fail = threading.Event()
+        periodic_busy = threading.Event()
+        periodic_busy.set()
+        orig_find_active = find_active_doctor_job
+
+        def _busy_periodic(*args: Any, **kwargs: Any) -> Any:
+            lookup_calls[0] += 1
+            if lookup_calls[0] >= 2 and periodic_busy.is_set():
+                periodic_attempts[0] += 1
+                first_periodic_fail.set()
+                raise BrainError(ErrorCode.STORE_BUSY, "periodic schedule store busy")
+            return orig_find_active(*args, **kwargs)
+
+        monkeypatch.setattr(_daemon_doctor, "find_active_doctor_job", _busy_periodic)
+
+        with _serve(cfg, os_=real_os, clock=cast(Any, real_os.clock), mono=cast(Any, real_os.monotonic)) as d:
+            assert first_periodic_fail.wait(timeout=WAKE_BUDGET_S), (
+                "P2.11: periodic schedule never woke to attempt lookup"
+            )
+            time.sleep(1.1)
+            attempts_in_window = periodic_attempts[0]
+            runs_during_fault = len(_doctor_runs(root))
+            periodic_busy.clear()
+
+            assert runs_during_fault == 1
+            assert 2 <= attempts_in_window <= 7, (
+                f"P2.11: expected bounded periodic retry cadence (2..7 in 1.1s), got {attempts_in_window}"
+            )
+            assert _wait_until(lambda: len(_doctor_runs(root)) >= 2, WAKE_BUDGET_S), (
+                f"P2.11: periodic DoctorRun did not recover after STORE_BUSY cleared: {_doctor_jobs(root)}"
+            )
+            runs = _doctor_runs(root)
+            assert len(runs) == 2 and runs[1].get("trigger") == "schedule"
+            assert _job_tuple(root, str(runs[1]["job_id"])) == ("succeeded", 1, None)
+            assert pokes[0] == 0
+            _assert_clean_stop(d)
+        return
+
+    rt = reopen_kernel_job_runtime(cfg.data_root, rep.store_id, real_os)
+    try:
+        orphan_digest = rt.store.cas.put(b"p2-11-idle-gc-orphan")
+    finally:
+        rt.close()
+    orphan_path = blob_path(root.cas_dir, orphan_digest)
+    old_ts = (real_os.clock.now() - timedelta(hours=25)).timestamp()
+    os.utime(orphan_path, (old_ts, old_ts))
+    assert orphan_path.is_file()
+
+    gc_calls = [0]
+    gc_failed = threading.Event()
+    orig_gc = ContentStore.collect_garbage
+
+    def _gc_fail_once(self_cas: ContentStore, *args: Any, **kwargs: Any) -> Any:
+        gc_calls[0] += 1
+        if gc_calls[0] == 1:
+            gc_failed.set()
+            raise BrainError(ErrorCode.IO_ERROR, "transient gc failure")
+        return orig_gc(self_cas, *args, **kwargs)
+
+    monkeypatch.setattr(ContentStore, "collect_garbage", _gc_fail_once)
+
+    with _serve(cfg, os_=real_os, clock=cast(Any, real_os.clock), mono=cast(Any, real_os.monotonic)) as d:
+        assert _wait_until(lambda: (not orphan_path.exists()) and len(_doctor_runs(root)) >= 2, WAKE_BUDGET_S), (
+            f"P2.11 (gc): idle periodic GC/schedule failed (orphan_exists={orphan_path.exists()}, "
+            f"runs={len(_doctor_runs(root))}, gc_calls={gc_calls[0]})"
+        )
+        assert gc_failed.is_set() and gc_calls[0] >= 2
+        runs = _doctor_runs(root)
+        assert runs[1].get("trigger") == "schedule"
+        assert _job_tuple(root, str(runs[1]["job_id"])) == ("succeeded", 1, None)
+        assert pokes[0] == 0
+        _assert_clean_stop(d)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "concurrent_active_spanning_due",
+        "concurrent_completed_before_due",
+        "backward_clock_jump",
+        "restore_and_stop_reset",
+    ],
+)
+def test_p2_12_periodic_schedule_dedup_backward_clock_and_restore_reset(
+    trusted_tmp: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    """Periodic schedule deduplicates concurrent CLI runs, tolerates backward clock jumps, and resets on restore."""
+    from datetime import UTC
+
+    from tests.integration.test_i4_f4_f8_remediation import _ReadGate
+
+    if case == "concurrent_active_spanning_due":
+        real_os = os_adapters()
+        _rep, cfg, _priv, ca_pem, _leaf, cli_token, _adapters = _init_doctor_root(
+            trusted_tmp / "p2-12-active-dedup", cast(Any, real_os.clock), os_=real_os
+        )
+        root = DataRoot.at(cfg.data_root)
+        monkeypatch.setattr(_daemon_doctor, "DOCTOR_SCHEDULE_INTERVAL", timedelta(seconds=0.8))
+        gate = _ReadGate(monkeypatch)
+        t_start = time.monotonic()
+
+        with _serve(cfg, os_=real_os, clock=cast(Any, real_os.clock), mono=cast(Any, real_os.monotonic)) as d:
+            assert d.loop.wait_doctor_settled(timeout=BOUND_WAIT_S) is True
+            assert len(_doctor_runs(root)) == 1
+            fix_res = _post_operator(
+                d.ready, ca_pem, "/v2/operator/doctor/fix", cli_token, {"actions": ["reconcile_policy"]}, 15.0
+            )
+            assert fix_res.get("ok") is True, fix_res
+
+            gate.armed.set()
+            cli_box: dict[str, Any] = {}
+
+            def _call_report() -> None:
+                cli_box["res"] = _post_operator(
+                    d.ready, ca_pem, "/v2/operator/doctor/report", cli_token, {"wait_timeout_ms": WAIT_MS}, 15.0
+                )
+
+            cli_thr = threading.Thread(target=_call_report, name="p2-12-cli-report", daemon=True)
+            cli_thr.start()
+            try:
+                assert gate.entered.wait(timeout=BOUND_WAIT_S), "precondition: CLI doctor job must enter read_snapshot"
+                time.sleep(max(0.0, 0.95 - (time.monotonic() - t_start)))
+            finally:
+                gate.release.set()
+                cli_thr.join(timeout=BOUND_WAIT_S)
+
+            assert not cli_thr.is_alive()
+            cli_res = cast(dict[str, Any], cli_box.get("res") or {})
+            assert cli_res.get("ok") is True and (cli_res.get("data") or {}).get("status") == "completed", cli_res
+
+            time.sleep(0.15)
+            jobs = _doctor_jobs(root)
+            runs = _doctor_runs(root)
+            assert len(jobs) == 2 and len(runs) == 2, (
+                f"P2.12 ({case}): duplicate schedule job ran alongside spanning CLI job: jobs={jobs}"
+            )
+            assert runs[1].get("trigger") == "cli"
+            _assert_clean_stop(d)
+        return
+
+    if case == "concurrent_completed_before_due":
+        env = _Env(trusted_tmp, "p2-12-completed-dedup")
+        with env.serve() as d:
+            assert d.loop.wait_doctor_settled(timeout=BOUND_WAIT_S) is True
+            assert len(_doctor_runs(env.root)) == 1
+
+            env.clock.advance(timedelta(hours=23, minutes=59))
+            cli_rep = _report(d, env, env.cli_token, wait_ms=WAIT_MS)
+            assert cli_rep.get("ok") is True and (cli_rep.get("data") or {}).get("status") == "completed", cli_rep
+            assert len(_doctor_runs(env.root)) == 2 and _doctor_runs(env.root)[1].get("trigger") == "cli"
+
+            env.clock.advance(timedelta(minutes=2))
+            assert d.loop.wait_doctor_settled(timeout=BOUND_WAIT_S) is True
+            assert len(_doctor_runs(env.root)) == 2, (
+                f"P2.12 ({case}): periodic schedule double-ran right after store-wide CLI completion: "
+                f"{_doctor_jobs(env.root)}"
+            )
+
+            env.clock.advance(timedelta(hours=24))
+            assert d.loop.wait_doctor_settled(timeout=BOUND_WAIT_S) is True
+            runs = _doctor_runs(env.root)
+            assert len(runs) == 3 and runs[2].get("trigger") == "schedule"
+            _assert_clean_stop(d)
+        return
+
+    if case == "backward_clock_jump":
+        class _OffsetClock:
+            def __init__(self) -> None:
+                self._lock = threading.Lock()
+                self._offset_s = 0.0
+
+            def now(self) -> datetime:
+                with self._lock:
+                    offset = self._offset_s
+                return datetime.now(UTC) + timedelta(seconds=offset)
+
+            def shift(self, delta_s: float) -> None:
+                with self._lock:
+                    self._offset_s += delta_s
+
+        env = _Env(trusted_tmp, "p2-12-back-clock")
+        clk = _OffsetClock()
+        real_os = os_adapters(clock=clk)
+        pokes = _spy_owner_pokes(monkeypatch)
+        monkeypatch.setattr(_daemon_doctor, "DOCTOR_SCHEDULE_INTERVAL", timedelta(seconds=0.7))
+
+        with _serve(env.cfg, os_=real_os, clock=cast(Any, clk), mono=cast(Any, real_os.monotonic)) as d:
+            assert _wait_until(lambda: len(_doctor_runs(env.root)) >= 1, WAKE_BUDGET_S)
+            assert len(_doctor_runs(env.root)) == 1
+
+            owner_wake = cast(threading.Event, cast(Any, d.loop)._owner_wake)
+            orig_wait = owner_wake.wait
+            wait_timeouts: list[float | None] = []
+
+            def _spied_wait(timeout: float | None = None) -> bool:
+                wait_timeouts.append(timeout)
+                return orig_wait(timeout=timeout)
+
+            monkeypatch.setattr(owner_wake, "wait", _spied_wait)
+            clk.shift(-1.0)
+            time.sleep(0.85)
+
+            assert len(_doctor_runs(env.root)) == 1, (
+                f"P2.12 ({case}): periodic run fired prematurely after -1.0s clock jump"
+            )
+            assert all(t is None or t >= 0.0 for t in wait_timeouts), (
+                f"P2.12 ({case}): negative owner wait timeout observed: {wait_timeouts}"
+            )
+            assert any(t is not None and t >= 0.7 for t in wait_timeouts), (
+                f"P2.12 ({case}): wait timeout did not extend to cover backward jump: {wait_timeouts}"
+            )
+
+            assert _wait_until(lambda: len(_doctor_runs(env.root)) >= 2, WAKE_BUDGET_S), (
+                f"P2.12 ({case}): periodic DoctorRun did not fire after corrected clock reached due: "
+                f"{_doctor_jobs(env.root)}"
+            )
+            runs = _doctor_runs(env.root)
+            assert len(runs) == 2 and runs[1].get("trigger") == "schedule"
+            assert _durable(env, str(runs[1]["job_id"])) == ("succeeded", 1, None)
+            assert pokes[0] == 0
+            _assert_clean_stop(d)
+        return
+
+    env = _Env(trusted_tmp, "p2-12-restore-stop")
+    with env.serve() as d:
+        assert d.loop.wait_doctor_settled(timeout=BOUND_WAIT_S) is True
+        assert len(_doctor_runs(env.root)) == 1
+        store_bak = d.loop.run_owner_action(
+            lambda: create_store_backup(cast(Any, d.loop)._session.rt.store, env.os_, env.clock.now())
+        ).result(timeout=BOUND_WAIT_S)
+
+        env.clock.advance(timedelta(hours=23, minutes=59))
+        _run_online_restore_helper(d.ready, env.rep, env.ca_pem, env.cli_token, env.priv, env.os_, "store", store_bak)
+        env.clock.advance(timedelta(minutes=2))
+        assert d.loop.wait_doctor_settled(timeout=BOUND_WAIT_S) is True
+        assert len(_doctor_runs(env.root)) == 1, (
+            f"P2.12 ({case}): spurious periodic DoctorRun fired 2m after restore: {_doctor_jobs(env.root)}"
+        )
+
+        env.clock.advance(timedelta(hours=24))
+        assert d.loop.wait_doctor_settled(timeout=BOUND_WAIT_S) is True
+        runs = _doctor_runs(env.root)
+        assert len(runs) == 2 and runs[1].get("trigger") == "schedule"
+        assert _durable(env, str(runs[1]["job_id"])) == ("succeeded", 1, None)
+
+        session_obj = cast(Any, d.loop)._session
+        orig_step = session_obj.step_owner_work
+        post_stop = threading.Event()
+        post_stop_steps = [0]
+
+        def _count_post_stop_step(*, allow_new_jobs: bool) -> bool:
+            if post_stop.is_set():
+                post_stop_steps[0] += 1
+            return cast(bool, orig_step(allow_new_jobs=allow_new_jobs))
+
+        monkeypatch.setattr(session_obj, "step_owner_work", _count_post_stop_step)
+        _assert_clean_stop(d)
+        post_stop.set()
+        time.sleep(0.25)
+        assert post_stop_steps[0] == 0
