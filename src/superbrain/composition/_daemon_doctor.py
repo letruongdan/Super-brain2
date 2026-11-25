@@ -6,6 +6,7 @@ import contextlib
 import logging
 import os
 import shutil
+import sqlite3
 import threading
 import time
 from collections.abc import Callable, Mapping
@@ -160,13 +161,14 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
             oldest = next(iter(self._finished_jobs))
             del self._finished_jobs[oldest]
 
-    def _drop_inflight_locked(self) -> None:
+    def _drop_inflight_locked(self) -> threading.Timer | None:
         self._active_token, self._active_lease, self._completed = None, None, None
         self._pending_lease, self._pending_settle, self._reconcile_claims = None, None, False
+        timer, self._retry_timer = self._retry_timer, None
+        return timer
 
-    def _cancel_retry_timer(self) -> None:
-        with self._lock:
-            timer, self._retry_timer = self._retry_timer, None
+    @staticmethod
+    def _cancel_timer(timer: threading.Timer | None) -> None:
         if timer is not None:
             timer.cancel()
 
@@ -174,9 +176,10 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
         """Invalidate any in-flight background probe before store/policy handles are closed/swapped."""
         with self._lock:
             self._generation += 1
-            self._drop_inflight_locked()
+            timer = self._drop_inflight_locked()
             self._finished_jobs.clear()  # outcomes of the pre-restore store/epoch must never answer a later report
             self._wait_cond.notify_all()
+        self._cancel_timer(timer)
         self._notify_waiters()
 
     def rebind_after_restore(
@@ -190,7 +193,7 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
         """Bind new runtime/stores post-restore and invalidate any pre-restore probes."""
         with self._lock:
             self._generation += 1
-            self._drop_inflight_locked()
+            timer = self._drop_inflight_locked()
             self._finished_jobs.clear()
             self._rt = rt
             self._job_store = job_store
@@ -198,6 +201,7 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
             if tls_not_after is not None:
                 self._tls_not_after = tls_not_after
             self._wait_cond.notify_all()
+        self._cancel_timer(timer)
         self._notify_waiters()
 
     def finish_restore_reconcile(self) -> None:
@@ -210,8 +214,8 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
             self._stopping = True
             self._startup_due = False
             self._generation += 1
-            self._drop_inflight_locked()
-        self._cancel_retry_timer()
+            timer = self._drop_inflight_locked()
+        self._cancel_timer(timer)
         self._notify_waiters()
 
     @property
@@ -237,15 +241,16 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
         with self._lock:
             self._closed = True
             self._stopping = True
-        self._cancel_retry_timer()
+            timer, self._retry_timer = self._retry_timer, None
+        self._cancel_timer(timer)
         self._notify_waiters()
 
     def cancel_on_teardown(self) -> None:
         """Cancel any unfinished ``system.doctor`` jobs before runtime closes on daemon shutdown."""
         with self._lock:
             self._closed, self._stopping, self._generation = True, True, self._generation + 1
-            self._drop_inflight_locked()
-        self._cancel_retry_timer()
+            timer = self._drop_inflight_locked()
+        self._cancel_timer(timer)
         self._notify_waiters()
         if not self._rt.store.closed and not self._rt.policy.closed:
             with contextlib.suppress(BrainError):
@@ -347,13 +352,28 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
 
     def _arm_retry(self) -> None:
         """Wake the owner again soon: a doctor-only daemon otherwise sleeps until an unrelated event."""
+        holder: list[threading.Timer] = []
+
+        def _fire() -> None:
+            target = holder[0] if holder else None
+            with self._lock:
+                if self._retry_timer is target:
+                    self._retry_timer = None
+            self._wake_owner()
+
         with self._lock:
-            if self._stopping or self._closed or (self._retry_timer is not None and self._retry_timer.is_alive()):
+            if self._stopping or self._closed or self._retry_timer is not None:
                 return
-            timer = threading.Timer(_SETTLE_RETRY_S, self._wake_owner)
+            timer = threading.Timer(_SETTLE_RETRY_S, _fire)
             timer.daemon = True
+            holder.append(timer)
             self._retry_timer = timer
-        timer.start()
+            try:
+                timer.start()
+            except RuntimeError:
+                if self._retry_timer is timer:
+                    self._retry_timer = None
+                _LOGGER.warning("doctor retry timer failed to start")
 
     def _defer(
         self, gen: int, *, lease: JobLease | None = None, settle: _PendingSettle | None = None, claims: bool = False
@@ -402,16 +422,19 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
         ``True`` enqueued, ``False`` nothing to do (slot taken or no pinned owner), ``None`` the attempt failed and
         must be retried: the caller keeps the work due instead of deferring it a whole interval.
         """
-        owner_id = resolve_store_owner(self._rt.policy)
-        if owner_id is None:
-            _LOGGER.info("doctor %s run skipped: store has no pinned owner", trigger)  # a normal fresh-store state
-            return False
         try:
+            owner_id = resolve_store_owner(self._rt.policy)
+            if owner_id is None:
+                _LOGGER.info("doctor %s run skipped: store has no pinned owner", trigger)  # a normal fresh-store state
+                return False
             if find_active_doctor_job(self._rt, self._job_store, owner_id=owner_id, checkout_root=None) is not None:
                 return False
             self._enqueue_system_doctor_job(owner_id, trigger)
         except BrainError as err:
             _LOGGER.warning("doctor %s run not scheduled (code=%s)", trigger, err.code.value)
+            return None
+        except sqlite3.Error:
+            _LOGGER.warning("doctor %s run not scheduled (code=sqlite_error)", trigger)
             return None
         return True
 
@@ -423,19 +446,29 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
             self._last_gc_at = now_utc
             # Same fence set and scope as deep health: only a store-wide run of this store, writer epoch, restore
             # epoch and trust generation counts as a recent self-check.
-            owner_id = resolve_store_owner(self._rt.policy)
-            latest = (
-                find_latest_valid_doctor_run(self._rt, owner_id, now_utc, checkout_root=None)
-                if owner_id is not None
-                else None
-            )
+            try:
+                owner_id = resolve_store_owner(self._rt.policy)
+                latest = (
+                    find_latest_valid_doctor_run(self._rt, owner_id, now_utc, checkout_root=None)
+                    if owner_id is not None
+                    else None
+                )
+            except BrainError as err:
+                _LOGGER.warning("doctor startup lookup failed (code=%s)", err.code.value)
+                self._arm_retry()
+                return False
+            except sqlite3.Error:
+                _LOGGER.warning("doctor startup lookup failed (code=sqlite_error)")
+                self._arm_retry()
+                return False
             if latest is not None and not _due(latest[0].recorded_at, now_utc):
                 self._startup_due = False
                 self._last_scheduled_at = latest[0].recorded_at
                 return False
             outcome = self._schedule_store_run("startup")
             if outcome is None:
-                return False  # still due: the next tick retries the self-check
+                self._arm_retry()
+                return False  # still due: the retry timer wakes even on a doctor-only daemon
             self._startup_due = False
             self._last_scheduled_at = now_utc
             return outcome
@@ -453,11 +486,18 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
                 _LOGGER.warning("debounced maintenance failed (code=%s)", err.code.value)
                 if err.code is ErrorCode.STORE_BUSY:
                     self._last_gc_at = now_utc
+                else:
+                    self._arm_retry()
+            except sqlite3.Error:
+                _LOGGER.warning("debounced maintenance failed (code=sqlite_error)")
+                self._arm_retry()
 
         if _due(self._last_scheduled_at, now_utc):
             outcome = self._schedule_store_run("schedule")
             if outcome is not None:  # a failed attempt stays due and is retried on the next tick
                 self._last_scheduled_at = now_utc
+            else:
+                self._arm_retry()
             if outcome:
                 did_work = True
 
@@ -593,6 +633,8 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
                     return run_id
         except BrainError as err:
             _LOGGER.warning("doctor run lookup failed (code=%s)", err.code.value)
+        except sqlite3.Error:
+            _LOGGER.warning("doctor run lookup failed (code=sqlite_error)")
         return None  # finish_report then resolves the run from the store by job
 
     def _read_job(self, job_id: str) -> tuple[bool, JobRecord | None]:
@@ -710,16 +752,15 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
         if completed.snapshot is None:
             self._end_failed(completed, retryable=completed.transient)
             return
-        if not verify_doctor_snapshot_fences(self._rt, self._adapters, completed.fences):
-            # Measured against an identity that no longer holds: rerun on a fresh snapshot instead of dropping it.
-            self._end_failed(completed, retryable=True)
-            return
-
         def _is_stale() -> bool:
             with self._lock:
                 return self._stopping or self._closed or completed.generation != self._generation
 
         try:
+            if not verify_doctor_snapshot_fences(self._rt, self._adapters, completed.fences):
+                # Measured against an identity that no longer holds: rerun on a fresh snapshot instead of dropping it.
+                self._end_failed(completed, retryable=True)
+                return
             doctor_run_id = commit_doctor_run_snapshot(
                 rt=self._rt, job_store=self._job_store, scanner=self._scanner,
                 lease=completed.lease, owner_id=completed.owner_id, trigger=completed.trigger,
@@ -731,6 +772,10 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
             # A busy store is transient: the same job reruns with backoff and its waiters keep waiting. If the commit
             # landed before the error, the fenced failure write is refused and the durable row (SUCCEEDED) is published.
             self._end_failed(completed, retryable=err.code in _TRANSIENT_COMMIT_CODES)
+            return
+        except sqlite3.Error:
+            _LOGGER.warning("doctor run commit failed cleanly (code=sqlite_error)")
+            self._end_failed(completed, retryable=True)
             return
 
         with self._lock:

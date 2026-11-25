@@ -20,7 +20,7 @@ Tài liệu vận hành cho lệnh tự chẩn đoán (SP1 đợt 4, đặc tả
 
 ## 2. Đọc báo cáo
 
-Mỗi mục check có các trường `group`, `name`, `status` (`PASS`, `WARN` hoặc `FAIL`), `reason`, `detail` và `remediation`. Khi một check thiếu bằng chứng native xác minh, phát hiện drift/lỗi quyền hay chạm giới hạn quét, nó trả `WARN` hoặc `FAIL` kèm `reason` riêng, không bao giờ làm giả `PASS`. Khi chạy bare CLI chưa nối adapter SP2, `capture.probe` ghi `sp2_not_wired`; trên `run_m1_handover_probe` và `--fix replay_outbox`, thiếu adapter trả `WARN`/`capability_unavailable`.
+Mỗi mục check có các trường `group`, `name`, `status` (`PASS`, `WARN` hoặc `FAIL`), `reason`, `detail` và `remediation`. Khi một check thiếu bằng chứng native xác minh, phát hiện drift/lỗi quyền hay chạm giới hạn quét, nó trả `WARN` hoặc `FAIL` kèm `reason` riêng, không bao giờ làm giả `PASS`. Khi chạy bare CLI chưa nối adapter SP2, `capture.probe` trả `PASS` với `reason="sp2_not_wired"`; trên `run_m1_handover_probe` (`capture.sp2_probes`), thiếu adapter trả `WARN` với `reason="capture_probe_unattached"`; còn `--fix replay_outbox` / `restart_daemon` khi thiếu adapter trả `capability_unavailable`.
 
 | Nhóm | Mã check |
 |---|---|
@@ -32,41 +32,50 @@ Mỗi mục check có các trường `group`, `name`, `status` (`PASS`, `WARN` h
 | retention | `retention.tombstones` |
 | harness | `harness.layer2`, `harness.proposals`, `harness.bootstrap_drift` |
 | capture | `capture.probe` (số liệu do SP2 cấp qua adapter) |
-| chưa có khả năng | `index.status`, `skill.status`, `lessons.status` (hoãn SP3–SP4), `jev.passive` |
+| jev | `jev.passive` (kiểm thụ động không nối mạng: `ok` hoặc `price_drift`) |
+| chưa có khả năng | `index.status`, `skill.status`, `lessons.status` (`deferred_sp_scope`, hoãn SP3–SP4) |
 
 `get_health(deep=true)` (MCP) chỉ trả trạng thái và ref đã lọc của DoctorRun toàn kho gần nhất. Nếu run đó cũ hơn 24 giờ, nó xếp hoặc gắn vào một job và trả `job_id`. Muốn xem báo cáo đầy đủ thì cần quyền operator.
 
 ### Mẫu output đã lọc (`brain doctor --config <ABS> --json`)
 
-Mọi chuỗi trong report (`detail`, `remediation`, `layer2_harnesses`, `permission_problems`…) đều đi qua bộ lọc privacy trước khi xuất ra CLI/operator:
+Mọi chuỗi trong report (`detail`, `remediation`, `layer2_harnesses`, `permission_problems`…) đều đi qua bộ lọc privacy trước khi xuất ra CLI/operator (`DoctorReport.to_dict()`):
 
 ```json
 {
   "ok": true,
   "data": {
-    "overall_status": "PASS",
-    "store_id": "store_01...",
+    "overall_status": "pass",
+    "store_id": "019...",
     "data_root": "<ABS_DATA_ROOT>",
-    "schema": {"store": 5, "policy": 4},
+    "schema": {
+      "store_version": 5,
+      "policy_version": 4,
+      "expected_store_version": 5,
+      "expected_policy_version": 4,
+      "min_store_reader_version": 1,
+      "min_policy_reader_version": 1
+    },
     "restore_epoch": 0,
     "trust_generation": 1,
     "signer_reset_recorded": false,
     "terminal_channel_eligible": false,
-    "signers": [{"owner_id": "dan", "channel": "ssh_key", "fingerprint": "sha256:..."}],
+    "signers": [{"signer_id": "sig_...", "channel": "ssh_key", "key_digest": "sha256:...", "tofu": true, "sign_count": 0}],
     "layer2_harnesses": [],
-    "bootstrap_drifts": [],
-    "pending_proposals": [],
     "unresolved_accounting_locks": [],
-    "active_turn_intents": [],
-    "incomplete_journals": [],
-    "permission_problems": [],
-    "integrity_errors": [],
+    "pending_restore_tombstones": {"present": false, "restore_epoch": null, "expired_holders_count": 0, "corrupt_error": null},
+    "pending_proposals": [],
+    "bootstrap_drifts": [],
     "checks": [
       {"group": "daemon", "name": "daemon.writer_lock", "status": "PASS", "reason": "stopped_cleanly", "detail": "daemon stopped cleanly (epoch=1, endpoint.json absent (daemon stopped))", "remediation": null},
       {"group": "storage", "name": "storage.cas_sample", "status": "PASS", "reason": "ok", "detail": "verified 0/0 CAS blobs (0B)", "remediation": null},
       {"group": "permissions", "name": "permissions.tree", "status": "PASS", "reason": "ok", "detail": "owner-only tree and ancestors verified", "remediation": null}
     ],
-    "remediations": []
+    "remediations": [],
+    "integrity_errors": [],
+    "active_turn_intents": [],
+    "incomplete_journals": [],
+    "permission_problems": []
   }
 }
 ```

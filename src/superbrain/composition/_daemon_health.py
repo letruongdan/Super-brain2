@@ -40,6 +40,7 @@ from superbrain.ports.doctor import MAX_DOCTOR_RUN_BLOB_BYTES
 from superbrain.ports.kernel import KernelTx
 from superbrain.ports.os import OsAdapters
 from superbrain.storage.cas import read_held_blob_or_none
+from superbrain.storage.errors import sqlite_error
 from superbrain.storage.idempotency import StagedKernelStore
 from superbrain.storage.restore import read_restore_epoch
 from superbrain.storage.retention import RetentionPolicy, default_expiry
@@ -693,17 +694,20 @@ def load_committed_doctor_run_dto(
 ) -> dict[str, JsonValue]:
     """Load an owner's committed ``DoctorRun`` DTO from ledger + held CAS blob."""
     now_utc, _ = require_aware_utc(now)
-    for meta, refs in iter_owner_doctor_ledger(rt, owner_id=owner_id, job_id=job_id):
-        if doctor_run_id is not None and meta.get("doctor_run_id") != doctor_run_id:
-            continue
-        if meta.get("job_id") != job_id:
-            continue
-        run_id = meta.get("doctor_run_id")
-        digest = meta.get("report_digest")
-        if not isinstance(run_id, str) or not isinstance(digest, str) or not refs or refs[0] != digest:
-            raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
-        doc = _read_doctor_run_cas_doc(rt, run_id=run_id, digest=digest, now_utc=now_utc)
-        if doc is None or doc.get("owner_id") != owner_id:
-            raise BrainError(ErrorCode.NOT_FOUND, "not found")
-        return doctor_run_dto_from_doc(doc, doctor_run_id=run_id, job_id=job_id)
+    try:
+        for meta, refs in iter_owner_doctor_ledger(rt, owner_id=owner_id, job_id=job_id):
+            if doctor_run_id is not None and meta.get("doctor_run_id") != doctor_run_id:
+                continue
+            if meta.get("job_id") != job_id:
+                continue
+            run_id = meta.get("doctor_run_id")
+            digest = meta.get("report_digest")
+            if not isinstance(run_id, str) or not isinstance(digest, str) or not refs or refs[0] != digest:
+                raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
+            doc = _read_doctor_run_cas_doc(rt, run_id=run_id, digest=digest, now_utc=now_utc)
+            if doc is None or doc.get("owner_id") != owner_id:
+                raise BrainError(ErrorCode.NOT_FOUND, "not found")
+            return doctor_run_dto_from_doc(doc, doctor_run_id=run_id, job_id=job_id)
+    except sqlite3.Error as exc:
+        raise sqlite_error("load_committed_doctor_run_dto", exc, busy=True) from exc
     raise BrainError(ErrorCode.NOT_FOUND, "not found")

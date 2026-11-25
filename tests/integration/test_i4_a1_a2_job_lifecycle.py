@@ -22,6 +22,7 @@ Invariants under test:
 
 from __future__ import annotations
 
+import sqlite3
 import threading
 import time
 from collections.abc import Callable, Sequence
@@ -35,6 +36,7 @@ import pytest
 from superbrain.adapters.os.daemon_config import read_client_endpoint
 from superbrain.application.jobs import JobService
 from superbrain.composition._daemon_doctor import DaemonDoctorRunner
+from superbrain.composition._daemon_health import load_committed_doctor_run_dto
 from superbrain.core._kernel_jobs import MAX_JOB_ATTEMPTS, retry_backoff
 from superbrain.core.canonical import canonical_json, digest_bytes
 from superbrain.core.errors import BrainError, ErrorCode
@@ -574,3 +576,141 @@ def test_a2_4_restore_clears_finished_cache_and_isolates_prior_epoch(trusted_tmp
                 assert runner._finished_jobs == {}
 
         d.loop.run_owner_action(_direct_fence_and_rebind).result(timeout=BOUND_WAIT_S)
+
+
+def test_r1_arm_retry_rearms_while_timer_thread_alive_and_startup_retries(
+    trusted_tmp: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Deferred retries must still schedule a new wakeup even while the firing timer thread has not exited."""
+    env = _Env(trusted_tmp, "r1-timer-alive")
+    startup_fail = [True]
+    orig_find_active = __import__(
+        "superbrain.composition._daemon_doctor", fromlist=["find_active_doctor_job"]
+    ).find_active_doctor_job
+
+    def _startup_busy(*args: Any, **kwargs: Any) -> Any:
+        if startup_fail[0]:
+            startup_fail[0] = False
+            raise BrainError(ErrorCode.STORE_BUSY, "transient startup schedule busy")
+        return orig_find_active(*args, **kwargs)
+
+    monkeypatch.setattr("superbrain.composition._daemon_doctor.find_active_doctor_job", _startup_busy)
+
+    with env.serve() as d:
+        # Startup transient failure on doctor-only daemon must re-arm retry instead of stalling forever.
+        assert d.loop.wait_doctor_settled(timeout=3.0) is True, (
+            "R1.1: startup scheduling transient STORE_BUSY stalled doctor-only daemon"
+        )
+        runner = _runner(d)
+
+        env.clock.advance(timedelta(minutes=16))
+        [job_id] = _enqueue_jobs_on_owner(d, env, owner_id=OWNER_DAN, count=1, delay=DELAY, tag="r1-timer")
+
+        # Keep the first firing Timer thread alive (is_alive() == True) past wake_owner so the second
+        # STORE_BUSY deferral runs inside the overlap window.
+        release_timer = threading.Event()
+        timer_holding = threading.Event()
+        timer_wakes = [0]
+        orig_wake = runner._wake_owner
+
+        def _slow_exit_wake() -> None:
+            orig_wake()
+            if isinstance(threading.current_thread(), threading.Timer):
+                timer_wakes[0] += 1
+                if timer_wakes[0] == 1:
+                    timer_holding.set()
+                    release_timer.wait(timeout=2.0)
+
+        monkeypatch.setattr(runner, "_wake_owner", _slow_exit_wake)
+
+        hold = threading.Event()
+        hold.set()
+        rollbacks = _fault_tx_record_gate(monkeypatch, job_id, "job.leased", hold)
+        env.clock.advance(DELAY + timedelta(milliseconds=1))
+        d.loop.run_owner_action(lambda: None).result(timeout=BOUND_WAIT_S)
+        try:
+            assert timer_holding.wait(timeout=BOUND_WAIT_S), "precondition: retry timer #1 never fired"
+            assert _wait_until(lambda: rollbacks[0] >= 2, BOUND_WAIT_S), (
+                f"precondition: retry attempt while timer #1 alive did not run ({rollbacks[0]})"
+            )
+            hold.clear()
+        finally:
+            release_timer.set()
+
+        assert _wait_until(lambda: _durable(env, job_id)[0] == "succeeded", WAKE_BUDGET_S), (
+            "R1: _arm_retry lost second wakeup while timer #1 thread was still exiting; "
+            f"durable={_durable(env, job_id)}"
+        )
+        assert d.loop.wait_doctor_settled(timeout=BOUND_WAIT_S) is True
+
+        # Verify fence_on_restore and rebind_after_restore cancel any armed pre-restore retry timer immediately.
+        runner._arm_retry()
+        with runner._lock:
+            armed = runner._retry_timer
+        assert armed is not None
+        runner.fence_on_restore()
+        with runner._lock:
+            assert runner._retry_timer is None
+        assert armed.finished.is_set()
+
+        session = cast(Any, d.loop)._session
+        assert session is not None
+        runner._arm_retry()
+        with runner._lock:
+            armed2 = runner._retry_timer
+        assert armed2 is not None
+        runner.rebind_after_restore(rt=session.rt, job_store=session._job_store, job_service=session._job_service)
+        with runner._lock:
+            assert runner._retry_timer is None
+        assert armed2.finished.is_set()
+
+
+def test_r2_sqlite_error_in_ledger_lookup_never_crashes_owner_or_leaks_raw(
+    trusted_tmp: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``sqlite3.Error`` in ``_committed_run_id`` / ``load_committed_doctor_run_dto`` must translate cleanly."""
+    env = _Env(trusted_tmp, "r2-sqlite")
+    with env.serve() as d:
+        assert d.loop.wait_doctor_settled(timeout=BOUND_WAIT_S) is True
+        env.clock.advance(timedelta(minutes=16))
+
+        orig_iter = __import__(
+            "superbrain.composition._daemon_doctor", fromlist=["iter_owner_doctor_ledger"]
+        ).iter_owner_doctor_ledger
+        fail_next = [True]
+
+        def _sql_err_once(*args: Any, **kwargs: Any) -> Any:
+            if fail_next[0]:
+                fail_next[0] = False
+                raise sqlite3.OperationalError("database is locked")
+            return orig_iter(*args, **kwargs)
+
+        monkeypatch.setattr("superbrain.composition._daemon_doctor.iter_owner_doctor_ledger", _sql_err_once)
+        monkeypatch.setattr("superbrain.composition._daemon_health.iter_owner_doctor_ledger", _sql_err_once)
+
+        [job_id] = _enqueue_jobs_on_owner(d, env, owner_id=OWNER_DAN, count=1, delay=DELAY, tag="r2-sql")
+        _fault_commit_run_ack_once(monkeypatch, ErrorCode.STORE_BUSY)
+        env.clock.advance(DELAY + timedelta(milliseconds=1))
+        d.loop.run_owner_action(lambda: None).result(timeout=BOUND_WAIT_S)
+        assert _wait_until(lambda: _durable(env, job_id)[0] == "succeeded", WAKE_BUDGET_S)
+        assert d.loop.wait_doctor_settled(timeout=BOUND_WAIT_S) is True, (
+            "R2.1: sqlite3.Error in _committed_run_id crashed OwnerLoop instead of falling back cleanly"
+        )
+
+        # Direct boundary check: load_committed_doctor_run_dto must translate sqlite3.Error to BrainError, not leak.
+        fail_next[0] = True
+        with pytest.raises(BrainError) as exc_info:
+            d.loop.run_owner_action(
+                lambda: load_committed_doctor_run_dto(
+                    cast(Any, d.loop)._session.rt,
+                    owner_id=OWNER_DAN,
+                    job_id=job_id,
+                    doctor_run_id=None,
+                    now=env.clock.now(),
+                )
+            ).result(timeout=BOUND_WAIT_S)
+        assert exc_info.value.code in (ErrorCode.STORE_BUSY, ErrorCode.IO_ERROR, ErrorCode.INTEGRITY_FAILURE)
+
+        rep = _report(d, env, env.cli_token, wait_ms=WAIT_MS)
+        assert rep.get("ok") is True, rep
+        assert d.loop.wait_doctor_settled(timeout=BOUND_WAIT_S) is True
