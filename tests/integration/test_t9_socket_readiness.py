@@ -414,10 +414,11 @@ def test_socket_readiness_timeout_strictly_bounded_by_connect_deadline_ns(
 
                 with monkeypatch.context() as mp:
                     mp.setattr(owner, "_lookup_loopback_client_pid", _blocked_lookup)
-                    t_wall_start = time.monotonic_ns()
+                    t_wall_start = [time.monotonic_ns()]
                     c_start = 10_000_000_000
                     tight_deadline_ns = c_start + 80_000_000
-                    client = h.open_client(monotonic_ns=lambda: c_start + (time.monotonic_ns() - t_wall_start))
+                    client = h.open_client(monotonic_ns=lambda: c_start + (time.monotonic_ns() - t_wall_start[0]))
+                    t_wall_start[0] = time.monotonic_ns()
                     t0 = time.monotonic()
                     with pytest.raises(LoopbackTransportError):
                         client.call(
