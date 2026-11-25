@@ -22,6 +22,7 @@ Invariants under test:
 
 from __future__ import annotations
 
+import contextlib
 import sqlite3
 import threading
 import time
@@ -37,7 +38,11 @@ from superbrain.adapters.os.daemon_config import read_client_endpoint
 from superbrain.application.jobs import JobService
 from superbrain.composition import _daemon_doctor
 from superbrain.composition._daemon_doctor import DaemonDoctorRunner
-from superbrain.composition._daemon_health import find_active_doctor_job, load_committed_doctor_run_dto
+from superbrain.composition._daemon_health import (
+    enqueue_doctor_tx,
+    find_active_doctor_job,
+    load_committed_doctor_run_dto,
+)
 from superbrain.core._kernel_jobs import MAX_JOB_ATTEMPTS, retry_backoff
 from superbrain.core.canonical import canonical_json, digest_bytes
 from superbrain.core.errors import BrainError, ErrorCode
@@ -75,6 +80,7 @@ from tests.integration.test_i4_r9_doctor_payload_fault_classification import (
 )
 from tests.integration.test_i4_rereview_remediation import _Daemon
 from tests.integration.test_i4_review_remediation import _run_online_restore_helper
+from tests.support.inc2_fixture import kernel_job_service
 
 WAKE_BUDGET_S = 5.0
 
@@ -1042,3 +1048,323 @@ def test_r2_sqlite_error_in_ledger_lookup_never_crashes_owner_or_leaks_raw(
         rep = _report(d, env, env.cli_token, wait_ms=WAIT_MS)
         assert rep.get("ok") is True, rep
         assert d.loop.wait_doctor_settled(timeout=BOUND_WAIT_S) is True
+
+
+# ---------------------------------------------------------------------------
+# P2 R4: Independent per-lane retry deadlines (maintenance vs claim vs settle)
+# ---------------------------------------------------------------------------
+
+
+def _count_claimed_reconciles(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Count durable ``claimed_jobs_by_kinds`` reads during orphan lease reconciliation."""
+    orig = StagedKernelStore.transact
+    counts = [0]
+
+    class _Tx:
+        def __init__(self, inner: Any) -> None:
+            self._inner = inner
+
+        def claimed_jobs_by_kinds(self, *args: Any, **kwargs: Any) -> Any:
+            counts[0] += 1
+            return self._inner.claimed_jobs_by_kinds(*args, **kwargs)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._inner, name)
+
+    def _transact(self: StagedKernelStore, operation: Callable[[Any], Any]) -> Any:
+        return orig(self, lambda tx: operation(_Tx(tx)))
+
+    monkeypatch.setattr(StagedKernelStore, "transact", _transact)
+    return counts
+
+
+def _enqueue_offline_doctor_job(job_store: StagedKernelStore, env: _Env, *, tag: str) -> str:
+    """Enqueue one due store-wide ``system.doctor`` job through the given ``StagedKernelStore``."""
+    job_id = new_id()
+    payload = canonical_json({"schema": 1, "trigger": "manual", "checkout_root": None, "tag": tag})
+    job_store.stage_blob(payload)
+    _, now_str = require_aware_utc(env.clock.now())
+    job_store.transact(
+        lambda tx: enqueue_doctor_tx(tx, job_id=job_id, owner_id=OWNER_DAN, payload_bytes=payload, retry_at=now_str)
+    )
+    return job_id
+
+
+@contextlib.contextmanager
+def _direct_runner(env: _Env) -> Any:
+    """Create a real SQLite-backed ``DaemonDoctorRunner`` without background ``OwnerLoop`` interference."""
+    with env.offline_rt() as rt:
+        job_service, job_store = kernel_job_service(rt, env.clock)
+        runner = DaemonDoctorRunner(
+            rt=rt,
+            job_store=job_store,
+            job_service=job_service,
+            adapters=env.os_,
+            clock=env.clock,
+            tls_not_after=env.clock.now() + timedelta(days=30),
+            clock_untrusted_fn=lambda: False,
+            prune_idempotency_fn=lambda _now, _limit: 0,
+            wake_owner=lambda: None,
+        )
+        try:
+            yield runner, job_store
+        finally:
+            runner.close()
+            runner.join(BOUND_WAIT_S)
+
+
+def _complete_direct_startup(runner: DaemonDoctorRunner, env: _Env) -> None:
+    """Drive initial startup doctor run to completion on a standalone ``DaemonDoctorRunner``."""
+    runner.step(allow_new_jobs=True)
+    assert _wait_until(lambda: runner.is_drained, BOUND_WAIT_S)
+    runner.step(allow_new_jobs=True)
+    assert len(_doctor_runs(env.root)) == 1
+
+
+@pytest.mark.parametrize("mode", ["direct_step", "live_owner_loop"])
+def test_p2_8_continuing_maintenance_failures_do_not_starve_due_lease_reconciliation(
+    trusted_tmp: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    """Continuing maintenance failures must never postpone or starve an already-due lease reconciliation."""
+    env = _Env(trusted_tmp, f"p2-8-{mode}")
+    reconcile_attempts = _count_claimed_reconciles(monkeypatch)
+    maint_busy = threading.Event()
+    maint_attempts = [0]
+    orig_find_active = find_active_doctor_job
+
+    def _persistent_maint_busy(*args: Any, **kwargs: Any) -> Any:
+        if maint_busy.is_set():
+            maint_attempts[0] += 1
+            raise BrainError(ErrorCode.STORE_BUSY, "persistent maintenance schedule busy")
+        return orig_find_active(*args, **kwargs)
+
+    monkeypatch.setattr(_daemon_doctor, "find_active_doctor_job", _persistent_maint_busy)
+
+    if mode == "direct_step":
+        with _direct_runner(env) as (runner, job_store):
+            _complete_direct_startup(runner, env)
+
+            # Healthy-maintenance twin: lost lease ACK reconciles cleanly on its own retry turn.
+            env.clock.advance(timedelta(minutes=16))
+            ctrl_job_id = _enqueue_offline_doctor_job(job_store, env, tag="p2-8-ctrl")
+            ctrl_fired, _ = _fault_lease_ack_once(monkeypatch, target_job_id=ctrl_job_id)
+            runner.step(allow_new_jobs=True)
+            assert ctrl_fired.is_set()
+            wait_ctrl = runner.next_retry_wait_s()
+            assert wait_ctrl is not None
+            time.sleep(wait_ctrl + 0.02)
+            runner.step(allow_new_jobs=True)
+            assert _wait_until(lambda: runner.is_drained, BOUND_WAIT_S)
+            runner.step(allow_new_jobs=True)
+            assert reconcile_attempts[0] >= 1 and _durable(env, ctrl_job_id) == ("succeeded", 1, None)
+
+            # Fault phase: continuing maintenance STORE_BUSY across 4 due turns alongside lost lease ACK.
+            reconcile_attempts[0] = 0
+            env.clock.advance(timedelta(hours=24, seconds=1))
+            target_job_id = _enqueue_offline_doctor_job(job_store, env, tag="p2-8-starved")
+            fired, _ = _fault_lease_ack_once(monkeypatch, target_job_id=target_job_id)
+            maint_busy.set()
+
+            runner.step(allow_new_jobs=True)
+            assert fired.is_set(), "precondition: lost lease ACK on target job must fire"
+            assert _durable(env, target_job_id) == ("leased", 1, None)
+
+            for _turn in range(4):
+                wait_s = runner.next_retry_wait_s()
+                assert wait_s is not None, "retry wait must remain armed while maintenance keeps failing"
+                time.sleep(wait_s + 0.02)
+                runner.step(allow_new_jobs=True)
+
+            assert _wait_until(lambda: runner.is_drained, BOUND_WAIT_S)
+            runner.step(allow_new_jobs=False)
+
+            assert maint_attempts[0] >= 5, f"expected >=5 maintenance attempts across 4 turns, got {maint_attempts[0]}"
+            assert reconcile_attempts[0] >= 1, (
+                f"P2.8 (direct_step): continuing maintenance failures starved due lease reconciliation "
+                f"(reconcile_attempts={reconcile_attempts[0]}, durable={_durable(env, target_job_id)})"
+            )
+            assert _durable(env, target_job_id) == ("succeeded", 1, None)
+            assert len(_runs_for(env, target_job_id)) == 1
+
+            maint_busy.clear()
+            rem_wait = runner.next_retry_wait_s()
+            if rem_wait is not None:
+                time.sleep(rem_wait + 0.02)
+                runner.step(allow_new_jobs=True)
+                assert _wait_until(lambda: runner.is_drained, BOUND_WAIT_S)
+                runner.step(allow_new_jobs=True)
+        return
+
+    with env.serve() as d:
+        assert d.loop.wait_doctor_settled(timeout=BOUND_WAIT_S) is True
+        env.clock.advance(timedelta(minutes=16))
+        [target_job_id] = _enqueue_jobs_on_owner(d, env, owner_id=OWNER_DAN, count=1, delay=DELAY, tag="p2-8-live")
+
+        fired, _ = _fault_lease_ack_once(monkeypatch, target_job_id=target_job_id)
+        maint_busy.set()
+        env.clock.advance(timedelta(hours=24, seconds=1))
+        d.loop.run_owner_action(lambda: None).result(timeout=BOUND_WAIT_S)
+
+        assert fired.wait(timeout=BOUND_WAIT_S), "precondition: lost lease ACK on live owner loop must fire"
+        assert _wait_until(lambda: maint_attempts[0] >= 5, BOUND_WAIT_S), (
+            f"precondition: expected >=5 maintenance attempts across 4 retry turns, got {maint_attempts[0]}"
+        )
+        assert reconcile_attempts[0] >= 1, (
+            f"P2.8 (live_owner_loop): continuing maintenance failures starved due lease reconciliation "
+            f"(reconcile_attempts={reconcile_attempts[0]}, durable={_durable(env, target_job_id)})"
+        )
+        assert _wait_until(lambda: _durable(env, target_job_id)[0] == "succeeded", WAKE_BUDGET_S), (
+            f"P2.8 (live_owner_loop): leased job failed to reconcile while maintenance failed: "
+            f"{_durable(env, target_job_id)}"
+        )
+        assert _durable(env, target_job_id) == ("succeeded", 1, None)
+        assert len(_runs_for(env, target_job_id)) == 1
+
+        maint_busy.clear()
+        assert d.loop.wait_doctor_settled(timeout=BOUND_WAIT_S) is True
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "maint_streak_does_not_delay_settlement",
+        "claim_streak_does_not_delay_maintenance",
+        "settle_streak_does_not_delay_maintenance",
+    ],
+)
+def test_p2_9_cross_lane_retry_deadlines_remain_independent(
+    trusted_tmp: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    """Backoff streak or retry failure in one lane must not postpone another lane's earlier deadline."""
+    env = _Env(trusted_tmp, f"p2-9-{case}")
+    maint_busy = threading.Event()
+    maint_lookups = [0]
+    orig_find_active = find_active_doctor_job
+
+    def _counting_find_active(*args: Any, **kwargs: Any) -> Any:
+        maint_lookups[0] += 1
+        if maint_busy.is_set():
+            raise BrainError(ErrorCode.STORE_BUSY, "maintenance lookup busy")
+        return orig_find_active(*args, **kwargs)
+
+    monkeypatch.setattr(_daemon_doctor, "find_active_doctor_job", _counting_find_active)
+
+    with _direct_runner(env) as (runner, job_store):
+        _complete_direct_startup(runner, env)
+
+        if case == "maint_streak_does_not_delay_settlement":
+            env.clock.advance(timedelta(hours=24, seconds=1))
+            maint_busy.set()
+            # Build maintenance backoff streak=3 -> next maintenance retry wait is ~0.8s.
+            for _ in range(2):
+                runner.step(allow_new_jobs=True)
+                wait_m = runner.next_retry_wait_s()
+                assert wait_m is not None
+                time.sleep(wait_m + 0.02)
+            runner.step(allow_new_jobs=True)
+            long_maint_wait = runner.next_retry_wait_s()
+            assert long_maint_wait is not None and long_maint_wait > 0.5
+
+            job_id = _enqueue_offline_doctor_job(job_store, env, tag="p2-9-settle")
+            orig_read = StorageDoctorReader.read_snapshot
+            snap_failed = threading.Event()
+
+            def _bad_snap(self_r: Any, *args: Any, **kwargs: Any) -> Any:
+                if not snap_failed.is_set():
+                    snap_failed.set()
+                    raise BrainError(ErrorCode.INTEGRITY_FAILURE, "injected snapshot failure")
+                return orig_read(self_r, *args, **kwargs)
+
+            monkeypatch.setattr(StorageDoctorReader, "read_snapshot", _bad_snap)
+            settle_hold = threading.Event()
+            settle_hold.set()
+            _fault_tx_record_gate(monkeypatch, job_id, "job.terminal", settle_hold, required_state="failed")
+
+            assert runner.claim_pending_if_idle() is True
+            assert _wait_until(lambda: runner.is_drained, BOUND_WAIT_S)
+            runner.step(allow_new_jobs=False)
+            settle_hold.clear()
+
+            earliest_wait = runner.next_retry_wait_s()
+            assert earliest_wait is not None and earliest_wait <= 0.3, (
+                f"P2.9 ({case}): maintenance streak delayed settlement wakeup to {earliest_wait:.3f}s"
+            )
+            time.sleep(0.25)
+            runner.step(allow_new_jobs=True)
+            assert _durable(env, job_id) == ("failed", 1, "handler_failed"), (
+                f"P2.9 ({case}): due settlement was skipped behind maintenance backoff: {_durable(env, job_id)}"
+            )
+            maint_busy.clear()
+            return
+
+        env.clock.advance(timedelta(minutes=16))
+        job_id = _enqueue_offline_doctor_job(job_store, env, tag=f"p2-9-{case}")
+        if case == "claim_streak_does_not_delay_maintenance":
+            claim_hold = threading.Event()
+            claim_hold.set()
+            _fault_tx_record_gate(monkeypatch, job_id, "job.leased", claim_hold)
+            for _ in range(2):
+                runner.step(allow_new_jobs=True)
+                wait_c = runner.next_retry_wait_s()
+                assert wait_c is not None
+                time.sleep(wait_c + 0.02)
+            runner.step(allow_new_jobs=True)
+        else:
+            orig_read = StorageDoctorReader.read_snapshot
+            snap_failed = threading.Event()
+
+            def _bad_snap2(self_r: Any, *args: Any, **kwargs: Any) -> Any:
+                if not snap_failed.is_set():
+                    snap_failed.set()
+                    raise BrainError(ErrorCode.INTEGRITY_FAILURE, "injected snapshot failure")
+                return orig_read(self_r, *args, **kwargs)
+
+            monkeypatch.setattr(StorageDoctorReader, "read_snapshot", _bad_snap2)
+            settle_hold = threading.Event()
+            settle_hold.set()
+            _fault_tx_record_gate(monkeypatch, job_id, "job.terminal", settle_hold, required_state="failed")
+            runner.step(allow_new_jobs=True)
+            assert _wait_until(lambda: runner.is_drained, BOUND_WAIT_S)
+            for _ in range(2):
+                runner.step(allow_new_jobs=False)
+                wait_s = runner.next_retry_wait_s()
+                assert wait_s is not None
+                time.sleep(wait_s + 0.02)
+            runner.step(allow_new_jobs=False)
+
+        long_other_wait = runner.next_retry_wait_s()
+        assert long_other_wait is not None and long_other_wait > 0.5
+
+        maint_lookups[0] = 0
+        maint_busy.set()
+        env.clock.advance(timedelta(hours=24, seconds=1))
+        runner.step(allow_new_jobs=True)
+        assert maint_lookups[0] == 1
+
+        earliest_wait = runner.next_retry_wait_s()
+        assert earliest_wait is not None and earliest_wait <= 0.3, (
+            f"P2.9 ({case}): long claim/settle streak delayed maintenance wakeup to {earliest_wait:.3f}s"
+        )
+        maint_busy.clear()
+        time.sleep(0.25)
+        runner.step(allow_new_jobs=True)
+        assert maint_lookups[0] >= 2, (
+            f"P2.9 ({case}): due maintenance retry was postponed behind claim/settle backoff"
+        )
+
+        if case == "claim_streak_does_not_delay_maintenance":
+            claim_hold.clear()
+        else:
+            settle_hold.clear()
+        rem = runner.next_retry_wait_s()
+        if rem is not None:
+            time.sleep(rem + 0.02)
+        runner.step(allow_new_jobs=True)
+        assert _wait_until(lambda: runner.is_drained, BOUND_WAIT_S)
+        runner.step(allow_new_jobs=True)
+        expected = ("succeeded", 1, None) if case == "claim_streak_does_not_delay_maintenance" else (
+            "failed",
+            1,
+            "handler_failed",
+        )
+        assert _durable(env, job_id) == expected

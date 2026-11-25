@@ -98,6 +98,52 @@ class _PendingSettle:
     outcome: JobOutcome  # the failure to record through ``JobService.complete``
 
 
+@dataclass
+class _RetryLane:
+    """Independent per-obligation backoff deadline and streak under ``DaemonDoctorRunner._lock``."""
+
+    pending: bool = False
+    due_mono: float | None = None
+    gen: int = 0
+    streak: int = 0
+
+    def reset(self) -> None:
+        self.pending = False
+        self.due_mono = None
+        self.gen = 0
+        self.streak = 0
+
+    def active_wait_s(self, current_gen: int, now_mono: float) -> float | None:
+        if not self.pending or self.due_mono is None or self.gen != current_gen:
+            return None
+        return max(0.0, self.due_mono - now_mono)
+
+    def backoff_active(self, current_gen: int, now_mono: float) -> bool:
+        return self.pending and self.due_mono is not None and self.gen == current_gen and now_mono < self.due_mono
+
+    def arm(self, current_gen: int, target_gen: int, now_mono: float) -> None:
+        if current_gen != target_gen:
+            return
+        self.pending = True
+        if self.due_mono is not None and self.gen == target_gen and now_mono < self.due_mono:
+            return
+        self.streak += 1
+        delay_s = min(_MAX_RETRY_S, _SETTLE_RETRY_S * (2 ** min(3, self.streak - 1)))
+        self.due_mono = now_mono + delay_s
+        self.gen = target_gen
+
+    def begin_attempt(self, current_gen: int) -> None:
+        self.pending = False
+        if self.gen == current_gen:
+            self.due_mono = None
+
+    def finish_if_settled(self) -> None:
+        if not self.pending:
+            self.streak = 0
+            self.due_mono = None
+            self.gen = 0
+
+
 
 def _due(last: datetime, now_utc: datetime) -> bool:
     return now_utc - last >= DOCTOR_SCHEDULE_INTERVAL
@@ -154,10 +200,9 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
         self._pending_lease: JobLease | None = None  # claimed doctor lease whose settle/start must be retried
         self._pending_settle: _PendingSettle | None = None  # outcome write not yet confirmed by the durable row
         self._reconcile_claims = False  # a lease attempt failed: it may have committed without returning the lease
-        self._retry_due_mono: float | None = None
-        self._retry_gen: int = 0
-        self._retry_streak: int = 0
-        self._maint_retry_pending = False
+        self._maint_retry = _RetryLane()
+        self._claim_retry = _RetryLane()
+        self._settle_retry = _RetryLane()
 
     def _record_finished_locked(self, job_id: str, status: str, doctor_run_id: str | None) -> None:
         self._finished_jobs[job_id] = (status, doctor_run_id)
@@ -166,10 +211,9 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
             del self._finished_jobs[oldest]
 
     def _clear_retry_locked(self) -> None:
-        self._retry_due_mono = None
-        self._retry_gen = 0
-        self._retry_streak = 0
-        self._maint_retry_pending = False
+        self._maint_retry.reset()
+        self._claim_retry.reset()
+        self._settle_retry.reset()
 
     def _drop_inflight_locked(self) -> None:
         self._active_token, self._active_lease, self._completed = None, None, None
@@ -277,29 +321,23 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
         with self._lock:
             if self._stopping or self._closed:
                 return False
-            busy = (
-                self._startup_due
-                or self._active_token is not None
-                or self._completed is not None
-                or self._has_unresolved_locked()
-                or self._maintenance_due_locked(now_utc)
-            )
-            if not busy and not self._has_active_doctor_job():
+            if not self._is_busy_locked(now_utc) and not self._has_active_doctor_job():
                 return True
             self._waiters.append(wake_event)
             return False
 
     def next_retry_wait_s(self) -> float | None:
-        """Seconds until the next due doctor retry backoff, or ``None`` when no retry is pending."""
+        """Seconds until the earliest due doctor retry lane, or ``None`` when no retry is pending."""
         with self._lock:
-            if (
-                self._stopping
-                or self._closed
-                or self._retry_due_mono is None
-                or self._retry_gen != self._generation
-            ):
+            if self._stopping or self._closed:
                 return None
-            return max(0.0, self._retry_due_mono - time.monotonic())
+            now_mono = time.monotonic()
+            waits = [
+                wait
+                for lane in (self._maint_retry, self._claim_retry, self._settle_retry)
+                if (wait := lane.active_wait_s(self._generation, now_mono)) is not None
+            ]
+            return min(waits) if waits else None
 
     def step(self, *, allow_new_jobs: bool) -> bool:
         """Advance background doctor work and 24h maintenance on the owner thread."""
@@ -322,15 +360,16 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
 
         settle: _PendingSettle | None = None
         with self._lock:
-            if self._pending_settle is not None and not self._retry_backoff_active_locked():
+            if self._pending_settle is not None and not self._settle_retry.backoff_active(
+                self._generation, time.monotonic()
+            ):
                 settle, self._pending_settle = self._pending_settle, None
-                if self._retry_gen == self._generation:
-                    self._retry_due_mono = None
+                self._settle_retry.begin_attempt(self._generation)
         if settle is not None:
             self._complete_and_publish(settle.lease, settle.gen, settle.outcome)
             with self._lock:
                 if self._pending_settle is None:
-                    self._reset_retry_streak_if_idle_locked()
+                    self._settle_retry.finish_if_settled()
                     did_work = True  # a re-deferred retry waits for the owner loop retry deadline
 
         if allow_new_jobs and not self._is_stopping_or_closed():
@@ -350,67 +389,51 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
     def _can_claim_doctor(self) -> bool:
         return not self._is_stopping_or_closed()
 
+    def _is_busy_locked(self, now_utc: datetime) -> bool:
+        return (
+            self._startup_due
+            or self._maint_retry.pending
+            or self._claim_retry.pending
+            or self._settle_retry.pending
+            or self._active_token is not None
+            or self._completed is not None
+            or self._has_unresolved_locked()
+            or self._maintenance_due_locked(now_utc)
+        )
+
     def _is_settled_now(self) -> bool:
         now_utc, _ = require_aware_utc(self._clock.now())
         with self._lock:
-            if (
-                self._startup_due
-                or self._maint_retry_pending
-                or self._active_token is not None
-                or self._completed is not None
-                or self._has_unresolved_locked()
-            ):
-                return False
-            if self._maintenance_due_locked(now_utc):
+            if self._is_busy_locked(now_utc):
                 return False
         return not self._has_active_doctor_job()
 
     def _has_unresolved_locked(self) -> bool:
         return self._pending_lease is not None or self._pending_settle is not None or self._reconcile_claims
 
-    def _retry_backoff_active_locked(self) -> bool:
-        return (
-            self._retry_due_mono is not None
-            and self._retry_gen == self._generation
-            and time.monotonic() < self._retry_due_mono
-        )
-
-    def _reset_retry_streak_if_idle_locked(self) -> None:
-        if not self._maint_retry_pending and self._retry_due_mono is None and not self._has_unresolved_locked():
-            self._retry_streak = 0
-
-    def _arm_retry_locked(self, gen: int, *, maintenance: bool = False) -> None:
-        if self._stopping or self._closed or self._generation != gen:
-            return
-        if maintenance:
-            self._maint_retry_pending = True
-        now_mono = time.monotonic()
-        if self._retry_due_mono is not None and self._retry_gen == gen and now_mono < self._retry_due_mono:
-            return
-        self._retry_streak += 1
-        delay_s = min(_MAX_RETRY_S, _SETTLE_RETRY_S * (2 ** min(3, self._retry_streak - 1)))
-        self._retry_due_mono = now_mono + delay_s
-        self._retry_gen = gen
-
-    def _arm_retry(self, gen: int, *, maintenance: bool = False) -> None:
-        """Arm an owner-loop retry backoff for ``gen``: no timer thread is needed or can wake late."""
+    def _arm_maint_retry(self, gen: int) -> None:
+        """Arm the maintenance/schedule retry lane for ``gen`` without delaying claim/settle lanes."""
         with self._lock:
-            self._arm_retry_locked(gen, maintenance=maintenance)
+            if not (self._stopping or self._closed):
+                self._maint_retry.arm(self._generation, gen, time.monotonic())
 
     def _defer(
         self, gen: int, *, lease: JobLease | None = None, settle: _PendingSettle | None = None, claims: bool = False
     ) -> None:
-        """Keep responsibility for an unresolved write of generation ``gen`` and schedule its retry."""
+        """Keep responsibility for an unresolved write of generation ``gen`` and schedule its retry lane."""
         with self._lock:
             if self._generation != gen or self._stopping or self._closed:
                 return
+            now_mono = time.monotonic()
             if lease is not None:
                 self._pending_lease = lease
-            if settle is not None:
-                self._pending_settle = settle
             if claims:
                 self._reconcile_claims = True
-            self._arm_retry_locked(gen)
+            if lease is not None or claims:
+                self._claim_retry.arm(self._generation, gen, now_mono)
+            if settle is not None:
+                self._pending_settle = settle
+                self._settle_retry.arm(self._generation, gen, now_mono)
 
     def _maintenance_due_locked(self, now_utc: datetime) -> bool:
         """Background work is due once a full interval has elapsed (``>=``), the one rule settle and schedule share."""
@@ -462,17 +485,14 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
 
     def _finish_maint_attempt(self) -> None:
         with self._lock:
-            self._reset_retry_streak_if_idle_locked()
+            self._maint_retry.finish_if_settled()
 
     def _run_maintenance_and_schedule(self) -> bool:
         with self._lock:
-            if self._maint_retry_pending and self._retry_backoff_active_locked():
+            if self._maint_retry.backoff_active(self._generation, time.monotonic()):
                 return False
             gen = self._generation
-            if self._maint_retry_pending:
-                self._maint_retry_pending = False
-                if self._retry_gen == gen:
-                    self._retry_due_mono = None
+            self._maint_retry.begin_attempt(gen)
         now_utc, _ = require_aware_utc(self._clock.now())
         did_work = False
 
@@ -489,11 +509,11 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
                 )
             except BrainError as err:
                 _LOGGER.warning("doctor startup lookup failed (code=%s)", err.code.value)
-                self._arm_retry(gen, maintenance=True)
+                self._arm_maint_retry(gen)
                 return False
             except sqlite3.Error:
                 _LOGGER.warning("doctor startup lookup failed (code=sqlite_error)")
-                self._arm_retry(gen, maintenance=True)
+                self._arm_maint_retry(gen)
                 return False
             if latest is not None and not _due(latest[0].recorded_at, now_utc):
                 self._startup_due = False
@@ -502,7 +522,7 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
                 return False
             outcome = self._schedule_store_run("startup")
             if outcome is None:
-                self._arm_retry(gen, maintenance=True)
+                self._arm_maint_retry(gen)
                 return False  # still due: owner-loop retry backoff wakes even on a doctor-only daemon
             self._startup_due = False
             self._last_scheduled_at = now_utc
@@ -523,17 +543,17 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
                 if err.code is ErrorCode.STORE_BUSY:
                     self._last_gc_at = now_utc
                 else:
-                    self._arm_retry(gen, maintenance=True)
+                    self._arm_maint_retry(gen)
             except sqlite3.Error:
                 _LOGGER.warning("debounced maintenance failed (code=sqlite_error)")
-                self._arm_retry(gen, maintenance=True)
+                self._arm_maint_retry(gen)
 
         if _due(self._last_scheduled_at, now_utc):
             outcome = self._schedule_store_run("schedule")
             if outcome is not None:  # a failed attempt stays due and is retried on the next due pass
                 self._last_scheduled_at = now_utc
             else:
-                self._arm_retry(gen, maintenance=True)
+                self._arm_maint_retry(gen)
             if outcome:
                 did_work = True
 
@@ -545,11 +565,11 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
             if self._stopping or self._closed or self._active_token is not None or self._pending_settle is not None:
                 return False
             had_pending_claim = self._pending_lease is not None or self._reconcile_claims
-            if had_pending_claim and self._retry_backoff_active_locked():
+            if had_pending_claim and self._claim_retry.backoff_active(self._generation, time.monotonic()):
                 return False
             gen = self._generation
-            if had_pending_claim and self._retry_gen == gen:
-                self._retry_due_mono = None
+            if had_pending_claim:
+                self._claim_retry.begin_attempt(gen)
             pending, self._pending_lease = self._pending_lease, None
             reconcile_claims, self._reconcile_claims = self._reconcile_claims, False
 
@@ -578,7 +598,7 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
             if lease is None:
                 if had_pending_claim:
                     with self._lock:
-                        self._reset_retry_streak_if_idle_locked()
+                        self._claim_retry.finish_if_settled()
                 return False
 
         try:
@@ -591,7 +611,7 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
         if spec is None:
             if had_pending_claim:
                 with self._lock:
-                    self._reset_retry_streak_if_idle_locked()
+                    self._claim_retry.finish_if_settled()
             return True
 
         token = object()
@@ -602,7 +622,7 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
             self._active_token = token
             self._active_lease = lease
             if had_pending_claim:
-                self._reset_retry_streak_if_idle_locked()
+                self._claim_retry.finish_if_settled()
 
         # From here the slot is held: every failure must release it and end the job (_abandon_launch).
         thread: threading.Thread | None = None
