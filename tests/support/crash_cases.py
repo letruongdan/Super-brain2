@@ -55,6 +55,8 @@ from tests.storage.conftest import DEMO_KINDS, STORE_ID
 from tests.storage.test_backup import only_backup_dir, verify_store
 from tests.storage.test_migrate import POLICY_V2, STORE_V2
 from tests.storage.test_restore import (
+    _copy_seed_tree,
+    _is_fresh_seed_target,
     count_entries,
     every_original_dir_still_exists,
     generation_in,
@@ -146,6 +148,29 @@ def parse_crash_table(path: Path) -> list[str]:
 
 # --- seeding -----------------------------------------------------------------------------------------------------
 
+_I1_SEED_LOCK = threading.Lock()
+_I1_SEED_CACHE: dict[str, tuple[Path, "SeedState"]] = {}
+
+
+def _seed_cached(key: str, data_root: Path, builder: Callable[[Path], "SeedState"]) -> "SeedState":
+    if not _is_fresh_seed_target(data_root):
+        return builder(data_root)
+    with _I1_SEED_LOCK:
+        cached = _I1_SEED_CACHE.get(key)
+        if cached is None or not cached[0].is_dir():
+            base = ensure_template_base() / "i1-crash-seeds"
+            base.mkdir(parents=True, exist_ok=True)
+            tpl = base / key
+            if tpl.exists():
+                import shutil
+
+                shutil.rmtree(tpl, ignore_errors=True)
+            state = builder(tpl)
+            _I1_SEED_CACHE[key] = (tpl, state)
+            cached = (tpl, state)
+    _copy_seed_tree(cached[0], data_root)
+    return cached[1]
+
 
 def capture(data_root: Path) -> SeedState:
     """Open the seeded data root once and record what the expectations compare against."""
@@ -158,9 +183,7 @@ def capture(data_root: Path) -> SeedState:
         rt.close()
 
 
-def seed_named_store(data_root: Path) -> SeedState:
-    """A policy store and an empty main store bound to ``STORE_ID``, the id the ``append_demo`` and
-    ``put_and_hold`` children open the store with."""
+def _build_named_store(data_root: Path) -> SeedState:
     os_ = os_adapters()
     root = prepare_data_root(data_root, os_)
     with acquire_writer(root, os_) as lease:
@@ -173,8 +196,13 @@ def seed_named_store(data_root: Path) -> SeedState:
     return capture(data_root)
 
 
-def seed_event(data_root: Path) -> SeedState:
-    """The event payload held by ``("event", EVENT_ID)``, as ``crash_child.seed_event`` does."""
+def seed_named_store(data_root: Path) -> SeedState:
+    """A policy store and an empty main store bound to ``STORE_ID``, the id the ``append_demo`` and
+    ``put_and_hold`` children open the store with."""
+    return _seed_cached("named_store", data_root, _build_named_store)
+
+
+def _build_event(data_root: Path) -> SeedState:
     rt = open_cloned_runtime(data_root, os_adapters(), role="crash-seed-event")
     try:
         rt.store.store_content(EVENT_PAYLOAD, "event", EVENT_ID, RetentionClass.EVENT_PAYLOAD, None)
@@ -183,8 +211,12 @@ def seed_event(data_root: Path) -> SeedState:
     return capture(data_root)
 
 
-def seed_quarantined_event(data_root: Path) -> SeedState:
-    """The event payload, held and then quarantined: the intent is recorded and applied to the store."""
+def seed_event(data_root: Path) -> SeedState:
+    """The event payload held by ``("event", EVENT_ID)``, as ``crash_child.seed_event`` does."""
+    return _seed_cached("event", data_root, _build_event)
+
+
+def _build_quarantined_event(data_root: Path) -> SeedState:
     rt = open_cloned_runtime(data_root, os_adapters(), role="crash-seed-quarantine")
     try:
         rt.store.store_content(EVENT_PAYLOAD, "event", EVENT_ID, RetentionClass.EVENT_PAYLOAD, None)
@@ -195,19 +227,36 @@ def seed_quarantined_event(data_root: Path) -> SeedState:
     return capture(data_root)
 
 
-def seed_runtime(data_root: Path) -> SeedState:
+def seed_quarantined_event(data_root: Path) -> SeedState:
+    """The event payload, held and then quarantined: the intent is recorded and applied to the store."""
+    return _seed_cached("quarantined_event", data_root, _build_quarantined_event)
+
+
+def _build_runtime(data_root: Path) -> SeedState:
     open_cloned_runtime(data_root, os_adapters(), role="crash-seed-runtime").close()
     return capture(data_root)
 
 
-def seed_restore(data_root: Path) -> SeedState:
+def seed_runtime(data_root: Path) -> SeedState:
+    return _seed_cached("runtime", data_root, _build_runtime)
+
+
+def _build_restore(data_root: Path) -> SeedState:
     seed_before_backup_after(data_root)
     return capture(data_root)
 
 
-def seed_policy_restore(data_root: Path) -> SeedState:
+def seed_restore(data_root: Path) -> SeedState:
+    return _seed_cached("restore", data_root, _build_restore)
+
+
+def _build_policy_restore(data_root: Path) -> SeedState:
     assert seed_policy_backup(data_root) == 5
     return capture(data_root)
+
+
+def seed_policy_restore(data_root: Path) -> SeedState:
+    return _seed_cached("policy_restore", data_root, _build_policy_restore)
 
 
 # --- shared checks -----------------------------------------------------------------------------------------------

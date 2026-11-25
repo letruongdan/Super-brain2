@@ -270,6 +270,29 @@ def seed_policy_backup(data_root: Path) -> int:
     return gen_val
 
 
+def seed_crash_event_root(data_root: Path) -> None:
+    """Create the event payload root held by ``("event", EVENT_ID)``, matching ``crash_child.seed_event``."""
+    if not _is_fresh_seed_target(data_root):
+        rt = open_runtime(data_root, os_adapters())
+        try:
+            rt.store.store_content(b"event payload", "event", EVENT_ID, RetentionClass.EVENT_PAYLOAD, None)
+        finally:
+            rt.close()
+        return
+    with _RESTORE_SEED_LOCK:
+        cached = _RESTORE_SEED_CACHE.get("crash_event")
+        if cached is None or not cached[0].is_dir():
+            tpl = _restore_seed_base() / "crash_event"
+            rt = open_cloned_runtime(tpl, os_adapters(), role="seed-event")
+            try:
+                rt.store.store_content(b"event payload", "event", EVENT_ID, RetentionClass.EVENT_PAYLOAD, None)
+            finally:
+                rt.close()
+            _RESTORE_SEED_CACHE["crash_event"] = (tpl, None)
+            cached = (tpl, None)
+    _copy_seed_tree(cached[0], data_root)
+
+
 def set_meta_versions(path: Path, version: int) -> None:
     db = sqlite3.connect(path, isolation_level=None)
     try:

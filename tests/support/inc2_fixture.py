@@ -216,6 +216,7 @@ def open_inc2_installed_env(scratch: Path) -> Iterator[InstalledEnv]:
             "--offline",
             "--no-deps",
             "--link-mode=copy",
+            "--compile-bytecode",
             "--python",
             str(venv_python),
             str(wheel_path),
@@ -229,11 +230,7 @@ def open_inc2_installed_env(scratch: Path) -> Iterator[InstalledEnv]:
                 str(venv_python),
                 "-I",
                 "-c",
-                "import compileall, pathlib, sysconfig; "
-                "p = sysconfig.get_path('purelib'); "
-                "ok = compileall.compile_dir(pathlib.Path(p) / 'superbrain', quiet=1); "
-                "print(p); "
-                "raise SystemExit(0 if ok else 1)",
+                "import sysconfig; print(sysconfig.get_path('purelib'))",
             ],
             cwd=scratch,
             text=True,
