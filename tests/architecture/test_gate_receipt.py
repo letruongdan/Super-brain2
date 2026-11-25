@@ -497,6 +497,21 @@ def _read_started_identity(path: Path) -> tuple[int, str]:
     return int(lines[0]), lines[1]
 
 
+def _collect_started_identities(*paths: Path) -> list[tuple[int, str]]:
+    """Read every valid ``(pid, token)`` identity already published by started child/descendant probes."""
+    found: list[tuple[int, str]] = []
+    for path in paths:
+        if not path.is_file():
+            continue
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        if len(lines) >= 2 and lines[0].isdigit() and lines[1]:
+            found.append((int(lines[0]), lines[1]))
+    return found
+
+
 def _is_exact_process_alive(pid: int, expected_token: str) -> bool:
     if sys.platform == "win32":
         import ctypes
@@ -666,7 +681,8 @@ def test_run_kills_a_process_that_exceeds_its_timeout(tmp_path: Path) -> None:
         assert time.monotonic() < cutoff_at
         assert not marker.exists() and not grand_marker.exists()
     finally:
-        _cleanup_exact_processes(identities)
+        published = _collect_started_identities(child_started, grand_started)
+        _cleanup_exact_processes(list(dict.fromkeys([*identities, *published])))
 
 
 def test_run_does_not_wait_forever_for_a_killed_process(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2803,6 +2819,9 @@ def test_win32_job_object_lifecycle_and_non_win32_graceful_noop(
         proc = subprocess.Popen([sys.executable, "-I", "-c", code], cwd=tmp_path)
         job = None
         identities: list[tuple[int, str]] = []
+        proc_ticks = _win32_creation_ticks_for_handle(int(cast(Any, proc)._handle))
+        if proc_ticks is not None:
+            identities.append((proc.pid, str(proc_ticks)))
         try:
             job = assign_fn(proc)
             assert isinstance(job, int) and job != 0
@@ -2814,10 +2833,6 @@ def test_win32_job_object_lifecycle_and_non_win32_graceful_noop(
             child_pid, child_token = _read_started_identity(child_started)
             grand_pid, grand_token = _read_started_identity(grand_started)
             assert child_pid != os.getpid() and grand_pid not in (os.getpid(), child_pid, proc.pid)
-            proc_handle = int(cast(Any, proc)._handle)
-            proc_ticks = _win32_creation_ticks_for_handle(proc_handle)
-            if proc_ticks is not None:
-                identities.append((proc.pid, str(proc_ticks)))
             identities.extend([(child_pid, child_token), (grand_pid, grand_token)])
 
             began = time.monotonic()
@@ -2838,7 +2853,8 @@ def test_win32_job_object_lifecycle_and_non_win32_graceful_noop(
             if proc.poll() is None:
                 proc.kill()
             proc.wait(timeout=5)
-            _cleanup_exact_processes(identities)
+            published = _collect_started_identities(child_started, grand_started)
+            _cleanup_exact_processes(list(dict.fromkeys([*identities, *published])))
 
         # Boolean handles and invalid handles refuse assignment cleanly.
         class _MockProcBool:
