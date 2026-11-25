@@ -1,11 +1,12 @@
 # Báo Cáo Khắc Phục Kiểm Tra Độc Lập & Đo Lường Thực Tế (`remediate-runtime-opt`)
 
-**Tài liệu kiểm tra độc lập Lượt 1:** [2026-11-24-test-suite-optimization-verification.md](2026-11-24-test-suite-optimization-verification.md)  
-**Tài liệu kiểm tra độc lập Lượt 2:** [2026-11-24-test-suite-optimization-verification-r2.md](2026-11-24-test-suite-optimization-verification-r2.md)  
-**Kế hoạch gốc:** [2026-11-23-test-suite-runtime-optimization.md](../superpowers/plans/2026-11-23-test-suite-runtime-optimization.md)  
-**Nhánh thực hiện:** `remediate-runtime-opt` (tách biệt hoàn toàn; `thuc_hien_ke_hoach_sp2` giữ nguyên tại `5f73a0a`)  
-**Commit tối ưu code đã đo Phụ lục A (`diag-remediate-v11`):** `4ce42af` (kèm hiệu chỉnh trọng số Task 5 trên `scripts/gate.py` ngay sau đó)  
-**Trạng thái seal & review:** Chưa reseal `.verification/task9-seal.json`; chưa có tuyên bố "Codex đã duyệt".
+**Tài liệu kiểm tra độc lập Lượt 1:** [2026-11-24-test-suite-optimization-verification.md](2026-11-24-test-suite-optimization-verification.md)
+**Tài liệu kiểm tra độc lập Lượt 2:** [2026-11-24-test-suite-optimization-verification-r2.md](2026-11-24-test-suite-optimization-verification-r2.md)
+**Tái kiểm SP2-3 tại 5ee4f35:** [2026-11-25-sp2-3-acceptance-rereview-5ee4f35.md](2026-11-25-sp2-3-acceptance-rereview-5ee4f35.md)
+**Kế hoạch gốc:** [2026-11-23-test-suite-runtime-optimization.md](../superpowers/plans/2026-11-23-test-suite-runtime-optimization.md)
+**Nhánh thực hiện:** `remediate-runtime-opt` (tách biệt hoàn toàn; `thuc_hien_ke_hoach_sp2` giữ nguyên tại `5f73a0a`)
+**Commit tối ưu code đã đo:** `5ee4f35` (`final-remediate-gate-v6`) + vá oracle W3/P2 tiếp nối trên `remediate-runtime-opt`
+**Trạng thái seal & review:** Chưa reseal `.verification/task9-seal.json` (chờ reviewer duyệt 29 tệp + oracle W3 mới và chạy `test_lock.py check`); chưa có tuyên bố "Codex đã duyệt".
 
 ---
 
@@ -23,7 +24,10 @@
    - **Python 3.14:** `test_job_s = 232.46 s` (`< 275 s`), `pytest_wall = 195.19 s`, tổng JUnit `<testsuite>` = **`1081.63 s`** (`<= 1200 s`, `testcase_sum = 1071.39 s`, giảm **575.6 s** so với baseline `1657.2 s` ở `claude-r11-diag`).
    - **Python 3.11:** `test_job_s = 247.61 s` (`< 275 s`), `pytest_wall = 202.89 s`, tổng JUnit `<testsuite>` = **`1160.33 s`** (`<= 1200 s`, `testcase_sum = 1144.60 s`, giảm **391.0 s** so với baseline `1551.3 s`).
    - Sau đó hiệu chỉnh lại `_HEAVY_FILE_COST_MS` trong `scripts/gate.py` từ trung bình `diag-remediate-v11` (3.14 & 3.11), đưa chênh lệch shard mô phỏng về **5.4% (3.11)** và **5.7% (3.14)**; bốn lượt nghiệm thu `scripts.gate --shards 6` thật (cold wheel cache, 3.14 × 2 + 3.11 × 2) được chạy trên chính commit sạch cuối cùng ngay sau khi commit bản cập nhật này (`final-remediate-gate-v6`).
-7. **W3 (P3) — Biên thời gian test kill tiến trình (`tests/architecture/test_gate_receipt.py:480`):** Đã xác nhận `test_run_kills_a_process_that_exceeds_its_timeout` dùng `time.sleep(3.0)` ở tiến trình con, `timeout_s=0.2`, kiểm `elapsed < 2.5`, rồi đợi `1.5 s` xác minh file marker không được ghi.
+7. **W3 / Rereview P2 (P2) — Oracle kiểm kill tiến trình & Job Object / Process Group (`tests/architecture/test_gate_receipt.py`):**
+   - Khắc phục lỗ hổng pass giả ở `5ee4f35` (khi runner mô phỏng trả timeout `0.2 s` mà tiến trình con còn sống trước khi ghi `survived.txt` ở giây thứ 3).
+   - `test_run_kills_a_process_that_exceeds_its_timeout` và `test_win32_job_object_lifecycle_and_non_win32_graceful_noop` giờ xác nhận cây tiến trình con/cháu thực sự đã khởi động (`child.started` / `grand.started`), nhận diện đúng PID + dấu khởi tạo OS (`GetProcessTimes` trên Win32 / `/proc/<pid>/stat` hoặc `ps -o lstart=` trên POSIX), kiểm toàn bộ cây tiến trình đã kết thúc trước cutoff `2.5 s`, và kiểm nhánh `start_new_session=True` + `os.killpg(SIGKILL)` trên POSIX. Giữ nguyên tập 3.470 node ID.
+   - Đã kiểm chứng trên `C:\Users\letru\sb2-trusted-local\evidence\w3-bugproof\`: probe lỗi giả `5ee4f35` (`probe_5ee4f35_false_pass.log`) nay bị bắt (`red_probe_caught.log`), GREEN trên 3.14/3.11 (`green_314.log`, `green_311.log`), và cả 3 mutation bỏ kill bị bắt (`mut_run_killed.log`, `mut_job_killed.log`, `mut_posix_killpg_killed.log`).
 8. **W4 (P3) — Khóa schema dict trong `tests/domain/test_capture_envelope_and_privacy.py:991`:** Đã xác nhận `_seed_outbox_frames` assert `sample_dict == sample_rec.to_dict()`.
 
 ---
@@ -121,29 +125,35 @@
 
 ---
 
-### Finding W3 (P3): Biên Thời Gian Kill Tiến Trình (`test_gate_receipt.py:480`)
+### Finding W3 & Rereview P2 (P2): Oracle Kill Tiến Trình, Job Object & Process Group (`test_gate_receipt.py`)
 
 #### 1. Invariant
-> Kiểm thử kill tiến trình vượt timeout phải có khoảng đệm đủ rộng giữa timeout của runner và thời điểm tiến trình con hoàn tất tự nhiên để phân biệt chắc chắn bị kill với thoát bình thường dưới tải hệ điều hành.
+> Mọi oracle kiểm thử ngắt tiến trình vượt timeout hoặc dọn nhóm tiến trình phải xác nhận đối tượng mục tiêu và hậu duệ thực sự đã khởi chạy với danh tính OS xác thực, đồng thời chứng minh chúng đã kết thúc trước ngưỡng cutoff chứ không thể pass khi tiến trình con còn sống lúc kiểm tra.
 
 #### 2. Sibling sweep
-- `tests/architecture/test_gate_receipt.py:480-488` (`test_run_kills_a_process_that_exceeds_its_timeout`): con ngủ `3.0 s`, runner `timeout_s=0.2`, assert `exit_code is None` và `elapsed < 2.5`, đợi `1.5 s`, assert `not marker.exists()`.
-- Sibling kế tiếp `test_run_does_not_wait_forever_for_a_killed_process` (dòng 491) không dùng sleep thực (`Hung`), vẫn đạt.
+- `tests/architecture/test_gate_receipt.py::test_run_kills_a_process_that_exceeds_its_timeout`: khởi chạy cây con + cháu bằng `_process_tree_probe_script(..., sleep_s=6.0)` qua `gate.run(..., timeout_s=1.0)`; kiểm `exit_code is None`, xác nhận `child.started` & `grand.started` tồn tại (tức cả hai đã khởi động trước timeout), kiểm `_wait_process_tree_terminated` với PID + token khởi tạo OS (`GetProcessTimes` trên Windows, `/proc/<pid>/stat` hoặc `ps` trên POSIX) trả về rỗng trước cutoff `2.5 s`, và kiểm `not survived.txt` / `not grand_survived.txt`.
+- `tests/architecture/test_gate_receipt.py::test_win32_job_object_lifecycle_and_non_win32_graceful_noop`: áp dụng cùng `_process_tree_probe_script` + `_wait_process_tree_terminated` cho `_win32_close_job(job, terminate=True)` trên toàn bộ cây `(proc, child, grandchild)` của Job Object trên Windows (tính đến launcher shim `uv` tạo tiến trình con); đồng thời trong nhánh `sys.platform == "linux"` kiểm chứng `gate.run` truyền `start_new_session=True`, `_kill_tree` gọi `os.killpg(pid, signal.SIGKILL)` + `proc.kill()`, và nhánh `ProcessLookupError` vẫn gọi `proc.kill()`. Giữ nguyên 100% tập node ID (`153` test trong `test_gate_receipt.py`, `3470` toàn repo).
+- Sibling khác đã rà soát trong `tests/architecture/test_gate_receipt.py`: `test_run_does_not_wait_forever_for_a_killed_process`, `test_run_reports_a_timeout_when_killing_the_timed_out_process_fails`, `test_failed_kill_of_a_started_phase_is_not_reported_as_could_not_start` — dùng mock `Hung`/`TimedOutProcess` để kiểm báo cáo lỗi/khôi phục khi kill thất bại, vẫn hợp lệ.
+- Bằng chứng thực nghiệm (`C:\Users\letru\sb2-trusted-local\evidence\w3-bugproof\`):
+  - Probe `5ee4f35` (`probe_5ee4f35_false_pass.log`): runner mô phỏng `0.2 s` không kill pass giả khi `poll() is None` rồi ghi `survived.txt`.
+  - Probe trên bản sửa (`red_probe_caught.log`): cả `0p2s_nokill` lẫn `started_tree_nokill` đều FAIL ngay vì bắt được PID + creation token còn sống.
+  - GREEN (`green_314.log`, `green_311.log`): Python 3.14 đạt `1.27 s` + `0.32 s` (`1.95 s`), Python 3.11 đạt `1.30 s` + `0.32 s` (`2.00 s`).
+  - Mutation (`mut_run_killed.log`, `mut_job_killed.log`, `mut_posix_killpg_killed.log`): cả 3 biến thể bỏ kill (`gate.run`, `_win32_close_job`, và `_kill_tree` thiếu `killpg`) đều bị bắt.
 
 #### 3. Lens table
 | Lens | Status | Reason |
 |---|---|---|
-| Crash between two durable steps | holds | File `survived.txt` chỉ được tạo sau khi `sleep(3.0)` kết thúc. |
-| Restore, rollback and migration rewind state | not applicable | Test unit runner trên `tmp_path`. |
-| Old binaries, old data, version fences | holds | Dùng `sys.executable -I`. |
-| Every path to the same invariant | holds | Bao phủ cả đường kill thật (`480`) và đường `Hung` mock (`491`). |
-| Concurrency, shutdown and cutoffs | fixed here | Biên đệm `3.0 - 0.2 = 2.8 s` triệt tiêu flake do trễ lập lịch Windows 6 shard. |
-| Authority, identity and scope | holds | Chỉ kill tiến trình con trong `tmp_path` riêng. |
-| Fail closed at limits and on the unknown | holds | Nếu kill thất bại, `survived.txt` xuất hiện và `assert not marker.exists()` bắt lỗi. |
-| What actually left, and to whom | holds | Không phát sinh I/O ngoài `tmp_path`. |
-| The world outside the daemon | fixed here | Chịu được trễ lập lịch Windows khi 6 shard chạy song song. |
-| Evidence and oracles | fixed here | Đã chạy thực nghiệm trong `task-1058` (`153 passed in 11.68s`) và `diag-remediate-v10`. |
-| The document agrees with itself | holds | Tham số mô tả khớp chính xác dòng 480–488. |
+| Crash between two durable steps | holds | File `.started` được ghi nguyên tử qua file tạm + `os.replace` sau khi khởi tạo xong; marker `.survived` chỉ ghi sau `sleep_s`. |
+| Restore, rollback and migration rewind state | not applicable | Test vòng đời tiến trình OS tạm thời trong `tmp_path`. |
+| Old binaries, old data, version fences | holds | Chạy `sys.executable -I`; xử lý được trường hợp Windows `.venv\Scripts\python.exe` là launcher shim tạo process con. |
+| Every path to the same invariant | fixed here | Áp cùng oracle xác thực khởi chạy + kết thúc đúng danh tính cho `gate.run`, Win32 Job Object `_win32_close_job`, và đường POSIX `start_new_session`/`killpg` ở `_kill_tree`. |
+| Concurrency, shutdown and cutoffs | fixed here | Toàn bộ cây con/cháu phải thoát hoàn toàn trước `cutoff_at = began + 2.5 s` (không còn kẽ hở ngủ ngắn 1.5 s < 3.0 s). |
+| Authority, identity and scope | fixed here | Kiểm tra exact process identity (`(pid, GetProcessTimes / proc starttime)`), tránh nhầm khi OS tái sử dụng PID; cleanup `finally` cũng chỉ kill khi khớp token. |
+| Fail closed at limits and on the unknown | fixed here | Nếu `.started` chưa xuất hiện trước timeout hoặc còn bất kỳ PID khớp token nào sống qua cutoff, assertion fail ngay; không dọn trước khi assert. |
+| What actually left, and to whom | holds | Mọi file tạm và tiến trình đều nằm cô lập trong `tmp_path` và bị dọn ở `finally`. |
+| The world outside the daemon | fixed here | Bao phủ cả hành vi launcher trampoline trên Windows lẫn process group trên POSIX; chạy ổn định dưới tải 6 shard. |
+| Evidence and oracles | fixed here | Có đầy đủ probe tái hiện `5ee4f35`, GREEN 3.14/3.11, và 3 mutation bỏ kill bị tiêu diệt lưu tại `evidence/w3-bugproof/`. |
+| The document agrees with itself | fixed here | Khớp chính xác code mới trong `tests/architecture/test_gate_receipt.py` và kết quả kiểm chứng thực tế. |
 
 ---
 
@@ -225,7 +235,7 @@ Kiểm tra inventory bằng `gate.parse_collected`:
 | File đã sửa | A1 (Inventory) | A2 (Assert giữ nguyên) | A3 (Mutation / Bug-proof) | A4 (Tải 6 shard 3.14 & 3.11) | A5/A6 (Thời gian) | A7 (Lint / Type / LF) |
 |---|---|---|---|---|---|---|
 | `tests/domain/test_capture_envelope_and_privacy.py` + `hook_entry.py` | 21 → 22 (+1 test W1) | Giữ nguyên + W4 assert | **RED/GREEN/MUTATION KILLED** (`evidence/v4-bugproof/`) | Pass trong `v10`, `v11` (3.14 & 3.11) | **Đạt 3.14** (27.2 → 17.5 s) | Đạt |
-| `tests/architecture/test_gate_receipt.py` + `scripts/gate.py` | 153 = 153 | Giữ nguyên + biên W3 | `153 passed in 12.78s` sau Task 5 `v11` | Pass trong `v10`, `v11` (3.14 & 3.11) | **Đạt** (39.1 → 19.9 s) | Đạt |
+| `tests/architecture/test_gate_receipt.py` + `scripts/gate.py` | 153 = 153 | Giữ nguyên + oracle cây tiến trình W3/P2 | **PROBE/GREEN/3-MUTATION KILLED** (`evidence/w3-bugproof/`), `153 passed in 11.25s` | Pass trong `v10`, `v11` (3.14 & 3.11) | **Đạt** (39.1 → 19.9 s) | Đạt |
 | `tests/integration/test_sp2_i2_wheel_compat.py` + `tests/support/inc2_fixture.py` | 2 = 2 | Khôi phục `len(wheels)==1` & SHA-256 | Kiểm thực wheel I2 vs SP2 + `py=194 pyc=194` trên 3.14/3.11 | Pass trong `v11` (3.14 & 3.11) | **Đạt** (62.2 → 29.6 s) | Đạt |
 | `tests/application/test_t8_review_p01_{wrapped_paths,r2_edge_globs,r3_spellings}.py` + `_privacy_scan.py` | 64=64, 73=73 | Giữ nguyên 100% wrapper/glob | Kiểm tương đương `[a-z]+` IGNORECASE trên 3.11 & 3.14 (`0x130, 0x131, 0x17f, 0x212a`) | Pass trong `v10`, `v11` (3.14 & 3.11) | **Đạt** (19.5→8.3, 22.9→10.9 s) | Đạt |
 | `tests/integration/test_kernel_daemon.py` | 36 = 36 | Giữ nguyên shutdown cutoff | Kiểm overrun trên `FakeMonotonicClock` | Pass trong `v10`, `v11` (3.14 & 3.11) | No-Go (-18.7 s; 36 ca daemon thực) | Đạt |
@@ -238,12 +248,16 @@ Kiểm tra inventory bằng `gate.parse_collected`:
 
 ---
 
-## 4. Nghiệm Thu Cuối Cùng Trên Commit Sạch
+## 4. Kết Quả Gate Đã Đo Trên `5ee4f35` Và Bước Nghiệm Thu Sau Vá W3
 
-Sau khi commit bản cập nhật `scripts/gate.py` (Task 5 từ `diag-remediate-v11`) và báo cáo này lên `remediate-runtime-opt`, chạy đầy đủ trên chính commit sạch đó (`tree_is_clean(repo)`):
-1. `uv run --locked python -m scripts.gate --python 3.14 --shards 6 --evidence-dir C:\Users\letru\sb2-trusted-local\evidence\final-remediate-gate-v6\3.14-run1`
-2. `uv run --locked python -m scripts.gate --python 3.14 --shards 6 --evidence-dir C:\Users\letru\sb2-trusted-local\evidence\final-remediate-gate-v6\3.14-run2`
-3. `uv run --locked python -m scripts.gate --python 3.11 --shards 6 --evidence-dir C:\Users\letru\sb2-trusted-local\evidence\final-remediate-gate-v6\3.11-run1`
-4. `uv run --locked python -m scripts.gate --python 3.11 --shards 6 --evidence-dir C:\Users\letru\sb2-trusted-local\evidence\final-remediate-gate-v6\3.11-run2`
-5. Full serial suite (`uv run --locked pytest -q -p no:cacheprovider`) + `ruff check src tests scripts` + `mypy` + `lint-imports` cho A7.
-6. Báo cáo toàn bộ số đo thực tế và receipt cho Reviewer độc lập trước khi xem xét reseal `.verification/task9-seal.json`.
+### Kết quả 4 lượt gate trên commit sạch `5ee4f35` (`final-remediate-gate-v6`, cache wheel lạnh, `--shards 6`):
+- **Python 3.14 Lượt 1:** `accepted=True`, `test_job_seconds = 231.918 s` (`< 275 s`), JUnit `<testsuite>` = **`1108.453 s`** (`<= 1200 s`), `3414 passed, 56 skipped, 0 failed` (`3470` total).
+- **Python 3.14 Lượt 2:** `accepted=True`, `test_job_seconds = 233.138 s` (`< 275 s`), JUnit `<testsuite>` = **`1119.918 s`** (`<= 1200 s`), `3414 passed, 56 skipped, 0 failed`.
+- **Python 3.11 Lượt 1:** `accepted=True`, `test_job_seconds = 230.891 s` (`< 275 s`), JUnit `<testsuite>` = **`1126.327 s`** (`<= 1200 s`), `3414 passed, 56 skipped, 0 failed`.
+- **Python 3.11 Lượt 2:** `accepted=True`, `test_job_seconds = 230.938 s` (`< 275 s`), JUnit `<testsuite>` = **`1129.004 s`** (`<= 1200 s`), `3414 passed, 56 skipped, 0 failed`.
+- Full serial suite trên `5ee4f35` (Python 3.14): `3414 passed, 56 skipped, 6 warnings in 539.26 s`.
+
+### Chạy gate xác nhận sau khi sửa W3/P2 trên commit sạch kế tiếp:
+1. Lưu commit sửa W3/P2 (`tests/architecture/test_gate_receipt.py`) + tài liệu đối chiếu này lên nhánh `remediate-runtime-opt` (`tree_is_clean(repo) == True`).
+2. Chạy `scripts.gate --shards 6` (cache wheel lạnh, 3.14 × 2 và 3.11 × 2) vào `C:\Users\letru\sb2-trusted-local\evidence\final-remediate-gate-v7\`.
+3. Kiểm tra lại `ruff check src tests scripts`, `mypy`, `lint-imports` và bàn giao cho Reviewer độc lập đối chiếu thay đổi 29 tệp + W3 và quyết định reseal `.verification/task9-seal.json`.

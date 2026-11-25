@@ -8,6 +8,7 @@ import os
 import platform
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -477,15 +478,195 @@ def test_junit_temp_file_is_removed(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     assert not list(tmp_path.glob("*-junit.xml"))
 
 
+def _win32_creation_ticks_for_handle(handle: int) -> int | None:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetProcessTimes.argtypes = [wintypes.HANDLE, *[ctypes.POINTER(wintypes.FILETIME)] * 4]
+    kernel32.GetProcessTimes.restype = wintypes.BOOL
+    times = [wintypes.FILETIME() for _ in range(4)]
+    if not kernel32.GetProcessTimes(wintypes.HANDLE(handle), *(ctypes.byref(t) for t in times)):
+        return None
+    return (int(times[0].dwHighDateTime) << 32) | int(times[0].dwLowDateTime)
+
+
+def _read_started_identity(path: Path) -> tuple[int, str]:
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 2 and lines[0].isdigit() and lines[1], f"malformed started identity at {path}: {lines!r}"
+    return int(lines[0]), lines[1]
+
+
+def _is_exact_process_alive(pid: int, expected_token: str) -> bool:
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+        kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        ctypes.set_last_error(0)
+        handle = kernel32.OpenProcess(0x00101000, False, pid)  # SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            err = ctypes.get_last_error()
+            if err in (87, 5):  # ERROR_INVALID_PARAMETER (exited) or protected/recycled owner
+                return False
+            raise OSError(err, f"OpenProcess failed for pid={pid}")
+        try:
+            ticks = _win32_creation_ticks_for_handle(int(handle))
+            if ticks is None:
+                return True
+            if str(ticks) != expected_token:
+                return False
+            exit_code = wintypes.DWORD()
+            if kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)) and exit_code.value != 259:
+                return False
+            return bool(kernel32.WaitForSingleObject(handle, 0) != 0)
+        finally:
+            kernel32.CloseHandle(handle)
+
+    stat_path = Path(f"/proc/{pid}/stat")
+    if Path("/proc").is_dir():
+        try:
+            raw = stat_path.read_text(encoding="ascii", errors="replace")
+        except OSError:
+            return False
+        _, _, tail = raw.rpartition(")")
+        fields = tail.split()
+        if len(fields) <= 19:
+            return False
+        return fields[0] != "Z" and fields[19] == expected_token
+
+    out = subprocess.run(["ps", "-o", "stat=,lstart=", "-p", str(pid)], capture_output=True, text=True, check=False)
+    if out.returncode != 0 or not out.stdout.strip():
+        return False
+    parts = out.stdout.strip().split()
+    if len(parts) < 2 or parts[0].startswith("Z"):
+        return False
+    return "_".join(parts[1:]) == expected_token
+
+
+def _wait_process_tree_terminated(identities: Sequence[tuple[int, str]], *, deadline: float) -> list[tuple[int, str]]:
+    while True:
+        alive = [(pid, token) for pid, token in identities if _is_exact_process_alive(pid, token)]
+        if not alive or time.monotonic() >= deadline:
+            return alive
+        time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
+
+
+def _cleanup_exact_processes(identities: Sequence[tuple[int, str]]) -> None:
+    for pid, token in identities:
+        if not _is_exact_process_alive(pid, token):
+            continue
+        if sys.platform == "win32":
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+            kernel32.TerminateProcess.restype = wintypes.BOOL
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            handle = kernel32.OpenProcess(0x0001 | 0x1000, False, pid)
+            if handle:
+                try:
+                    if str(_win32_creation_ticks_for_handle(int(handle))) == token:
+                        kernel32.TerminateProcess(handle, 1)
+                finally:
+                    kernel32.CloseHandle(handle)
+        else:
+            sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
+            try:
+                if _is_exact_process_alive(pid, token):
+                    os.kill(pid, sigkill)
+            except OSError:
+                pass
+
+
+def _process_tree_probe_script(
+    child_started: Path, grand_started: Path, child_marker: Path, grand_marker: Path, *, sleep_s: float
+) -> str:
+    token_fn = textwrap.dedent(
+        """\
+        def _token():
+            if sys.platform == 'win32':
+                import ctypes
+                from ctypes import wintypes
+                k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+                k32.GetCurrentProcess.restype = wintypes.HANDLE
+                k32.GetProcessTimes.argtypes = [wintypes.HANDLE, *[ctypes.POINTER(wintypes.FILETIME)] * 4]
+                k32.GetProcessTimes.restype = wintypes.BOOL
+                ts = [wintypes.FILETIME() for _ in range(4)]
+                assert k32.GetProcessTimes(k32.GetCurrentProcess(), *(ctypes.byref(t) for t in ts))
+                return str((ts[0].dwHighDateTime << 32) | ts[0].dwLowDateTime)
+            sp = Path('/proc/self/stat')
+            if sp.exists():
+                return sp.read_text(encoding='ascii').rpartition(')')[2].split()[19]
+            cmd = ['ps', '-o', 'lstart=', '-p', str(os.getpid())]
+            out = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            return '_'.join(out.stdout.split())
+        def _write_id(target):
+            tmp = target.with_suffix('.tmp')
+            tmp.write_text(f'{os.getpid()}\\n{_token()}\\n', encoding='utf-8')
+            os.replace(tmp, target)
+        """
+    )
+    grand_code = (
+        "import os, subprocess, sys, time; from pathlib import Path\n"
+        + token_fn
+        + f"_write_id(Path({str(grand_started)!r}))\n"
+        + f"time.sleep({sleep_s!r})\n"
+        + f"Path({str(grand_marker)!r}).write_text('x', encoding='utf-8')\n"
+    )
+    return (
+        "import os, subprocess, sys, time; from pathlib import Path\n"
+        + token_fn
+        + f"gp = subprocess.Popen([sys.executable, '-I', '-c', {grand_code!r}], stdin=subprocess.DEVNULL)\n"
+        + f"gs = Path({str(grand_started)!r})\n"
+        + "t_wait = time.monotonic() + 4.0\n"
+        + "while not gs.is_file() and time.monotonic() < t_wait: time.sleep(0.01)\n"
+        + "assert gs.is_file()\n"
+        + f"_write_id(Path({str(child_started)!r}))\n"
+        + "print('STARTED', flush=True)\n"
+        + f"time.sleep({sleep_s!r})\n"
+        + f"Path({str(child_marker)!r}).write_text('x', encoding='utf-8')\n"
+        + "gp.wait()\n"
+    )
+
+
 def test_run_kills_a_process_that_exceeds_its_timeout(tmp_path: Path) -> None:
+    child_started = tmp_path / "child.started"
+    grand_started = tmp_path / "grand.started"
     marker = tmp_path / "survived.txt"
-    code = f"import time; time.sleep(3.0); open({str(marker)!r}, 'w').write('x')"
+    grand_marker = tmp_path / "grand_survived.txt"
+    code = _process_tree_probe_script(child_started, grand_started, marker, grand_marker, sleep_s=6.0)
+    identities: list[tuple[int, str]] = []
     began = time.monotonic()
-    exit_code, _, _ = gate.run([sys.executable, "-I", "-c", code], cwd=tmp_path, timeout_s=0.2)
-    assert exit_code is None
-    assert time.monotonic() - began < 2.5
-    time.sleep(1.5)
-    assert not marker.exists()
+    try:
+        exit_code, _, _ = gate.run([sys.executable, "-I", "-c", code], cwd=tmp_path, timeout_s=1.0)
+        cutoff_at = began + 2.5
+        assert exit_code is None
+        assert time.monotonic() < cutoff_at
+        assert child_started.is_file() and grand_started.is_file(), "child process tree never started before timeout"
+        child_pid, child_token = _read_started_identity(child_started)
+        grand_pid, grand_token = _read_started_identity(grand_started)
+        assert child_pid != os.getpid() and grand_pid not in (os.getpid(), child_pid)
+        identities.extend([(child_pid, child_token), (grand_pid, grand_token)])
+        alive = _wait_process_tree_terminated(identities, deadline=cutoff_at)
+        assert alive == [], f"timed-out process tree still alive before cutoff: {alive}"
+        assert time.monotonic() < cutoff_at
+        assert not marker.exists() and not grand_marker.exists()
+    finally:
+        _cleanup_exact_processes(identities)
 
 
 def test_run_does_not_wait_forever_for_a_killed_process(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2552,13 +2733,16 @@ def test_is_worktree_registered_tolerates_broken_unrelated_worktree_entries(
     assert registered_fn(repo, owned) is True
 
 
-def test_win32_job_object_lifecycle_and_non_win32_graceful_noop(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Windows Job Object assigns subprocess, terminates on cleanup, and no-ops gracefully elsewhere."""
+def test_win32_job_object_lifecycle_and_non_win32_graceful_noop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Windows Job Object assigns tree, terminates all members before cutoff, and POSIX exercises killpg path."""
     assign_fn = getattr(gate, "_win32_assign_job", None)
     close_fn = getattr(gate, "_win32_close_job", None)
-    assert callable(assign_fn) and callable(close_fn)
+    kill_tree_fn = getattr(gate, "_kill_tree", None)
+    assert callable(assign_fn) and callable(close_fn) and callable(kill_tree_fn)
 
-    # 1. Non-win32 platform returns None and close is a clean no-op.
+    # 1. Non-win32 platform returns None, closes cleanly, and uses start_new_session + os.killpg in _kill_tree.
     with monkeypatch.context() as mp:
         mp.setattr(sys, "platform", "linux")
         fake_proc = subprocess.Popen([sys.executable, "-I", "-c", "pass"])
@@ -2569,24 +2753,92 @@ def test_win32_job_object_lifecycle_and_non_win32_graceful_noop(monkeypatch: pyt
         finally:
             fake_proc.wait()
 
+        pg_calls: list[tuple[int, int]] = []
+        proc_kills: list[int] = []
+        popen_sessions: list[bool] = []
+
+        class _FakePosixProc:
+            pid = 42424
+
+            def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+                if len(proc_kills) == 0:
+                    raise subprocess.TimeoutExpired("cmd", timeout or 0)
+                return "", ""
+
+            def kill(self) -> None:
+                proc_kills.append(self.pid)
+
+        def _fake_killpg(pid: int, sig: int) -> None:
+            pg_calls.append((pid, sig))
+
+        def _fake_popen(*_a: Any, **kw: Any) -> _FakePosixProc:
+            popen_sessions.append(bool(kw.get("start_new_session")))
+            return _FakePosixProc()
+
+        mp.setattr(signal, "SIGKILL", 9, raising=False)
+        mp.setattr(os, "killpg", _fake_killpg, raising=False)
+        mp.setattr(subprocess, "Popen", _fake_popen)
+        exit_code, _, _ = gate.run(["x"], cwd=tmp_path, timeout_s=0.05)
+        assert exit_code is None
+        assert popen_sessions == [True]
+        assert pg_calls == [(42424, 9)] and proc_kills == [42424]
+
+        # A vanished process group (ProcessLookupError) still finishes proc.kill().
+        mp.setattr(os, "killpg", lambda *_a: (_ for _ in ()).throw(ProcessLookupError()), raising=False)
+        proc_kills.clear()
+        kill_tree_fn(_FakePosixProc())
+        assert proc_kills == [42424]
+
     # 2. None job is a safe no-op.
     close_fn(None, terminate=False)
     close_fn(None, terminate=True)
 
-    # 3. On Windows, assigning a real process returns an integer job handle and closing terminates cleanly.
+    # 3. On Windows, assigning a real tree returns a job handle and closing terminates parent + grandchild in time.
     if sys.platform == "win32":
-        proc = subprocess.Popen([sys.executable, "-I", "-c", "import time; time.sleep(10)"])
+        child_started = tmp_path / "job_child.started"
+        grand_started = tmp_path / "job_grand.started"
+        child_marker = tmp_path / "job_child.survived"
+        grand_marker = tmp_path / "job_grand.survived"
+        code = _process_tree_probe_script(child_started, grand_started, child_marker, grand_marker, sleep_s=10.0)
+        proc = subprocess.Popen([sys.executable, "-I", "-c", code], cwd=tmp_path)
         job = None
+        identities: list[tuple[int, str]] = []
         try:
             job = assign_fn(proc)
             assert isinstance(job, int) and job != 0
+            wait_start = time.monotonic() + 3.0
+            while (not child_started.is_file() or not grand_started.is_file()) and time.monotonic() < wait_start:
+                assert proc.poll() is None, f"child exited unexpectedly before starting tree (rc={proc.returncode})"
+                time.sleep(0.01)
+            assert child_started.is_file() and grand_started.is_file(), "Job Object tree did not start"
+            child_pid, child_token = _read_started_identity(child_started)
+            grand_pid, grand_token = _read_started_identity(grand_started)
+            assert child_pid != os.getpid() and grand_pid not in (os.getpid(), child_pid, proc.pid)
+            proc_handle = int(cast(Any, proc)._handle)
+            proc_ticks = _win32_creation_ticks_for_handle(proc_handle)
+            if proc_ticks is not None:
+                identities.append((proc.pid, str(proc_ticks)))
+            identities.extend([(child_pid, child_token), (grand_pid, grand_token)])
+
+            began = time.monotonic()
+            close_fn(job, terminate=True)
+            job = None
+            cutoff_at = began + 2.5
+            alive = _wait_process_tree_terminated(identities, deadline=cutoff_at)
+            assert alive == [], f"Win32 Job Object left member(s) alive: {alive}"
+            proc.wait(timeout=max(0.1, cutoff_at - time.monotonic()))
+            assert proc.poll() is not None and time.monotonic() < cutoff_at
+            assert not child_marker.exists() and not grand_marker.exists()
         finally:
             if job is not None:
-                close_fn(job, terminate=True)
-            else:
+                try:
+                    close_fn(job, terminate=True)
+                except RuntimeError:
+                    pass
+            if proc.poll() is None:
                 proc.kill()
             proc.wait(timeout=5)
-            assert proc.poll() is not None
+            _cleanup_exact_processes(identities)
 
         # Boolean handles and invalid handles refuse assignment cleanly.
         class _MockProcBool:
