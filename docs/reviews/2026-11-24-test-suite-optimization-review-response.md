@@ -485,7 +485,14 @@ Kiểm tra inventory bằng `gate.parse_collected`:
 - **Python 3.14 Lượt 2:** `accepted=True`, `test_job_seconds = 254.726 s`, JUnit `<testsuite>` = `1199.362 s`, spread `11.6%`, `3414 passed, 56 skipped, 0 failed`.
 - **Python 3.14 Lượt 3:** `accepted=True`, `test_job_seconds = 246.807 s`, JUnit `<testsuite>` = `1161.141 s`, spread `11.8%`, `3414 passed, 56 skipped, 0 failed`.
 
-### Bước tiếp theo ngay sau commit vá P2 `outbox.py` & `test_outbox_durability_and_limits.py`:
-1. Kiểm `ruff`, `mypy`, `lint-imports`, `test_outbox_durability_and_limits.py`, `test_capture_envelope_and_privacy.py`, và bằng chứng `evidence/v11-outbox-bugproof/` trên commit sạch của `remediate-runtime-opt` (`tree_is_clean == True`).
-2. Chạy lại full gate **`final-remediate-gate-v12`** (`--shards 6`, Python 3.11 × 2 và Python 3.14 × 2) trên commit sạch mới.
+### Kết quả gate `final-remediate-gate-v12` trên `a196223` (`--shards 6`, cache wheel lạnh):
+- **Python 3.11 Lượt 1 (giữ làm hồ sơ):** `accepted=False`, `wall=300.303 s`, `3413 passed, 1 failed` (`test_long_key_word_split_stays_linear` `0.1206 s > 0.1 s` dưới tải 6 shard + `shard-4` chạm `300 s`).
+- **Python 3.11 Lượt 2 (giữ làm hồ sơ):** `accepted=False`, `wall=261.447 s`, `3413 passed, 1 failed` (`test_long_key_word_split_stays_linear` `0.1333 s > 0.1 s`).
+- **Python 3.14 Lượt 1:** `accepted=True`, `test_job_seconds = 256.615 s`, JUnit `<testsuite>` = `1212.464 s`, `3414 passed, 56 skipped, 0 failed`.
+- **Python 3.14 Lượt 2:** `accepted=True`, `test_job_seconds = 251.667 s`, JUnit `<testsuite>` = `1187.557 s`, `3414 passed, 56 skipped, 0 failed`.
+- **Sửa tối ưu tiếp theo (`privacy.py` `_sensitive_key`):** Thêm prefilter chính xác `_sensitive_sub_re` trên chuỗi ASCII `[0-9a-z]` (`translate(_ASCII_LOWER_TABLE, _ASCII_NON_ALNUM_BYTES)`) cho `key.isascii() and len(key) >= 128` (chỉ khi không có bất kỳ substring nhạy cảm nào mới trả `False` ngay; mọi trường hợp khớp vẫn đi qua trọn vẹn `_key_words` + word-window + benign rules), giảm `"a1"*30_000` trên Python 3.11 từ `22.60 ms` xuống `2.78 ms` (`296 passed in 0.47s`).
+
+### Bước tiếp theo ngay sau commit vá `_sensitive_key`:
+1. Kiểm `ruff`, `mypy`, `lint-imports`, `test_kernel_privacy.py`, `test_t8_privacy_performance_equivalence.py` trên commit sạch của `remediate-runtime-opt`.
+2. Chạy full gate **`final-remediate-gate-v13`** (`--shards 6`, Python 3.11 × 2 và Python 3.14 × 2) trên commit sạch mới.
 3. Bàn giao cho Reviewer độc lập (Codex) thẩm định delta + phê duyệt reseal `.verification/task9-seal.json` (giữ digest cũ `ca08c25897c9765e249261fcb08c9e775a57dd508a08d942ccc8a4c12641150e`), rồi chạy `test_lock.py check` + gate xác nhận cuối trên commit đã có seal hợp lệ.

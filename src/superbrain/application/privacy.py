@@ -141,6 +141,10 @@ def _high_entropy(text: str, minimum: float) -> bool:
     return _shannon_from_counts(counts, total) >= minimum
 
 
+_ASCII_LOWER_TABLE = bytes.maketrans(b"ABCDEFGHIJKLMNOPQRSTUVWXYZ", b"abcdefghijklmnopqrstuvwxyz")
+_ASCII_NON_ALNUM_BYTES = bytes(b for b in range(256) if not (48 <= b <= 57 or 65 <= b <= 90 or 97 <= b <= 122))
+
+
 @dataclasses.dataclass(frozen=True)
 class _CompiledPolicy:
     sensitive: frozenset[str]
@@ -151,6 +155,7 @@ class _CompiledPolicy:
     prefixes: frozenset[str]
     contained: tuple[str, ...]
     contained_re: re.Pattern[str] | None
+    sensitive_sub_re: re.Pattern[str] | None
     candidate: re.Pattern[str]
     entropy_thresh: float
     entropy_min_distinct: float
@@ -175,6 +180,11 @@ def _compile_policy(policy: FilterPolicy) -> _CompiledPolicy:
     prefixes = frozenset(name[:i] for name in sensitive for i in range(1, len(name) + 1))
     contained = tuple(sorted(name for name in sensitive if len(name) >= _CONTAINMENT_MIN))
     contained_re = re.compile("|".join(re.escape(name) for name in contained)) if contained else None
+    sensitive_sub_re = (
+        re.compile("|".join(re.escape(name) for name in sorted(sensitive, key=len, reverse=True)))
+        if sensitive
+        else None
+    )
     candidate = re.compile(rf"[\x21-\x7e]{{{policy.entropy_min_length},}}")
     entropy_thresh = 2 ** -(policy.entropy_min_bits + 1e-12)
     entropy_min_distinct = 2 ** (policy.entropy_min_bits - 1e-12)
@@ -198,6 +208,7 @@ def _compile_policy(policy: FilterPolicy) -> _CompiledPolicy:
         prefixes=prefixes,
         contained=contained,
         contained_re=contained_re,
+        sensitive_sub_re=sensitive_sub_re,
         candidate=candidate,
         entropy_thresh=entropy_thresh,
         entropy_min_distinct=entropy_min_distinct,
@@ -232,6 +243,7 @@ class _Run(_TextScans):
         self._prefixes = compiled.prefixes
         self._contained = compiled.contained
         self._contained_re = compiled.contained_re
+        self._sensitive_sub_re = compiled.sensitive_sub_re
         self._candidate = compiled.candidate
         self._entropy_thresh = compiled.entropy_thresh
         self._entropy_min_distinct = compiled.entropy_min_distinct
@@ -303,6 +315,13 @@ class _Run(_TextScans):
 
         Windows are bounded by the longest name and pruned by name prefixes, so the check is linear in the key.
         """
+        if key.isascii() and len(key) >= 128:
+            sub_re = self._sensitive_sub_re
+            if sub_re is None:
+                return False
+            alnum = key.encode("ascii").translate(_ASCII_LOWER_TABLE, _ASCII_NON_ALNUM_BYTES).decode("ascii")
+            if sub_re.search(alnum) is None:
+                return False
         words = _key_words(key)
         word_count = len(words)
         contained_re = self._contained_re
