@@ -5220,43 +5220,83 @@ def test_stop_applies_shared_cutoff_to_arbiter_join_and_reports_overrun_when_arb
         release_owner_a.set()
         assert hold_fut_a.result(timeout=1.0) is True
 
+        arbiter_thread_a = arbiter_cb_threads[0]
+        spy_lock = threading.Lock()
+        closed_wait_calls: list[tuple[int, float | None, float]] = []
+        owner_join_calls: list[tuple[int, float | None, float]] = []
+        arbiter_join_calls: list[tuple[int, float | None, float]] = []
+        observed_deadlines: list[float] = []
+        first_cutoff = 0.0
+
+        orig_closed_wait = loop_a._closed_done.wait
+        orig_owner_join = owner_thread_a.join
+        orig_arbiter_join = arbiter_thread_a.join
+
+        def _spy_closed_wait(timeout: float | None = None) -> bool:
+            called_at = time.perf_counter()
+            with spy_lock:
+                closed_wait_calls.append((threading.get_ident(), timeout, called_at))
+            return orig_closed_wait(timeout=timeout)
+
+        def _spy_owner_join(timeout: float | None = None) -> None:
+            called_at = time.perf_counter()
+            with spy_lock:
+                owner_join_calls.append((threading.get_ident(), timeout, called_at))
+            orig_owner_join(timeout=timeout)
+
+        def _spy_arbiter_join(timeout: float | None = None) -> None:
+            called_at = time.perf_counter()
+            with spy_lock:
+                arbiter_join_calls.append((threading.get_ident(), timeout, called_at))
+            orig_arbiter_join(timeout=timeout)
+
         with ThreadPoolExecutor(max_workers=3) as pool:
-            stop_started = time.monotonic()
-            first_stop_fut = pool.submit(loop_a.stop, grace_s=0.35)
-            _wait_until(lambda: loop_a.ready is None, desc="first stop caller to lock shared cutoff")
-            second_stop_fut = pool.submit(loop_a.stop, grace_s=3.0)
-            try:
-                pre_release_deadline = stop_started + 0.85
+            with monkeypatch.context() as hooks_a:
+                hooks_a.setattr(loop_a._closed_done, "wait", _spy_closed_wait)
+                hooks_a.setattr(owner_thread_a, "join", _spy_owner_join)
+                hooks_a.setattr(arbiter_thread_a, "join", _spy_arbiter_join)
+                stop_started = time.monotonic()
+                first_stop_fut = pool.submit(loop_a.stop, grace_s=0.55)
+                _wait_until(lambda: loop_a.ready is None, desc="first stop caller to lock shared cutoff")
+                first_cutoff = loop_a._stop_wall_deadline
+                second_stop_fut = pool.submit(loop_a.stop, grace_s=3.0)
                 try:
-                    first_rep = first_stop_fut.result(
-                        timeout=max(0.01, pre_release_deadline - time.monotonic())
-                    )
-                    first_returned_before_cb_release = (
-                        not cb_released_marker.is_set() and not arbiter_cb_exited.is_set()
-                    )
-                except TimeoutError:
-                    first_returned_before_cb_release = False
-                try:
-                    second_rep = second_stop_fut.result(
-                        timeout=max(0.01, pre_release_deadline - time.monotonic())
-                    )
-                    second_returned_before_cb_release = (
-                        not cb_released_marker.is_set() and not arbiter_cb_exited.is_set()
-                    )
-                except TimeoutError:
-                    second_returned_before_cb_release = False
-                if first_returned_before_cb_release and second_returned_before_cb_release:
-                    third_stop_fut = pool.submit(loop_a.stop, grace_s=0.5)
+                    pre_release_deadline = stop_started + 0.85
                     try:
-                        third_rep = third_stop_fut.result(timeout=0.35)
-                        third_returned_before_cb_release = (
+                        first_rep = first_stop_fut.result(
+                            timeout=max(0.01, pre_release_deadline - time.monotonic())
+                        )
+                        first_returned_before_cb_release = (
                             not cb_released_marker.is_set() and not arbiter_cb_exited.is_set()
                         )
                     except TimeoutError:
-                        third_returned_before_cb_release = False
-            finally:
-                cb_released_marker.set()
-                release_arbiter_cb.set()
+                        first_returned_before_cb_release = False
+                    try:
+                        second_rep = second_stop_fut.result(
+                            timeout=max(0.01, pre_release_deadline - time.monotonic())
+                        )
+                        second_returned_before_cb_release = (
+                            not cb_released_marker.is_set() and not arbiter_cb_exited.is_set()
+                        )
+                    except TimeoutError:
+                        second_returned_before_cb_release = False
+                    observed_deadlines.append(loop_a._stop_wall_deadline)
+                    if first_returned_before_cb_release and second_returned_before_cb_release:
+                        third_start_idx = len(closed_wait_calls)
+                        third_stop_fut = pool.submit(loop_a.stop, grace_s=0.5)
+                        try:
+                            third_rep = third_stop_fut.result(timeout=0.30)
+                            third_returned_before_cb_release = (
+                                not cb_released_marker.is_set() and not arbiter_cb_exited.is_set()
+                            )
+                        except TimeoutError:
+                            third_returned_before_cb_release = False
+                        observed_deadlines.append(loop_a._stop_wall_deadline)
+                    else:
+                        third_start_idx = len(closed_wait_calls)
+                finally:
+                    cb_released_marker.set()
+                    release_arbiter_cb.set()
 
             if first_rep is None:
                 first_rep = first_stop_fut.result(timeout=BOUND_WAIT_S)
@@ -5275,6 +5315,17 @@ def test_stop_applies_shared_cutoff_to_arbiter_join_and_reports_overrun_when_arb
     assert first_returned_before_cb_release is True
     assert second_returned_before_cb_release is True
     assert third_returned_before_cb_release is True
+    assert observed_deadlines == [first_cutoff, first_cutoff]
+    assert len(closed_wait_calls) >= 3
+    for _tid, wait_to, called_at in closed_wait_calls:
+        assert wait_to is not None and 0.0 <= wait_to <= max(0.0, first_cutoff - called_at) + 0.02
+        assert wait_to <= 0.55 + 1e-6
+    third_waits = [wait_to for _tid, wait_to, _ts in closed_wait_calls[third_start_idx:]]
+    assert third_waits and all(w is not None and w <= 0.05 for w in third_waits)
+    assert arbiter_join_calls
+    for _tid, join_to, called_at in (*owner_join_calls, *arbiter_join_calls):
+        assert join_to is not None and join_to <= max(0.01, first_cutoff - called_at) + 0.02
+        assert join_to <= 0.55 + 0.02
     assert first_rep is not None
     assert (first_rep.state, first_rep.error_code) == (ShutdownState.OVERRUN, ErrorCode.DEADLINE_EXCEEDED)
     assert second_rep is not None

@@ -4,10 +4,12 @@
 **Tài liệu kiểm tra độc lập Lượt 2:** [2026-11-24-test-suite-optimization-verification-r2.md](2026-11-24-test-suite-optimization-verification-r2.md)
 **Tái kiểm SP2-3 tại 5ee4f35:** [2026-11-25-sp2-3-acceptance-rereview-5ee4f35.md](2026-11-25-sp2-3-acceptance-rereview-5ee4f35.md)
 **Tái kiểm SP2-3 tại 4f5138c:** [2026-11-25-sp2-3-acceptance-rereview-4f5138c.md](2026-11-25-sp2-3-acceptance-rereview-4f5138c.md)
+**Tái kiểm SP2-3 tại b289f87:** [2026-11-25-sp2-3-acceptance-rereview-b289f87.md](2026-11-25-sp2-3-acceptance-rereview-b289f87.md)
+**Review oracle trước reseal tại b289f87:** [2026-11-25-sp2-3-reseal-review-b289f87.md](2026-11-25-sp2-3-reseal-review-b289f87.md)
 **Kế hoạch gốc:** [2026-11-23-test-suite-runtime-optimization.md](../superpowers/plans/2026-11-23-test-suite-runtime-optimization.md)
 **Nhánh thực hiện:** `remediate-runtime-opt` (tách biệt hoàn toàn; `thuc_hien_ke_hoach_sp2` giữ nguyên tại `5f73a0a`)
-**Commit tối ưu code đã đo:** `5ee4f35` (`final-remediate-gate-v6`), `4f5138c` (`final-remediate-gate-v7`) + vá W3 partial-start cleanup & cân bằng trọng số 3.11 trên `remediate-runtime-opt`
-**Trạng thái seal & review:** Chưa reseal `.verification/task9-seal.json` (chờ reviewer duyệt 29 tệp + oracle W3 mới và chạy `test_lock.py check`); chưa có tuyên bố "Codex đã duyệt".
+**Commit tối ưu code đã đo:** `b289f87` (`final-remediate-gate-v8`, 4/4 lượt đạt `< 275 s` và `≤ 1200 s`) + vá oracle shutdown Reseal-P2 trên `remediate-runtime-opt`
+**Trạng thái seal & review:** Chưa reseal `.verification/task9-seal.json` (chờ reviewer duyệt 29 tệp sau khi vá oracle shutdown Reseal-P2 và chạy `test_lock.py check`); chưa có tuyên bố "Codex đã duyệt".
 
 ---
 
@@ -159,6 +161,44 @@
 
 ---
 
+### Finding Reseal-P2 (P2): Oracle Cutoff Chung Cho Shutdown Daemon (`test_kernel_daemon.py:5223`)
+
+#### 1. Invariant
+> Ca kiểm cutoff chung lúc shutdown phải phát hiện được khi một lần gọi tiếp nối tự mở deadline mới hoặc tổng thời gian chờ của các pha `stop()` cộng dồn vượt quá phần ngân sách còn lại kể từ lần khởi tạo đầu tiên.
+
+#### 2. Sibling sweep
+- `tests/integration/test_kernel_daemon.py::test_stop_applies_shared_cutoff_to_arbiter_join_and_reports_overrun_when_arbiter_callback_blocks` (Part A):
+  - Thu hẹp biên dư so với `grace_s`: chuyển từ `grace_s=0.35`, `pre_release_deadline = stop_started + 0.85` (biên dư `0.50 s > 0.35 s`) sang **`grace_s=0.55`**, **`pre_release_deadline = stop_started + 0.85`** (biên dư `0.30 s < grace_s = 0.55 s` và nhỏ hơn probe `+0.40 s`), giữ nguyên `third_stop_fut` (`grace_s=0.5`, `timeout=0.30`).
+  - Dùng `monkeypatch.context()` cục bộ trên instance `loop_a._closed_done.wait`, `owner_thread_a.join`, `arbiter_thread_a.join` ngay trước `loop_a.stop(grace_s=0.55)` để xác minh ở biên tham số:
+    1. `observed_deadlines == [first_cutoff, first_cutoff]` (`loop_a._stop_wall_deadline` không thay đổi khi caller thứ hai `grace_s=3.0` và thứ ba `grace_s=0.5` đi vào).
+    2. Mọi lệnh `loop_a._closed_done.wait(timeout)` đều có `0 <= timeout <= max(0, first_cutoff - called_at) + 0.02` và `<= 0.55`; riêng caller thứ ba sau khi `first_cutoff` đã qua chỉ nhận `timeout <= 0.05` (không nhận `0.5 s`).
+    3. Mọi lệnh `owner_thread_a.join(timeout)` / `arbiter_thread_a.join(timeout)` đều có `timeout <= max(0.01, first_cutoff - called_at) + 0.02` và `<= 0.55 + 0.02`.
+- Sibling đã kiểm:
+  - Part B (`loop_b`, dòng 5350–5375): kiểm trường hợp callback được giải phóng trước deadline (`1.43 s < grace_s = 1.50 s`) -> giữ nguyên oracle.
+  - Part C (`serve`, dòng 5382–5475): kiểm foreground `serve()` chờ cả hai thread kết thúc khi `OVERRUN` và trả về `rc = 1` -> giữ nguyên oracle.
+  - `tests/integration/test_t9_r21_shutdown_wait.py` và W3 (`tests/architecture/test_gate_receipt.py`): giữ nguyên, cùng mô hình quan sát biên `join` / cutoff.
+- Bằng chứng thực nghiệm (`C:\Users\letru\sb2-trusted-local\evidence\daemon-cutoff-bugproof\`):
+  - **Probe +0.40 s (`red_extra_wait_0p40s.log`):** chèn `time.sleep(0.40)` ngay trước khi `OwnerLoop.stop` trả về -> **FAIL** ngay tại `assert first_returned_before_cb_release is True` (`PROBE_0P40S_RC=1`, 1 failed in 1.82s).
+  - **Mutation mở lại deadline (`mut_reopen_deadline_killed.log`):** caller thứ hai ghi đè `_stop_wall_deadline` bằng `now + 3.0` -> **FAIL** (`MUT_REOPEN_RC=1`, 1 failed in 1.66s).
+  - **GREEN:** `green_314.log` (`2.51 s` call / `3.69 s` total), `green_311.log` (`2.65 s` call / `3.54 s` total), và toàn file `test_kernel_daemon.py` đạt **36 passed in 21.79s** cùng `ruff`, `mypy` (431 files), `lint-imports` (2 contracts kept).
+
+#### 3. Lens table
+| Lens | Status | Reason |
+|---|---|---|
+| Crash between two durable steps | holds | Part A vẫn tạo/đóng store thật, kiểm endpoint bị xóa và mở lại thành công ở epoch `epoch_a + 1`. |
+| Restore, rollback and migration rewind state | not applicable | Kiểm tra điều phối cutoff bộ nhớ RAM và join thread trong `OwnerLoop.stop`. |
+| Old binaries, old data, version fences | holds | Khởi tạo daemon runtime chuẩn với store v7, giữ nguyên phiên bản schema. |
+| Every path to the same invariant | fixed here | Kiểm cả caller 1 (`0.55`), caller 2 (`3.0`), caller 3 (`0.5`) trên `_stop_wall_deadline`, `_closed_done.wait`, `owner_thread.join` và `arbiter_thread.join`. |
+| Concurrency, shutdown and cutoffs | fixed here | Thu hẹp slack về `0.30 s < grace_s (0.55 s)` kết hợp spy tham số wait/join; chặn hoàn toàn lượt chờ lặp pha hay `+0.40 s`. |
+| Authority, identity and scope | holds | Giữ nguyên token/scope của `_daemon_template`. |
+| Fail closed at limits and on the unknown | fixed here | Timeout join/wait bằng `None` hoặc vượt quá `first_cutoff - now` đều khiến assertion fail; quá `pre_release_deadline` cũng fail. |
+| What actually left, and to whom | holds | Callback vẫn bị chặn bởi event thật và chỉ nhả sau khi các `stop()` trả `OVERRUN`. |
+| The world outside the daemon | holds | Chừa biên `0.30 s` đủ cho jitter Windows 6 shard (`~0.01–0.05 s`) như baseline `0.35 s` trước đây. |
+| Evidence and oracles | fixed here | Đủ bằng chứng GREEN 3.14/3.11 (36/36 pass), probe `+0.40 s` FAIL (`rc=1`) và mutation mở deadline FAIL (`rc=1`). |
+| The document agrees with itself | fixed here | Khớp dòng 5223–5330 của `test_kernel_daemon.py`, `owner_loop.py` và bảng A1–A7 dưới đây. |
+
+---
+
 ### Finding W4 (P3): Khóa Schema Dict Seed Outbox (`test_capture_envelope_and_privacy.py:991`)
 
 #### 1. Invariant
@@ -240,7 +280,7 @@ Kiểm tra inventory bằng `gate.parse_collected`:
 | `tests/architecture/test_gate_receipt.py` + `scripts/gate.py` | 153 = 153 | Giữ nguyên + oracle cây tiến trình W3/P2 | **PROBE/GREEN/3-MUTATION KILLED** (`evidence/w3-bugproof/`), `153 passed in 11.25s` | Pass trong `v10`, `v11` (3.14 & 3.11) | **Đạt** (39.1 → 19.9 s) | Đạt |
 | `tests/integration/test_sp2_i2_wheel_compat.py` + `tests/support/inc2_fixture.py` | 2 = 2 | Khôi phục `len(wheels)==1` & SHA-256 | Kiểm thực wheel I2 vs SP2 + `py=194 pyc=194` trên 3.14/3.11 | Pass trong `v11` (3.14 & 3.11) | **Đạt** (62.2 → 29.6 s) | Đạt |
 | `tests/application/test_t8_review_p01_{wrapped_paths,r2_edge_globs,r3_spellings}.py` + `_privacy_scan.py` | 64=64, 73=73 | Giữ nguyên 100% wrapper/glob | Kiểm tương đương `[a-z]+` IGNORECASE trên 3.11 & 3.14 (`0x130, 0x131, 0x17f, 0x212a`) | Pass trong `v10`, `v11` (3.14 & 3.11) | **Đạt** (19.5→8.3, 22.9→10.9 s) | Đạt |
-| `tests/integration/test_kernel_daemon.py` | 36 = 36 | Giữ nguyên shutdown cutoff | Kiểm overrun trên `FakeMonotonicClock` | Pass trong `v10`, `v11` (3.14 & 3.11) | No-Go (-18.7 s; 36 ca daemon thực) | Đạt |
+| `tests/integration/test_kernel_daemon.py` | 36 = 36 | Giữ nguyên + spy cutoff & wait/join Reseal-P2 (`grace_s=0.55 < 0.85`) | **+0.40s PROBE & REOPEN-DEADLINE MUTATION KILLED** (`evidence/daemon-cutoff-bugproof/`), `36 passed in 21.79s` | Pass trong `v6`–`v8` + kiểm sau vá Reseal-P2 | No-Go (-18.7 s; 36 ca daemon thực) | Đạt |
 | `tests/integration/{test_t9_client_sighting,test_kernel_native_receipt_contract,test_t9_socket_readiness}.py` | Không đổi | Giữ nguyên `< 0.10 s` & `< collector_timeout_s` | Reset mốc đồng hồ ngay sau `open_client`; `test_t9_r02` dùng `250 ms < collector_timeout_s (500 ms)` tránh jitter TLS 6 shard | Pass trên 3.14 & 3.11 | Đạt | Đạt |
 | `tests/application/test_remediation_i2_t5_worker.py` | Không đổi | Giữ nguyên `wait_cancelled` & `seen_attempts == [1, 2]` | Đồng bộ timeout chờ hủy `0.3` -> `BOUND_WAIT_S` với toàn bộ 8 sibling `wait_cancelled` | Đã kiểm cục bộ + gate 3.14/3.11 | Không tăng khi hủy ngay | Đạt |
 | `tests/integration/test_kernel_privacy_persistence.py` | Không đổi | Giữ nguyên toàn bộ assert privacy & `drop_episode` trực tiếp | Retry 1 lần đúng `idempotency_key` nếu `CLIENT_TOOL_BUDGET_NS` 2 s gặp nghẽn CPU >2 s | Đã kiểm cục bộ + gate 3.14/3.11 | Không đổi khi không stall | Đạt |
@@ -265,7 +305,13 @@ Kiểm tra inventory bằng `gate.parse_collected`:
 - **Python 3.11 Lượt 1:** `accepted=True`, `test_job_seconds = 278.078 s` (`< 300 s`, `shard-2 = 224.12 s` lệch tải), JUnit `<testsuite>` = `1226.702 s`, `3414 passed, 56 skipped, 0 failed`.
 - **Python 3.11 Lượt 2:** `accepted=True`, `test_job_seconds = 271.532 s` (`< 275 s`), JUnit `<testsuite>` = `1272.188 s`, `3414 passed, 56 skipped, 0 failed`.
 
-### Chạy gate xác nhận sau khi sửa partial-start W3 và cân bằng trọng số 3.11:
-1. Cập nhật 194 trọng số `_HEAVY_FILE_COST_MS` theo trung bình đo 3.11 thực tế từ `v6` + `v7` và lưu commit sạch lên nhánh `remediate-runtime-opt` (`tree_is_clean(repo) == True`).
-2. Chạy `scripts.gate --shards 6` (cache wheel lạnh, 3.11 × 2 và 3.14 × 2) vào `C:\Users\letru\sb2-trusted-local\evidence\final-remediate-gate-v8\`.
-3. Kiểm tra lại `ruff check src tests scripts`, `mypy`, `lint-imports` và bàn giao cho Reviewer độc lập đối chiếu thay đổi 29 tệp + W3 và quyết định reseal `.verification/task9-seal.json`.
+### Kết quả 4 lượt gate trên commit sạch `b289f87` (`final-remediate-gate-v8`, cache wheel lạnh, `--shards 6`):
+- **Python 3.11 Lượt 1:** `accepted=True`, `test_job_seconds = 204.110 s` (`< 275 s`), JUnit `<testsuite>` = **`963.175 s`** (`<= 1200 s`), độ lệch shard `7.2%`, `3414 passed, 56 skipped, 0 failed` (`3470` total).
+- **Python 3.11 Lượt 2:** `accepted=True`, `test_job_seconds = 224.547 s` (`< 275 s`), JUnit `<testsuite>` = **`1070.423 s`** (`<= 1200 s`), độ lệch shard `6.4%`, `3414 passed, 56 skipped, 0 failed`.
+- **Python 3.14 Lượt 1:** `accepted=True`, `test_job_seconds = 235.173 s` (`< 275 s`), JUnit `<testsuite>` = **`1118.863 s`** (`<= 1200 s`), độ lệch shard `8.7%`, `3414 passed, 56 skipped, 0 failed`.
+- **Python 3.14 Lượt 2:** `accepted=True`, `test_job_seconds = 236.985 s` (`< 275 s`), JUnit `<testsuite>` = **`1110.450 s`** (`<= 1200 s`), độ lệch shard `9.2%`, `3414 passed, 56 skipped, 0 failed`.
+
+### Chạy gate xác nhận sau khi vá oracle shutdown Reseal-P2:
+1. Lưu commit sửa oracle shutdown (`tests/integration/test_kernel_daemon.py`) + tài liệu đối chiếu này lên nhánh `remediate-runtime-opt` (`tree_is_clean(repo) == True`).
+2. Chạy `scripts.gate --shards 6` (cache wheel lạnh, 3.11 × 2 và 3.14 × 2) vào `C:\Users\letru\sb2-trusted-local\evidence\final-remediate-gate-v9\`.
+3. Kiểm tra lại `ruff check src tests scripts`, `mypy`, `lint-imports` và bàn giao cho Reviewer độc lập duyệt 29 tệp + reseal `.verification/task9-seal.json`.
