@@ -9,6 +9,7 @@ import shutil
 import threading
 import time
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -39,6 +40,7 @@ from superbrain.composition._daemon_health import (
     find_active_doctor_job,
     find_fresh_doctor_run_dto,
     find_latest_valid_doctor_run,
+    iter_owner_doctor_ledger,
     prepare_deep_health,
     render_deep_health,
 )
@@ -81,7 +83,17 @@ from superbrain.storage.runtime import Runtime
 DOCTOR_SCHEDULE_INTERVAL = timedelta(hours=24)
 _MAX_FINISHED_CACHE = 256
 _TRANSIENT_COMMIT_CODES = frozenset({ErrorCode.STORE_BUSY, ErrorCode.FILESYSTEM_BUSY})
+_SETTLE_RETRY_S = 0.2  # how soon an unresolved claim/settlement is retried when nothing else wakes the owner
 _LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _PendingSettle:
+    """A doctor outcome whose write may or may not have committed: retried until the durable row resolves it."""
+
+    gen: int
+    lease: JobLease
+    outcome: JobOutcome  # the failure to record through ``JobService.complete``
 
 
 
@@ -138,6 +150,9 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
         self._waiters: list[threading.Event] = []
         self._finished_jobs: dict[str, tuple[str, str | None]] = {}
         self._pending_lease: JobLease | None = None  # claimed doctor lease whose settle/start must be retried
+        self._pending_settle: _PendingSettle | None = None  # outcome write not yet confirmed by the durable row
+        self._reconcile_claims = False  # a lease attempt failed: it may have committed without returning the lease
+        self._retry_timer: threading.Timer | None = None
 
     def _record_finished_locked(self, job_id: str, status: str, doctor_run_id: str | None) -> None:
         self._finished_jobs[job_id] = (status, doctor_run_id)
@@ -145,12 +160,22 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
             oldest = next(iter(self._finished_jobs))
             del self._finished_jobs[oldest]
 
+    def _drop_inflight_locked(self) -> None:
+        self._active_token, self._active_lease, self._completed = None, None, None
+        self._pending_lease, self._pending_settle, self._reconcile_claims = None, None, False
+
+    def _cancel_retry_timer(self) -> None:
+        with self._lock:
+            timer, self._retry_timer = self._retry_timer, None
+        if timer is not None:
+            timer.cancel()
+
     def fence_on_restore(self) -> None:
         """Invalidate any in-flight background probe before store/policy handles are closed/swapped."""
         with self._lock:
             self._generation += 1
-            self._active_token, self._active_lease, self._completed = None, None, None
-            self._pending_lease = None
+            self._drop_inflight_locked()
+            self._finished_jobs.clear()  # outcomes of the pre-restore store/epoch must never answer a later report
             self._wait_cond.notify_all()
         self._notify_waiters()
 
@@ -165,10 +190,8 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
         """Bind new runtime/stores post-restore and invalidate any pre-restore probes."""
         with self._lock:
             self._generation += 1
-            self._active_token = None
-            self._active_lease = None
-            self._completed = None
-            self._pending_lease = None
+            self._drop_inflight_locked()
+            self._finished_jobs.clear()
             self._rt = rt
             self._job_store = job_store
             self._job_service = job_service
@@ -187,8 +210,8 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
             self._stopping = True
             self._startup_due = False
             self._generation += 1
-            self._active_token, self._active_lease, self._completed = None, None, None
-            self._pending_lease = None
+            self._drop_inflight_locked()
+        self._cancel_retry_timer()
         self._notify_waiters()
 
     @property
@@ -214,14 +237,15 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
         with self._lock:
             self._closed = True
             self._stopping = True
+        self._cancel_retry_timer()
         self._notify_waiters()
 
     def cancel_on_teardown(self) -> None:
         """Cancel any unfinished ``system.doctor`` jobs before runtime closes on daemon shutdown."""
         with self._lock:
             self._closed, self._stopping, self._generation = True, True, self._generation + 1
-            self._active_token, self._active_lease, self._completed = None, None, None
-            self._pending_lease = None
+            self._drop_inflight_locked()
+        self._cancel_retry_timer()
         self._notify_waiters()
         if not self._rt.store.closed and not self._rt.policy.closed:
             with contextlib.suppress(BrainError):
@@ -253,7 +277,7 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
                 self._startup_due
                 or self._active_token is not None
                 or self._completed is not None
-                or self._pending_lease is not None
+                or self._has_unresolved_locked()
                 or self._maintenance_due_locked(now_utc)
             )
             if not busy and not self._has_active_doctor_job():
@@ -280,6 +304,13 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
             self._commit_completed(completed)
             did_work = True
 
+        with self._lock:
+            settle, self._pending_settle = self._pending_settle, None
+        if settle is not None:
+            self._complete_and_publish(settle.lease, settle.gen, settle.outcome)
+            with self._lock:
+                did_work = did_work or self._pending_settle is None  # a re-deferred retry waits for its timer
+
         if allow_new_jobs and not self._is_stopping_or_closed():
             if self._run_maintenance_and_schedule():
                 did_work = True
@@ -304,12 +335,40 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
                 self._startup_due
                 or self._active_token is not None
                 or self._completed is not None
-                or self._pending_lease is not None
+                or self._has_unresolved_locked()
             ):
                 return False
             if self._maintenance_due_locked(now_utc):
                 return False
         return not self._has_active_doctor_job()
+
+    def _has_unresolved_locked(self) -> bool:
+        return self._pending_lease is not None or self._pending_settle is not None or self._reconcile_claims
+
+    def _arm_retry(self) -> None:
+        """Wake the owner again soon: a doctor-only daemon otherwise sleeps until an unrelated event."""
+        with self._lock:
+            if self._stopping or self._closed or (self._retry_timer is not None and self._retry_timer.is_alive()):
+                return
+            timer = threading.Timer(_SETTLE_RETRY_S, self._wake_owner)
+            timer.daemon = True
+            self._retry_timer = timer
+        timer.start()
+
+    def _defer(
+        self, gen: int, *, lease: JobLease | None = None, settle: _PendingSettle | None = None, claims: bool = False
+    ) -> None:
+        """Keep responsibility for an unresolved write of generation ``gen`` and schedule its retry."""
+        with self._lock:
+            if self._generation != gen or self._stopping or self._closed:
+                return
+            if lease is not None:
+                self._pending_lease = lease
+            if settle is not None:
+                self._pending_settle = settle
+            if claims:
+                self._reconcile_claims = True
+        self._arm_retry()
 
     def _maintenance_due_locked(self, now_utc: datetime) -> bool:
         """Background work is due once a full interval has elapsed (``>=``), the one rule settle and schedule share."""
@@ -406,11 +465,19 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
 
     def _claim_and_launch_worker(self) -> bool:
         with self._lock:
-            if self._stopping or self._closed or self._active_token is not None:
+            if self._stopping or self._closed or self._active_token is not None or self._pending_settle is not None:
                 return False
             gen = self._generation
             pending, self._pending_lease = self._pending_lease, None
+            reconcile_claims, self._reconcile_claims = self._reconcile_claims, False
 
+        if pending is None and reconcile_claims:
+            try:
+                pending = self._orphaned_claim()
+            except BrainError as err:
+                _LOGGER.warning("doctor claim reconcile failed (code=%s)", err.code.value)
+                self._defer(gen, claims=True)
+                return False
         lease = pending
         if lease is None:
             try:
@@ -423,6 +490,8 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
                 )
             except BrainError as err:
                 _LOGGER.warning("doctor lease failed (code=%s)", err.code.value)
+                # The lease may have committed before the error: find it by the durable state before claiming again.
+                self._defer(gen, claims=True)
                 return False
             if lease is None:
                 return False
@@ -432,9 +501,7 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
         except BrainError as err:
             _LOGGER.warning("doctor claim unresolved (code=%s)", err.code.value)
             # Keep responsibility until a durable read confirms this lease has been resolved or replaced.
-            with self._lock:
-                if self._generation == gen and not (self._stopping or self._closed):
-                    self._pending_lease = lease
+            self._defer(gen, lease=lease)
             return False
         if spec is None:
             return True
@@ -494,13 +561,64 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
                 self._record_settled_at_claim(row, gen)
         return spec
 
+    def _orphaned_claim(self) -> JobLease | None:
+        """The doctor lease this writer epoch committed but never received, read from the durable job state."""
+        epoch = self._rt.lease.epoch
+        rows = self._job_store.transact(lambda tx: tx.claimed_jobs_by_kinds((DOCTOR_JOB_KIND,), epoch, 1))
+        for row in rows:
+            if row.writer_epoch is not None and row.lease_id is not None:
+                return JobLease(row.job_id, row.attempt, row.writer_epoch, row.lease_id)
+        return None
+
     def _record_settled_at_claim(self, row: JobRecord, gen: int) -> None:
         """Publish only terminal outcomes observed in the durable store."""
+        self._publish_durable(row, gen)
+
+    def _publish_durable(self, row: JobRecord, gen: int) -> None:
+        """Answer waiters from a durable row: a terminal state is cached (with its committed run), else they wait."""
         if row.state in TERMINAL_JOB_STATES:
+            run_id = self._committed_run_id(row) if row.state is JobState.SUCCEEDED else None
             with self._lock:
                 if self._generation == gen:
-                    self._record_finished_locked(row.job_id, row.state.value, None)
+                    self._record_finished_locked(row.job_id, row.state.value, run_id)
+                    if row.state is JobState.SUCCEEDED:
+                        self._fix_dirty = False
         self._notify_waiters()
+
+    def _committed_run_id(self, row: JobRecord) -> str | None:
+        try:
+            for meta, _refs in iter_owner_doctor_ledger(self._rt, owner_id=row.owner_id, job_id=row.job_id):
+                run_id = meta.get("doctor_run_id")
+                if isinstance(run_id, str):
+                    return run_id
+        except BrainError as err:
+            _LOGGER.warning("doctor run lookup failed (code=%s)", err.code.value)
+        return None  # finish_report then resolves the run from the store by job
+
+    def _read_job(self, job_id: str) -> tuple[bool, JobRecord | None]:
+        """``(read_ok, row)``: a failed read is not a conclusion about the job."""
+        try:
+            return True, self._job_store.transact(lambda tx: tx.read_job(job_id))
+        except BrainError as err:
+            _LOGGER.warning("doctor job read failed (code=%s)", err.code.value)
+            return False, None
+
+    def _complete_and_publish(self, lease: JobLease, gen: int, outcome: JobOutcome) -> None:
+        """Write a failure outcome, then publish only what the durable row confirms; an unconfirmed write retries."""
+        write_failed = False
+        try:
+            self._job_service.complete(lease, outcome)
+        except BrainError as err:
+            _LOGGER.warning("doctor job settlement failed (code=%s)", err.code.value)
+            write_failed = True
+        read_ok, row = self._read_job(lease.job_id)
+        if not read_ok or (write_failed and row is not None and row.matches(lease, JobState.RUNNING)):
+            self._defer(gen, settle=_PendingSettle(gen=gen, lease=lease, outcome=outcome))
+            return
+        if row is not None:
+            self._publish_durable(row, gen)  # terminal (failed/dead_letter) is cached; a requeued job keeps waiting
+        else:
+            self._notify_waiters()
 
     def _abandon_launch(self, lease: JobLease, token: object, gen: int) -> None:
         """Owner thread: release a claimed slot whose worker never started and fail its job durably."""
@@ -510,12 +628,9 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
                 self._active_token, self._active_lease = None, None
             current = self._generation == gen
         if current:
-            with contextlib.suppress(BrainError):
-                self._job_service.complete(lease, JobOutcome.failure(JobErrorCode.HANDLER_FAILED, retryable=False))
-            with self._lock:
-                if self._generation == gen:
-                    self._record_finished_locked(lease.job_id, "failed", None)
-        self._notify_waiters()
+            self._complete_and_publish(lease, gen, JobOutcome.failure(JobErrorCode.HANDLER_FAILED, retryable=False))
+        else:
+            self._notify_waiters()
 
     def _run_worker(
         self,
@@ -577,15 +692,13 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
         with self._lock:
             current = not (self._stopping or self._closed) and completed.generation == self._generation
         if current:
-            with contextlib.suppress(BrainError):
-                self._job_service.complete(
-                    completed.lease, JobOutcome.failure(JobErrorCode.HANDLER_FAILED, retryable=retryable)
-                )
-            if not retryable:
-                with self._lock:
-                    if completed.generation == self._generation:
-                        self._record_finished_locked(completed.lease.job_id, "failed", None)
-        self._notify_waiters()
+            self._complete_and_publish(
+                completed.lease,
+                completed.generation,
+                JobOutcome.failure(JobErrorCode.HANDLER_FAILED, retryable=retryable),
+            )
+        else:
+            self._notify_waiters()
 
     def _commit_completed(self, completed: _CompletedDoctorProbe) -> None:
         with self._lock:
@@ -615,7 +728,8 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
                 is_stale_fn=_is_stale,
             )
         except BrainError as err:
-            # A busy store is transient: the same job reruns with backoff and its waiters keep waiting.
+            # A busy store is transient: the same job reruns with backoff and its waiters keep waiting. If the commit
+            # landed before the error, the fenced failure write is refused and the durable row (SUCCEEDED) is published.
             self._end_failed(completed, retryable=err.code in _TRANSIENT_COMMIT_CODES)
             return
 

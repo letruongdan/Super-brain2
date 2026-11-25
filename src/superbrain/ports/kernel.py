@@ -198,6 +198,10 @@ class KernelTx(Protocol):
         """Up to ``limit`` ``queued|leased|running`` jobs matching ``kinds`` in ``(sequence, job_id)`` order."""
         ...
 
+    def claimed_jobs_by_kinds(self, kinds: Sequence[str], epoch: int, limit: int) -> tuple[JobRecord, ...]:
+        """Up to ``limit`` ``leased|running`` jobs matching ``kinds`` leased in writer ``epoch``, by ``job_id``."""
+        ...
+
     def stale_jobs(self, epoch: int, limit: int) -> tuple[JobRecord, ...]:
         """Up to ``limit`` ``leased|running`` jobs whose lease epoch is older than ``epoch``, by ``job_id``."""
         ...

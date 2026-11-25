@@ -450,6 +450,14 @@ class JobKernelTxReads:
             (*kind_tuple, bounded),
         )
 
+    def claimed_jobs_by_kinds(self, kinds: Sequence[str], epoch: int, limit: int) -> tuple[JobRecord, ...]:
+        kind_tuple = self._checked_kinds(kinds)
+        placeholders = ", ".join("?" for _ in kind_tuple)
+        return self._jobs(
+            f"state IN ('leased', 'running') AND writer_epoch = ? AND kind IN ({placeholders}) ORDER BY job_id LIMIT ?",
+            (_epoch(epoch), *kind_tuple, _bounded(limit)),
+        )
+
     def stale_jobs(self, epoch: int, limit: int) -> tuple[JobRecord, ...]:
         return self._jobs(
             "state IN ('leased', 'running') AND writer_epoch < ? ORDER BY job_id LIMIT ?",
