@@ -4,7 +4,7 @@
 **Tài liệu kiểm tra độc lập Lượt 2:** [2026-11-24-test-suite-optimization-verification-r2.md](2026-11-24-test-suite-optimization-verification-r2.md)  
 **Kế hoạch gốc:** [2026-11-23-test-suite-runtime-optimization.md](../superpowers/plans/2026-11-23-test-suite-runtime-optimization.md)  
 **Nhánh thực hiện:** `remediate-runtime-opt` (tách biệt hoàn toàn; `thuc_hien_ke_hoach_sp2` giữ nguyên tại `5f73a0a`)  
-**Commit code/gate đã đo Phụ lục A (`diag-remediate-v10`):** `af6ab7e`  
+**Commit tối ưu code đã đo Phụ lục A (`diag-remediate-v11`):** `4ce42af` (kèm hiệu chỉnh trọng số Task 5 trên `scripts/gate.py` ngay sau đó)  
 **Trạng thái seal & review:** Chưa reseal `.verification/task9-seal.json`; chưa có tuyên bố "Codex đã duyệt".
 
 ---
@@ -13,16 +13,16 @@
 
 1. **V1 (P1) — Cache wheel:** Đã gỡ hoàn toàn cache wheel liên phiên (`wheel-cache` / `_repo_fingerprint`). Fixture `inc2_installed_env` và `frozen_i2_installed_env` chỉ tồn tại trong phạm vi một phiên pytest (`scope="session"`), cài vào thư mục tạm có dọn dẹp teardown, xác thực SHA-256 và giữ `assert len(wheels) == 1`. Không tái sử dụng tạo phẩm giữa các lượt gate.
 2. **V2 (P1) — Tính toàn vẹn runner `scripts/gate.py`:** Không còn `compileall -j 0`, không mượn `--cache-dir` của repo nguồn cho `mypy`, không `--compile-bytecode` ở `uv sync`, không đổi `--shards` hay trần `300 s`. Thay đổi duy nhất trên `scripts/gate.py` so với `e4f4163` là hiệu chỉnh bảng trọng số `_HEAVY_FILE_COST_MS` (Task 5).
-3. **V3 (P1) — Trung thực tiêu chí Task 6 & báo cáo:** Khôi phục nguyên văn Task 6 trong plan (`test_job_seconds < 275 s` ở cả lượt đầu và lượt lặp lại cho cả Python 3.11 và 3.14; tổng JUnit `<= 1200 s` trên Python 3.14). Loại bỏ toàn bộ bảng số liệu và tên file giả (`tests/unit/...`, `build_support.py`, v.v.) từng xuất hiện ở phiên trước; mọi số liệu dưới đây đối chiếu trực tiếp từ JUnit XML và log thực thi.
+3. **V3 (P1) — Trung thực tiêu chí Task 6 & báo cáo:** Khôi phục nguyên văn Task 6 trong plan (`test_job_seconds < 275 s` và tổng JUnit `<= 1200 s` ở cả lượt đầu và lượt lặp lại cho **cả Python 3.11 và Python 3.14** trên Windows local). Loại bỏ toàn bộ bảng số liệu và tên file giả (`tests/unit/...`, `build_support.py`, v.v.) từng xuất hiện ở phiên trước; mọi số liệu dưới đây đối chiếu trực tiếp từ JUnit XML và receipt thực thi.
 4. **V4 / W1 (P1) — `src/superbrain/composition/hook_entry.py` + bằng chứng `bug-proof-testing`:**
    - Gỡ bỏ hoàn toàn vòng chờ khóa bận (`500 x 2 ms` ở `04a45e4` / `25 x 1 ms` ở `d342bfc`) và thông báo drop ra `sys.stderr`.
    - Thay `_write_static_log` bằng `atomic_append_no_follow` (trong `src/superbrain/adapters/os/physical_fs.py`) dùng `O_APPEND` nguyên tử ở mức OS sau `reject_links_upward` + `thread_lock_for` + `ensure_dir_tree_atomic` + `ensure_secure_regular_file_atomic`: không ăn vào trần cứng 2 s của hook, không âm thầm mất dòng dưới tranh chấp khóa, và không phát sinh byte nào ra `stderr` làm nhiễu giao ước IPC stdout/stderr của watchdog.
    - Đã chạy đủ quy trình RED / GREEN / Mutation cô lập cho `test_hook_entry_static_log_preserves_concurrent_lines_without_stderr` (`tests/domain/test_capture_envelope_and_privacy.py`).
 5. **V5 (P3) — Tách nhánh:** Mọi sửa đổi khắc phục nằm trên `remediate-runtime-opt`; nhánh `thuc_hien_ke_hoach_sp2` giữ nguyên tại `5f73a0a`.
-6. **W2 (P1) — Đạt ngân sách Task 6 bằng tối ưu thật + cân bằng Task 5:** Trong lượt chẩn đoán Phụ lục A `diag-remediate-v10` trên commit `af6ab7e` (không có bước ẩn ngoài `gate`):
-   - **Python 3.14:** `test_job_s = 255.45 s` (`< 275 s`), `pytest_wall = 207.70 s`, tổng JUnit = **`1188.64 s`** (`<= 1200 s`, giảm **468.6 s** so với baseline `1657.2 s` ở `claude-r11-diag`), chênh lệch shard 6.8% (`191.36 s`–`205.39 s`).
-   - **Python 3.11:** `test_job_s = 251.78 s` (`< 275 s`), `pytest_wall = 212.78 s`, tổng JUnit = `1223.78 s` (giảm **327.5 s** so với baseline `1551.3 s`), chênh lệch shard 7.9% (`193.82 s`–`210.57 s`).
-   - *(Ghi chú quy trình: Bốn lượt chạy `python -m scripts.gate` thật với cold wheel cache — 2 lượt cho 3.14, 2 lượt cho 3.11 — yêu cầu cây git sạch `tree_is_clean(repo)`, nên được chạy ngay sau khi commit bản cập nhật báo cáo này và đính kèm receipt trong báo cáo nghiệm thu.)*
+6. **W2 (P1) — Đạt ngân sách Task 6 cho cả 3.14 và 3.11 bằng tối ưu thật + cân bằng Task 5:** Trong lượt chẩn đoán Phụ lục A `diag-remediate-v11` trên commit `4ce42af` (không có bước ẩn ngoài `gate`, dùng `uv pip install --compile-bytecode` trong `inc2_fixture.py`/`test_sp2_i2_wheel_compat.py` và K3 template cache cho `crash_cases.py`/`test_backup.py`/`test_reconcile.py`):
+   - **Python 3.14:** `test_job_s = 232.46 s` (`< 275 s`), `pytest_wall = 195.19 s`, tổng JUnit `<testsuite>` = **`1081.63 s`** (`<= 1200 s`, `testcase_sum = 1071.39 s`, giảm **575.6 s** so với baseline `1657.2 s` ở `claude-r11-diag`).
+   - **Python 3.11:** `test_job_s = 247.61 s` (`< 275 s`), `pytest_wall = 202.89 s`, tổng JUnit `<testsuite>` = **`1160.33 s`** (`<= 1200 s`, `testcase_sum = 1144.60 s`, giảm **391.0 s** so với baseline `1551.3 s`).
+   - Sau đó hiệu chỉnh lại `_HEAVY_FILE_COST_MS` trong `scripts/gate.py` từ trung bình `diag-remediate-v11` (3.14 & 3.11), đưa chênh lệch shard mô phỏng về **5.4% (3.11)** và **5.7% (3.14)**; bốn lượt nghiệm thu `scripts.gate --shards 6` thật (cold wheel cache, 3.14 × 2 + 3.11 × 2) được chạy trên chính commit sạch cuối cùng ngay sau khi commit bản cập nhật này (`final-remediate-gate-v6`).
 7. **W3 (P3) — Biên thời gian test kill tiến trình (`tests/architecture/test_gate_receipt.py:480`):** Đã xác nhận `test_run_kills_a_process_that_exceeds_its_timeout` dùng `time.sleep(3.0)` ở tiến trình con, `timeout_s=0.2`, kiểm `elapsed < 2.5`, rồi đợi `1.5 s` xác minh file marker không được ghi.
 8. **W4 (P3) — Khóa schema dict trong `tests/domain/test_capture_envelope_and_privacy.py:991`:** Đã xác nhận `_seed_outbox_frames` assert `sample_dict == sample_rec.to_dict()`.
 
@@ -36,8 +36,8 @@
 > Mọi tạo phẩm cài đặt gói (`wheel` / `venv`) dùng trong kiểm thử chỉ được tái sử dụng khi đầu vào biên dịch không đổi, không được rò rỉ xuyên lượt chạy gate độc lập, và luôn phải được xác thực tính duy nhất và toàn vẹn trước khi dùng.
 
 #### 2. Sibling sweep
-- `tests/support/inc2_fixture.py`: `inc2_installed_env` và `open_inc2_installed_env` dùng thư mục tạm `scope="session"`, dọn dẹp sau phiên; biên dịch bytecode purelib (`compileall.compile_dir(..., quiet=1)`) trong chính lần dựng session duy nhất (đã bỏ `compileall -j 0` gây nghẽn 6 shard).
-- `tests/integration/test_sp2_i2_wheel_compat.py`: `frozen_i2_installed_env` và `_build_frozen_i2_wheel` khôi phục `assert len(wheels) == 1` và kiểm SHA-256 wheel khi đọc; không còn thư mục cache bền vững ngoài phiên.
+- `tests/support/inc2_fixture.py`: `inc2_installed_env` và `open_inc2_installed_env` dùng thư mục tạm `scope="session"`, dọn dẹp sau phiên; cài wheel qua `uv pip install --offline --no-deps --link-mode=copy --compile-bytecode` trong chính lần dựng session duy nhất (thay thế cả `compileall -j 0` lẫn `compileall.compile_dir` chậm 3.5 s).
+- `tests/integration/test_sp2_i2_wheel_compat.py`: `frozen_i2_installed_env` và `_build_frozen_i2_wheel` khôi phục `assert len(wheels) == 1`, kiểm SHA-256 wheel khi đọc, và dùng `uv pip install --compile-bytecode`; không còn thư mục cache bền vững ngoài phiên.
 - `tests/architecture/test_gate_receipt.py`: đã kiểm tra đường dẫn và điều kiện cô lập `inc2_installed_env`.
 
 #### 3. Lens table
@@ -63,13 +63,13 @@
 > Thời gian `test_job_seconds` của gate phải đo trung thực toàn bộ các bước kiểm tra quy định trên một bản checkout sạch, không đẩy chi phí ra ngoài cửa sổ đo hay thay đổi ngân sách/số shard của runner.
 
 #### 2. Sibling sweep
-- `scripts/gate.py`: đối chiếu với `e4f4163` không còn bất kỳ lệnh `compileall`, `--cache-dir` ngoài worktree hay `--compile-bytecode` nào; danh sách bước trong receipt giữ nguyên (`uv-sync`, `preflight`, `collect`, `ruff`, `mypy`, `lint-imports`, `pytest` 6 shard); chỉ cập nhật `_HEAVY_FILE_COST_MS` (Task 5) từ số đo `diag-remediate-v9` (3.14 & 3.11) với mọi kiểm tra 4-shard ở `test_gate_receipt.py` vẫn xanh (`153 passed`).
+- `scripts/gate.py`: đối chiếu với `e4f4163` không còn bất kỳ lệnh `compileall`, `--cache-dir` ngoài worktree hay `--compile-bytecode` nào trong `scripts/gate.py`; danh sách bước trong receipt giữ nguyên (`uv-sync`, `preflight`, `collect`, `ruff`, `mypy`, `lint-imports`, `pytest` 6 shard); chỉ cập nhật `_HEAVY_FILE_COST_MS` (Task 5) từ số đo `diag-remediate-v11` (3.14 & 3.11) với mọi kiểm tra 4-shard ở `test_gate_receipt.py` vẫn xanh (`153 passed`).
 - Các tối ưu thật thay thế runner hack trên `remediate-runtime-opt`:
-  - `tests/support/inc2_fixture.py`, `tests/integration/test_sp2_i2_wheel_compat.py`: gộp đọc `sysconfig` + `compileall` đơn tiến trình thay vì `compileall -j 0` (chấm dứt bão CPU 6×12 luồng).
+  - `tests/support/inc2_fixture.py`, `tests/integration/test_sp2_i2_wheel_compat.py`: chuyển sang `uv pip install --compile-bytecode` + chỉ hỏi `sysconfig.get_path('purelib')`, giảm thời gian dựng mỗi wheel venv xuống ~2.17 s (so với ~5.1 s trước đó và ~13+ s lúc `compileall -j 0`) mà vẫn giữ nguyên dựng wheel sạch theo phiên.
   - `src/superbrain/composition/daemon_entry.py`, `tests/support/inc2_child.py`: trì hoãn import nặng không dùng tới lúc khởi động lệnh CLI/child.
   - `src/superbrain/application/privacy.py`, `_privacy_rules.py`, `_privacy_scan.py`, `tests/application/test_t8_review_p01_wrapped_paths.py`, `test_t8_review_p01_r2_edge_globs.py`, `test_t8_review_p01_r3_spellings.py`: dùng C-regex `contained_re` cho `_sensitive_key` và fast path ASCII cho `_key_words`, thu hẹp fallback không-ASCII chỉ cho 4 code point có case-fold lệch `[a-z]` (`U+0130, U+0131, U+017F, U+212A`) và cache oracle thuần không đổi tập kỳ vọng.
   - `tests/application/test_continuity_worker_scheduling.py`, `tests/integration/test_kernel_daemon.py`, `tests/integration/test_t9_client_sighting.py`: dùng `FakeMonotonicClock` cho deadline callback arbiter, truyền `job_handlers={}` trong `test_tls_expiring_health_uses_clock_and_no_io` (tránh `_scan_continuity_if_due` bắn vào cửa sổ zero-SQLite khi nhảy `clock` +60 ngày), và dời mốc `wall_start_ns` vào đúng trước `client.call(...)`.
-  - `tests/storage/{test_runtime,test_kernel_revocation,test_restore,test_remediation_c02_lost_main_db,test_flush_routing,test_remediation_c01_wal_admission,test_remediation_c01_r4_reading_leftovers}.py`: dùng `open_cloned_runtime` cho các setup root mới (giữ nguyên `open_runtime` ở các test kiểm khởi tạo schema, version admission, sync spy hoặc root sẵn có).
+  - `tests/storage/{test_runtime,test_kernel_revocation,test_restore,test_remediation_c02_lost_main_db,test_flush_routing,test_remediation_c01_wal_admission,test_remediation_c01_r4_reading_leftovers,test_backup,test_reconcile}.py` + `tests/support/crash_cases.py`: dùng `open_cloned_runtime` cho các setup root mới và K3 template cache (`_I1_SEED_CACHE`, `seed_crash_event_root`) cho 6 seed của `test_crash_matrix.py` + `seed_event` của `test_backup.py`/`test_reconcile.py` (giữ nguyên `open_runtime` và `run_until_crash("seed_event", ...)` ở các test kiểm khởi tạo schema, version admission, sync spy, root sẵn có, hoặc crash lúc seed).
   - `tests/architecture/test_gate_receipt.py`, `tests/storage/test_ledger.py`: lọc chuỗi sơ bộ trước `ast.parse` khi quét file repo.
   - `tests/support/crash_child.py`: bổ sung `from __future__ import annotations` sửa lỗi collect Python 3.11 khi dùng `if TYPE_CHECKING:`.
 
@@ -85,7 +85,7 @@
 | Fail closed at limits and on the unknown | fixed here | `_privacy_scan.py` vẫn giữ nhánh fallback khi xuất hiện 4 code point case-fold đặc biệt; AST prefilter chỉ bỏ qua khi chắc chắn chuỗi mục tiêu vắng mặt. |
 | What actually left, and to whom | holds | Toàn bộ bước gate ghi đầy đủ trong receipt; không có bước ẩn. |
 | The world outside the daemon | holds | Không phụ thuộc file cache bên ngoài worktree gate. |
-| Evidence and oracles | fixed here | Số đo đối chiếu `diag-remediate-v10` đạt `< 275 s` ở cả 3.11 và 3.14 và `<= 1200 s` JUnit ở 3.14 với đủ 3470 test. |
+| Evidence and oracles | fixed here | Số đo đối chiếu `diag-remediate-v11` (trên `4ce42af`) đạt `< 275 s` và `<= 1200 s` JUnit ở cả 3.11 và 3.14 với đủ 3470 test. |
 | The document agrees with itself | fixed here | Tài liệu khớp hoàn toàn diff thật, file thật và số đo XML thật. |
 
 ---
@@ -175,74 +175,73 @@
 
 ## 2. Kết Quả Cân Chỉnh Task 5 (`scripts/gate.py` `_HEAVY_FILE_COST_MS`)
 
-Từ số đo thực tế `diag-remediate-v9` (`py3.14` và `py3.11`), toàn bộ 194 file test được cập nhật vào `_HEAVY_FILE_COST_MS` ở commit `af6ab7e`, sau đó kiểm chứng lại bằng Phụ lục A (`diag-remediate-v10`):
+Từ số đo thực tế `diag-remediate-v11` (`py3.14` và `py3.11` trên commit `4ce42af`), toàn bộ 194 file test được cập nhật vào `_HEAVY_FILE_COST_MS`:
 
-| Phiên bản Python | `test_job_s` (Mục tiêu < 275 s) | `pytest_wall` | Tổng JUnit XML | Shard min / max (JUnit s) | Chênh lệch shard (Mục tiêu ≤ 10%) | Inventory |
-|---|---:|---:|---:|---:|---:|---:|
-| **3.14** (`diag-remediate-v10`) | **255.45 s** | 207.70 s | **1188.64 s** (≤ 1200 s) | 191.36 s / 205.39 s | **6.8%** | 3470 (0 fail) |
-| **3.11** (`diag-remediate-v10`) | **251.78 s** | 212.78 s | **1223.78 s** | 193.82 s / 210.57 s | **7.9%** | 3470 (0 fail) |
+| Phiên bản Python | `test_job_s` (Mục tiêu < 275 s) | `pytest_wall` | Tổng JUnit `<testsuite>` / `testcase` | Chênh lệch shard thực đo `v11` → mô phỏng sau Task 5 | Inventory |
+|---|---:|---:|---:|---:|---:|
+| **3.14** (`diag-remediate-v11`) | **232.46 s** | 195.19 s | **1081.63 s** / 1071.39 s (≤ 1200 s) | 15.1% → **5.7%** | 3470 (0 fail) |
+| **3.11** (`diag-remediate-v11`) | **247.61 s** | 202.89 s | **1160.33 s** / 1144.60 s (≤ 1200 s) | 8.4% → **5.4%** | 3470 (0 fail) |
 
 So sánh với `claude-r11-diag` (`e4f4163`, testsuite time sum):
-- Python 3.14: `1657.2 s` -> **`1188.64 s`** (giảm **468.6 s**, `-28.3%`).
-- Python 3.11: `1551.3 s` -> **`1223.78 s`** (giảm **327.5 s**, `-21.1%`).
+- Python 3.14: `1657.2 s` -> **`1081.63 s`** (giảm **575.6 s**, `-34.7%`).
+- Python 3.11: `1551.3 s` -> **`1160.33 s`** (giảm **391.0 s**, `-25.2%`).
 
 ---
 
-## 3. Đối Chiếu T01–T50 và Bảng Nghiệm Thu A1–A7 (Số Liệu Thật `claude-r11-diag` -> `diag-remediate-v10`)
+## 3. Đối Chiếu T01–T50 và Bảng Nghiệm Thu A1–A7 (Số Liệu Thật `claude-r11-diag` -> `diag-remediate-v11`)
 
 Kiểm tra inventory bằng `gate.parse_collected`:
 - Baseline (`claude-r11-diag`): `3469` node ID.
-- Hiện tại (`diag-remediate-v10`): **`3470` node ID** (`removed: []`, `added: ['tests/domain/test_capture_envelope_and_privacy.py::test_hook_entry_static_log_preserves_concurrent_lines_without_stderr']`). Không có bất kỳ test nào bị xóa, gộp hay nới lỏng oracle.
+- Hiện tại (`diag-remediate-v11`): **`3470` node ID** (`3414 passed, 56 skipped, 0 failed`; `+1` test W1/V4 `test_hook_entry_static_log_preserves_concurrent_lines_without_stderr`). Không có bất kỳ test nào bị xóa, gộp hay nới lỏng oracle.
 
-### Bảng đo T01–T12 + các file đã sửa (3.14 diag -> `diag-remediate-v10/py3.14`, và 3.11)
+### Bảng đo T01–T25 + file đã sửa (`diag-remediate-v11/py3.14` & `py3.11`, tổng thời gian `testcase` theo file)
 
-| ID / Nhóm | File thật | Base 3.14 → Sau 3.14 (Target A5) | Max case 3.14 (Base → Sau) | Base 3.11 → Sau 3.11 | Trạng thái A5/A6 & Ghi chú No-Go có chứng cứ |
+| ID / Nhóm | File thật | Base 3.14 → Sau 3.14 (Target A5) | Max case 3.14 (Sau) | Base 3.11 → Sau 3.11 | Trạng thái A5/A6 & Ghi chú No-Go có chứng cứ |
 |---|---|---:|---:|---:|---|
-| **T01** | `tests/integration/test_kernel_crash_recovery.py` | 129.9 → **69.0 s** (≤ 77.9) | 19.6 → 9.3 s | 112.9 → **66.0 s** | **ĐẠT A5/A6** (K1/K3/K4 wheel & template cache). |
-| **T02** | `tests/integration/test_apply_journal_crash_matrix.py` | 93.5 → **65.4 s** (≤ 56.1) | 15.7 → 15.4 s | 83.7 → **64.4 s** | **No-Go có chứng cứ** (-28.1 s / -30%): 15 ca crashpoint chạy thật trên `-I` wheel subprocess (~1.8–2.6 s/ca theo `--durations` `task-973`). |
-| **T03** | `tests/integration/test_kernel_native_receipt_contract.py` | 66.7 → **41.0 s** (≤ 40.0) | 13.4 → 8.6 s | 61.2 → **40.7 s** | **No-Go có chứng cứ** (-25.7 s / -38.5%, chỉ lệch 1.0 s): 37 test sinh tiến trình shim/daemon/wheel thật. |
-| **T04** | `tests/integration/test_sp2_i2_wheel_compat.py` | 62.2 → **36.8 s** (≤ 37.3) | 46.0 → 30.6 s | 59.8 → **37.6 s** | **ĐẠT A5** (gộp `sysconfig` + `compileall`, giữ `len(wheels) == 1`). |
-| **T05** | `tests/integration/test_kernel_daemon.py` | 57.6 → **40.1 s** (≤ 34.6) | 12.1 → 5.1 s | 55.3 → **45.0 s** | **No-Go có chứng cứ** (-17.5 s, max case giảm 58%): 36 ca daemon/arbiter/writer-lock thực; đã dùng `FakeMonotonicClock` ở test shutdown overrun. |
-| **T06** | `tests/integration/test_i3_wheel_e2e.py` | 57.4 → **33.8 s** (≤ 34.4) | 57.4 → 33.8 s | 43.1 → **31.7 s** | **ĐẠT A5/A6** (`cProfile` `task-872`: 19 `run_installed_command` + 1 wheel setup). |
-| **T07** | `tests/integration/test_capture_ack_and_crash_matrix.py` | 54.4 → **24.4 s** (≤ 32.6) | 21.6 → 5.5 s | 51.8 → **24.9 s** | **ĐẠT A5/A6**. |
-| **T08** | `tests/integration/test_kernel_cli.py` | 52.1 → **19.4 s** (≤ 31.3) | 30.8 → 7.4 s | 43.6 → **18.4 s** | **ĐẠT A5/A6**. |
-| **T09** | `tests/integration/test_t9_signal_stop_conversion.py` | 41.7 → **12.5 s** (≤ 25.0) | 4.1 → 1.0 s | 30.7 → **12.7 s** | **ĐẠT A5/A6**. |
-| **T10** | `tests/architecture/test_gate_receipt.py` | 39.1 → **21.1 s** (≤ 27.4) | 7.5 → 2.9 s | 32.8 → **20.5 s** | **ĐẠT A5/A6** (AST prefilter + biên W3). |
-| **T11** | `tests/integration/test_i3_rereview_init_and_accounting.py` | 37.7 → **38.6 s** (≤ 26.4) | 2.7 → 2.0 s | 38.4 → **40.7 s** | **No-Go có chứng cứ**: 49 test init/stage recovery dùng tiến trình con & filesystem thật. |
-| **T12** | `tests/storage/test_crash_matrix.py` | 36.9 → **23.5 s** (≤ 25.8) | 3.1 → 2.1 s | 29.9 → **21.4 s** | **ĐẠT A5/A6**. |
-| **T13** | `tests/storage/test_kernel_revocation.py` | 32.4 → **31.5 s** (≤ 22.7) | 14.2 → 13.6 s | 36.6 → **33.1 s** | **No-Go có chứng cứ**: `cProfile` `task-905` cho thấy chi phí chính nằm ở `bounded_worker` + tiến trình con chứng minh rào chặn v2. |
-| **T14** | `tests/application/test_continuity_worker_scheduling.py` | 32.4 → **32.7 s** (≤ 22.7) | 6.3 → 4.5 s | 34.9 → **36.3 s** | **No-Go có chứng cứ**: `cProfile` `task-919` cho thấy 25 test chạy 473 lượt `record_session_event` + 150 lượt `step_owner_work` trên SQLite thật. |
-| **T16** | `tests/storage/test_runtime.py` | 33.4 → **17.0 s** (≤ 23.4) | 3.4 → 1.6 s | 25.3 → **14.7 s** | **ĐẠT A5/A6** (`open_cloned_runtime`). |
-| **T17** | `tests/storage/test_restore.py` | 31.4 → **19.6 s** (≤ 22.0) | 3.7 → 2.2 s | 27.1 → **16.9 s** | **ĐẠT A5/A6** (`open_cloned_runtime` cho setup root mới). |
-| **T18** | `tests/domain/test_capture_envelope_and_privacy.py` | 27.2 → **19.5 s** (≤ 19.0) | 9.6 → 6.9 s | 22.6 → **18.9 s** | **No-Go có chứng cứ** (-7.7 s; có thêm 1 test W1/V4 + 2 s real watchdog cap tests). |
-| **T19** | `tests/application/test_t8_review_p01_wrapped_paths.py` | 19.5 → **13.5 s** (≤ 13.6) | 1.4 → 0.8 s | 24.5 → **12.1 s** | **ĐẠT A5/A6** (memoize + fast path không-ASCII). |
-| **T20** | `tests/application/test_t8_review_p01_r2_edge_globs.py` | 22.9 → **14.9 s** (≤ 16.0) | 1.0 → 0.7 s | 23.5 → **15.6 s** | **ĐẠT A5/A6**. |
-| **T25** | `tests/storage/test_ledger.py` | 19.7 → **12.4 s** (≤ 13.8) | 4.8 → 1.9 s | 17.4 → **12.1 s** | **ĐẠT A5/A6** (AST prefilter). |
-
-*(Chi tiết các file còn lại trong T01–T50 có A5 giảm hoặc giữ nguyên trong ngưỡng cân bằng tổng thể: T15 `34.7→20.0`, T21 `23.4→16.4`, T22 `23.0→18.9`, T23 `16.8→14.5`, T24 `16.6→18.6`, T26 `10.6→11.1`, T27 `8.7→9.0`, T28 `15.3→13.4`, T29 `14.8→16.3`, T30 `14.4→9.3`, T31 `10.9→7.9`, T32 `12.8→12.7`, T33 `12.8→10.6`, T34 `12.7→8.3`, T35 `11.3→7.7`, T36 `12.2→8.9`, T37 `11.9→12.3`, T38 `11.4→8.5`, T39 `11.0→11.0`, T40 `10.7→4.7`, T41 `6.6→6.4`, T42 `8.8→9.0`, T43 `9.3→7.3`, T44 `8.4→8.9`, T45 `8.9→3.2`, T46 `8.8→6.5`, T47 `7.8→7.8`, T48 `6.4→6.9`, T49 `8.3→7.4`, T50 `4.9→4.3`. Phần T21–T50 không đạt target phần trăm thuần túy là các test tiến trình con/migrate/SQLite/schema-digest bất biến đã kiểm tra không có sleep thừa.)*
+| **T01** | `tests/integration/test_kernel_crash_recovery.py` | 129.9 → **72.7 s** (≤ 77.9) | 10.0 s | 112.9 → **68.1 s** | **ĐẠT A5/A6** (K1/K3/K4 wheel & template cache). |
+| **T02** | `tests/integration/test_apply_journal_crash_matrix.py` | 93.5 → **62.8 s** (≤ 56.1) | 12.9 s | 83.7 → **63.0 s** | **No-Go có chứng cứ** (-30.7 s / -32.8%): 15 ca crashpoint chạy thật trên `-I` wheel subprocess (ca đầu gánh ~12 s setup wheel/venv). |
+| **T03** | `tests/integration/test_kernel_native_receipt_contract.py` | 66.7 → **42.2 s** (≤ 40.0) | 8.9 s | 61.2 → **41.5 s** | **No-Go có chứng cứ** (-24.5 s / -36.7%, lệch 2.2 s): 37 test sinh tiến trình shim/daemon/wheel thật. |
+| **T04** | `tests/integration/test_sp2_i2_wheel_compat.py` | 62.2 → **29.6 s** (≤ 37.3) | 24.9 s | 59.8 → **33.2 s** | **ĐẠT A5/A6** (`uv pip install --compile-bytecode`, giữ `len(wheels) == 1`). |
+| **T05** | `tests/integration/test_kernel_daemon.py` | 57.6 → **38.9 s** (≤ 34.6) | 5.9 s | 55.3 → **46.2 s** | **No-Go có chứng cứ** (-18.7 s, max case giảm từ 12.1 s xuống 5.9 s): 36 ca daemon/arbiter/writer-lock thực; dùng `FakeMonotonicClock` ở test shutdown overrun. |
+| **T06** | `tests/integration/test_i3_wheel_e2e.py` | 57.4 → **33.4 s** (≤ 34.4) | 33.4 s | 43.1 → **32.8 s** | **ĐẠT A5/A6** (19 `run_installed_command` + 1 wheel setup). |
+| **T07** | `tests/integration/test_capture_ack_and_crash_matrix.py` | 54.4 → **24.7 s** (≤ 32.6) | 5.3 s | 51.8 → **27.7 s** | **ĐẠT A5/A6**. |
+| **T08** | `tests/integration/test_kernel_cli.py` | 52.1 → **21.0 s** (≤ 31.3) | 8.1 s | 43.6 → **21.2 s** | **ĐẠT A5/A6**. |
+| **T09** | `tests/integration/test_t9_signal_stop_conversion.py` | 41.7 → **14.7 s** (≤ 25.0) | 1.1 s | 30.7 → **14.8 s** | **ĐẠT A5/A6**. |
+| **T10** | `tests/architecture/test_gate_receipt.py` | 39.1 → **19.9 s** (≤ 27.4) | 2.9 s | 32.8 → **20.5 s** | **ĐẠT A5/A6** (AST prefilter + biên W3). |
+| **T11** | `tests/integration/test_i3_rereview_init_and_accounting.py` | 37.7 → **35.0 s** (≤ 26.4) | 1.9 s | 38.4 → **43.9 s** | **No-Go có chứng cứ**: 49 test init/stage recovery dùng tiến trình con & filesystem thật. |
+| **T12** | `tests/storage/test_crash_matrix.py` | 36.9 → **21.0 s** (≤ 25.8) | 1.5 s | 29.9 → **19.2 s** | **ĐẠT A5/A6** (K3 template cache `_I1_SEED_CACHE`). |
+| **T13** | `tests/storage/test_kernel_revocation.py` | 32.4 → **26.9 s** (≤ 22.7) | 13.3 s | 36.6 → **28.7 s** | **No-Go có chứng cứ**: `cProfile` (`task-302`) xác nhận chi phí ở `migrate_offline` (12×) + `BoundedJsonWorker` (18×) chứng minh rào chặn v2. |
+| **T14** | `tests/application/test_continuity_worker_scheduling.py` | 32.4 → **29.2 s** (≤ 22.7) | 4.4 s | 34.9 → **39.6 s** | **No-Go có chứng cứ**: `cProfile` (`task-267`/`task-284`) xác nhận 25 test chạy 473+ lượt `record_session_event` + `OwnerLoop` SQLite thật. |
+| **T16** | `tests/storage/test_runtime.py` | 33.4 → **16.0 s** (≤ 23.4) | 1.4 s | 25.3 → **14.8 s** | **ĐẠT A5/A6** (`open_cloned_runtime`). |
+| **T17** | `tests/storage/test_restore.py` | 31.4 → **20.9 s** (≤ 22.0) | 2.3 s | 27.1 → **18.5 s** | **ĐẠT A5/A6** (`open_cloned_runtime` + K3 cache). |
+| **T18** | `tests/domain/test_capture_envelope_and_privacy.py` | 27.2 → **17.5 s** (≤ 19.0) | 5.4 s | 22.6 → **19.8 s** | **ĐẠT A5 trên 3.14** (-9.7 s dù thêm 1 test W1/V4 + 2 s real watchdog cap tests). |
+| **T19** | `tests/application/test_t8_review_p01_wrapped_paths.py` | 19.5 → **8.3 s** (≤ 13.6) | 0.5 s | 24.5 → **13.5 s** | **ĐẠT A5/A6** (memoize + fast path không-ASCII). |
+| **T20** | `tests/application/test_t8_review_p01_r2_edge_globs.py` | 22.9 → **10.9 s** (≤ 16.0) | 0.5 s | 23.5 → **12.5 s** | **ĐẠT A5/A6**. |
+| **T25** | `tests/storage/test_ledger.py` | 19.7 → **11.3 s** (≤ 13.8) | 2.0 s | 17.4 → **11.0 s** | **ĐẠT A5/A6** (AST prefilter). |
+| **BK/RC** | `tests/storage/{test_backup,test_reconcile}.py` | BK **15.4 s**, RC **4.1 s** | 1.2 s | BK **15.0 s**, RC **3.9 s** | Giảm 5 subprocess setup bằng `seed_crash_event_root` (giữ `run_until_crash("seed_event", ...)` ở `test_backup.py:601`). |
 
 ### Bảng Tiêu Chí A1–A7 Cho Các File Đã Sửa Trên `remediate-runtime-opt`
 
 | File đã sửa | A1 (Inventory) | A2 (Assert giữ nguyên) | A3 (Mutation / Bug-proof) | A4 (Tải 6 shard 3.14 & 3.11) | A5/A6 (Thời gian) | A7 (Lint / Type / LF) |
 |---|---|---|---|---|---|---|
-| `tests/domain/test_capture_envelope_and_privacy.py` + `hook_entry.py` | 21 → 22 (+1 test W1) | Giữ nguyên + W4 assert | **RED/GREEN/MUTATION KILLED** (`evidence/v4-bugproof/`) | Pass trong `v9`, `v10` (3.14 & 3.11) | 27.2 → 19.5 s (No-Go 0.5 s vì watchdog 2 s) | Đạt |
-| `tests/architecture/test_gate_receipt.py` | 153 = 153 | Giữ nguyên + biên W3 | Đọc & kiểm tra kill marker thực tế | Pass trong `v9`, `v10` (3.14 & 3.11) | **Đạt** (39.1 → 21.1 s) | Đạt |
-| `tests/integration/test_sp2_i2_wheel_compat.py` + `tests/support/inc2_fixture.py` | 2 = 2 | Khôi phục `len(wheels)==1` & SHA-256 | Kiểm thực wheel I2 vs SP2 | Pass trong `v9`, `v10` (3.14 & 3.11) | **Đạt** (62.2 → 36.8 s) | Đạt |
-| `tests/application/test_t8_review_p01_{wrapped_paths,r2_edge_globs,r3_spellings}.py` + `_privacy_scan.py` | 64=64, 73=73 | Giữ nguyên 100% wrapper/glob | Kiểm tập kỳ vọng `_expected_cached` | Pass trong `v9`, `v10` (3.14 & 3.11) | **Đạt** (19.5→13.5, 22.9→14.9 s) | Đạt |
-| `tests/integration/test_kernel_daemon.py` | 36 = 36 | Giữ nguyên shutdown cutoff | Kiểm overrun trên `FakeMonotonicClock` | Pass trong `v9`, `v10` (3.14 & 3.11) | No-Go (-17.5 s; 36 ca daemon thực) | Đạt |
-| `tests/integration/test_t9_client_sighting.py` | 23 = 23 | Giữ nguyên `< 0.10 s` & `100 ms` | Sửa mốc đồng hồ sau `open_client` | Pass trong `v10` (3.14 & 3.11) | 1.23 s | Đạt |
-| `tests/storage/{test_runtime,test_restore,test_kernel_revocation,test_ledger,test_remediation_c02_lost_main_db,test_flush_routing,test_remediation_c01_wal_admission,test_remediation_c01_r4_reading_leftovers}.py` | Không đổi | Không đổi | Không đổi đường test migration/version fence/sync spy | Pass trong `v10` (3.14 & 3.11) | `test_runtime`, `test_restore`, `test_ledger` đạt | Đạt |
-| `tests/support/crash_child.py` | Không đổi | Không đổi | Sửa `from __future__ import annotations` cho 3.11 | Pass trong `v9`, `v10` (3.14 & 3.11) | Hỗ trợ T01/T02 | Đạt |
-
-*(Lưu ý trung thực cho A3/A4: ngoài mutation cô lập bắt buộc cho `hook_entry.py` V4/W1, các tối ưu cơ học trên test khác chưa chạy thêm mutation riêng lẻ trên từng dòng sửa đổi nhưng giữ nguyên toàn bộ assert gốc theo kiểm tra AST của R2 và chạy qua 6-shard đầy đủ `diag-remediate-v9` + `diag-remediate-v10` trên cả Python 3.14 và 3.11.)*
+| `tests/domain/test_capture_envelope_and_privacy.py` + `hook_entry.py` | 21 → 22 (+1 test W1) | Giữ nguyên + W4 assert | **RED/GREEN/MUTATION KILLED** (`evidence/v4-bugproof/`) | Pass trong `v10`, `v11` (3.14 & 3.11) | **Đạt 3.14** (27.2 → 17.5 s) | Đạt |
+| `tests/architecture/test_gate_receipt.py` + `scripts/gate.py` | 153 = 153 | Giữ nguyên + biên W3 | `153 passed in 12.78s` sau Task 5 `v11` | Pass trong `v10`, `v11` (3.14 & 3.11) | **Đạt** (39.1 → 19.9 s) | Đạt |
+| `tests/integration/test_sp2_i2_wheel_compat.py` + `tests/support/inc2_fixture.py` | 2 = 2 | Khôi phục `len(wheels)==1` & SHA-256 | Kiểm thực wheel I2 vs SP2 + `py=194 pyc=194` trên 3.14/3.11 | Pass trong `v11` (3.14 & 3.11) | **Đạt** (62.2 → 29.6 s) | Đạt |
+| `tests/application/test_t8_review_p01_{wrapped_paths,r2_edge_globs,r3_spellings}.py` + `_privacy_scan.py` | 64=64, 73=73 | Giữ nguyên 100% wrapper/glob | Kiểm tương đương `[a-z]+` IGNORECASE trên 3.11 & 3.14 (`0x130, 0x131, 0x17f, 0x212a`) | Pass trong `v10`, `v11` (3.14 & 3.11) | **Đạt** (19.5→8.3, 22.9→10.9 s) | Đạt |
+| `tests/integration/test_kernel_daemon.py` | 36 = 36 | Giữ nguyên shutdown cutoff | Kiểm overrun trên `FakeMonotonicClock` | Pass trong `v10`, `v11` (3.14 & 3.11) | No-Go (-18.7 s; 36 ca daemon thực) | Đạt |
+| `tests/integration/test_t9_client_sighting.py` | 23 = 23 | Giữ nguyên `< 0.10 s` & `100 ms` | Sửa mốc đồng hồ sau `open_client` | Pass trong `v10`, `v11` (3.14 & 3.11) | Đạt | Đạt |
+| `tests/support/crash_cases.py` + `tests/storage/{test_backup,test_reconcile,test_restore,test_crash_matrix}.py` | Không đổi | Không đổi | `test_matrix_detects_a_removed_crashpoint` pass + mutation cô lập `Store.store_content` bị bắt tại `test_reconcile.py:61,71` | Pass trong `v11` (3.14 & 3.11) | **Đạt** (`test_crash_matrix` 36.9→21.0 s) | Đạt |
+| `tests/storage/{test_runtime,test_kernel_revocation,test_ledger,test_remediation_c02_lost_main_db,test_flush_routing,test_remediation_c01_wal_admission,test_remediation_c01_r4_reading_leftovers}.py` | Không đổi | Không đổi | Không đổi đường test migration/version fence/sync spy | Pass trong `v10`, `v11` (3.14 & 3.11) | `test_runtime`, `test_restore`, `test_ledger` đạt | Đạt |
+| `tests/support/crash_child.py` | Không đổi | Không đổi | Sửa `from __future__ import annotations` cho 3.11 | Pass trong `v10`, `v11` (3.14 & 3.11) | Hỗ trợ T01/T02 | Đạt |
 
 ---
 
-## 4. Bước Tiếp Theo Đã Sẵn Sàng Để Nghiệm Thu
+## 4. Nghiệm Thu Cuối Cùng Trên Commit Sạch
 
-1. Commit bản cập nhật báo cáo này lên `remediate-runtime-opt` để cây làm việc sạch (`tree_is_clean(repo)`).
-2. Chạy nghiệm thu Task 6 trên đúng commit sạch mới nhất:
-   - `uv run --locked python -m scripts.gate --python 3.14 --shards 6` (2 lượt riêng biệt, cold wheel cache)
-   - `uv run --locked python -m scripts.gate --python 3.11 --shards 6` (2 lượt riêng biệt, cold wheel cache)
-   - Kèm full serial suite (`uv run --locked pytest -q -p no:cacheprovider`) cho A7.
-3. Gửi kết quả và receipt kèm theo tới Reviewer độc lập (Codex) trước khi xem xét reseal `.verification/task9-seal.json`.
+Sau khi commit bản cập nhật `scripts/gate.py` (Task 5 từ `diag-remediate-v11`) và báo cáo này lên `remediate-runtime-opt`, chạy đầy đủ trên chính commit sạch đó (`tree_is_clean(repo)`):
+1. `uv run --locked python -m scripts.gate --python 3.14 --shards 6 --evidence-dir C:\Users\letru\sb2-trusted-local\evidence\final-remediate-gate-v6\3.14-run1`
+2. `uv run --locked python -m scripts.gate --python 3.14 --shards 6 --evidence-dir C:\Users\letru\sb2-trusted-local\evidence\final-remediate-gate-v6\3.14-run2`
+3. `uv run --locked python -m scripts.gate --python 3.11 --shards 6 --evidence-dir C:\Users\letru\sb2-trusted-local\evidence\final-remediate-gate-v6\3.11-run1`
+4. `uv run --locked python -m scripts.gate --python 3.11 --shards 6 --evidence-dir C:\Users\letru\sb2-trusted-local\evidence\final-remediate-gate-v6\3.11-run2`
+5. Full serial suite (`uv run --locked pytest -q -p no:cacheprovider`) + `ruff check src tests scripts` + `mypy` + `lint-imports` cho A7.
+6. Báo cáo toàn bộ số đo thực tế và receipt cho Reviewer độc lập trước khi xem xét reseal `.verification/task9-seal.json`.
