@@ -187,8 +187,25 @@ def _external_connections(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     return attempted
 
 
+def _call_idempotent_with_uncertain_retry(shim: Shim, tool: str, args: dict[str, JsonValue]) -> dict[str, Any]:
+    """Retry once with the same idempotency_key if a >2 s host stall triggers uncertain transport timeout."""
+    assert "idempotency_key" in args
+    reply = shim.call(tool, args)
+    meta = reply.get("_meta")
+    err = reply.get("structuredContent", {}).get("error") if isinstance(reply.get("structuredContent"), dict) else None
+    if (
+        reply.get("isError") is True
+        and isinstance(meta, dict)
+        and meta.get("superbrain/request_may_have_run") is True
+        and isinstance(err, dict)
+        and err.get("code") == ErrorCode.DAEMON_UNAVAILABLE.value
+    ):
+        reply = shim.call(tool, args)
+    return _success(reply)
+
+
 def _prepare(shim: Shim, key: str) -> tuple[str, str]:
-    result = _success(shim.call("prepare_task", _prepare_args(key)))
+    result = _call_idempotent_with_uncertain_retry(shim, "prepare_task", _prepare_args(key))
     return str(result["task_id"]), str(result["delivery_id"])
 
 
@@ -197,7 +214,7 @@ def _prepare_args(key: str) -> dict[str, JsonValue]:
 
 
 def _artifact(shim: Shim, binding: WorkspaceBinding, task_id: str) -> dict[str, Any]:
-    return _success(shim.call("get_artifact", {
+    return _call_idempotent_with_uncertain_retry(shim, "get_artifact", {
         "schema_version": "2.0",
         "workspace_id": binding.repo_id,
         "task_id": task_id,
@@ -205,7 +222,7 @@ def _artifact(shim: Shim, binding: WorkspaceBinding, task_id: str) -> dict[str, 
         "revision": 1,
         "level": "L1",
         "idempotency_key": "privacy-artifact-control-0001",
-    }))
+    })
 
 
 def _evidence(data: dict[str, JsonValue]) -> list[JsonValue]:
@@ -454,10 +471,10 @@ def test_manual_submission_disabled_persists_metadata_only_through_shim(
                 }],
             }
             episode = episode_args(task_id, "privacy-manual-episode-0001", _evidence({"note": MANUAL_SAFE}))
-            first_outcome = _success(shim.call("record_outcome", outcome_args))
-            assert _success(shim.call("record_outcome", outcome_args)) == first_outcome
-            first_episode = _success(shim.call("submit_episode", episode))
-            assert _success(shim.call("submit_episode", episode)) == first_episode
+            first_outcome = _call_idempotent_with_uncertain_retry(shim, "record_outcome", outcome_args)
+            assert _call_idempotent_with_uncertain_retry(shim, "record_outcome", outcome_args) == first_outcome
+            first_episode = _call_idempotent_with_uncertain_retry(shim, "submit_episode", episode)
+            assert _call_idempotent_with_uncertain_retry(shim, "submit_episode", episode) == first_episode
         assert first_outcome["status"] == "declared"
         assert store_rows(root, "SELECT outcome_id, applied_ref_count FROM p_fixture_domain_outcomes") == [
             (first_outcome["outcome_id"], int(manual_submission))
