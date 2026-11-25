@@ -231,6 +231,10 @@ def open_inc2_installed_env(scratch: Path) -> Iterator[InstalledEnv]:
             timeout=30.0,
         ).strip()
     )
+    _run_checked(
+        [str(venv_python), "-I", "-m", "compileall", "-q", "-j", "0", str(purelib_dir / "superbrain")],
+        cwd=scratch,
+    )
     hook_src = Path(__file__).resolve().with_name("_socket_readiness_hook.py").read_bytes()
     (purelib_dir / "_superbrain_test_readiness.py").write_bytes(hook_src)
     (purelib_dir / "_superbrain_test_readiness.pth").write_text(

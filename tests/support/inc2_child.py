@@ -24,13 +24,9 @@ from types import TracebackType
 from typing import IO, TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from superbrain.application.owner_loop import OwnerLoop
     from tests.support.inc2_cli import _Win32ProcessJob
 
-from superbrain.adapters.os import os_adapters
-from superbrain.adapters.os.daemon_config import read_daemon_config
-from superbrain.application.owner_loop import OwnerLoop
-from superbrain.composition.daemon_entry import serve_config_path
-from superbrain.composition.migrate_entry import migrate_offline
 from superbrain.core.errors import BrainError
 from superbrain.core.jsonvalue import JsonValue
 from superbrain.core.kernel import DEFAULT_SHUTDOWN_GRACE_S, Endpoint, Ready
@@ -564,6 +560,8 @@ def _watch_stdin_for_cmd(expected_cmd: str, target_event: threading.Event) -> No
 
 
 def _run_serve_child(config_path: Path, extra_args: Sequence[str], ctrl_out: IO[str]) -> int:
+    from superbrain.composition.daemon_entry import serve_config_path
+
     grace_s = DEFAULT_SHUTDOWN_GRACE_S
     idx = 0
     while idx < len(extra_args):
@@ -624,6 +622,10 @@ def _run_migrate_child(config_path: Path, extra_args: Sequence[str], ctrl_out: I
         _emit(ctrl_out, {"event": "paused_in_migrate"})
         if not resume_event.wait(timeout=_CHILD_PAUSE_TIMEOUT_S):
             raise TimeoutError("migrate_offline child timed out waiting for resume command")
+
+    from superbrain.adapters.os import os_adapters
+    from superbrain.adapters.os.daemon_config import read_daemon_config
+    from superbrain.composition.migrate_entry import migrate_offline
 
     adapters = os_adapters()
     cfg = read_daemon_config(config_path, adapters)

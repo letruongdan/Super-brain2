@@ -185,6 +185,10 @@ def frozen_i2_installed_env(tmp_path_factory: pytest.TempPathFactory) -> Iterato
                 timeout=30.0,
             ).strip()
         )
+        _run_offline(
+            [str(venv_python), "-I", "-m", "compileall", "-q", "-j", "0", str(purelib_dir / "superbrain")],
+            cwd=scratch,
+        )
         hook_src = (REPO_ROOT / "tests" / "support" / "_socket_readiness_hook.py").read_bytes()
         (purelib_dir / "_superbrain_test_readiness.py").write_bytes(hook_src)
         (purelib_dir / "_superbrain_test_readiness.pth").write_text(

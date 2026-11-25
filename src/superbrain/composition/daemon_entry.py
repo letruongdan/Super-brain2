@@ -13,20 +13,15 @@ from collections.abc import Callable, Iterator, Mapping
 from datetime import datetime
 from pathlib import Path
 from types import FrameType
+from typing import TYPE_CHECKING
 
 from superbrain.adapters.os import os_adapters
 from superbrain.adapters.os.daemon_config import read_daemon_config
-from superbrain.adapters.os.tls_material import verify_server_tls_files
 from superbrain.application.approvals import OperatorHandle
-from superbrain.application.continuity_worker import sweep_legacy_continuity_copies
 from superbrain.application.deadlines import Reservation
 from superbrain.application.dispatch import KernelToolDomain
-from superbrain.application.jobs import JobService
-from superbrain.application.journal_recovery import reconcile_and_classify_journals
 from superbrain.application.owner_loop import AuthGate, OwnerLoop, OwnerSession
 from superbrain.application.review_apply import ReviewApplyService
-from superbrain.cli_api._loopback_server import LoopbackServer
-from superbrain.composition._daemon_restore import DaemonRestoreHandler, LazyConfigMerger, build_review_apply_service
 from superbrain.composition._daemon_session import (
     DaemonTestHooks,
     _AdmittedOwnerSession,
@@ -39,9 +34,7 @@ from superbrain.composition._endpoint import (
     publish_endpoint,
     remove_own_endpoint,
 )
-from superbrain.composition.kernel_bridge import KernelBridge
 from superbrain.composition.kernel_projections import kernel_store_extensions
-from superbrain.composition.operator_entry import build_operator_service, make_operator_executor
 from superbrain.core._kernel_approval import canonical_utc
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.faults import crashpoint
@@ -63,13 +56,10 @@ from superbrain.core.kernel import (
 )
 from superbrain.ports.clock import Clock, MonotonicClock
 from superbrain.ports.os import OsAdapters
-from superbrain.storage.capture_events import KernelCaptureStore
-from superbrain.storage.idempotency import StagedKernelStore
-from superbrain.storage.jobs import has_legacy_incomplete_settled_projections
-from superbrain.storage.proposals import PolicyApplyAuthority, StoreProposalAdapter
-from superbrain.storage.runtime import admit_existing_pair, open_runtime_under_lease
-from superbrain.storage.sessions import SessionStore
 from superbrain.workers.executor import PRODUCTION_JOB_HANDLERS, JobExecutor, JobHandler
+
+if TYPE_CHECKING:
+    from superbrain.cli_api._loopback_server import LoopbackServer
 
 __all__ = [
     "BoundLoopbackListener",
@@ -108,6 +98,24 @@ def _open_owner_session(
     on_listener_bound: Callable[[BoundLoopbackListener], None] | None,
     operator: OperatorHandle | None = None,
 ) -> _AdmittedOwnerSession:
+    from superbrain.adapters.os.tls_material import verify_server_tls_files
+    from superbrain.application.continuity_worker import sweep_legacy_continuity_copies
+    from superbrain.application.jobs import JobService
+    from superbrain.application.journal_recovery import reconcile_and_classify_journals
+    from superbrain.composition._daemon_restore import (
+        DaemonRestoreHandler,
+        LazyConfigMerger,
+        build_review_apply_service,
+    )
+    from superbrain.composition.kernel_bridge import KernelBridge
+    from superbrain.composition.operator_entry import build_operator_service
+    from superbrain.storage.capture_events import KernelCaptureStore
+    from superbrain.storage.idempotency import StagedKernelStore
+    from superbrain.storage.jobs import has_legacy_incomplete_settled_projections
+    from superbrain.storage.proposals import PolicyApplyAuthority, StoreProposalAdapter
+    from superbrain.storage.runtime import admit_existing_pair, open_runtime_under_lease
+    from superbrain.storage.sessions import SessionStore
+
     adapters = os_ if os_ is not None else os_adapters(clock=clock, monotonic=monotonic_clock)
     resolved_clock = clock if clock is not None else adapters.clock
     resolved_mono = monotonic_clock if monotonic_clock is not None else adapters.monotonic
@@ -450,6 +458,9 @@ def serve(
         or shutdown_grace_s <= 0
     ):
         raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+
+    from superbrain.cli_api._loopback_server import LoopbackServer
+    from superbrain.composition.operator_entry import make_operator_executor
 
     adapters = os_ if os_ is not None else os_adapters(clock=clock, monotonic=monotonic_clock)
     resolved_clock = clock if clock is not None else adapters.clock
