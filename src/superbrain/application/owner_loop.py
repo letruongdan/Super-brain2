@@ -113,6 +113,7 @@ class OwnerSession(Protocol):
 @runtime_checkable
 class _DoctorOwnerSession(Protocol):
     def poll_doctor_settled(self, wake_event: threading.Event) -> bool: ...
+    def next_doctor_retry_wait_s(self) -> float | None: ...
 
 
 OwnerSessionFactory = Callable[[DaemonConfig, Callable[[], None], Callable[[], None]], OwnerSession]
@@ -584,8 +585,18 @@ class OwnerLoop:
                         session.step_owner_work(allow_new_jobs=False)
                     break
 
-                if session.has_job_handlers and not self._stopping:
-                    self._owner_wake.wait(timeout=_WORKER_IDLE_POLL_S)
+                wait_s: float | None = (
+                    _WORKER_IDLE_POLL_S if (session.has_job_handlers and not self._stopping) else None
+                )
+                doctor_wait_s = (
+                    session.next_doctor_retry_wait_s()
+                    if (not self._stopping and isinstance(session, _DoctorOwnerSession))
+                    else None
+                )
+                if doctor_wait_s is not None:
+                    wait_s = doctor_wait_s if wait_s is None else min(wait_s, doctor_wait_s)
+                if wait_s is not None:
+                    self._owner_wake.wait(timeout=wait_s)
                 else:
                     self._owner_wake.wait()
         except Exception as err:  # noqa: BLE001

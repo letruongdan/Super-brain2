@@ -213,6 +213,11 @@ class _AdmittedOwnerSession(OwnerSession):
             return True
         return self._doctor_runner.poll_settled(wake_event)
 
+    def next_doctor_retry_wait_s(self) -> float | None:
+        if self._doctor_runner is None:
+            return None
+        return self._doctor_runner.next_retry_wait_s()
+
     def begin_restore_doctor_fence(self) -> None:
         if self._doctor_runner is not None:
             self._doctor_runner.fence_on_restore()

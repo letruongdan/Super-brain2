@@ -35,28 +35,32 @@ import pytest
 
 from superbrain.adapters.os.daemon_config import read_client_endpoint
 from superbrain.application.jobs import JobService
+from superbrain.composition import _daemon_doctor
 from superbrain.composition._daemon_doctor import DaemonDoctorRunner
-from superbrain.composition._daemon_health import load_committed_doctor_run_dto
+from superbrain.composition._daemon_health import find_active_doctor_job, load_committed_doctor_run_dto
 from superbrain.core._kernel_jobs import MAX_JOB_ATTEMPTS, retry_backoff
 from superbrain.core.canonical import canonical_json, digest_bytes
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.ids import new_id
 from superbrain.core.jsonvalue import JsonValue
-from superbrain.core.kernel import KernelRecord, require_aware_utc
+from superbrain.core.kernel import KernelRecord, ShutdownState, require_aware_utc
 from superbrain.storage._doctor_reader import StorageDoctorReader
 from superbrain.storage.backup import create_store_backup
 from superbrain.storage.cas import blob_path
 from superbrain.storage.idempotency import StagedKernelStore
+from superbrain.workers.executor import JobHandler
 from tests.integration.test_doctor_jobs import BOUND_WAIT_S, OWNER_DAN, _ro_db
 from tests.integration.test_i4_f4_f8_remediation import (
     OTHER_OWNER,
     _doctor_jobs,
+    _doctor_runs,
     _Env,
     _RecordingTx,
     _report,
     _wait_until,
 )
 from tests.integration.test_i4_owner_thread_remediation import DOCTOR_WORKER_PREFIX, _post_operator
+from tests.integration.test_i4_r3_remediation import _serve
 from tests.integration.test_i4_r9_doctor_payload_fault_classification import (
     DELAY,
     DOCTOR_KIND,
@@ -578,50 +582,205 @@ def test_a2_4_restore_clears_finished_cache_and_isolates_prior_epoch(trusted_tmp
         d.loop.run_owner_action(_direct_fence_and_rebind).result(timeout=BOUND_WAIT_S)
 
 
-def test_r1_arm_retry_rearms_while_timer_thread_alive_and_startup_retries(
+# ---------------------------------------------------------------------------
+# P2 / R1: Doctor retry wakeup, bounded cadence, restore fence & stop safety
+# ---------------------------------------------------------------------------
+
+
+def _patch_doctor_timers(monkeypatch: pytest.MonkeyPatch, *, fail: bool) -> list[threading.Timer]:
+    """Record ``threading.Timer.start`` calls in the test and optionally raise ``RuntimeError``."""
+    orig_start = threading.Timer.start
+    timers: list[threading.Timer] = []
+
+    def _wrapped_start(self: threading.Timer) -> None:
+        timers.append(self)
+        if fail:
+            raise RuntimeError("injected doctor retry timer start failure")
+        orig_start(self)
+
+    monkeypatch.setattr(threading.Timer, "start", _wrapped_start)
+    return timers
+
+
+def _spy_runner_wake(
+    monkeypatch: pytest.MonkeyPatch,
+    on_wake: Callable[[Callable[[], None]], None],
+) -> None:
+    """Observe ``DaemonDoctorRunner``'s ``wake_owner`` callback without altering public wiring."""
+    orig_init = DaemonDoctorRunner.__init__
+
+    def _wrapped_init(self: DaemonDoctorRunner, *args: Any, **kwargs: Any) -> None:
+        orig_wake = cast(Callable[[], None], kwargs["wake_owner"])
+
+        def _spied_wake() -> None:
+            on_wake(orig_wake)
+
+        kwargs["wake_owner"] = _spied_wake
+        orig_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(DaemonDoctorRunner, "__init__", _wrapped_init)
+
+
+def test_p2_1_clean_startup_completes_doctor_run_on_idle_doctor_only_daemon(trusted_tmp: Path) -> None:
+    """Clean startup on an idle doctor-only daemon completes its startup DoctorRun without client requests."""
+    env = _Env(trusted_tmp, "p2-1-clean-startup")
+    with env.serve() as d:
+        session = cast(Any, d.loop)._session
+        assert session is not None and session.has_job_handlers is False
+        assert _wait_until(lambda: len(_doctor_runs(env.root)) == 1, WAKE_BUDGET_S), (
+            f"P2.1: idle doctor-only daemon failed to complete startup DoctorRun: {_doctor_jobs(env.root)}"
+        )
+        runs = _doctor_runs(env.root)
+        assert len(runs) == 1
+        assert runs[0].get("trigger") == "startup" and runs[0].get("owner_id") == OWNER_DAN
+        job_id = str(runs[0]["job_id"])
+        assert _durable(env, job_id) == ("succeeded", 1, None)
+        assert d.loop.wait_doctor_settled(timeout=BOUND_WAIT_S) is True
+
+
+def test_p2_2_startup_store_busy_with_timer_start_failure_still_completes(
     trusted_tmp: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Deferred retries must still schedule a new wakeup even while the firing timer thread has not exited."""
-    env = _Env(trusted_tmp, "r1-timer-alive")
-    startup_fail = [True]
-    orig_find_active = __import__(
-        "superbrain.composition._daemon_doctor", fromlist=["find_active_doctor_job"]
-    ).find_active_doctor_job
+    """Transient STORE_BUSY during startup schedule still completes DoctorRun even if Timer.start raises."""
+    env = _Env(trusted_tmp, "p2-2-startup-timer-fail")
+    schedule_failed = threading.Event()
+    orig_find_active = find_active_doctor_job
 
-    def _startup_busy(*args: Any, **kwargs: Any) -> Any:
-        if startup_fail[0]:
-            startup_fail[0] = False
+    def _busy_once(*args: Any, **kwargs: Any) -> Any:
+        if not schedule_failed.is_set():
+            schedule_failed.set()
             raise BrainError(ErrorCode.STORE_BUSY, "transient startup schedule busy")
         return orig_find_active(*args, **kwargs)
 
-    monkeypatch.setattr("superbrain.composition._daemon_doctor.find_active_doctor_job", _startup_busy)
+    monkeypatch.setattr(_daemon_doctor, "find_active_doctor_job", _busy_once)
+    _patch_doctor_timers(monkeypatch, fail=True)
 
     with env.serve() as d:
-        # Startup transient failure on doctor-only daemon must re-arm retry instead of stalling forever.
-        assert d.loop.wait_doctor_settled(timeout=3.0) is True, (
-            "R1.1: startup scheduling transient STORE_BUSY stalled doctor-only daemon"
+        session = cast(Any, d.loop)._session
+        assert session is not None and session.has_job_handlers is False
+        assert schedule_failed.wait(timeout=BOUND_WAIT_S), "precondition: startup STORE_BUSY must fire"
+        assert _wait_until(lambda: bool(_doctor_runs(env.root)), 3.0), (
+            f"P2.2: startup DoctorRun stranded after Timer.start RuntimeError: {_doctor_jobs(env.root)}"
         )
-        runner = _runner(d)
+        runs = _doctor_runs(env.root)
+        assert len(runs) == 1
+        assert runs[0].get("trigger") == "startup"
+        assert _durable(env, str(runs[0]["job_id"])) == ("succeeded", 1, None)
+        assert d.loop.wait_doctor_settled(timeout=BOUND_WAIT_S) is True
 
+
+def test_p2_3_periodic_24h_schedule_store_busy_with_timer_start_failure_recovers(
+    trusted_tmp: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Periodic 24h schedule STORE_BUSY recovers without client pokes even when Timer.start fails."""
+    env = _Env(trusted_tmp, "p2-3-periodic-timer-fail")
+    with env.serve() as d:
+        session = cast(Any, d.loop)._session
+        assert session is not None and session.has_job_handlers is False
+        assert _wait_until(lambda: len(_doctor_runs(env.root)) == 1, WAKE_BUDGET_S)
+        assert d.loop.wait_doctor_settled(timeout=BOUND_WAIT_S) is True
+
+        # Fail two lookups so Pass 1 (owner wake) and any immediate Pass 2 (GC did_work=True) cannot mask missing retry.
+        failures_left = [2]
+        schedule_failed = threading.Event()
+        orig_find_active = find_active_doctor_job
+
+        def _busy_periodic(*args: Any, **kwargs: Any) -> Any:
+            if failures_left[0] > 0:
+                failures_left[0] -= 1
+                schedule_failed.set()
+                raise BrainError(ErrorCode.STORE_BUSY, "transient periodic schedule busy")
+            return orig_find_active(*args, **kwargs)
+
+        monkeypatch.setattr(_daemon_doctor, "find_active_doctor_job", _busy_periodic)
+        _patch_doctor_timers(monkeypatch, fail=True)
+
+        env.clock.advance(timedelta(hours=24, seconds=1))
+        d.loop.run_owner_action(lambda: None).result(timeout=BOUND_WAIT_S)
+        assert schedule_failed.wait(timeout=BOUND_WAIT_S), "precondition: periodic schedule STORE_BUSY must fire"
+        assert _wait_until(lambda: len(_doctor_runs(env.root)) == 2, 3.0), (
+            f"P2.3: periodic 24h DoctorRun stranded after STORE_BUSY + Timer.start failure: {_doctor_jobs(env.root)}"
+        )
+        runs = _doctor_runs(env.root)
+        assert len(runs) == 2 and runs[1].get("trigger") == "schedule"
+        assert _durable(env, str(runs[1]["job_id"])) == ("succeeded", 1, None)
+        assert d.loop.wait_doctor_settled(timeout=BOUND_WAIT_S) is True
+
+
+@pytest.mark.parametrize("fault_path", ["claim_lease", "settlement_failed"])
+def test_p2_4_defer_claim_and_settlement_rollback_recover_with_timer_start_failure(
+    trusted_tmp: Path, monkeypatch: pytest.MonkeyPatch, fault_path: str
+) -> None:
+    """_defer on claim lease rollback or failed-settlement rollback reconciles without pokes if Timer.start fails."""
+    env = _Env(trusted_tmp, f"p2-4-{fault_path}")
+    with env.serve() as d:
+        session = cast(Any, d.loop)._session
+        assert session is not None and session.has_job_handlers is False
+        assert d.loop.wait_doctor_settled(timeout=BOUND_WAIT_S) is True
         env.clock.advance(timedelta(minutes=16))
-        [job_id] = _enqueue_jobs_on_owner(d, env, owner_id=OWNER_DAN, count=1, delay=DELAY, tag="r1-timer")
+        [job_id] = _enqueue_jobs_on_owner(d, env, owner_id=OWNER_DAN, count=1, delay=DELAY, tag=f"p2-4-{fault_path}")
 
-        # Keep the first firing Timer thread alive (is_alive() == True) past wake_owner so the second
-        # STORE_BUSY deferral runs inside the overlap window.
-        release_timer = threading.Event()
-        timer_holding = threading.Event()
-        timer_wakes = [0]
-        orig_wake = runner._wake_owner
+        _patch_doctor_timers(monkeypatch, fail=True)
+        hold = threading.Event()
+        hold.set()
+        fault_fired = threading.Event()
+        if fault_path == "claim_lease":
+            rollbacks = _fault_tx_record_gate(monkeypatch, job_id, "job.leased", hold)
+            fault_fired.set()
+        else:
+            orig_read = StorageDoctorReader.read_snapshot
 
-        def _slow_exit_wake() -> None:
-            orig_wake()
-            if isinstance(threading.current_thread(), threading.Timer):
-                timer_wakes[0] += 1
-                if timer_wakes[0] == 1:
-                    timer_holding.set()
-                    release_timer.wait(timeout=2.0)
+            def _bad_snap(self_r: Any, *args: Any, **kwargs: Any) -> Any:
+                if not fault_fired.is_set():
+                    fault_fired.set()
+                    raise BrainError(ErrorCode.INTEGRITY_FAILURE, "injected non-transient snapshot failure")
+                return orig_read(self_r, *args, **kwargs)
 
-        monkeypatch.setattr(runner, "_wake_owner", _slow_exit_wake)
+            monkeypatch.setattr(StorageDoctorReader, "read_snapshot", _bad_snap)
+            rollbacks = _fault_tx_record_gate(monkeypatch, job_id, "job.terminal", hold, required_state="failed")
+
+        env.clock.advance(DELAY + timedelta(milliseconds=1))
+        d.loop.run_owner_action(lambda: None).result(timeout=BOUND_WAIT_S)
+        assert fault_fired.wait(timeout=BOUND_WAIT_S), "precondition: non-transient snapshot fault must fire"
+        assert _wait_until(lambda: rollbacks[0] >= 2, BOUND_WAIT_S), (
+            f"precondition: {fault_path} rollback must trigger retry path ({rollbacks[0]})"
+        )
+        time.sleep(0.05)
+        hold.clear()
+
+        expected_state = "succeeded" if fault_path == "claim_lease" else "failed"
+        assert _wait_until(lambda: _durable(env, job_id)[0] == expected_state, WAKE_BUDGET_S), (
+            f"P2.4 ({fault_path}): deferred job stranded after Timer.start failure: {_durable(env, job_id)}"
+        )
+        if fault_path == "claim_lease":
+            assert _durable(env, job_id) == ("succeeded", 1, None)
+            assert len(_runs_for(env, job_id)) == 1
+        else:
+            assert _durable(env, job_id) == ("failed", 1, "handler_failed")
+            assert not _runs_for(env, job_id)
+        assert d.loop.wait_doctor_settled(timeout=BOUND_WAIT_S) is True
+
+
+def test_p2_4b_repeated_claim_deferrals_recover_while_firing_timer_thread_alive(
+    trusted_tmp: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Repeated claim deferrals recover cleanly even if a firing timer thread overlaps the next deferral."""
+    env = _Env(trusted_tmp, "p2-4b-timer-overlap")
+    release_timer = threading.Event()
+    timer_wakes = [0]
+
+    def _slow_timer_wake(orig_wake: Callable[[], None]) -> None:
+        orig_wake()
+        if isinstance(threading.current_thread(), threading.Timer):
+            timer_wakes[0] += 1
+            if timer_wakes[0] == 1:
+                release_timer.wait(timeout=2.0)
+
+    _spy_runner_wake(monkeypatch, _slow_timer_wake)
+    with env.serve() as d:
+        assert d.loop.wait_doctor_settled(timeout=BOUND_WAIT_S) is True
+        env.clock.advance(timedelta(minutes=16))
+        [job_id] = _enqueue_jobs_on_owner(d, env, owner_id=OWNER_DAN, count=1, delay=DELAY, tag="p2-4b-overlap")
 
         hold = threading.Event()
         hold.set()
@@ -629,40 +788,209 @@ def test_r1_arm_retry_rearms_while_timer_thread_alive_and_startup_retries(
         env.clock.advance(DELAY + timedelta(milliseconds=1))
         d.loop.run_owner_action(lambda: None).result(timeout=BOUND_WAIT_S)
         try:
-            assert timer_holding.wait(timeout=BOUND_WAIT_S), "precondition: retry timer #1 never fired"
-            assert _wait_until(lambda: rollbacks[0] >= 2, BOUND_WAIT_S), (
-                f"precondition: retry attempt while timer #1 alive did not run ({rollbacks[0]})"
-            )
+            time.sleep(0.5)
+            assert rollbacks[0] >= 2, f"precondition: repeated deferrals did not occur ({rollbacks[0]})"
             hold.clear()
         finally:
             release_timer.set()
 
         assert _wait_until(lambda: _durable(env, job_id)[0] == "succeeded", WAKE_BUDGET_S), (
-            "R1: _arm_retry lost second wakeup while timer #1 thread was still exiting; "
-            f"durable={_durable(env, job_id)}"
+            f"P2.4b: repeated deferrals lost wakeup during overlapping timer exit: {_durable(env, job_id)}"
         )
         assert d.loop.wait_doctor_settled(timeout=BOUND_WAIT_S) is True
 
-        # Verify fence_on_restore and rebind_after_restore cancel any armed pre-restore retry timer immediately.
-        runner._arm_retry()
-        with runner._lock:
-            armed = runner._retry_timer
-        assert armed is not None
-        runner.fence_on_restore()
-        with runner._lock:
-            assert runner._retry_timer is None
-        assert armed.finished.is_set()
 
+@pytest.mark.parametrize("has_handlers", [False, True])
+def test_p2_5_sustained_store_busy_retries_with_bounded_cadence_and_recovers(
+    trusted_tmp: Path, monkeypatch: pytest.MonkeyPatch, has_handlers: bool
+) -> None:
+    """Sustained STORE_BUSY retries at bounded backoff cadence (no stall, no 50ms spin) and recovers."""
+    env = _Env(trusted_tmp, f"p2-5-sustained-{has_handlers}")
+    busy = threading.Event()
+    busy.set()
+    first_attempt = threading.Event()
+    attempts = [0]
+    orig_find_active = find_active_doctor_job
+
+    def _sustained_busy(*args: Any, **kwargs: Any) -> Any:
+        if busy.is_set():
+            attempts[0] += 1
+            first_attempt.set()
+            raise BrainError(ErrorCode.STORE_BUSY, "sustained startup store busy")
+        return orig_find_active(*args, **kwargs)
+
+    monkeypatch.setattr(_daemon_doctor, "find_active_doctor_job", _sustained_busy)
+    _patch_doctor_timers(monkeypatch, fail=True)
+    handlers: dict[str, JobHandler] | None = {"fixture.noop": lambda _spec, _ctx: ()} if has_handlers else None
+
+    with _serve(env.cfg, os_=env.os_, clock=env.clock, mono=env.mono, job_handlers=handlers) as d:
         session = cast(Any, d.loop)._session
-        assert session is not None
-        runner._arm_retry()
+        assert session is not None and session.has_job_handlers is has_handlers
+        assert first_attempt.wait(timeout=BOUND_WAIT_S), "precondition: initial startup lookup must run"
+        time.sleep(1.1)
+        attempts_in_window = attempts[0]
+        runs_during_fault = len(_doctor_runs(env.root))
+        busy.clear()
+
+        assert runs_during_fault == 0
+        assert 2 <= attempts_in_window <= 6, (
+            f"P2.5 (has_job_handlers={has_handlers}): expected bounded retries (2..6) in 1.1s, got {attempts_in_window}"
+        )
+        assert _wait_until(lambda: len(_doctor_runs(env.root)) == 1, WAKE_BUDGET_S), (
+            f"P2.5 (has_job_handlers={has_handlers}): failed to recover after sustained STORE_BUSY cleared"
+        )
+        runs = _doctor_runs(env.root)
+        assert runs[0].get("trigger") == "startup"
+        assert _durable(env, str(runs[0]["job_id"])) == ("succeeded", 1, None)
+        assert d.loop.wait_doctor_settled(timeout=BOUND_WAIT_S) is True
+
+
+def test_p2_6_restore_fences_and_drops_pending_retry_without_executing_stale_work(
+    trusted_tmp: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Online restore, fence_on_restore, and rebind_after_restore bump generation and drop pre-restore retries."""
+    env = _Env(trusted_tmp, "p2-6-restore-fence")
+    timers = _patch_doctor_timers(monkeypatch, fail=False)
+    with env.serve() as d:
+        assert d.loop.wait_doctor_settled(timeout=BOUND_WAIT_S) is True
+        env.clock.advance(timedelta(minutes=16))
+        [old_job_id] = _enqueue_jobs_on_owner(d, env, owner_id=OWNER_DAN, count=1, delay=DELAY, tag="p2-6-old")
+        store_bak = d.loop.run_owner_action(
+            lambda: create_store_backup(cast(Any, d.loop)._session.rt.store, env.os_, env.clock.now())
+        ).result(timeout=BOUND_WAIT_S)
+
+        fault_fired = threading.Event()
+        orig_read = StorageDoctorReader.read_snapshot
+
+        def _bad_snap(self_r: Any, *args: Any, **kwargs: Any) -> Any:
+            if not fault_fired.is_set():
+                fault_fired.set()
+                raise BrainError(ErrorCode.INTEGRITY_FAILURE, "injected snapshot failure before restore")
+            return orig_read(self_r, *args, **kwargs)
+
+        monkeypatch.setattr(StorageDoctorReader, "read_snapshot", _bad_snap)
+        busy = threading.Event()
+        busy.set()
+        busy_hits = _fault_tx_record_gate(monkeypatch, old_job_id, "job.terminal", busy, required_state="failed")
+
+        env.clock.advance(DELAY + timedelta(milliseconds=1))
+        d.loop.run_owner_action(lambda: None).result(timeout=BOUND_WAIT_S)
+        assert fault_fired.wait(timeout=BOUND_WAIT_S)
+        assert _wait_until(lambda: busy_hits[0] >= 1, BOUND_WAIT_S)
+
+        runner = _runner(d)
         with runner._lock:
-            armed2 = runner._retry_timer
-        assert armed2 is not None
-        runner.rebind_after_restore(rt=session.rt, job_store=session._job_store, job_service=session._job_service)
+            gen_before = runner._generation
+            assert runner._pending_settle is not None
+
+        _run_online_restore_helper(d.ready, env.rep, env.ca_pem, env.cli_token, env.priv, env.os_, "store", store_bak)
         with runner._lock:
-            assert runner._retry_timer is None
-        assert armed2.finished.is_set()
+            assert runner._generation > gen_before
+            assert runner._pending_settle is None
+            assert runner._pending_lease is None
+            assert runner._reconcile_claims is False
+            assert runner._finished_jobs == {}
+        assert _durable(env, old_job_id)[0] == "cancelled"
+
+        busy.clear()
+        time.sleep(0.3)
+        assert _durable(env, old_job_id)[0] == "cancelled"
+        assert not _runs_for(env, old_job_id)
+
+        ep_post = read_client_endpoint(env.root.endpoint_path, env.os_)
+        ready_post = replace(d.ready, endpoint=ep_post, identity=ep_post.identity)
+        post_rep = _post_operator(
+            ready_post, env.ca_pem, "/v2/operator/doctor/report", env.cli_token, {"wait_timeout_ms": WAIT_MS}, 16.0
+        )
+        post_data = cast(dict[str, Any], post_rep.get("data") or {})
+        assert post_rep.get("ok") is True and post_data.get("status") == "completed", post_rep
+        assert post_data.get("job_id") != old_job_id
+        assert d.loop.wait_doctor_settled(timeout=BOUND_WAIT_S) is True
+
+        env.clock.advance(timedelta(minutes=16))
+        [old_job_2] = _enqueue_jobs_on_owner(d, env, owner_id=OWNER_DAN, count=1, delay=DELAY, tag="p2-6-direct")
+        hold2 = threading.Event()
+        hold2.set()
+        rollbacks2 = _fault_tx_record_gate(monkeypatch, old_job_2, "job.leased", hold2)
+        env.clock.advance(DELAY + timedelta(milliseconds=1))
+        d.loop.run_owner_action(lambda: None).result(timeout=BOUND_WAIT_S)
+        assert _wait_until(lambda: rollbacks2[0] >= 1, BOUND_WAIT_S)
+
+        def _direct_fence_and_rebind() -> None:
+            session = cast(Any, d.loop)._session
+            assert session is not None
+            with runner._lock:
+                g0 = runner._generation
+            runner.fence_on_restore()
+            with runner._lock:
+                assert runner._generation == g0 + 1
+                assert runner._pending_lease is None
+                assert runner._pending_settle is None
+                assert runner._reconcile_claims is False
+            assert all(t.finished.is_set() for t in timers)
+            runner.finish_restore_reconcile()
+            runner.rebind_after_restore(rt=session.rt, job_store=session._job_store, job_service=session._job_service)
+            with runner._lock:
+                assert runner._generation == g0 + 2
+                assert runner._pending_lease is None
+                assert runner._pending_settle is None
+                assert runner._reconcile_claims is False
+
+        d.loop.run_owner_action(_direct_fence_and_rebind).result(timeout=BOUND_WAIT_S)
+        hold2.clear()
+        time.sleep(0.3)
+        assert _durable(env, old_job_2)[0] == "cancelled"
+        assert not _runs_for(env, old_job_2)
+
+        post_rep_2 = _post_operator(
+            ready_post, env.ca_pem, "/v2/operator/doctor/report", env.cli_token, {"wait_timeout_ms": WAIT_MS}, 16.0
+        )
+        post_data_2 = cast(dict[str, Any], post_rep_2.get("data") or {})
+        assert post_rep_2.get("ok") is True and post_data_2.get("status") == "completed", post_rep_2
+        assert post_data_2.get("job_id") != old_job_2
+
+
+@pytest.mark.parametrize("fail_timer_start", [False, True])
+def test_p2_7_stop_while_sustained_retry_pending_completes_promptly_without_post_stop_wakeup(
+    trusted_tmp: Path, monkeypatch: pytest.MonkeyPatch, fail_timer_start: bool
+) -> None:
+    """d.loop.stop while sustained retry is pending stops promptly (<1s) with zero post-stop wake_owner calls."""
+    env = _Env(trusted_tmp, f"p2-7-stop-{fail_timer_start}")
+    attempts = [0]
+
+    def _always_busy(*_args: Any, **_kwargs: Any) -> Any:
+        attempts[0] += 1
+        raise BrainError(ErrorCode.STORE_BUSY, "sustained busy during stop")
+
+    monkeypatch.setattr(_daemon_doctor, "find_active_doctor_job", _always_busy)
+    timers = _patch_doctor_timers(monkeypatch, fail=fail_timer_start)
+
+    post_stop = threading.Event()
+    post_stop_wakes: list[float] = []
+
+    def _record_wake(orig_wake: Callable[[], None]) -> None:
+        if post_stop.is_set():
+            post_stop_wakes.append(time.monotonic())
+        orig_wake()
+
+    _spy_runner_wake(monkeypatch, _record_wake)
+
+    with env.serve() as d:
+        assert _wait_until(lambda: attempts[0] >= 2, BOUND_WAIT_S), (
+            f"P2.7 (fail_timer_start={fail_timer_start}): sustained retry never looped ({attempts[0]})"
+        )
+        t_stop = time.monotonic()
+        report = d.loop.stop(grace_s=2.0)
+        stop_elapsed = time.monotonic() - t_stop
+        post_stop.set()
+
+        assert report.state is ShutdownState.STOPPED, report
+        assert report.error_code is None, report
+        assert stop_elapsed < 1.0, f"stop() blocked on retry backoff for {stop_elapsed:.3f}s"
+
+        time.sleep(0.35)
+        assert post_stop_wakes == [], f"lingering retry timer called wake_owner after stop: {post_stop_wakes}"
+        assert all(t.finished.is_set() and not t.is_alive() for t in timers)
 
 
 def test_r2_sqlite_error_in_ledger_lookup_never_crashes_owner_or_leaks_raw(
