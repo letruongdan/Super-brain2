@@ -72,7 +72,7 @@ def _match_part(p: str, g: str) -> bool:
     return fnmatch.fnmatchcase(p, g)
 
 
-@functools.cache
+@functools.lru_cache(maxsize=65536)
 def _spec_blocked(spelling: str, patterns: tuple[str, ...]) -> bool:
     parts = _components(spelling)
     len_parts = len(parts)
@@ -84,7 +84,7 @@ def _spec_blocked(spelling: str, patterns: tuple[str, ...]) -> bool:
     return False
 
 
-@functools.cache
+@functools.lru_cache(maxsize=65536)
 def _token_outcomes(token: str, patterns: tuple[str, ...]) -> frozenset[str] | None:
     """Acceptable replacements of one token, or ``None`` when no spelling of it is blocked."""
     lead_max = len(token) - len(token.lstrip(LEAD))
@@ -103,18 +103,35 @@ def _token_outcomes(token: str, patterns: tuple[str, ...]) -> frozenset[str] | N
     return outcomes or None
 
 
-@functools.cache
 def _expected_cached(text: str, patterns: tuple[str, ...]) -> tuple[frozenset[str], int]:
-    """Every acceptable filtered form of ``text`` and the exact number of redactions (cached frozenset)."""
-    pieces: list[frozenset[str] | set[str]] = []
+    """Every acceptable filtered form of ``text`` and the exact number of redactions."""
+    pieces: list[frozenset[str]] = []
+    single_pieces: list[str] | None = []
     cursor = count = 0
     for match in _TOKEN.finditer(text):
-        pieces.append({text[cursor : match.start()]})
+        gap = text[cursor : match.start()]
         outcomes = _token_outcomes(match.group(0), patterns)
-        count += outcomes is not None
-        pieces.append(outcomes or {match.group(0)})
+        if outcomes is None:
+            piece_val = match.group(0)
+            if single_pieces is not None:
+                single_pieces.extend((gap, piece_val))
+            else:
+                pieces.extend((frozenset({gap}), frozenset({piece_val})))
+        else:
+            count += 1
+            if single_pieces is not None and len(outcomes) == 1:
+                single_pieces.extend((gap, next(iter(outcomes))))
+            else:
+                if single_pieces is not None:
+                    pieces = [frozenset({p}) for p in single_pieces]
+                    single_pieces = None
+                pieces.extend((frozenset({gap}), outcomes))
         cursor = match.end()
-    pieces.append({text[cursor:]})
+    tail = text[cursor:]
+    if single_pieces is not None:
+        single_pieces.append(tail)
+        return frozenset({"".join(single_pieces)}), count
+    pieces.append(frozenset({tail}))
     return frozenset("".join(parts) for parts in itertools.product(*pieces)), count
 
 
@@ -124,9 +141,8 @@ def _expected(text: str, patterns: tuple[str, ...]) -> tuple[set[str], int]:
     return set(forms), count
 
 
-@functools.cache
 def _redaction_count(text: str, patterns: tuple[str, ...]) -> int:
-    """The exact number of redactions in ``text`` under ``patterns`` (fast scalar oracle)."""
+    """The exact number of redactions in ``text`` under ``patterns``."""
     return sum(1 for match in _TOKEN.finditer(text) if _token_outcomes(match.group(0), patterns) is not None)
 
 
@@ -137,7 +153,6 @@ def _wrappers(chars: str, *, inner: int, full: bool) -> tuple[str, ...]:
     return ("", *chars, *(pair for pair in pairs if full or pair[inner] not in _BOUNDARY))
 
 
-@functools.cache
 def _wrapped_tuple(base: str, *, full: bool = False) -> tuple[str, ...]:
     leads = _wrappers(LEAD, inner=1, full=full)
     trails = _wrappers(TRAIL, inner=0, full=full)

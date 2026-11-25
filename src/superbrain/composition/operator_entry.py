@@ -9,10 +9,9 @@ from collections.abc import Callable
 from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from pathlib import Path
-from typing import TypeVar
+from typing import TYPE_CHECKING, TypeVar
 
 from superbrain.adapters.auth.ssh_sig import SshSigVerifier
-from superbrain.adapters.auth.webauthn_verifier import WebAuthnApprovalVerifier, WebAuthnResult
 from superbrain.adapters.os import find_ssh_keygen, os_adapters
 from superbrain.application.approvals import (
     BootstrapProposalHandler,
@@ -32,6 +31,9 @@ from superbrain.core.kernel import CallResult
 from superbrain.core.wire import make_error_envelope, make_success_envelope
 from superbrain.ports.approval import ApprovalPolicyPort, SshApprovalVerifierPort, WebAuthnApprovalVerifierPort
 from superbrain.ports.os import OsAdapters
+
+if TYPE_CHECKING:
+    from superbrain.adapters.auth.webauthn_verifier import WebAuthnResult
 
 __all__ = ["build_operator_service", "make_default_bootstrap_handler", "make_operator_executor"]
 
@@ -137,6 +139,8 @@ class _LocalhostWebAuthnVerifier(WebAuthnApprovalVerifierPort):
         match = _LOCALHOST_ORIGIN_RE.match(origin)
         if match is None or not 1 <= int(match.group(1)) <= 65535:
             raise BrainError(ErrorCode.UNAUTHENTICATED, "unauthenticated")
+        from superbrain.adapters.auth.webauthn_verifier import WebAuthnApprovalVerifier
+
         return WebAuthnApprovalVerifier(rp_id="localhost", origin=origin).verify(
             message,
             response_json=response_json,

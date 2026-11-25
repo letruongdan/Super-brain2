@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import contextlib
+import threading
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
-from superbrain.adapters.harness_config.merger import SharedConfigMergerAdapter
 from superbrain.application.approvals import OperatorHandle, RestoreHandler
 from superbrain.application.continuity_worker import sweep_legacy_continuity_copies
 from superbrain.application.jobs import JobService
@@ -35,8 +35,10 @@ from superbrain.core.kernel import (
     RequestAuthView,
     ShallowHealthMeta,
 )
+from superbrain.core.proposals import ManagedFormat
 from superbrain.ports.clock import Clock
 from superbrain.ports.os import OsAdapters
+from superbrain.ports.proposals import ConfigMergerPort, MergeOutput
 from superbrain.storage.capture_events import KernelCaptureStore
 from superbrain.storage.idempotency import StagedKernelStore
 from superbrain.storage.jobs import has_legacy_incomplete_settled_projections
@@ -55,6 +57,55 @@ from superbrain.storage.store import Store
 from superbrain.workers.executor import JobExecutor
 
 
+class LazyConfigMerger(ConfigMergerPort):
+    """Defer importing harness-config parsers (tomlkit/json) until config slice merge/remove is needed."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._inner: ConfigMergerPort | None = None
+
+    def _get(self) -> ConfigMergerPort:
+        if self._inner is None:
+            with self._lock:
+                if self._inner is None:
+                    from superbrain.adapters.harness_config.merger import SharedConfigMergerAdapter
+
+                    self._inner = SharedConfigMergerAdapter()
+        return self._inner
+
+    def apply_slice(
+        self,
+        existing_text: str | None,
+        *,
+        managed_format: ManagedFormat,
+        slice_id: str,
+        replacement_bytes: bytes,
+        expected_slice_digest: str | None,
+    ) -> MergeOutput:
+        return self._get().apply_slice(
+            existing_text,
+            managed_format=managed_format,
+            slice_id=slice_id,
+            replacement_bytes=replacement_bytes,
+            expected_slice_digest=expected_slice_digest,
+        )
+
+    def remove_slice(
+        self,
+        existing_text: str,
+        *,
+        managed_format: ManagedFormat,
+        slice_id: str,
+        expected_slice_digest: str | None,
+    ) -> MergeOutput:
+        return self._get().remove_slice(
+            existing_text,
+            managed_format=managed_format,
+            slice_id=slice_id,
+            expected_slice_digest=expected_slice_digest,
+        )
+
+
 def build_review_apply_service(
     store: Store,
     policy: PolicyStore,
@@ -71,7 +122,7 @@ def build_review_apply_service(
             adapters,
             data_root=root_dir,
             home_dir=Path.home(),
-            config_merger=SharedConfigMergerAdapter(),
+            config_merger=LazyConfigMerger(),
         )
     return None
 
@@ -193,7 +244,7 @@ class DaemonRestoreHandler(RestoreHandler):
                 self._adapters,
                 data_root=new_rt.root.root,
                 home_dir=Path.home(),
-                config_merger=SharedConfigMergerAdapter(),
+                config_merger=LazyConfigMerger(),
                 now_utc_fn=lambda: canonical_utc(self._clock.now()),
             )
         return job_service

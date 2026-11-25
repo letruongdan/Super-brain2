@@ -509,50 +509,91 @@ def test_hook_entry_privacy_rejection_exits_zero_with_zero_leaks_and_static_log(
     assert "invalid_input" in log_text
 
 
-def test_hook_entry_static_log_concurrency_lock_and_stderr_warning(trusted_tmp: Path) -> None:
-    """Verifies _write_static_log serialization under concurrency, bounded lock wait, and stderr drop warning."""
-    import io
-    import threading
+def test_hook_entry_static_log_preserves_concurrent_lines_without_stderr(trusted_tmp: Path) -> None:
+    """Concurrent multi-thread and multi-process cold log appends never lose lines, stall, or emit stderr."""
+    from superbrain.adapters.os import os_adapters
+    from superbrain.composition.hook_entry import _write_static_log, run_hook
 
-    from superbrain.adapters.os.locks import OUTBOX_FILE_LOCK
-    from superbrain.composition.hook_entry import _write_static_log
+    os_ = os_adapters()
 
-    log_path = trusted_tmp / "concurrent_static.log"
+    # Part 1: Barrier-synchronized threads on a cold log preserve every distinct line.
+    thread_log = trusted_tmp / "concurrent_threads.log"
+    barrier = threading.Barrier(8)
+    thread_errors: list[BaseException] = []
 
-    # Part 1: Concurrent writers must all land without collision
     def _worker(idx: int) -> None:
-        _write_static_log(log_path, phase="test_phase", code=f"code_{idx}")
+        try:
+            barrier.wait(timeout=10.0)
+            _write_static_log(thread_log, phase="test_phase", code=f"code_{idx}")
+        except BaseException as err:  # noqa: BLE001
+            thread_errors.append(err)
 
     threads = [threading.Thread(target=_worker, args=(i,)) for i in range(8)]
     for t in threads:
         t.start()
     for t in threads:
-        t.join()
+        t.join(timeout=10.0)
+    assert not thread_errors
+    thread_lines = thread_log.read_text(encoding="utf-8").splitlines()
+    assert len(thread_lines) == 8, f"expected 8 lines, got: {thread_lines}"
+    assert set(thread_lines) == {f"phase=test_phase error.code=code_{i}" for i in range(8)}
+    assert os_.permissions.object_problems(thread_log) == []
 
-    lines = [ln for ln in log_path.read_text(encoding="utf-8").splitlines() if ln]
-    assert len(lines) == 8, f"expected 8 lines, got: {lines}"
-    assert all("phase=test_phase" in ln for ln in lines)
-
-    # Part 2: Lock acquisition timeout emits warning to stderr and drops line cleanly
-    fd = os.open(log_path, os.O_RDWR)
-    assert OUTBOX_FILE_LOCK.try_lock_fd(fd), "failed to acquire external lock for test"
-    old_stderr = sys.stderr
-    sys.stderr = capture = io.StringIO()
-    try:
-        t0 = time.monotonic()
-        _write_static_log(log_path, phase="timeout_phase", code="timeout_code")
-        elapsed = time.monotonic() - t0
-    finally:
-        sys.stderr = old_stderr
-        OUTBOX_FILE_LOCK.unlock_fd(fd)
-        os.close(fd)
-
-    err_text = capture.getvalue()
-    assert (
-        "superbrain.hook_entry: dropped log line phase=timeout_phase error.code=timeout_code (lock timeout)\n"
-        in err_text
+    # Part 2: Synchronized subprocesses on a cold log never overwrite each other and emit zero stderr.
+    proc_outbox = trusted_tmp / "concurrent_proc_outbox"
+    proc_log = trusted_tmp / "concurrent_proc.log"
+    proc_cmd = (
+        "import pathlib, sys; "
+        "from superbrain.composition.hook_entry import main, run_hook; "
+        "outbox = pathlib.Path(sys.argv[1]); "
+        "log = pathlib.Path(sys.argv[2]); "
+        "sys.stdout.write('READY\\n'); sys.stdout.flush(); "
+        "assert sys.stdin.buffer.readline() == b'GO\\n'; "
+        "assert main(['--outbox', str(outbox), '--log', str(log)]) == 0; "
+        "assert all(run_hook(b'{bad', outbox_dir=outbox, log_path=log) == 0 for _ in range(4))"
     )
-    assert elapsed < 0.2, f"bounded wait exceeded expected deadline: {elapsed:.3f}s"
+    procs: list[subprocess.Popen[bytes]] = []
+    t0 = time.monotonic()
+    try:
+        for _ in range(4):
+            procs.append(
+                subprocess.Popen(
+                    [sys.executable, "-I", "-c", proc_cmd, str(proc_outbox), str(proc_log)],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=_clean_hook_env(),
+                )
+            )
+        for p in procs:
+            assert p.stdout is not None
+            assert p.stdout.readline().strip() == b"READY"
+        for p in procs:
+            assert p.stdin is not None
+            p.stdin.write(b"GO\n{bad")
+            p.stdin.flush()
+            p.stdin.close()
+        for p in procs:
+            rc = p.wait(timeout=15.0)
+            assert rc == 0
+            assert p.stderr is not None
+            assert p.stderr.read() == b""
+    finally:
+        for p in procs:
+            if p.poll() is None:
+                p.kill()
+                p.wait(timeout=5.0)
+    elapsed = time.monotonic() - t0
+    proc_lines = proc_log.read_text(encoding="utf-8").splitlines()
+    assert proc_lines == ["phase=hook error.code=invalid_input"] * 20
+    assert os_.permissions.object_problems(proc_log) == []
+    assert elapsed < 10.0
+
+    # Part 3: Fail-closed target check (existing directory as log target) exits 0 without crashing.
+    dir_target = trusted_tmp / "log_is_dir"
+    dir_target.mkdir()
+    assert run_hook(b"{bad", outbox_dir=proc_outbox, log_path=dir_target) == 0
+    assert dir_target.is_dir()
 
 
 def test_hook_entry_timeout_writes_hook_timeout_gap_and_exits_zero(trusted_tmp: Path) -> None:

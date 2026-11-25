@@ -220,9 +220,7 @@ class _TextScans:
     def _blocked_path(self, match: re.Match[str]) -> str:
         """§14.2: replace a blocked spelling of the token (any trim of its wrapper runs); wrappers outside it stay."""
         token = match.group(0)
-        if not self._paths.may_block(token):
-            return token
-        found = self._paths.find(token)
+        found = self._paths.find_cached(token)
         if found is None:
             return token
         start, cut = found

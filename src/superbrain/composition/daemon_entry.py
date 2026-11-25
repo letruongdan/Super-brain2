@@ -14,7 +14,6 @@ from datetime import datetime
 from pathlib import Path
 from types import FrameType
 
-from superbrain.adapters.harness_config.merger import SharedConfigMergerAdapter
 from superbrain.adapters.os import os_adapters
 from superbrain.adapters.os.daemon_config import read_daemon_config
 from superbrain.adapters.os.tls_material import verify_server_tls_files
@@ -27,7 +26,7 @@ from superbrain.application.journal_recovery import reconcile_and_classify_journ
 from superbrain.application.owner_loop import AuthGate, OwnerLoop, OwnerSession
 from superbrain.application.review_apply import ReviewApplyService
 from superbrain.cli_api._loopback_server import LoopbackServer
-from superbrain.composition._daemon_restore import DaemonRestoreHandler, build_review_apply_service
+from superbrain.composition._daemon_restore import DaemonRestoreHandler, LazyConfigMerger, build_review_apply_service
 from superbrain.composition._daemon_session import (
     DaemonTestHooks,
     _AdmittedOwnerSession,
@@ -164,7 +163,7 @@ def _open_owner_session(
                 adapters,
                 data_root=rt.root.root,
                 home_dir=Path.home(),
-                config_merger=SharedConfigMergerAdapter(),
+                config_merger=LazyConfigMerger(),
                 now_utc_fn=lambda: canonical_utc(resolved_clock.now()),
             )
 

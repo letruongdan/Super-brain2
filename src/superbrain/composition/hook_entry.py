@@ -13,6 +13,7 @@ from pathlib import Path
 
 from superbrain.adapters.os import os_adapters
 from superbrain.adapters.os.locks import OUTBOX_FILE_LOCK
+from superbrain.adapters.os.physical_fs import atomic_append_no_follow
 from superbrain.application.privacy import PrivacyFilter
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.ids import new_id
@@ -26,13 +27,10 @@ from superbrain.ports.capture import (
     default_outbox_dir_renamer,
 )
 from superbrain.storage._outbox_io import (
-    _O_BINARY,
-    _O_NOFOLLOW,
     ensure_dir_tree_atomic,
     ensure_secure_regular_file_atomic,
     reject_links_upward,
     thread_lock_for,
-    write_all_fd,
 )
 from superbrain.storage.outbox import OutboxSpool
 
@@ -50,27 +48,7 @@ def _write_static_log(log_path: Path | None, *, phase: str, code: str) -> None:
         with thread_lock_for(resolved):
             ensure_dir_tree_atomic(resolved.parent, perms, renamer, verify_existing=False)
             ensure_secure_regular_file_atomic(resolved, perms)
-            fd = os.open(resolved, os.O_WRONLY | os.O_APPEND | _O_BINARY | _O_NOFOLLOW, 0o600)
-            try:
-                locked = False
-                for _ in range(25):
-                    if OUTBOX_FILE_LOCK.try_lock_fd(fd):
-                        locked = True
-                        break
-                    time.sleep(0.001)
-                if not locked:
-                    sys.stderr.write(
-                        f"superbrain.hook_entry: dropped log line phase={phase} error.code={code} (lock timeout)\n"
-                    )
-                    sys.stderr.flush()
-                    return
-                try:
-                    os.lseek(fd, 0, os.SEEK_END)
-                    write_all_fd(fd, f"phase={phase} error.code={code}\n".encode())
-                finally:
-                    OUTBOX_FILE_LOCK.unlock_fd(fd)
-            finally:
-                os.close(fd)
+            atomic_append_no_follow(resolved, f"phase={phase} error.code={code}\n".encode())
     except (OSError, BrainError):
         pass
 

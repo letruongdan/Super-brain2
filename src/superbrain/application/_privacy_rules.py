@@ -534,7 +534,14 @@ class _PathMatcher:
                 self._chain_globs.append([_Glob(part) for part in parts])
         self._names = re.compile("|".join(f"(?:{n})" for n in names)) if names else None
         self._results: dict[str, bool] = {}
+        self._find_results: dict[str, tuple[int, int] | tuple[()]] = {}
         self._needles = _path_needles(patterns)
+        self._single_needle: str | None = (
+            self._needles[0] if (self._needles is not None and len(self._needles) == 1) else None
+        )
+        self._prefilter: _PathPrefilter | None = (
+            _build_path_prefilter(self._needles) if (self._needles is not None and len(self._needles) > 1) else None
+        )
 
     def fresh(self) -> _PathMatcher:
         """Clone immutable compiled matchers with an empty per-run result cache."""
@@ -544,7 +551,10 @@ class _PathMatcher:
         clone._chain_globs = self._chain_globs
         clone._names = self._names
         clone._needles = self._needles
+        clone._single_needle = self._single_needle
+        clone._prefilter = self._prefilter
         clone._results = {}
+        clone._find_results = {}
         return clone
 
     def may_block(self, token: str) -> bool:
@@ -552,7 +562,20 @@ class _PathMatcher:
         if self._needles is None:
             return True
         low = token.lower()
-        return any(needle in low for needle in self._needles)
+        if self._single_needle is not None:
+            return self._single_needle in low
+        assert self._prefilter is not None
+        return self._prefilter.matches(low)
+
+    def find_cached(self, token: str) -> tuple[int, int] | None:
+        """Per-run bounded cache over ``may_block`` + ``find`` for repeated tokens."""
+        cached = self._find_results.get(token)
+        if cached is not None:
+            return cached if cached else None
+        found = self.find(token) if self.may_block(token) else None
+        if len(token) <= 256 and len(self._find_results) < 2048:
+            self._find_results[token] = found if found is not None else ()
+        return found
 
     def blocked(self, token: str) -> bool:
         cached = self._results.get(token)
@@ -577,6 +600,9 @@ class _PathMatcher:
             return lead, trail  # the fully trimmed spelling first: every wrapper outside it is kept
         if not lead and not trail:
             return None
+        if "/" not in low and "\\" not in low:
+            rev = low[::-1]
+            return next((hit for g in self._name_globs if (hit := g.single(low, rev, lead, trail)) is not None), None)
         segs = _PATH_SPLIT.split(low)
         if len(segs) == 1:
             rev = low[::-1]
@@ -609,9 +635,19 @@ class _PathMatcher:
 
     def _matches(self, token: str) -> bool:
         low = token.lower()
-        if self._needles is not None and not any(needle in low for needle in self._needles):
-            return False
-        return self._matches_parts([p for p in _PATH_SPLIT.split(low) if p and p != "."])
+        if self._needles is not None:
+            if self._single_needle is not None:
+                if self._single_needle not in low:
+                    return False
+            else:
+                assert self._prefilter is not None
+                if not self._prefilter.matches(low):
+                    return False
+        if "/" not in low and "\\" not in low:
+            parts = [] if low == "." else ([low] if low else [])
+        else:
+            parts = [p for p in _PATH_SPLIT.split(low) if p and p != "."]
+        return self._matches_parts(parts)
 
     def _matches_parts(self, parts: list[str]) -> bool:
         for index, part in enumerate(parts):
