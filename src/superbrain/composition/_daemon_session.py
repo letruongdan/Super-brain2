@@ -14,7 +14,6 @@ from superbrain.application.approvals import OperatorHandle
 from superbrain.application.continuity_worker import ContinuityWorkerCoordinator
 from superbrain.application.deadlines import Reservation
 from superbrain.application.dispatch import KernelToolDomain, PreparedEffect
-from superbrain.application.handoff_service import HandoffKernelDomain
 from superbrain.application.jobs import JobService
 from superbrain.application.owner_loop import AuthGate, OwnerSession
 from superbrain.composition._daemon_job_recovery import UNREADABLE, LeasedAttempts
@@ -55,10 +54,8 @@ from superbrain.core.wire import encode_envelope, make_success_envelope
 from superbrain.ports.clock import Clock, MonotonicClock
 from superbrain.ports.continuity import CONTINUITY_REFRESH_JOB_KIND
 from superbrain.ports.policy import Intent
-from superbrain.storage.handoffs import HandoffStore
 from superbrain.storage.idempotency import StagedKernelStore
 from superbrain.storage.runtime import Runtime
-from superbrain.storage.send_attempts import KernelSendAttemptStore
 from superbrain.workers.executor import JobExecutor, WorkItem
 
 _DAEMON_WORKER_ITEM_BUDGET_NS = 60_000_000_000
@@ -83,6 +80,8 @@ class DaemonTestHooks:
     before_runtime_close: Callable[[Runtime], None] | None = None
 
 
+_DEFAULT_HANDOFF_TOOLS: frozenset[str] = frozenset({"prepare_task", "get_artifact", "submit_episode"})
+
 _STORED_REF_TOOL: dict[str, str] = {
     "delivery_result": "prepare_task",
     "artifact_result": "get_artifact",
@@ -95,16 +94,36 @@ def build_default_handoff_domain(
     rt: Runtime,
     clock: Clock,
     writer_epoch: int,
-) -> HandoffKernelDomain | None:
+) -> KernelToolDomain | None:
     """Build the production SP2-4 ``HandoffKernelDomain`` when store v8 and policy v5 are admitted."""
     if rt.store.schema_version < 8 or rt.policy.schema_version < 5:
         return None
+    from superbrain.application.handoff_service import HandoffKernelDomain
+    from superbrain.storage.handoffs import HandoffStore
+    from superbrain.storage.send_attempts import KernelSendAttemptStore
+
     return HandoffKernelDomain(
         handoffs=HandoffStore(rt.store, rt.policy),
         policy=rt.policy,
         clock=clock,
         send_attempts=KernelSendAttemptStore(rt.store, rt.policy, writer_epoch=writer_epoch),
     )
+
+
+def make_default_handoff_domain_factory(
+    *,
+    rt: Runtime,
+    clock: Clock,
+    writer_epoch: int,
+) -> Callable[[], KernelToolDomain | None] | None:
+    """Return a lazy builder for ``HandoffKernelDomain`` when store v8 and policy v5 are admitted."""
+    if rt.store.schema_version < 8 or rt.policy.schema_version < 5:
+        return None
+
+    def _build() -> KernelToolDomain | None:
+        return build_default_handoff_domain(rt=rt, clock=clock, writer_epoch=writer_epoch)
+
+    return _build
 
 
 class _DaemonCompositeDomain:
@@ -116,10 +135,18 @@ class _DaemonCompositeDomain:
         delegate: KernelToolDomain | None,
         *,
         fallback: KernelToolDomain | None = None,
+        fallback_factory: Callable[[], KernelToolDomain | None] | None = None,
     ) -> None:
         self._job_service = job_service
         self._delegate = delegate
         self._fallback = fallback
+        self._fallback_factory = fallback_factory
+
+    def _get_fallback(self) -> KernelToolDomain | None:
+        if self._fallback is None and self._fallback_factory is not None:
+            self._fallback = self._fallback_factory()
+            self._fallback_factory = None
+        return self._fallback
 
     def rebind_job_service(self, job_service: JobService) -> None:
         """Point subsequent job queries at the post-restore ``JobService``."""
@@ -129,6 +156,16 @@ class _DaemonCompositeDomain:
         """Point SP2-4 continuity tools at the post-restore ``HandoffKernelDomain``."""
         if self._delegate is None:
             self._fallback = fallback
+            self._fallback_factory = None
+
+    def rebind_fallback_factory(
+        self,
+        factory: Callable[[], KernelToolDomain | None] | None,
+    ) -> None:
+        """Reset SP2-4 continuity fallback to a post-restore lazy factory."""
+        if self._delegate is None:
+            self._fallback = None
+            self._fallback_factory = factory
 
     @property
     def store(self) -> object:
@@ -147,8 +184,10 @@ class _DaemonCompositeDomain:
             return True
         if self._delegate is not None and self._delegate.supports_tool(tool, deep=deep):
             return True
-        if self._fallback is not None and self._fallback.supports_tool(tool, deep=deep):
-            return True
+        if self._fallback is not None:
+            return self._fallback.supports_tool(tool, deep=deep)
+        if self._fallback_factory is not None:
+            return tool in _DEFAULT_HANDOFF_TOOLS and not deep
         return False
 
     def execute_readonly(self, call: Call, ctx: CallContext) -> dict[str, JsonValue]:
@@ -161,23 +200,35 @@ class _DaemonCompositeDomain:
             return self._job_service.get_job(job_id, ctx.principal, selected_scope=ctx.selected_scope).to_dict()
         if self._delegate is not None and self._delegate.supports_tool(call.tool, deep=False):
             return self._delegate.execute_readonly(call, ctx)
-        if self._fallback is not None and self._fallback.supports_tool(call.tool, deep=False):
-            return self._fallback.execute_readonly(call, ctx)
+        if self._fallback is not None or (
+            self._fallback_factory is not None and call.tool in _DEFAULT_HANDOFF_TOOLS
+        ):
+            fb = self._get_fallback()
+            if fb is not None and fb.supports_tool(call.tool, deep=False):
+                return fb.execute_readonly(call, ctx)
         raise BrainError(ErrorCode.CAPABILITY_UNAVAILABLE, "capability unavailable")
 
     def prepare_mutation(self, call: Call, ctx: CallContext, *, now: datetime) -> PreparedEffect:
         if self._delegate is not None and self._delegate.supports_tool(call.tool, deep=False):
             return self._delegate.prepare_mutation(call, ctx, now=now)
-        if self._fallback is not None and self._fallback.supports_tool(call.tool, deep=False):
-            return self._fallback.prepare_mutation(call, ctx, now=now)
+        if self._fallback is not None or (
+            self._fallback_factory is not None and call.tool in _DEFAULT_HANDOFF_TOOLS
+        ):
+            fb = self._get_fallback()
+            if fb is not None and fb.supports_tool(call.tool, deep=False):
+                return fb.prepare_mutation(call, ctx, now=now)
         raise BrainError(ErrorCode.CAPABILITY_UNAVAILABLE, "capability unavailable")
 
     def _stored_target(self, result: StoredResult) -> KernelToolDomain | None:
         tool = _STORED_REF_TOOL.get(result.refs[0].kind) if result.refs else None
         if self._delegate is not None and (tool is None or self._delegate.supports_tool(tool, deep=False)):
             return self._delegate
-        if self._fallback is not None and tool is not None and self._fallback.supports_tool(tool, deep=False):
-            return self._fallback
+        if tool is not None and (
+            self._fallback is not None or (self._fallback_factory is not None and tool in _DEFAULT_HANDOFF_TOOLS)
+        ):
+            fb = self._get_fallback()
+            if fb is not None and fb.supports_tool(tool, deep=False):
+                return fb
         return self._delegate
 
     def render_stored(

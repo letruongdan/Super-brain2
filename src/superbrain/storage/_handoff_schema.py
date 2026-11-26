@@ -56,10 +56,16 @@ def _cols(db: sqlite3.Connection, table: str) -> set[str]:
     return {str(r[1]) for r in db.execute(f"PRAGMA table_info({table})").fetchall()}
 
 
-def _add_missing_cols(db: sqlite3.Connection, table: str, specs: tuple[tuple[str, str], ...]) -> None:
-    existing = _cols(db, table)
+def _add_missing_cols(
+    db: sqlite3.Connection,
+    table: str,
+    specs: tuple[tuple[str, str], ...],
+    *,
+    existing: set[str] | None = None,
+) -> None:
+    cols = _cols(db, table) if existing is None else existing
     for col_name, col_ddl in specs:
-        if col_name not in existing:
+        if col_name not in cols:
             db.execute(f"ALTER TABLE {table} ADD COLUMN {col_name} {col_ddl}")
 
 
@@ -80,26 +86,30 @@ def apply_handoff_store_v8(db: sqlite3.Connection) -> None:
     """Upgrade store v7 -> v8 with SP2-4 handoff revision headers, C5 columns, and delivery/episode tables."""
     sa_cols = _require_base_table(db, "artifact_send_attempt", _SEND_ATTEMPT_BASE_COLS)
     ra_cols = _require_base_table(db, "artifact_read_ack", _READ_ACK_BASE_COLS)
-    _require_base_table(db, "tasks", _TASKS_BASE_COLS)
-    _require_base_table(db, "task_handoffs", _TASK_HANDOFFS_BASE_COLS)
+    tasks_cols = _require_base_table(db, "tasks", _TASKS_BASE_COLS)
+    th_cols = _require_base_table(db, "task_handoffs", _TASK_HANDOFFS_BASE_COLS)
     _verify_pair_or_absent(sa_cols, _SEND_ATTEMPT_EXT_COLS, "artifact_send_attempt")
     _verify_pair_or_absent(ra_cols, _READ_ACK_EXT_COLS, "artifact_read_ack")
 
-    _add_missing_cols(db, "artifact_send_attempt", _SEND_ATTEMPT_EXT_COLS)
-    _add_missing_cols(db, "artifact_read_ack", _READ_ACK_EXT_COLS)
-    db.execute(
-        "UPDATE artifact_read_ack SET artifact_id = COALESCE("
-        "(SELECT s.artifact_id FROM artifact_send_attempt AS s WHERE s.id = artifact_read_ack.served_receipt_id), '') "
-        "WHERE artifact_id = ''"
-    )
+    _add_missing_cols(db, "artifact_send_attempt", _SEND_ATTEMPT_EXT_COLS, existing=sa_cols)
+    _add_missing_cols(db, "artifact_read_ack", _READ_ACK_EXT_COLS, existing=ra_cols)
+    if db.execute("SELECT 1 FROM artifact_read_ack LIMIT 1").fetchone() is not None:
+        db.execute(
+            "UPDATE artifact_read_ack SET artifact_id = COALESCE("
+            "(SELECT s.artifact_id FROM artifact_send_attempt AS s "
+            "WHERE s.id = artifact_read_ack.served_receipt_id), '') "
+            "WHERE artifact_id = ''"
+        )
 
-    _add_missing_cols(db, "tasks", (("goal_ref", "TEXT"), ("goal_holder_id", "TEXT")))
-    _add_missing_cols(db, "task_handoffs", _TASK_HANDOFF_V8_COLS)
-    db.execute(
-        "UPDATE task_handoffs SET updated_at = COALESCE("
-        "(SELECT t.updated_at FROM tasks AS t WHERE t.task_id = task_handoffs.task_id), '') "
-        "WHERE updated_at = ''"
-    )
+    _add_missing_cols(db, "tasks", (("goal_ref", "TEXT"), ("goal_holder_id", "TEXT")), existing=tasks_cols)
+    _add_missing_cols(db, "task_handoffs", _TASK_HANDOFF_V8_COLS, existing=th_cols)
+    has_handoffs = db.execute("SELECT 1 FROM task_handoffs LIMIT 1").fetchone() is not None
+    if has_handoffs:
+        db.execute(
+            "UPDATE task_handoffs SET updated_at = COALESCE("
+            "(SELECT t.updated_at FROM tasks AS t WHERE t.task_id = task_handoffs.task_id), '') "
+            "WHERE updated_at = ''"
+        )
 
     db.execute(
         "CREATE TABLE IF NOT EXISTS handoff_revision_headers ("
@@ -129,17 +139,18 @@ def apply_handoff_store_v8(db: sqlite3.Connection) -> None:
         "ON handoff_revision_headers (task_id, revision_epoch, revision)"
     )
     # Backfill any v7 task_handoffs that already have a positive revision.
-    db.execute(
-        "INSERT OR IGNORE INTO handoff_revision_headers ("
-        "artifact_id, revision_epoch, revision, handoff_revision, task_id, task_state, task_state_source, "
-        "holder_restore_epoch, writer_generation, holder_harness_id, holder_principal, holder_session_ref, "
-        "session_state, agent_ref, agent_holder_id, observed_ref, agent_updated_at, observed_through, recorded_at"
-        ") SELECT "
-        "h.artifact_id, h.current_revision_epoch, h.current_revision, h.handoff_revision, h.task_id, "
-        "h.task_state, h.task_state_source, h.holder_restore_epoch, h.writer_generation, NULL, "
-        "h.holder_principal, h.holder_session_ref, NULL, h.agent_ref, NULL, h.observed_ref, h.agent_updated_at, "
-        "h.observed_through, h.updated_at FROM task_handoffs AS h WHERE h.current_revision >= 1"
-    )
+    if has_handoffs:
+        db.execute(
+            "INSERT OR IGNORE INTO handoff_revision_headers ("
+            "artifact_id, revision_epoch, revision, handoff_revision, task_id, task_state, task_state_source, "
+            "holder_restore_epoch, writer_generation, holder_harness_id, holder_principal, holder_session_ref, "
+            "session_state, agent_ref, agent_holder_id, observed_ref, agent_updated_at, observed_through, recorded_at"
+            ") SELECT "
+            "h.artifact_id, h.current_revision_epoch, h.current_revision, h.handoff_revision, h.task_id, "
+            "h.task_state, h.task_state_source, h.holder_restore_epoch, h.writer_generation, NULL, "
+            "h.holder_principal, h.holder_session_ref, NULL, h.agent_ref, NULL, h.observed_ref, h.agent_updated_at, "
+            "h.observed_through, h.updated_at FROM task_handoffs AS h WHERE h.current_revision >= 1"
+        )
 
     db.execute(
         "CREATE TABLE IF NOT EXISTS deliveries ("

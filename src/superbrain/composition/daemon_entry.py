@@ -26,7 +26,7 @@ from superbrain.composition._daemon_session import (
     DaemonTestHooks,
     _AdmittedOwnerSession,
     _DaemonCompositeDomain,
-    build_default_handoff_domain,
+    make_default_handoff_domain_factory,
 )
 from superbrain.composition._endpoint import (
     BoundLoopbackListener,
@@ -201,8 +201,8 @@ def _open_owner_session(
         composite_domain = _DaemonCompositeDomain(
             job_service,
             domain,
-            fallback=(
-                build_default_handoff_domain(
+            fallback_factory=(
+                make_default_handoff_domain_factory(
                     rt=rt,
                     clock=resolved_clock,
                     writer_epoch=rt.lease.epoch,
