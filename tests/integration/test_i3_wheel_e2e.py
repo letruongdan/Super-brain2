@@ -737,6 +737,7 @@ def test_i3_wheel_synthetic_lifecycle_e2e(inc2_installed_env: InstalledEnv, trus
         ).stdout
     )["data"]
     assert doc_locked["restore_epoch"] >= 1 and len(doc_locked["unresolved_accounting_locks"]) >= 1
+    assert doc_locked["terminal_channel_eligible"] is False
 
     # Reconcile locks: stale restore_epoch refused; current restore_epoch succeeds -> clean doctor!
     rt_rec = reopen_kernel_job_runtime(data_root, store_id, os_)
@@ -789,6 +790,16 @@ def test_i3_wheel_synthetic_lifecycle_e2e(inc2_installed_env: InstalledEnv, trus
         rt_rec.policy.reconcile_accounting_locks(
             base_policy_revision=rev_c, base_restore_epoch=cur_ep, policy_diff_digest=diff_d,
             approval=m_ok, signer_id=tofu_id, channel=ApprovalChannel.SSH_KEY, expected_restore_epoch=cur_ep,
+        )
+        # SP2-5 invalidates restored Layer-2 VERIFIED rows on restore_policy until re-verified.
+        rt_rec.policy.set_layer2_state(
+            harness_id="claude-code",
+            host_version="1.0.0",
+            config_digest="sha256:" + "1" * 64,
+            state=Layer2State.VERIFIED,
+        )
+        rt_rec.policy.set_layer2_state(
+            harness_id="codex", host_version="1.0.0", config_digest="sha256:" + "2" * 64, state=Layer2State.VERIFIED
         )
     finally:
         rt_rec.close()
