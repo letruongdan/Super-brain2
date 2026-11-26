@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Collection
 from functools import lru_cache
 
 from superbrain.core.errors import BrainError, ErrorCode
@@ -40,6 +41,7 @@ _ALTER_STMTS: dict[str, tuple[str, ...]] = {
         "ALTER TABLE task_handoffs ADD COLUMN takeover_from_principal TEXT",
         "ALTER TABLE task_handoffs ADD COLUMN takeover_from_session_ref TEXT",
         "ALTER TABLE task_handoffs ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE task_handoffs ADD COLUMN agent_event_order INTEGER NOT NULL DEFAULT 0",
     ),
 }
 
@@ -64,6 +66,7 @@ _NEW_TABLE_STMTS: dict[str, str] = {
         "observed_ref TEXT, "
         "agent_updated_at TEXT, "
         "observed_through TEXT, "
+        "events_since_agent INTEGER NOT NULL DEFAULT 0 CHECK (events_since_agent >= 0), "
         "recorded_at TEXT NOT NULL, "
         "PRIMARY KEY (artifact_id, revision_epoch, revision))"
     ),
@@ -297,16 +300,44 @@ def apply_handoff_store_v8(db: sqlite3.Connection) -> None:
             "INSERT OR IGNORE INTO handoff_revision_headers ("
             "artifact_id, revision_epoch, revision, handoff_revision, task_id, task_state, task_state_source, "
             "holder_restore_epoch, writer_generation, holder_harness_id, holder_principal, holder_session_ref, "
-            "session_state, agent_ref, agent_holder_id, observed_ref, agent_updated_at, observed_through, recorded_at"
+            "session_state, agent_ref, agent_holder_id, observed_ref, agent_updated_at, observed_through, "
+            "events_since_agent, recorded_at"
             ") SELECT "
             "h.artifact_id, h.current_revision_epoch, h.current_revision, h.handoff_revision, h.task_id, "
             "h.task_state, h.task_state_source, h.holder_restore_epoch, h.writer_generation, NULL, "
             "h.holder_principal, h.holder_session_ref, NULL, h.agent_ref, NULL, h.observed_ref, h.agent_updated_at, "
-            "h.observed_through, h.updated_at FROM task_handoffs AS h WHERE h.current_revision >= 1"
+            "h.observed_through, 0, h.updated_at FROM task_handoffs AS h WHERE h.current_revision >= 1"
         )
 
     if _definitions_by_table(db, _ALL_V8_TABLES) != v8_ddls:
         raise BrainError(ErrorCode.INTEGRITY_FAILURE, "store v8 post-migration schema mismatch")
+
+
+def read_revision_events_since_agent_in_tx(
+    db: sqlite3.Connection,
+    *,
+    artifact_id: str,
+    revision_epoch: int,
+    revision: int,
+) -> int:
+    """Return committed ``events_since_agent`` for ``(artifact_id, revision_epoch, revision)``, or ``0``."""
+    if revision < 1:
+        return 0
+    row = db.execute(
+        "SELECT events_since_agent FROM handoff_revision_headers "
+        "WHERE artifact_id = ? AND revision_epoch = ? AND revision = ?",
+        (artifact_id, revision_epoch, revision),
+    ).fetchone()
+    return 0 if row is None else int(row[0])
+
+
+def max_task_event_order_in_tx(db: sqlite3.Connection, task_id: str) -> int:
+    """Return the highest ``event_order`` linked to ``task_id`` in ``session_task_events``."""
+    row = db.execute(
+        "SELECT COALESCE(MAX(event_order), 0) FROM session_task_events WHERE task_id = ?",
+        (task_id,),
+    ).fetchone()
+    return 0 if row is None else int(row[0])
 
 
 def record_v8_revision_header_in_tx(
@@ -326,6 +357,8 @@ def record_v8_revision_header_in_tx(
     recorded_at: str,
     holder_harness_id: str | None = None,
     session_state: str | None = None,
+    batch_event_orders: Collection[int] | None = None,
+    reset_events_since_agent: bool = False,
     store: object | None = None,
 ) -> None:
     """Best-effort sync of ``handoff_revision_headers`` when the store is already on ``v8+``."""
@@ -335,13 +368,14 @@ def record_v8_revision_header_in_tx(
     if has_tbl is None:
         return
     hrow = db.execute(
-        "SELECT artifact_id, current_revision_epoch, holder_restore_epoch, writer_generation, agent_holder_id "
-        "FROM task_handoffs WHERE task_id = ?",
+        "SELECT artifact_id, current_revision_epoch, holder_restore_epoch, writer_generation, "
+        "agent_holder_id, agent_event_order FROM task_handoffs WHERE task_id = ?",
         (task_id,),
     ).fetchone()
     if hrow is None:
         return
-    eff_epoch = int(hrow[1])
+    old_epoch = int(hrow[1])
+    eff_epoch = old_epoch
     if store is not None:
         schema_ver = getattr(store, "schema_version", 0)
         root_obj = getattr(store, "root", None)
@@ -350,7 +384,7 @@ def record_v8_revision_header_in_tx(
             from superbrain.storage._restore_epoch import read_restore_epoch
 
             eff_epoch = read_restore_epoch(root_obj, schema_version=schema_ver, os_=os_obj)
-            if eff_epoch != int(hrow[1]):
+            if eff_epoch != old_epoch:
                 db.execute(
                     "UPDATE task_handoffs SET current_revision_epoch = ? WHERE task_id = ?",
                     (eff_epoch, task_id),
@@ -359,12 +393,33 @@ def record_v8_revision_header_in_tx(
                     "UPDATE tasks SET current_revision_epoch = ? WHERE task_id = ?",
                     (eff_epoch, task_id),
                 )
+    if reset_events_since_agent:
+        next_events_since_agent = 0
+        db.execute(
+            "UPDATE task_handoffs SET agent_event_order = ? WHERE task_id = ?",
+            (max_task_event_order_in_tx(db, task_id), task_id),
+        )
+    else:
+        prev_count = read_revision_events_since_agent_in_tx(
+            db,
+            artifact_id=str(hrow[0]),
+            revision_epoch=old_epoch,
+            revision=next_revision - 1,
+        )
+        agent_ev_order = int(hrow[5])
+        added = (
+            sum(1 for order_i in set(batch_event_orders) if order_i > agent_ev_order)
+            if batch_event_orders
+            else 0
+        )
+        next_events_since_agent = prev_count + added
     db.execute(
         "INSERT OR REPLACE INTO handoff_revision_headers ("
         "artifact_id, revision_epoch, revision, handoff_revision, task_id, task_state, task_state_source, "
         "holder_restore_epoch, writer_generation, holder_harness_id, holder_principal, holder_session_ref, "
-        "session_state, agent_ref, agent_holder_id, observed_ref, agent_updated_at, observed_through, recorded_at"
-        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "session_state, agent_ref, agent_holder_id, observed_ref, agent_updated_at, observed_through, "
+        "events_since_agent, recorded_at"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             str(hrow[0]),
             eff_epoch,
@@ -384,9 +439,15 @@ def record_v8_revision_header_in_tx(
             observed_ref,
             agent_updated_at,
             observed_through,
+            next_events_since_agent,
             recorded_at,
         ),
     )
 
 
-__all__ = ["apply_handoff_store_v8", "record_v8_revision_header_in_tx"]
+__all__ = [
+    "apply_handoff_store_v8",
+    "max_task_event_order_in_tx",
+    "read_revision_events_since_agent_in_tx",
+    "record_v8_revision_header_in_tx",
+]

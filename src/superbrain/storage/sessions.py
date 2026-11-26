@@ -523,6 +523,7 @@ class SessionStore(SessionWorkerMixin):
                 agent_updated_at=stamp,
                 observed_through=cur.observed_through,
                 recorded_at=stamp,
+                reset_events_since_agent=True,
                 store=self._store,
             )
             updated = txn.db.execute(

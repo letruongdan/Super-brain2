@@ -720,6 +720,7 @@ class HandoffKernelDomain(KernelToolDomain):
                         "observed_ref": h.observed_ref,
                         "agent_updated_at": h.agent_updated_at,
                         "observed_through": h.observed_through,
+                        "events_since_agent": h.events_since_agent,
                     }
                     for h in hist_headers
                 ]

@@ -3959,7 +3959,7 @@ def test_get_artifact_l1_l2_pins_observed_ref_sources_and_events_since_agent_acr
             now=clock.now(),
         )
 
-        # Post-restore (post_ep, 3) pins [ev-r5-003] (plus ev-r5-001? NO: worker batch 2 only saw ev-r5-003!).
+        # Post-restore (post_ep, 3) pins [ev-r5-003] (worker batch 2 after rev 1 agent write -> cumulative 2).
         r3y_l2 = _call_ok(
             bridge2,
             rt2,
@@ -3977,7 +3977,7 @@ def test_get_artifact_l1_l2_pins_observed_ref_sources_and_events_since_agent_acr
             scope=scope,
         )
         m3y, o3y, c3y = _extract_obs_and_conv(r3y_l2)
-        assert m3y["events_since_agent"] == 1
+        assert m3y["events_since_agent"] == 2
         assert [i["source_event_id"] for i in o3y] == ["ev-r5-003"]
         assert [i["source_event_id"] for i in c3y] == ["ev-r5-003"]
         assert "Event 3 post-restore" in str(o3y[0])
@@ -4031,13 +4031,13 @@ def test_get_artifact_l1_l2_pins_observed_ref_sources_and_events_since_agent_acr
             scope=scope,
         )
         m_ee, o_ee, c_ee = _extract_obs_and_conv(r3y_exp_ev)
-        assert m_ee["events_since_agent"] == 1
+        assert m_ee["events_since_agent"] == 2
         assert len(o_ee) == 1 and o_ee[0]["source_event_id"] == "ev-r5-003" and o_ee[0]["status"] == "expired"
         assert len(c_ee) == 1 and c_ee[0]["status"] == "expired"
         assert "Event 3 post-restore" not in str(r3y_exp_ev["resources"])
         assert "Event 4 post uncommitted" not in str(r3y_exp_ev["resources"])
 
-        # Advance 12 more days (104d since Event 3, 94d since obs_post): observed_ref expired -> fails closed.
+        # Advance 12 more days (104d since Event 3, 94d since obs_post): observed_ref expired -> count stays 2.
         clock.advance(dt.timedelta(days=12))
         r3y_exp_ref = _call_ok(
             bridge2,
@@ -4056,7 +4056,7 @@ def test_get_artifact_l1_l2_pins_observed_ref_sources_and_events_since_agent_acr
             scope=scope,
         )
         m_eo, o_eo, c_eo = _extract_obs_and_conv(r3y_exp_ref)
-        assert m_eo["events_since_agent"] == 0
+        assert m_eo["events_since_agent"] == 2
         assert o_eo == [
             {
                 "kind": "observed_summary",
@@ -4067,5 +4067,576 @@ def test_get_artifact_l1_l2_pins_observed_ref_sources_and_events_since_agent_acr
             }
         ]
         assert c_eo == []
+    finally:
+        rt2.close()
+
+
+def test_events_since_agent_accumulates_across_worker_batches_takeover_retries_and_restore(
+    trusted_tmp: Path,
+) -> None:
+    import json
+
+    from superbrain.application.continuity_worker import ContinuityWorkerCoordinator
+    from superbrain.composition._daemon_session import build_default_handoff_domain
+    from superbrain.composition.kernel_bridge import KernelBridge
+    from superbrain.core.canonical import canonical_json
+    from superbrain.core.ids import new_id
+    from superbrain.ports.policy import IntentKind
+    from superbrain.storage.backup import create_store_backup
+    from superbrain.storage.handoffs import HandoffStore
+    from superbrain.storage.kernel_schema import KERNEL_POLICY_MIGRATIONS, KERNEL_STORE_MIGRATIONS
+    from superbrain.storage.policy_store import PolicyStore
+    from superbrain.storage.restore import restore_store
+    from superbrain.storage.sessions import SessionStore
+    from superbrain.workers.executor import PRODUCTION_JOB_HANDLERS, JobExecutor
+    from tests.storage.conftest import maintenance_lease
+    from tests.support.inc2_fixture import kernel_job_service
+
+    def _obs_meta_and_items(data: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        obs_meta: dict[str, Any] = {}
+        obs_items: list[dict[str, Any]] = []
+        for res in data["resources"]:
+            name = str(res["name"])
+            if name.startswith("observed_"):
+                parsed = json.loads(str(res["content"]))
+                for entry in parsed:
+                    if isinstance(entry, dict) and "events_since_agent" in entry:
+                        obs_meta = entry
+                    else:
+                        obs_items.append(entry)
+        return obs_meta, obs_items
+
+    def _l2_history(data: dict[str, Any]) -> list[dict[str, Any]]:
+        revs: list[dict[str, Any]] = []
+        for res in data["resources"]:
+            name = str(res["name"])
+            if name.startswith("l2_history_"):
+                revs.extend(json.loads(str(res["content"]))[0]["revision_history"])
+            elif name.startswith("l2_revisions_"):
+                revs.extend(json.loads(str(res["content"]))["revision_history"])
+        return revs
+
+    clock = FakeClock(dt.datetime(2026, 11, 26, 12, 0, tzinfo=dt.UTC))
+    os_ = os_adapters(clock=clock)
+    data_root = trusted_tmp / "r6-cnt" / "data"
+    rt = open_kernel_job_runtime(data_root, os_, role="sp24-r6")
+    try:
+        cred = seed_principal_and_credential(rt.policy, owner_id="dan", harness_id="claude-code", machine_id="m1")
+        ws = register_workspace_direct(
+            rt,
+            clock,
+            cred.principal,
+            alias="ws-r6",
+            checkout_dir=trusted_tmp / "r6-cnt" / "chk",
+            remote="https://github.example/dan/r6.git",
+        )
+        rt.store.reconcile_policy()
+        scope = Scope(ws.repo_id, ws.checkout_id)
+        domain = build_default_handoff_domain(rt=rt, clock=clock, writer_epoch=rt.lease.epoch)
+        assert domain is not None
+        bridge = KernelBridge(store=rt.store, policy=rt.policy, clock=clock, writer_epoch=rt.lease.epoch, domain=domain)
+        hs = HandoffStore(rt.store, rt.policy)
+        ss = SessionStore(rt.store, rt.policy)
+
+        prep = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "work",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "description": "Cumulative events_since_agent test",
+                "idempotency_key": "idem-r6-0000-prep-1",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        tid = str(prep["task_id"])
+        sref = ss.bind_session(
+            principal_id=cred.principal.principal_id,
+            repo_id=ws.repo_id,
+            checkout_id=ws.checkout_id,
+            harness_id="claude-code",
+            raw_session_id="RAW_SID_R6_1",
+            now=clock.now(),
+        ).session_ref
+
+        svc, _ = kernel_job_service(rt, clock)
+        exec_ = JobExecutor(PRODUCTION_JOB_HANDLERS, lambda: 10_000)
+        exec_.start()
+        try:
+            coord = ContinuityWorkerCoordinator(
+                rt=rt, job_service=svc, executor=exec_, clock=clock, mono=lambda: 10_000
+            )
+
+            def _record(seq: int, text: str, *, eid_prefix: str = "ev-r6") -> CaptureEventRecord:
+                clock.advance(dt.timedelta(seconds=5))
+                rec = CaptureEventRecord(
+                    event_id=f"{eid_prefix}-{seq:03d}",
+                    producer_stream="stream-r6",
+                    sequence=seq,
+                    harness_id="claude-code",
+                    kind="user_message",
+                    recorded_at=clock.now().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    payload={"role": "user", "text": text},
+                    session_ref=sref,
+                )
+                ss.record_session_event(
+                    session_ref=sref,
+                    repo_id=ws.repo_id,
+                    checkout_id=ws.checkout_id,
+                    task_id=tid,
+                    producer_stream="stream-r6",
+                    event=rec,
+                    now=clock.now(),
+                )
+                return rec
+
+            def _run_worker_batch() -> None:
+                clock.advance(dt.timedelta(seconds=65))
+                assert coord.enqueue_if_due(task_id=tid, now=clock.now()) is not None
+                assert coord.run_next(writer_epoch=rt.lease.epoch, now=clock.now()) is True
+
+            # 1. Worker-only revisions (no agent write yet): batch 1 (1 ev -> 1), batch 2 (2 evs -> 3).
+            _record(1, "Worker-only seq 1")
+            _run_worker_batch()
+            _record(2, "Worker-only seq 2")
+            _record(3, "Worker-only seq 3")
+            _run_worker_batch()
+            for lvl, ikey in (("L1", "idem-r6-0000-r2-l1"), ("L2", "idem-r6-0000-r2-l2")):
+                r2 = _call_ok(
+                    bridge,
+                    rt,
+                    "get_artifact",
+                    {
+                        "workspace_id": ws.repo_id,
+                        "task_id": tid,
+                        "artifact_id": tid,
+                        "revision_epoch": 0,
+                        "revision": 2,
+                        "level": lvl,
+                        "idempotency_key": ikey,
+                    },
+                    cred=cred,
+                    scope=scope,
+                )
+                m2, _ = _obs_meta_and_items(r2)
+                assert m2["events_since_agent"] == 3
+
+            # Record pre-patch seq 4 (still unsummarized) BEFORE agent write, then agent patch rev 3 resets to 0.
+            _record(4, "Pre-patch unsummarized seq 4")
+            hdr2 = hs.read_header(tid, principal_id=cred.principal.principal_id, scope=scope)
+            assert hdr2 is not None
+            _call_ok(
+                bridge,
+                rt,
+                "submit_episode",
+                {
+                    "task_id": tid,
+                    "session_id": "RAW_SID_R6_1",
+                    "workspace_id": ws.repo_id,
+                    "evidence": [],
+                    "base_revision": hdr2.handoff_revision,
+                    "fence": hdr2.handoff_live.fence.to_dict(),
+                    "takeover": {"acknowledge_active": True, "reason": "claim agent hold"},
+                    "handoff": {"working_goal": "Agent goal rev 3", "task_state": "open"},
+                    "idempotency_key": "idem-r6-0000-sub-3",
+                },
+                cred=cred,
+                scope=scope,
+            )
+            r3 = _call_ok(
+                bridge,
+                rt,
+                "get_artifact",
+                {
+                    "workspace_id": ws.repo_id,
+                    "task_id": tid,
+                    "artifact_id": tid,
+                    "revision_epoch": 0,
+                    "revision": 3,
+                    "level": "L1",
+                    "idempotency_key": "idem-r6-0000-r3-l1",
+                },
+                cred=cred,
+                scope=scope,
+            )
+            assert _obs_meta_and_items(r3)[0]["events_since_agent"] == 0
+
+            # 2. Multi-batch worker refreshes after agent patch (exact reviewer probe):
+            #    Batch 1 picks up pre-patch seq 4 + post-patch seq 5 -> ONLY seq 5 counts (1).
+            #    Batch 2 picks up post-patch seq 6 -> cumulative count becomes 2 (handoff_revision stays 1)!
+            ev5 = _record(5, "Post-patch batch 1 seq 5")
+            _run_worker_batch()
+            hdr4 = hs.read_revision_header(
+                artifact_id=tid,
+                revision_epoch=0,
+                revision=4,
+                principal_id=cred.principal.principal_id,
+                scope=scope,
+            )
+            assert hdr4 is not None and hdr4.handoff_revision == 1
+            bak_rev4 = create_store_backup(rt.store, os_, clock.now())
+
+            ev6 = _record(6, "Post-patch batch 2 seq 6")
+            _run_worker_batch()
+            hdr5 = hs.read_revision_header(
+                artifact_id=tid,
+                revision_epoch=0,
+                revision=5,
+                principal_id=cred.principal.principal_id,
+                scope=scope,
+            )
+            assert hdr5 is not None and hdr5.handoff_revision == 1
+
+            for rev_n, exp_cnt, prefix in ((4, 1, "rev4"), (5, 2, "rev5")):
+                for lvl in ("L1", "L2"):
+                    fresh = _call_ok(
+                        bridge,
+                        rt,
+                        "get_artifact",
+                        {
+                            "workspace_id": ws.repo_id,
+                            "task_id": tid,
+                            "artifact_id": tid,
+                            "revision_epoch": 0,
+                            "revision": rev_n,
+                            "level": lvl,
+                            "idempotency_key": f"idem-r6-0000-{prefix}-{lvl.lower()}-f",
+                        },
+                        cred=cred,
+                        scope=scope,
+                    )
+                    assert _obs_meta_and_items(fresh)[0]["events_since_agent"] == exp_cnt
+                    replay = _call_ok(
+                        bridge,
+                        rt,
+                        "get_artifact",
+                        {
+                            "workspace_id": ws.repo_id,
+                            "task_id": tid,
+                            "artifact_id": tid,
+                            "revision_epoch": 0,
+                            "revision": rev_n,
+                            "level": lvl,
+                            "idempotency_key": f"idem-r6-0000-{prefix}-{lvl.lower()}-f",
+                        },
+                        cred=cred,
+                        scope=scope,
+                    )
+                    assert _obs_meta_and_items(replay)[0]["events_since_agent"] == exp_cnt
+                    if lvl == "L2" and rev_n == 5:
+                        hist = _l2_history(fresh)
+                        assert [(h["revision"], h["events_since_agent"]) for h in hist[:5]] == [
+                            (5, 2),
+                            (4, 1),
+                            (3, 0),
+                            (2, 3),
+                            (1, 1),
+                        ]
+
+            # 3. Takeover-only (no agent patch) MUST preserve cumulative count (still 2) at rev 6!
+            hdr_live5 = hs.read_header(tid, principal_id=cred.principal.principal_id, scope=scope)
+            assert hdr_live5 is not None
+            _call_ok(
+                bridge,
+                rt,
+                "submit_episode",
+                {
+                    "task_id": tid,
+                    "session_id": "RAW_SID_R6_2",
+                    "workspace_id": ws.repo_id,
+                    "evidence": [],
+                    "base_revision": hdr_live5.handoff_revision,
+                    "fence": hdr_live5.handoff_live.fence.to_dict(),
+                    "takeover": {"acknowledge_active": True, "reason": "takeover without patch"},
+                    "idempotency_key": "idem-r6-0000-take-6",
+                },
+                cred=cred,
+                scope=scope,
+            )
+            for lvl in ("L1", "L2"):
+                r6 = _call_ok(
+                    bridge,
+                    rt,
+                    "get_artifact",
+                    {
+                        "workspace_id": ws.repo_id,
+                        "task_id": tid,
+                        "artifact_id": tid,
+                        "revision_epoch": 0,
+                        "revision": 6,
+                        "level": lvl,
+                        "idempotency_key": f"idem-r6-0000-r6-{lvl.lower()}",
+                    },
+                    cred=cred,
+                    scope=scope,
+                )
+                assert _obs_meta_and_items(r6)[0]["events_since_agent"] == 2
+
+            # 4. Duplicate event recording does not enqueue/double-count; worker commit with overlapping
+            #    already-summarized tuple + duplicate new tuple counts new event seq 7 ONLY ONCE -> 3.
+            ss.record_session_event(
+                session_ref=sref,
+                repo_id=ws.repo_id,
+                checkout_id=ws.checkout_id,
+                task_id=tid,
+                producer_stream="stream-r6",
+                event=ev6,
+                now=clock.now(),
+            )
+            clock.advance(dt.timedelta(seconds=65))
+            assert coord.enqueue_if_due(task_id=tid, now=clock.now()) is None
+
+            ev7 = _record(7, "Post-takeover seq 7")
+            dup_summary: dict[str, Any] = {
+                "source_events": [
+                    ["stream-r6", 6, ev6.event_id, digest_bytes(canonical_json(ev6.payload))],
+                    ["stream-r6", 7, ev7.event_id, digest_bytes(canonical_json(ev7.payload))],
+                    ["stream-r6", 7, ev7.event_id, digest_bytes(canonical_json(ev7.payload))],
+                ],
+                "items": [["user_message", ev7.event_id, "Post-takeover seq 7"]],
+                "last_event_at": ev7.recorded_at,
+                "long_running_source": None,
+            }
+            dup_bytes = canonical_json(dup_summary)
+            dup_dig = digest_bytes(dup_bytes)
+            rt.store.cas.put(dup_bytes)
+            out7 = svc._store.transact(
+                lambda ktx: ss.apply_worker_commit_in_tx(
+                    ktx,
+                    task_id=tid,
+                    job_id=new_id(),
+                    observed_digest=dup_dig,
+                    observed_summary=dup_summary,
+                    now=clock.now(),
+                    cutoff_order=7,
+                )
+            )
+            assert out7.current_revision == 7
+            r7 = _call_ok(
+                bridge,
+                rt,
+                "get_artifact",
+                {
+                    "workspace_id": ws.repo_id,
+                    "task_id": tid,
+                    "artifact_id": tid,
+                    "revision_epoch": 0,
+                    "revision": 7,
+                    "level": "L1",
+                    "idempotency_key": "idem-r6-0000-r7-l1",
+                },
+                cred=cred,
+                scope=scope,
+            )
+            assert _obs_meta_and_items(r7)[0]["events_since_agent"] == 3
+
+            # 5. Quarantine seq 5 while committed rev 5 (2) & rev 7 (3) remain intact with redacted content.
+            ev5_dig = digest_bytes(canonical_json(ev5.payload))
+            rt.policy.record_intent(IntentKind.QUARANTINE, {"digest": ev5_dig})
+            rt.store.reconcile_policy()
+            r5_q = _call_ok(
+                bridge,
+                rt,
+                "get_artifact",
+                {
+                    "workspace_id": ws.repo_id,
+                    "task_id": tid,
+                    "artifact_id": tid,
+                    "revision_epoch": 0,
+                    "revision": 5,
+                    "level": "L2",
+                    "idempotency_key": "idem-r6-0000-r5-q",
+                },
+                cred=cred,
+                scope=scope,
+            )
+            m5q, o5q = _obs_meta_and_items(r5_q)
+            assert m5q["events_since_agent"] == 2
+            assert any(i["source_event_id"] == ev6.event_id and i["status"] == "ok" for i in o5q)
+        finally:
+            exec_.close(5.0)
+    finally:
+        rt.close()
+
+    # 6. Restore backup from rev 4 (count=1), advance epoch, commit post-restore worker batch -> 2,
+    #    then agent patch -> 0, then worker batch -> 1.
+    with maintenance_lease(data_root, os_) as (root_obj, lease):
+        pol_h = PolicyStore.open(root_obj, lease, os_, migrations=KERNEL_POLICY_MIGRATIONS)
+        try:
+            rep = restore_store(
+                root_obj, lease, os_, bak_rev4, pol_h, clock.now(), migrations=KERNEL_STORE_MIGRATIONS
+            )
+            post_ep = rep.new_epoch
+            assert post_ep > 0
+        finally:
+            pol_h.close()
+
+    rt2 = open_kernel_job_runtime(data_root, os_, role="sp24-r6")
+    try:
+        domain2 = build_default_handoff_domain(rt=rt2, clock=clock, writer_epoch=rt2.lease.epoch)
+        assert domain2 is not None
+        bridge2 = KernelBridge(
+            store=rt2.store, policy=rt2.policy, clock=clock, writer_epoch=rt2.lease.epoch, domain=domain2
+        )
+        hs2 = HandoffStore(rt2.store, rt2.policy)
+        ss2 = SessionStore(rt2.store, rt2.policy)
+        svc2, _ = kernel_job_service(rt2, clock)
+        exec2 = JobExecutor(PRODUCTION_JOB_HANDLERS, lambda: 10_000)
+        exec2.start()
+        try:
+            coord2 = ContinuityWorkerCoordinator(
+                rt=rt2, job_service=svc2, executor=exec2, clock=clock, mono=lambda: 10_000
+            )
+            # Archived (0, 4) preserves 1.
+            r04 = _call_ok(
+                bridge2,
+                rt2,
+                "get_artifact",
+                {
+                    "workspace_id": ws.repo_id,
+                    "task_id": tid,
+                    "artifact_id": tid,
+                    "revision_epoch": 0,
+                    "revision": 4,
+                    "level": "L1",
+                    "idempotency_key": "idem-r6-0000-r04-p",
+                },
+                cred=cred,
+                scope=scope,
+            )
+            assert _obs_meta_and_items(r04)[0]["events_since_agent"] == 1
+
+            clock.advance(dt.timedelta(seconds=5))
+            ss2.record_session_event(
+                session_ref=sref,
+                repo_id=ws.repo_id,
+                checkout_id=ws.checkout_id,
+                task_id=tid,
+                producer_stream="stream-r6",
+                event=CaptureEventRecord(
+                    event_id="ev-r6-post-001",
+                    producer_stream="stream-r6",
+                    sequence=8,
+                    harness_id="claude-code",
+                    kind="user_message",
+                    recorded_at=clock.now().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    payload={"role": "user", "text": "Post-restore event 8"},
+                    session_ref=sref,
+                ),
+                now=clock.now(),
+            )
+            clock.advance(dt.timedelta(seconds=65))
+            assert coord2.enqueue_if_due(task_id=tid, now=clock.now()) is not None
+            assert coord2.run_next(writer_epoch=rt2.lease.epoch, now=clock.now()) is True
+
+            # Accumulates from restored anchor rev 4 (1 + 1 = 2)!
+            r5p = _call_ok(
+                bridge2,
+                rt2,
+                "get_artifact",
+                {
+                    "workspace_id": ws.repo_id,
+                    "task_id": tid,
+                    "artifact_id": tid,
+                    "revision_epoch": post_ep,
+                    "revision": 5,
+                    "level": "L2",
+                    "idempotency_key": "idem-r6-0000-r5p-l2",
+                },
+                cred=cred,
+                scope=scope,
+            )
+            assert _obs_meta_and_items(r5p)[0]["events_since_agent"] == 2
+            assert [(h["revision_epoch"], h["revision"], h["events_since_agent"]) for h in _l2_history(r5p)] == [
+                (post_ep, 5, 2),
+                (0, 4, 1),
+                (0, 3, 0),
+                (0, 2, 3),
+                (0, 1, 1),
+            ]
+
+            # Post-restore agent patch resets to 0, then subsequent worker batch starts fresh at 1.
+            hdr_p5 = hs2.read_header(tid, principal_id=cred.principal.principal_id, scope=scope)
+            assert hdr_p5 is not None
+            _call_ok(
+                bridge2,
+                rt2,
+                "submit_episode",
+                {
+                    "task_id": tid,
+                    "session_id": "RAW_SID_R6_1",
+                    "workspace_id": ws.repo_id,
+                    "evidence": [],
+                    "base_revision": hdr_p5.handoff_revision,
+                    "fence": hdr_p5.handoff_live.fence.to_dict(),
+                    "takeover": {"acknowledge_active": True, "reason": "post-restore agent reset"},
+                    "handoff": {"working_goal": "Post-restore agent goal", "task_state": "open"},
+                    "idempotency_key": "idem-r6-0000-sub-p6",
+                },
+                cred=cred,
+                scope=scope,
+            )
+            r6p = _call_ok(
+                bridge2,
+                rt2,
+                "get_artifact",
+                {
+                    "workspace_id": ws.repo_id,
+                    "task_id": tid,
+                    "artifact_id": tid,
+                    "revision_epoch": post_ep,
+                    "revision": 6,
+                    "level": "L1",
+                    "idempotency_key": "idem-r6-0000-r6p-l1",
+                },
+                cred=cred,
+                scope=scope,
+            )
+            assert _obs_meta_and_items(r6p)[0]["events_since_agent"] == 0
+
+            clock.advance(dt.timedelta(seconds=5))
+            ss2.record_session_event(
+                session_ref=sref,
+                repo_id=ws.repo_id,
+                checkout_id=ws.checkout_id,
+                task_id=tid,
+                producer_stream="stream-r6",
+                event=CaptureEventRecord(
+                    event_id="ev-r6-post-002",
+                    producer_stream="stream-r6",
+                    sequence=9,
+                    harness_id="claude-code",
+                    kind="user_message",
+                    recorded_at=clock.now().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    payload={"role": "user", "text": "Post-restore event 9"},
+                    session_ref=sref,
+                ),
+                now=clock.now(),
+            )
+            clock.advance(dt.timedelta(seconds=65))
+            assert coord2.enqueue_if_due(task_id=tid, now=clock.now()) is not None
+            assert coord2.run_next(writer_epoch=rt2.lease.epoch, now=clock.now()) is True
+            r7p = _call_ok(
+                bridge2,
+                rt2,
+                "get_artifact",
+                {
+                    "workspace_id": ws.repo_id,
+                    "task_id": tid,
+                    "artifact_id": tid,
+                    "revision_epoch": post_ep,
+                    "revision": 7,
+                    "level": "L1",
+                    "idempotency_key": "idem-r6-0000-r7p-l1",
+                },
+                cred=cred,
+                scope=scope,
+            )
+            assert _obs_meta_and_items(r7p)[0]["events_since_agent"] == 1
+        finally:
+            exec2.close(5.0)
     finally:
         rt2.close()

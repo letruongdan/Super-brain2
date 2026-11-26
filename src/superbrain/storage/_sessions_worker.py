@@ -511,22 +511,21 @@ class SessionWorkerMixin:
         session_ref, prev_rowid = str(wrow[0]), int(wrow[1])
 
         raw_sources = observed_summary.get("source_events")
-        next_rowid, saw_lr = prev_rowid, False
+        next_rowid, saw_lr, batch_orders = prev_rowid, False, set()
         if isinstance(raw_sources, Sequence) and not isinstance(raw_sources, (str, bytes)):
             for item in raw_sources:
-                if not isinstance(item, Sequence) or len(item) < 2:
-                    continue
-                raw_seq = item[1]
-                seq_v = raw_seq if type(raw_seq) is int else -1
-                if seq_v < 1:
+                if not isinstance(item, Sequence) or len(item) < 2 or type(item[1]) is not int or item[1] < 1:
                     continue
                 erow = db.execute(
                     "SELECT event_order, kind FROM session_task_events "
                     "WHERE task_id = ? AND producer_stream = ? AND sequence = ?",
-                    (task_id, str(item[0]), seq_v),
+                    (task_id, str(item[0]), item[1]),
                 ).fetchone()
                 if erow is not None:
-                    next_rowid = max(next_rowid, int(erow[0]))
+                    ev_order = int(erow[0])
+                    if ev_order > prev_rowid:
+                        batch_orders.add(ev_order)
+                    next_rowid = max(next_rowid, ev_order)
                     saw_lr = saw_lr or str(erow[1]) == "long_running_job"
 
         next_rowid = max(next_rowid, cutoff_order)
@@ -552,20 +551,11 @@ class SessionWorkerMixin:
             (task_id, cur.handoff_revision, cur.agent_ref, observed_digest, stamp),
         )
         record_v8_revision_header_in_tx(
-            db,
-            task_id=task_id,
-            next_revision=next_current_rev,
-            next_handoff_revision=cur.handoff_revision,
-            next_task_state=cur.task_state,
-            next_source=next_source,
-            principal_id=cur.holder_principal,
-            session_ref=cur.holder_session_ref,
-            agent_ref=cur.agent_ref,
-            observed_ref=observed_digest,
-            agent_updated_at=cur.agent_updated_at,
-            observed_through=next_obs_through,
-            recorded_at=stamp,
-            store=self._store,
+            db, task_id=task_id, next_revision=next_current_rev, next_handoff_revision=cur.handoff_revision,
+            next_task_state=cur.task_state, next_source=next_source, principal_id=cur.holder_principal,
+            session_ref=cur.holder_session_ref, agent_ref=cur.agent_ref, observed_ref=observed_digest,
+            agent_updated_at=cur.agent_updated_at, observed_through=next_obs_through, recorded_at=stamp,
+            batch_event_orders=batch_orders, store=self._store,
         )
         persist_long_running_checkpoint(
             db,

@@ -40,6 +40,7 @@ from superbrain.ports.handoff import (
     SeenHandoffSpec,
 )
 from superbrain.ports.kernel import KernelTx
+from superbrain.storage._handoff_schema import max_task_event_order_in_tx, read_revision_events_since_agent_in_tx
 from superbrain.storage._restore_epoch import read_restore_epoch
 from superbrain.storage._sessions_sources import live_event_record
 from superbrain.storage._sessions_sql import parse_iso_utc
@@ -226,7 +227,7 @@ _REV_HDR_SELECT = (
     "SELECT r.artifact_id, r.revision_epoch, r.revision, r.handoff_revision, r.task_id, r.task_state, "
     "r.task_state_source, r.holder_restore_epoch, r.writer_generation, r.holder_harness_id, "
     "r.holder_principal, r.holder_session_ref, r.session_state, r.agent_ref, r.observed_ref, "
-    "r.agent_updated_at, r.observed_through, t.repo_id, t.checkout_id "
+    "r.agent_updated_at, r.observed_through, t.repo_id, t.checkout_id, r.events_since_agent "
     "FROM handoff_revision_headers AS r JOIN tasks AS t ON t.task_id = r.task_id "
 )
 
@@ -252,6 +253,7 @@ def _row_to_rev_header(row: Sequence[object]) -> HandoffRevisionHeader:
         observed_ref=None if row[14] is None else str(row[14]),
         agent_updated_at=None if row[15] is None else str(row[15]),
         observed_through=None if row[16] is None else str(row[16]),
+        events_since_agent=require_non_negative_int(row[19]),
     )
 
 
@@ -992,6 +994,17 @@ class HandoffStore(HandoffStorePort):
         eff_agent_at = stamp if has_patch else cur.agent_updated_at
         take_from_p = cur.holder_principal if takeover else None
         take_from_s = cur.holder_session_ref if takeover else None
+        if has_patch:
+            next_events_since_agent = 0
+            next_agent_event_order: int | None = max_task_event_order_in_tx(db, task_id)
+        else:
+            next_events_since_agent = read_revision_events_since_agent_in_tx(
+                db,
+                artifact_id=cur.artifact_id,
+                revision_epoch=cur.revision_epoch,
+                revision=cur.revision,
+            )
+            next_agent_event_order = None
 
         if has_patch and new_agent_holder_id is not None:
             db.execute(
@@ -1007,6 +1020,7 @@ class HandoffStore(HandoffStorePort):
             "UPDATE task_handoffs SET current_revision = ?, current_revision_epoch = ?, handoff_revision = ?, "
             "writer_generation = ?, agent_ref = ?, task_state = ?, task_state_source = ?, holder_principal = ?, "
             "holder_session_ref = ?, holder_restore_epoch = ?, agent_updated_at = ?, "
+            "agent_event_order = COALESCE(?, agent_event_order), "
             "takeover_from_principal = COALESCE(?, takeover_from_principal), "
             "takeover_from_session_ref = COALESCE(?, takeover_from_session_ref), updated_at = ? WHERE task_id = ?",
             (
@@ -1021,6 +1035,7 @@ class HandoffStore(HandoffStorePort):
                 session_ref,
                 next_epoch,
                 eff_agent_at,
+                next_agent_event_order,
                 take_from_p,
                 take_from_s,
                 stamp,
@@ -1043,8 +1058,9 @@ class HandoffStore(HandoffStorePort):
             "INSERT INTO handoff_revision_headers ("
             "artifact_id, revision_epoch, revision, handoff_revision, task_id, task_state, task_state_source, "
             "holder_restore_epoch, writer_generation, holder_harness_id, holder_principal, holder_session_ref, "
-            "session_state, agent_ref, agent_holder_id, observed_ref, agent_updated_at, observed_through, recorded_at"
-            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "session_state, agent_ref, agent_holder_id, observed_ref, agent_updated_at, observed_through, "
+            "events_since_agent, recorded_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 cur.artifact_id,
                 next_epoch,
@@ -1064,6 +1080,7 @@ class HandoffStore(HandoffStorePort):
                 cur.observed_ref,
                 eff_agent_at,
                 cur.observed_through,
+                next_events_since_agent,
                 stamp,
             ),
         )
@@ -1111,14 +1128,12 @@ class HandoffStore(HandoffStorePort):
         task_id: str,
         observed_ref: str | None,
         now: datetime,
-        agent_updated_at: str | None = None,
-        observed_after_agent: bool = True,
-    ) -> tuple[list[ResolvedSourceContent], list[ResolvedSourceContent], int]:
+    ) -> tuple[list[ResolvedSourceContent], list[ResolvedSourceContent]]:
         """Resolve pinned ``observed_ref`` sources live at read time (never scanning uncommitted events)."""
         _require_v8_ready(self._store, self._policy)
         now_utc, _ = require_aware_utc(now)
         if observed_ref is None:
-            return [], [], 0
+            return [], []
 
         raw_obs, obs_status = _check_blob_status(
             self._store._db,
@@ -1141,18 +1156,17 @@ class HandoffStore(HandoffStorePort):
                     )
                 ],
                 [],
-                0,
             )
 
         try:
             decoded = json.loads(raw_obs.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
-            return [], [], 0
+            return [], []
         if not isinstance(decoded, Mapping):
-            return [], [], 0
+            return [], []
         raw_sources = decoded.get("source_events")
         if not isinstance(raw_sources, list):
-            return [], [], 0
+            return [], []
 
         kind_by_eid: dict[str, str] = {}
         raw_items = decoded.get("items")
@@ -1185,10 +1199,8 @@ class HandoffStore(HandoffStorePort):
                 seen_keys.add(ref_key)
                 pinned_refs.append(ref_key)
 
-        agent_dt = parse_iso_utc(agent_updated_at) if agent_updated_at is not None else None
         obs_items: list[ResolvedSourceContent] = []
         conv_items: list[ResolvedSourceContent] = []
-        events_since_agent = 0
 
         for stream, seq, eid, dig in reversed(pinned_refs):
             meta_row = self._store._db.execute(
@@ -1233,7 +1245,6 @@ class HandoffStore(HandoffStorePort):
                     recorded_at=meta_rec_at,
                 )
                 eff_kind = meta_kind
-                eff_rec_at = meta_rec_at
             else:
                 content = ResolvedSourceContent(
                     source_event_id=rec.event_id,
@@ -1244,17 +1255,12 @@ class HandoffStore(HandoffStorePort):
                     recorded_at=rec.recorded_at,
                 )
                 eff_kind = rec.kind
-                eff_rec_at = rec.recorded_at
 
             if eff_kind in {"user_message", "user_prompt"}:
                 conv_items.append(content)
             obs_items.append(content)
-            if agent_dt is None:
-                events_since_agent += 1
-            elif observed_after_agent and (eff_rec_at is None or parse_iso_utc(eff_rec_at) >= agent_dt):
-                events_since_agent += 1
 
-        return obs_items, conv_items, events_since_agent
+        return obs_items, conv_items
 
     def bind_session_for_episode(
         self,
@@ -1914,34 +1920,10 @@ class HandoffStore(HandoffStorePort):
             if astatus == "ok" and abytes is not None:
                 agent_state = HandoffAgentState.from_dict(json.loads(abytes.decode("utf-8")))
 
-        causal_history = self.list_revision_history(
-            artifact_id=artifact_id,
-            task_id=task_id,
-            revision_epoch=revision_epoch,
-            revision=revision,
-            principal_id=principal_id,
-            scope=scope,
-        )
-        observed_after_agent = False
-        if hdr.observed_ref is not None:
-            if hdr.handoff_revision == 0 or hdr.agent_updated_at is None:
-                observed_after_agent = True
-            else:
-                agent_commit_hdr = hdr
-                for anc in causal_history:
-                    if anc.handoff_revision == hdr.handoff_revision:
-                        agent_commit_hdr = anc
-                observed_after_agent = (agent_commit_hdr.observed_ref != hdr.observed_ref) or (
-                    hdr.observed_through is not None
-                    and parse_iso_utc(hdr.observed_through) > parse_iso_utc(hdr.agent_updated_at)
-                )
-
-        obs_items, conv_items, events_since_agent = self.resolve_observed_sources(
+        obs_items, conv_items = self.resolve_observed_sources(
             task_id=task_id,
             observed_ref=hdr.observed_ref,
             now=now_utc,
-            agent_updated_at=hdr.agent_updated_at,
-            observed_after_agent=observed_after_agent,
         )
 
         sess_state = hdr.session_state
@@ -1968,7 +1950,18 @@ class HandoffStore(HandoffStorePort):
                 ).fetchone()
                 other_active = orow is not None
 
-        revision_history: tuple[HandoffRevisionHeader, ...] = causal_history if include_history else ()
+        revision_history: tuple[HandoffRevisionHeader, ...] = (
+            self.list_revision_history(
+                artifact_id=artifact_id,
+                task_id=task_id,
+                revision_epoch=revision_epoch,
+                revision=revision,
+                principal_id=principal_id,
+                scope=scope,
+            )
+            if include_history
+            else ()
+        )
 
         return HandoffContentBundle(
             header=hdr,
@@ -1983,7 +1976,7 @@ class HandoffStore(HandoffStorePort):
             session_state=sess_state,
             other_active_warning=other_active,
             revision_history=revision_history,
-            events_since_agent=events_since_agent,
+            events_since_agent=hdr.events_since_agent,
         )
 
     def tx_commit_handoff_mutation(

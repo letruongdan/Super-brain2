@@ -629,12 +629,14 @@ class HandoffRevisionHeader:
     observed_ref: str | None
     agent_updated_at: str | None
     observed_through: str | None
+    events_since_agent: int = 0
 
     def __post_init__(self) -> None:
         require_opaque_id(self.artifact_id)
         require_non_negative_int(self.revision_epoch)
         require_positive_int(self.revision)
         require_non_negative_int(self.handoff_revision)
+        require_non_negative_int(self.events_since_agent)
         require_opaque_id(self.task_id)
         if not is_strict_int(self.fence.restore_epoch):
             raise _invalid()
@@ -661,6 +663,7 @@ class HandoffRevisionHeader:
             "observed_ref": self.observed_ref,
             "agent_updated_at": self.agent_updated_at,
             "observed_through": self.observed_through,
+            "events_since_agent": self.events_since_agent,
         }
 
 
