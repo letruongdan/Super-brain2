@@ -23,6 +23,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
+from superbrain.adapters.harness.layer2_probe import compute_harness_config_digest
 from superbrain.adapters.harness_config.bootstrap_templates import (
     AUTHORITY_ASK_COMMANDS,
     HANDOFF_RULE_TEXT,
@@ -791,15 +792,19 @@ def test_i3_wheel_synthetic_lifecycle_e2e(inc2_installed_env: InstalledEnv, trus
             base_policy_revision=rev_c, base_restore_epoch=cur_ep, policy_diff_digest=diff_d,
             approval=m_ok, signer_id=tofu_id, channel=ApprovalChannel.SSH_KEY, expected_restore_epoch=cur_ep,
         )
-        # SP2-5 invalidates restored Layer-2 VERIFIED rows on restore_policy until re-verified.
+        # SP2-5 invalidates restored Layer-2 VERIFIED rows on restore_policy until re-verified
+        # against the live checkout digests on disk.
+        claude_dig = compute_harness_config_digest("claude-code", co_a, os_)
+        codex_dig = compute_harness_config_digest("codex", co_b, os_)
+        assert claude_dig is not None and codex_dig is not None
         rt_rec.policy.set_layer2_state(
             harness_id="claude-code",
             host_version="1.0.0",
-            config_digest="sha256:" + "1" * 64,
+            config_digest=claude_dig,
             state=Layer2State.VERIFIED,
         )
         rt_rec.policy.set_layer2_state(
-            harness_id="codex", host_version="1.0.0", config_digest="sha256:" + "2" * 64, state=Layer2State.VERIFIED
+            harness_id="codex", host_version="1.0.0", config_digest=codex_dig, state=Layer2State.VERIFIED
         )
     finally:
         rt_rec.close()
