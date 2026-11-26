@@ -91,10 +91,23 @@ def _iter_non_link_paths(root: Path, *, check_path_is_symlink: bool) -> Iterator
                 continue
             try:
                 est = entry.stat(follow_symlinks=False)
-            except FileNotFoundError:
-                continue  # removed after it was listed
             except OSError as err:
-                raise _inspect_error(epath, err) from err
+                state = classify_below_root_failure(epath, root, err)
+                if state == "vanished":
+                    continue  # removed after it was listed
+                if state == "recreated_link":
+                    raise BrainError(ErrorCode.UNSAFE_PATH, f"unsafe link: {epath}") from err
+                if state == "recreated":
+                    try:
+                        est = os.lstat(epath)
+                    except FileNotFoundError:
+                        continue
+                    except OSError as lstat_err:
+                        raise _inspect_error(epath, lstat_err) from lstat_err
+                    if _is_reparse_or_link(est) or (check_path_is_symlink and epath.is_symlink()):
+                        raise BrainError(ErrorCode.UNSAFE_PATH, f"unsafe link: {epath}") from err
+                else:
+                    raise _inspect_error(epath, err) from err
             if _is_reparse_or_link(est):
                 continue
             children.append(epath)

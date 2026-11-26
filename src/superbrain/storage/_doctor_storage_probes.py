@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import cast
 
+from superbrain.core._fs_walk import stat_reparse_or_link
 from superbrain.core.errors import BrainError, describe_exception
 from superbrain.ports.doctor import (
     MAX_LIST_FINDINGS_PER_GROUP,
@@ -184,7 +185,7 @@ def _collect_cas_digests(cas_dir: Path, errors: list[str]) -> list[tuple[str, Pa
             est = shard_ent.stat(follow_symlinks=False)
         except OSError:
             continue
-        if not stat.S_ISDIR(est.st_mode):
+        if stat_reparse_or_link(est) or not stat.S_ISDIR(est.st_mode):
             continue
         try:
             blobs = sorted(os.scandir(shard_path), key=lambda e: e.name)
@@ -199,7 +200,7 @@ def _collect_cas_digests(cas_dir: Path, errors: list[str]) -> list[tuple[str, Pa
                 bst = blob_ent.stat(follow_symlinks=False)
             except OSError:
                 continue
-            if stat.S_ISREG(bst.st_mode):
+            if not stat_reparse_or_link(bst) and stat.S_ISREG(bst.st_mode):
                 items.append((f"sha256:{blob_ent.name}", bpath, int(bst.st_size)))
     items.sort(key=lambda t: t[0])
     return items

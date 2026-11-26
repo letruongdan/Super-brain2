@@ -122,11 +122,11 @@ def ensure_no_links_in_tree(root: Path, os_: OsAdapters) -> tuple[list[Path], li
                     except OSError as lstat_exc:
                         detail = f"cannot stat {epath.name}: {describe_exception(lstat_exc)}"
                         raise BrainError(ErrorCode.INSECURE_PERMISSIONS, detail) from lstat_exc
-                    if stat_reparse_or_link(est):
-                        raise BrainError(ErrorCode.UNSAFE_PATH, f"unsafe link inside data root: {epath}") from exc
                 else:
                     detail = f"cannot stat {epath.name}: {describe_exception(exc)}"
                     raise BrainError(ErrorCode.INSECURE_PERMISSIONS, detail) from exc
+            if stat_reparse_or_link(est) or entry.is_symlink():
+                raise BrainError(ErrorCode.UNSAFE_PATH, f"unsafe link inside data root: {epath}")
             if stat.S_ISDIR(est.st_mode):
                 dirs.append(epath)
                 stack.append(epath)
@@ -135,7 +135,25 @@ def ensure_no_links_in_tree(root: Path, os_: OsAdapters) -> tuple[list[Path], li
     return dirs, files
 
 
-def _resolve_pre_identity(path: Path, base: Path, os_: OsAdapters) -> PhysicalObjectId | None:
+def _assert_expected_entry_type(path: Path, expected_is_dir: bool) -> bool:
+    """Confirm non-link object type matches ``expected_is_dir``; return False if missing, raise on flip/link."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        detail = f"cannot inspect {path.name}: {describe_exception(exc)}"
+        raise BrainError(ErrorCode.INSECURE_PERMISSIONS, detail) from exc
+    if stat_reparse_or_link(st):
+        raise BrainError(ErrorCode.UNSAFE_PATH, f"target replaced by link: {path}")
+    if stat.S_ISDIR(st.st_mode) != expected_is_dir:
+        raise BrainError(ErrorCode.UNSAFE_PATH, f"target type changed before ACL repair: {path}")
+    return True
+
+
+def _resolve_pre_identity(
+    path: Path, base: Path, os_: OsAdapters, *, expected_is_dir: bool | None = None
+) -> PhysicalObjectId | None:
     """Resolve non-link physical identity; ``None`` only when confirmed vanished strictly below ``base``."""
     assert os_.physical is not None
     for attempt in range(MAX_TRANSIENT_WALK_ATTEMPTS):
@@ -143,6 +161,8 @@ def _resolve_pre_identity(path: Path, base: Path, os_: OsAdapters) -> PhysicalOb
         if ident is not None:
             if ident.is_link:
                 raise BrainError(ErrorCode.UNSAFE_PATH, f"unsafe link: {path}")
+            if expected_is_dir is not None and ident.is_dir != expected_is_dir:
+                raise BrainError(ErrorCode.UNSAFE_PATH, f"target type changed before ACL repair: {path}")
             return ident
         state = classify_below_root_failure(path, base, FileNotFoundError(str(path)))
         if state == "vanished":
@@ -167,7 +187,8 @@ def _verify_and_secure(
     """Repair one entry; ``None`` step when ``may_write`` refused the write this entry needed.
 
     An entry strictly below ``walk_root`` removed after listing needs no repair (``0``); one that vanished and
-    immediately recreated cleanly is re-verified with refreshed identity; links and denied lookups keep failing closed.
+    immediately recreated cleanly is re-verified with refreshed identity; links, type flips, and denied lookups fail
+    closed.
     """
     current_pre_id = pre_id
 
@@ -185,12 +206,14 @@ def _verify_and_secure(
         if state == "recreated":
             assert walk_root is not None
             if os_.physical is not None:
-                refreshed = _resolve_pre_identity(path, walk_root, os_)
+                refreshed = _resolve_pre_identity(path, walk_root, os_, expected_is_dir=is_dir)
                 if refreshed is None:
                     return "vanished"
                 current_pre_id = refreshed
             elif _is_link(path, os_):
                 raise BrainError(ErrorCode.UNSAFE_PATH, f"target replaced by link: {path}") from exc
+            elif not _assert_expected_entry_type(path, is_dir):
+                return "vanished"
             return "recreated"
         return "fail_closed"
 
@@ -216,10 +239,14 @@ def _verify_and_secure(
                 if outcome == "recreated" and attempt + 1 < MAX_TRANSIENT_WALK_ATTEMPTS:
                     continue
                 raise BrainError(ErrorCode.UNSAFE_PATH, f"target identity changed before ACL repair: {path}")
-            if cur_id.is_link or cur_id != current_pre_id:
+            if cur_id.is_link or cur_id != current_pre_id or cur_id.is_dir != is_dir:
                 raise BrainError(ErrorCode.UNSAFE_PATH, f"target identity changed before ACL repair: {path}")
         elif _is_link(path, os_):
             raise BrainError(ErrorCode.UNSAFE_PATH, f"target replaced by link: {path}")
+        elif not _assert_expected_entry_type(path, is_dir):
+            if walk_root is not None and not classify_below_root_failure(path, walk_root) == "vanished":
+                raise BrainError(ErrorCode.UNSAFE_PATH, f"target replaced before ACL repair: {path}")
+            return 0, current_pre_id
         try:
             if is_dir:
                 os_.permissions.secure_directory(path)
@@ -271,7 +298,7 @@ def tighten_data_root_permissions(
         dirs, files = ensure_no_links_in_tree(base, os_)
         for d in dirs:
             if os_.physical is not None:
-                ident = _resolve_pre_identity(d, base, os_)
+                ident = _resolve_pre_identity(d, base, os_, expected_is_dir=True)
                 if ident is None:
                     continue
             else:
@@ -279,7 +306,7 @@ def tighten_data_root_permissions(
             all_dirs.append((d, ident, base))
         for f in files:
             if os_.physical is not None:
-                ident = _resolve_pre_identity(f, base, os_)
+                ident = _resolve_pre_identity(f, base, os_, expected_is_dir=False)
                 if ident is None:
                     continue
             else:

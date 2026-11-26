@@ -118,15 +118,15 @@ def check_permissions_strict(
                         except OSError as lstat_exc:
                             errors.append(f"stat error at {epath.name}: {describe_exception(lstat_exc)}")
                             continue
-                        if stat_reparse_or_link(est) or is_link_entry(epath):
-                            rel = epath.relative_to(root.root).as_posix()
-                            msg = f"forbidden symlink/reparse point at {rel}"
-                            perm_problems.append(msg)
-                            errors.append(msg)
-                            continue
                     else:
                         errors.append(f"stat error at {epath.name}: {describe_exception(exc)}")
                         continue
+                if stat_reparse_or_link(est) or entry.is_symlink():
+                    rel = epath.relative_to(root.root).as_posix()
+                    msg = f"forbidden symlink/reparse point at {rel}"
+                    perm_problems.append(msg)
+                    errors.append(msg)
+                    continue
                 if stat.S_ISDIR(est.st_mode):
                     stack.append(epath)
 
@@ -335,7 +335,7 @@ def run_privacy_rescan(
                 lst = ent.stat(follow_symlinks=False)
             except OSError:
                 continue
-            if not stat.S_ISREG(lst.st_mode):
+            if stat_reparse_or_link(lst) or not stat.S_ISREG(lst.st_mode):
                 continue
             if log_files_seen >= limits.max_log_files or scanned_items >= limits.max_privacy_rescan_items:
                 truncated = True
