@@ -360,7 +360,9 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
         with self._lock:
             if self._stopping or self._closed or self._startup_due or self._maint_retry.pending:
                 return None
-            next_due_utc = min(self._last_scheduled_at, self._last_gc_at) + DOCTOR_SCHEDULE_INTERVAL
+            # A GC deferred behind a running worker is woken by that worker's completion, not by a zero wait.
+            gc_at = self._last_scheduled_at if self._active_token is not None else self._last_gc_at
+            next_due_utc = min(self._last_scheduled_at, gc_at) + DOCTOR_SCHEDULE_INTERVAL
             due_in_s = max(0.0, (next_due_utc - now_utc).total_seconds())
             return min(due_in_s, _MAX_SCHEDULE_WAIT_S)
 
@@ -527,6 +529,8 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
             startup_due = self._startup_due
             last_gc_at = self._last_gc_at
             last_scheduled_at = self._last_scheduled_at
+            # GC commits to the store; run during a worker's DB snapshot it splits every pair and starves the run.
+            worker_active = self._active_token is not None
         now_utc, _ = require_aware_utc(self._clock.now())
         did_work = False
 
@@ -569,7 +573,7 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
                     self._maint_retry.finish_if_settled()
             return outcome
 
-        if _due(last_gc_at, now_utc):
+        if _due(last_gc_at, now_utc) and not worker_active:  # stays due; the worker's completion wakes the owner
             try:
                 expire_due(self._rt.store, self._rt.policy, now_utc)
                 self._rt.store.cas.collect_garbage(now=now_utc)

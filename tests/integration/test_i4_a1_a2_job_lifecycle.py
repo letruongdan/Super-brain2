@@ -1626,9 +1626,21 @@ def test_p2_12_periodic_schedule_dedup_backward_clock_and_restore_reset(
             trusted_tmp / "p2-12-active-dedup", cast(Any, real_os.clock), os_=real_os
         )
         root = DataRoot.at(cfg.data_root)
-        monkeypatch.setattr(_daemon_doctor, "DOCTOR_SCHEDULE_INTERVAL", timedelta(seconds=0.8))
+        # Host-speed independent setup (R6): the periodic interval stays at its 24h default until the CLI job is
+        # active, so a slow startup run cannot let the schedule fire before the CLI request. Once the CLI job holds
+        # the slot (blocked in read_snapshot) the interval is shortened so the schedule due time has passed, one owner
+        # step evaluates it while the CLI job is active, and the interval is restored to 24h before the CLI job is
+        # released so no further interval can elapse during a slow tail.
         gate = _ReadGate(monkeypatch)
-        t_start = time.monotonic()
+        schedule_calls: list[tuple[str, bool | None]] = []
+        orig_schedule = DaemonDoctorRunner._schedule_store_run
+
+        def _spied_schedule(self_runner: DaemonDoctorRunner, trigger: str) -> bool | None:
+            outcome = orig_schedule(self_runner, trigger)
+            schedule_calls.append((trigger, outcome))
+            return outcome
+
+        monkeypatch.setattr(DaemonDoctorRunner, "_schedule_store_run", _spied_schedule)
 
         with _serve(cfg, os_=real_os, clock=cast(Any, real_os.clock), mono=cast(Any, real_os.monotonic)) as d:
             assert d.loop.wait_doctor_settled(timeout=BOUND_WAIT_S) is True
@@ -1650,7 +1662,15 @@ def test_p2_12_periodic_schedule_dedup_backward_clock_and_restore_reset(
             cli_thr.start()
             try:
                 assert gate.entered.wait(timeout=BOUND_WAIT_S), "precondition: CLI doctor job must enter read_snapshot"
-                time.sleep(max(0.0, 0.95 - (time.monotonic() - t_start)))
+                before = len(schedule_calls)
+                monkeypatch.setattr(_daemon_doctor, "DOCTOR_SCHEDULE_INTERVAL", timedelta(milliseconds=1))
+                time.sleep(0.05)  # the schedule due time (last run + interval) is now in the past
+                # wait_doctor_settled runs one doctor step on the owner thread (False: the CLI job is still active).
+                d.loop.wait_doctor_settled(timeout=0.5)
+                assert ("schedule", False) in schedule_calls[before:], (
+                    f"precondition: the due schedule must be evaluated while the CLI job is active: {schedule_calls}"
+                )
+                monkeypatch.setattr(_daemon_doctor, "DOCTOR_SCHEDULE_INTERVAL", timedelta(hours=24))
             finally:
                 gate.release.set()
                 cli_thr.join(timeout=BOUND_WAIT_S)

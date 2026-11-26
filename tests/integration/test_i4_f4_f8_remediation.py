@@ -583,6 +583,7 @@ def test_f6_control_non_transient_commit_error_ends_job_failed(
 # ---------------------------------------------------------------------------
 
 SEED_OTHER_RUNS = 200
+SEED_SETUP_TIMEOUT_S = 120.0  # setup only: seeding 200 runs may be slow on a hosted runner
 
 
 def test_f7_fresh_run_found_behind_many_other_owner_runs(trusted_tmp: Path) -> None:
@@ -623,33 +624,55 @@ def test_f7_fresh_run_found_behind_many_other_owner_runs(trusted_tmp: Path) -> N
     assert not violations, "F7 fresh lookup stopped at the scan limit:\n" + "\n".join(violations)
 
 
-def test_f7_succeeded_job_dto_loads_behind_many_other_owner_runs(
-    trusted_tmp: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_f7_succeeded_job_dto_loads_behind_many_other_owner_runs(trusted_tmp: Path) -> None:
+    # Setup (R6, host-speed independent): the 200 other-owner runs used to be seeded on the owner thread inside the
+    # CLI DoctorRun commit, i.e. on the critical path of the in-flight report request, so a slow host pushed the
+    # response past the client read timeout. Now the CLI report completes first, the runs are seeded by an owner
+    # action off any request, and the same job's DTO is read again through the report's phase 3 (finish_report, the
+    # call the HTTP report makes after its wait) with the seeded runs newer than the job's run.
     env = _Env(trusted_tmp, "f7-load")
     seeded = threading.Event()
-    armed = threading.Event()
-    orig = StagedKernelStore.transact
-
-    def _transact(self: StagedKernelStore, operation: Callable[[Any], Any]) -> Any:
-        saw: list[KernelRecord] = []
-        result = orig(self, lambda tx: operation(_RecordingTx(tx, saw.append)))
-        if (
-            armed.is_set()
-            and not seeded.is_set()
-            and any(r.kind == "doctor.run" and r.meta.get("trigger") == "cli" for r in saw)
-        ):
-            seeded.set()
-            _, now_str = require_aware_utc(env.clock.now())
-            _seed_other_owner_runs(self, lambda op: orig(self, op), now_str, SEED_OTHER_RUNS)
-        return result
-
-    monkeypatch.setattr(StagedKernelStore, "transact", _transact)
     with env.serve() as d:
         assert d.loop.wait_doctor_settled(timeout=BOUND_WAIT_S)
         env.clock.advance(timedelta(minutes=16))
-        armed.set()
-        res = _report(d, env, env.cli_token, wait_ms=10_000)
+        first = _report(d, env, env.cli_token, wait_ms=10_000)
+        first_data = cast(dict[str, Any], first.get("data") or {})
+        job_id = str(first_data.get("job_id") or "")
+        assert first.get("ok") is True and first_data.get("status") == "completed" and job_id, (
+            f"precondition: the CLI report completed its own job before seeding: {first}"
+        )
+
+        def _seed() -> None:
+            rt = d.rt
+            js = StagedKernelStore(rt.store, rt.policy, writer_epoch=rt.lease.epoch)
+            _, now_str = require_aware_utc(env.clock.now())
+            _seed_other_owner_runs(js, js.transact, now_str, SEED_OTHER_RUNS)
+            seeded.set()
+
+        d.loop.run_owner_action(_seed).result(timeout=SEED_SETUP_TIMEOUT_S)
+        runs = _doctor_runs(env.root)
+        at = next(i for i, r in enumerate(runs) if r.get("job_id") == job_id)
+        newer_others = [r for r in runs[at + 1 :] if r["owner_id"] != OWNER_DAN]
+        assert len(newer_others) == SEED_OTHER_RUNS, (
+            f"precondition: {SEED_OTHER_RUNS} other-owner runs are newer than the job's run, got {len(newer_others)}"
+        )
+        session = cast(Any, d.loop)._session
+        runner = session._doctor_runner
+        generation, writer_epoch = runner._generation, d.ready.identity.writer_epoch
+
+        def _finish() -> dict[str, Any]:
+            return cast(
+                dict[str, Any],
+                runner.finish_report(
+                    owner_id=OWNER_DAN, job_id=job_id, generation=generation, writer_epoch=writer_epoch
+                ),
+            )
+
+        res: dict[str, Any]
+        try:
+            res = {"ok": True, "data": d.loop.run_owner_action(_finish).result(timeout=BOUND_WAIT_S)}
+        except BrainError as err:
+            res = {"ok": False, "error": {"code": err.code.value}}
     assert seeded.is_set(), "precondition: other-owner runs were seeded right after the CLI DoctorRun commit"
     data = cast(dict[str, Any], res.get("data") or {})
     assert res.get("ok") is True and data.get("status") == "completed" and data.get("doctor_run_id"), (
