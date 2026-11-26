@@ -565,6 +565,7 @@ class SessionWorkerMixin:
             agent_updated_at=cur.agent_updated_at,
             observed_through=next_obs_through,
             recorded_at=stamp,
+            store=self._store,
         )
         persist_long_running_checkpoint(
             db,

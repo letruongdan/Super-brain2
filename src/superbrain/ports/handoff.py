@@ -107,6 +107,7 @@ class HandoffContentBundle:
     holder_harness_id: str | None
     session_state: str | None
     other_active_warning: bool
+    revision_history: tuple[HandoffRevisionHeader, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -205,6 +206,18 @@ class HandoffStorePort(Protocol):
         principal_id: str,
         scope: Scope,
     ) -> HandoffRevisionHeader | None: ...
+
+    def list_revision_history(
+        self,
+        *,
+        artifact_id: str,
+        task_id: str,
+        revision_epoch: int,
+        revision: int,
+        principal_id: str,
+        scope: Scope,
+        limit: int = 1024,
+    ) -> tuple[HandoffRevisionHeader, ...]: ...
 
     def list_discover(
         self,
@@ -394,6 +407,7 @@ class HandoffStorePort(Protocol):
         principal_id: str,
         scope: Scope,
         now: datetime,
+        include_history: bool = False,
     ) -> HandoffContentBundle: ...
 
     def tx_commit_handoff_mutation(

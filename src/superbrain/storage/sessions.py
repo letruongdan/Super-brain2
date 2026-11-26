@@ -523,6 +523,7 @@ class SessionStore(SessionWorkerMixin):
                 agent_updated_at=stamp,
                 observed_through=cur.observed_through,
                 recorded_at=stamp,
+                store=self._store,
             )
             updated = txn.db.execute(
                 f"SELECT {TASK_SELECT_COLS} FROM task_handoffs WHERE task_id = ?", (task_id,)

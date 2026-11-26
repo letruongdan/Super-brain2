@@ -2923,3 +2923,608 @@ def test_prepare_task_degraded_codes_discover_work_resume_and_replay(trusted_tmp
         assert work_aged["degraded_codes"] == ["snapshot_unavailable", *unavailable_codes]
     finally:
         rt.close()
+
+
+def test_get_artifact_l1_l2_header_refs_served_receipt_and_revision_history_across_restore(
+    trusted_tmp: Path,
+) -> None:
+    import json
+
+    from superbrain.application.continuity_worker import ContinuityWorkerCoordinator
+    from superbrain.composition._daemon_session import build_default_handoff_domain
+    from superbrain.composition.kernel_bridge import KernelBridge
+    from superbrain.domain.continuity.budget import HANDOFF_L1_RESOURCE_MAX_BYTES, HANDOFF_L2_MAX_BYTES, utf8_len
+    from superbrain.storage.backup import create_store_backup
+    from superbrain.storage.handoffs import HandoffStore
+    from superbrain.storage.kernel_schema import KERNEL_POLICY_MIGRATIONS, KERNEL_STORE_MIGRATIONS
+    from superbrain.storage.policy_store import PolicyStore
+    from superbrain.storage.restore import restore_store
+    from superbrain.storage.sessions import SessionStore
+    from superbrain.workers.executor import PRODUCTION_JOB_HANDLERS, JobExecutor
+    from tests.storage.conftest import maintenance_lease
+    from tests.support.inc2_fixture import kernel_job_service
+
+    def _find_header(data: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+        hdr_res = next(r for r in data["resources"] if r["name"] == "handoff_header")
+        return hdr_res, json.loads(str(hdr_res["content"]))
+
+    def _extract_l2_revs(data: dict[str, Any]) -> list[dict[str, Any]]:
+        revs: list[dict[str, Any]] = []
+        total_b = 0
+        for r in data["resources"]:
+            content = str(r["content"])
+            assert utf8_len(content) <= HANDOFF_L1_RESOURCE_MAX_BYTES
+            total_b += utf8_len(content)
+            parsed = json.loads(content)
+            name = str(r["name"])
+            if name.startswith("l2_history_"):
+                revs.extend(parsed[0]["revision_history"])
+            elif name.startswith("l2_revisions_"):
+                revs.extend(parsed["revision_history"])
+        assert total_b <= HANDOFF_L2_MAX_BYTES
+        return revs
+
+    def _receipt_hdr_digest(rt_obj: Any, delivery_dict: dict[str, Any], art_id: str, rev: int, level: str) -> str:
+        receipt_id = str(delivery_dict["served_receipt_id"])
+        row = rt_obj.store._db.execute(
+            "SELECT digests_json FROM artifact_send_attempt "
+            "WHERE id = ? AND artifact_id = ? AND revision = ? AND level = ?",
+            (receipt_id, art_id, rev, level),
+        ).fetchone()
+        assert row is not None, f"missing send attempt {receipt_id} for {art_id} rev={rev} level={level}"
+        digs = {item["name"]: item["digest"] for item in json.loads(str(row[0]))}
+        return str(digs["handoff_header"])
+
+    clock = FakeClock(dt.datetime(2026, 11, 26, 10, 0, tzinfo=dt.UTC))
+    os_ = os_adapters(clock=clock)
+    data_root = trusted_tmp / "r4-l1l2" / "data"
+    rt = open_kernel_job_runtime(data_root, os_, role="sp24-r4")
+    try:
+        cred = seed_principal_and_credential(rt.policy, owner_id="dan", harness_id="claude-code", machine_id="m1")
+        ws = register_workspace_direct(
+            rt,
+            clock,
+            cred.principal,
+            alias="ws-r4",
+            checkout_dir=trusted_tmp / "r4-l1l2" / "chk",
+            remote="https://github.example/dan/r4.git",
+        )
+        ws2 = register_workspace_direct(
+            rt,
+            clock,
+            cred.principal,
+            alias="ws-r4-other",
+            checkout_dir=trusted_tmp / "r4-l1l2" / "chk2",
+            remote="https://github.example/dan/r4.git",
+        )
+        rt.store.reconcile_policy()
+        scope = Scope(ws.repo_id, ws.checkout_id)
+        scope2 = Scope(ws2.repo_id, ws2.checkout_id)
+        domain = build_default_handoff_domain(rt=rt, clock=clock, writer_epoch=rt.lease.epoch)
+        assert domain is not None
+        bridge = KernelBridge(store=rt.store, policy=rt.policy, clock=clock, writer_epoch=rt.lease.epoch, domain=domain)
+        hs = HandoffStore(rt.store, rt.policy)
+        ss = SessionStore(rt.store, rt.policy)
+
+        # Task A: agent-only patch -> agent_ref populated, observed_ref is None.
+        prep_a = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "work",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "description": "Task A agent only",
+                "idempotency_key": "idem-r4-v000-prep-a",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        task_a = str(prep_a["task_id"])
+        _call_ok(
+            bridge,
+            rt,
+            "submit_episode",
+            {
+                "task_id": task_a,
+                "session_id": "SID_R4_A",
+                "workspace_id": ws.repo_id,
+                "evidence": [],
+                "base_revision": 0,
+                "fence": prep_a["handoff_live"]["fence"],
+                "takeover": {"acknowledge_active": True, "reason": "task A agent hold"},
+                "handoff": {"working_goal": "Task A goal v1", "task_state": "open"},
+                "idempotency_key": "idem-r4-v000-sub-a1",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        hdr_a1 = hs.read_revision_header(
+            artifact_id=task_a,
+            revision_epoch=0,
+            revision=1,
+            principal_id=cred.principal.principal_id,
+            scope=scope,
+        )
+        assert hdr_a1 is not None and hdr_a1.agent_ref is not None and hdr_a1.observed_ref is None
+        a_l1 = _call_ok(
+            bridge,
+            rt,
+            "get_artifact",
+            {
+                "workspace_id": ws.repo_id,
+                "task_id": task_a,
+                "artifact_id": task_a,
+                "revision_epoch": 0,
+                "revision": 1,
+                "level": "L1",
+                "idempotency_key": "idem-r4-v000-get-a-l1",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        a_l2 = _call_ok(
+            bridge,
+            rt,
+            "get_artifact",
+            {
+                "workspace_id": ws.repo_id,
+                "task_id": task_a,
+                "artifact_id": task_a,
+                "revision_epoch": 0,
+                "revision": 1,
+                "level": "L2",
+                "idempotency_key": "idem-r4-v000-get-a-l2",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        a_l1_hres, a_l1_hdr = _find_header(a_l1)
+        a_l2_hres, a_l2_hdr = _find_header(a_l2)
+        assert a_l1_hdr["agent_ref"] == hdr_a1.agent_ref and a_l1_hdr["observed_ref"] is None
+        assert a_l2_hdr == a_l1_hdr
+        assert a_l1_hres["digest"] == digest_bytes(str(a_l1_hres["content"]).encode("utf-8"))
+        assert _receipt_hdr_digest(rt, a_l1, task_a, 1, "L1") == a_l1_hres["digest"]
+        assert _receipt_hdr_digest(rt, a_l2, task_a, 1, "L2") == a_l2_hres["digest"]
+
+        # Task B: observed-only rev 1 -> agent patch rev 2 -> agent patch rev 3.
+        prep_b = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "work",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "description": "Task B full lifecycle",
+                "idempotency_key": "idem-r4-v000-prep-b",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        task_b = str(prep_b["task_id"])
+        sref_b = ss.bind_session(
+            principal_id=cred.principal.principal_id,
+            repo_id=ws.repo_id,
+            checkout_id=ws.checkout_id,
+            harness_id="claude-code",
+            raw_session_id="SID_R4_B",
+            now=clock.now(),
+        ).session_ref
+        ss.record_session_event(
+            session_ref=sref_b,
+            repo_id=ws.repo_id,
+            checkout_id=ws.checkout_id,
+            task_id=task_b,
+            producer_stream="stream-r4-b",
+            event=CaptureEventRecord(
+                event_id="ev-r4-obs-1",
+                producer_stream="stream-r4-b",
+                sequence=1,
+                harness_id="claude-code",
+                kind="user_message",
+                recorded_at="2026-11-26T10:00:05Z",
+                payload={"role": "user", "text": "Observed event on Task B"},
+                session_ref=sref_b,
+            ),
+            now=clock.now(),
+        )
+        svc, _ = kernel_job_service(rt, clock)
+        exec_ = JobExecutor(PRODUCTION_JOB_HANDLERS, lambda: 10_000)
+        exec_.start()
+        try:
+            coord = ContinuityWorkerCoordinator(
+                rt=rt, job_service=svc, executor=exec_, clock=clock, mono=lambda: 10_000
+            )
+            clock.advance(dt.timedelta(seconds=65))
+            assert coord.enqueue_if_due(task_id=task_b, now=clock.now()) is not None
+            assert coord.run_next(writer_epoch=rt.lease.epoch, now=clock.now()) is True
+        finally:
+            exec_.close(5.0)
+
+        hdr_b1 = hs.read_revision_header(
+            artifact_id=task_b,
+            revision_epoch=0,
+            revision=1,
+            principal_id=cred.principal.principal_id,
+            scope=scope,
+        )
+        assert hdr_b1 is not None and hdr_b1.agent_ref is None and hdr_b1.observed_ref is not None
+        b1_l1 = _call_ok(
+            bridge,
+            rt,
+            "get_artifact",
+            {
+                "workspace_id": ws.repo_id,
+                "task_id": task_b,
+                "artifact_id": task_b,
+                "revision_epoch": 0,
+                "revision": 1,
+                "level": "L1",
+                "idempotency_key": "idem-r4-v000-get-b1l1",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        _, b1_hdr = _find_header(b1_l1)
+        assert b1_hdr["agent_ref"] is None and b1_hdr["observed_ref"] == hdr_b1.observed_ref
+
+        live_b1 = hs.read_header(task_b, principal_id=cred.principal.principal_id, scope=scope)
+        assert live_b1 is not None
+        sub_b2 = _call_ok(
+            bridge,
+            rt,
+            "submit_episode",
+            {
+                "task_id": task_b,
+                "session_id": "SID_R4_B",
+                "workspace_id": ws.repo_id,
+                "evidence": [],
+                "base_revision": 0,
+                "fence": live_b1.handoff_live.fence.to_dict(),
+                "takeover": {"acknowledge_active": True, "reason": "claim after observed rev 1"},
+                "handoff": {"working_goal": "Task B goal rev 2", "task_state": "open"},
+                "idempotency_key": "idem-r4-v000-sub-b2",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        hdr_b2 = hs.read_revision_header(
+            artifact_id=task_b,
+            revision_epoch=0,
+            revision=2,
+            principal_id=cred.principal.principal_id,
+            scope=scope,
+        )
+        assert hdr_b2 is not None and hdr_b2.agent_ref is not None and hdr_b2.observed_ref == hdr_b1.observed_ref
+
+        # Pin historical (0, 2) L1 & L2 calls before creating backup and rev 3 ("Branch X").
+        b2_l1 = _call_ok(
+            bridge,
+            rt,
+            "get_artifact",
+            {
+                "workspace_id": ws.repo_id,
+                "task_id": task_b,
+                "artifact_id": task_b,
+                "revision_epoch": 0,
+                "revision": 2,
+                "level": "L1",
+                "idempotency_key": "idem-r4-v000-get-b2l1",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        b2_l2 = _call_ok(
+            bridge,
+            rt,
+            "get_artifact",
+            {
+                "workspace_id": ws.repo_id,
+                "task_id": task_b,
+                "artifact_id": task_b,
+                "revision_epoch": 0,
+                "revision": 2,
+                "level": "L2",
+                "idempotency_key": "idem-r4-v000-get-b2l2",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        _, b2_l1_hdr = _find_header(b2_l1)
+        assert b2_l1_hdr["agent_ref"] == hdr_b2.agent_ref and b2_l1_hdr["observed_ref"] == hdr_b2.observed_ref
+        assert [(h["revision_epoch"], h["revision"]) for h in _extract_l2_revs(b2_l2)] == [(0, 2), (0, 1)]
+
+        bak_b2 = create_store_backup(rt.store, os_, clock.now())
+
+        _call_ok(
+            bridge,
+            rt,
+            "submit_episode",
+            {
+                "task_id": task_b,
+                "session_id": "SID_R4_B",
+                "workspace_id": ws.repo_id,
+                "evidence": [],
+                "base_revision": 1,
+                "fence": sub_b2["fence"],
+                "handoff": {"working_goal": "Task B branch X rev 3"},
+                "idempotency_key": "idem-r4-v000-sub-b3x",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        hdr_b3x = hs.read_revision_header(
+            artifact_id=task_b,
+            revision_epoch=0,
+            revision=3,
+            principal_id=cred.principal.principal_id,
+            scope=scope,
+        )
+        assert hdr_b3x is not None and hdr_b3x.agent_ref is not None and hdr_b3x.agent_ref != hdr_b2.agent_ref
+
+        b3x_l2 = _call_ok(
+            bridge,
+            rt,
+            "get_artifact",
+            {
+                "workspace_id": ws.repo_id,
+                "task_id": task_b,
+                "artifact_id": task_b,
+                "revision_epoch": 0,
+                "revision": 3,
+                "level": "L2",
+                "idempotency_key": "idem-r4-v000-get-b3xl2",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        _, b3x_hdr = _find_header(b3x_l2)
+        assert b3x_hdr["agent_ref"] == hdr_b3x.agent_ref and b3x_hdr["observed_ref"] == hdr_b3x.observed_ref
+        b3x_revs = _extract_l2_revs(b3x_l2)
+        assert [(h["revision_epoch"], h["revision"]) for h in b3x_revs] == [(0, 3), (0, 2), (0, 1)]
+        assert [h["agent_ref"] for h in b3x_revs] == [hdr_b3x.agent_ref, hdr_b2.agent_ref, None]
+        assert all(h["artifact_id"] == task_b for h in b3x_revs)
+
+        # Reading historical (0, 2) must not include (0, 3).
+        b2_hist_l2 = _call_ok(
+            bridge,
+            rt,
+            "get_artifact",
+            {
+                "workspace_id": ws.repo_id,
+                "task_id": task_b,
+                "artifact_id": task_b,
+                "revision_epoch": 0,
+                "revision": 2,
+                "level": "L2",
+                "idempotency_key": "idem-r4-v000-get-b2hist",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        assert [(h["revision_epoch"], h["revision"]) for h in _extract_l2_revs(b2_hist_l2)] == [(0, 2), (0, 1)]
+
+        # Cross-scope L2 lookup fails closed with NOT_FOUND.
+        assert (
+            _call_err(
+                bridge,
+                rt,
+                "get_artifact",
+                {
+                    "workspace_id": ws2.repo_id,
+                    "task_id": task_b,
+                    "artifact_id": task_b,
+                    "revision_epoch": 0,
+                    "revision": 3,
+                    "level": "L2",
+                    "idempotency_key": "idem-r4-v000-get-xscope",
+                },
+                cred=cred,
+                scope=scope2,
+            )
+            == ErrorCode.NOT_FOUND.value
+        )
+    finally:
+        rt.close()
+
+    # Restore backup at (0, 2) -> restore_epoch=1; take over and create (1, 3) Branch Y and (1, 4).
+    with maintenance_lease(data_root, os_) as (root_obj, lease):
+        pol_handle = PolicyStore.open(root_obj, lease, os_, migrations=KERNEL_POLICY_MIGRATIONS)
+        try:
+            rep = restore_store(
+                root_obj,
+                lease,
+                os_,
+                bak_b2,
+                pol_handle,
+                clock.now(),
+                migrations=KERNEL_STORE_MIGRATIONS,
+            )
+            post_ep = rep.new_epoch
+            assert post_ep > 0
+        finally:
+            pol_handle.close()
+
+    rt2 = open_kernel_job_runtime(data_root, os_, role="sp24-r4")
+    try:
+        domain2 = build_default_handoff_domain(rt=rt2, clock=clock, writer_epoch=rt2.lease.epoch)
+        assert domain2 is not None
+        bridge2 = KernelBridge(
+            store=rt2.store, policy=rt2.policy, clock=clock, writer_epoch=rt2.lease.epoch, domain=domain2
+        )
+        hs2 = HandoffStore(rt2.store, rt2.policy)
+        live_after_res = hs2.read_header(task_b, principal_id=cred.principal.principal_id, scope=scope)
+        assert live_after_res is not None
+        assert live_after_res.handoff_live.fence.restore_epoch == post_ep
+
+        sub_b3y = _call_ok(
+            bridge2,
+            rt2,
+            "submit_episode",
+            {
+                "task_id": task_b,
+                "session_id": "SID_R4_B_Y",
+                "workspace_id": ws.repo_id,
+                "evidence": [],
+                "base_revision": 1,
+                "fence": live_after_res.handoff_live.fence.to_dict(),
+                "takeover": {"acknowledge_active": True, "reason": "post-restore branch Y"},
+                "handoff": {"working_goal": "Task B branch Y rev 3"},
+                "idempotency_key": "idem-r4-v000-sub-b3y",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        sub_b4y = _call_ok(
+            bridge2,
+            rt2,
+            "submit_episode",
+            {
+                "task_id": task_b,
+                "session_id": "SID_R4_B_Y",
+                "workspace_id": ws.repo_id,
+                "evidence": [],
+                "base_revision": 2,
+                "fence": sub_b3y["fence"],
+                "handoff": {"working_goal": "Task B branch Y rev 4"},
+                "idempotency_key": "idem-r4-v000-sub-b4y",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        assert sub_b4y["handoff_status"] == "stored"
+
+        hdr_b3y = hs2.read_revision_header(
+            artifact_id=task_b,
+            revision_epoch=post_ep,
+            revision=3,
+            principal_id=cred.principal.principal_id,
+            scope=scope,
+        )
+        hdr_b4y = hs2.read_revision_header(
+            artifact_id=task_b,
+            revision_epoch=post_ep,
+            revision=4,
+            principal_id=cred.principal.principal_id,
+            scope=scope,
+        )
+        assert hdr_b3y is not None and hdr_b4y is not None
+        assert hdr_b3y.agent_ref is not None and hdr_b3y.agent_ref != hdr_b3x.agent_ref
+
+        # Seed a duplicate (0, 3) Branch X header row + durable CAS blob to verify branch isolation on rev 3.
+        from superbrain.core.canonical import canonical_json
+        from superbrain.core.ids import new_id
+        from superbrain.ports._handoff_types import HandoffAgentState
+        from superbrain.storage.kinds import RetentionClass
+
+        bx_bytes = canonical_json(HandoffAgentState(working_goal="Task B branch X archived").to_dict())
+        bx_dig = digest_bytes(bx_bytes)
+        bx_hid = new_id()
+        rt2.store.cas.put(bx_bytes)
+        with rt2.store.transaction() as txn:
+            txn.hold(bx_dig, "event", bx_hid, RetentionClass.DURABLE, None)
+            txn.db.execute(
+                "INSERT INTO handoff_revision_headers ("
+                "artifact_id, revision_epoch, revision, handoff_revision, task_id, task_state, task_state_source, "
+                "holder_restore_epoch, writer_generation, holder_harness_id, holder_principal, holder_session_ref, "
+                "session_state, agent_ref, agent_holder_id, observed_ref, agent_updated_at, observed_through, "
+                "recorded_at"
+                ") VALUES (?, 0, 3, 2, ?, 'open', 'agent', 0, 1, 'claude-code', ?, ?, 'active', ?, ?, ?, "
+                "?, ?, ?)",
+                (
+                    task_b,
+                    task_b,
+                    cred.principal.principal_id,
+                    hdr_b3x.holder_session_ref,
+                    bx_dig,
+                    bx_hid,
+                    hdr_b3x.observed_ref,
+                    hdr_b3x.agent_updated_at,
+                    hdr_b3x.observed_through,
+                    "2026-11-26T10:02:00Z",
+                ),
+            )
+
+        # Replay pre-restore (0, 2) keeps epoch-0 fence and refs while handoff_live reports live epoch.
+        rep_b2_l2 = _call_ok(
+            bridge2,
+            rt2,
+            "get_artifact",
+            {
+                "workspace_id": ws.repo_id,
+                "task_id": task_b,
+                "artifact_id": task_b,
+                "revision_epoch": 0,
+                "revision": 2,
+                "level": "L2",
+                "idempotency_key": "idem-r4-v000-get-b2l2",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        _, rep_b2_hdr = _find_header(rep_b2_l2)
+        assert rep_b2_hdr["agent_ref"] == hdr_b2.agent_ref
+        assert rep_b2_hdr["observed_ref"] == hdr_b2.observed_ref
+        assert rep_b2_hdr["fence"]["restore_epoch"] == 0
+        assert rep_b2_l2["handoff_live"]["fence"]["restore_epoch"] == post_ep
+        assert [(h["revision_epoch"], h["revision"]) for h in _extract_l2_revs(rep_b2_l2)] == [(0, 2), (0, 1)]
+
+        # Reading post-restore rev 4 includes Branch Y (post_ep, 3) and pre-restore (0, 2), (0, 1), never (0, 3).
+        b4y_l2 = _call_ok(
+            bridge2,
+            rt2,
+            "get_artifact",
+            {
+                "workspace_id": ws.repo_id,
+                "task_id": task_b,
+                "artifact_id": task_b,
+                "revision_epoch": post_ep,
+                "revision": 4,
+                "level": "L2",
+                "idempotency_key": "idem-r4-v000-get-b4yl2",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        b4y_hres, b4y_hdr = _find_header(b4y_l2)
+        assert b4y_hdr["agent_ref"] == hdr_b4y.agent_ref and b4y_hdr["observed_ref"] == hdr_b4y.observed_ref
+        assert b4y_hdr["fence"]["restore_epoch"] == post_ep
+        assert _receipt_hdr_digest(rt2, b4y_l2, task_b, 4, "L2") == b4y_hres["digest"]
+        b4y_revs = _extract_l2_revs(b4y_l2)
+        assert [(h["revision_epoch"], h["revision"]) for h in b4y_revs] == [
+            (post_ep, 4),
+            (post_ep, 3),
+            (0, 2),
+            (0, 1),
+        ]
+        assert [h["agent_ref"] for h in b4y_revs] == [
+            hdr_b4y.agent_ref,
+            hdr_b3y.agent_ref,
+            hdr_b2.agent_ref,
+            None,
+        ]
+
+        # Reading archived Branch X (0, 3) excludes all epoch-1 revisions.
+        b3x_post_l2 = _call_ok(
+            bridge2,
+            rt2,
+            "get_artifact",
+            {
+                "workspace_id": ws.repo_id,
+                "task_id": task_b,
+                "artifact_id": task_b,
+                "revision_epoch": 0,
+                "revision": 3,
+                "level": "L2",
+                "idempotency_key": "idem-r4-v000-get-b3xpost",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        b3x_post_revs = _extract_l2_revs(b3x_post_l2)
+        assert [(h["revision_epoch"], h["revision"]) for h in b3x_post_revs] == [(0, 3), (0, 2), (0, 1)]
+        assert b3x_post_revs[0]["agent_ref"] == bx_dig
+    finally:
+        rt2.close()

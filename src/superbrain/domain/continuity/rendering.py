@@ -160,6 +160,14 @@ def select_discover_items(
     return selected, truncated
 
 
+def _render_l1_header_only_task_state(
+    task_state: str | None, state: HandoffAgentState | None
+) -> str:
+    if task_state is not None:
+        return task_state
+    return "open" if state is None else state.task_state
+
+
 def render_handoff_l1(
     *,
     task_id: str,
@@ -177,6 +185,7 @@ def render_handoff_l1(
     observed_sources: Sequence[ResolvedSourceContent],
     agent_ref: str | None = None,
     observed_ref: str | None = None,
+    task_state: str | None = None,
     task_state_source: str = "agent",
     restore_epoch_for_header: int | None = None,
     events_since_agent: int = 0,
@@ -186,6 +195,10 @@ def render_handoff_l1(
     effective_epoch = revision_epoch if restore_epoch_for_header is None else restore_epoch_for_header
     active = derive_active_sets(state)
     l1_goal, goal_clipped = truncate_utf8_boundary(task_goal, HANDOFF_L1_GOAL_MAX_BYTES)
+    eff_task_state = _render_l1_header_only_task_state(task_state, state)
+    eff_task_state_source = task_state_source if (handoff_revision > 0 or agent_ref is not None) else (
+        task_state_source if task_state is not None else "inferred"
+    )
     header: dict[str, JsonValue] = {
         "artifact_id": artifact_id,
         "revision_epoch": revision_epoch,
@@ -194,8 +207,8 @@ def render_handoff_l1(
         "agent_ref": agent_ref,
         "observed_ref": observed_ref,
         "task_id": task_id,
-        "task_state": "open" if state is None else state.task_state,
-        "task_state_source": task_state_source if handoff_revision > 0 else "inferred",
+        "task_state": eff_task_state,
+        "task_state_source": eff_task_state_source,
         "fence": {"restore_epoch": effective_epoch, "writer_generation": writer_generation},
         "holder_harness_id": holder_harness_id,
         "session_state": session_state,
@@ -252,6 +265,87 @@ def render_handoff_l1(
     return resources, incomplete_optional
 
 
+def _pack_goal_chunks(
+    full_task_goal: str, *, used_bytes: int, max_total_bytes: int
+) -> tuple[list[dict[str, JsonValue]], int, bool]:
+    encoded_full = canonical_json({"full_task_goal": full_task_goal}).decode("utf-8")
+    full_len = utf8_len(encoded_full)
+    if full_len <= HANDOFF_L1_RESOURCE_MAX_BYTES and used_bytes + full_len <= max_total_bytes:
+        return [_make_resource("l2_goal_0", encoded_full)], used_bytes + full_len, False
+    chunks: list[dict[str, JsonValue]] = []
+    rest = full_task_goal
+    part = 0
+    # Leave room for {"full_task_goal":"..."} wrapper + JSON escaping overhead.
+    max_text_bytes = HANDOFF_L1_RESOURCE_MAX_BYTES - 1024
+    while rest:
+        seg, _ = truncate_utf8_boundary(rest, max_text_bytes)
+        if not seg:
+            return chunks, used_bytes, True
+        # Remove trailing "..." if truncated purely for chunking.
+        if seg.endswith("...") and len(seg) < len(rest):
+            seg = seg[:-3]
+        if not seg:
+            return chunks, used_bytes, True
+        enc = canonical_json({"full_task_goal": seg}).decode("utf-8")
+        clen = utf8_len(enc)
+        while clen > HANDOFF_L1_RESOURCE_MAX_BYTES and len(seg) > 1:
+            seg = seg[: max(1, len(seg) // 2)]
+            enc = canonical_json({"full_task_goal": seg}).decode("utf-8")
+            clen = utf8_len(enc)
+        if clen > HANDOFF_L1_RESOURCE_MAX_BYTES or used_bytes + clen > max_total_bytes:
+            return chunks, used_bytes, True
+        chunks.append(_make_resource(f"l2_goal_{part}", enc))
+        used_bytes += clen
+        part += 1
+        rest = rest[len(seg) :]
+    return chunks, used_bytes, False
+
+
+def _pack_list_section(
+    prefix: str,
+    field_key: str,
+    entries: Sequence[JsonValue],
+    *,
+    used_bytes: int,
+    max_total_bytes: int,
+) -> tuple[list[dict[str, JsonValue]], int, bool]:
+    """Pack whole list items sequentially into valid <=8 KB JSON chunks within ``max_total_bytes``."""
+    if not entries:
+        enc_empty = canonical_json({field_key: []}).decode("utf-8")
+        elen = utf8_len(enc_empty)
+        if elen <= HANDOFF_L1_RESOURCE_MAX_BYTES and used_bytes + elen <= max_total_bytes:
+            return [_make_resource(f"{prefix}_0", enc_empty)], used_bytes + elen, False
+        return [], used_bytes, True
+
+    out: list[dict[str, JsonValue]] = []
+    bucket: list[JsonValue] = []
+    part = 0
+    for entry in entries:
+        cand_enc = canonical_json({field_key: [*bucket, entry]}).decode("utf-8")
+        cand_len = utf8_len(cand_enc)
+        if cand_len <= HANDOFF_L1_RESOURCE_MAX_BYTES and used_bytes + cand_len <= max_total_bytes:
+            bucket.append(entry)
+            continue
+        if bucket:
+            flush_enc = canonical_json({field_key: bucket}).decode("utf-8")
+            flush_len = utf8_len(flush_enc)
+            out.append(_make_resource(f"{prefix}_{part}", flush_enc))
+            used_bytes += flush_len
+            part += 1
+            bucket = []
+        single_enc = canonical_json({field_key: [entry]}).decode("utf-8")
+        single_len = utf8_len(single_enc)
+        if single_len <= HANDOFF_L1_RESOURCE_MAX_BYTES and used_bytes + single_len <= max_total_bytes:
+            bucket = [entry]
+        else:
+            return out, used_bytes, True
+    if bucket:
+        flush_enc = canonical_json({field_key: bucket}).decode("utf-8")
+        out.append(_make_resource(f"{prefix}_{part}", flush_enc))
+        used_bytes += utf8_len(flush_enc)
+    return out, used_bytes, False
+
+
 def render_handoff_l2(
     *,
     l1_resources: Sequence[Mapping[str, JsonValue]],
@@ -259,40 +353,54 @@ def render_handoff_l2(
     state: HandoffAgentState | None,
     revision_history: Sequence[Mapping[str, JsonValue]],
     conversation_excerpts: Sequence[ResolvedSourceContent],
+    max_total_bytes: int = HANDOFF_L2_MAX_BYTES,
 ) -> list[dict[str, JsonValue]]:
     """Render L2 full detail + revision/closed history bounded to 256 KB UTF-8 newest-first (§7.4)."""
     resources: list[dict[str, JsonValue]] = [dict(r) for r in l1_resources]
     used_bytes = sum(utf8_len(str(r.get("content", ""))) for r in resources)
 
+    rev_list: list[JsonValue] = [dict(h) for h in revision_history]
+    all_dec: list[JsonValue] = [] if state is None else [d.to_dict() for d in state.decisions]
+    all_rej: list[JsonValue] = [] if state is None else [r.to_dict() for r in state.rejected]
+    closed_chg: list[JsonValue] = [] if state is None else [c.to_dict() for c in state.closed_changes]
+    conv_list: list[JsonValue] = [_render_source_content(c) for c in conversation_excerpts]
+
     history_payload: dict[str, JsonValue] = {
         "full_task_goal": full_task_goal,
-        "all_decisions": [] if state is None else [d.to_dict() for d in state.decisions],
-        "all_rejected": [] if state is None else [r.to_dict() for r in state.rejected],
-        "closed_changes": [] if state is None else [c.to_dict() for c in state.closed_changes],
-        "revision_history": [dict(h) for h in revision_history],
-        "conversation_excerpts": [_render_source_content(c) for c in conversation_excerpts],
+        "all_decisions": all_dec,
+        "all_rejected": all_rej,
+        "closed_changes": closed_chg,
+        "revision_history": rev_list,
+        "conversation_excerpts": conv_list,
     }
-    hist_resources = _chunk_json_entries("l2_history", [history_payload], HANDOFF_L1_RESOURCE_MAX_BYTES)
-    if len(hist_resources) == 1 and used_bytes + utf8_len(str(hist_resources[0]["content"])) <= HANDOFF_L2_MAX_BYTES:
-        resources.extend(hist_resources)
+    encoded_all = canonical_json([history_payload]).decode("utf-8")
+    all_bytes = utf8_len(encoded_all)
+    if all_bytes <= HANDOFF_L1_RESOURCE_MAX_BYTES and used_bytes + all_bytes <= max_total_bytes:
+        resources.append(_make_resource("l2_history_0", encoded_all))
         return resources
 
-    # Pack piecewise within 256 KB newest-first so oversized goals/history never violate the 256 KB ceiling.
-    pieces: list[tuple[str, JsonValue]] = [
-        ("l2_goal", {"full_task_goal": full_task_goal}),
-        ("l2_closed", {"closed_changes": history_payload["closed_changes"]}),
-        ("l2_decisions", {"all_decisions": history_payload["all_decisions"]}),
-        ("l2_rejected", {"all_rejected": history_payload["all_rejected"]}),
-        ("l2_revisions", {"revision_history": history_payload["revision_history"]}),
-        ("l2_conversation", {"conversation_excerpts": history_payload["conversation_excerpts"]}),
-    ]
-    for name, piece in pieces:
-        for chunk in _chunk_json_entries(name, [piece], HANDOFF_L1_RESOURCE_MAX_BYTES):
-            cbytes = utf8_len(str(chunk["content"]))
-            if used_bytes + cbytes > HANDOFF_L2_MAX_BYTES:
-                return resources
-            resources.append(chunk)
-            used_bytes += cbytes
+    # Pack piecewise within max_total_bytes keeping every resource valid JSON <= 8 KB.
+    goal_chunks, used_bytes, exhausted = _pack_goal_chunks(
+        full_task_goal, used_bytes=used_bytes, max_total_bytes=max_total_bytes
+    )
+    resources.extend(goal_chunks)
+    if exhausted:
+        return resources
+
+    sections: tuple[tuple[str, str, Sequence[JsonValue]], ...] = (
+        ("l2_closed", "closed_changes", closed_chg),
+        ("l2_decisions", "all_decisions", all_dec),
+        ("l2_rejected", "all_rejected", all_rej),
+        ("l2_revisions", "revision_history", rev_list),
+        ("l2_conversation", "conversation_excerpts", conv_list),
+    )
+    for prefix, field_key, entries in sections:
+        sec_chunks, used_bytes, exhausted = _pack_list_section(
+            prefix, field_key, entries, used_bytes=used_bytes, max_total_bytes=max_total_bytes
+        )
+        resources.extend(sec_chunks)
+        if exhausted:
+            return resources
     return resources
 
 

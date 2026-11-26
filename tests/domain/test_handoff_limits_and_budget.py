@@ -344,3 +344,94 @@ def test_multibyte_utf8_write_limits_and_32kb_non_growing_exemption() -> None:
     too_small, trunc_small = select_discover_items(cands, budget_tokens=10)
     assert too_small == [] and trunc_small is True
     assert utf8_byte_v1_tokens(601) == math.ceil(601 / 4)
+
+
+def test_render_handoff_l2_chunks_revision_history_newest_first_within_256kb_budget() -> None:
+    import json
+
+    from superbrain.domain.continuity.budget import HANDOFF_L1_RESOURCE_MAX_BYTES, HANDOFF_L2_MAX_BYTES, utf8_len
+    from superbrain.domain.continuity.rendering import render_handoff_l1, render_handoff_l2
+
+    ag_ref = digest_bytes(b"agent-state-v1")
+    obs_ref = digest_bytes(b"observed-state-v1")
+    l1_res, inc_opt = render_handoff_l1(
+        task_id="task-l2-budget",
+        artifact_id="art-l2-budget",
+        revision=3,
+        revision_epoch=1,
+        handoff_revision=2,
+        writer_generation=4,
+        holder_harness_id="codex",
+        session_state="active",
+        agent_updated_at="2026-11-26T10:00:00Z",
+        observed_through="2026-11-26T10:01:00Z",
+        task_goal="Goal for L1/L2 header and chunked revision history",
+        state=None,
+        observed_sources=(),
+        agent_ref=ag_ref,
+        observed_ref=obs_ref,
+        task_state_source="agent",
+        restore_epoch_for_header=1,
+    )
+    assert inc_opt is False
+    hdr = json.loads(str(l1_res[0]["content"]))
+    assert hdr["agent_ref"] == ag_ref
+    assert hdr["observed_ref"] == obs_ref
+    assert hdr["fence"] == {"restore_epoch": 1, "writer_generation": 4}
+
+    def _make_hist(count: int) -> list[dict[str, JsonValue]]:
+        return [
+            {
+                "artifact_id": "art-l2-budget",
+                "revision_epoch": 1 if rev > 30 else 0,
+                "revision": rev,
+                "handoff_revision": rev,
+                "task_state": "open",
+                "task_state_source": "agent",
+                "fence": {"restore_epoch": 1 if rev > 30 else 0, "writer_generation": 1},
+                "agent_ref": digest_bytes(f"ag-{rev}".encode()),
+                "observed_ref": digest_bytes(f"obs-{rev}".encode()),
+            }
+            for rev in range(count, 0, -1)
+        ]
+
+    def _collect_revs(resources: list[dict[str, JsonValue]]) -> list[int]:
+        out: list[int] = []
+        total_b = 0
+        for res in resources:
+            raw = str(res["content"])
+            b = utf8_len(raw)
+            assert b <= HANDOFF_L1_RESOURCE_MAX_BYTES
+            total_b += b
+            parsed = json.loads(raw)
+            name = str(res["name"])
+            if name.startswith("l2_history_"):
+                assert isinstance(parsed, list) and len(parsed) == 1
+                out.extend(int(h["revision"]) for h in parsed[0]["revision_history"])
+            elif name.startswith("l2_revisions_"):
+                assert isinstance(parsed, dict)
+                out.extend(int(h["revision"]) for h in parsed["revision_history"])
+        assert total_b <= HANDOFF_L2_MAX_BYTES
+        return out
+
+    # Medium history (>8 KB single-resource limit, <256 KB total cap): keeps all 60 entries newest-first as valid JSON.
+    med_res = render_handoff_l2(
+        l1_resources=l1_res,
+        full_task_goal="Goal for medium history",
+        state=None,
+        revision_history=_make_hist(60),
+        conversation_excerpts=(),
+    )
+    assert _collect_revs(med_res) == list(range(60, 0, -1))
+
+    # Oversized history (>256 KB total): drops oldest revisions cleanly, keeping valid JSON and newest-first prefix.
+    big_res = render_handoff_l2(
+        l1_resources=l1_res,
+        full_task_goal="Goal for oversized history",
+        state=None,
+        revision_history=_make_hist(950),
+        conversation_excerpts=(),
+    )
+    kept_big = _collect_revs(big_res)
+    assert len(kept_big) < 950 and len(kept_big) > 100
+    assert kept_big == list(range(950, 950 - len(kept_big), -1))

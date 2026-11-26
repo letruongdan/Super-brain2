@@ -222,6 +222,39 @@ _HEADER_SQL = (
 )
 
 
+_REV_HDR_SELECT = (
+    "SELECT r.artifact_id, r.revision_epoch, r.revision, r.handoff_revision, r.task_id, r.task_state, "
+    "r.task_state_source, r.holder_restore_epoch, r.writer_generation, r.holder_harness_id, "
+    "r.holder_principal, r.holder_session_ref, r.session_state, r.agent_ref, r.observed_ref, "
+    "r.agent_updated_at, r.observed_through, t.repo_id, t.checkout_id "
+    "FROM handoff_revision_headers AS r JOIN tasks AS t ON t.task_id = r.task_id "
+)
+
+
+def _row_to_rev_header(row: Sequence[object]) -> HandoffRevisionHeader:
+    return HandoffRevisionHeader(
+        artifact_id=str(row[0]),
+        revision_epoch=require_non_negative_int(row[1]),
+        revision=require_positive_int(row[2]),
+        handoff_revision=require_non_negative_int(row[3]),
+        task_id=str(row[4]),
+        task_state=str(row[5]),
+        task_state_source=str(row[6]),
+        fence=HandoffFence(
+            restore_epoch=require_non_negative_int(row[7]),
+            writer_generation=require_non_negative_int(row[8]),
+        ),
+        holder_harness_id=None if row[9] is None else str(row[9]),
+        holder_principal=None if row[10] is None else str(row[10]),
+        holder_session_ref=None if row[11] is None else str(row[11]),
+        session_state=None if row[12] is None else str(row[12]),
+        agent_ref=None if row[13] is None else str(row[13]),
+        observed_ref=None if row[14] is None else str(row[14]),
+        agent_updated_at=None if row[15] is None else str(row[15]),
+        observed_through=None if row[16] is None else str(row[16]),
+    )
+
+
 class HandoffStore(HandoffStorePort):
     """Durable SP2-4 handoff, immutable revision header, delivery, and episode store over ``store v8``."""
 
@@ -283,34 +316,68 @@ class HandoffStore(HandoffStorePort):
         if scope.checkout_id is None:
             raise BrainError(ErrorCode.NOT_FOUND, "not found")
         row = self._store._db.execute(
-            "SELECT r.artifact_id, r.revision_epoch, r.revision, r.handoff_revision, r.task_id, r.task_state, "
-            "r.task_state_source, r.holder_restore_epoch, r.writer_generation, r.holder_harness_id, "
-            "r.holder_principal, r.holder_session_ref, r.session_state, r.agent_ref, r.observed_ref, "
-            "r.agent_updated_at, r.observed_through, t.repo_id, t.checkout_id "
-            "FROM handoff_revision_headers AS r JOIN tasks AS t ON t.task_id = r.task_id "
-            "WHERE r.artifact_id = ? AND r.revision_epoch = ? AND r.revision = ?",
+            _REV_HDR_SELECT + "WHERE r.artifact_id = ? AND r.revision_epoch = ? AND r.revision = ?",
             (artifact_id, revision_epoch, revision),
         ).fetchone()
         if row is None or str(row[17]) != scope.repo_id or str(row[18]) != scope.checkout_id:
             raise BrainError(ErrorCode.NOT_FOUND, "not found")
-        return HandoffRevisionHeader(
-            artifact_id=str(row[0]),
-            revision_epoch=int(row[1]),
-            revision=int(row[2]),
-            handoff_revision=int(row[3]),
-            task_id=str(row[4]),
-            task_state=str(row[5]),
-            task_state_source=str(row[6]),
-            fence=HandoffFence(restore_epoch=int(row[7]), writer_generation=int(row[8])),
-            holder_harness_id=None if row[9] is None else str(row[9]),
-            holder_principal=None if row[10] is None else str(row[10]),
-            holder_session_ref=None if row[11] is None else str(row[11]),
-            session_state=None if row[12] is None else str(row[12]),
-            agent_ref=None if row[13] is None else str(row[13]),
-            observed_ref=None if row[14] is None else str(row[14]),
-            agent_updated_at=None if row[15] is None else str(row[15]),
-            observed_through=None if row[16] is None else str(row[16]),
-        )
+        return _row_to_rev_header(row)
+
+    def list_revision_history(
+        self,
+        *,
+        artifact_id: str,
+        task_id: str,
+        revision_epoch: int,
+        revision: int,
+        principal_id: str,
+        scope: Scope,
+        limit: int = 1024,
+    ) -> tuple[HandoffRevisionHeader, ...]:
+        """Return pinned-branch headers newest-first up to ``limit``, isolating restore branches."""
+        _require_v8_ready(self._store, self._policy)
+        require_opaque_id(artifact_id, label="artifact_id")
+        require_opaque_id(task_id, label="task_id")
+        require_non_negative_int(revision_epoch)
+        require_positive_int(revision)
+        require_opaque_id(principal_id, label="principal_id")
+        require_positive_int(limit)
+        if scope.checkout_id is None:
+            raise BrainError(ErrorCode.NOT_FOUND, "not found")
+        rows = self._store._db.execute(
+            _REV_HDR_SELECT
+            + "WHERE r.artifact_id = ? AND r.task_id = ? AND t.repo_id = ? AND t.checkout_id = ? "
+            "AND r.revision_epoch <= ? AND r.revision <= ? "
+            "ORDER BY r.revision DESC, r.revision_epoch DESC",
+            (artifact_id, task_id, scope.repo_id, scope.checkout_id, revision_epoch, revision),
+        ).fetchall()
+        results: list[HandoffRevisionHeader] = []
+        target_found = False
+        cur_max_epoch = revision_epoch
+        last_rev = revision + 1
+        for row in rows:
+            hdr = _row_to_rev_header(row)
+            if not target_found:
+                if hdr.revision == revision and hdr.revision_epoch == revision_epoch:
+                    target_found = True
+                    results.append(hdr)
+                    cur_max_epoch = hdr.revision_epoch
+                    last_rev = hdr.revision
+                    if len(results) >= limit:
+                        break
+                continue
+            if hdr.revision == last_rev:
+                continue
+            if hdr.revision > last_rev or hdr.revision_epoch > cur_max_epoch:
+                continue
+            results.append(hdr)
+            cur_max_epoch = hdr.revision_epoch
+            last_rev = hdr.revision
+            if len(results) >= limit:
+                break
+        if not target_found:
+            raise BrainError(ErrorCode.NOT_FOUND, "not found")
+        return tuple(results)
 
     def has_open_handoffs(
         self, *, owner_id: str, repo_id: str, checkout_id: str, now: datetime | None = None
@@ -1693,6 +1760,7 @@ class HandoffStore(HandoffStorePort):
         principal_id: str,
         scope: Scope,
         now: datetime,
+        include_history: bool = False,
     ) -> HandoffContentBundle:
         _require_v8_ready(self._store, self._policy)
         now_utc, _ = require_aware_utc(now)
@@ -1778,6 +1846,17 @@ class HandoffStore(HandoffStorePort):
                 ).fetchone()
                 other_active = orow is not None
 
+        revision_history: tuple[HandoffRevisionHeader, ...] = ()
+        if include_history:
+            revision_history = self.list_revision_history(
+                artifact_id=artifact_id,
+                task_id=task_id,
+                revision_epoch=revision_epoch,
+                revision=revision,
+                principal_id=principal_id,
+                scope=scope,
+            )
+
         return HandoffContentBundle(
             header=hdr,
             live=live,
@@ -1790,6 +1869,7 @@ class HandoffStore(HandoffStorePort):
             holder_harness_id=holder_harness_id,
             session_state=sess_state,
             other_active_warning=other_active,
+            revision_history=revision_history,
         )
 
     def tx_commit_handoff_mutation(

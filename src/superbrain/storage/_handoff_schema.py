@@ -326,6 +326,7 @@ def record_v8_revision_header_in_tx(
     recorded_at: str,
     holder_harness_id: str | None = None,
     session_state: str | None = None,
+    store: object | None = None,
 ) -> None:
     """Best-effort sync of ``handoff_revision_headers`` when the store is already on ``v8+``."""
     has_tbl = db.execute(
@@ -340,6 +341,24 @@ def record_v8_revision_header_in_tx(
     ).fetchone()
     if hrow is None:
         return
+    eff_epoch = int(hrow[1])
+    if store is not None:
+        schema_ver = getattr(store, "schema_version", 0)
+        root_obj = getattr(store, "root", None)
+        os_obj = getattr(store, "_os", None)
+        if isinstance(schema_ver, int) and schema_ver >= 8 and root_obj is not None and os_obj is not None:
+            from superbrain.storage._restore_epoch import read_restore_epoch
+
+            eff_epoch = read_restore_epoch(root_obj, schema_version=schema_ver, os_=os_obj)
+            if eff_epoch != int(hrow[1]):
+                db.execute(
+                    "UPDATE task_handoffs SET current_revision_epoch = ? WHERE task_id = ?",
+                    (eff_epoch, task_id),
+                )
+                db.execute(
+                    "UPDATE tasks SET current_revision_epoch = ? WHERE task_id = ?",
+                    (eff_epoch, task_id),
+                )
     db.execute(
         "INSERT OR REPLACE INTO handoff_revision_headers ("
         "artifact_id, revision_epoch, revision, handoff_revision, task_id, task_state, task_state_source, "
@@ -348,7 +367,7 @@ def record_v8_revision_header_in_tx(
         ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             str(hrow[0]),
-            int(hrow[1]),
+            eff_epoch,
             next_revision,
             next_handoff_revision,
             task_id,

@@ -649,6 +649,7 @@ class HandoffKernelDomain(KernelToolDomain):
             principal_id=principal.principal_id,
             scope=scope,
             now=self._clock.now(),
+            include_history=(rec.level == "L2"),
         )
         if bundle.goal_status != "ok" or bundle.agent_status != "ok":
             reason = bundle.goal_status if bundle.goal_status != "ok" else bundle.agent_status
@@ -680,22 +681,6 @@ class HandoffKernelDomain(KernelToolDomain):
                     "content": l0,
                 }
             ]
-        elif rec.level == "L1":
-            resources, _ = render_handoff_l1(
-                task_id=bundle.header.task_id,
-                artifact_id=bundle.header.artifact_id,
-                revision=bundle.header.revision,
-                revision_epoch=bundle.header.revision_epoch,
-                handoff_revision=bundle.header.handoff_revision,
-                writer_generation=bundle.header.fence.writer_generation,
-                holder_harness_id=bundle.holder_harness_id,
-                session_state=bundle.session_state,
-                agent_updated_at=bundle.header.agent_updated_at,
-                observed_through=bundle.header.observed_through,
-                task_goal=bundle.task_goal or "",
-                state=bundle.agent_state,
-                observed_sources=bundle.observed_sources,
-            )
         else:
             l1_resources, _ = render_handoff_l1(
                 task_id=bundle.header.task_id,
@@ -711,24 +696,39 @@ class HandoffKernelDomain(KernelToolDomain):
                 task_goal=bundle.task_goal or "",
                 state=bundle.agent_state,
                 observed_sources=bundle.observed_sources,
+                agent_ref=bundle.header.agent_ref,
+                observed_ref=bundle.header.observed_ref,
+                task_state=bundle.header.task_state,
+                task_state_source=bundle.header.task_state_source,
+                restore_epoch_for_header=bundle.header.fence.restore_epoch,
             )
-            rev_hist: list[dict[str, JsonValue]] = [
-                {
-                    "artifact_id": bundle.header.artifact_id,
-                    "revision_epoch": bundle.header.revision_epoch,
-                    "revision": bundle.header.revision,
-                    "handoff_revision": bundle.header.handoff_revision,
-                    "task_state": bundle.header.task_state,
-                    "task_state_source": bundle.header.task_state_source,
-                }
-            ]
-            resources = render_handoff_l2(
-                l1_resources=l1_resources,
-                full_task_goal=bundle.task_goal or "",
-                state=bundle.agent_state,
-                revision_history=rev_hist,
-                conversation_excerpts=bundle.conversation_sources,
-            )
+            if rec.level == "L1":
+                resources = l1_resources
+            else:
+                hist_headers = bundle.revision_history or (bundle.header,)
+                rev_hist: list[dict[str, JsonValue]] = [
+                    {
+                        "artifact_id": h.artifact_id,
+                        "revision_epoch": h.revision_epoch,
+                        "revision": h.revision,
+                        "handoff_revision": h.handoff_revision,
+                        "task_state": h.task_state,
+                        "task_state_source": h.task_state_source,
+                        "fence": h.fence.to_dict(),
+                        "agent_ref": h.agent_ref,
+                        "observed_ref": h.observed_ref,
+                        "agent_updated_at": h.agent_updated_at,
+                        "observed_through": h.observed_through,
+                    }
+                    for h in hist_headers
+                ]
+                resources = render_handoff_l2(
+                    l1_resources=l1_resources,
+                    full_task_goal=bundle.task_goal or "",
+                    state=bundle.agent_state,
+                    revision_history=rev_hist,
+                    conversation_excerpts=bundle.conversation_sources,
+                )
         return {
             "artifact_id": rec.artifact_id,
             "revision_epoch": rec.revision_epoch,
