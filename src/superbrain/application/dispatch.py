@@ -229,12 +229,7 @@ class KernelDispatcher:
         live_principal = self._policy.resolve_credential(auth.token)
         if live_principal != auth.principal or live_principal != ctx.principal:
             raise BrainError(ErrorCode.IDENTITY_MISMATCH, "principal identity mismatch")
-        snap = self._current_snapshot()
-        if self._effective_snapshot is not None:
-            effective_principal = snap.resolve_credential(auth.token)
-            if effective_principal != live_principal:
-                raise BrainError(ErrorCode.IDENTITY_MISMATCH, "principal identity mismatch")
-        authorize_call_against_snapshot(snap, live_principal, call)
+        authorize_call_against_snapshot(self._policy.snapshot(), live_principal, call)
         return live_principal
 
     def _check_handler_budget(self, ctx: CallContext, reservation: Reservation | None) -> None:
@@ -405,6 +400,34 @@ class KernelDispatcher:
 
     def _check_raced_row(self, row: IdempotencyRow, call: Call, *, now: datetime) -> bool:
         return self._verify_retained_row(row, call, now=now)
+
+
+def verify_effective_mcp_auth(
+    *,
+    store_id: str,
+    policy: KernelPolicyPort,
+    effective_snapshot: Callable[[], AuthSnapshot],
+    call: Call,
+    ctx: CallContext,
+    auth: PrivateRequestAuth,
+) -> Principal:
+    """Authenticate bearer token against live policy first, then enforce runtime MCP capabilities."""
+    if not isinstance(call, Call) or not isinstance(ctx, CallContext) or not isinstance(auth, PrivateRequestAuth):
+        raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+    if ctx.identity.store_id != store_id or ctx.selected_scope != call.selected_scope:
+        raise BrainError(ErrorCode.IDENTITY_MISMATCH, "principal identity mismatch")
+    parsed_cred_id, _ = parse_bearer_token(auth.token)
+    if parsed_cred_id != auth.credential_id:
+        raise BrainError(ErrorCode.UNAUTHENTICATED, "unauthenticated")
+    live_principal = policy.resolve_credential(auth.token)
+    if live_principal != auth.principal or live_principal != ctx.principal:
+        raise BrainError(ErrorCode.IDENTITY_MISMATCH, "principal identity mismatch")
+    snap = effective_snapshot()
+    effective_principal = snap.resolve_credential(auth.token)
+    if effective_principal != live_principal:
+        raise BrainError(ErrorCode.IDENTITY_MISMATCH, "principal identity mismatch")
+    authorize_call_against_snapshot(snap, live_principal, call)
+    return live_principal
 
 
 def dispatch(
