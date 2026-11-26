@@ -328,7 +328,7 @@ def test_multibyte_utf8_write_limits_and_32kb_non_growing_exemption() -> None:
     )
     assert utf8_len(l0) <= HANDOFF_L0_SUMMARY_MAX_BYTES
 
-    cands = [
+    cands: list[dict[str, JsonValue]] = [
         {
             "kind": "handoff",
             "id": f"t-{i}",

@@ -830,7 +830,16 @@ def test_fixture_receipts_have_no_native_authority(
         )
         assert settled_state(tracker, root, receipt) == "served_only"
         columns = {row[1] for row in store_rows(root, "PRAGMA table_info(artifact_read_ack)")}
-        assert columns == {"id", "served_receipt_id", "principal_id", "task_id", "revision", "digests_json"}
+        assert columns == {
+            "id",
+            "served_receipt_id",
+            "principal_id",
+            "task_id",
+            "artifact_id",
+            "revision_epoch",
+            "revision",
+            "digests_json",
+        }
         extras: tuple[dict[str, Any], ...] = ({"native": True}, {"verified": True}, {"source": "native"})
         for i, extra in enumerate(extras):
             claimed = call(

@@ -127,7 +127,8 @@ class _DaemonCompositeDomain:
 
     def rebind_fallback(self, fallback: KernelToolDomain | None) -> None:
         """Point SP2-4 continuity tools at the post-restore ``HandoffKernelDomain``."""
-        self._fallback = fallback
+        if self._delegate is None:
+            self._fallback = fallback
 
     @property
     def store(self) -> object:

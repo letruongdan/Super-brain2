@@ -487,7 +487,7 @@ def test_takeover_fence_idempotency_not_holder_not_stored_policy_and_checkout_is
 def test_production_loopback_daemon_l0_l1_l2_served_receipt_read_ack_and_resume(trusted_tmp: Path) -> None:
     from superbrain.core.kernel import ToolCommand
     from superbrain.storage.sqlite import open_readonly
-    from tests.integration.test_capture_ack_and_crash_matrix import get_shared_t7_transport_template
+    from tests.support.inc2_cli import get_shared_t7_transport_template
     from tests.support.inc2_transport import open_test_loopback_transport
 
     tpl = get_shared_t7_transport_template()
@@ -614,8 +614,13 @@ def test_production_loopback_daemon_l0_l1_l2_served_receipt_read_ack_and_resume(
         assert art_l2.get("ok") is True and art_l2["data"]["status"] == "ok", art_l2
 
         # 4. Negative ReadAck checks: wrong digest -> INVALID_INPUT; forged receipt -> NOT_FOUND.
-        l1_digests = [{"name": r["name"], "digest": r["digest"]} for r in l1_data["resources"]]
-        wrong_digs = [{"name": r["name"], "digest": digest_bytes(b"wrong")} for r in l1_data["resources"]]
+        assert isinstance(l1_data["resources"], list)
+        l1_digests: list[JsonValue] = [
+            {"name": str(r["name"]), "digest": str(r["digest"])} for r in l1_data["resources"]
+        ]
+        wrong_digs: list[JsonValue] = [
+            {"name": str(r["name"]), "digest": digest_bytes(b"wrong")} for r in l1_data["resources"]
+        ]
         bad_dig_ack = call_loop(
             "submit_episode",
             {

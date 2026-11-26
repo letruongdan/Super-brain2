@@ -568,7 +568,7 @@ def test_health_stays_shallow_under_owner_saturation(
                 assert (health["store_id"], health["writer_epoch"]) == (
                     template.store_id, h.ready.endpoint.writer_epoch
                 )
-                assert (health["schema_version"], health["policy_schema_version"]) == (7, 5)
+                assert (health["schema_version"], health["policy_schema_version"]) == (8, 5)
             finally:
                 release.set()
             assert blocker.result(timeout=WAIT_S)["ok"] is True

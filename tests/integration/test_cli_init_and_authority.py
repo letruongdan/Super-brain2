@@ -156,7 +156,7 @@ def test_brain_init_bootstraps_store_tls_cli_principal_and_tofu_signer(
     request, report = _init(trusted_tmp, config_dir, init_os)
     data_root = request.data_root
     assert read_schema_info(data_root / "policy" / "policy.db") == SchemaInfo(5, 5, report.store_id)
-    assert read_schema_info(data_root / "store" / "brain.db") == SchemaInfo(7, 7, report.store_id)
+    assert read_schema_info(data_root / "store" / "brain.db") == SchemaInfo(8, 8, report.store_id)
 
     cfg = read_daemon_config(report.daemon_config_path, init_os)
     assert (cfg.data_root, cfg.expected_store_id) == (data_root, report.store_id)

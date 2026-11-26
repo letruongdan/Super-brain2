@@ -1214,13 +1214,13 @@ def expect_crash_after_policy_swap(ctx: KernelCrashContext, seed: KernelSeed, ru
     migrate = ("migrate", "--offline", "--config", str(seed.config))
     resumed = _owner_envelope(run_installed_command(ctx.env, "brain", migrate, cwd=ctx.cwd, extra_env=hook_env))
     assert resumed["policy"] == {"status": "skipped", "from_version": 5, "to_version": 5}, resumed
-    assert resumed["store"] == {"status": "migrated", "from_version": 2, "to_version": 7}, resumed
+    assert resumed["store"] == {"status": "migrated", "from_version": 2, "to_version": 8}, resumed
     assert (resumed["store_id"], resumed["noop"]) == (seed.store_id, False), resumed
-    assert schema_versions(data_root) == (5, 7) and pair_rows(data_root, scratch) == seed.snapshot
+    assert schema_versions(data_root) == (5, 8) and pair_rows(data_root, scratch) == seed.snapshot
 
     repeat = _owner_envelope(run_installed_command(ctx.env, "brain", migrate, cwd=ctx.cwd, extra_env=hook_env))
     assert repeat["policy"] == {"status": "skipped", "from_version": 5, "to_version": 5}, repeat
-    assert repeat["store"] == {"status": "skipped", "from_version": 7, "to_version": 7}, repeat
+    assert repeat["store"] == {"status": "skipped", "from_version": 8, "to_version": 8}, repeat
     assert repeat["noop"] is True and pair_rows(data_root, scratch) == seed.snapshot
 
     def assert_recovered_owner_ready(current: Endpoint) -> None:

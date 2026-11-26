@@ -201,10 +201,14 @@ def _open_owner_session(
         composite_domain = _DaemonCompositeDomain(
             job_service,
             domain,
-            fallback=build_default_handoff_domain(
-                rt=rt,
-                clock=resolved_clock,
-                writer_epoch=rt.lease.epoch,
+            fallback=(
+                build_default_handoff_domain(
+                    rt=rt,
+                    clock=resolved_clock,
+                    writer_epoch=rt.lease.epoch,
+                )
+                if domain is None
+                else None
             ),
         )
         bridge = KernelBridge(

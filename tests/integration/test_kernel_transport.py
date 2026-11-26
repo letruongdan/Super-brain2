@@ -829,20 +829,16 @@ class TestTransportLifecycleAndRelease:
                 assert isinstance(res_cross["error"], dict)
                 assert res_cross["error"]["code"] == "not_found"
 
-                # Production capability_unavailable (prepare_task) -> ok=False, code="capability_unavailable"
+                # Production capability_unavailable (search_knowledge) -> ok=False, code="capability_unavailable"
                 dl = time.monotonic_ns() + call_budget
                 res_prep = client.call(
                     target,
                     ToolCommand(
-                        "prepare_task",
+                        "search_knowledge",
                         {
                             "schema_version": "2.0",
                             "workspace_id": transport_template.ws_a.repo_id,
-                            "checkout_id": transport_template.ws_a.checkout_id,
-                            "task_id": "t-1",
-                            "description": "test task",
-                            "context_budget_tokens": 100,
-                            "idempotency_key": "idem-prep-task-0001",
+                            "query": "test capability unavailable",
                         },
                         token=transport_template.cred.token,
                         selected_scope=scope_a,
