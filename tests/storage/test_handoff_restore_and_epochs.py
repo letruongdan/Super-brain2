@@ -480,3 +480,194 @@ def test_handoff_store_v8_migration_rejects_half_migrated_and_malformed_shapes(t
                 now=clock.now(),
             )
         assert exc_mal.value.code is ErrorCode.INTEGRITY_FAILURE
+
+
+def test_handoff_store_v8_migration_and_restore_reject_malformed_ddl_shapes(trusted_tmp: Path) -> None:
+    """F3 oracle (Lens 1, 2, 3, 7, 10): v8 rejects non-contract DDLs on migration and backup restore."""
+    import json
+    import sqlite3
+
+    from superbrain.core.canonical import canonical_json, digest_bytes
+    from superbrain.storage.handoffs import HandoffStore
+    from superbrain.storage.policy_store import PolicyStore
+    from superbrain.storage.prune import MANIFEST_NAME
+    from superbrain.storage.sessions import SessionStore
+
+    clock = FakeClock(dt.datetime(2026, 11, 26, 5, 0, tzinfo=dt.UTC))
+    adapters = os_adapters(clock=clock)
+    handlers, kinds = kernel_store_extensions()
+
+    def _expect_rejected_v7_migration(name: str, setup_sql: list[str]) -> None:
+        db_root = trusted_tmp / f"v8-bad-{name}"
+        rt = open_runtime(
+            db_root,
+            adapters,
+            handlers=handlers,
+            kinds=kinds,
+            store_migrations=KERNEL_STORE_MIGRATIONS[:7],
+            policy_migrations=KERNEL_POLICY_MIGRATIONS,
+        )
+        try:
+            with rt.store.transaction() as txn:
+                for stmt in setup_sql:
+                    txn.db.execute(stmt)
+        finally:
+            rt.close()
+
+        with maintenance_lease(db_root, adapters) as (root_b, lease):
+            with pytest.raises(BrainError) as exc_bad:
+                migrate_database(
+                    root_b,
+                    lease,
+                    adapters,
+                    target="store",
+                    migrations=KERNEL_STORE_MIGRATIONS,
+                    now=clock.now(),
+                )
+            assert exc_bad.value.code is ErrorCode.INTEGRITY_FAILURE
+
+        reopened = open_runtime(
+            db_root,
+            adapters,
+            handlers=handlers,
+            kinds=kinds,
+            store_migrations=KERNEL_STORE_MIGRATIONS[:7],
+            policy_migrations=KERNEL_POLICY_MIGRATIONS,
+        )
+        try:
+            assert reopened.store.schema_version == 7
+        finally:
+            reopened.close()
+
+    # 1. Exact reviewer probe: preseeded 3-col handoff_revision_headers matching index columns only.
+    _expect_rejected_v7_migration(
+        "rev-hdr-3col",
+        ["CREATE TABLE handoff_revision_headers (task_id TEXT, revision_epoch INTEGER, revision INTEGER)"],
+    )
+
+    # 2. All other new v8 tables preseeded with malformed/wrong DDL.
+    for bad_tbl, ddl in (
+        ("deliveries", "CREATE TABLE deliveries (delivery_id TEXT PRIMARY KEY)"),
+        ("delivery_seen_handoffs", "CREATE TABLE delivery_seen_handoffs (delivery_id TEXT PRIMARY KEY)"),
+        ("episodes", "CREATE TABLE episodes (episode_id TEXT PRIMARY KEY)"),
+        ("episode_evidence", "CREATE TABLE episode_evidence (evidence_id TEXT PRIMARY KEY)"),
+        ("artifact_get_results", "CREATE TABLE artifact_get_results (result_id TEXT PRIMARY KEY)"),
+    ):
+        _expect_rejected_v7_migration(f"tbl-{bad_tbl}", [ddl])
+
+    # 3. C5 extended column type/constraint/default drift on existing v7 tables.
+    _expect_rejected_v7_migration(
+        "c5-send-wrong-default",
+        [
+            "ALTER TABLE artifact_send_attempt ADD COLUMN level TEXT NOT NULL DEFAULT 'L1'",
+            "ALTER TABLE artifact_send_attempt ADD COLUMN revision_epoch INTEGER NOT NULL DEFAULT 0",
+        ],
+    )
+    _expect_rejected_v7_migration(
+        "c5-send-wrong-type-nullable",
+        [
+            "ALTER TABLE artifact_send_attempt ADD COLUMN level TEXT",
+            "ALTER TABLE artifact_send_attempt ADD COLUMN revision_epoch TEXT",
+        ],
+    )
+    _expect_rejected_v7_migration(
+        "c5-ack-wrong-type-nullable",
+        [
+            "ALTER TABLE artifact_read_ack ADD COLUMN artifact_id TEXT",
+            "ALTER TABLE artifact_read_ack ADD COLUMN revision_epoch TEXT",
+        ],
+    )
+
+    # 4. Restore backup containing malformed v7->v8 shape leaves live v8 store & data intact.
+    live_root = trusted_tmp / "v8-restore-live"
+    rt7 = open_runtime(
+        live_root,
+        adapters,
+        handlers=handlers,
+        kinds=kinds,
+        store_migrations=KERNEL_STORE_MIGRATIONS[:7],
+        policy_migrations=KERNEL_POLICY_MIGRATIONS,
+    )
+    try:
+        v7_backup = create_store_backup(rt7.store, adapters, clock.now())
+    finally:
+        rt7.close()
+
+    # Tamper ONLY the v7 backup snapshot to inject malformed 3-col handoff_revision_headers, then re-sign manifest.
+    bak_db_path = v7_backup / "brain.db"
+    conn = sqlite3.connect(str(bak_db_path))
+    try:
+        conn.execute("CREATE TABLE handoff_revision_headers (task_id TEXT, revision_epoch INTEGER, revision INTEGER)")
+        conn.commit()
+    finally:
+        conn.close()
+    man_path = v7_backup / MANIFEST_NAME
+    man_obj = json.loads(man_path.read_text(encoding="utf-8"))
+    man_obj["db_digest"] = digest_bytes(bak_db_path.read_bytes())
+    man_path.write_bytes(canonical_json(man_obj))
+
+    # Upgrade live_root cleanly to v8 and commit live task/handoff state before attempting malformed restore.
+    with maintenance_lease(live_root, adapters) as (r_live, lease):
+        mrep = migrate_database(
+            r_live, lease, adapters, target="store", migrations=KERNEL_STORE_MIGRATIONS, now=clock.now()
+        )
+        assert mrep.from_version == 7 and mrep.to_version == 8
+
+    live_tid = "task-live-control-1"
+    rt8 = open_kernel_job_runtime(live_root, adapters, role="sp24-live-ctrl")
+    try:
+        prin = seed_principal_and_credential(
+            rt8.policy, owner_id="dan", harness_id="claude-code", machine_id="m1"
+        ).principal
+        ws = register_workspace_direct(rt8, clock, prin, alias="ws-ctrl", checkout_dir=trusted_tmp / "chk-ctrl")
+        rt8.store.reconcile_policy()
+        sess = SessionStore(rt8.store, rt8.policy).bind_session(
+            principal_id=prin.principal_id,
+            repo_id=ws.repo_id,
+            checkout_id=ws.checkout_id,
+            harness_id="claude-code",
+            raw_session_id="RAW_CTRL_SID",
+            now=clock.now(),
+        )
+        HandoffStore(rt8.store, rt8.policy).create_work_task(
+            task_id=live_tid,
+            owner_id="dan",
+            repo_id=ws.repo_id,
+            checkout_id=ws.checkout_id,
+            principal_id=prin.principal_id,
+            session_ref=sess.session_ref,
+            description="Live control task must survive failed restore",
+            delivery_id="deliv-live-ctrl",
+            now=clock.now(),
+        )
+        epoch_before = read_restore_epoch(DataRoot.at(live_root), schema_version=8, os_=adapters)
+    finally:
+        rt8.close()
+
+    clock.advance(dt.timedelta(seconds=3))
+    with maintenance_lease(live_root, adapters) as (r_rest, lease):
+        pol_h = PolicyStore.open(r_rest, lease, adapters, migrations=KERNEL_POLICY_MIGRATIONS)
+        try:
+            with pytest.raises(BrainError) as exc_rest:
+                restore_store(
+                    r_rest,
+                    lease,
+                    adapters,
+                    v7_backup,
+                    pol_h,
+                    clock.now(),
+                    migrations=KERNEL_STORE_MIGRATIONS,
+                )
+            assert exc_rest.value.code is ErrorCode.INTEGRITY_FAILURE
+        finally:
+            pol_h.close()
+
+    rt_after = open_kernel_job_runtime(live_root, adapters, role="sp24-live-after")
+    try:
+        assert rt_after.store.schema_version == 8
+        assert read_restore_epoch(DataRoot.at(live_root), schema_version=8, os_=adapters) == epoch_before
+        hs_after = HandoffStore(rt_after.store, rt_after.policy)
+        hdr = hs_after.read_header(live_tid, principal_id=prin.principal_id, scope=Scope(ws.repo_id, ws.checkout_id))
+        assert hdr is not None and hdr.task_id == live_tid
+    finally:
+        rt_after.close()

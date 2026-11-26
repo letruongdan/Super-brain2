@@ -262,7 +262,14 @@ class HandoffKernelDomain(KernelToolDomain):
         description = args.get("description")
         if not isinstance(description, str) or not description:
             raise BrainError(ErrorCode.INVALID_INPUT, "description required")
-        goal_bytes = description.encode("utf-8") if create_task else None
+        flags = self._repo_flags(binding.repo_id)
+        fpolicy = filter_policy_for(flags)
+        filtered_payload = self._privacy.apply({"description": description}, fpolicy).value
+        goal_bytes: bytes | None = None
+        if create_task and isinstance(filtered_payload, Mapping):
+            filtered_desc = filtered_payload.get("description")
+            if isinstance(filtered_desc, str):
+                goal_bytes = filtered_desc.encode("utf-8")
         raw_snap_id = args.get("source_snapshot_id")
         source_snapshot_id = (
             require_opaque_id(raw_snap_id, label="source_snapshot_id") if raw_snap_id is not None else None
@@ -749,21 +756,22 @@ class HandoffKernelDomain(KernelToolDomain):
             session_ref=ep.session_ref,
             scope=scope,
         )
-        ep_fence = (
-            HandoffFence(
+        if ep.committed_restore_epoch is not None and ep.committed_writer_generation is not None:
+            ep_fence = HandoffFence(
                 restore_epoch=ep.committed_restore_epoch,
                 writer_generation=ep.committed_writer_generation,
             )
-            if ep.committed_restore_epoch is not None and ep.committed_writer_generation is not None
-            else live_fence
-        )
+            writer_is_live_holder = is_holder and ep.principal_id == principal.principal_id and ep_fence == live_fence
+        else:
+            ep_fence = live_fence
+            writer_is_live_holder = False
         return {
             "episode_id": ep.episode_id,
             "evidence_ids": list(ep.evidence_ids),
             "handoff_revision": ep.committed_handoff_revision,
             "handoff_status": ep.handoff_status or "not_stored_policy",
             "fence": ep_fence.to_dict(),
-            "writer_status": "holder" if is_holder else "not_holder",
+            "writer_status": "holder" if writer_is_live_holder else "not_holder",
         }
 
     def describe_artifact_send(

@@ -1067,3 +1067,482 @@ def test_continuity_worker_3phase_quarantine_redaction_and_restore_epoch(trusted
         )
     finally:
         rt_rest.close()
+
+
+def test_replay_ack_writer_status_requires_live_fence_match_across_siblings(trusted_tmp: Path) -> None:
+    """F1 oracle (§7.4, case 74): replay ACK has writer_status='holder' iff caller holds task AND ACK fence == live."""
+    from superbrain.composition._daemon_session import build_default_handoff_domain
+    from superbrain.composition.kernel_bridge import KernelBridge
+    from superbrain.storage.backup import create_store_backup
+    from superbrain.storage.kernel_schema import KERNEL_POLICY_MIGRATIONS, KERNEL_STORE_MIGRATIONS
+    from superbrain.storage.policy_store import PolicyStore
+    from superbrain.storage.restore import restore_store
+    from tests.storage.conftest import maintenance_lease
+
+    clock = FakeClock(dt.datetime(2026, 11, 26, 6, 0, tzinfo=dt.UTC))
+    adapters = os_adapters(clock=clock)
+    root = trusted_tmp / "f1-replay-fence"
+    rt = open_kernel_job_runtime(root / "data", adapters, role="sp24-f1")
+    try:
+        cred_a = seed_principal_and_credential(rt.policy, owner_id="dan", harness_id="claude-code", machine_id="m1")
+        cred_b = seed_principal_and_credential(rt.policy, owner_id="dan", harness_id="codex", machine_id="m1")
+        ws = register_workspace_direct(
+            rt,
+            clock,
+            cred_a.principal,
+            alias="ws-f1",
+            checkout_dir=root / "chk-f1",
+            remote="https://github.example/dan/repo-f1.git",
+        )
+        seed_repo_grant(rt.policy, principal_id=cred_b.principal.principal_id, repo_id=ws.repo_id, owner_id="dan")
+        rt.store.reconcile_policy()
+
+        domain = build_default_handoff_domain(rt=rt, clock=clock, writer_epoch=rt.lease.epoch)
+        assert domain is not None
+        bridge = KernelBridge(store=rt.store, policy=rt.policy, clock=clock, writer_epoch=rt.lease.epoch, domain=domain)
+        scope = Scope(ws.repo_id, ws.checkout_id)
+
+        prep = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "work",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "description": "Replay writer_status fence probe",
+                "idempotency_key": "idem-sp24-f1-prep-0001",
+            },
+            cred=cred_a,
+            scope=scope,
+        )
+        tid = str(prep["task_id"])
+
+        def sub(cred: SeededCredential, sid: str, key: str, args: dict[str, JsonValue]) -> dict[str, Any]:
+            return _call_ok(
+                bridge,
+                rt,
+                "submit_episode",
+                {
+                    "task_id": tid,
+                    "session_id": sid,
+                    "workspace_id": ws.repo_id,
+                    "evidence": [],
+                    "idempotency_key": key,
+                    **args,
+                },
+                cred=cred,
+                scope=scope,
+            )
+
+        # A initial write -> gen 1, holder.
+        a1_args: dict[str, JsonValue] = {
+            "evidence": [],
+            "base_revision": 0,
+            "fence": {"restore_epoch": 0, "writer_generation": 0},
+            "handoff": {"working_goal": "A gen 1"},
+        }
+        a_g1 = sub(cred_a, "SID_A_F1", "idem-sp24-f1-a1-0001", a1_args)
+        assert a_g1["writer_status"] == "holder"
+        assert a_g1["fence"] == {"restore_epoch": 0, "writer_generation": 1}
+
+        # B takeover -> gen 2, holder; replay of A gen 1 -> not_holder.
+        b_g2 = sub(
+            cred_b,
+            "SID_B_F1",
+            "idem-sp24-f1-b2-0001",
+            {
+                "evidence": [],
+                "base_revision": 1,
+                "fence": a_g1["fence"],
+                "takeover": {"acknowledge_active": True},
+                "handoff": {"working_goal": "B gen 2"},
+            },
+        )
+        assert b_g2["writer_status"] == "holder"
+        assert b_g2["fence"] == {"restore_epoch": 0, "writer_generation": 2}
+        assert sub(cred_a, "SID_A_F1", "idem-sp24-f1-a1-0001", a1_args)["writer_status"] == "not_holder"
+
+        # A (same principal & same session) takes over -> gen 3, holder.
+        a3_args: dict[str, JsonValue] = {
+            "evidence": [],
+            "base_revision": 2,
+            "fence": b_g2["fence"],
+            "takeover": {"acknowledge_active": True},
+            "handoff": {"working_goal": "A gen 3"},
+        }
+        a_g3 = sub(cred_a, "SID_A_F1", "idem-sp24-f1-a3-0001", a3_args)
+        assert a_g3["writer_status"] == "holder"
+        assert a_g3["fence"] == {"restore_epoch": 0, "writer_generation": 3}
+
+        # Case 74 exact probe: replay A's stale gen 1 ACK while A holds gen 3 MUST report not_holder!
+        a_g1_replay = sub(cred_a, "SID_A_F1", "idem-sp24-f1-a1-0001", a1_args)
+        assert a_g1_replay["episode_id"] == a_g1["episode_id"]
+        assert a_g1_replay["fence"] == {"restore_epoch": 0, "writer_generation": 1}
+        assert a_g1_replay["writer_status"] == "not_holder"
+        assert sub(cred_a, "SID_A_F1", "idem-sp24-f1-a3-0001", a3_args)["writer_status"] == "holder"
+
+        # Takeover-only sibling: B takeover-only -> gen 4 (handoff_revision stays 3), A -> gen 5, B -> gen 6.
+        b4_args: dict[str, JsonValue] = {
+            "evidence": [],
+            "base_revision": 3,
+            "fence": a_g3["fence"],
+            "takeover": {"acknowledge_active": True},
+        }
+        b_g4_to = sub(cred_b, "SID_B_F1", "idem-sp24-f1-b4-0001", b4_args)
+        assert b_g4_to["writer_status"] == "holder"
+        assert b_g4_to["handoff_revision"] == 3
+        assert b_g4_to["fence"] == {"restore_epoch": 0, "writer_generation": 4}
+        a_g5_to = sub(
+            cred_a,
+            "SID_A_F1",
+            "idem-sp24-f1-a5-0001",
+            {"evidence": [], "base_revision": 3, "fence": b_g4_to["fence"], "takeover": {"acknowledge_active": True}},
+        )
+        b6_args: dict[str, JsonValue] = {
+            "evidence": [],
+            "base_revision": 3,
+            "fence": a_g5_to["fence"],
+            "takeover": {"acknowledge_active": True},
+        }
+        b_g6_to = sub(cred_b, "SID_B_F1", "idem-sp24-f1-b6-0001", b6_args)
+        assert sub(cred_b, "SID_B_F1", "idem-sp24-f1-b4-0001", b4_args)["writer_status"] == "not_holder"
+        assert sub(cred_b, "SID_B_F1", "idem-sp24-f1-b6-0001", b6_args)["writer_status"] == "holder"
+
+        # not_stored_policy sibling: holder gets holder at live fence; once fence moves past it, replay flips.
+        rt.policy.set_repo_policy(ws.repo_id, manual_submission_enabled=False)
+        bpol_args: dict[str, JsonValue] = {
+            "evidence": [],
+            "base_revision": 3,
+            "fence": b_g6_to["fence"],
+            "handoff": {"working_goal": "Blocked by policy"},
+        }
+        b_pol = sub(cred_b, "SID_B_F1", "idem-sp24-f1-bpol-01", bpol_args)
+        assert b_pol["handoff_status"] == "not_stored_policy"
+        assert b_pol["handoff_revision"] is None
+        assert b_pol["fence"] == {"restore_epoch": 0, "writer_generation": 6}
+        assert b_pol["writer_status"] == "holder"
+        assert sub(cred_b, "SID_B_F1", "idem-sp24-f1-bpol-01", bpol_args)["writer_status"] == "holder"
+
+        apol_args: dict[str, JsonValue] = {
+            "evidence": [],
+            "base_revision": 3,
+            "fence": b_g6_to["fence"],
+            "takeover": {"acknowledge_active": True},
+        }
+        a_pol = sub(cred_a, "SID_A_F1", "idem-sp24-f1-apol-01", apol_args)
+        assert a_pol["handoff_status"] == "not_stored_policy"
+        assert a_pol["writer_status"] == "not_holder"
+
+        rt.policy.set_repo_policy(ws.repo_id, manual_submission_enabled=True)
+        a_g7 = sub(
+            cred_a,
+            "SID_A_F1",
+            "idem-sp24-f1-a7-0001",
+            {"evidence": [], "base_revision": 3, "fence": b_g6_to["fence"], "takeover": {"acknowledge_active": True}},
+        )
+        b8_args: dict[str, JsonValue] = {
+            "evidence": [],
+            "base_revision": 3,
+            "fence": a_g7["fence"],
+            "takeover": {"acknowledge_active": True},
+        }
+        b_g8 = sub(cred_b, "SID_B_F1", "idem-sp24-f1-b8-0001", b8_args)
+        assert b_g8["writer_status"] == "holder"
+        assert b_g8["fence"] == {"restore_epoch": 0, "writer_generation": 8}
+        assert sub(cred_b, "SID_B_F1", "idem-sp24-f1-bpol-01", bpol_args)["writer_status"] == "not_holder"
+        assert sub(cred_a, "SID_A_F1", "idem-sp24-f1-apol-01", apol_args)["writer_status"] == "not_holder"
+
+        bak = create_store_backup(rt.store, adapters, clock.now())
+    finally:
+        rt.close()
+
+    # Restore sibling: pre-restore ACK (epoch 0) stays not_holder both before and after B retakes holder at epoch 1.
+    clock.advance(dt.timedelta(seconds=5))
+    with maintenance_lease(root / "data", adapters) as (droot, lease):
+        pol_h = PolicyStore.open(droot, lease, adapters, migrations=KERNEL_POLICY_MIGRATIONS)
+        try:
+            rep = restore_store(
+                droot,
+                lease,
+                adapters,
+                bak,
+                pol_h,
+                clock.now(),
+                migrations=KERNEL_STORE_MIGRATIONS,
+            )
+        finally:
+            pol_h.close()
+    assert rep.new_epoch >= 1
+
+    rt_rest = open_kernel_job_runtime(root / "data", adapters, role="sp24-f1-post")
+    try:
+        dom2 = build_default_handoff_domain(rt=rt_rest, clock=clock, writer_epoch=rt_rest.lease.epoch)
+        assert dom2 is not None
+        br2 = KernelBridge(
+            store=rt_rest.store,
+            policy=rt_rest.policy,
+            clock=clock,
+            writer_epoch=rt_rest.lease.epoch,
+            domain=dom2,
+        )
+        b8_replay_req: dict[str, JsonValue] = {
+            "task_id": tid,
+            "session_id": "SID_B_F1",
+            "workspace_id": ws.repo_id,
+            "idempotency_key": "idem-sp24-f1-b8-0001",
+            **b8_args,
+        }
+        assert (
+            _call_ok(br2, rt_rest, "submit_episode", b8_replay_req, cred=cred_b, scope=scope)["writer_status"]
+            == "not_holder"
+        )
+        b_ep1 = _call_ok(
+            br2,
+            rt_rest,
+            "submit_episode",
+            {
+                "task_id": tid,
+                "session_id": "SID_B_F1",
+                "workspace_id": ws.repo_id,
+                "evidence": [],
+                "base_revision": 3,
+                "fence": {"restore_epoch": rep.new_epoch, "writer_generation": 8},
+                "takeover": {"acknowledge_active": True},
+                "idempotency_key": "idem-sp24-f1-b9-rest",
+            },
+            cred=cred_b,
+            scope=scope,
+        )
+        assert b_ep1["writer_status"] == "holder"
+        assert b_ep1["fence"] == {"restore_epoch": rep.new_epoch, "writer_generation": 9}
+        assert (
+            _call_ok(br2, rt_rest, "submit_episode", b8_replay_req, cred=cred_b, scope=scope)["writer_status"]
+            == "not_holder"
+        )
+    finally:
+        rt_rest.close()
+
+
+def test_prepare_task_description_privacy_filter_manual_submission_and_rejection(trusted_tmp: Path) -> None:
+    """F2 oracle (§14.2): prepare_task filters description before staging goal CAS blob across all flag paths."""
+    from superbrain.composition._daemon_session import build_default_handoff_domain
+    from superbrain.composition.kernel_bridge import KernelBridge
+    from superbrain.storage.cas import blob_path
+
+    clock = FakeClock(dt.datetime(2026, 11, 26, 6, 30, tzinfo=dt.UTC))
+    adapters = os_adapters(clock=clock)
+    root = trusted_tmp / "f2-goal-privacy"
+    rt = open_kernel_job_runtime(root / "data", adapters, role="sp24-f2")
+    cas_dir = root / "data" / "store" / "cas"
+
+    def _cas_files() -> set[Path]:
+        return {p for p in cas_dir.rglob("*") if p.is_file()} if cas_dir.exists() else set()
+
+    def _blob_bytes_for_digest(digest: str) -> bytes:
+        return blob_path(cas_dir, digest).read_bytes()
+
+    try:
+        cred = seed_principal_and_credential(rt.policy, owner_id="dan", harness_id="claude-code", machine_id="m1")
+        ws = register_workspace_direct(
+            rt,
+            clock,
+            cred.principal,
+            alias="ws-f2",
+            checkout_dir=root / "chk-f2",
+            remote="https://github.example/dan/repo-f2.git",
+        )
+        rt.store.reconcile_policy()
+        domain = build_default_handoff_domain(rt=rt, clock=clock, writer_epoch=rt.lease.epoch)
+        assert domain is not None
+        bridge = KernelBridge(store=rt.store, policy=rt.policy, clock=clock, writer_epoch=rt.lease.epoch, domain=domain)
+        scope = Scope(ws.repo_id, ws.checkout_id)
+
+        # 1. Positive twin: normal description under manual_submission=True is stored verbatim & renders in L0/L1/L2.
+        pos = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "work",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "description": "Implement UTF-8 byte budget verification",
+                "idempotency_key": "idem-sp24-f2-pos-01",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        pos_tid = str(pos["task_id"])
+        with rt.store.transaction() as txn:
+            prow = txn.db.execute("SELECT goal_ref FROM task_handoffs WHERE task_id = ?", (pos_tid,)).fetchone()
+            assert prow is not None and isinstance(prow[0], str)
+            pos_goal_ref = prow[0]
+        assert _blob_bytes_for_digest(pos_goal_ref) == b"Implement UTF-8 byte budget verification"
+        cas_before_replay = _cas_files()
+        assert (
+            _call_ok(
+                bridge,
+                rt,
+                "prepare_task",
+                {
+                    "mode": "work",
+                    "workspace_id": ws.repo_id,
+                    "checkout_id": ws.checkout_id,
+                    "description": "Implement UTF-8 byte budget verification",
+                    "idempotency_key": "idem-sp24-f2-pos-01",
+                },
+                cred=cred,
+                scope=scope,
+            )
+            == pos
+        )
+        assert _cas_files() == cas_before_replay
+
+        # 2. Redaction under manual_submission=True: <private>...</private> and secret redacted BEFORE hold_blob.
+        priv = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "work",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "description": "Goal <private>SP24_GOAL_PRIVATE_CANARY</private> password=SP24_PWD_CANARY end",
+                "idempotency_key": "idem-sp24-f2-priv-01",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        priv_tid = str(priv["task_id"])
+        with rt.store.transaction() as txn:
+            r_priv = txn.db.execute("SELECT goal_ref FROM task_handoffs WHERE task_id = ?", (priv_tid,)).fetchone()
+            assert r_priv is not None and isinstance(r_priv[0], str)
+            priv_goal_ref = r_priv[0]
+        priv_blob = _blob_bytes_for_digest(priv_goal_ref)
+        assert b"[redacted]" in priv_blob
+        assert b"SP24_GOAL_PRIVATE_CANARY" not in priv_blob
+        assert b"SP24_PWD_CANARY" not in priv_blob
+
+        # Render L1 -> task_goal is filtered too (no raw canary).
+        sub_priv = _call_ok(
+            bridge,
+            rt,
+            "submit_episode",
+            {
+                "task_id": priv_tid,
+                "session_id": "SID_F2_PRIV",
+                "workspace_id": ws.repo_id,
+                "evidence": [],
+                "base_revision": 0,
+                "fence": priv["handoff_live"]["fence"],
+                "handoff": {"working_goal": "Check filtered goal rendering"},
+                "idempotency_key": "idem-sp24-f2-sub-01",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        assert sub_priv["handoff_revision"] == 1
+        l1_priv = _call_ok(
+            bridge,
+            rt,
+            "get_artifact",
+            {
+                "workspace_id": ws.repo_id,
+                "task_id": priv_tid,
+                "artifact_id": priv_tid,
+                "revision": 1,
+                "level": "L1",
+                "idempotency_key": "idem-sp24-f2-l1-001",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        assert "SP24_GOAL_PRIVATE_CANARY" not in str(l1_priv)
+        assert "[redacted]" in str(l1_priv)
+
+        # 3. manual_submission=False: metadata-only work task (0 new CAS blobs, NULL goal_ref, replay identical).
+        rt.policy.set_repo_policy(ws.repo_id, manual_submission_enabled=False)
+        cas_before_off = _cas_files()
+        man_off = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "work",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "description": "Manual off <private>SP24_MANUAL_OFF_CANARY</private> goal",
+                "idempotency_key": "idem-sp24-f2-moff-01",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        off_tid = str(man_off["task_id"])
+        assert _cas_files() == cas_before_off
+        with rt.store.transaction() as txn:
+            t_off = txn.db.execute(
+                "SELECT goal_ref, goal_holder_id FROM tasks WHERE task_id = ?", (off_tid,)
+            ).fetchone()
+            h_off = txn.db.execute(
+                "SELECT goal_ref, goal_holder_id FROM task_handoffs WHERE task_id = ?", (off_tid,)
+            ).fetchone()
+            assert t_off == (None, None)
+            assert h_off == (None, None)
+        assert (
+            _call_ok(
+                bridge,
+                rt,
+                "prepare_task",
+                {
+                    "mode": "work",
+                    "workspace_id": ws.repo_id,
+                    "checkout_id": ws.checkout_id,
+                    "description": "Manual off <private>SP24_MANUAL_OFF_CANARY</private> goal",
+                    "idempotency_key": "idem-sp24-f2-moff-01",
+                },
+                cred=cred,
+                scope=scope,
+            )
+            == man_off
+        )
+        assert _cas_files() == cas_before_off
+
+        # 4. Filter-rejected input (unclosed <private>) fails closed under both manual_submission=False and True.
+        for label, enabled, target_tid in (
+            ("manoff_new", False, None),
+            ("manon_new", True, None),
+            ("manon_existing", True, pos_tid),
+        ):
+            rt.policy.set_repo_policy(ws.repo_id, manual_submission_enabled=enabled)
+            cas_pre = _cas_files()
+            with rt.store.transaction() as txn:
+                deliv_pre = int(txn.db.execute("SELECT COUNT(*) FROM deliveries").fetchone()[0])
+                tasks_pre = int(txn.db.execute("SELECT COUNT(*) FROM tasks").fetchone()[0])
+            req_args: dict[str, JsonValue] = {
+                "mode": "work",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "description": f"Bad <private>SP24_REJECT_UNCLOSED_CANARY_{label}",
+                "idempotency_key": f"idem-sp24-f2-rj-{label}",
+            }
+            if target_tid is not None:
+                req_args["task_id"] = target_tid
+            err_env = _dispatch_call(bridge, rt, "prepare_task", req_args, cred=cred, scope=scope)
+            assert err_env.get("ok") is False, err_env
+            assert err_env["error"]["code"] == ErrorCode.INVALID_INPUT.value
+            assert "SP24_REJECT_UNCLOSED_CANARY" not in str(err_env)
+            assert _cas_files() == cas_pre
+            with rt.store.transaction() as txn:
+                assert int(txn.db.execute("SELECT COUNT(*) FROM deliveries").fetchone()[0]) == deliv_pre
+                assert int(txn.db.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]) == tasks_pre
+
+        for p in (root / "data" / "store").rglob("*"):
+            if p.is_file():
+                raw_b = p.read_bytes()
+                assert b"SP24_GOAL_PRIVATE_CANARY" not in raw_b
+                assert b"SP24_PWD_CANARY" not in raw_b
+                assert b"SP24_MANUAL_OFF_CANARY" not in raw_b
+                assert b"SP24_REJECT_UNCLOSED_CANARY" not in raw_b
+    finally:
+        rt.close()

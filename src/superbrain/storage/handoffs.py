@@ -476,13 +476,16 @@ class HandoffStore(HandoffStorePort):
         checkout_id: str,
         principal_id: str,
         session_ref: str | None,
-        goal_bytes: bytes,
+        goal_bytes: bytes | None,
         delivery_id: str,
         now: datetime,
     ) -> CreateWorkTaskResult:
         live_epoch = _require_v8_ready(self._store, self._policy)
-        goal_holder_id = new_id()
-        goal_digest = tx.hold_blob(goal_bytes, holder_id=goal_holder_id)
+        goal_holder_id: str | None = None
+        goal_digest: str | None = None
+        if goal_bytes is not None:
+            goal_holder_id = new_id()
+            goal_digest = tx.hold_blob(goal_bytes, holder_id=goal_holder_id)
         return self._apply_create_work_task_in_tx(
             _txn_of(tx).db,
             live_epoch=live_epoch,
@@ -509,8 +512,8 @@ class HandoffStore(HandoffStorePort):
         checkout_id: str,
         principal_id: str,
         session_ref: str | None,
-        goal_digest: str,
-        goal_holder_id: str,
+        goal_digest: str | None,
+        goal_holder_id: str | None,
         delivery_id: str,
         now: datetime,
     ) -> CreateWorkTaskResult:
@@ -521,7 +524,8 @@ class HandoffStore(HandoffStorePort):
         require_opaque_id(principal_id, label="principal_id")
         if session_ref is not None:
             require_sha256_digest(session_ref)
-        require_sha256_digest(goal_digest)
+        if goal_digest is not None:
+            require_sha256_digest(goal_digest)
         require_opaque_id(delivery_id, label="delivery_id")
         now_utc, _ = require_aware_utc(now)
         stamp = utc_timestamp(now_utc)
@@ -549,7 +553,7 @@ class HandoffStore(HandoffStorePort):
             task_id=task_id,
             artifact_id=artifact_id,
             delivery_id=delivery_id,
-            goal_digest=goal_digest,
+            goal_digest=goal_digest or digest_bytes(b""),
             handoff_live=HandoffHeaderState(
                 task_id=task_id,
                 artifact_id=artifact_id,
@@ -731,7 +735,7 @@ class HandoffStore(HandoffStorePort):
                     session_ref,
                     1 if (has_patch or takeover) else 0,
                     cur.artifact_id,
-                    cur.holder_restore_epoch,
+                    cur.live_fence.restore_epoch,
                     cur.writer_generation,
                     canonical_json(list(ev_ids)).decode("utf-8"),
                     stamp,
@@ -1249,8 +1253,6 @@ class HandoffStore(HandoffStorePort):
         if create_task:
             if resume_ref is not None:
                 raise BrainError(ErrorCode.NOT_FOUND, "not found")
-            if description_bytes is None:
-                raise BrainError(ErrorCode.INVALID_INPUT, "description_bytes required for task creation")
             work_res = self.tx_create_work_task(
                 tx,
                 task_id=task_id,
