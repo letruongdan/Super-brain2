@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
 
+from superbrain.application._deep_health import (
+    DeepHealthProbeResult,
+    prepare_deep_health_effect,
+    render_deep_health_stored,
+)
 from superbrain.application.dispatch import KernelToolDomain, PreparedEffect
 from superbrain.application.lineage import admit_source_snapshot, resolve_binding
 from superbrain.application.privacy import PrivacyFilter, filter_policy_for
@@ -156,12 +161,16 @@ class HandoffKernelDomain(KernelToolDomain):
         clock: Clock,
         send_attempts: KernelSendAttemptPort | None = None,
         privacy_filter: PrivacyFilter | None = None,
+        deep_health_probe: Callable[[], DeepHealthProbeResult] | None = None,
+        read_blob: Callable[[str], bytes] | None = None,
     ) -> None:
         self._handoffs = handoffs
         self._policy = policy
         self._clock = clock
         self._send_attempts = send_attempts
         self._privacy = privacy_filter if privacy_filter is not None else PrivacyFilter()
+        self._deep_health_probe = deep_health_probe
+        self._read_blob = read_blob
 
     def rebind(
         self,
@@ -169,13 +178,21 @@ class HandoffKernelDomain(KernelToolDomain):
         handoffs: HandoffStorePort,
         policy: KernelPolicyPort,
         send_attempts: KernelSendAttemptPort | None = None,
+        deep_health_probe: Callable[[], DeepHealthProbeResult] | None = None,
+        read_blob: Callable[[str], bytes] | None = None,
     ) -> None:
         """Point subsequent operations at restored store/policy adapters."""
         self._handoffs = handoffs
         self._policy = policy
         self._send_attempts = send_attempts
+        if deep_health_probe is not None:
+            self._deep_health_probe = deep_health_probe
+        if read_blob is not None:
+            self._read_blob = read_blob
 
     def supports_tool(self, tool: str, *, deep: bool = False) -> bool:
+        if tool == "get_health" and deep:
+            return self._deep_health_probe is not None and self._read_blob is not None
         return tool in {"prepare_task", "get_artifact", "submit_episode"} and not deep
 
     def _repo_flags(self, repo_id: str) -> RepoFlags:
@@ -222,6 +239,10 @@ class HandoffKernelDomain(KernelToolDomain):
         }
 
     def prepare_mutation(self, call: Call, ctx: CallContext, *, now: datetime) -> PreparedEffect:
+        if call.tool == "get_health":
+            if not call.arguments.get("deep") or self._deep_health_probe is None:
+                raise BrainError(ErrorCode.CAPABILITY_UNAVAILABLE, "capability unavailable")
+            return prepare_deep_health_effect(self._deep_health_probe)
         if call.tool == "prepare_task":
             return self._prepare_work_task(call, ctx, now=now)
         if call.tool == "get_artifact":
@@ -551,6 +572,10 @@ class HandoffKernelDomain(KernelToolDomain):
             return self._render_artifact(result.result_id, principal, selected_scope=selected_scope)
         if kind == "episode_result":
             return self._render_episode(result.result_id, principal, selected_scope=selected_scope)
+        if kind == "health_result":
+            if self._read_blob is None:
+                raise BrainError(ErrorCode.CAPABILITY_UNAVAILABLE, "capability unavailable")
+            return render_deep_health_stored(result, self._read_blob)
         raise BrainError(ErrorCode.INVALID_INPUT, f"unsupported stored ref kind: {kind}")
 
     def _render_delivery(

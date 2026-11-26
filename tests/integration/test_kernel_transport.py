@@ -849,7 +849,7 @@ class TestTransportLifecycleAndRelease:
                 assert isinstance(res_prep["error"], dict)
                 assert res_prep["error"]["code"] == "capability_unavailable"
 
-                # Production capability_unavailable (get_health deep=True) -> ok=False, code="capability_unavailable"
+                # Production get_health(deep=True) returns typed deep diagnostics in SP2-5.
                 dl = time.monotonic_ns() + call_budget
                 res_deep = client.call(
                     target,
@@ -860,9 +860,8 @@ class TestTransportLifecycleAndRelease:
                     ),
                     deadline_ns=dl,
                 )
-                assert res_deep["ok"] is False
-                assert isinstance(res_deep["error"], dict)
-                assert res_deep["error"]["code"] == "capability_unavailable"
+                assert res_deep["ok"] is True
+                assert isinstance(res_deep["data"], dict)
 
                 # Stop child cleanly via control pipe
                 stop_out = child.request_stop_and_wait()

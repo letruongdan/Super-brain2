@@ -1954,9 +1954,8 @@ def test_get_job_uses_owner_scope(
             ).result(timeout=BOUND_WAIT_S)
             assert denied == {"ok": False, "error": {"code": "not_found", "message": "not found"}}
 
-        # 3. Deep health and unimplemented business tools return capability_unavailable after auth/validation.
+        # 3. Unimplemented SP3 business tools return capability_unavailable after auth/validation.
         unsupported_calls: tuple[tuple[str, dict[str, JsonValue], Scope | None], ...] = (
-            ("get_health", {"schema_version": "2.0", "deep": True, "idempotency_key": "idem-deep-health-0001"}, None),
             (
                 "search_knowledge",
                 {"schema_version": "2.0", "workspace_id": ws_a.repo_id, "query": "bug"},

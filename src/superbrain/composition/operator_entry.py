@@ -161,6 +161,7 @@ def build_operator_service(
     expected_endpoint_path: Path | None = None,
     expected_leaf_cert_sha256: str | None = None,
     server_cert_path: Path | None = None,
+    live_layer2_check: Callable[[], None] | None = None,
 ) -> OperatorService:
     """The operator service over ``policy`` with real SSH, localhost WebAuthn, and bootstrap wiring."""
     return OperatorService(
@@ -169,6 +170,7 @@ def build_operator_service(
         webauthn_verifier=webauthn_verifier if webauthn_verifier is not None else _LocalhostWebAuthnVerifier(),
         review_apply=review_apply,
         restore_handler=restore_handler,
+        live_layer2_check=live_layer2_check,
         bootstrap_handler=(
             bootstrap_handler
             if bootstrap_handler is not None

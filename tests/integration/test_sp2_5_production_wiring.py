@@ -1,0 +1,1476 @@
+"""SP2-5 production wiring regressions for Layer-2 live invalidation, bootstrap/hooks, doctor & deep health."""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import inspect
+import json
+import shlex
+import socket
+import ssl
+import struct
+import subprocess
+import sys
+import threading
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any, cast
+
+import jsonschema
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
+from superbrain.adapters.harness.layer2_probe import (
+    AuthorityCommandProbeResult,
+    NativeHostReceipt,
+    compute_harness_config_digest,
+)
+from superbrain.adapters.harness_config.bootstrap_templates import (
+    AUTHORITY_ASK_COMMANDS,
+    plan_claude_bootstrap,
+    plan_codex_bootstrap,
+)
+from superbrain.adapters.harness_config.markdown_blocks import merge_markdown_block
+from superbrain.adapters.harness_config.merger import SharedConfigMergerAdapter
+from superbrain.adapters.os import os_adapters
+from superbrain.adapters.os.daemon_config import read_daemon_config
+from superbrain.application.owner_loop import OwnerLoop
+from superbrain.application.review_apply import ReviewApplyService, TargetWriteInput
+from superbrain.cli_api.capture_client import CaptureClient
+from superbrain.cli_api.loopback import LoopbackClient, LoopbackTarget
+from superbrain.composition import daemon_entry, init_entry
+from superbrain.composition.capture_drain_entry import drain_outbox
+from superbrain.composition.doctor_entry import run_doctor
+from superbrain.composition.doctor_probes_sp2 import reconcile_harness_layer2_in_policy
+from superbrain.core._kernel_approval import (
+    APPROVAL_NAMESPACE,
+    RISK_POLICY_VERSION,
+    ApprovalAction,
+    ApprovalChannel,
+    ApprovalMessage,
+    Layer2State,
+    RecoveryScope,
+    RiskLevel,
+    RiskResource,
+    SignerEnrollment,
+)
+from superbrain.core.canonical import canonical_json
+from superbrain.core.errors import ErrorCode
+from superbrain.core.ids import new_id
+from superbrain.core.kernel import (
+    CAPABILITY_CAPTURE_PRODUCER,
+    CaptureBatchCommand,
+    CaptureProducerBinding,
+    DaemonConfig,
+    Ready,
+    ResourceDigest,
+    ToolCommand,
+    WorkspaceBinding,
+)
+from superbrain.core.proposals import ManagedFormat
+from superbrain.core.wire import SCHEMA_VERSION
+from superbrain.ports.capture import CaptureEventRecord
+from superbrain.ports.os import OsAdapters
+from superbrain.storage.backup import create_policy_backup
+from superbrain.storage.kernel_schema import KERNEL_POLICY_MIGRATIONS
+from superbrain.storage.outbox import OutboxSpool
+from superbrain.storage.proposals import PolicyApplyAuthority, StoreProposalAdapter
+from superbrain.storage.restore import restore_policy
+from superbrain.storage.sessions import SessionStore
+from tests.storage.conftest import maintenance_lease
+from tests.support.clock import FakeClock
+from tests.support.fs import digest_tree
+from tests.support.inc2_cli import (
+    clean_installed_subprocess_env,
+    get_shared_t7_transport_template,
+    write_client_profile_file,
+    write_credential_file,
+)
+from tests.support.inc2_fixture import reopen_kernel_job_runtime
+from tests.support.inc2_transport import (
+    FakeMonotonicClock,
+    open_test_loopback_transport,
+    read_raw_http_response,
+    register_workspace_direct,
+)
+from tests.support.kernel_auth import SeededCredential, seed_principal_and_credential, seed_repo_grant
+
+_OWNER = "dan"
+_MACHINE = "m-sp25-prod"
+_CLAUDE_VER = "2.1.325"
+_CODEX_VER = "26.1111.2228.0"
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_SCHEMA_PATH = _REPO_ROOT / "schemas" / "mcp-tools-v2.json"
+
+
+def _ssh_signer() -> tuple[Ed25519PrivateKey, SignerEnrollment]:
+    priv = Ed25519PrivateKey.generate()
+    raw = priv.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+    blob = struct.pack(">I", 11) + b"ssh-ed25519" + struct.pack(">I", len(raw)) + raw
+    return priv, SignerEnrollment(
+        owner_id=_OWNER,
+        channel=ApprovalChannel.SSH_KEY,
+        public_key="ssh-ed25519 " + base64.b64encode(blob).decode("ascii") + " sp25@devbox",
+    )
+
+
+def _ssh_sig_b64(priv: Ed25519PrivateKey, payload: bytes) -> str:
+    raw = priv.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+    blob = struct.pack(">I", 11) + b"ssh-ed25519" + struct.pack(">I", len(raw)) + raw
+
+    def _s(data: bytes) -> bytes:
+        return struct.pack(">I", len(data)) + data
+
+    ns = APPROVAL_NAMESPACE.encode()
+    signed = b"SSHSIG" + _s(ns) + _s(b"") + _s(b"sha512") + _s(hashlib.sha512(payload).digest())
+    sig = _s(b"ssh-ed25519") + _s(priv.sign(signed))
+    body = b"SSHSIG" + struct.pack(">I", 1) + _s(blob) + _s(ns) + _s(b"") + _s(b"sha512") + _s(sig)
+    armored = base64.b64encode(body).decode("ascii")
+    pem = (
+        "-----BEGIN SSH SIGNATURE-----\n"
+        + "\n".join(armored[i : i + 70] for i in range(0, len(armored), 70))
+        + "\n-----END SSH SIGNATURE-----\n"
+    ).encode("ascii")
+    return base64.b64encode(pem).decode("ascii")
+
+
+def _write_plan_targets(checkout: Path, targets: tuple[Any, ...]) -> None:
+    for tgt in targets:
+        dest = checkout / Path(*tgt.rel_path.split("/"))
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(tgt.preview_text, encoding="utf-8")
+
+
+def _build_receipt(*, harness_id: str, host_version: str, config_digest: str) -> NativeHostReceipt:
+    probes = tuple(
+        AuthorityCommandProbeResult(
+            command_pattern=cmd,
+            prompted_user=True,
+            blocked_without_approval=True,
+        )
+        for cmd in AUTHORITY_ASK_COMMANDS
+    )
+    return NativeHostReceipt.build(
+        receipt_id=f"rcpt-{harness_id}-{host_version}-{new_id()[:8]}",
+        harness_id=harness_id,
+        host_version=host_version,
+        config_digest=config_digest,
+        probe_mode="approved_sandbox_probe",
+        command_probes=probes,
+        observed_at="2026-11-26T14:00:00Z",
+    )
+
+
+@contextmanager
+def _serve_daemon(
+    cfg: DaemonConfig,
+    os_: OsAdapters,
+    clock: FakeClock,
+    mono: FakeMonotonicClock,
+) -> Iterator[tuple[Ready, OwnerLoop]]:
+    ready_evt = threading.Event()
+    stop_evt = threading.Event()
+    box: dict[str, Any] = {}
+    exits: list[int] = []
+
+    def _on_ready(ready: Ready, loop: OwnerLoop) -> None:
+        box["ready"] = ready
+        box["loop"] = loop
+        ready_evt.set()
+
+    def _bg() -> None:
+        exits.append(
+            daemon_entry.serve(
+                cfg,
+                os_=os_,
+                clock=clock,
+                monotonic_clock=mono,
+                stop_event=stop_evt,
+                shutdown_grace_s=1.0,
+                on_ready=_on_ready,
+            )
+        )
+
+    thr = threading.Thread(target=_bg, name="sp25-prod-daemon", daemon=True)
+    thr.start()
+    try:
+        assert ready_evt.wait(timeout=5.0), f"daemon not ready (exits={exits})"
+        yield cast(Ready, box["ready"]), cast(OwnerLoop, box["loop"])
+    finally:
+        stop_evt.set()
+        thr.join(timeout=5.0)
+        assert not thr.is_alive()
+
+
+def _post_tls(ready: Ready, ca_pem: str, path: str, token: str, body_obj: object) -> tuple[int, dict[str, Any]]:
+    host = f"{ready.endpoint.host}:{ready.endpoint.port}"
+    body = json.dumps(body_obj).encode("utf-8")
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.load_verify_locations(cadata=ca_pem)
+    ctx.check_hostname = True
+    with (
+        socket.create_connection((ready.endpoint.host, ready.endpoint.port), timeout=2.0) as raw,
+        ctx.wrap_socket(raw, server_hostname="127.0.0.1") as sock,
+    ):
+        sock.settimeout(3.0)
+        sock.sendall(f"GET /v2/identity HTTP/1.1\r\nHost: {host}\r\n\r\n".encode("ascii"))
+        assert read_raw_http_response(sock, timeout=3.0).startswith(b"HTTP/1.1 200 ")
+        hdr = (
+            f"POST {path} HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer {token}\r\n"
+            f"X-Store-Id: {ready.identity.store_id}\r\nX-Writer-Epoch: {ready.identity.writer_epoch}\r\n"
+            f"X-Superbrain-Instance: {ready.identity.instance_id}\r\n"
+            f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n\r\n"
+        ).encode("iso-8859-1")
+        sock.sendall(hdr + body)
+        resp = read_raw_http_response(sock, timeout=5.0)
+    head, sep, data = resp.partition(b"\r\n\r\n")
+    assert sep and head.startswith(b"HTTP/1.1 "), resp[:200]
+    status = int(head.splitlines()[0].split()[1])
+    return status, cast(dict[str, Any], json.loads(data))
+
+
+def _create_low_risk_proposal(
+    rt: Any,
+    os_: OsAdapters,
+    *,
+    data_root: Path,
+    home: Path,
+    checkout: Path,
+    note_name: str,
+) -> str:
+    svc = ReviewApplyService(
+        StoreProposalAdapter(rt.store, os_),
+        PolicyApplyAuthority(rt.policy),
+        os_,
+        data_root=data_root,
+        home_dir=home,
+        config_merger=SharedConfigMergerAdapter(),
+    )
+    m = merge_markdown_block("", slice_id="note-1", block_body=f"Confirm {note_name}\n", expected_slice_digest=None)
+    targets = [
+        TargetWriteInput(
+            checkout,
+            note_name,
+            m.updated_text.encode("utf-8"),
+            ManagedFormat.MARKDOWN,
+            "note-1",
+            m.slice_digest,
+        )
+    ]
+    prop = svc.create_proposal(
+        owner_id=_OWNER,
+        kind="lesson_confirm",
+        reason=f"low-risk-{note_name}",
+        resources=[RiskResource(component="c1")],
+        targets=targets,
+    )
+    assert prop.risk_level is RiskLevel.LOW
+    return prop.proposal_id
+
+
+def _publish_capture_creds(
+    loop: OwnerLoop,
+    bindings: list[tuple[SeededCredential, str, WorkspaceBinding]],
+) -> None:
+    def _act() -> None:
+        session = cast(Any, loop._session)
+        assert session is not None
+        snap = session._rt.policy.snapshot()
+        merged = dict(snap.credentials)
+        for cred, stream, ws in bindings:
+            merged[cred.credential_id] = replace(
+                merged[cred.credential_id],
+                capabilities=frozenset({CAPABILITY_CAPTURE_PRODUCER}),
+                capture_binding=CaptureProducerBinding(stream, ws.repo_id, ws.checkout_id),
+            )
+        session.auth_gate.publish(replace(snap, credentials=merged))
+
+    loop.run_owner_action(_act).result(timeout=10.0)
+
+
+def _capture_event_row(loop: OwnerLoop, event_id: str) -> tuple[str, str]:
+    def _read() -> tuple[str, str]:
+        session = cast(Any, loop._session)
+        assert session is not None
+        row = session._rt.store._db.execute(
+            "SELECT source, source_verification FROM capture_events WHERE event_id = ?",
+            (event_id,),
+        ).fetchone()
+        assert row is not None, f"missing capture_events row for {event_id}"
+        return str(row[0]), str(row[1])
+
+    return loop.run_owner_action(_read).result(timeout=10.0)
+
+
+def _terminal_approve_proposal(
+    ready: Ready,
+    ca_pem: str,
+    cli_token: str,
+    proposal_id: str,
+) -> tuple[int, dict[str, Any]]:
+    st_c, ch_env = _post_tls(
+        ready,
+        ca_pem,
+        "/v2/operator/proposal/approve",
+        cli_token,
+        {"proposal_id": proposal_id},
+    )
+    if st_c != 200 or ch_env.get("ok") is not True:
+        return st_c, ch_env
+    return _post_tls(
+        ready,
+        ca_pem,
+        "/v2/operator/proposal/approve",
+        cli_token,
+        {
+            "proposal_id": proposal_id,
+            "approval": {
+                "message": ch_env["data"]["challenge"],
+                "channel": ApprovalChannel.TERMINAL.value,
+            },
+        },
+    )
+
+
+def _split_cmd(val: str) -> list[str]:
+    tokens: list[str] = []
+    for tok in shlex.split(val, posix=False):
+        if len(tok) >= 2 and tok[0] == tok[-1] and tok[0] in {"'", '"'}:
+            tokens.append(tok[1:-1])
+        else:
+            tokens.append(tok)
+    return tokens
+
+
+def _find_hook_commands(node: Any) -> list[list[str]]:
+    found: list[list[str]] = []
+    if isinstance(node, dict):
+        for key, val in node.items():
+            if key in {"command", "args"} and isinstance(val, str) and "superbrain.composition.hook_entry" in val:
+                found.append(_split_cmd(val))
+            elif (
+                key in {"command", "args"}
+                and isinstance(val, list)
+                and all(isinstance(x, str) for x in val)
+                and any("superbrain.composition.hook_entry" in x for x in val)
+            ):
+                found.append([str(x) for x in val])
+            else:
+                found.extend(_find_hook_commands(val))
+    elif isinstance(node, list):
+        if (
+            all(isinstance(x, str) for x in node)
+            and any("superbrain.composition.hook_entry" in x for x in node)
+        ):
+            found.append([str(x) for x in node])
+        else:
+            for item in node:
+                found.extend(_find_hook_commands(item))
+    elif isinstance(node, str) and "superbrain.composition.hook_entry" in node:
+        found.append(_split_cmd(node))
+    return found
+
+
+def _extract_outbox_arg(cmd: list[str]) -> str:
+    idx = cmd.index("--outbox")
+    return cmd[idx + 1]
+
+
+def _extract_harness_arg(cmd: list[str]) -> str:
+    idx = cmd.index("--harness")
+    return cmd[idx + 1]
+
+
+def _validate_get_health_schema(data: dict[str, Any]) -> None:
+    schema = json.loads(_SCHEMA_PATH.read_text(encoding="utf-8"))
+    ref_schema = {
+        "$schema": schema["$schema"],
+        "$defs": schema["$defs"],
+        "$ref": "#/$defs/GetHealthResult",
+    }
+    jsonschema.validate(instance=data, schema=ref_schema)
+
+
+# ---------------------------------------------------------------------------
+# P1 Finding 1: Live Layer-2 invalidation & policy restore
+# ---------------------------------------------------------------------------
+
+
+def test_p1_finding1_live_layer2_config_drift_and_host_version_drift_fail_closed(trusted_tmp: Path) -> None:
+    """Checkout config drift & host version drift fail-close capture and terminal approval without helper calls."""
+    clock = FakeClock(datetime.now(UTC).replace(microsecond=0))
+    mono = FakeMonotonicClock(1_000_000_000)
+    os_ = os_adapters(clock=clock, monotonic=mono)
+    _priv, s_enr = _ssh_signer()
+
+    cfg_dir = trusted_tmp / "cfg"
+    data_root = trusted_tmp / "data"
+    chk_a = trusted_tmp / "chk-a"
+    home_dir = trusted_tmp / "home"
+    for d in (cfg_dir, chk_a, home_dir):
+        d.mkdir(parents=True, exist_ok=True)
+        os_.permissions.secure_directory(d)
+
+    rep = init_entry.init_store(
+        init_entry.InitRequest(
+            data_root=data_root, config_dir=cfg_dir, owner_id=_OWNER, machine_id=_MACHINE, signer=s_enr
+        ),
+        os_,
+    )
+    cfg = read_daemon_config(rep.daemon_config_path, os_)
+    ca_pem = (cfg_dir / "tls" / "ca.pem").read_text(encoding="utf-8")
+    cli_token = rep.cli_credential_path.read_text(encoding="ascii").strip()
+
+    prof_path = cfg_dir / "claude-profile.json"
+    _write_plan_targets(chk_a, plan_claude_bootstrap(checkout_root=chk_a, profile_path=prof_path).targets)
+    _write_plan_targets(chk_a, plan_codex_bootstrap(checkout_root=chk_a, profile_path=prof_path).targets)
+    c_dig1 = compute_harness_config_digest("claude-code", chk_a, os_)
+    x_dig1 = compute_harness_config_digest("codex", chk_a, os_)
+    assert c_dig1 is not None and x_dig1 is not None
+
+    rt = reopen_kernel_job_runtime(data_root, rep.store_id, os_)
+    try:
+        mcp_c = seed_principal_and_credential(rt.policy, owner_id=_OWNER, harness_id="claude-code", machine_id=_MACHINE)
+        cap_c = seed_principal_and_credential(rt.policy, owner_id=_OWNER, harness_id="claude-code", machine_id=_MACHINE)
+        cap_x = seed_principal_and_credential(rt.policy, owner_id=_OWNER, harness_id="codex", machine_id=_MACHINE)
+        ws_a = register_workspace_direct(rt, clock, mcp_c.principal, alias="ws-l2-live", checkout_dir=chk_a)
+        seed_repo_grant(rt.policy, principal_id=cap_x.principal.principal_id, repo_id=ws_a.repo_id, owner_id=_OWNER)
+        rt.store.reconcile_policy()
+
+        assert (
+            reconcile_harness_layer2_in_policy(
+                rt.policy,
+                harness_id="claude-code",
+                checkout_root=chk_a,
+                observed_host_version=_CLAUDE_VER,
+                os_=os_,
+                receipt=_build_receipt(harness_id="claude-code", host_version=_CLAUDE_VER, config_digest=c_dig1),
+            )[0]
+            is Layer2State.VERIFIED
+        )
+        assert (
+            reconcile_harness_layer2_in_policy(
+                rt.policy,
+                harness_id="codex",
+                checkout_root=chk_a,
+                observed_host_version=_CODEX_VER,
+                os_=os_,
+                receipt=_build_receipt(harness_id="codex", host_version=_CODEX_VER, config_digest=x_dig1),
+            )[0]
+            is Layer2State.VERIFIED
+        )
+        prop_ok = _create_low_risk_proposal(
+            rt, os_, data_root=data_root, home=home_dir, checkout=chk_a, note_name="n1.md"
+        )
+        prop_codex_drift = _create_low_risk_proposal(
+            rt, os_, data_root=data_root, home=home_dir, checkout=chk_a, note_name="n1b.md"
+        )
+        prop_cfg_drift = _create_low_risk_proposal(
+            rt, os_, data_root=data_root, home=home_dir, checkout=chk_a, note_name="n2.md"
+        )
+        prop_ver_ok = _create_low_risk_proposal(
+            rt, os_, data_root=data_root, home=home_dir, checkout=chk_a, note_name="n3.md"
+        )
+        prop_ver_drift = _create_low_risk_proposal(
+            rt, os_, data_root=data_root, home=home_dir, checkout=chk_a, note_name="n4.md"
+        )
+    finally:
+        rt.close()
+
+    with _serve_daemon(cfg, os_, clock, mono) as (ready, loop):
+        _publish_capture_creds(
+            loop,
+            [
+                (cap_c, "stream-claude-l2", ws_a),
+                (cap_x, "stream-codex-l2", ws_a),
+            ],
+        )
+        target = LoopbackTarget(
+            endpoint=ready.endpoint,
+            expected_store_id=rep.store_id,
+            ca_pem=ca_pem,
+            leaf_cert_sha256=ready.leaf_cert_sha256,
+        )
+        cap_client = CaptureClient(LoopbackClient(monotonic_ns=mono.monotonic_ns))
+
+        def _send_ev(seq: int, *, event_id: str, host_ver: str, cfg_dig: str) -> None:
+            ev = CaptureEventRecord(
+                event_id=event_id,
+                producer_stream="stream-claude-l2",
+                sequence=seq,
+                harness_id="claude-code",
+                kind="command_result",
+                recorded_at=f"2026-11-26T14:00:{seq:02d}Z",
+                payload={"cmd": "pytest", "seq": seq},
+                source_metadata={"host_version": host_ver, "config_digest": cfg_dig},
+            ).to_dict()
+            ack = cap_client.post_batch(
+                target,
+                CaptureBatchCommand("stream-claude-l2", ws_a.repo_id, ws_a.checkout_id, (ev,), cap_c.token),
+            )
+            assert ack.accepted_count == 1
+
+        # Positive baseline: verified live binding -> verified_host + terminal approval succeeds.
+        _send_ev(1, event_id="ev-l2-live-1", host_ver=_CLAUDE_VER, cfg_dig=c_dig1)
+        assert _capture_event_row(loop, "ev-l2-live-1") == ("tool_observed", "verified_host")
+
+        st_ok, app_ok = _terminal_approve_proposal(ready, ca_pem, cli_token, prop_ok)
+        assert st_ok == 200 and app_ok.get("ok") is True, (st_ok, app_ok)
+        assert app_ok["data"]["proposal"]["status"] == "approved"
+
+        # Case 1a-direct: Mutate .codex/hooks.json on disk and call terminal approval DIRECTLY before any capture
+        # batch is sent -> MUST immediately fail closed with CAPABILITY_UNAVAILABLE.
+        codex_hooks_path = chk_a / ".codex" / "hooks.json"
+        codex_hooks_obj = json.loads(codex_hooks_path.read_text(encoding="utf-8"))
+        codex_hooks_obj["extra_drift_flag"] = True
+        codex_hooks_path.write_bytes(canonical_json(codex_hooks_obj))
+
+        st_cd, app_cd = _terminal_approve_proposal(ready, ca_pem, cli_token, prop_codex_drift)
+        assert app_cd.get("ok") is False, (st_cd, app_cd)
+        assert app_cd["error"]["code"] == ErrorCode.CAPABILITY_UNAVAILABLE.value
+
+        # Case 1a: Mutate .claude/settings.local.json on disk WITHOUT calling reconcile_harness_layer2_in_policy.
+        settings_path = chk_a / ".claude" / "settings.local.json"
+        settings_obj = json.loads(settings_path.read_text(encoding="utf-8"))
+        settings_obj["permissions"]["allow"] = ["Bash(pytest *)"]
+        settings_path.write_bytes(canonical_json(settings_obj))
+
+        # Capture claiming old c_dig1 MUST immediately fall back to ("unknown", "unverified").
+        _send_ev(2, event_id="ev-l2-live-cfg-drift", host_ver=_CLAUDE_VER, cfg_dig=c_dig1)
+        assert _capture_event_row(loop, "ev-l2-live-cfg-drift") == ("unknown", "unverified")
+
+        # Terminal approval MUST immediately fail closed with CAPABILITY_UNAVAILABLE.
+        st_drift, app_drift = _terminal_approve_proposal(ready, ca_pem, cli_token, prop_cfg_drift)
+        assert app_drift.get("ok") is False, (st_drift, app_drift)
+        assert app_drift["error"]["code"] == ErrorCode.CAPABILITY_UNAVAILABLE.value
+
+        # Production run_doctor MUST reflect drifted Layer-2 state & terminal_channel_eligible=False.
+        doc = run_doctor(rep.daemon_config_path, checkout_root=chk_a, os_=os_)
+        assert doc.terminal_channel_eligible is False
+        by_h = {h.harness_id: h for h in doc.layer2_harnesses}
+        assert by_h["claude-code"].state is Layer2State.UNKNOWN
+        assert by_h["codex"].state is Layer2State.UNKNOWN
+
+        # Case 1b: Re-verify at c_dig2 & x_dig2 as clean baseline, then observe live host_version drift ("2.1.326").
+        c_dig2 = compute_harness_config_digest("claude-code", chk_a, os_)
+        x_dig2 = compute_harness_config_digest("codex", chk_a, os_)
+        assert c_dig2 is not None and c_dig2 != c_dig1
+        assert x_dig2 is not None and x_dig2 != x_dig1
+
+        def _reverify_c2() -> None:
+            session = cast(Any, loop._session)
+            assert session is not None
+            st2, _ = reconcile_harness_layer2_in_policy(
+                session._rt.policy,
+                harness_id="claude-code",
+                checkout_root=chk_a,
+                observed_host_version=_CLAUDE_VER,
+                os_=os_,
+                receipt=_build_receipt(harness_id="claude-code", host_version=_CLAUDE_VER, config_digest=c_dig2),
+            )
+            assert st2 is Layer2State.VERIFIED
+            stx2, _ = reconcile_harness_layer2_in_policy(
+                session._rt.policy,
+                harness_id="codex",
+                checkout_root=chk_a,
+                observed_host_version=_CODEX_VER,
+                os_=os_,
+                receipt=_build_receipt(harness_id="codex", host_version=_CODEX_VER, config_digest=x_dig2),
+            )
+            assert stx2 is Layer2State.VERIFIED
+
+        loop.run_owner_action(_reverify_c2).result(timeout=10.0)
+        st_vok, app_vok = _terminal_approve_proposal(ready, ca_pem, cli_token, prop_ver_ok)
+        assert st_vok == 200 and app_vok.get("ok") is True, (st_vok, app_vok)
+
+        # Host reports drifted version "2.1.326" -> both seq 3 AND subsequent stale "2.1.325" seq 4 MUST be
+        # unverified, and terminal approval MUST refuse with CAPABILITY_UNAVAILABLE without calling
+        # reconcile_harness_layer2_in_policy!
+        _send_ev(3, event_id="ev-l2-live-ver-drift", host_ver="2.1.326", cfg_dig=c_dig2)
+        assert _capture_event_row(loop, "ev-l2-live-ver-drift") == ("unknown", "unverified")
+
+        _send_ev(4, event_id="ev-l2-live-ver-stale", host_ver=_CLAUDE_VER, cfg_dig=c_dig2)
+        assert _capture_event_row(loop, "ev-l2-live-ver-stale") == ("unknown", "unverified")
+
+        st_vd, app_vd = _terminal_approve_proposal(ready, ca_pem, cli_token, prop_ver_drift)
+        assert app_vd.get("ok") is False, (st_vd, app_vd)
+        assert app_vd["error"]["code"] == ErrorCode.CAPABILITY_UNAVAILABLE.value
+
+
+def test_p1_finding1_policy_restore_with_old_verified_row_fails_closed(trusted_tmp: Path) -> None:
+    """Restoring a policy backup with an old VERIFIED row (online or offline) fails-closes terminal & capture."""
+    clock = FakeClock(datetime.now(UTC).replace(microsecond=0))
+    mono = FakeMonotonicClock(1_000_000_000)
+    os_ = os_adapters(clock=clock, monotonic=mono)
+    priv, s_enr = _ssh_signer()
+
+    cfg_dir = trusted_tmp / "cfg"
+    data_root = trusted_tmp / "data"
+    chk_a = trusted_tmp / "chk-restore"
+    home_dir = trusted_tmp / "home"
+    for d in (cfg_dir, chk_a, home_dir):
+        d.mkdir(parents=True, exist_ok=True)
+        os_.permissions.secure_directory(d)
+
+    rep = init_entry.init_store(
+        init_entry.InitRequest(
+            data_root=data_root, config_dir=cfg_dir, owner_id=_OWNER, machine_id=_MACHINE, signer=s_enr
+        ),
+        os_,
+    )
+    cfg = read_daemon_config(rep.daemon_config_path, os_)
+    ca_pem = (cfg_dir / "tls" / "ca.pem").read_text(encoding="utf-8")
+    cli_token = rep.cli_credential_path.read_text(encoding="ascii").strip()
+
+    prof_path = cfg_dir / "claude-profile.json"
+    _write_plan_targets(chk_a, plan_claude_bootstrap(checkout_root=chk_a, profile_path=prof_path).targets)
+    _write_plan_targets(chk_a, plan_codex_bootstrap(checkout_root=chk_a, profile_path=prof_path).targets)
+    c_dig1 = compute_harness_config_digest("claude-code", chk_a, os_)
+    x_dig1 = compute_harness_config_digest("codex", chk_a, os_)
+    assert c_dig1 is not None and x_dig1 is not None
+
+    rt = reopen_kernel_job_runtime(data_root, rep.store_id, os_)
+    try:
+        mcp_c = seed_principal_and_credential(rt.policy, owner_id=_OWNER, harness_id="claude-code", machine_id=_MACHINE)
+        cap_c = seed_principal_and_credential(rt.policy, owner_id=_OWNER, harness_id="claude-code", machine_id=_MACHINE)
+        cap_x = seed_principal_and_credential(rt.policy, owner_id=_OWNER, harness_id="codex", machine_id=_MACHINE)
+        ws_a = register_workspace_direct(rt, clock, mcp_c.principal, alias="ws-l2-res", checkout_dir=chk_a)
+        seed_repo_grant(rt.policy, principal_id=cap_x.principal.principal_id, repo_id=ws_a.repo_id, owner_id=_OWNER)
+        rt.store.reconcile_policy()
+
+        assert (
+            reconcile_harness_layer2_in_policy(
+                rt.policy,
+                harness_id="claude-code",
+                checkout_root=chk_a,
+                observed_host_version=_CLAUDE_VER,
+                os_=os_,
+                receipt=_build_receipt(harness_id="claude-code", host_version=_CLAUDE_VER, config_digest=c_dig1),
+            )[0]
+            is Layer2State.VERIFIED
+        )
+        assert (
+            reconcile_harness_layer2_in_policy(
+                rt.policy,
+                harness_id="codex",
+                checkout_root=chk_a,
+                observed_host_version=_CODEX_VER,
+                os_=os_,
+                receipt=_build_receipt(harness_id="codex", host_version=_CODEX_VER, config_digest=x_dig1),
+            )[0]
+            is Layer2State.VERIFIED
+        )
+        bak_verified = create_policy_backup(rt.policy, os_, clock.now())
+        prop_same_cfg = _create_low_risk_proposal(
+            rt, os_, data_root=data_root, home=home_dir, checkout=chk_a, note_name="r-same.md"
+        )
+        prop_reverified = _create_low_risk_proposal(
+            rt, os_, data_root=data_root, home=home_dir, checkout=chk_a, note_name="r-reverify.md"
+        )
+        prop_online = _create_low_risk_proposal(
+            rt, os_, data_root=data_root, home=home_dir, checkout=chk_a, note_name="r-on.md"
+        )
+        prop_offline = _create_low_risk_proposal(
+            rt, os_, data_root=data_root, home=home_dir, checkout=chk_a, note_name="r-off.md"
+        )
+    finally:
+        rt.close()
+
+    def _run_online_restore(ready_obj: Any) -> None:
+        st_p, prev_env = _post_tls(
+            ready_obj, ca_pem, "/v2/operator/restore", cli_token, {"target": "policy", "backup": str(bak_verified)}
+        )
+        assert st_p == 200 and prev_env.get("ok") is True, (st_p, prev_env)
+        ch = cast(dict[str, Any], prev_env["data"]["challenge"])
+        msg = ApprovalMessage(
+            store_id=rep.store_id,
+            owner_id=_OWNER,
+            trust_generation=int(ch["trust_generation"]),
+            action=ApprovalAction.RESTORE,
+            subject_id=str(ch["subject_id"]),
+            subject_revision=1,
+            resource_digests=(ResourceDigest("backup", str(prev_env["data"]["backup_db_digest"])),),
+            target_files=(),
+            risk_level=RiskLevel.HIGH,
+            risk_policy_version=RISK_POLICY_VERSION,
+            recovery_scope=RecoveryScope.NONE,
+            nonce=str(ch["nonce"]),
+            expires_at=datetime.fromisoformat(str(ch["expires_at"]).replace("Z", "+00:00")),
+        )
+        st_e, exec_env = _post_tls(
+            ready_obj,
+            ca_pem,
+            "/v2/operator/restore",
+            cli_token,
+            {
+                "target": "policy",
+                "backup": str(bak_verified),
+                "approval": {
+                    "message": msg.to_dict(),
+                    "channel": ApprovalChannel.SSH_KEY.value,
+                    "signer_id": rep.signer.signer_id,
+                    "signature": _ssh_sig_b64(priv, msg.canonical_bytes()),
+                },
+            },
+        )
+        assert st_e == 200 and exec_env.get("ok") is True, (st_e, exec_env)
+
+    # Subcase 1c-match: Restore bak_verified WHILE disk checkout config still matches c_dig1/x_dig1 (no drift).
+    # Restored policy MUST STILL fail-close both terminal & capture until explicitly re-verified!
+    with _serve_daemon(cfg, os_, clock, mono) as (ready0, loop0):
+        _publish_capture_creds(loop0, [(cap_c, "stream-claude-r-match", ws_a)])
+        _run_online_restore(ready0)
+
+        st_same, app_same = _terminal_approve_proposal(ready0, ca_pem, cli_token, prop_same_cfg)
+        assert app_same.get("ok") is False, (st_same, app_same)
+        assert app_same["error"]["code"] == ErrorCode.CAPABILITY_UNAVAILABLE.value
+
+        target0 = LoopbackTarget(
+            endpoint=ready0.endpoint,
+            expected_store_id=rep.store_id,
+            ca_pem=ca_pem,
+            leaf_cert_sha256=ready0.leaf_cert_sha256,
+        )
+        cap_client0 = CaptureClient(LoopbackClient(monotonic_ns=mono.monotonic_ns))
+        ev_same = CaptureEventRecord(
+            event_id="ev-l2-restored-match",
+            producer_stream="stream-claude-r-match",
+            sequence=1,
+            harness_id="claude-code",
+            kind="command_result",
+            recorded_at="2026-11-26T14:04:01Z",
+            payload={"cmd": "pytest"},
+            source_metadata={"host_version": _CLAUDE_VER, "config_digest": c_dig1},
+        ).to_dict()
+        assert (
+            cap_client0.post_batch(
+                target0,
+                CaptureBatchCommand("stream-claude-r-match", ws_a.repo_id, ws_a.checkout_id, (ev_same,), cap_c.token),
+            ).accepted_count
+            == 1
+        )
+        assert _capture_event_row(loop0, "ev-l2-restored-match") == ("unknown", "unverified")
+
+        def _reverify_after_restore() -> None:
+            session = cast(Any, loop0._session)
+            assert session is not None
+            assert (
+                reconcile_harness_layer2_in_policy(
+                    session._rt.policy,
+                    harness_id="claude-code",
+                    checkout_root=chk_a,
+                    observed_host_version=_CLAUDE_VER,
+                    os_=os_,
+                    receipt=_build_receipt(harness_id="claude-code", host_version=_CLAUDE_VER, config_digest=c_dig1),
+                )[0]
+                is Layer2State.VERIFIED
+            )
+            assert (
+                reconcile_harness_layer2_in_policy(
+                    session._rt.policy,
+                    harness_id="codex",
+                    checkout_root=chk_a,
+                    observed_host_version=_CODEX_VER,
+                    os_=os_,
+                    receipt=_build_receipt(harness_id="codex", host_version=_CODEX_VER, config_digest=x_dig1),
+                )[0]
+                is Layer2State.VERIFIED
+            )
+
+        loop0.run_owner_action(_reverify_after_restore).result(timeout=10.0)
+        st_rv, app_rv = _terminal_approve_proposal(ready0, ca_pem, cli_token, prop_reverified)
+        assert st_rv == 200 and app_rv.get("ok") is True, (st_rv, app_rv)
+
+    # Mutate checkout on disk AFTER backup so restored policy row has stale c_dig1 != live c_dig2.
+    settings_path = chk_a / ".claude" / "settings.local.json"
+    settings_obj = json.loads(settings_path.read_text(encoding="utf-8"))
+    settings_obj["permissions"]["allow"] = ["Bash(pytest *)"]
+    settings_path.write_bytes(canonical_json(settings_obj))
+
+    # Subcase 1c-live: Online /v2/operator/restore to bak_verified -> terminal & capture MUST fail closed immediately.
+    clock.advance(timedelta(seconds=5))
+    with _serve_daemon(cfg, os_, clock, mono) as (ready, loop):
+        _publish_capture_creds(loop, [(cap_c, "stream-claude-r", ws_a)])
+        _run_online_restore(ready)
+
+        st_term_on, app_term_on = _terminal_approve_proposal(ready, ca_pem, cli_token, prop_online)
+        assert app_term_on.get("ok") is False, (st_term_on, app_term_on)
+        assert app_term_on["error"]["code"] == ErrorCode.CAPABILITY_UNAVAILABLE.value
+
+        target = LoopbackTarget(
+            endpoint=ready.endpoint,
+            expected_store_id=rep.store_id,
+            ca_pem=ca_pem,
+            leaf_cert_sha256=ready.leaf_cert_sha256,
+        )
+        cap_client = CaptureClient(LoopbackClient(monotonic_ns=mono.monotonic_ns))
+        ev_on = CaptureEventRecord(
+            event_id="ev-l2-restored-on",
+            producer_stream="stream-claude-r",
+            sequence=1,
+            harness_id="claude-code",
+            kind="command_result",
+            recorded_at="2026-11-26T14:05:01Z",
+            payload={"cmd": "pytest"},
+            source_metadata={"host_version": _CLAUDE_VER, "config_digest": c_dig1},
+        ).to_dict()
+        assert (
+            cap_client.post_batch(
+                target, CaptureBatchCommand("stream-claude-r", ws_a.repo_id, ws_a.checkout_id, (ev_on,), cap_c.token)
+            ).accepted_count
+            == 1
+        )
+        assert _capture_event_row(loop, "ev-l2-restored-on") == ("unknown", "unverified")
+
+    # Subcase 1c-offline: Offline restore_policy + daemon restart -> terminal & capture STILL fail closed.
+    clock.advance(timedelta(seconds=5))
+    with maintenance_lease(data_root, os_) as (root_obj, lease):
+        restore_policy(
+            root_obj,
+            lease,
+            os_,
+            bak_verified,
+            store_id=rep.store_id,
+            now=clock.now(),
+            migrations=KERNEL_POLICY_MIGRATIONS,
+        )
+
+    with _serve_daemon(cfg, os_, clock, mono) as (ready2, loop2):
+        _publish_capture_creds(loop2, [(cap_c, "stream-claude-r", ws_a)])
+        st_term_off, app_term_off = _terminal_approve_proposal(ready2, ca_pem, cli_token, prop_offline)
+        assert app_term_off.get("ok") is False, (st_term_off, app_term_off)
+        assert app_term_off["error"]["code"] == ErrorCode.CAPABILITY_UNAVAILABLE.value
+
+        target2 = LoopbackTarget(
+            endpoint=ready2.endpoint,
+            expected_store_id=rep.store_id,
+            ca_pem=ca_pem,
+            leaf_cert_sha256=ready2.leaf_cert_sha256,
+        )
+        cap_client2 = CaptureClient(LoopbackClient(monotonic_ns=mono.monotonic_ns))
+        ev_off = CaptureEventRecord(
+            event_id="ev-l2-restored-off",
+            producer_stream="stream-claude-r",
+            sequence=2,
+            harness_id="claude-code",
+            kind="command_result",
+            recorded_at="2026-11-26T14:05:10Z",
+            payload={"cmd": "pytest"},
+            source_metadata={"host_version": _CLAUDE_VER, "config_digest": c_dig1},
+        ).to_dict()
+        assert (
+            cap_client2.post_batch(
+                target2, CaptureBatchCommand("stream-claude-r", ws_a.repo_id, ws_a.checkout_id, (ev_off,), cap_c.token)
+            ).accepted_count
+            == 1
+        )
+        assert _capture_event_row(loop2, "ev-l2-restored-off") == ("unknown", "unverified")
+
+
+# ---------------------------------------------------------------------------
+# P1 Finding 2: Production Bootstrap + Hook Adapter End-to-End
+# ---------------------------------------------------------------------------
+
+
+def test_p1_finding2_bootstrap_and_installed_hook_adapters_end_to_end(trusted_tmp: Path) -> None:
+    """Bootstrapped checkout hooks invoke hook_entry + host adapters with strict checkout/transcript isolation."""
+    clock = FakeClock(datetime.now(UTC).replace(microsecond=0))
+    mono = FakeMonotonicClock(1_000_000_000)
+    os_ = os_adapters(clock=clock, monotonic=mono)
+    priv, s_enr = _ssh_signer()
+
+    cfg_dir = trusted_tmp / "cfg"
+    data_root = trusted_tmp / "data"
+    chk_a = trusted_tmp / "chk-a"
+    chk_b = trusted_tmp / "chk-b"
+    prof_dir = trusted_tmp / "profiles"
+    for d in (cfg_dir, chk_a, chk_b, prof_dir):
+        d.mkdir(parents=True, exist_ok=True)
+        os_.permissions.secure_directory(d)
+
+    rep = init_entry.init_store(
+        init_entry.InitRequest(
+            data_root=data_root, config_dir=cfg_dir, owner_id=_OWNER, machine_id=_MACHINE, signer=s_enr
+        ),
+        os_,
+    )
+    cfg = read_daemon_config(rep.daemon_config_path, os_)
+    ca_path = cfg_dir / "tls" / "ca.pem"
+    ca_pem = ca_path.read_text(encoding="utf-8")
+    cli_token = rep.cli_credential_path.read_text(encoding="ascii").strip()
+
+    rt = reopen_kernel_job_runtime(data_root, rep.store_id, os_)
+    try:
+        mcp_c = seed_principal_and_credential(rt.policy, owner_id=_OWNER, harness_id="claude-code", machine_id=_MACHINE)
+        mcp_x = seed_principal_and_credential(rt.policy, owner_id=_OWNER, harness_id="codex", machine_id=_MACHINE)
+        cap_c = seed_principal_and_credential(rt.policy, owner_id=_OWNER, harness_id="claude-code", machine_id=_MACHINE)
+        cap_x = seed_principal_and_credential(rt.policy, owner_id=_OWNER, harness_id="codex", machine_id=_MACHINE)
+        ws_a = register_workspace_direct(
+            rt,
+            clock,
+            mcp_c.principal,
+            alias="ws-hook-a",
+            checkout_dir=chk_a,
+            remote="https://github.example/dan/repo-hook-a.git",
+        )
+        ws_b = register_workspace_direct(
+            rt,
+            clock,
+            mcp_c.principal,
+            alias="ws-hook-b",
+            checkout_dir=chk_b,
+            remote="https://github.example/dan/repo-hook-b.git",
+        )
+        for pid in (mcp_x.principal.principal_id, cap_x.principal.principal_id):
+            seed_repo_grant(rt.policy, principal_id=pid, repo_id=ws_a.repo_id, owner_id=_OWNER)
+            seed_repo_grant(rt.policy, principal_id=pid, repo_id=ws_b.repo_id, owner_id=_OWNER)
+        rt.store.reconcile_policy()
+    finally:
+        rt.close()
+
+    with _serve_daemon(cfg, os_, clock, mono) as (ready, loop):
+        _publish_capture_creds(
+            loop,
+            [
+                (cap_c, "stream-claude-a", ws_a),
+                (cap_x, "stream-codex-a", ws_a),
+            ],
+        )
+
+        # Build isolated ClientProfile files for (chk_a, chk_b) x (claude-code, codex) and bootstrap via /v2/operator.
+        ep_path = data_root / "endpoint.json"
+        cred_c_file = write_credential_file(prof_dir / "claude.cred", mcp_c.token)
+        cred_x_file = write_credential_file(prof_dir / "codex.cred", mcp_x.token)
+
+        def _make_profile(name: str, cred_file: Path, ws: WorkspaceBinding, chk: Path) -> Path:
+            p, _ = write_client_profile_file(
+                prof_dir / name,
+                endpoint_path=ep_path,
+                expected_store_id=rep.store_id,
+                ca_file=ca_path,
+                leaf_cert_sha256=ready.leaf_cert_sha256,
+                credential_file=cred_file,
+                workspace={
+                    "alias": ws.alias,
+                    "expected_workspace_id": ws.repo_id,
+                    "expected_checkout_id": ws.checkout_id,
+                    "checkout_path": str(chk),
+                },
+            )
+            return p
+
+        profiles = {
+            ("chk_a", "claude-code"): _make_profile("a-claude.json", cred_c_file, ws_a, chk_a),
+            ("chk_a", "codex"): _make_profile("a-codex.json", cred_x_file, ws_a, chk_a),
+            ("chk_b", "claude-code"): _make_profile("b-claude.json", cred_c_file, ws_b, chk_b),
+            ("chk_b", "codex"): _make_profile("b-codex.json", cred_x_file, ws_b, chk_b),
+        }
+
+        # Direct planner sanity check also requires executable hook_entry commands.
+        direct_c = plan_claude_bootstrap(checkout_root=chk_a, profile_path=profiles[("chk_a", "claude-code")])
+        direct_x = plan_codex_bootstrap(checkout_root=chk_a, profile_path=profiles[("chk_a", "codex")])
+        assert any(
+            t.rel_path == ".claude/settings.local.json" and "superbrain.composition.hook_entry" in t.preview_text
+            for t in direct_c.targets
+        ), "plan_claude_bootstrap must emit executable capture hook command via build_capture_hook_command"
+        assert any(
+            t.rel_path == ".codex/hooks.json" and "superbrain.composition.hook_entry" in t.preview_text
+            for t in direct_x.targets
+        ), "plan_codex_bootstrap must emit executable capture hook command via build_capture_hook_command"
+
+        def _bootstrap_approve_apply(harness: str, chk: Path, prof: Path) -> None:
+            st_b, b_env = _post_tls(
+                ready,
+                ca_pem,
+                "/v2/operator/proposal/bootstrap",
+                cli_token,
+                {"harness": harness, "checkout_root": str(chk), "harness_profile_path": str(prof)},
+            )
+            assert st_b == 200 and b_env.get("ok") is True, (st_b, b_env)
+            pid = str(b_env["data"]["proposal"]["proposal_id"])
+
+            for op_path in ("/v2/operator/proposal/approve", "/v2/operator/proposal/apply"):
+                st_c, ch_env = _post_tls(ready, ca_pem, op_path, cli_token, {"proposal_id": pid})
+                assert st_c == 200 and ch_env.get("ok") is True, (op_path, ch_env)
+                ch = cast(dict[str, Any], ch_env["data"]["challenge"])
+                msg = ApprovalMessage.from_dict(ch)
+                st_x, ex_env = _post_tls(
+                    ready,
+                    ca_pem,
+                    op_path,
+                    cli_token,
+                    {
+                        "proposal_id": pid,
+                        "approval": {
+                            "message": ch,
+                            "channel": ApprovalChannel.SSH_KEY.value,
+                            "signer_id": rep.signer.signer_id,
+                            "signature": _ssh_sig_b64(priv, msg.canonical_bytes()),
+                        },
+                    },
+                )
+                assert st_x == 200 and ex_env.get("ok") is True, (op_path, ex_env)
+
+        _bootstrap_approve_apply("claude-code", chk_a, profiles[("chk_a", "claude-code")])
+        _bootstrap_approve_apply("codex", chk_a, profiles[("chk_a", "codex")])
+        _bootstrap_approve_apply("claude-code", chk_b, profiles[("chk_b", "claude-code")])
+        _bootstrap_approve_apply("codex", chk_b, profiles[("chk_b", "codex")])
+
+        # Inspect bootstrapped hook configs on chk_a & chk_b.
+        cfg_a_claude = json.loads((chk_a / ".claude" / "settings.local.json").read_text(encoding="utf-8"))
+        cfg_b_claude = json.loads((chk_b / ".claude" / "settings.local.json").read_text(encoding="utf-8"))
+        cfg_a_codex = json.loads((chk_a / ".codex" / "hooks.json").read_text(encoding="utf-8"))
+        cfg_b_codex = json.loads((chk_b / ".codex" / "hooks.json").read_text(encoding="utf-8"))
+
+        # Preserve non_blocking/remind and all 11 AUTHORITY_ASK_COMMANDS.
+        for cfg_obj in (cfg_a_claude, cfg_b_claude, cfg_a_codex, cfg_b_codex):
+            sb = cfg_obj["hooks"]["PreToolUse"]["super_brain"]
+            assert sb["mode"] == "remind" and sb["non_blocking"] is True
+            assert tuple(sb["authority_ask_commands"]) == AUTHORITY_ASK_COMMANDS
+        assert len(cfg_a_claude["permissions"]["ask"]) == len(AUTHORITY_ASK_COMMANDS)
+
+        cmds_a_claude = _find_hook_commands(cfg_a_claude)
+        cmds_b_claude = _find_hook_commands(cfg_b_claude)
+        cmds_a_codex = _find_hook_commands(cfg_a_codex)
+        cmds_b_codex = _find_hook_commands(cfg_b_codex)
+        assert cmds_a_claude and cmds_b_claude and cmds_a_codex and cmds_b_codex
+
+        cmd_a_claude = cmds_a_claude[0]
+        cmd_b_claude = cmds_b_claude[0]
+        cmd_a_codex = cmds_a_codex[0]
+        cmd_b_codex = cmds_b_codex[0]
+
+        assert _extract_harness_arg(cmd_a_claude) == "claude-code"
+        assert _extract_harness_arg(cmd_a_codex) == "codex"
+        outbox_a_claude = Path(_extract_outbox_arg(cmd_a_claude))
+        outbox_b_claude = Path(_extract_outbox_arg(cmd_b_claude))
+        outbox_a_codex = Path(_extract_outbox_arg(cmd_a_codex))
+        outbox_b_codex = Path(_extract_outbox_arg(cmd_b_codex))
+        assert outbox_a_claude.resolve() != outbox_b_claude.resolve()
+        assert outbox_a_codex.resolve() != outbox_b_codex.resolve()
+
+        def _invoke_hook(cmd: list[str], payload: dict[str, Any], *, cwd: Path) -> None:
+            run_cmd = [sys.executable, *cmd[1:]] if Path(cmd[0]).name.lower().startswith("python") else cmd
+            t0 = time.perf_counter()
+            proc = subprocess.run(
+                run_cmd,
+                cwd=cwd,
+                env=clean_installed_subprocess_env(),
+                input=json.dumps(payload).encode("utf-8"),
+                capture_output=True,
+                timeout=5.0,
+                check=False,
+            )
+            elapsed = time.perf_counter() - t0
+            assert proc.returncode == 0
+            assert elapsed < 2.0
+
+        # Prepare transcripts: one valid in allowed dir, one outside allowed root, one with chk_b cross-leak.
+        outside_tr = chk_b / "outside-transcript.jsonl"
+        outside_tr.write_text(
+            json.dumps(
+                {
+                    "event_id": "tr-outside-1",
+                    "event_name": "UserPromptSubmit",
+                    "recorded_at": "2026-11-26T14:10:00Z",
+                    "cwd": str(chk_b),
+                    "payload": {"role": "user", "text": "SECRET_OUTSIDE_CHK_B"},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        # Positive case: native-shaped payloads for BOTH claude-code and codex in chk_a.
+        target = LoopbackTarget(
+            endpoint=ready.endpoint,
+            expected_store_id=rep.store_id,
+            ca_pem=ca_pem,
+            leaf_cert_sha256=ready.leaf_cert_sha256,
+        )
+        cap_client = CaptureClient(LoopbackClient(monotonic_ns=mono.monotonic_ns))
+
+        for harness_id, cmd_a, outbox_a, stream, cred, event_name, ev_id in (
+            ("claude-code", cmd_a_claude, outbox_a_claude, "stream-claude-a", cap_c, "PostToolUse", "ev-hook-c-1"),
+            ("codex", cmd_a_codex, outbox_a_codex, "stream-codex-a", cap_x, "command_completed", "ev-hook-x-1"),
+        ):
+            _invoke_hook(
+                cmd_a,
+                {
+                    "event_id": ev_id,
+                    "sequence": 1,
+                    "event_name": event_name,
+                    "recorded_at": "2026-11-26T14:11:00Z",
+                    "cwd": str(chk_a),
+                    "producer_stream": stream,
+                    "session_id": "RAW_NATIVE_SID_MUST_NOT_LEAK",
+                    "payload": {"command": "pytest -q", "exit_code": 0},
+                    "channel_kind": "local_capture",
+                },
+                cwd=chk_a,
+            )
+            spool = OutboxSpool(outbox_a, permissions=os_.permissions)
+            pending = spool.read_pending(limit=10, producer_stream=stream)
+            assert len(pending) >= 1, f"{harness_id} hook must enqueue normalized event into {outbox_a}"
+            assert all("RAW_NATIVE_SID_MUST_NOT_LEAK" not in entry.payload_json for entry in pending)
+
+            ack = drain_outbox(
+                spool,
+                client=cap_client,
+                target=target,
+                producer_stream=stream,
+                repo_id=ws_a.repo_id,
+                checkout_id=ws_a.checkout_id,
+                token=cred.token,
+            )
+            assert ack is not None and ack.accepted_count >= 1
+            assert spool.read_pending(limit=10, producer_stream=stream) == []
+
+            # Workspace switch (cwd = chk_b sent to chk_a's hook) -> rc=0, 0 events written to chk_a outbox.
+            _invoke_hook(
+                cmd_a,
+                {
+                    "event_id": f"{ev_id}-wrong-ws",
+                    "sequence": 2,
+                    "event_name": event_name,
+                    "recorded_at": "2026-11-26T14:11:05Z",
+                    "cwd": str(chk_b),
+                    "producer_stream": stream,
+                    "payload": {"command": "echo secret-b"},
+                },
+                cwd=chk_b,
+            )
+            assert spool.read_pending(limit=10, producer_stream=stream) == []
+
+            # Transcript mismatch (pointing outside allowed root / chk_b data) -> zero chk_b leak.
+            _invoke_hook(
+                cmd_a,
+                {
+                    "event_id": f"{ev_id}-tr-mismatch",
+                    "sequence": 3,
+                    "event_name": event_name,
+                    "recorded_at": "2026-11-26T14:11:10Z",
+                    "cwd": str(chk_a),
+                    "producer_stream": stream,
+                    "transcript_path": str(outside_tr),
+                    "payload": {"command": "pytest"},
+                },
+                cwd=chk_a,
+            )
+            after_tr = spool.read_pending(limit=10, producer_stream=stream)
+            assert all("SECRET_OUTSIDE_CHK_B" not in entry.payload_json for entry in after_tr)
+
+            # Missing evidence / unknown native event kind -> fail-closed (no promoted sent_to_recipient/tool_observed).
+            _invoke_hook(
+                cmd_a,
+                {
+                    "event_id": f"{ev_id}-unknown-kind",
+                    "sequence": 4,
+                    "event_name": "UndocumentedHostEvent",
+                    "recorded_at": "2026-11-26T14:11:15Z",
+                    "cwd": str(chk_a),
+                    "producer_stream": stream,
+                    "channel_kind": "model_io",
+                    "exposure_evidence": "sent_to_recipient",
+                    "payload": {"note": "missing model call"},
+                },
+                cwd=chk_a,
+            )
+            after_unk = spool.read_pending(limit=10, producer_stream=stream)
+            assert all('"exposure_evidence": "sent_to_recipient"' not in entry.payload_json for entry in after_unk)
+
+        # Verify drained events landed in brain.db without raw session_id or chk_b secrets.
+        def _db_check() -> None:
+            session = cast(Any, loop._session)
+            assert session is not None
+            rows = session._rt.store._db.execute(
+                "SELECT event_id, source, source_verification FROM capture_events ORDER BY sequence"
+            ).fetchall()
+            ids = {str(r[0]) for r in rows}
+            assert "ev-hook-c-1" in ids and "ev-hook-x-1" in ids
+
+        loop.run_owner_action(_db_check).result(timeout=10.0)
+
+
+# ---------------------------------------------------------------------------
+# P2 Finding 3: Production doctor CLI & MCP get_health(deep=true)
+# ---------------------------------------------------------------------------
+
+
+def test_p2_finding3_doctor_cli_sp2_diagnostics_and_readonly_preservation(trusted_tmp: Path) -> None:
+    """Production doctor CLI & run_doctor report SP2 outbox/gaps/sessions/Layer-2 read-only."""
+    clock = FakeClock(datetime.now(UTC).replace(microsecond=0))
+    mono = FakeMonotonicClock(1_000_000_000)
+    os_ = os_adapters(clock=clock, monotonic=mono)
+    _priv, s_enr = _ssh_signer()
+
+    cfg_dir = trusted_tmp / "cfg"
+    data_root = trusted_tmp / "data"
+    chk_a = trusted_tmp / "chk-doc"
+    outbox_dir = trusted_tmp / "outbox-doc"
+    for d in (cfg_dir, chk_a):
+        d.mkdir(parents=True, exist_ok=True)
+        os_.permissions.secure_directory(d)
+
+    rep = init_entry.init_store(
+        init_entry.InitRequest(
+            data_root=data_root, config_dir=cfg_dir, owner_id=_OWNER, machine_id=_MACHINE, signer=s_enr
+        ),
+        os_,
+    )
+    cfg = read_daemon_config(rep.daemon_config_path, os_)
+    ca_pem = (cfg_dir / "tls" / "ca.pem").read_text(encoding="utf-8")
+
+    prof_path = cfg_dir / "claude-profile.json"
+    _write_plan_targets(chk_a, plan_claude_bootstrap(checkout_root=chk_a, profile_path=prof_path).targets)
+    c_dig1 = compute_harness_config_digest("claude-code", chk_a, os_)
+    assert c_dig1 is not None
+
+    rt = reopen_kernel_job_runtime(data_root, rep.store_id, os_)
+    try:
+        mcp_c = seed_principal_and_credential(rt.policy, owner_id=_OWNER, harness_id="claude-code", machine_id=_MACHINE)
+        cap_c = seed_principal_and_credential(rt.policy, owner_id=_OWNER, harness_id="claude-code", machine_id=_MACHINE)
+        ws_a = register_workspace_direct(rt, clock, mcp_c.principal, alias="ws-doc-prod", checkout_dir=chk_a)
+        rt.store.reconcile_policy()
+        reconcile_harness_layer2_in_policy(
+            rt.policy,
+            harness_id="claude-code",
+            checkout_root=chk_a,
+            observed_host_version=_CLAUDE_VER,
+            os_=os_,
+            receipt=_build_receipt(harness_id="claude-code", host_version=_CLAUDE_VER, config_digest=c_dig1),
+        )
+        SessionStore(rt.store, rt.policy).bind_session(
+            principal_id=mcp_c.principal.principal_id,
+            repo_id=ws_a.repo_id,
+            checkout_id=ws_a.checkout_id,
+            harness_id="claude-code",
+            raw_session_id="RAW_DOC_PROD_SID",
+            now=clock.now(),
+        )
+    finally:
+        rt.close()
+
+    # Seed pending outbox event + open daemon gap via out-of-order capture batch (seq 1, 3 omitting 2).
+    spool = OutboxSpool(outbox_dir, permissions=os_.permissions)
+    spool.enqueue_event(
+        CaptureEventRecord(
+            event_id="ev-doc-pending-1",
+            producer_stream="stream-doc-prod",
+            sequence=2,
+            harness_id="claude-code",
+            kind="tool_post",
+            recorded_at="2026-11-26T14:20:02Z",
+            payload={"pending": True},
+        )
+    )
+    with _serve_daemon(cfg, os_, clock, mono) as (ready, loop):
+        _publish_capture_creds(loop, [(cap_c, "stream-doc-prod", ws_a)])
+        target = LoopbackTarget(
+            endpoint=ready.endpoint,
+            expected_store_id=rep.store_id,
+            ca_pem=ca_pem,
+            leaf_cert_sha256=ready.leaf_cert_sha256,
+        )
+        cap_client = CaptureClient(LoopbackClient(monotonic_ns=mono.monotonic_ns))
+        evs = tuple(
+            CaptureEventRecord(
+                event_id=f"ev-doc-ooo-{seq}",
+                producer_stream="stream-doc-prod",
+                sequence=seq,
+                harness_id="claude-code",
+                kind="tool_post",
+                recorded_at=f"2026-11-26T14:20:0{seq}Z",
+                payload={"seq": seq},
+            ).to_dict()
+            for seq in (1, 3)
+        )
+        ack = cap_client.post_batch(
+            target,
+            CaptureBatchCommand("stream-doc-prod", ws_a.repo_id, ws_a.checkout_id, evs, cap_c.token),
+        )
+        assert ack.accepted_count == 2
+
+    # Mutate checkout config on disk so Layer-2 is drifted.
+    settings_path = chk_a / ".claude" / "settings.local.json"
+    settings_obj = json.loads(settings_path.read_text(encoding="utf-8"))
+    settings_obj["permissions"]["allow"] = ["Bash(pytest *)"]
+    settings_path.write_bytes(canonical_json(settings_obj))
+
+    snap_data = digest_tree(data_root)
+    snap_outbox = digest_tree(outbox_dir)
+    snap_chk = digest_tree(chk_a)
+
+    # Run real isolated doctor CLI.
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-m",
+            "superbrain.cli.main",
+            "doctor",
+            "--config",
+            str(rep.daemon_config_path),
+            "--checkout",
+            str(chk_a),
+            "--json",
+        ],
+        env=clean_installed_subprocess_env(),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=15.0,
+        check=False,
+    )
+    assert proc.returncode == 0, (proc.returncode, proc.stderr)
+    parsed = json.loads(proc.stdout)
+    assert parsed.get("ok") is True, parsed
+    doc_data = parsed["data"]
+
+    # Also test run_doctor directly (passing outbox_dir if supported).
+    sig_params = inspect.signature(run_doctor).parameters
+    if "outbox_dir" in sig_params:
+        direct_report = cast(Any, run_doctor)(
+            rep.daemon_config_path, checkout_root=chk_a, outbox_dir=outbox_dir, os_=os_
+        )
+        doc_data = direct_report.to_dict()
+
+    sp2_view = doc_data.get("sp2") if isinstance(doc_data.get("sp2"), dict) else doc_data
+    assert "gaps" in sp2_view, f"doctor JSON missing SP2 gaps diagnostics: {list(doc_data)}"
+    assert "sessions" in sp2_view, f"doctor JSON missing SP2 sessions diagnostics: {list(doc_data)}"
+    assert "outbox" in sp2_view, f"doctor JSON missing SP2 outbox diagnostics: {list(doc_data)}"
+    assert "terminal_channel_eligible_effective" in sp2_view
+    assert sp2_view["gaps"]["open_daemon_gaps"] >= 1
+    assert sp2_view["sessions"]["total_sessions"] >= 1
+    assert sp2_view["terminal_channel_eligible_effective"] is False
+    assert "RAW_DOC_PROD_SID" not in proc.stdout
+
+    # Strict read-only invariant: zero bytes created, modified, or deleted.
+    assert digest_tree(data_root) == snap_data
+    assert digest_tree(outbox_dir) == snap_outbox
+    assert digest_tree(chk_a) == snap_chk
+
+
+def test_p2_finding3_mcp_get_health_deep_and_shallow_contracts(trusted_tmp: Path) -> None:
+    """MCP get_health(deep=true) returns schema-valid SP2 diagnostics without mutating domain tables."""
+    tpl = get_shared_t7_transport_template()
+    ws_a = tpl.ws_a
+    assert ws_a is not None
+
+    with open_test_loopback_transport(tpl, name="sp25-deep-health", domain=None) as h:
+        def _seed_sp2_state() -> SeededCredential:
+            session = cast(Any, h.loop._session)
+            assert session is not None
+            rt = session._rt
+            cap_c = seed_principal_and_credential(
+                rt.policy, owner_id="dan", harness_id="claude-code", machine_id="m-1"
+            )
+            seed_repo_grant(rt.policy, principal_id=cap_c.principal.principal_id, repo_id=ws_a.repo_id, owner_id="dan")
+            snap = rt.policy.snapshot()
+            merged = dict(snap.credentials)
+            merged[cap_c.credential_id] = replace(
+                merged[cap_c.credential_id],
+                capabilities=frozenset({CAPABILITY_CAPTURE_PRODUCER}),
+                capture_binding=CaptureProducerBinding("stream-deep-health", ws_a.repo_id, ws_a.checkout_id),
+            )
+            session.auth_gate.publish(replace(snap, credentials=merged))
+            SessionStore(rt.store, rt.policy).bind_session(
+                principal_id=h.cred.principal.principal_id,
+                repo_id=ws_a.repo_id,
+                checkout_id=ws_a.checkout_id,
+                harness_id="claude-code",
+                raw_session_id="RAW_DEEP_HEALTH_SID",
+                now=h.clock.now(),
+            )
+            return cap_c
+
+        cap_c = h.loop.run_owner_action(_seed_sp2_state).result(timeout=10.0)
+        target = h.make_target()
+        cap_client = CaptureClient(h.open_client())
+
+        # Create an open daemon CaptureGap (seq 1 and 3, omitting 2).
+        evs = tuple(
+            CaptureEventRecord(
+                event_id=f"ev-dh-{seq}",
+                producer_stream="stream-deep-health",
+                sequence=seq,
+                harness_id="claude-code",
+                kind="tool_post",
+                recorded_at=f"2026-11-26T14:30:0{seq}Z",
+                payload={"seq": seq},
+            ).to_dict()
+            for seq in (1, 3)
+        )
+        assert (
+            cap_client.post_batch(
+                target,
+                CaptureBatchCommand("stream-deep-health", ws_a.repo_id, ws_a.checkout_id, evs, cap_c.token),
+            ).accepted_count
+            == 2
+        )
+
+        def _snapshot_domain_tables() -> dict[str, list[tuple[Any, ...]]]:
+            session = cast(Any, h.loop._session)
+            assert session is not None
+            db = session._rt.store._db
+            pol_db = session._rt.policy._db
+            return {
+                "capture_events": db.execute("SELECT * FROM capture_events ORDER BY event_id").fetchall(),
+                "capture_gaps": db.execute("SELECT * FROM capture_gaps ORDER BY gap_id").fetchall(),
+                "sessions": db.execute("SELECT * FROM sessions ORDER BY session_ref").fetchall(),
+                "task_handoffs": db.execute("SELECT * FROM task_handoffs ORDER BY task_id").fetchall(),
+                "harness_layer2_state": pol_db.execute("SELECT * FROM harness_layer2_state ORDER BY seq").fetchall(),
+            }
+
+        before_tables = h.loop.run_owner_action(_snapshot_domain_tables).result(timeout=10.0)
+
+        # Shallow get_health(deep=False) still succeeds fast without idempotency_key.
+        shallow = h.open_client().call(
+            target,
+            ToolCommand(
+                tool="get_health",
+                arguments={"schema_version": SCHEMA_VERSION, "deep": False},
+                token=tpl.cred.token,
+                selected_scope=None,
+            ),
+        )
+        assert shallow.get("ok") is True, shallow
+        shallow_data = cast(dict[str, Any], shallow["data"])
+        _validate_get_health_schema(shallow_data)
+        assert "capture_gap_present" in shallow_data["degraded_codes"]
+
+        # Deep get_health(deep=True) must succeed (NOT CAPABILITY_UNAVAILABLE) and match GetHealthResult schema.
+        deep = h.open_client().call(
+            target,
+            ToolCommand(
+                tool="get_health",
+                arguments={
+                    "schema_version": SCHEMA_VERSION,
+                    "deep": True,
+                    "idempotency_key": f"idem-deep-health-{new_id()}",
+                },
+                token=tpl.cred.token,
+                selected_scope=None,
+            ),
+        )
+        assert deep.get("ok") is True, deep
+        deep_data = cast(dict[str, Any], deep["data"])
+        _validate_get_health_schema(deep_data)
+        assert deep_data["store_id"] == h.store_id
+        assert deep_data["writer_epoch"] == h.ready.identity.writer_epoch
+        assert deep_data["schema_version"] == 8
+        assert deep_data["policy_schema_version"] == 5
+        assert "capture_gap_present" in deep_data["degraded_codes"]
+        assert any(
+            "layer2" in str(code) or "terminal" in str(code) or "unverified" in str(code)
+            for code in deep_data["degraded_codes"]
+        ), deep_data["degraded_codes"]
+
+        # Domain tables must NOT be mutated by get_health(deep=True).
+        after_tables = h.loop.run_owner_action(_snapshot_domain_tables).result(timeout=10.0)
+        assert after_tables == before_tables

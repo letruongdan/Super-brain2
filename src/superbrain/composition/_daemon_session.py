@@ -8,6 +8,7 @@ from collections.abc import Callable, Mapping
 from concurrent.futures import Future
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from pathlib import Path
 
 from superbrain.application._future_notify import safe_set_result
 from superbrain.application.approvals import OperatorHandle
@@ -80,12 +81,13 @@ class DaemonTestHooks:
     before_runtime_close: Callable[[Runtime], None] | None = None
 
 
-_DEFAULT_HANDOFF_TOOLS: frozenset[str] = frozenset({"prepare_task", "get_artifact", "submit_episode"})
+_DEFAULT_HANDOFF_TOOLS: frozenset[str] = frozenset({"prepare_task", "get_artifact", "submit_episode", "get_health"})
 
 _STORED_REF_TOOL: dict[str, str] = {
     "delivery_result": "prepare_task",
     "artifact_result": "get_artifact",
     "episode_result": "submit_episode",
+    "health_result": "get_health",
 }
 
 
@@ -94,19 +96,63 @@ def build_default_handoff_domain(
     rt: Runtime,
     clock: Clock,
     writer_epoch: int,
+    deep_health: bool = False,
 ) -> KernelToolDomain | None:
-    """Build the production SP2-4 ``HandoffKernelDomain`` when store v8 and policy v5 are admitted."""
+    """Build the production SP2-4/5 ``HandoffKernelDomain`` when store v8 and policy v5 are admitted."""
     if rt.store.schema_version < 8 or rt.policy.schema_version < 5:
         return None
+    from superbrain.application._deep_health import DeepHealthProbeResult
     from superbrain.application.handoff_service import HandoffKernelDomain
+    from superbrain.application.idempotency import is_idempotency_expired
+    from superbrain.composition.doctor_probes_sp2 import run_sp2_doctor_probes
+    from superbrain.core._kernel_approval import Layer2State
     from superbrain.storage.handoffs import HandoffStore
+    from superbrain.storage.idempotency import KernelIdempotencyStore
     from superbrain.storage.send_attempts import KernelSendAttemptStore
+
+    idem_store = (
+        KernelIdempotencyStore(
+            rt.store,
+            rt.policy,
+            policy_view=rt.policy,
+            writer_epoch=writer_epoch,
+            is_expired=is_idempotency_expired,
+        )
+        if deep_health
+        else None
+    )
+
+    def _probe_deep() -> DeepHealthProbeResult:
+        snap = rt.policy.snapshot()
+        chk_paths = [Path(b.checkout_path) for b in snap.checkouts.values()]
+        primary_chk = chk_paths[0] if chk_paths else None
+        sp2 = run_sp2_doctor_probes(rt.root.root, checkout_root=primary_chk, os_=rt.os_, now=clock.now())
+        drifted = any(
+            h.recorded_state is Layer2State.VERIFIED and h.effective_state is not Layer2State.VERIFIED
+            for h in sp2.layer2_harnesses
+        )
+        untrusted = idem_store.clock_untrusted() if idem_store is not None else False
+        return DeepHealthProbeResult(
+            store_id=rt.store.store_id,
+            writer_epoch=writer_epoch,
+            store_schema_version=rt.store.schema_version,
+            policy_schema_version=rt.policy.schema_version,
+            clock_untrusted=untrusted,
+            has_open_gaps=sp2.gaps.open_daemon_gaps > 0 or sp2.gaps.producer_gaps > 0,
+            outbox_pending=sp2.outbox.pending_event_count + sp2.outbox.pending_gap_count,
+            active_sessions=sp2.sessions.active_sessions,
+            layer2_degraded=not sp2.terminal_channel_eligible_effective,
+            layer2_drifted=drifted,
+            probe_errors=sp2.integrity_errors,
+        )
 
     return HandoffKernelDomain(
         handoffs=HandoffStore(rt.store, rt.policy),
         policy=rt.policy,
         clock=clock,
         send_attempts=KernelSendAttemptStore(rt.store, rt.policy, writer_epoch=writer_epoch),
+        deep_health_probe=_probe_deep if deep_health else None,
+        read_blob=rt.store.cas.read if deep_health else None,
     )
 
 
@@ -121,7 +167,7 @@ def make_default_handoff_domain_factory(
         return None
 
     def _build() -> KernelToolDomain | None:
-        return build_default_handoff_domain(rt=rt, clock=clock, writer_epoch=writer_epoch)
+        return build_default_handoff_domain(rt=rt, clock=clock, writer_epoch=writer_epoch, deep_health=True)
 
     return _build
 
@@ -187,7 +233,9 @@ class _DaemonCompositeDomain:
         if self._fallback is not None:
             return self._fallback.supports_tool(tool, deep=deep)
         if self._fallback_factory is not None:
-            return tool in _DEFAULT_HANDOFF_TOOLS and not deep
+            return (tool == "get_health" and deep) or (
+                tool in {"prepare_task", "get_artifact", "submit_episode"} and not deep
+            )
         return False
 
     def execute_readonly(self, call: Call, ctx: CallContext) -> dict[str, JsonValue]:
@@ -209,25 +257,27 @@ class _DaemonCompositeDomain:
         raise BrainError(ErrorCode.CAPABILITY_UNAVAILABLE, "capability unavailable")
 
     def prepare_mutation(self, call: Call, ctx: CallContext, *, now: datetime) -> PreparedEffect:
-        if self._delegate is not None and self._delegate.supports_tool(call.tool, deep=False):
+        deep = call.tool == "get_health" and bool(call.arguments.get("deep"))
+        if self._delegate is not None and self._delegate.supports_tool(call.tool, deep=deep):
             return self._delegate.prepare_mutation(call, ctx, now=now)
         if self._fallback is not None or (
             self._fallback_factory is not None and call.tool in _DEFAULT_HANDOFF_TOOLS
         ):
             fb = self._get_fallback()
-            if fb is not None and fb.supports_tool(call.tool, deep=False):
+            if fb is not None and fb.supports_tool(call.tool, deep=deep):
                 return fb.prepare_mutation(call, ctx, now=now)
         raise BrainError(ErrorCode.CAPABILITY_UNAVAILABLE, "capability unavailable")
 
     def _stored_target(self, result: StoredResult) -> KernelToolDomain | None:
         tool = _STORED_REF_TOOL.get(result.refs[0].kind) if result.refs else None
-        if self._delegate is not None and (tool is None or self._delegate.supports_tool(tool, deep=False)):
+        deep = tool == "get_health"
+        if self._delegate is not None and (tool is None or self._delegate.supports_tool(tool, deep=deep)):
             return self._delegate
         if tool is not None and (
             self._fallback is not None or (self._fallback_factory is not None and tool in _DEFAULT_HANDOFF_TOOLS)
         ):
             fb = self._get_fallback()
-            if fb is not None and fb.supports_tool(tool, deep=False):
+            if fb is not None and fb.supports_tool(tool, deep=deep):
                 return fb
         return self._delegate
 

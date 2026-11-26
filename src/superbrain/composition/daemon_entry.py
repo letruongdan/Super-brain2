@@ -198,15 +198,14 @@ def _open_owner_session(
             elif session_box:
                 session_box[0].record_request_drained()
 
+        from superbrain.composition._layer2_live import reconcile_live_layer2_all
+
+        seen_configured_layer2: set[tuple[str, str]] = set()
         composite_domain = _DaemonCompositeDomain(
             job_service,
             domain,
             fallback_factory=(
-                make_default_handoff_domain_factory(
-                    rt=rt,
-                    clock=resolved_clock,
-                    writer_epoch=rt.lease.epoch,
-                )
+                make_default_handoff_domain_factory(rt=rt, clock=resolved_clock, writer_epoch=rt.lease.epoch)
                 if domain is None
                 else None
             ),
@@ -231,6 +230,8 @@ def _open_owner_session(
             on_owner_finished=_on_owner_finished,
             on_clock_untrusted_changed=auth_gate.update_clock_untrusted,
             on_capture_gaps_changed=auth_gate.update_capture_gaps_present,
+            os_=adapters,
+            seen_configured_layer2=seen_configured_layer2,
         )
         bridge.recover_pending_send_attempts()
 
@@ -344,6 +345,9 @@ def _open_owner_session(
                     expected_endpoint_path=rt.root.endpoint_path,
                     expected_leaf_cert_sha256=verified_tls.leaf_cert_sha256,
                     server_cert_path=verified_tls.cert_path,
+                    live_layer2_check=lambda: reconcile_live_layer2_all(
+                        session.rt.policy, os_=adapters, seen_configured=seen_configured_layer2
+                    ),
                 )
             )
         return session

@@ -115,6 +115,7 @@ def _read_policy_state(
         reset_rec = policy_layer2.signer_reset_recorded(db) if _table_exists(db, "meta") else False
         signers = policy_approvals.active_signers(db) if _table_exists(db, "signer") else ()
         term_ok = policy_layer2.terminal_channel_eligible(db, None) if _table_exists(db, "principal") else False
+        stale_l2_seq = policy_layer2.layer2_stale_through_seq(db) if _table_exists(db, "meta") else 0
 
         harnesses: list[DoctorLayer2HarnessStatus] = []
         if _table_exists(db, "harness_layer2_state"):
@@ -132,7 +133,7 @@ def _read_policy_state(
                 seen.add(str(hid))
             for hid in sorted(seen):
                 latest = db.execute(
-                    "SELECT host_version, config_digest, state, created_at "
+                    "SELECT seq, host_version, config_digest, state, created_at "
                     "FROM harness_layer2_state WHERE harness_id = ? ORDER BY seq DESC LIMIT 1",
                     (hid,),
                 ).fetchone()
@@ -147,13 +148,16 @@ def _read_policy_state(
                         )
                     )
                 else:
+                    l2_state = Layer2State(str(latest[3]))
+                    if l2_state is Layer2State.VERIFIED and int(latest[0]) <= stale_l2_seq:
+                        l2_state = Layer2State.UNKNOWN
                     harnesses.append(
                         DoctorLayer2HarnessStatus(
                             harness_id=hid,
-                            host_version=str(latest[0]),
-                            config_digest=str(latest[1]),
-                            state=Layer2State(str(latest[2])),
-                            created_at=str(latest[3]),
+                            host_version=str(latest[1]),
+                            config_digest=str(latest[2]),
+                            state=l2_state,
+                            created_at=str(latest[4]),
                         )
                     )
 

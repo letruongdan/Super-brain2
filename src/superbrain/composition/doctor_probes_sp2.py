@@ -24,6 +24,7 @@ from superbrain.core.jsonvalue import JsonValue
 from superbrain.ports.capture import OUTBOX_RECORD_EVENT, OUTBOX_RECORD_GAP
 from superbrain.ports.continuity import SessionState, decide_session_liveness
 from superbrain.ports.os import OsAdapters
+from superbrain.storage import _policy_layer2 as policy_layer2
 from superbrain.storage._outbox_io import (
     _PART_SUFFIX,
     _REPARSE_POINT,
@@ -294,17 +295,19 @@ def probe_sp2_layer2_readonly(
                 active_non_cli.add(str(hid))
                 seen.add(str(hid))
         if _table_exists(db, "harness_layer2_state"):
+            stale_seq = policy_layer2.layer2_stale_through_seq(db)
             for (hid,) in db.execute("SELECT DISTINCT harness_id FROM harness_layer2_state").fetchall():
                 seen.add(str(hid))
             for hid in sorted(seen):
                 row = db.execute(
-                    "SELECT host_version, config_digest, state FROM harness_layer2_state "
+                    "SELECT seq, host_version, config_digest, state FROM harness_layer2_state "
                     "WHERE harness_id = ? ORDER BY seq DESC LIMIT 1",
                     (hid,),
                 ).fetchone()
-                rec_ver = None if row is None else str(row[0])
-                rec_dig = None if row is None else str(row[1])
-                rec_state = Layer2State.UNKNOWN if row is None else Layer2State(str(row[2]))
+                row_seq = 0 if row is None else int(row[0])
+                rec_ver = None if row is None else str(row[1])
+                rec_dig = None if row is None else str(row[2])
+                rec_state = Layer2State.UNKNOWN if row is None else Layer2State(str(row[3]))
                 obs_ver = observed_host_versions.get(hid)
                 obs_dig = (
                     compute_harness_config_digest(hid, checkout_root, os_)
@@ -320,6 +323,9 @@ def probe_sp2_layer2_readonly(
                     elif checkout_root is not None and obs_dig != rec_dig:
                         eff_state = Layer2State.UNKNOWN
                         inv_reason = "config_digest_changed"
+                    elif row_seq <= stale_seq:
+                        eff_state = Layer2State.UNKNOWN
+                        inv_reason = "policy_restored"
                 probes.append(
                     Sp2Layer2HarnessProbe(
                         harness_id=hid,

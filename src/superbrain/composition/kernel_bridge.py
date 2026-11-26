@@ -6,6 +6,7 @@ from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
 from typing import Protocol, TypeVar, cast
 
+from superbrain.adapters.os import os_adapters
 from superbrain.adapters.os.clock import SystemMonotonicClock
 from superbrain.application.capture_ingest import CaptureBatchAck, CaptureIngestService
 from superbrain.application.deadlines import (
@@ -19,7 +20,7 @@ from superbrain.application.deadlines import (
 from superbrain.application.dispatch import KernelDispatcher, KernelToolDomain
 from superbrain.application.idempotency import is_idempotency_expired
 from superbrain.application.privacy import PrivacyFilter
-from superbrain.core._kernel_approval import Layer2State
+from superbrain.composition._layer2_live import make_live_layer2_lookup
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.ids import new_id
 from superbrain.core.jsonvalue import JsonValue
@@ -48,6 +49,7 @@ from superbrain.core.kernel import (
 from superbrain.core.wire import encode_envelope, make_error_envelope
 from superbrain.ports.clock import Clock, MonotonicClock
 from superbrain.ports.kernel import KernelBlobStagePort, KernelStorePort, RequestAuthStatePort
+from superbrain.ports.os import OsAdapters
 from superbrain.ports.policy import Intent, IntentKind
 from superbrain.storage._pair_admission import verify_admitted_store_pair
 from superbrain.storage.capture_events import KernelCaptureStore
@@ -124,6 +126,9 @@ class KernelBridge(KernelBlobStagePort):
         on_owner_finished: Callable[[Reservation, bool], None] | None = None,
         on_clock_untrusted_changed: Callable[[bool], None] | None = None,
         on_capture_gaps_changed: Callable[[bool], None] | None = None,
+        os_: OsAdapters | None = None,
+        host_version_resolver: Callable[[str], str | None] | None = None,
+        seen_configured_layer2: set[tuple[str, str]] | None = None,
     ) -> None:
         if not isinstance(recover_pending_on_init, bool):
             raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
@@ -159,6 +164,9 @@ class KernelBridge(KernelBlobStagePort):
         self._on_owner_reply_ready = on_owner_reply_ready
         self._on_clock_untrusted_changed = on_clock_untrusted_changed
         self._on_capture_gaps_changed = on_capture_gaps_changed
+        self._os = os_ if os_ is not None else os_adapters(clock=clock, monotonic=resolved_mono)
+        self._host_version_resolver = host_version_resolver
+        self._seen_l2: set[tuple[str, str]] = set() if seen_configured_layer2 is None else seen_configured_layer2
         self.on_continuity_tasks: Callable[[tuple[str, ...]], None] | None = None  # owner thread
         self._wire_stores(store, policy, writer_epoch)
         if recover_pending_on_init:
@@ -526,12 +534,6 @@ class KernelBridge(KernelBlobStagePort):
         self._check_live_pair()
         return self._capture_store.has_gaps()
 
-    def _verified_layer2_tuple(self, harness_id: str) -> tuple[str, str] | None:
-        latest = self._policy.layer2_state(harness_id)
-        if latest is None or latest[3] is not Layer2State.VERIFIED:
-            return None
-        return (latest[1], latest[2])
-
     def ingest_capture_batch(self, command: CaptureBatchCommand, *, deadline_ns: int | None = None) -> CaptureBatchAck:
         """Authorize, privacy-filter, attribute, and commit one ``POST /v2/capture/events`` batch."""
         self._check_live_pair()
@@ -569,8 +571,18 @@ class KernelBridge(KernelBlobStagePort):
                 self._store, self._policy, principal_id=live_p.principal_id, repo_id=command.repo_id,
                 checkout_id=command.checkout_id, now=self._clock.now(),
             ) if repo_pol.automatic_capture_enabled else (None, None, [])
+            layer2_lookup = make_live_layer2_lookup(
+                self._policy,
+                events=command.events,
+                harness_id=live_p.harness_id,
+                repo_id=command.repo_id,
+                checkout_id=command.checkout_id,
+                os_=self._os,
+                host_version_resolver=self._host_version_resolver,
+                seen_configured=self._seen_l2,
+            )
             ack = self._capture_ingest.ingest_batch(
-                command, principal=live_p, repo_policy=repo_pol, layer2_lookup=self._verified_layer2_tuple,
+                command, principal=live_p, repo_policy=repo_pol, layer2_lookup=layer2_lookup,
                 deadline_ns=deadline_ns, before_commit=bind_fn, on_event_committed_in_tx=link_fn,
             )
             if touched and self.on_continuity_tasks is not None:

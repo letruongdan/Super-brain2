@@ -399,6 +399,8 @@ class DaemonRestoreHandler(RestoreHandler):
             self._session.auth_gate.invalidate()
         svc = self._operator.service()
         if svc is not None:
+            from superbrain.composition._layer2_live import reconcile_live_layer2_all
+
             svc.rebind_authorities(
                 rt.policy,
                 build_review_apply_service(
@@ -407,6 +409,10 @@ class DaemonRestoreHandler(RestoreHandler):
                     rt.root.root,
                     self._adapters,
                     service_cls=self._review_apply_cls,
+                ),
+                live_layer2_check=lambda: reconcile_live_layer2_all(
+                    self._session.rt.policy,
+                    os_=self._adapters,
                 ),
             )
         return job_service

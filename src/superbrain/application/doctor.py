@@ -68,9 +68,10 @@ class DoctorReport:
     active_turn_intents: tuple[DoctorTurnIntentInfo, ...] = ()
     incomplete_journals: tuple[DoctorJournalInfo, ...] = ()
     permission_problems: tuple[str, ...] = ()
+    sp2: dict[str, JsonValue] | None = None
 
     def to_dict(self) -> dict[str, JsonValue]:
-        return {
+        out: dict[str, JsonValue] = {
             "overall_status": self.overall_status,
             "data_root": self.data_root,
             "store_id": self.store_id,
@@ -167,6 +168,12 @@ class DoctorReport:
             ],
             "permission_problems": list(self.permission_problems),
         }
+        if self.sp2 is not None:
+            out["sp2"] = dict(self.sp2)
+            for key in ("outbox", "gaps", "sessions", "terminal_channel_eligible_effective"):
+                if key in self.sp2 and key not in out:
+                    out[key] = self.sp2[key]
+        return out
 
 
 def inspect_doctor_snapshot(snapshot: DoctorSnapshot) -> DoctorReport:

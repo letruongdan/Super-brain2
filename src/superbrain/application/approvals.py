@@ -89,6 +89,7 @@ class OperatorService:
         review_apply: ReviewApplyService | None = None,
         restore_handler: RestoreHandler | None = None,
         bootstrap_handler: BootstrapProposalHandler | None = None,
+        live_layer2_check: Callable[[], None] | None = None,
     ) -> None:
         self._policy = policy
         self._ssh_verifier = ssh_verifier
@@ -96,11 +97,24 @@ class OperatorService:
         self._review_apply = review_apply
         self._restore_handler = restore_handler
         self._bootstrap_handler = bootstrap_handler
+        self._live_layer2_check = live_layer2_check
 
-    def rebind_authorities(self, policy: ApprovalPolicyPort, review_apply: ReviewApplyService | None) -> None:
+    def rebind_authorities(
+        self,
+        policy: ApprovalPolicyPort,
+        review_apply: ReviewApplyService | None,
+        *,
+        live_layer2_check: Callable[[], None] | None = None,
+    ) -> None:
         """Update the live policy authority and review-apply service after an online restore."""
         self._policy = policy
         self._review_apply = review_apply
+        if live_layer2_check is not None:
+            self._live_layer2_check = live_layer2_check
+
+    def _refresh_live_layer2(self) -> None:
+        if self._live_layer2_check is not None:
+            self._live_layer2_check()
 
     def handle(
         self,
@@ -215,6 +229,8 @@ class OperatorService:
     def commit_call(self, pending: PendingApprovalCall, *, new_sign_count: int | None) -> dict[str, JsonValue]:
         """Phase 3 (owner thread): re-verify live caller credential and commit mutation + ``sign_count`` atomically."""
         self._verify_caller(pending.principal, pending.token)
+        if pending.channel is ApprovalChannel.TERMINAL:
+            self._refresh_live_layer2()
         signer_id = pending.signer.signer_id if pending.signer is not None else None
         if pending.enrollment is not None:
             record = self._policy.enroll_signer(
@@ -329,6 +345,7 @@ class OperatorService:
         enrollment = SignerEnrollment(
             owner_id=principal.owner_id, channel=parsed, public_key=key, credential_id=credential
         )
+        self._refresh_live_layer2()
         if "approval" not in body:
             return PreparedOperatorCall(immediate=self._challenge(ApprovalAction.SIGNER_ENROLL, enrollment.subject_id))
         message, channel_used, signer, raw_approval = self._parse_approval(principal, body["approval"])
@@ -352,6 +369,7 @@ class OperatorService:
         if not set(body) <= {"signer_id", "approval"} or not isinstance(body.get("signer_id"), str):
             raise _invalid()
         target = str(body["signer_id"])
+        self._refresh_live_layer2()
         if "approval" not in body:
             return PreparedOperatorCall(immediate=self._challenge(ApprovalAction.SIGNER_REVOKE, target))
         message, channel_used, signer, raw_approval = self._parse_approval(principal, body["approval"])
@@ -384,6 +402,7 @@ class OperatorService:
         if prop.owner_id != principal.owner_id:
             raise BrainError(ErrorCode.NOT_FOUND, "not found")
         action = _PROPOSAL_PATH_ACTIONS[path]
+        self._refresh_live_layer2()
         if "approval" not in body:
             return prepare_proposal_challenge(self._policy, self._review_apply, prop, action=action, body=body)
         message, channel_used, signer, raw_approval = self._parse_approval(principal, body["approval"])

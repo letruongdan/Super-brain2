@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import stat
+import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -241,14 +243,50 @@ def _guidance_body(profile_path: Path) -> str:
     return f"{LAYER1_RULE_TEXT}\n\n{HANDOFF_RULE_TEXT}\n\nProfile: {profile_path}"
 
 
-def _nonblocking_hooks_payload(profile_path: Path) -> dict[str, JsonValue]:
+def _checkout_capture_paths(
+    harness_id: str,
+    checkout_root: Path,
+    profile_path: Path,
+) -> tuple[Path, Path]:
+    chk_tag = hashlib.sha256(f"{harness_id}:{checkout_root}".encode()).hexdigest()[:12]
+    base = profile_path.parent
+    return (
+        base / "capture-outbox" / f"{harness_id}-{chk_tag}",
+        base / "capture-logs" / f"{harness_id}-{chk_tag}.log",
+    )
+
+
+def _nonblocking_hooks_payload(
+    profile_path: Path,
+    *,
+    harness_id: str,
+    checkout_root: Path,
+    outbox_dir: Path | None = None,
+    log_path: Path | None = None,
+    python_executable: str | None = None,
+) -> dict[str, JsonValue]:
     ask_cmds: list[JsonValue] = list(AUTHORITY_ASK_COMMANDS)
+    default_outbox, default_log = _checkout_capture_paths(harness_id, checkout_root, profile_path)
+    resolved_outbox = outbox_dir if outbox_dir is not None else default_outbox
+    resolved_log = log_path if log_path is not None else default_log
+    py_exe = python_executable or sys.executable or "python"
+    hook_cmd = build_capture_hook_command(
+        harness_id,
+        outbox_dir=resolved_outbox,
+        log_path=resolved_log,
+        python_executable=py_exe,
+        checkout_root=checkout_root,
+        profile_path=profile_path,
+    )
     return {
         "super_brain": {
             "mode": "remind",
             "non_blocking": True,
             "profile": str(profile_path),
             "authority_ask_commands": ask_cmds,
+            "outbox_dir": str(resolved_outbox),
+            "log_path": str(resolved_log),
+            "command": list(hook_cmd),
         }
     }
 
@@ -283,7 +321,9 @@ def plan_claude_bootstrap(
         expected_slice_digest=_expected_digest(expected_slice_digests, "CLAUDE.md", "super-brain-layer1"),
     )
     ask_rules = [f"Bash({cmd} *)" for cmd in AUTHORITY_ASK_COMMANDS]
-    hooks_val = _nonblocking_hooks_payload(profile_path)
+    hooks_val = _nonblocking_hooks_payload(
+        profile_path, harness_id="claude-code", checkout_root=checkout_root
+    )
     settings_existing = _read_existing(checkout_root, ".claude", "settings.local.json")
     settings_merge = merge_json_multi_keys(
         settings_existing,
@@ -347,7 +387,7 @@ def plan_codex_bootstrap(
     hooks_merge = merge_json_keys(
         _read_existing(checkout_root, ".codex", "hooks.json"),
         key_path=("hooks", "PreToolUse"),
-        value=_nonblocking_hooks_payload(profile_path),
+        value=_nonblocking_hooks_payload(profile_path, harness_id="codex", checkout_root=checkout_root),
         expected_slice_digest=_expected_digest(expected_slice_digests, ".codex/hooks.json", "hooks.PreToolUse"),
     )
     return BootstrapPlan(
@@ -387,6 +427,8 @@ def build_capture_hook_command(
     outbox_dir: Path,
     log_path: Path | None = None,
     python_executable: str = "python",
+    checkout_root: Path | None = None,
+    profile_path: Path | None = None,
 ) -> tuple[str, ...]:
     """Build bounded isolated CLI args invoking ``superbrain.composition.hook_entry``."""
     if harness_id not in {"claude-code", "codex"}:
@@ -403,6 +445,10 @@ def build_capture_hook_command(
         "--harness",
         harness_id,
     ]
+    if checkout_root is not None:
+        args.extend(["--checkout", str(checkout_root)])
+    if profile_path is not None:
+        args.extend(["--profile", str(profile_path)])
     if log_path is not None:
         args.extend(["--log", str(log_path)])
     return tuple(args)

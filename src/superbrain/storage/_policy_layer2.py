@@ -23,6 +23,7 @@ from superbrain.storage.kinds import is_uuid
 from superbrain.storage.ledger import utc_timestamp
 
 SIGNER_RESET_META_KEY = "signer_reset_recorded"
+LAYER2_STALE_THROUGH_SEQ_KEY = "layer2_stale_through_seq"
 _GRANT_ACTIONS = frozenset({ApprovalAction.APPLY.value, ApprovalAction.ROLLBACK.value})
 _GRANT_COLUMNS = "grant_id, approval_id, journal_id, subject_id, recovery_scope, trust_generation, state, end_reason"
 
@@ -60,6 +61,43 @@ def set_layer2_state(
     return intent
 
 
+def _stale_through_seq(db: sqlite3.Connection) -> int:
+    has_meta = db.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'").fetchone()
+    if has_meta is None:
+        return 0
+    row = db.execute("SELECT value FROM meta WHERE key = ?", (LAYER2_STALE_THROUGH_SEQ_KEY,)).fetchone()
+    if row is None or not isinstance(row[0], str):
+        return 0
+    try:
+        val = int(row[0])
+    except ValueError as err:
+        raise _integrity("layer2_stale_through_seq") from err
+    if val < 0:
+        raise _integrity("layer2_stale_through_seq")
+    return val
+
+
+def layer2_stale_through_seq(db: sqlite3.Connection) -> int:
+    """Return the highest ``harness_layer2_state.seq`` invalidated by ``restore_policy`` (0 if none)."""
+    return _stale_through_seq(db)
+
+
+def mark_restored_layer2_stale(db: sqlite3.Connection) -> None:
+    """Invalidate any pre-restore ``VERIFIED`` rows in restored ``policy.db`` until re-verified."""
+    has_l2 = db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'harness_layer2_state'"
+    ).fetchone()
+    has_meta = db.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'").fetchone()
+    if has_l2 is None or has_meta is None:
+        return
+    row = db.execute("SELECT COALESCE(MAX(seq), 0) FROM harness_layer2_state").fetchone()
+    max_seq = int(row[0]) if row is not None and row[0] is not None else 0
+    db.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+        (LAYER2_STALE_THROUGH_SEQ_KEY, str(max_seq)),
+    )
+
+
 def read_latest_layer2_state(
     db: sqlite3.Connection, *, harness_id: str
 ) -> tuple[str, str, str, Layer2State] | None:
@@ -67,19 +105,21 @@ def read_latest_layer2_state(
     if not isinstance(harness_id, str) or not OPAQUE_ID_RE.fullmatch(harness_id):
         raise _invalid()
     row = db.execute(
-        "SELECT host_version, config_digest, state FROM harness_layer2_state "
+        "SELECT seq, host_version, config_digest, state FROM harness_layer2_state "
         "WHERE harness_id = ? ORDER BY seq DESC LIMIT 1",
         (harness_id,),
     ).fetchone()
     if row is None:
         return None
-    host_ver, cfg_dig, state_raw = row
+    row_seq, host_ver, cfg_dig, state_raw = row
     if not isinstance(host_ver, str) or not isinstance(cfg_dig, str) or not isinstance(state_raw, str):
         raise _integrity("harness_layer2_state row")
     try:
         state_val = Layer2State(state_raw)
     except ValueError as err:
         raise _integrity("harness_layer2_state state") from err
+    if state_val is Layer2State.VERIFIED and int(str(row_seq)) <= _stale_through_seq(db):
+        state_val = Layer2State.UNKNOWN
     return (harness_id, host_ver, cfg_dig, state_val)
 
 
@@ -209,11 +249,13 @@ def terminal_channel_eligible(db: sqlite3.Connection, machine_id: str | None) ->
     harnesses = [str(row[0]) for row in rows]
     if not harnesses:
         return False
+    stale_seq = _stale_through_seq(db)
     for harness_id in harnesses:
         current = db.execute(
-            "SELECT state FROM harness_layer2_state WHERE harness_id = ? ORDER BY seq DESC LIMIT 1", (harness_id,)
+            "SELECT seq, state FROM harness_layer2_state WHERE harness_id = ? ORDER BY seq DESC LIMIT 1",
+            (harness_id,),
         ).fetchone()
-        if current is None or current[0] != Layer2State.VERIFIED.value:
+        if current is None or current[1] != Layer2State.VERIFIED.value or int(current[0]) <= stale_seq:
             return False
     return True
 

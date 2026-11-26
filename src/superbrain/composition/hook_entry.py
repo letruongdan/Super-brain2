@@ -75,6 +75,10 @@ def run_hook(
     cap_ns: int = HOOK_HARD_CAP_NS,
     default_harness_id: str | None = None,
     raw_session_id: str | None = None,
+    checkout_root: Path | None = None,
+    profile_path: Path | None = None,
+    producer_stream: str | None = None,
+    sequence: int | None = None,
 ) -> int:
     """Validate, privacy-filter, and durably enqueue a capture record; always returns ``0``."""
     start_ns = int(monotonic_ns())
@@ -85,6 +89,7 @@ def run_hook(
     reserve_ns = min(max(1, cap_ns // 10), 50_000_000)
     work_deadline_ns = start_ns + max(1, cap_ns - reserve_ns)
     normalized: CaptureEventRecord | ProducerCaptureGap | None = None
+    effective_raw_sid = raw_session_id
     try:
         if not isinstance(raw_bytes, bytes) or len(raw_bytes) > _MAX_STDIN_BYTES:
             raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
@@ -95,7 +100,31 @@ def run_hook(
             parsed: JsonValue = json.loads(text)
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as err:
             raise BrainError(ErrorCode.INVALID_INPUT, "invalid input") from err
-        normalized = normalize_capture_record(parsed, default_harness_id=default_harness_id)
+        is_native = isinstance(parsed, dict) and (
+            checkout_root is not None
+            or profile_path is not None
+            or any(k in parsed for k in ("event_name", "hook_event_name", "event_type", "transcript_path"))
+        )
+        if is_native:
+            assert isinstance(parsed, dict)
+            from superbrain.composition._hook_adapter_bridge import adapt_native_hook_payload
+
+            adapted, effective_raw_sid, skip_code = adapt_native_hook_payload(
+                parsed,
+                os_=os_adapters(),
+                default_harness_id=default_harness_id,
+                checkout_root=checkout_root,
+                profile_path=profile_path,
+                producer_stream=producer_stream,
+                sequence=sequence,
+                raw_session_id=raw_session_id,
+            )
+            if adapted is None:
+                _write_static_log(log_path, phase="hook_adapter", code=skip_code or "unavailable")
+                return 0
+            normalized = adapted
+        else:
+            normalized = normalize_capture_record(parsed, default_harness_id=default_harness_id)
         if int(monotonic_ns()) >= work_deadline_ns:
             raise BrainError(ErrorCode.DEADLINE_EXCEEDED, "deadline exceeded")
 
@@ -103,7 +132,7 @@ def run_hook(
         if isinstance(normalized, ProducerCaptureGap):
             validated_gap = gate.validate_gap(
                 normalized,
-                raw_session_id=raw_session_id,
+                raw_session_id=effective_raw_sid,
                 deadline_ns=work_deadline_ns,
             )
             spool = _make_spool(outbox_dir, spool_factory)
@@ -112,7 +141,7 @@ def run_hook(
 
         sanitized = gate.sanitize_event(
             normalized,
-            raw_session_id=raw_session_id,
+            raw_session_id=effective_raw_sid,
             deadline_ns=work_deadline_ns,
         )
         spool = _make_spool(outbox_dir, spool_factory)
@@ -120,10 +149,10 @@ def run_hook(
         return 0
     except BrainError as err:
         _write_static_log(log_path, phase="hook", code=err.code.value)
-        raw_ok = raw_session_id is None or (
-            isinstance(raw_session_id, str)
+        raw_ok = effective_raw_sid is None or (
+            isinstance(effective_raw_sid, str)
             and isinstance(normalized, CaptureEventRecord)
-            and raw_session_id not in normalized.producer_stream
+            and effective_raw_sid not in normalized.producer_stream
         )
         cur_ns = int(monotonic_ns())
         if (
@@ -163,6 +192,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--outbox", required=True, type=Path, help="Local outbox spool directory")
     parser.add_argument("--log", default=None, type=Path, help="Optional static diagnostic log file")
     parser.add_argument("--harness", default=None, help="Default harness_id when omitted by stdin payload")
+    parser.add_argument("--checkout", default=None, type=Path, help="Pinned checkout root for adapter verification")
+    parser.add_argument("--profile", default=None, type=Path, help="Pinned harness ClientProfile JSON path")
+    parser.add_argument("--producer-stream", default=None, help="Optional default producer_stream")
+    parser.add_argument("--sequence", default=None, type=int, help="Optional sequence number when omitted")
     start_ns = time.monotonic_ns()
     args = parser.parse_args(list(argv) if argv is not None else None)
     done = threading.Event()
@@ -184,6 +217,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 outbox_dir=args.outbox,
                 log_path=args.log,
                 default_harness_id=args.harness,
+                checkout_root=args.checkout,
+                profile_path=args.profile,
+                producer_stream=args.producer_stream,
+                sequence=args.sequence,
                 cap_ns=remaining_ns,
             )
         finally:
