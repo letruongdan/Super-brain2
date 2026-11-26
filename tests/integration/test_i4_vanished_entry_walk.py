@@ -91,29 +91,37 @@ def _remove(path: Path) -> Callable[[], None]:
 
 def _deny() -> Callable[[], None]:
     def _do() -> None:
-        raise pywintypes.error(ERROR_ACCESS_DENIED, "GetNamedSecurityInfo", "Access is denied.")
+        if sys.platform == "win32":  # Windows-only module: a platform block lets mypy check this file on every platform
+            raise pywintypes.error(ERROR_ACCESS_DENIED, "GetNamedSecurityInfo", "Access is denied.")
+        raise AssertionError("Windows-only helper")
 
     return _do
 
 
 def _patch_get_security(monkeypatch: pytest.MonkeyPatch, trigger: _Trigger) -> None:
-    real = win32security.GetNamedSecurityInfo
+    if sys.platform != "win32":  # Windows-only module: a platform block lets mypy check this file on every platform
+        raise AssertionError("Windows-only helper")
+    else:
+        real = win32security.GetNamedSecurityInfo
 
-    def wrapper(path: Any, *args: Any) -> Any:
-        trigger.maybe_fire(path)
-        return real(path, *args)
+        def wrapper(path: Any, *args: Any) -> Any:
+            trigger.maybe_fire(path)
+            return real(path, *args)
 
-    monkeypatch.setattr(win32security, "GetNamedSecurityInfo", wrapper)
+        monkeypatch.setattr(win32security, "GetNamedSecurityInfo", wrapper)
 
 
 def _patch_set_security(monkeypatch: pytest.MonkeyPatch, trigger: _Trigger) -> None:
-    real = win32security.SetNamedSecurityInfo
+    if sys.platform != "win32":  # Windows-only module: a platform block lets mypy check this file on every platform
+        raise AssertionError("Windows-only helper")
+    else:
+        real = win32security.SetNamedSecurityInfo
 
-    def wrapper(path: Any, *args: Any) -> Any:
-        trigger.maybe_fire(path)
-        return real(path, *args)
+        def wrapper(path: Any, *args: Any) -> Any:
+            trigger.maybe_fire(path)
+            return real(path, *args)
 
-    monkeypatch.setattr(win32security, "SetNamedSecurityInfo", wrapper)
+        monkeypatch.setattr(win32security, "SetNamedSecurityInfo", wrapper)
 
 
 def _patch_scandir(monkeypatch: pytest.MonkeyPatch, trigger: _Trigger) -> None:
@@ -474,7 +482,9 @@ def _not_found_then_deny_lookup(deny: _DenyLstat, kind: str, path: Path) -> Call
     def _do() -> None:
         deny.armed = True
         if kind == "acl":
-            raise pywintypes.error(2, "GetNamedSecurityInfo", "The system cannot find the file specified.")
+            if sys.platform == "win32":  # Windows-only module (mypy platform block)
+                raise pywintypes.error(2, "GetNamedSecurityInfo", "The system cannot find the file specified.")
+            raise AssertionError("Windows-only helper")
         raise FileNotFoundError(2, "The system cannot find the path specified", os.fspath(path))
 
     return _do

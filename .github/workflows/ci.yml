@@ -137,7 +137,7 @@ jobs:
           if-no-files-found: error
 
   gate-windows-worker:
-    name: gate-worker (windows-2022, python ${{ matrix.python }}, part ${{ matrix.partition }}/2)
+    name: gate-worker (windows-2022, python ${{ matrix.python }}, part ${{ matrix.partition }}/4)
     runs-on: windows-2022
     timeout-minutes: 15
     env:
@@ -148,7 +148,7 @@ jobs:
       fail-fast: false
       matrix:
         python: ["3.11", "3.14"]
-        partition: ["0", "1"]
+        partition: ["0", "1", "2", "3"]
 
     steps:
       - uses: actions/checkout@v4
@@ -192,7 +192,7 @@ jobs:
         shell: bash
         run: uv sync --locked --python ${{ matrix.python }}
 
-      - name: Run partitioned worker gate (${{ matrix.partition }}/2)
+      - name: Run partitioned worker gate (${{ matrix.partition }}/4)
         shell: bash
         run: |
           ev="${{ runner.temp }}/gate-evidence"
@@ -200,7 +200,7 @@ jobs:
           out="${{ runner.temp }}/gate.stdout.log"
           err="${{ runner.temp }}/gate.stderr.log"
           set +e
-          uv run --locked --python ${{ matrix.python }} python scripts/gate.py --python ${{ matrix.python }} --partition ${{ matrix.partition }}/2 --evidence-dir "$ev" > "$out" 2> "$err"
+          uv run --locked --python ${{ matrix.python }} python scripts/gate.py --python ${{ matrix.python }} --partition ${{ matrix.partition }}/4 --evidence-dir "$ev" > "$out" 2> "$err"
           code=$?
           [ -f "$out" ] && cat "$out"
           [ -f "$err" ] && cat "$err" >&2
@@ -305,6 +305,20 @@ jobs:
           name: gate-worker-windows-${{ matrix.python }}-part-1
           path: ${{ runner.temp }}/agg-workers-${{ matrix.python }}/part-1
 
+      - name: Download worker partition 2 evidence
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: gate-worker-windows-${{ matrix.python }}-part-2
+          path: ${{ runner.temp }}/agg-workers-${{ matrix.python }}/part-2
+
+      - name: Download worker partition 3 evidence
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: gate-worker-windows-${{ matrix.python }}-part-3
+          path: ${{ runner.temp }}/agg-workers-${{ matrix.python }}/part-3
+
       - name: Run aggregate receipt validation
         shell: bash
         run: |
@@ -314,7 +328,7 @@ jobs:
           out="${{ runner.temp }}/gate-agg.stdout.log"
           err="${{ runner.temp }}/gate-agg.stderr.log"
           set +e
-          uv run --locked --python ${{ matrix.python }} python scripts/gate.py aggregate --python ${{ matrix.python }} --partition-count 2 --workers-dir "$workers" --expected-commit "${{ github.sha }}" --evidence-dir "$ev" > "$out" 2> "$err"
+          uv run --locked --python ${{ matrix.python }} python scripts/gate.py aggregate --python ${{ matrix.python }} --partition-count 4 --workers-dir "$workers" --expected-commit "${{ github.sha }}" --evidence-dir "$ev" > "$out" 2> "$err"
           code=$?
           [ -f "$out" ] && cat "$out"
           [ -f "$err" ] && cat "$err" >&2
