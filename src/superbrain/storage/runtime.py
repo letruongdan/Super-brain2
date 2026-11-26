@@ -28,6 +28,7 @@ from superbrain.storage.kinds import KindRegistry
 from superbrain.storage.layout import (
     DataRoot,
     check_endpoint_entries_under_lease,
+    ensure_private_directory_tree,
     prepare_data_root,
     secure_subdirectories,
     verify_existing_data_root,
@@ -285,44 +286,12 @@ def _ensure_scratch_base(base: Path, root: Path, os_: OsAdapters) -> None:
     os_.paths.reject_unsafe_path(str(base))
     if base == root or root in base.parents or base in root.parents:
         raise BrainError(ErrorCode.UNSAFE_PATH, "pre-admission scratch directory must be outside data_root")
-    os_.paths.reject_links(base)
-    anc = os_.permissions.check_ancestors(base)
-    if anc:
-        raise BrainError(ErrorCode.INSECURE_PERMISSIONS, f"scratch ancestor is not trusted: {anc[0].path}")
-
-    missing: list[Path] = []
-    for candidate in (base, *base.parents):
-        if os.path.lexists(candidate):
-            break
-        missing.append(candidate)
-    else:
-        raise BrainError(ErrorCode.IO_ERROR, f"no existing directory ancestor is available for {base}")
-
-    for directory in reversed(missing):
-        try:
-            directory.mkdir(mode=0o700)
-        except FileExistsError:
-            os_.paths.reject_links(directory)
-            if not directory.is_dir():
-                raise BrainError(ErrorCode.INVALID_INPUT, f"scratch base {directory} is not a directory") from None
-            if os_.permissions.object_problems(directory):
-                raise BrainError(
-                    ErrorCode.INSECURE_PERMISSIONS, f"scratch base {directory} is not owner-only"
-                ) from None
-        except OSError as exc:
-            raise os_error(f"cannot create scratch base {directory}", exc) from exc
-        else:
-            os_.paths.reject_links(directory)
-            os_.permissions.secure_directory(directory)
-
-    os_.paths.reject_links(base)
-    anc = os_.permissions.check_ancestors(base)
-    if anc:
-        raise BrainError(ErrorCode.INSECURE_PERMISSIONS, f"scratch ancestor is not trusted: {anc[0].path}")
-    if not base.is_dir():
-        raise BrainError(ErrorCode.INVALID_INPUT, f"scratch base {base} is not a directory")
-    if os_.permissions.object_problems(base):
-        raise BrainError(ErrorCode.INSECURE_PERMISSIONS, f"scratch base {base} is not owner-only")
+    ensure_private_directory_tree(
+        base,
+        os_,
+        label="scratch base",
+        ancestor_label="scratch ancestor is not trusted",
+    )
 
 
 @contextlib.contextmanager

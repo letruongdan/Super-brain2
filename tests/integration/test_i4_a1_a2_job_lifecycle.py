@@ -1161,7 +1161,7 @@ def test_p2_8_continuing_maintenance_failures_do_not_starve_due_lease_reconcilia
             runner.step(allow_new_jobs=True)
             assert reconcile_attempts[0] >= 1 and _durable(env, ctrl_job_id) == ("succeeded", 1, None)
 
-            # Fault phase: continuing maintenance STORE_BUSY across 4 due turns alongside lost lease ACK.
+            # Fault phase: continuing maintenance STORE_BUSY across continuing retry windows alongside lost lease ACK.
             reconcile_attempts[0] = 0
             env.clock.advance(timedelta(hours=24, seconds=1))
             target_job_id = _enqueue_offline_doctor_job(job_store, env, tag="p2-8-starved")
@@ -1172,7 +1172,19 @@ def test_p2_8_continuing_maintenance_failures_do_not_starve_due_lease_reconcilia
             assert fired.is_set(), "precondition: lost lease ACK on target job must fire"
             assert _durable(env, target_job_id) == ("leased", 1, None)
 
-            for _turn in range(4):
+            # Drive earliest due retry turns up to BOUND_WAIT_S. _claim_retry and _maint_retry arm independent
+            # deadlines, so a next_retry_wait_s() wakeup for _claim_retry may fire between maintenance backoff windows;
+            # verify BOTH that due lease reconciliation succeeds AND that maintenance continues retrying across windows.
+            reconcile_deadline = time.monotonic() + BOUND_WAIT_S
+            while time.monotonic() < reconcile_deadline and (
+                maint_attempts[0] < 5 or _durable(env, target_job_id)[0] != "succeeded"
+            ):
+                if _durable(env, target_job_id)[0] != "succeeded":
+                    if not runner.is_drained:
+                        assert _wait_until(lambda: runner.is_drained, BOUND_WAIT_S)
+                    runner.step(allow_new_jobs=False)
+                    if maint_attempts[0] >= 5 and _durable(env, target_job_id)[0] == "succeeded":
+                        break
                 wait_s = runner.next_retry_wait_s()
                 assert wait_s is not None, "retry wait must remain armed while maintenance keeps failing"
                 time.sleep(wait_s + 0.02)
@@ -1181,7 +1193,13 @@ def test_p2_8_continuing_maintenance_failures_do_not_starve_due_lease_reconcilia
             assert _wait_until(lambda: runner.is_drained, BOUND_WAIT_S)
             runner.step(allow_new_jobs=False)
 
-            assert maint_attempts[0] >= 5, f"expected >=5 maintenance attempts across 4 turns, got {maint_attempts[0]}"
+            assert maint_attempts[0] >= 5, (
+                f"expected >=5 maintenance attempts across continuing retry windows within {BOUND_WAIT_S}s, "
+                f"got {maint_attempts[0]}"
+            )
+            assert runner.next_retry_wait_s() is not None, (
+                "retry wait must remain armed while maintenance keeps failing"
+            )
             assert reconcile_attempts[0] >= 1, (
                 f"P2.8 (direct_step): continuing maintenance failures starved due lease reconciliation "
                 f"(reconcile_attempts={reconcile_attempts[0]}, durable={_durable(env, target_job_id)})"
@@ -1210,15 +1228,15 @@ def test_p2_8_continuing_maintenance_failures_do_not_starve_due_lease_reconcilia
 
         assert fired.wait(timeout=BOUND_WAIT_S), "precondition: lost lease ACK on live owner loop must fire"
         assert _wait_until(lambda: maint_attempts[0] >= 5, BOUND_WAIT_S), (
-            f"precondition: expected >=5 maintenance attempts across 4 retry turns, got {maint_attempts[0]}"
-        )
-        assert reconcile_attempts[0] >= 1, (
-            f"P2.8 (live_owner_loop): continuing maintenance failures starved due lease reconciliation "
-            f"(reconcile_attempts={reconcile_attempts[0]}, durable={_durable(env, target_job_id)})"
+            f"precondition: expected >=5 maintenance attempts within {BOUND_WAIT_S}s, got {maint_attempts[0]}"
         )
         assert _wait_until(lambda: _durable(env, target_job_id)[0] == "succeeded", WAKE_BUDGET_S), (
             f"P2.8 (live_owner_loop): leased job failed to reconcile while maintenance failed: "
             f"{_durable(env, target_job_id)}"
+        )
+        assert reconcile_attempts[0] >= 1, (
+            f"P2.8 (live_owner_loop): continuing maintenance failures starved due lease reconciliation "
+            f"(reconcile_attempts={reconcile_attempts[0]}, durable={_durable(env, target_job_id)})"
         )
         assert _durable(env, target_job_id) == ("succeeded", 1, None)
         assert len(_runs_for(env, target_job_id)) == 1

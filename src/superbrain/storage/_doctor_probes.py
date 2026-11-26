@@ -8,6 +8,11 @@ import stat
 import threading
 from pathlib import Path
 
+from superbrain.core._fs_walk import (
+    MAX_TRANSIENT_WALK_ATTEMPTS,
+    classify_below_root_failure,
+    stat_reparse_or_link,
+)
 from superbrain.core.canonical import digest_bytes
 from superbrain.core.errors import BrainError, describe_exception
 from superbrain.ports.doctor import (
@@ -42,17 +47,6 @@ __all__ = [
 ]
 
 
-def _not_found(path: Path) -> bool:
-    """Only "not found" means removed; any other lookup failure is still reported."""
-    try:
-        os.lstat(path)
-    except FileNotFoundError:
-        return True
-    except OSError:
-        return False
-    return False
-
-
 def check_permissions_strict(
     root: DataRoot,
     os_: OsAdapters,
@@ -74,16 +68,27 @@ def check_permissions_strict(
         stack: list[Path] = [root.root]
         while stack:
             cur = stack.pop()
-            try:
-                with os.scandir(cur) as it:
-                    entries = sorted(it, key=lambda e: e.name)
-            except FileNotFoundError as exc:
-                if cur != root.root and _not_found(cur):
-                    continue  # removed after it was listed: no entry left to judge
-                errors.append(f"directory scan error at {cur.name}: {describe_exception(exc)}")
-                continue
-            except OSError as exc:
-                errors.append(f"directory scan error at {cur.name}: {describe_exception(exc)}")
+            entries: list[os.DirEntry[str]] | None = None
+            for attempt in range(MAX_TRANSIENT_WALK_ATTEMPTS):
+                try:
+                    with os.scandir(cur) as it:
+                        entries = sorted(it, key=lambda e: e.name)
+                    break
+                except OSError as exc:
+                    state = classify_below_root_failure(cur, root.root, exc)
+                    if state == "vanished":
+                        break
+                    if state == "recreated_link":
+                        rel = cur.relative_to(root.root).as_posix()
+                        msg = f"forbidden symlink/reparse point at {rel}"
+                        perm_problems.append(msg)
+                        errors.append(msg)
+                        break
+                    if state == "recreated" and attempt + 1 < MAX_TRANSIENT_WALK_ATTEMPTS:
+                        continue
+                    errors.append(f"directory scan error at {cur.name}: {describe_exception(exc)}")
+                    break
+            if entries is None:
                 continue
             for entry in entries:
                 epath = Path(entry.path)
@@ -95,11 +100,33 @@ def check_permissions_strict(
                     continue
                 try:
                     est = entry.stat(follow_symlinks=False)
-                except FileNotFoundError:
-                    continue  # removed after it was listed
                 except OSError as exc:
-                    errors.append(f"stat error at {epath.name}: {describe_exception(exc)}")
-                    continue
+                    state = classify_below_root_failure(epath, root.root, exc)
+                    if state == "vanished":
+                        continue
+                    if state == "recreated_link":
+                        rel = epath.relative_to(root.root).as_posix()
+                        msg = f"forbidden symlink/reparse point at {rel}"
+                        perm_problems.append(msg)
+                        errors.append(msg)
+                        continue
+                    if state == "recreated":
+                        try:
+                            est = os.lstat(epath)
+                        except FileNotFoundError:
+                            continue
+                        except OSError as lstat_exc:
+                            errors.append(f"stat error at {epath.name}: {describe_exception(lstat_exc)}")
+                            continue
+                        if stat_reparse_or_link(est) or is_link_entry(epath):
+                            rel = epath.relative_to(root.root).as_posix()
+                            msg = f"forbidden symlink/reparse point at {rel}"
+                            perm_problems.append(msg)
+                            errors.append(msg)
+                            continue
+                    else:
+                        errors.append(f"stat error at {epath.name}: {describe_exception(exc)}")
+                        continue
                 if stat.S_ISDIR(est.st_mode):
                     stack.append(epath)
 

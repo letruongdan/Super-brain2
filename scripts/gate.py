@@ -442,6 +442,7 @@ _HEAVY_FILE_COST_MS: dict[str, int] = {
     "tests/storage/test_remediation_c04_r2_cas_siblings.py": 818,
     "tests/cli_api/test_t9_tcp_latency.py": 780,
     "tests/support/test_inc2_process_cleanup.py": 708,
+    "tests/integration/test_i4_r7_remediation.py": 1500,
     "tests/cli_api/test_i3_5_review_web_regressions.py": 679,
     "tests/application/test_t8_privacy_performance_equivalence.py": 675,
     "tests/application/test_t8_review_w01_canonical_reuse.py": 660,

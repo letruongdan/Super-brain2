@@ -32,6 +32,7 @@ from superbrain.core.kernel import CallResult
 from superbrain.core.wire import make_error_envelope, make_success_envelope
 from superbrain.ports.approval import ApprovalPolicyPort, SshApprovalVerifierPort, WebAuthnApprovalVerifierPort
 from superbrain.ports.os import OsAdapters
+from superbrain.storage.layout import ensure_private_directory_tree
 
 if TYPE_CHECKING:
     from superbrain.adapters.auth.webauthn_verifier import WebAuthnResult
@@ -56,35 +57,12 @@ def _verified_ssh_scratch_dir(adapters: OsAdapters) -> Path:
         adapters.paths.reject_unsafe_path(str(base))
         base = Path(os.path.abspath(base))
     scratch = base / "ssh-verify"
-    adapters.paths.reject_unsafe_path(str(scratch))
-    adapters.paths.reject_links(scratch)
-    if adapters.permissions.check_ancestors(scratch):
-        raise BrainError(ErrorCode.INSECURE_PERMISSIONS, "insecure permissions")
-
-    missing: list[Path] = []
-    for candidate in (scratch, *scratch.parents):
-        if os.path.lexists(candidate):
-            break
-        missing.append(candidate)
-    for directory in reversed(missing):
-        try:
-            directory.mkdir(mode=0o700)
-        except FileExistsError:
-            pass
-        adapters.paths.reject_links(directory)
-        if not directory.is_dir():
-            raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
-        adapters.permissions.secure_directory(directory)
-        if adapters.permissions.object_problems(directory):
-            raise BrainError(ErrorCode.INSECURE_PERMISSIONS, "insecure permissions")
-
-    adapters.paths.reject_links(scratch)
-    if adapters.permissions.check_ancestors(scratch):
-        raise BrainError(ErrorCode.INSECURE_PERMISSIONS, "insecure permissions")
-    if not scratch.is_dir():
-        raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
-    if adapters.permissions.object_problems(scratch):
-        raise BrainError(ErrorCode.INSECURE_PERMISSIONS, "insecure permissions")
+    ensure_private_directory_tree(
+        scratch,
+        adapters,
+        label="ssh scratch directory",
+        ancestor_label="scratch ancestor is not trusted",
+    )
     return scratch
 
 

@@ -608,12 +608,15 @@ def test_f7_fresh_run_found_behind_many_other_owner_runs(trusted_tmp: Path) -> N
         ctrl = cast(dict[str, Any], _report(d, env, env.cli_token, wait_ms=0).get("data") or {})
         assert ctrl.get("doctor_run_id") == target_run, f"control: fresh run reused before seeding: {ctrl}"
 
-        def _seed() -> None:
+        def _stage() -> tuple[StagedKernelStore, list[tuple[str, bytes]]]:
             rt = d.rt
             js = StagedKernelStore(rt.store, rt.policy, writer_epoch=rt.lease.epoch)
-            _seed_other_owner_runs(js, js.transact, now_str, SEED_OTHER_RUNS)
+            return js, _stage_other_owner_runs(js, SEED_OTHER_RUNS)
 
-        d.loop.run_owner_action(_seed).result(timeout=BOUND_WAIT_S)
+        js, seeds = d.loop.run_owner_action(_stage).result(timeout=SEED_SETUP_TIMEOUT_S)
+        d.loop.run_owner_action(lambda: _commit_other_owner_runs(js.transact, seeds, now_str)).result(
+            timeout=SEED_SETUP_TIMEOUT_S
+        )
         assert len(_doctor_runs(env.root)) == SEED_OTHER_RUNS + 1
         jobs_before = len(_doctor_jobs(env.root))
         rep_env = _report(d, env, env.cli_token, wait_ms=0)

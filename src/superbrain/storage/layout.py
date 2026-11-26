@@ -7,7 +7,9 @@ a ``WriterLease`` is held.
 """
 
 import os
+import shutil
 import stat
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -171,6 +173,92 @@ def _require_owner_only(path: Path, os_: OsAdapters) -> None:
     problems = os_.permissions.object_problems(path)
     if problems:
         raise _insecure(problems, f"existing {path} is not owner-only")
+
+
+def _verify_existing_private_directory(directory: Path, os_: OsAdapters, label: str) -> None:
+    """Strictly validate an existing directory without altering its permissions."""
+    os_.paths.reject_links(directory)
+    if not directory.is_dir():
+        raise BrainError(ErrorCode.INVALID_INPUT, f"{label} {directory} is not a directory")
+    if os_.permissions.object_problems(directory):
+        raise BrainError(ErrorCode.INSECURE_PERMISSIONS, f"{label} {directory} is not owner-only")
+
+
+def _create_private_directory(directory: Path, os_: OsAdapters, label: str) -> None:
+    """Create ``directory`` owner-only; stage and secure a sibling before atomic rename when ``stage_private_dirs``."""
+    if os_.traits.stage_private_dirs:
+        stage = directory.parent / f".{directory.name}.{uuid.uuid4().hex[:12]}.tmp"
+        try:
+            try:
+                stage.mkdir(mode=0o700)
+            except OSError as exc:
+                raise os_error(f"cannot create {label} {directory}", exc) from exc
+            os_.paths.reject_links(stage)
+            os_.permissions.secure_directory(stage)
+            if os_.permissions.object_problems(stage):
+                raise BrainError(
+                    ErrorCode.INSECURE_PERMISSIONS, f"{label} {directory} could not be restricted to owner-only"
+                )
+            try:
+                os.rename(stage, directory)
+            except FileExistsError:
+                shutil.rmtree(stage, ignore_errors=True)
+                _verify_existing_private_directory(directory, os_, label)
+            except OSError as exc:
+                raise os_error(f"cannot create {label} {directory}", exc) from exc
+        finally:
+            if os.path.lexists(stage):
+                shutil.rmtree(stage, ignore_errors=True)
+        return
+
+    try:
+        directory.mkdir(mode=0o700)
+    except FileExistsError:
+        _verify_existing_private_directory(directory, os_, label)
+    except OSError as exc:
+        raise os_error(f"cannot create {label} {directory}", exc) from exc
+    else:
+        os_.paths.reject_links(directory)
+        os_.permissions.secure_directory(directory)
+        if os_.permissions.object_problems(directory):
+            raise BrainError(ErrorCode.INSECURE_PERMISSIONS, f"{label} {directory} is not owner-only")
+
+
+def ensure_private_directory_tree(
+    target: Path,
+    os_: OsAdapters,
+    *,
+    label: str,
+    ancestor_label: str = "ancestor is not trusted",
+) -> None:
+    """Ensure ``target`` and any missing ancestors exist cleanly as owner-only directories.
+
+    On Windows each missing directory is staged, secured owner-only, and published atomically via ``os.rename`` so
+    concurrent callers never observe a newly created directory before DACL restriction. Pre-existing directories are
+    strictly verified and never re-secured.
+    """
+    os_.paths.reject_unsafe_path(str(target))
+    os_.paths.reject_links(target)
+    anc = os_.permissions.check_ancestors(target)
+    if anc:
+        raise BrainError(ErrorCode.INSECURE_PERMISSIONS, f"{ancestor_label}: {anc[0].path}")
+
+    missing: list[Path] = []
+    for candidate in (target, *target.parents):
+        if os.path.lexists(candidate):
+            break
+        missing.append(candidate)
+    else:
+        raise BrainError(ErrorCode.IO_ERROR, f"no existing directory ancestor is available for {target}")
+
+    for directory in reversed(missing):
+        _create_private_directory(directory, os_, label)
+
+    os_.paths.reject_links(target)
+    anc = os_.permissions.check_ancestors(target)
+    if anc:
+        raise BrainError(ErrorCode.INSECURE_PERMISSIONS, f"{ancestor_label}: {anc[0].path}")
+    _verify_existing_private_directory(target, os_, label)
 
 
 def prepare_data_root(root: Path, os_: OsAdapters) -> DataRoot:

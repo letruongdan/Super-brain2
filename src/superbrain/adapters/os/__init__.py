@@ -83,6 +83,7 @@ def platform_traits(platform: str = sys.platform) -> PlatformTraits:
             default_scratch_base=_default_windows_scratch_base,
             resolve_temp_links=False,
             temp_dir=_system_temp_dir,
+            stage_private_dirs=True,
         )
     if platform == "darwin":
         return PlatformTraits(

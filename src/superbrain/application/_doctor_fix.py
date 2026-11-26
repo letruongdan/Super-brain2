@@ -11,6 +11,11 @@ from pathlib import Path
 from superbrain.application._doctor_checks import clip_report_str
 from superbrain.application._log_rotate import rotate_logs
 from superbrain.application.doctor import DoctorReport
+from superbrain.core._fs_walk import (
+    MAX_TRANSIENT_WALK_ATTEMPTS,
+    classify_below_root_failure,
+    stat_reparse_or_link,
+)
 from superbrain.core.errors import BrainError, ErrorCode, describe_exception
 from superbrain.core.jsonvalue import JsonValue
 from superbrain.ports.doctor import (
@@ -43,23 +48,6 @@ SAFE_FIX_ACTIONS: tuple[str, ...] = (
     "restart_daemon",
 )
 SAFE_FIX_ACTION_SET: frozenset[str] = frozenset(SAFE_FIX_ACTIONS)
-_REPARSE_POINT = 0x400
-
-
-def _vanished_below(path: Path, root: Path) -> bool:
-    """``path`` lies strictly below the walk's ``root`` and is not found: removed after it was listed.
-
-    Any other lookup failure is not "removed", so the entry keeps failing closed.
-    """
-    if os.path.abspath(path) == os.path.abspath(root):
-        return False
-    try:
-        os.lstat(path)
-    except FileNotFoundError:
-        return True
-    except OSError:
-        return False
-    return False
 
 
 def _is_link(path: Path, os_: OsAdapters) -> bool:
@@ -70,12 +58,31 @@ def _is_link(path: Path, os_: OsAdapters) -> bool:
     except OSError as exc:
         detail = f"cannot inspect {path.name}: {describe_exception(exc)}"
         raise BrainError(ErrorCode.INSECURE_PERMISSIONS, detail) from exc
-    if stat.S_ISLNK(st.st_mode) or bool(getattr(st, "st_file_attributes", 0) & _REPARSE_POINT):
+    if stat_reparse_or_link(st):
         return True
     if os_.physical is not None:
         ident = os_.physical.stat_physical_identity(path)
         return ident is not None and ident.is_link
     return False
+
+
+def _scandir_below_root(current: Path, root: Path) -> list[os.DirEntry[str]] | None:
+    """Scan ``current`` under ``root``, retrying transient vanish/recreate below ``root`` cleanly."""
+    for attempt in range(MAX_TRANSIENT_WALK_ATTEMPTS):
+        try:
+            with os.scandir(current) as it:
+                return sorted(it, key=lambda e: e.name)
+        except OSError as exc:
+            state = classify_below_root_failure(current, root, exc)
+            if state == "vanished":
+                return None
+            if state == "recreated_link":
+                raise BrainError(ErrorCode.UNSAFE_PATH, f"unsafe link inside data root: {current}") from exc
+            if state == "recreated" and attempt + 1 < MAX_TRANSIENT_WALK_ATTEMPTS:
+                continue
+            detail = f"cannot list {current.name}: {describe_exception(exc)}"
+            raise BrainError(ErrorCode.INSECURE_PERMISSIONS, detail) from exc
+    raise AssertionError("unreachable")  # pragma: no cover
 
 
 def ensure_no_links_in_tree(root: Path, os_: OsAdapters) -> tuple[list[Path], list[Path]]:
@@ -92,34 +99,60 @@ def ensure_no_links_in_tree(root: Path, os_: OsAdapters) -> tuple[list[Path], li
     stack: list[Path] = [root]
     while stack:
         current = stack.pop()
-        try:
-            with os.scandir(current) as it:
-                entries = sorted(it, key=lambda e: e.name)
-        except FileNotFoundError as exc:
-            if _vanished_below(current, root):
-                continue  # removed after it was listed
-            detail = f"cannot list {current.name}: {describe_exception(exc)}"
-            raise BrainError(ErrorCode.INSECURE_PERMISSIONS, detail) from exc
-        except OSError as exc:
-            detail = f"cannot list {current.name}: {describe_exception(exc)}"
-            raise BrainError(ErrorCode.INSECURE_PERMISSIONS, detail) from exc
+        entries = _scandir_below_root(current, root)
+        if entries is None:
+            continue  # removed after it was listed
         for entry in entries:
             epath = Path(entry.path)
             if entry.is_symlink() or _is_link(epath, os_):
                 raise BrainError(ErrorCode.UNSAFE_PATH, f"unsafe link inside data root: {epath}")
             try:
                 est = entry.stat(follow_symlinks=False)
-            except FileNotFoundError:
-                continue  # removed after it was listed
             except OSError as exc:
-                detail = f"cannot stat {epath.name}: {describe_exception(exc)}"
-                raise BrainError(ErrorCode.INSECURE_PERMISSIONS, detail) from exc
+                state = classify_below_root_failure(epath, root, exc)
+                if state == "vanished":
+                    continue
+                if state == "recreated_link":
+                    raise BrainError(ErrorCode.UNSAFE_PATH, f"unsafe link inside data root: {epath}") from exc
+                if state == "recreated":
+                    try:
+                        est = os.lstat(epath)
+                    except FileNotFoundError:
+                        continue
+                    except OSError as lstat_exc:
+                        detail = f"cannot stat {epath.name}: {describe_exception(lstat_exc)}"
+                        raise BrainError(ErrorCode.INSECURE_PERMISSIONS, detail) from lstat_exc
+                    if stat_reparse_or_link(est):
+                        raise BrainError(ErrorCode.UNSAFE_PATH, f"unsafe link inside data root: {epath}") from exc
+                else:
+                    detail = f"cannot stat {epath.name}: {describe_exception(exc)}"
+                    raise BrainError(ErrorCode.INSECURE_PERMISSIONS, detail) from exc
             if stat.S_ISDIR(est.st_mode):
                 dirs.append(epath)
                 stack.append(epath)
             else:
                 files.append(epath)
     return dirs, files
+
+
+def _resolve_pre_identity(path: Path, base: Path, os_: OsAdapters) -> PhysicalObjectId | None:
+    """Resolve non-link physical identity; ``None`` only when confirmed vanished strictly below ``base``."""
+    assert os_.physical is not None
+    for attempt in range(MAX_TRANSIENT_WALK_ATTEMPTS):
+        ident = os_.physical.stat_physical_identity(path)
+        if ident is not None:
+            if ident.is_link:
+                raise BrainError(ErrorCode.UNSAFE_PATH, f"unsafe link: {path}")
+            return ident
+        state = classify_below_root_failure(path, base, FileNotFoundError(str(path)))
+        if state == "vanished":
+            return None
+        if state == "recreated_link":
+            raise BrainError(ErrorCode.UNSAFE_PATH, f"unsafe link: {path}")
+        if state == "recreated" and attempt + 1 < MAX_TRANSIENT_WALK_ATTEMPTS:
+            continue
+        raise BrainError(ErrorCode.INSECURE_PERMISSIONS, f"cannot stat {path.name}")
+    raise BrainError(ErrorCode.INSECURE_PERMISSIONS, f"cannot stat {path.name}")
 
 
 def _verify_and_secure(
@@ -130,43 +163,77 @@ def _verify_and_secure(
     os_: OsAdapters,
     may_write: Callable[[], bool] | None = None,
     walk_root: Path | None = None,
-) -> int | None:
-    """Repair one entry; ``None`` when ``may_write`` refused the write this entry needed (nothing was changed).
+) -> tuple[int | None, PhysicalObjectId | None]:
+    """Repair one entry; ``None`` step when ``may_write`` refused the write this entry needed.
 
-    An entry strictly below ``walk_root`` that was removed after the walk listed it needs no repair (``0``); one
-    that still exists and cannot be inspected or repaired keeps failing closed.
+    An entry strictly below ``walk_root`` removed after listing needs no repair (``0``); one that vanished and
+    immediately recreated cleanly is re-verified with refreshed identity; links and denied lookups keep failing closed.
     """
+    current_pre_id = pre_id
 
-    def vanished() -> bool:
-        return walk_root is not None and _vanished_below(path, walk_root)
+    def handle_transient(exc: BaseException) -> str:
+        nonlocal current_pre_id
+        state = (
+            classify_below_root_failure(path, walk_root, exc)
+            if walk_root is not None
+            else "fail_closed"
+        )
+        if state == "vanished":
+            return "vanished"
+        if state == "recreated_link":
+            raise BrainError(ErrorCode.UNSAFE_PATH, f"target replaced by link: {path}") from exc
+        if state == "recreated":
+            assert walk_root is not None
+            if os_.physical is not None:
+                refreshed = _resolve_pre_identity(path, walk_root, os_)
+                if refreshed is None:
+                    return "vanished"
+                current_pre_id = refreshed
+            elif _is_link(path, os_):
+                raise BrainError(ErrorCode.UNSAFE_PATH, f"target replaced by link: {path}") from exc
+            return "recreated"
+        return "fail_closed"
 
-    try:
-        if not os_.permissions.object_problems(path):
-            return 0
-    except BrainError:
-        if vanished():
-            return 0
-        raise
-    if may_write is not None and not may_write():
-        return None
-    if os_.physical is not None:
-        cur_id = os_.physical.stat_physical_identity(path)
-        if cur_id is None and vanished():
-            return 0
-        if cur_id is None or cur_id.is_link or cur_id != pre_id:
-            raise BrainError(ErrorCode.UNSAFE_PATH, f"target identity changed before ACL repair: {path}")
-    elif _is_link(path, os_):
-        raise BrainError(ErrorCode.UNSAFE_PATH, f"target replaced by link: {path}")
-    try:
-        if is_dir:
-            os_.permissions.secure_directory(path)
-        else:
-            os_.permissions.secure_file(path)
-    except BrainError:
-        if vanished():
-            return 0
-        raise
-    return 1
+    for attempt in range(MAX_TRANSIENT_WALK_ATTEMPTS):
+        try:
+            if not os_.permissions.object_problems(path):
+                return 0, current_pre_id
+        except BrainError as exc:
+            outcome = handle_transient(exc)
+            if outcome == "vanished":
+                return 0, current_pre_id
+            if outcome == "recreated" and attempt + 1 < MAX_TRANSIENT_WALK_ATTEMPTS:
+                continue
+            raise
+        if may_write is not None and not may_write():
+            return None, current_pre_id
+        if os_.physical is not None:
+            cur_id = os_.physical.stat_physical_identity(path)
+            if cur_id is None:
+                outcome = handle_transient(FileNotFoundError(str(path)))
+                if outcome == "vanished":
+                    return 0, current_pre_id
+                if outcome == "recreated" and attempt + 1 < MAX_TRANSIENT_WALK_ATTEMPTS:
+                    continue
+                raise BrainError(ErrorCode.UNSAFE_PATH, f"target identity changed before ACL repair: {path}")
+            if cur_id.is_link or cur_id != current_pre_id:
+                raise BrainError(ErrorCode.UNSAFE_PATH, f"target identity changed before ACL repair: {path}")
+        elif _is_link(path, os_):
+            raise BrainError(ErrorCode.UNSAFE_PATH, f"target replaced by link: {path}")
+        try:
+            if is_dir:
+                os_.permissions.secure_directory(path)
+            else:
+                os_.permissions.secure_file(path)
+        except BrainError as exc:
+            outcome = handle_transient(exc)
+            if outcome == "vanished":
+                return 0, current_pre_id
+            if outcome == "recreated" and attempt + 1 < MAX_TRANSIENT_WALK_ATTEMPTS:
+                continue
+            raise
+        return 1, current_pre_id
+    raise BrainError(ErrorCode.INSECURE_PERMISSIONS, f"cannot stabilize permissions for {path.name}")
 
 
 class FixInterrupted(Exception):  # noqa: N818 - a stop signal, not an error
@@ -203,24 +270,51 @@ def tighten_data_root_permissions(
     for base in unique_roots:
         dirs, files = ensure_no_links_in_tree(base, os_)
         for d in dirs:
-            ident = os_.physical.stat_physical_identity(d) if os_.physical is not None else None
-            if ident is not None and ident.is_link:
-                raise BrainError(ErrorCode.UNSAFE_PATH, f"unsafe link: {d}")
+            if os_.physical is not None:
+                ident = _resolve_pre_identity(d, base, os_)
+                if ident is None:
+                    continue
+            else:
+                ident = None
             all_dirs.append((d, ident, base))
         for f in files:
-            ident = os_.physical.stat_physical_identity(f) if os_.physical is not None else None
-            if ident is not None and ident.is_link:
-                raise BrainError(ErrorCode.UNSAFE_PATH, f"unsafe link: {f}")
+            if os_.physical is not None:
+                ident = _resolve_pre_identity(f, base, os_)
+                if ident is None:
+                    continue
+            else:
+                ident = None
             all_files.append((f, ident, base))
 
-    # Second file pass catches any child whose ACL reset during parent directory DACL update on Windows.
-    steps = [(d, True, i, b) for d, i, b in all_dirs] + [(f, False, i, b) for f, i, b in all_files] * 2
     changed = 0
-    for path, is_dir, pre_id, base in steps:
+    for path, pre_id, base in all_dirs:
         if should_stop is not None and should_stop():
             raise FixInterrupted(changed)
-        step = _verify_and_secure(
-            path, is_dir=is_dir, pre_id=pre_id, os_=os_, may_write=may_write, walk_root=base
+        step, _ = _verify_and_secure(
+            path, is_dir=True, pre_id=pre_id, os_=os_, may_write=may_write, walk_root=base
+        )
+        if step is None:
+            raise FixInterrupted(changed)
+        changed += step
+
+    # Second file pass catches any child whose ACL reset during parent directory DACL update on Windows.
+    second_pass_files: list[tuple[Path, PhysicalObjectId | None, Path]] = []
+    for path, pre_id, base in all_files:
+        if should_stop is not None and should_stop():
+            raise FixInterrupted(changed)
+        step, next_id = _verify_and_secure(
+            path, is_dir=False, pre_id=pre_id, os_=os_, may_write=may_write, walk_root=base
+        )
+        if step is None:
+            raise FixInterrupted(changed)
+        changed += step
+        second_pass_files.append((path, next_id, base))
+
+    for path, pre_id, base in second_pass_files:
+        if should_stop is not None and should_stop():
+            raise FixInterrupted(changed)
+        step, _ = _verify_and_secure(
+            path, is_dir=False, pre_id=pre_id, os_=os_, may_write=may_write, walk_root=base
         )
         if step is None:
             raise FixInterrupted(changed)
