@@ -16,7 +16,7 @@ from superbrain.application.deadlines import (
     ReservationTable,
     SubmittedKernelRequest,
 )
-from superbrain.application.dispatch import KernelDispatcher, KernelToolDomain, verify_effective_mcp_auth
+from superbrain.application.dispatch import KernelDispatcher, KernelToolDomain
 from superbrain.application.idempotency import is_idempotency_expired
 from superbrain.application.privacy import PrivacyFilter
 from superbrain.core._kernel_approval import Layer2State
@@ -239,25 +239,18 @@ class KernelBridge(KernelBlobStagePort):
         self._check_live_pair()
         return self._policy.schema_version
 
-    def _verify_bridge_mcp_auth(self, call: Call, ctx: CallContext, auth: PrivateRequestAuth) -> None:
-        verify_effective_mcp_auth(
-            store_id=self._store.store_id, policy=self._policy,
-            effective_snapshot=self._effective_policy_snapshot, call=call, ctx=ctx, auth=auth,
-        )
-
     def _run_reserved_on_owner(
         self, call: Call, ctx: CallContext, auth: PrivateRequestAuth, reservation: Reservation
     ) -> CallResult:
         try:
             self._check_live_pair()
-            self._verify_bridge_mcp_auth(call, ctx, auth)
         except BrainError as err:
-            if err.code is ErrorCode.UNAUTHENTICATED:
-                self._clear_auth_if_diverged(auth.credential_id)
-            elif err.code in (ErrorCode.IDENTITY_MISMATCH, ErrorCode.POLICY_UNAVAILABLE, ErrorCode.INTEGRITY_FAILURE):
+            if err.code in (ErrorCode.IDENTITY_MISMATCH, ErrorCode.POLICY_UNAVAILABLE, ErrorCode.INTEGRITY_FAILURE):
                 self._auth_state.clear()
             return _encoded_error(err)
-        result = self._dispatcher.dispatch_reserved(call, ctx, auth=auth, reservation=reservation)
+        result = self._dispatcher.dispatch_reserved(
+            call, ctx, auth=auth, reservation=reservation, enforce_effective=True
+        )
         if self._on_clock_untrusted_changed is not None:
             self._on_clock_untrusted_changed(self._idempotency.clock_untrusted())
         if result.get("ok") is False:
@@ -462,12 +455,9 @@ class KernelBridge(KernelBlobStagePort):
     def dispatch(self, call: Call, ctx: CallContext, *, auth: PrivateRequestAuth) -> CallResult:
         try:
             self._check_live_pair()
-            self._verify_bridge_mcp_auth(call, ctx, auth)
         except BrainError as err:
-            if err.code is ErrorCode.UNAUTHENTICATED:
-                self._clear_auth_if_diverged(auth.credential_id)
             return _encoded_error(err)
-        result = self._dispatcher.dispatch(call, ctx, auth=auth)
+        result = self._dispatcher.dispatch(call, ctx, auth=auth, enforce_effective=True)
         if result.get("ok") is False:
             err_obj = result.get("error")
             err_code = err_obj.get("code") if isinstance(err_obj, Mapping) else None

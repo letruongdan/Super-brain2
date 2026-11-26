@@ -139,9 +139,18 @@ class KernelDispatcher:
     def _current_snapshot(self) -> AuthSnapshot:
         return self._effective_snapshot() if self._effective_snapshot is not None else self._policy.snapshot()
 
-    def dispatch(self, call: Call, ctx: CallContext, *, auth: PrivateRequestAuth) -> CallResult:
+    def dispatch(
+        self,
+        call: Call,
+        ctx: CallContext,
+        *,
+        auth: PrivateRequestAuth,
+        enforce_effective: bool = False,
+    ) -> CallResult:
         """Execute ``call`` on the owner thread and return a validated v2 ``CallResult`` envelope."""
-        return self.dispatch_reserved(call, ctx, auth=auth, reservation=None)
+        return self.dispatch_reserved(
+            call, ctx, auth=auth, reservation=None, enforce_effective=enforce_effective
+        )
 
     def dispatch_reserved(
         self,
@@ -150,10 +159,13 @@ class KernelDispatcher:
         *,
         auth: PrivateRequestAuth,
         reservation: Reservation | None = None,
+        enforce_effective: bool = False,
     ) -> CallResult:
         """Execute ``call`` on the owner thread gated by ``reservation`` and ``enter_commit`` (Task 4b)."""
         try:
-            data = self._dispatch_data(call, ctx, auth=auth, reservation=reservation)
+            data = self._dispatch_data(
+                call, ctx, auth=auth, reservation=reservation, enforce_effective=enforce_effective
+            )
             envelope = make_success_envelope(data)
             encode_envelope(envelope)
             return envelope
@@ -218,7 +230,23 @@ class KernelDispatcher:
         attempt = self._send_attempts.record_pending_attempt(spec)
         return {**rendered, "served_receipt_id": attempt.served_receipt_id}
 
-    def _verify_owner_auth_and_scope(self, call: Call, ctx: CallContext, auth: PrivateRequestAuth) -> Principal:
+    def _verify_owner_auth_and_scope(
+        self,
+        call: Call,
+        ctx: CallContext,
+        auth: PrivateRequestAuth,
+        *,
+        enforce_effective: bool = False,
+    ) -> Principal:
+        if enforce_effective and self._effective_snapshot is not None:
+            return verify_effective_mcp_auth(
+                store_id=self._store_id,
+                policy=self._policy,
+                effective_snapshot=self._effective_snapshot,
+                call=call,
+                ctx=ctx,
+                auth=auth,
+            )
         if not isinstance(call, Call) or not isinstance(ctx, CallContext) or not isinstance(auth, PrivateRequestAuth):
             raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
         if ctx.identity.store_id != self._store_id or ctx.selected_scope != call.selected_scope:
@@ -293,8 +321,11 @@ class KernelDispatcher:
         *,
         auth: PrivateRequestAuth,
         reservation: Reservation | None = None,
+        enforce_effective: bool = False,
     ) -> dict[str, JsonValue]:
-        live_principal = self._verify_owner_auth_and_scope(call, ctx, auth)
+        live_principal = self._verify_owner_auth_and_scope(
+            call, ctx, auth, enforce_effective=enforce_effective
+        )
         self._check_handler_budget(ctx, reservation)
 
         uses_idem = tool_uses_idempotency(call)
