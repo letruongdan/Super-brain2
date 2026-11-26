@@ -566,15 +566,21 @@ class HandoffKernelDomain(KernelToolDomain):
         if not self._policy.allows(principal, scope, action="prepare_task"):
             raise BrainError(ErrorCode.NOT_FOUND, "not found")
         hdr = self._handoffs.resolve_task_scope(rec.task_id, principal_id=principal.principal_id, scope=scope)
-        entries = self._handoffs.list_discover(
-            principal_id=principal.principal_id,
-            owner_id=rec.owner_id,
-            repo_id=rec.repo_id,
-            checkout_id=rec.checkout_id,
-            task_id=rec.task_id,
-            now=self._clock.now(),
-            render_l0=render_handoff_l0,
-        )
+        entries: tuple[DiscoverEntry, ...] = ()
+        if rec.handoff_served_rev is not None and rec.handoff_served_epoch is not None:
+            entries = (
+                self._handoffs.render_delivery_handoff_l0(
+                    task_id=rec.task_id,
+                    owner_id=rec.owner_id,
+                    repo_id=rec.repo_id,
+                    checkout_id=rec.checkout_id,
+                    revision_epoch=rec.handoff_served_epoch,
+                    revision=rec.handoff_served_rev,
+                    served_digest=rec.handoff_served_digest,
+                    now=self._clock.now(),
+                    render_l0=render_handoff_l0,
+                ),
+            )
         continuity_items: list[JsonValue] = []
         for entry in entries:
             if entry.status == "redacted":

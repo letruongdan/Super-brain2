@@ -47,7 +47,7 @@ from superbrain.storage.cas import HOLDERS_TABLE, read_held_blob_or_none
 from superbrain.storage.kinds import RetentionClass, is_uuid
 from superbrain.storage.ledger import Txn, utc_timestamp
 from superbrain.storage.policy_store import PolicyStore
-from superbrain.storage.send_attempts import read_send_attempt_row
+from superbrain.storage.send_attempts import read_read_ack_by_receipt_row, read_send_attempt_row
 from superbrain.storage.sessions import SessionStore
 from superbrain.storage.store import Store
 
@@ -279,6 +279,175 @@ class HandoffStore(HandoffStorePort):
         ).fetchone()
         return row is not None
 
+    def _render_l0_row(
+        self,
+        *,
+        tid: str,
+        art_id: str,
+        rev_epoch: int,
+        rev: int,
+        hrev: int,
+        goal_ref: str | None,
+        goal_hid: str | None,
+        agent_ref: str | None,
+        agent_hid: str | None,
+        holder_sref: str | None,
+        agent_at: str | None,
+        obs_through: str | None,
+        repo_id: str,
+        checkout_id: str,
+        now_utc: datetime,
+        render_l0: Callable[..., str] | None,
+    ) -> DiscoverEntry:
+        task_goal = ""
+        if goal_ref is not None:
+            gbytes, gstatus = _check_blob_status(
+                self._store._db,
+                self._store,
+                self._policy,
+                goal_ref,
+                holder_id=goal_hid,
+                now=now_utc,
+            )
+            if gstatus != "ok" or gbytes is None:
+                return DiscoverEntry(
+                    task_id=tid,
+                    artifact_id=art_id,
+                    revision_epoch=rev_epoch,
+                    revision=rev,
+                    digest=agent_ref or goal_ref,
+                    summary="",
+                    status="redacted",
+                    reason=gstatus,
+                )
+            task_goal = gbytes.decode("utf-8", errors="replace")
+
+        agent_state: HandoffAgentState | None = None
+        if agent_ref is not None:
+            abytes, astatus = _check_blob_status(
+                self._store._db,
+                self._store,
+                self._policy,
+                agent_ref,
+                holder_id=agent_hid,
+                now=now_utc,
+            )
+            if astatus != "ok" or abytes is None:
+                return DiscoverEntry(
+                    task_id=tid,
+                    artifact_id=art_id,
+                    revision_epoch=rev_epoch,
+                    revision=rev,
+                    digest=agent_ref,
+                    summary="",
+                    status="redacted",
+                    reason=astatus,
+                )
+            agent_state = HandoffAgentState.from_dict(json.loads(abytes.decode("utf-8")))
+
+        sess_state: str | None = None
+        other_active = False
+        if holder_sref is not None:
+            srow = self._store._db.execute(
+                "SELECT state, last_event_at FROM sessions WHERE session_ref = ?",
+                (holder_sref,),
+            ).fetchone()
+            if srow is not None:
+                sess_state = decide_session_liveness(
+                    recorded_state=SessionState(str(srow[0])),
+                    last_event_at=parse_iso_utc(str(srow[1])),
+                    now=now_utc,
+                ).state.value
+            other_row = self._store._db.execute(
+                "SELECT 1 FROM sessions WHERE repo_id = ? AND checkout_id = ? AND state = 'active' "
+                "AND session_ref != ? LIMIT 1",
+                (repo_id, checkout_id, holder_sref),
+            ).fetchone()
+            other_active = other_row is not None
+
+        if render_l0 is not None:
+            summary = render_l0(
+                task_goal=task_goal,
+                state=agent_state,
+                handoff_revision=hrev,
+                session_state=sess_state,
+                agent_updated_at=agent_at,
+                observed_through=obs_through,
+                other_active_warning=other_active,
+            )
+        else:
+            summary = (task_goal or "")[:200]
+        return DiscoverEntry(
+            task_id=tid,
+            artifact_id=art_id,
+            revision_epoch=rev_epoch,
+            revision=rev,
+            digest=agent_ref or goal_ref or digest_bytes(summary.encode("utf-8")),
+            summary=summary,
+            status="ok",
+        )
+
+    def render_delivery_handoff_l0(
+        self,
+        *,
+        task_id: str,
+        owner_id: str,
+        repo_id: str,
+        checkout_id: str,
+        revision_epoch: int,
+        revision: int,
+        served_digest: str | None,
+        now: datetime,
+        render_l0: Callable[..., str] | None = None,
+    ) -> DiscoverEntry:
+        _require_v8_ready(self._store, self._policy)
+        require_opaque_id(task_id, label="task_id")
+        require_opaque_id(owner_id, label="owner_id")
+        require_opaque_id(repo_id, label="repo_id")
+        require_opaque_id(checkout_id, label="checkout_id")
+        require_non_negative_int(revision_epoch)
+        require_positive_int(revision)
+        now_utc, _ = require_aware_utc(now)
+
+        row = self._store._db.execute(
+            "SELECT r.task_id, r.artifact_id, r.revision_epoch, r.revision, r.handoff_revision, "
+            "t.goal_ref, t.goal_holder_id, r.agent_ref, r.agent_holder_id, "
+            "r.holder_session_ref, r.agent_updated_at, r.observed_through "
+            "FROM handoff_revision_headers AS r JOIN tasks AS t ON t.task_id = r.task_id "
+            "WHERE r.task_id = ? AND r.revision_epoch = ? AND r.revision = ? "
+            "AND t.owner_id = ? AND t.repo_id = ? AND t.checkout_id = ?",
+            (task_id, revision_epoch, revision, owner_id, repo_id, checkout_id),
+        ).fetchone()
+        if row is None:
+            return DiscoverEntry(
+                task_id=task_id,
+                artifact_id=task_id,
+                revision_epoch=revision_epoch,
+                revision=revision,
+                digest=served_digest or "",
+                summary="",
+                status="redacted",
+                reason="not_found",
+            )
+        return self._render_l0_row(
+            tid=str(row[0]),
+            art_id=str(row[1]),
+            rev_epoch=int(row[2]),
+            rev=int(row[3]),
+            hrev=int(row[4]),
+            goal_ref=None if row[5] is None else str(row[5]),
+            goal_hid=None if row[6] is None else str(row[6]),
+            agent_ref=None if row[7] is None else str(row[7]),
+            agent_hid=None if row[8] is None else str(row[8]),
+            holder_sref=None if row[9] is None else str(row[9]),
+            agent_at=None if row[10] is None else str(row[10]),
+            obs_through=None if row[11] is None else str(row[11]),
+            repo_id=repo_id,
+            checkout_id=checkout_id,
+            now_utc=now_utc,
+            render_l0=render_l0,
+        )
+
     def list_discover(
         self,
         *,
@@ -322,114 +491,27 @@ class HandoffStore(HandoffStorePort):
                 (owner_id, repo_id, checkout_id, cutoff),
             ).fetchall()
 
-        out: list[DiscoverEntry] = []
-        for row in rows:
-            tid, art_id = str(row[0]), str(row[1])
-            rev_epoch, rev, hrev = int(row[2]), int(row[3]), int(row[4])
-            goal_ref = None if row[5] is None else str(row[5])
-            goal_hid = None if row[6] is None else str(row[6])
-            agent_ref = None if row[7] is None else str(row[7])
-            agent_hid = None if row[8] is None else str(row[8])
-            holder_sref = None if row[9] is None else str(row[9])
-            agent_at = None if row[10] is None else str(row[10])
-            obs_through = None if row[11] is None else str(row[11])
-
-            task_goal = ""
-            if goal_ref is not None:
-                gbytes, gstatus = _check_blob_status(
-                    self._store._db,
-                    self._store,
-                    self._policy,
-                    goal_ref,
-                    holder_id=goal_hid,
-                    now=now_utc,
-                )
-                if gstatus != "ok" or gbytes is None:
-                    out.append(
-                        DiscoverEntry(
-                            task_id=tid,
-                            artifact_id=art_id,
-                            revision_epoch=rev_epoch,
-                            revision=rev,
-                            digest=agent_ref or goal_ref,
-                            summary="",
-                            status="redacted",
-                            reason=gstatus,
-                        )
-                    )
-                    continue
-                task_goal = gbytes.decode("utf-8", errors="replace")
-
-            agent_state: HandoffAgentState | None = None
-            if agent_ref is not None:
-                abytes, astatus = _check_blob_status(
-                    self._store._db,
-                    self._store,
-                    self._policy,
-                    agent_ref,
-                    holder_id=agent_hid,
-                    now=now_utc,
-                )
-                if astatus != "ok" or abytes is None:
-                    out.append(
-                        DiscoverEntry(
-                            task_id=tid,
-                            artifact_id=art_id,
-                            revision_epoch=rev_epoch,
-                            revision=rev,
-                            digest=agent_ref,
-                            summary="",
-                            status="redacted",
-                            reason=astatus,
-                        )
-                    )
-                    continue
-                agent_state = HandoffAgentState.from_dict(json.loads(abytes.decode("utf-8")))
-
-            sess_state: str | None = None
-            other_active = False
-            if holder_sref is not None:
-                srow = self._store._db.execute(
-                    "SELECT state, last_event_at FROM sessions WHERE session_ref = ?",
-                    (holder_sref,),
-                ).fetchone()
-                if srow is not None:
-                    sess_state = decide_session_liveness(
-                        recorded_state=SessionState(str(srow[0])),
-                        last_event_at=parse_iso_utc(str(srow[1])),
-                        now=now_utc,
-                    ).state.value
-                other_row = self._store._db.execute(
-                    "SELECT 1 FROM sessions WHERE repo_id = ? AND checkout_id = ? AND state = 'active' "
-                    "AND session_ref != ? LIMIT 1",
-                    (repo_id, checkout_id, holder_sref),
-                ).fetchone()
-                other_active = other_row is not None
-
-            if render_l0 is not None:
-                summary = render_l0(
-                    task_goal=task_goal,
-                    state=agent_state,
-                    handoff_revision=hrev,
-                    session_state=sess_state,
-                    agent_updated_at=agent_at,
-                    observed_through=obs_through,
-                    other_active_warning=other_active,
-                )
-            else:
-                summary = (task_goal or "")[:200]
-            out.append(
-                DiscoverEntry(
-                    task_id=tid,
-                    artifact_id=art_id,
-                    revision_epoch=rev_epoch,
-                    revision=rev,
-                    digest=agent_ref or goal_ref or digest_bytes(summary.encode("utf-8")),
-                    summary=summary,
-                    status="ok",
-                )
+        return tuple(
+            self._render_l0_row(
+                tid=str(row[0]),
+                art_id=str(row[1]),
+                rev_epoch=int(row[2]),
+                rev=int(row[3]),
+                hrev=int(row[4]),
+                goal_ref=None if row[5] is None else str(row[5]),
+                goal_hid=None if row[6] is None else str(row[6]),
+                agent_ref=None if row[7] is None else str(row[7]),
+                agent_hid=None if row[8] is None else str(row[8]),
+                holder_sref=None if row[9] is None else str(row[9]),
+                agent_at=None if row[10] is None else str(row[10]),
+                obs_through=None if row[11] is None else str(row[11]),
+                repo_id=repo_id,
+                checkout_id=checkout_id,
+                now_utc=now_utc,
+                render_l0=render_l0,
             )
-        return tuple(out)
+            for row in rows
+        )
 
     def create_work_task(
         self,
@@ -1106,9 +1188,9 @@ class HandoffStore(HandoffStorePort):
         repo_id: str,
         checkout_id: str,
         principal_id: str,
-        live_fence: HandoffFence,
+        cur: HandoffHeaderState,
         resume_ref: ResumeRefSpec,
-    ) -> tuple[str, int, int, str | None]:
+    ) -> tuple[str, int, int, str | None, str, bool]:
         art_row = db.execute(
             "SELECT t.task_id, t.owner_id, t.repo_id, t.checkout_id "
             "FROM task_handoffs AS h JOIN tasks AS t ON t.task_id = h.task_id "
@@ -1120,42 +1202,55 @@ class HandoffStore(HandoffStorePort):
             or str(art_row[1]) != owner_id
             or str(art_row[2]) != repo_id
             or str(art_row[3]) != checkout_id
+            or str(art_row[0]) != task_id
         ):
             raise BrainError(ErrorCode.NOT_FOUND, "not found")
-        if str(art_row[0]) != task_id:
-            raise BrainError(ErrorCode.INVALID_INPUT, "resume_ref does not belong to task_id")
 
-        res_epoch: int | None = None
         if resume_ref.served_receipt_id is not None:
             attempt = read_send_attempt_row(db, resume_ref.served_receipt_id)
             if (
                 attempt is None
                 or attempt.principal_id != principal_id
                 or attempt.task_id != task_id
+                or attempt.artifact_id != resume_ref.artifact_id
+                or attempt.revision != resume_ref.revision
+                or attempt.level != "L1"
                 or attempt.state is SendAttemptState.UNKNOWN
             ):
                 raise BrainError(ErrorCode.NOT_FOUND, "not found")
             if attempt.state is SendAttemptState.PENDING:
                 raise BrainError(ErrorCode.IN_PROGRESS, "operation in progress")
-            if attempt.artifact_id != resume_ref.artifact_id or attempt.revision != resume_ref.revision:
-                raise BrainError(ErrorCode.INVALID_INPUT, "resume_ref mismatches served_receipt_id")
-            res_epoch = attempt.revision_epoch
-        else:
-            cand_rows = db.execute(
-                "SELECT revision_epoch FROM handoff_revision_headers WHERE artifact_id = ? AND revision = ?",
-                (resume_ref.artifact_id, resume_ref.revision),
-            ).fetchall()
-            epochs = [int(r[0]) for r in cand_rows]
-            if not epochs:
+            if attempt.state is not SendAttemptState.SERVED_ONLY or not attempt.resource_digests:
                 raise BrainError(ErrorCode.NOT_FOUND, "not found")
-            if resume_ref.fence.restore_epoch in epochs:
-                res_epoch = resume_ref.fence.restore_epoch
-            elif live_fence.restore_epoch in epochs:
-                res_epoch = live_fence.restore_epoch
-            elif len(epochs) == 1:
-                res_epoch = epochs[0]
-            else:
-                raise BrainError(ErrorCode.INVALID_INPUT, "ambiguous resume_ref without served_receipt_id")
+            res_epoch = attempt.revision_epoch
+            ack = read_read_ack_by_receipt_row(db, resume_ref.served_receipt_id)
+            has_matching_ack = (
+                ack is not None
+                and ack.served_receipt_id == attempt.send_attempt_id
+                and ack.principal_id == principal_id
+                and ack.task_id == task_id
+                and ack.artifact_id == attempt.artifact_id
+                and ack.revision_epoch == attempt.revision_epoch
+                and ack.revision == attempt.revision
+                and ack.resource_digests == attempt.resource_digests
+            )
+            resume_exposure = "read_ack" if has_matching_ack else "served_only"
+        else:
+            resume_exposure = "unknown"
+            cand_epoch = db.execute(
+                "SELECT 1 FROM handoff_revision_headers "
+                "WHERE artifact_id = ? AND revision_epoch = ? AND revision = ?",
+                (resume_ref.artifact_id, resume_ref.fence.restore_epoch, resume_ref.revision),
+            ).fetchone()
+            if cand_epoch is None:
+                any_rev = db.execute(
+                    "SELECT 1 FROM handoff_revision_headers WHERE artifact_id = ? AND revision = ?",
+                    (resume_ref.artifact_id, resume_ref.revision),
+                ).fetchone()
+                if any_rev is None:
+                    raise BrainError(ErrorCode.NOT_FOUND, "not found")
+                raise BrainError(ErrorCode.REVISION_CONFLICT, "resume_ref does not match revision header")
+            res_epoch = resume_ref.fence.restore_epoch
 
         hrow = db.execute(
             "SELECT handoff_revision, holder_restore_epoch, writer_generation "
@@ -1164,12 +1259,21 @@ class HandoffStore(HandoffStorePort):
         ).fetchone()
         if hrow is None:
             raise BrainError(ErrorCode.NOT_FOUND, "not found")
-        if int(hrow[0]) != resume_ref.handoff_revision:
-            raise BrainError(ErrorCode.INVALID_INPUT, "resume_ref handoff_revision mismatch")
+        hdr_hrev = int(hrow[0])
         hdr_fence = HandoffFence(restore_epoch=int(hrow[1]), writer_generation=int(hrow[2]))
-        if resume_ref.fence not in (hdr_fence, live_fence):
-            raise BrainError(ErrorCode.INVALID_INPUT, "resume_ref fence invalid")
-        return resume_ref.artifact_id, res_epoch, resume_ref.revision, resume_ref.served_receipt_id
+        if resume_ref.handoff_revision != hdr_hrev or resume_ref.fence != hdr_fence:
+            raise BrainError(ErrorCode.REVISION_CONFLICT, "resume_ref does not match revision header")
+        if cur.handoff_revision != hdr_hrev or cur.committed_fence != hdr_fence:
+            raise BrainError(ErrorCode.REVISION_CONFLICT, "handoff changed since read revision")
+        observed_newer = (cur.revision_epoch, cur.revision) != (res_epoch, resume_ref.revision)
+        return (
+            resume_ref.artifact_id,
+            res_epoch,
+            resume_ref.revision,
+            resume_ref.served_receipt_id,
+            resume_exposure,
+            observed_newer,
+        )
 
     def _validate_seen_refs_in_tx(
         self,
@@ -1249,6 +1353,8 @@ class HandoffStore(HandoffStorePort):
         res_epoch: int | None = None
         res_rev: int | None = None
         res_receipt_id: str | None = None
+        resume_exposure: str | None = None
+        observed_newer = False
 
         if create_task:
             if resume_ref is not None:
@@ -1279,15 +1385,17 @@ class HandoffStore(HandoffStorePort):
             if towner_row is None or str(towner_row[0]) != owner_id:
                 raise BrainError(ErrorCode.NOT_FOUND, "not found")
             if resume_ref is not None:
-                res_art_id, res_epoch, res_rev, res_receipt_id = self._validate_resume_in_tx(
-                    db,
-                    task_id=task_id,
-                    owner_id=owner_id,
-                    repo_id=repo_id,
-                    checkout_id=checkout_id,
-                    principal_id=principal_id,
-                    live_fence=cur.live_fence,
-                    resume_ref=resume_ref,
+                res_art_id, res_epoch, res_rev, res_receipt_id, resume_exposure, observed_newer = (
+                    self._validate_resume_in_tx(
+                        db,
+                        task_id=task_id,
+                        owner_id=owner_id,
+                        repo_id=repo_id,
+                        checkout_id=checkout_id,
+                        principal_id=principal_id,
+                        cur=cur,
+                        resume_ref=resume_ref,
+                    )
                 )
             eff_live = cur.handoff_live
             goal_digest = cur.goal_ref or digest_bytes(b"")
@@ -1300,8 +1408,8 @@ class HandoffStore(HandoffStorePort):
                 handoff_live=eff_live,
             )
 
-        if resume_ref is not None:
-            eff_exposure = "resumed"
+        if resume_exposure is not None:
+            eff_exposure = resume_exposure
         elif seen_handoff_refs:
             eff_exposure = "seen_l0"
         elif has_open_other:
@@ -1309,16 +1417,22 @@ class HandoffStore(HandoffStorePort):
         else:
             eff_exposure = exposure_evidence or "none"
 
+        eff_degraded_codes = list(degraded_codes)
+        if observed_newer and "observed_newer" not in eff_degraded_codes:
+            eff_degraded_codes.append("observed_newer")
+
         served_ep = eff_live.revision_epoch
         served_rev = eff_live.revision
         served_dig: str | None = None
-        if served_rev is not None:
-            if not create_task:
-                hrow_dig = db.execute(
-                    "SELECT COALESCE(agent_ref, goal_ref) FROM task_handoffs WHERE task_id = ?", (task_id,)
-                ).fetchone()
-                if hrow_dig is not None and hrow_dig[0] is not None:
-                    served_dig = str(hrow_dig[0])
+        if served_rev is not None and served_ep is not None and not create_task:
+            hrow_dig = db.execute(
+                "SELECT COALESCE(r.agent_ref, t.goal_ref) "
+                "FROM handoff_revision_headers AS r JOIN tasks AS t ON t.task_id = r.task_id "
+                "WHERE r.task_id = ? AND r.revision_epoch = ? AND r.revision = ?",
+                (task_id, served_ep, served_rev),
+            ).fetchone()
+            if hrow_dig is not None and hrow_dig[0] is not None:
+                served_dig = str(hrow_dig[0])
 
         db.execute(
             "INSERT INTO deliveries ("
@@ -1344,7 +1458,7 @@ class HandoffStore(HandoffStorePort):
                 res_rev,
                 res_receipt_id,
                 eff_exposure,
-                canonical_json(list(degraded_codes)).decode("utf-8"),
+                canonical_json(eff_degraded_codes).decode("utf-8"),
                 served_ep,
                 served_rev,
                 served_dig,
@@ -1375,7 +1489,8 @@ class HandoffStore(HandoffStorePort):
         row = self._store._db.execute(
             "SELECT delivery_id, task_id, owner_id, repo_id, checkout_id, principal_id, session_ref, "
             "source_snapshot_id, snapshot_status, assignment_id, exposure_evidence, degraded_codes_json, "
-            "resume_artifact_id, resume_revision_epoch, resume_revision, resume_receipt_id "
+            "resume_artifact_id, resume_revision_epoch, resume_revision, resume_receipt_id, "
+            "handoff_served_epoch, handoff_served_rev, handoff_served_digest "
             "FROM deliveries WHERE delivery_id = ?",
             (delivery_id,),
         ).fetchone()
@@ -1412,6 +1527,9 @@ class HandoffStore(HandoffStorePort):
             resume_revision=None if row[14] is None else int(row[14]),
             resume_receipt_id=None if row[15] is None else str(row[15]),
             seen_refs=seen_refs,
+            handoff_served_epoch=None if row[16] is None else int(row[16]),
+            handoff_served_rev=None if row[17] is None else int(row[17]),
+            handoff_served_digest=None if row[18] is None else str(row[18]),
         )
 
     def tx_record_artifact_get(

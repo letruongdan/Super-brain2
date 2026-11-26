@@ -56,6 +56,9 @@ class DeliveryOutcomeRecord:
     resume_revision: int | None
     resume_receipt_id: str | None
     seen_refs: tuple[tuple[str, int, int, str], ...]
+    handoff_served_epoch: int | None = None
+    handoff_served_rev: int | None = None
+    handoff_served_digest: str | None = None
 
 
 @dataclass(frozen=True)
@@ -337,6 +340,20 @@ class HandoffStorePort(Protocol):
         principal_id: str,
         selected_scope: Scope | None,
     ) -> DeliveryOutcomeRecord: ...
+
+    def render_delivery_handoff_l0(
+        self,
+        *,
+        task_id: str,
+        owner_id: str,
+        repo_id: str,
+        checkout_id: str,
+        revision_epoch: int,
+        revision: int,
+        served_digest: str | None,
+        now: datetime,
+        render_l0: Callable[..., str] | None = None,
+    ) -> DiscoverEntry: ...
 
     def tx_record_artifact_get(
         self,
