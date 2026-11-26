@@ -53,6 +53,9 @@ KNOWN_CRASHPOINTS: frozenset[str] = frozenset({
     # SP2-3: dual-store session binding + 3-phase continuity worker crashpoints
     "session.after_policy_bind_before_store_project",
     "continuity.worker.before_owner_commit",
+    # SP2-4: handoff commit + C5 response flush crashpoints
+    "handoff.after_commit_before_ack",
+    "artifact_send.after_pending_before_flush",
 })
 
 KNOWN_PAUSEPOINTS: frozenset[str] = KNOWN_CRASHPOINTS | {"writer.held"}

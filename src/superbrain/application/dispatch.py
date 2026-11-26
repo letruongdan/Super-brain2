@@ -49,6 +49,7 @@ _PLACEHOLDER_RECEIPT_ID = "00000000-0000-7000-8000-000000000000"
 _STORED_KIND_ACTIONS: dict[str, str] = {
     "delivery_result": "prepare_task",
     "artifact_result": "get_artifact",
+    "episode_result": "submit_episode",
     "outcome_result": "record_outcome",
 }
 
@@ -365,6 +366,8 @@ class KernelDispatcher:
         )
         if not was_raced_replay:
             crashpoint("kernel.after_commit_before_response")
+            if call.tool == "submit_episode" and ("handoff" in call.arguments or "takeover" in call.arguments):
+                crashpoint("handoff.after_commit_before_ack")
             if self._on_commit_completed is not None:
                 try:
                     self._on_commit_completed(stored)

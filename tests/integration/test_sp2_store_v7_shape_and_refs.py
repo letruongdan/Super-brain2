@@ -121,7 +121,7 @@ def test_continuity_refs_resolve_only_the_pinned_event_of_a_verified_link(truste
         finally:
             rt.policy.close()
             rt.lease.release()
-    assert read_schema_info(DataRoot.at(fx.root).store_db) == SchemaInfo(7, 7, fx.store_id)
+    assert read_schema_info(DataRoot.at(fx.root).store_db) == SchemaInfo(8, 8, fx.store_id)
 
     rt = reopen_kernel_job_runtime(fx.root, fx.store_id, os_)
     try:
@@ -266,7 +266,7 @@ def test_store_restore_of_a_v6_backup_with_a_divergent_capture_table_fails_and_k
     shutil.rmtree(store_dir)
     shutil.copytree(healthy, store_dir)
     migrate_offline(_config(fx, trusted_tmp, os_, clock), os_)
-    assert read_schema_info(DataRoot.at(fx.root).store_db) == SchemaInfo(7, 7, fx.store_id)
+    assert read_schema_info(DataRoot.at(fx.root).store_db) == SchemaInfo(8, 8, fx.store_id)
 
     rt = reopen_kernel_job_runtime(fx.root, fx.store_id, os_)
     try:
@@ -277,7 +277,7 @@ def test_store_restore_of_a_v6_backup_with_a_divergent_capture_table_fails_and_k
     finally:
         rt.policy.close()
         rt.lease.release()
-    assert read_schema_info(DataRoot.at(fx.root).store_db) == SchemaInfo(7, 7, fx.store_id)
+    assert read_schema_info(DataRoot.at(fx.root).store_db) == SchemaInfo(8, 8, fx.store_id)
     rt = reopen_kernel_job_runtime(fx.root, fx.store_id, os_)
     try:
         rows = rt.store._db.execute("SELECT COUNT(*), MIN(cas_holder_id) FROM capture_events").fetchone()

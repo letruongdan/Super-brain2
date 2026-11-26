@@ -23,6 +23,7 @@ from superbrain.ports.continuity import (
     compute_hmac_session_ref,
     register_continuity_store_factory,
 )
+from superbrain.storage._handoff_schema import record_v8_revision_header_in_tx
 from superbrain.storage._sessions_sql import (
     SESSION_SELECT_COLS,
     TASK_SELECT_COLS,
@@ -507,6 +508,21 @@ class SessionStore(SessionWorkerMixin):
                 "(task_id, handoff_revision, source_kind, agent_ref, observed_ref, recorded_at) "
                 "VALUES (?, ?, 'agent', ?, ?, ?)",
                 (task_id, next_handoff_rev, agent_ref, cur.observed_ref, stamp),
+            )
+            record_v8_revision_header_in_tx(
+                txn.db,
+                task_id=task_id,
+                next_revision=next_current_rev,
+                next_handoff_revision=next_handoff_rev,
+                next_task_state=cur.task_state,
+                next_source="agent",
+                principal_id=cur.holder_principal,
+                session_ref=holder_sref,
+                agent_ref=agent_ref,
+                observed_ref=cur.observed_ref,
+                agent_updated_at=stamp,
+                observed_through=cur.observed_through,
+                recorded_at=stamp,
             )
             updated = txn.db.execute(
                 f"SELECT {TASK_SELECT_COLS} FROM task_handoffs WHERE task_id = ?", (task_id,)

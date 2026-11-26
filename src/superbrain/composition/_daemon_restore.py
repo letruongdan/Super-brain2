@@ -350,6 +350,11 @@ class DaemonRestoreHandler(RestoreHandler):
             cancel_signal=self._executor.cancel if self._executor is not None else None,
         )
         self._composite_domain.rebind_job_service(job_service)
+        from superbrain.composition._daemon_session import build_default_handoff_domain
+
+        self._composite_domain.rebind_fallback(
+            build_default_handoff_domain(rt=rt, clock=self._clock, writer_epoch=new_epoch)
+        )
         new_ready: Ready | None = None
         if epoch_bumped:
             new_endpoint = Endpoint(

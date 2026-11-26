@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 
 from superbrain.core.ids import new_id
 from superbrain.storage._continuity_schema import apply_continuity_store_v7
+from superbrain.storage._handoff_schema import apply_handoff_store_v8
 from superbrain.storage._proposal_schema import (
     KERNEL_PROPOSAL_KINDS as KERNEL_PROPOSAL_KINDS,
 )
@@ -580,6 +581,8 @@ STORE_V5_MIGRATION = Migration(to_version=5, min_reader_version=5, apply=_store_
 STORE_V6_MIGRATION = Migration(to_version=6, min_reader_version=6, apply=_store_v6)
 # Store v7: session and continuity tables over every known store v6 shape (_continuity_schema).
 STORE_V7_MIGRATION = Migration(to_version=7, min_reader_version=7, apply=apply_continuity_store_v7)
+# Store v8: SP2-4 handoff revision headers, C5 extended columns, deliveries & episodes (_handoff_schema).
+STORE_V8_MIGRATION = Migration(to_version=8, min_reader_version=8, apply=apply_handoff_store_v8)
 
 KERNEL_POLICY_MIGRATIONS: tuple[Migration, ...] = (
     *POLICY_MIGRATIONS,
@@ -596,4 +599,5 @@ KERNEL_STORE_MIGRATIONS: tuple[Migration, ...] = (
     STORE_V5_MIGRATION,
     STORE_V6_MIGRATION,
     STORE_V7_MIGRATION,
+    STORE_V8_MIGRATION,
 )

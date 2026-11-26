@@ -22,9 +22,7 @@ from superbrain.ports.continuity import (
     TestRunSignal,
 )
 
-_EDIT_TOOLS: frozenset[str] = frozenset(
-    {"edit", "multiedit", "write", "notebookedit", "file_edit", "file_write"}
-)
+_EDIT_TOOLS: frozenset[str] = frozenset({"edit", "multiedit", "write", "notebookedit", "file_edit", "file_write"})
 _USER_PROMPT_KINDS: frozenset[str] = frozenset({"user_prompt", "user_message"})
 _CORRECTION_RE = re.compile(
     r"(?i)(?:\b(?:don['’]?t|do\s+not|never|stop|avoid|instead|wrong)\b|^(?:please\s+)?(?:use|switch\s+to|always|prefer)\b)"
@@ -57,11 +55,7 @@ def should_schedule_refresh(
         raise _invalid("invalid job_in_flight flag")
     count = require_non_negative_int(pending_event_count)
     now_dt = _require_aware_utc(now, label="now")
-    first_dt = (
-        _require_aware_utc(first_pending_at, label="first_pending_at")
-        if first_pending_at is not None
-        else None
-    )
+    first_dt = _require_aware_utc(first_pending_at, label="first_pending_at") if first_pending_at is not None else None
     if job_in_flight or count <= 0:
         return False
     if count >= WORKER_EVENT_THRESHOLD:
@@ -90,9 +84,7 @@ def _extract_edited_file_paths(ev: CaptureEventRecord) -> list[str]:
         raw_tool = payload.get("tool")
     tool_lower = raw_tool.lower() if isinstance(raw_tool, str) else ""
     is_edit_event = (
-        tool_lower in _EDIT_TOOLS
-        or ev.kind in {"file_edit", "file_write"}
-        or payload.get("modified") is True
+        tool_lower in _EDIT_TOOLS or ev.kind in {"file_edit", "file_write"} or payload.get("modified") is True
     )
     if not is_edit_event:
         return []
@@ -184,9 +176,7 @@ def extract_observed_summary(events: Sequence[CaptureEventRecord]) -> ObservedSu
                 if text:
                     _item("user_message")
 
-    error_signatures = tuple(
-        ErrorSignatureSignal(signature=sig, count=cnt) for sig, cnt in err_counts.items()
-    )
+    error_signatures = tuple(ErrorSignatureSignal(signature=sig, count=cnt) for sig, cnt in err_counts.items())
     found_lr = extract_long_running_with_source(events)
     long_running = None if found_lr is None else found_lr[0]
     long_running_source: tuple[str, int, str, str] | None = None

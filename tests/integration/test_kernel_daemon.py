@@ -1626,7 +1626,7 @@ def test_shallow_health_bypasses_blocked_write_queue(
                 "ready": True,
                 "store_id": _daemon_template.store_id,
                 "writer_epoch": ready.endpoint.writer_epoch,
-                "schema_version": 7,
+                "schema_version": 8,
                 "policy_schema_version": 5,
                 "degraded_codes": [],
             },
@@ -1954,27 +1954,14 @@ def test_get_job_uses_owner_scope(
             ).result(timeout=BOUND_WAIT_S)
             assert denied == {"ok": False, "error": {"code": "not_found", "message": "not found"}}
 
-        # 3. Deep health and all 6 business tools return capability_unavailable after auth/validation.
+        # 3. Deep health and unimplemented business tools return capability_unavailable after auth/validation.
         unsupported_calls: tuple[tuple[str, dict[str, JsonValue], Scope | None], ...] = (
             ("get_health", {"schema_version": "2.0", "deep": True, "idempotency_key": "idem-deep-health-0001"}, None),
-            (
-                "prepare_task",
-                {
-                    "schema_version": "2.0",
-                    "workspace_id": ws_a.repo_id,
-                    "checkout_id": ws_a.checkout_id,
-                    "description": "task",
-                    "idempotency_key": "idem-cap-prep-0001",
-                },
-                scope_a,
-            ),
             (
                 "search_knowledge",
                 {"schema_version": "2.0", "workspace_id": ws_a.repo_id, "query": "bug"},
                 scope_a,
             ),
-            ("get_artifact", _artifact_args(ws_a, "idem-cap-art-0001"), scope_a),
-            ("submit_episode", _episode_args(ws_a, "idem-cap-ep-0001"), scope_a),
             (
                 "record_outcome",
                 {

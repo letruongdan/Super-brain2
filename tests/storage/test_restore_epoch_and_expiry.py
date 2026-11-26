@@ -122,7 +122,7 @@ def test_store_v5_create_and_lt5_upgrade_seed_zero_and_preserve_data_root_layout
     assert layout_v5.restore_epoch_path.is_file()
     assert json.loads(layout_v5.restore_epoch_path.read_text(encoding="utf-8")) == {"restore_epoch": 0}
     assert read_restore_epoch(layout_v5, schema_version=6, os_=os_) == 0
-    assert read_schema_info(layout_v5.store_db) == SchemaInfo(7, 7, sid_v5)
+    assert read_schema_info(layout_v5.store_db) == SchemaInfo(8, 8, sid_v5)
 
     # Pre-v5 store without restore_epoch.json reads as 0; migrating <5 -> latest writes 0.
     root_v4 = trusted_tmp / "v4-upgrade"
@@ -156,7 +156,7 @@ def test_store_v5_create_and_lt5_upgrade_seed_zero_and_preserve_data_root_layout
             migrations=KERNEL_STORE_MIGRATIONS,
             now=clock.now(),
         )
-        assert rep.to_version == 7
+        assert rep.to_version == 8
     assert layout_v4.restore_epoch_path.is_file()
     assert read_restore_epoch(layout_v4, schema_version=6, os_=os_) == 0
 

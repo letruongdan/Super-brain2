@@ -23,6 +23,7 @@ from superbrain.ports.continuity import (
     SessionState,
     decide_session_liveness,
 )
+from superbrain.storage._handoff_schema import record_v8_revision_header_in_tx
 from superbrain.storage._sessions_sources import (
     _advance_session_in_tx,
     bound_task_for_session,
@@ -549,6 +550,21 @@ class SessionWorkerMixin:
             "(task_id, handoff_revision, source_kind, agent_ref, observed_ref, recorded_at) "
             "VALUES (?, ?, 'observed', ?, ?, ?)",
             (task_id, cur.handoff_revision, cur.agent_ref, observed_digest, stamp),
+        )
+        record_v8_revision_header_in_tx(
+            db,
+            task_id=task_id,
+            next_revision=next_current_rev,
+            next_handoff_revision=cur.handoff_revision,
+            next_task_state=cur.task_state,
+            next_source=next_source,
+            principal_id=cur.holder_principal,
+            session_ref=cur.holder_session_ref,
+            agent_ref=cur.agent_ref,
+            observed_ref=observed_digest,
+            agent_updated_at=cur.agent_updated_at,
+            observed_through=next_obs_through,
+            recorded_at=stamp,
         )
         persist_long_running_checkpoint(
             db,

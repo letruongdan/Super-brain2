@@ -26,6 +26,7 @@ from superbrain.composition._daemon_session import (
     DaemonTestHooks,
     _AdmittedOwnerSession,
     _DaemonCompositeDomain,
+    build_default_handoff_domain,
 )
 from superbrain.composition._endpoint import (
     BoundLoopbackListener,
@@ -197,7 +198,15 @@ def _open_owner_session(
             elif session_box:
                 session_box[0].record_request_drained()
 
-        composite_domain = _DaemonCompositeDomain(job_service, domain)
+        composite_domain = _DaemonCompositeDomain(
+            job_service,
+            domain,
+            fallback=build_default_handoff_domain(
+                rt=rt,
+                clock=resolved_clock,
+                writer_epoch=rt.lease.epoch,
+            ),
+        )
         bridge = KernelBridge(
             store=rt.store,
             policy=rt.policy,

@@ -14,7 +14,7 @@ from typing import Any
 from superbrain.adapters.os import os_adapters
 from superbrain.adapters.os.tls_material import create_store_tls
 from superbrain.cli_api.loopback import LoopbackClient, LoopbackTarget, LoopbackTransportError
-from superbrain.core.kernel import CaptureBatchCommand, Endpoint
+from superbrain.core.kernel import CaptureBatchCommand, Endpoint, Scope, ToolCommand
 from superbrain.storage.layout import DataRoot
 from superbrain.storage.sqlite import open_readonly
 from tests.support.clock import FakeClock
@@ -42,6 +42,12 @@ SP2_3_CRASHPOINTS: frozenset[str] = frozenset(
         "continuity.worker.before_owner_commit",
     }
 )
+SP2_4_CRASHPOINTS: frozenset[str] = frozenset(
+    {
+        "handoff.after_commit_before_ack",
+        "artifact_send.after_pending_before_flush",
+    }
+)
 SP22_CHILD = Path(__file__).resolve().with_name("sp2_crash_child.py")
 OWNER = "dan"
 
@@ -64,6 +70,11 @@ SP2_2_CRASH_CASES: tuple[SP22CrashCase, ...] = (
 SP2_3_CRASH_CASES: tuple[SP22CrashCase, ...] = (
     SP22CrashCase("session-bind", "session.after_policy_bind_before_store_project"),
     SP22CrashCase("continuity-worker", "continuity.worker.before_owner_commit"),
+)
+
+SP2_4_CRASH_CASES: tuple[SP22CrashCase, ...] = (
+    SP22CrashCase("handoff-serve", "handoff.after_commit_before_ack"),
+    SP22CrashCase("handoff-serve", "artifact_send.after_pending_before_flush"),
 )
 
 
@@ -672,3 +683,281 @@ def run_sp2_3_crash_case(ctx: KernelCrashContext, case: SP22CrashCase) -> None:
         return
 
     raise AssertionError(f"unexpected SP2-3 crashpoint: {case.crashpoint!r}")
+
+
+def _prepare_handoff_crash_case(ctx: KernelCrashContext) -> tuple[Path, Path, dict[str, Any]]:
+    tpl = _sp22_template()
+    data_root = ctx.case_dir / "data"
+    cfg_dir = ctx.case_dir / "config"
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    os_adapters().permissions.secure_directory(cfg_dir)
+    clone_owner_only_tree(tpl.root / "data", data_root)
+    clone_owner_only_tree(tpl.root / "tls", cfg_dir / "tls")
+    cfg_path = write_daemon_config_file(
+        cfg_dir / "daemon.json",
+        data_root=data_root,
+        expected_store_id=tpl.store_id,
+        cert_path=cfg_dir / "tls" / tpl.cert_name,
+        key_path=cfg_dir / "tls" / tpl.key_name,
+    )
+    payload_path = ctx.case_dir / "handoff-payload.json"
+    payload_path.write_text("{}", encoding="utf-8")
+    return data_root, cfg_path, {
+        "tpl": tpl,
+        "payload_path": payload_path,
+    }
+
+
+def _call_daemon_tool(
+    target: LoopbackTarget,
+    token: str,
+    tool: str,
+    arguments: dict[str, Any],
+    *,
+    scope: Scope | None = None,
+) -> dict[str, Any]:
+    client = LoopbackClient()
+    return client.call(
+        target,
+        ToolCommand(tool=tool, arguments=arguments, token=token, selected_scope=scope),
+    )
+
+
+def run_sp2_4_crash_case(ctx: KernelCrashContext, case: SP22CrashCase) -> None:
+    import subprocess
+
+    data_root, cfg_path, extras = _prepare_handoff_crash_case(ctx)
+    tpl: _SP22Template = extras["tpl"]
+    tpl_scope = Scope(tpl.repo_id, tpl.checkout_id)
+    payload_path: Path = extras["payload_path"]
+    client_err: list[BaseException] = []
+    state: dict[str, Any] = {}
+
+    if case.crashpoint == "handoff.after_commit_before_ack":
+        ep_idem = "idem-sp24-crash-ep-1"
+        sub_args: dict[str, Any] = {}
+
+        def _trigger_commit(ep: Endpoint) -> None:
+            target = LoopbackTarget(
+                endpoint=ep,
+                expected_store_id=tpl.store_id,
+                ca_pem=tpl.ca_pem,
+                leaf_cert_sha256=tpl.leaf_sha256,
+            )
+            prep = _call_daemon_tool(
+                target,
+                tpl.token,
+                "prepare_task",
+                {
+                    "schema_version": "2.0",
+                    "mode": "work",
+                    "workspace_id": tpl.repo_id,
+                    "checkout_id": tpl.checkout_id,
+                    "description": "Crash commit continuity goal",
+                    "idempotency_key": "idem-sp24-crash-prep-1",
+                },
+                scope=tpl_scope,
+            )
+            assert prep.get("ok") is True, prep
+            task_id = prep["data"]["task_id"]
+            fence = prep["data"]["handoff_live"]["fence"]
+            state["task_id"] = task_id
+            sub_args.update(
+                {
+                    "schema_version": "2.0",
+                    "task_id": task_id,
+                    "session_id": "raw-sid-sp24-crash",
+                    "workspace_id": tpl.repo_id,
+                    "checkout_id": tpl.checkout_id,
+                    "evidence": [{"kind": "tool_post", "data": {"ok": True}}],
+                    "handoff": {"working_goal": "Committed right before crash"},
+                    "base_revision": 0,
+                    "fence": fence,
+                    "idempotency_key": ep_idem,
+                }
+            )
+            try:
+                bad_res = _call_daemon_tool(target, tpl.token, "submit_episode", sub_args, scope=tpl_scope)
+                raise AssertionError(f"submit_episode returned instead of crashing at {case.crashpoint}: {bad_res!r}")
+            except LoopbackTransportError as err:
+                client_err.append(err)
+
+        run = run_marked(
+            sp22_child_cmd(ctx.env, case.operation, cfg_path, payload_path),
+            cwd=ctx.cwd,
+            crashpoint=case.crashpoint,
+            while_ready=_trigger_commit,
+        )
+        assert_wheel_provenance(run, ctx)
+        assert_request_crashed(run, case.crashpoint, trigger_result=client_err)
+        assert client_err, "client must see transport error when server exits 86 after commit"
+
+        ro_scratch = ctx.case_dir / "ro-handoff"
+        ro_scratch.mkdir(exist_ok=True)
+        with contextlib.closing(open_readonly(DataRoot.at(data_root).store_db, scratch_dir=ro_scratch)) as conn:
+            hrow = conn.execute(
+                "SELECT handoff_revision, current_revision FROM task_handoffs WHERE task_id = ?",
+                (state["task_id"],),
+            ).fetchone()
+            assert hrow is not None and int(hrow[0]) == 1 and int(hrow[1]) == 1
+
+        # Restart daemon without crashpoint: idempotent replay returns same episode_id & live holder status.
+        restarted_res: list[dict[str, Any]] = []
+        proc = subprocess.Popen(
+            sp22_child_cmd(ctx.env, case.operation, cfg_path, payload_path),
+            cwd=str(ctx.cwd),
+            env=clean_installed_subprocess_env(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        try:
+            assert proc.stderr is not None
+            ready_ep: Endpoint | None = None
+            for raw_line in proc.stderr:
+                if raw_line.startswith("READY "):
+                    ready_ep = Endpoint.from_canonical(raw_line[6:].strip().encode("utf-8"))
+                    break
+            assert ready_ep is not None
+            target2 = LoopbackTarget(
+                endpoint=ready_ep,
+                expected_store_id=tpl.store_id,
+                ca_pem=tpl.ca_pem,
+                leaf_cert_sha256=tpl.leaf_sha256,
+            )
+            rep = _call_daemon_tool(target2, tpl.token, "submit_episode", sub_args, scope=tpl_scope)
+            restarted_res.append(rep)
+        finally:
+            proc.terminate()
+            proc.wait(timeout=10.0)
+        assert len(restarted_res) == 1 and restarted_res[0].get("ok") is True
+        rdata = restarted_res[0]["data"]
+        assert rdata["handoff_status"] == "stored"
+        assert rdata["handoff_revision"] == 1
+        assert rdata["writer_status"] == "holder"
+        return
+
+    if case.crashpoint == "artifact_send.after_pending_before_flush":
+        get_args: dict[str, Any] = {}
+
+        def _trigger_send(ep: Endpoint) -> None:
+            target = LoopbackTarget(
+                endpoint=ep,
+                expected_store_id=tpl.store_id,
+                ca_pem=tpl.ca_pem,
+                leaf_cert_sha256=tpl.leaf_sha256,
+            )
+            prep = _call_daemon_tool(
+                target,
+                tpl.token,
+                "prepare_task",
+                {
+                    "schema_version": "2.0",
+                    "mode": "work",
+                    "workspace_id": tpl.repo_id,
+                    "checkout_id": tpl.checkout_id,
+                    "description": "Flush crash goal",
+                    "idempotency_key": "idem-sp24-flush-prep-1",
+                },
+                scope=tpl_scope,
+            )
+            assert prep.get("ok") is True
+            tid = prep["data"]["task_id"]
+            sub = _call_daemon_tool(
+                target,
+                tpl.token,
+                "submit_episode",
+                {
+                    "schema_version": "2.0",
+                    "task_id": tid,
+                    "session_id": "raw-sid-sp24-flush",
+                    "workspace_id": tpl.repo_id,
+                    "checkout_id": tpl.checkout_id,
+                    "evidence": [],
+                    "handoff": {"working_goal": "Ready to serve"},
+                    "base_revision": 0,
+                    "fence": prep["data"]["handoff_live"]["fence"],
+                    "idempotency_key": "idem-sp24-flush-sub-1",
+                },
+                scope=tpl_scope,
+            )
+            assert sub.get("ok") is True, sub
+            state["task_id"] = tid
+            get_args.update(
+                {
+                    "schema_version": "2.0",
+                    "workspace_id": tpl.repo_id,
+                    "task_id": tid,
+                    "artifact_id": tid,
+                    "revision": 1,
+                    "level": "L1",
+                    "idempotency_key": "idem-sp24-flush-get-1",
+                }
+            )
+            try:
+                _call_daemon_tool(target, tpl.token, "get_artifact", get_args, scope=tpl_scope)
+            except LoopbackTransportError as err:
+                client_err.append(err)
+
+        run = run_marked(
+            sp22_child_cmd(ctx.env, case.operation, cfg_path, payload_path),
+            cwd=ctx.cwd,
+            crashpoint=case.crashpoint,
+            while_ready=_trigger_send,
+        )
+        assert_wheel_provenance(run, ctx)
+        assert_request_crashed(run, case.crashpoint, trigger_result=client_err)
+        assert client_err
+
+        ro_scratch = ctx.case_dir / "ro-flush"
+        ro_scratch.mkdir(exist_ok=True)
+        with contextlib.closing(open_readonly(DataRoot.at(data_root).store_db, scratch_dir=ro_scratch)) as conn:
+            arow = conn.execute(
+                "SELECT id, state FROM artifact_send_attempt WHERE task_id = ?",
+                (state["task_id"],),
+            ).fetchone()
+            assert arow is not None and str(arow[1]) == "pending"
+            aborted_id = str(arow[0])
+
+        proc = subprocess.Popen(
+            sp22_child_cmd(ctx.env, case.operation, cfg_path, payload_path),
+            cwd=str(ctx.cwd),
+            env=clean_installed_subprocess_env(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        try:
+            assert proc.stderr is not None
+            ready_ep2: Endpoint | None = None
+            for raw_line in proc.stderr:
+                if raw_line.startswith("READY "):
+                    ready_ep2 = Endpoint.from_canonical(raw_line[6:].strip().encode("utf-8"))
+                    break
+            assert ready_ep2 is not None
+            target2 = LoopbackTarget(
+                endpoint=ready_ep2,
+                expected_store_id=tpl.store_id,
+                ca_pem=tpl.ca_pem,
+                leaf_cert_sha256=tpl.leaf_sha256,
+            )
+            rep2 = _call_daemon_tool(target2, tpl.token, "get_artifact", get_args, scope=tpl_scope)
+            assert rep2.get("ok") is True
+            assert rep2["data"]["served_receipt_id"] != aborted_id
+        finally:
+            proc.terminate()
+            proc.wait(timeout=10.0)
+
+        with contextlib.closing(open_readonly(DataRoot.at(data_root).store_db, scratch_dir=ro_scratch)) as conn:
+            old_row = conn.execute(
+                "SELECT state FROM artifact_send_attempt WHERE id = ?",
+                (aborted_id,),
+            ).fetchone()
+            assert old_row is not None and str(old_row[0]) == "unknown"
+        return
+
+    raise AssertionError(f"unexpected SP2-4 crashpoint: {case.crashpoint!r}")

@@ -30,6 +30,7 @@ from superbrain.cli_api._server_http import (
 )
 from superbrain.cli_api.operator import OperatorExecutor
 from superbrain.core.errors import BrainError, ErrorCode
+from superbrain.core.faults import crashpoint
 from superbrain.core.kernel import (
     CAPABILITY_MCP_TOOL,
     OPERATOR_REQUEST_BUDGET_NS,
@@ -467,6 +468,8 @@ class LoopbackServer:
 
                 if int(self._monotonic_ns()) >= tool_deadline_ns or self._past_stop_deadline():
                     return
+                if reply.send_completion is not None:
+                    crashpoint("artifact_send.after_pending_before_flush")
                 try:
                     write_json_response(
                         ssl_sock,

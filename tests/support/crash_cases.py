@@ -1703,3 +1703,4 @@ from tests.support.inc3_crash_cases import I3_3_CRASH_CASES as I3_3_CRASH_CASES 
 from tests.support.inc3_i34_crash_cases import I3_4_CRASH_CASES as I3_4_CRASH_CASES  # noqa: E402, F401
 from tests.support.sp2_crash_cases import SP2_2_CRASH_CASES as SP2_2_CRASH_CASES  # noqa: E402, F401
 from tests.support.sp2_crash_cases import SP2_3_CRASH_CASES as SP2_3_CRASH_CASES  # noqa: E402, F401
+from tests.support.sp2_crash_cases import SP2_4_CRASH_CASES as SP2_4_CRASH_CASES  # noqa: E402, F401

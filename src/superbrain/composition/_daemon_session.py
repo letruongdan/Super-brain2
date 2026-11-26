@@ -14,6 +14,7 @@ from superbrain.application.approvals import OperatorHandle
 from superbrain.application.continuity_worker import ContinuityWorkerCoordinator
 from superbrain.application.deadlines import Reservation
 from superbrain.application.dispatch import KernelToolDomain, PreparedEffect
+from superbrain.application.handoff_service import HandoffKernelDomain
 from superbrain.application.jobs import JobService
 from superbrain.application.owner_loop import AuthGate, OwnerSession
 from superbrain.composition._daemon_job_recovery import UNREADABLE, LeasedAttempts
@@ -54,8 +55,10 @@ from superbrain.core.wire import encode_envelope, make_success_envelope
 from superbrain.ports.clock import Clock, MonotonicClock
 from superbrain.ports.continuity import CONTINUITY_REFRESH_JOB_KIND
 from superbrain.ports.policy import Intent
+from superbrain.storage.handoffs import HandoffStore
 from superbrain.storage.idempotency import StagedKernelStore
 from superbrain.storage.runtime import Runtime
+from superbrain.storage.send_attempts import KernelSendAttemptStore
 from superbrain.workers.executor import JobExecutor, WorkItem
 
 _DAEMON_WORKER_ITEM_BUDGET_NS = 60_000_000_000
@@ -80,16 +83,51 @@ class DaemonTestHooks:
     before_runtime_close: Callable[[Runtime], None] | None = None
 
 
-class _DaemonCompositeDomain:
-    """Serves ``get_job`` via ``JobService`` and delegates any injected test/business domain tools."""
+_STORED_REF_TOOL: dict[str, str] = {
+    "delivery_result": "prepare_task",
+    "artifact_result": "get_artifact",
+    "episode_result": "submit_episode",
+}
 
-    def __init__(self, job_service: JobService, delegate: KernelToolDomain | None) -> None:
+
+def build_default_handoff_domain(
+    *,
+    rt: Runtime,
+    clock: Clock,
+    writer_epoch: int,
+) -> HandoffKernelDomain | None:
+    """Build the production SP2-4 ``HandoffKernelDomain`` when store v8 and policy v5 are admitted."""
+    if rt.store.schema_version < 8 or rt.policy.schema_version < 5:
+        return None
+    return HandoffKernelDomain(
+        handoffs=HandoffStore(rt.store, rt.policy),
+        policy=rt.policy,
+        clock=clock,
+        send_attempts=KernelSendAttemptStore(rt.store, rt.policy, writer_epoch=writer_epoch),
+    )
+
+
+class _DaemonCompositeDomain:
+    """Serves ``get_job``, SP2-4 handoff tools, and any injected test/business domain tools."""
+
+    def __init__(
+        self,
+        job_service: JobService,
+        delegate: KernelToolDomain | None,
+        *,
+        fallback: KernelToolDomain | None = None,
+    ) -> None:
         self._job_service = job_service
         self._delegate = delegate
+        self._fallback = fallback
 
     def rebind_job_service(self, job_service: JobService) -> None:
         """Point subsequent job queries at the post-restore ``JobService``."""
         self._job_service = job_service
+
+    def rebind_fallback(self, fallback: KernelToolDomain | None) -> None:
+        """Point SP2-4 continuity tools at the post-restore ``HandoffKernelDomain``."""
+        self._fallback = fallback
 
     @property
     def store(self) -> object:
@@ -105,12 +143,12 @@ class _DaemonCompositeDomain:
 
     def supports_tool(self, tool: str, *, deep: bool = False) -> bool:
         if tool == "get_job" and not deep:
-            if self._delegate is not None and self._delegate.supports_tool(tool, deep=deep):
-                return True
             return True
-        if self._delegate is None:
-            return False
-        return self._delegate.supports_tool(tool, deep=deep)
+        if self._delegate is not None and self._delegate.supports_tool(tool, deep=deep):
+            return True
+        if self._fallback is not None and self._fallback.supports_tool(tool, deep=deep):
+            return True
+        return False
 
     def execute_readonly(self, call: Call, ctx: CallContext) -> dict[str, JsonValue]:
         if call.tool == "get_job":
@@ -120,14 +158,26 @@ class _DaemonCompositeDomain:
             if not isinstance(job_id, str):
                 raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
             return self._job_service.get_job(job_id, ctx.principal, selected_scope=ctx.selected_scope).to_dict()
-        if self._delegate is None:
-            raise BrainError(ErrorCode.CAPABILITY_UNAVAILABLE, "capability unavailable")
-        return self._delegate.execute_readonly(call, ctx)
+        if self._delegate is not None and self._delegate.supports_tool(call.tool, deep=False):
+            return self._delegate.execute_readonly(call, ctx)
+        if self._fallback is not None and self._fallback.supports_tool(call.tool, deep=False):
+            return self._fallback.execute_readonly(call, ctx)
+        raise BrainError(ErrorCode.CAPABILITY_UNAVAILABLE, "capability unavailable")
 
     def prepare_mutation(self, call: Call, ctx: CallContext, *, now: datetime) -> PreparedEffect:
-        if self._delegate is None:
-            raise BrainError(ErrorCode.CAPABILITY_UNAVAILABLE, "capability unavailable")
-        return self._delegate.prepare_mutation(call, ctx, now=now)
+        if self._delegate is not None and self._delegate.supports_tool(call.tool, deep=False):
+            return self._delegate.prepare_mutation(call, ctx, now=now)
+        if self._fallback is not None and self._fallback.supports_tool(call.tool, deep=False):
+            return self._fallback.prepare_mutation(call, ctx, now=now)
+        raise BrainError(ErrorCode.CAPABILITY_UNAVAILABLE, "capability unavailable")
+
+    def _stored_target(self, result: StoredResult) -> KernelToolDomain | None:
+        tool = _STORED_REF_TOOL.get(result.refs[0].kind) if result.refs else None
+        if self._delegate is not None and (tool is None or self._delegate.supports_tool(tool, deep=False)):
+            return self._delegate
+        if self._fallback is not None and tool is not None and self._fallback.supports_tool(tool, deep=False):
+            return self._fallback
+        return self._delegate
 
     def render_stored(
         self,
@@ -136,9 +186,10 @@ class _DaemonCompositeDomain:
         *,
         selected_scope: Scope | None,
     ) -> dict[str, JsonValue]:
-        if self._delegate is None:
+        target = self._stored_target(result)
+        if target is None:
             raise BrainError(ErrorCode.CAPABILITY_UNAVAILABLE, "capability unavailable")
-        return self._delegate.render_stored(result, principal, selected_scope=selected_scope)
+        return target.render_stored(result, principal, selected_scope=selected_scope)
 
     def describe_artifact_send(
         self,
@@ -148,9 +199,10 @@ class _DaemonCompositeDomain:
         *,
         selected_scope: Scope | None,
     ) -> ArtifactSendSpec | None:
-        if self._delegate is None:
+        target = self._stored_target(result)
+        if target is None:
             return None
-        return self._delegate.describe_artifact_send(result, rendered, principal, selected_scope=selected_scope)
+        return target.describe_artifact_send(result, rendered, principal, selected_scope=selected_scope)
 
 
 class _AdmittedOwnerSession(OwnerSession):

@@ -441,6 +441,21 @@ class StoreKernelTx(JobKernelTxReads):
 
         return _decoded(build)
 
+    def read_task_scope(self, task_id: str) -> tuple[str, str, str] | None:
+        """Return ``(owner_id, repo_id, checkout_id)`` from ``p_task_lineage_bindings`` or v8 ``tasks``."""
+        bound = self.read_task_binding(task_id)
+        bound_scope = None if bound is None else (bound.owner_id, bound.repo_id, bound.checkout_id)
+        has_tasks = self._query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'tasks'", ())
+        task_scope: tuple[str, str, str] | None = None
+        if has_tasks:
+            rows = self._query("SELECT owner_id, repo_id, checkout_id FROM tasks WHERE task_id = ?", (task_id,))
+            if rows:
+                row = rows[0]
+                task_scope = (str(row[0]), str(row[1]), str(row[2]))
+        if bound_scope is not None and task_scope is not None and bound_scope != task_scope:
+            raise BrainError(ErrorCode.INTEGRITY_FAILURE, "task scope mismatch between lineage and tasks")
+        return bound_scope if bound_scope is not None else task_scope
+
     def read_task_lineage(self, task_id: str) -> tuple[LineageSet, bool]:
         rows = self._query(f"SELECT {_SOURCE_COLUMNS} FROM {TASK_SOURCES_TABLE} WHERE task_id = ?", (task_id,))
         sources = _decoded(lambda: frozenset(_lineage_ref(row) for row in rows))

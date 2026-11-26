@@ -20,7 +20,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-_MODES = ("outbox-enqueue", "capture-serve", "session-bind", "continuity-worker")
+_MODES = ("outbox-enqueue", "capture-serve", "session-bind", "continuity-worker", "handoff-serve")
 
 
 class _StaticClock:
@@ -113,6 +113,25 @@ def _run_capture_serve(config_path: Path, payload: dict[str, Any]) -> int:
             session.auth_gate.publish(new_snap)
 
         loop.run_owner_action(_publish).result(timeout=5.0)
+        _mark("READY", ready.endpoint.encode_canonical().decode("utf-8"))
+
+    try:
+        return serve_config_path(config_path, os_=adapters, on_ready=_on_ready)
+    finally:
+        shutil.rmtree(scratch_base, ignore_errors=True)
+
+
+def _run_handoff_serve(config_path: Path, payload: dict[str, Any]) -> int:
+    from superbrain.application.owner_loop import OwnerLoop
+    from superbrain.composition.daemon_entry import serve_config_path
+    from superbrain.composition.owner_entry import _explicit_owner_adapters
+    from superbrain.core.kernel import Ready
+
+    _cfg, adapters, scratch_base = _explicit_owner_adapters(config_path)
+    _ = payload
+
+    def _on_ready(ready: Ready, _loop: OwnerLoop) -> None:
+        shutil.rmtree(scratch_base, ignore_errors=True)
         _mark("READY", ready.endpoint.encode_canonical().decode("utf-8"))
 
     try:
@@ -236,6 +255,8 @@ def main(argv: list[str]) -> int:
             return _run_session_bind(target_path, payload)
         if mode == "continuity-worker":
             return _run_continuity_worker(target_path, payload)
+        if mode == "handoff-serve":
+            return _run_handoff_serve(target_path, payload)
         return _run_capture_serve(target_path, payload)
     except BrainError as err:
         owner_entry._write_stderr(err.code.value)

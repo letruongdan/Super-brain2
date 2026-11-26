@@ -300,7 +300,7 @@ def test_every_known_store_v6_shape_upgrades_to_v7_and_serves_refs_only(trusted_
     assert read_schema_info(DataRoot.at(fx.root).store_db) == SchemaInfo(6, 6, fx.store_id)
     report = migrate_offline(cfg, os_)
     assert (report.policy_report.status, report.store_report.status) == ("skipped", "migrated")
-    assert read_schema_info(DataRoot.at(fx.root).store_db) == SchemaInfo(7, 7, fx.store_id)
+    assert read_schema_info(DataRoot.at(fx.root).store_db) == SchemaInfo(8, 8, fx.store_id)
 
     # Events kept; links kept by ID/digest; no event content copied into SQLite.
     events_after = _query(fx.root, scratch, "SELECT producer_stream, sequence, payload_digest FROM capture_events")
