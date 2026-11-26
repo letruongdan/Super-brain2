@@ -24,8 +24,10 @@ from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.ids import new_id
 from superbrain.core.jsonvalue import JsonValue
 from superbrain.core.kernel import (
+    CAPABILITY_MCP_TOOL,
     ArtifactSendAttempt,
     AuthGrantStamp,
+    AuthSnapshot,
     BootstrapAuthorization,
     Call,
     CallContext,
@@ -76,6 +78,14 @@ class _MutableRequestAuthState(RequestAuthStatePort, Protocol):
 
     def clear(self) -> None: ...
 
+    def merge_runtime_capabilities(self, snap: AuthSnapshot) -> AuthSnapshot: ...
+
+
+def _encoded_error(err: BrainError) -> CallResult:
+    envelope = make_error_envelope(err)
+    encode_envelope(envelope)
+    return envelope
+
 
 def _verify_domain_pair(domain: KernelToolDomain | None, *, store: Store, policy: PolicyStore) -> None:
     if domain is None:
@@ -110,9 +120,7 @@ class KernelBridge(KernelBlobStagePort):
         after_reserve_before_enqueue: Callable[[Reservation], None] | None = None,
         on_reservation_change: Callable[[], None] | None = None,
         on_queue_wake: Callable[[], None] | None = None,
-        on_owner_reply_ready: Callable[
-            [Reservation, AuthGrantStamp | None, SendAttemptCompletion | None], None
-        ]
+        on_owner_reply_ready: Callable[[Reservation, AuthGrantStamp | None, SendAttemptCompletion | None], None]
         | None = None,
         on_owner_finished: Callable[[Reservation, bool], None] | None = None,
         on_clock_untrusted_changed: Callable[[bool], None] | None = None,
@@ -238,31 +246,32 @@ class KernelBridge(KernelBlobStagePort):
         self._check_live_pair()
         return self._policy.schema_version
 
+    def _non_mcp_error_envelope(self, credential_id: str) -> CallResult | None:
+        view = self._auth_state.current()
+        cred = view.auth.credentials.get(credential_id) if view is not None else None
+        if cred is None or cred.revoked or CAPABILITY_MCP_TOOL in cred.capabilities:
+            return None
+        return _encoded_error(BrainError(ErrorCode.IDENTITY_MISMATCH, "identity mismatch"))
+
     def _run_reserved_on_owner(
-        self,
-        call: Call,
-        ctx: CallContext,
-        auth: PrivateRequestAuth,
-        reservation: Reservation,
+        self, call: Call, ctx: CallContext, auth: PrivateRequestAuth, reservation: Reservation
     ) -> CallResult:
         try:
             self._check_live_pair()
+            non_mcp = self._non_mcp_error_envelope(auth.credential_id)
+            if non_mcp is not None:
+                return non_mcp
         except BrainError as err:
             if err.code in (ErrorCode.IDENTITY_MISMATCH, ErrorCode.POLICY_UNAVAILABLE, ErrorCode.INTEGRITY_FAILURE):
                 self._auth_state.clear()
-            err_envelope = make_error_envelope(err)
-            encode_envelope(err_envelope)
-            return err_envelope
+            return _encoded_error(err)
         result = self._dispatcher.dispatch_reserved(call, ctx, auth=auth, reservation=reservation)
         if self._on_clock_untrusted_changed is not None:
             self._on_clock_untrusted_changed(self._idempotency.clock_untrusted())
         if result.get("ok") is False:
             err_obj = result.get("error")
             err_code = err_obj.get("code") if isinstance(err_obj, Mapping) else None
-            if err_code in (
-                ErrorCode.IDENTITY_MISMATCH.value,
-                ErrorCode.POLICY_UNAVAILABLE.value,
-            ):
+            if err_code in (ErrorCode.IDENTITY_MISMATCH.value, ErrorCode.POLICY_UNAVAILABLE.value):
                 self._auth_state.clear()
             elif err_code == ErrorCode.UNAUTHENTICATED.value:
                 self._clear_auth_if_diverged(auth.credential_id)
@@ -278,6 +287,20 @@ class KernelBridge(KernelBlobStagePort):
             self._on_owner_reply_ready(reservation, stamp, completion)
         return result
 
+    def _verified_auth_view(self) -> RequestAuthView | None:
+        try:
+            view = self._auth_state.current()
+            if view is None:
+                return None
+            live_snap = self._policy.snapshot()
+        except BrainError:
+            self._auth_state.clear()
+            return None
+        if not view.auth.matches_persisted_policy(live_snap):
+            self._auth_state.clear()
+            return None
+        return view
+
     def _clear_auth_if_diverged(self, credential_id: str) -> None:
         try:
             view = self._auth_state.current()
@@ -286,40 +309,14 @@ class KernelBridge(KernelBlobStagePort):
             return
         if view is None:
             return
-        cred = view.auth.credentials.get(credential_id)
-        if (
-            cred is not None
-            and not cred.revoked
-            and view.auth.principals.get(cred.principal.principal_id) == cred.principal
-        ):
+        if view.auth.is_active_mcp_credential(credential_id):
             self._auth_state.clear()
             return
-        try:
-            live_snap = self._policy.snapshot()
-        except BrainError:
-            self._auth_state.clear()
-            return
-        if view.auth != live_snap:
-            self._auth_state.clear()
+        self._verified_auth_view()
 
     def _mint_owner_grant_stamp(self, credential_id: str) -> AuthGrantStamp | None:
-        try:
-            view = self._auth_state.current()
-        except BrainError:
-            self._auth_state.clear()
-            return None
-        if view is None:
-            return None
-        try:
-            live_snap = self._policy.snapshot()
-        except BrainError:
-            self._auth_state.clear()
-            return None
-        if view.auth != live_snap:
-            self._auth_state.clear()
-            return None
-        cred = view.auth.credentials.get(credential_id)
-        if cred is None or cred.revoked or view.auth.principals.get(cred.principal.principal_id) != cred.principal:
+        view = self._verified_auth_view()
+        if view is None or not view.auth.is_active_mcp_credential(credential_id):
             return None
         return AuthGrantStamp(
             credential_id=credential_id,
@@ -343,7 +340,7 @@ class KernelBridge(KernelBlobStagePort):
         """Load snapshot + active request HMAC key on the owner thread and publish atomically into RAM (C3)."""
         try:
             self._check_live_pair()
-            snap = self._policy.snapshot()
+            snap = self._auth_state.merge_runtime_capabilities(self._policy.snapshot())
             key_id, key_bytes = self._policy.request_digest_key()
             version = self._auth_state.next_version()
             view = RequestAuthView(
@@ -449,9 +446,7 @@ class KernelBridge(KernelBlobStagePort):
     def close_admissions(self) -> None:
         self._coordinator.close_admissions()
 
-    def prepare_cancel_uncommitted_for_shutdown(
-        self,
-    ) -> tuple[int, tuple[Callable[[], None], ...]]:
+    def prepare_cancel_uncommitted_for_shutdown(self) -> tuple[int, tuple[Callable[[], None], ...]]:
         return self._coordinator.prepare_cancel_uncommitted_for_shutdown()
 
     def cancel_uncommitted_for_shutdown(self) -> int:
@@ -475,10 +470,11 @@ class KernelBridge(KernelBlobStagePort):
     def dispatch(self, call: Call, ctx: CallContext, *, auth: PrivateRequestAuth) -> CallResult:
         try:
             self._check_live_pair()
+            non_mcp = self._non_mcp_error_envelope(auth.credential_id)
+            if non_mcp is not None:
+                return non_mcp
         except BrainError as err:
-            err_envelope = make_error_envelope(err)
-            encode_envelope(err_envelope)
-            return err_envelope
+            return _encoded_error(err)
         return self._dispatcher.dispatch(call, ctx, auth=auth)
 
     def render_current(self, result: StoredResult, principal: Principal, *, selected_scope: Scope | None) -> JsonValue:

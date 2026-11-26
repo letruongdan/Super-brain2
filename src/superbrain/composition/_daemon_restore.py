@@ -368,7 +368,7 @@ class DaemonRestoreHandler(RestoreHandler):
             publish_endpoint(rt.root, rt.lease, new_endpoint, self._adapters)
             new_ready = replace(self._session.ready, endpoint=new_endpoint, identity=new_endpoint.identity)
         self._session.rebind_after_restore(rt=rt, job_store=job_store, job_service=job_service, ready=new_ready)
-        snap = rt.policy.snapshot()
+        snap = self._session.auth_gate.merge_runtime_capabilities(rt.policy.snapshot())
         has_active_cred = any(
             not cred.revoked and snap.principals.get(cred.principal.principal_id) == cred.principal
             for cred in snap.credentials.values()

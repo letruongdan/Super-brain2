@@ -18,11 +18,14 @@ from superbrain.core.kernel import (
     TLS_EXPIRING_WINDOW,
     AuthGrantStamp,
     AuthSnapshot,
+    CredentialCapabilityBinding,
     Identity,
     OwnerReply,
     RequestAuthView,
     ShallowHealthMeta,
     ToolCommand,
+    apply_credential_capability_bindings,
+    collect_credential_capability_bindings,
     is_strict_int,
     parse_bearer_token,
     require_aware_utc,
@@ -49,6 +52,7 @@ class AuthGate(RequestAuthStatePort):
         self._closed = False
         self._cached_key_id: str | None = None
         self._cached_key_bytes: bytes | None = None
+        self._credential_bindings: dict[str, CredentialCapabilityBinding] = {}
 
     @property
     def identity(self) -> Identity:
@@ -149,9 +153,18 @@ class AuthGate(RequestAuthStatePort):
                 self._issued_version = view.version
             self._cached_key_id = view.active_request_key_id
             self._cached_key_bytes = view.active_request_key_bytes
+            self._credential_bindings = collect_credential_capability_bindings(view.auth)
             if health_meta is not None:
                 self._health_meta = health_meta
             return view
+
+    def merge_runtime_capabilities(self, snap: AuthSnapshot) -> AuthSnapshot:
+        """Overlay cached runtime credential capabilities onto a freshly loaded policy snapshot."""
+        with self._lock:
+            if self._closed or not self._credential_bindings:
+                return snap
+            bindings = dict(self._credential_bindings)
+        return apply_credential_capability_bindings(snap, bindings)
 
     def install(self, view: RequestAuthView) -> RequestAuthView:
         return self.publish_view(view)
@@ -193,6 +206,7 @@ class AuthGate(RequestAuthStatePort):
                 self._issued_version = view.version
             self._cached_key_id = view.active_request_key_id
             self._cached_key_bytes = view.active_request_key_bytes
+            self._credential_bindings = collect_credential_capability_bindings(view.auth)
             self._health_meta = health_meta
             return view
 
@@ -243,6 +257,7 @@ class AuthGate(RequestAuthStatePort):
             self._closed = True
             self._view = None
             self._health_meta = None
+            self._credential_bindings.clear()
 
 
 def evaluate_shallow_health(
