@@ -12,7 +12,7 @@ Tài liệu vận hành cho lệnh tự chẩn đoán (SP1 đợt 4, đặc tả
 | `brain doctor … --checkout <ABS>` | Kiểm thêm một checkout | So theo dạng chuẩn của hệ điều hành. Report của một checkout không bao giờ được trả cho lời gọi toàn kho. |
 | `brain doctor … --wait-ms <0..10000>` | Chờ job doctor đang chạy | Mặc định 10000. Hết thời gian chờ thì trả `status: running` kèm `job_id`; chạy lại lệnh để đọc kết quả. |
 | `brain doctor … --json` | Dùng cho script | Kết quả là `{"ok": true, "data": …}`, hoặc `{"ok": false, "error": {"code", "message"}}` khi lỗi. |
-| `brain doctor --config <ABS> --fix` | Áp dụng mọi thao tác sửa an toàn (§3) qua daemon | Chỉ chạy online và cần quyền operator. Dùng cùng `--offline`, hoặc khi daemon không phục vụ, thì trả `daemon_unavailable`. |
+| `brain doctor --config|--profile <ABS> --fix` | Áp dụng mọi thao tác sửa an toàn (§3) qua daemon | Chỉ chạy online và cần credential operator thuộc **chủ kho đã ghim** (`store_owner`). Operator hợp lệ khác hoặc khi chưa ghim `store_owner` đều bị từ chối fail-closed với `not_found` (mã thoát `1`, không chạy thao tác nào). Dùng cùng `--offline`, hoặc khi daemon không phục vụ, thì trả `daemon_unavailable`. |
 
 **Mã thoát:** `0` khi có báo cáo, kể cả báo cáo chứa WARN hoặc FAIL; `1` khi gặp lỗi có mã (auth, TLS, scope, daemon không sẵn sàng, identity lệch, store bận…); `2` khi cú pháp sai (`invalid_input`).
 
@@ -82,7 +82,7 @@ Mọi chuỗi trong report (`detail`, `remediation`, `layer2_harnesses`, `permis
 
 ## 3. Thao tác sửa an toàn
 
-`brain doctor --fix` gửi yêu cầu tới `/v2/operator/doctor/fix` mà không chỉ định thao tác, nên **mọi** thao tác dưới đây đều được chạy. Muốn chỉ chạy một số thao tác thì gọi API operator với `{"actions": [...]}`; không được thêm khoá nào khác ngoài `actions` và `checkout_root`.
+Cả CLI (`brain doctor --config|--profile <ABS> --fix`) lẫn API operator (`POST /v2/operator/doctor/fix`) đều yêu cầu credential operator của **chủ kho đã ghim** (`store_owner`). Operator thuộc principal khác (dù hợp lệ với `brain doctor` / `/v2/operator/doctor/report`) hoặc khi store chưa ghim `store_owner` đều bị từ chối fail-closed với mã `not_found` trước khi chạy bất kỳ thao tác nào. Lệnh `brain doctor … --fix` không chỉ định thao tác nên **mọi** thao tác dưới đây đều được chạy; muốn chỉ chạy một số thao tác thì gọi API operator với `{"actions": [...]}` (không được thêm khoá nào khác ngoài `actions` và `checkout_root`).
 
 | Thao tác | Tác dụng | Ghi chú |
 |---|---|---|
@@ -93,7 +93,7 @@ Mọi chuỗi trong report (`detail`, `remediation`, `layer2_harnesses`, `permis
 | `replay_outbox` | Phát lại outbox capture theo hợp đồng ACK của SP2 | Không có adapter thì trả `capability_unavailable` |
 | `restart_daemon` | Khởi động lại qua supervisor đã xác minh | Không có supervisor thì trả `capability_unavailable` |
 
-Mỗi thao tác kiểm principal, lease và đích vật lý ngay trước khi ghi, rồi trả kết quả riêng: `applied`, `noop`, `capability_unavailable` hoặc `failed`. Các thao tác sửa **không bao giờ** đổi config của harness, không xử lý ApplyJournal và không restore. Các việc đó đi qua entrypoint có cổng duyệt riêng.
+Mỗi thao tác kiểm principal thuộc `store_owner` đã ghim (nếu lệch hoặc chưa ghim thì fail-closed với `not_found`), writer lease và đích vật lý ngay trước khi ghi, rồi trả kết quả riêng: `applied`, `noop`, `capability_unavailable` hoặc `failed`. Các thao tác sửa **không bao giờ** đổi config của harness, không xử lý ApplyJournal và không restore. Các việc đó đi qua entrypoint có cổng duyệt riêng.
 
 ## 4. Chạy nền
 
@@ -109,10 +109,11 @@ Mỗi thao tác kiểm principal, lease và đích vật lý ngay trước khi g
 | `daemon_unavailable` | Kiểm tra daemon bằng `brain status --profile <ABS>`. Chỉ đọc offline khi chắc chắn daemon đã dừng. |
 | `store_busy` khi dùng `--offline` | Có tiến trình đang giữ writer lock. Dùng đường online, hoặc dừng daemon trước. |
 | `identity_mismatch`, lỗi pin hay revoked | Không thử chạy offline thay thế; xác minh lại profile hoặc credential operator |
+| `not_found` khi chạy `--fix` hoặc gọi `POST /v2/operator/doctor/fix` | Credential operator không thuộc chủ kho đã ghim (`store_owner`) hoặc kho chưa ghim `store_owner`; không có thao tác sửa nào được chạy. Đổi sang credential/profile của `store_owner` rồi thử lại. |
 | `status: running` mãi không xong | Đọc lại theo `job_id`, rồi xem `get_health(deep=true)`. Job lỗi sẽ kết thúc ở `failed` hoặc `dead_letter` và không chặn lượt kế tiếp. |
-| `permissions.tree` hay `storage.ledger_projection_match` FAIL | `brain doctor --config <ABS> --fix`, hoặc gọi API operator với `tighten_permissions` hay `rebuild_projections` |
+| `permissions.tree` hay `storage.ledger_projection_match` FAIL | Dùng credential operator của `store_owner` đã ghim để chạy `brain doctor --config|--profile <ABS> --fix`, hoặc gọi API `POST /v2/operator/doctor/fix` với `tighten_permissions` hay `rebuild_projections` |
 | Có Capture gap hoặc outbox còn tồn | Thao tác `replay_outbox` (cần adapter SP2) |
 
 ## 6. Bằng chứng nghiệm thu
 
-Receipt gate nằm ngoài cây tracked: `.gate/receipt-<sha>-<python>-<platform>-*.json` trong checkout nghiệm thu, cùng thư mục `--evidence-dir` của mỗi lượt. Biên bản nghiệm thu I4 (fix note R1 tới R10 và A1/A2, ghi chú gói B, kế hoạch bàn giao `2026-11-25-sp1-increment4-acceptance-handoff.md`) nằm trong `docs/reviews/` và `docs/superpowers/plans/` của checkout điều phối.
+Receipt gate nằm ngoài cây tracked: `.gate/receipt-<sha>-<python>-<platform>-*.json` trong checkout nghiệm thu, cùng thư mục `--evidence-dir` của mỗi lượt. Biên bản nghiệm thu I4 (fix note R1 tới R11 và A1/A2, ghi chú gói B, kế hoạch bàn giao `2026-11-25-sp1-increment4-acceptance-handoff.md`) nằm trong `docs/reviews/` và `docs/superpowers/plans/` của checkout điều phối.
