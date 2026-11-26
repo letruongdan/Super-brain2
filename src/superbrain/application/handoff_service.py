@@ -47,6 +47,14 @@ from superbrain.ports.handoff import (
 from superbrain.ports.kernel import KernelPolicyPort, KernelSendAttemptPort, KernelTx
 
 _DEFAULT_BUDGET_TOKENS = 4000
+_UNAVAILABLE_SECTION_CODES: tuple[str, ...] = (
+    "skills_unavailable",
+    "lessons_unavailable",
+    "context_unavailable",
+    "finishing_gates_unavailable",
+)
+_CONTINUITY_TRUNCATED_CODE = "continuity_truncated"
+_SNAPSHOT_UNAVAILABLE_CODE = "snapshot_unavailable"
 
 
 def _discover_entries_to_dicts(entries: Sequence[DiscoverEntry]) -> list[dict[str, JsonValue]]:
@@ -203,14 +211,9 @@ class HandoffKernelDomain(KernelToolDomain):
             _discover_entries_to_dicts(entries),
             budget_tokens=budget_tokens,
         )
-        degraded: list[JsonValue] = [
-            "skills_unavailable",
-            "lessons_unavailable",
-            "context_unavailable",
-            "finishing_gates_unavailable",
-        ]
+        degraded: list[JsonValue] = list(_UNAVAILABLE_SECTION_CODES)
         if truncated:
-            degraded.append("handoff_discover_truncated")
+            degraded.append(_CONTINUITY_TRUNCATED_CODE)
         return {
             "workspace_id": binding.repo_id,
             "checkout_id": binding.checkout_id,
@@ -276,10 +279,10 @@ class HandoffKernelDomain(KernelToolDomain):
         )
         if source_snapshot_id is not None:
             snapshot_status = "available"
-            degraded_codes: tuple[str, ...] = ()
+            degraded_codes: tuple[str, ...] = _UNAVAILABLE_SECTION_CODES
         else:
             snapshot_status = "unavailable"
-            degraded_codes = ("snapshot_unavailable",)
+            degraded_codes = (_SNAPSHOT_UNAVAILABLE_CODE, *_UNAVAILABLE_SECTION_CODES)
         delivery_id = new_id()
         blobs = (goal_bytes,) if goal_bytes is not None else ()
 
@@ -297,6 +300,7 @@ class HandoffKernelDomain(KernelToolDomain):
                 session_ref=None,
                 description_bytes=goal_bytes,
                 create_task=create_task,
+                task_id_provided=raw_tid is not None,
                 source_snapshot_id=source_snapshot_id,
                 snapshot_status=snapshot_status,
                 assignment_id=None,

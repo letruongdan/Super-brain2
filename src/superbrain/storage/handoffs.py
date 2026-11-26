@@ -53,6 +53,49 @@ from superbrain.storage.store import Store
 
 _EVENT_RETENTION = timedelta(days=90)
 _DISCOVER_WINDOW = timedelta(days=14)
+_OPEN_HANDOFFS_PRESENT_CODE = "open_handoffs_present"
+_OBSERVED_NEWER_CODE = "observed_newer"
+
+
+def _unique_codes(codes: Sequence[str]) -> list[str]:
+    """Deduplicate degraded codes while preserving insertion order."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for code in codes:
+        if code not in seen:
+            seen.add(code)
+            out.append(code)
+    return out
+
+
+def _has_open_handoffs_in_db(
+    db: sqlite3.Connection,
+    *,
+    owner_id: str,
+    repo_id: str,
+    checkout_id: str,
+    cutoff: str | None = None,
+    exclude_task_id: str | None = None,
+) -> bool:
+    clauses = [
+        "t.owner_id = ?",
+        "t.repo_id = ?",
+        "t.checkout_id = ?",
+        "h.task_state IN ('open', 'in_progress')",
+        "h.current_revision >= 1",
+    ]
+    params: list[object] = [owner_id, repo_id, checkout_id]
+    if exclude_task_id is not None:
+        clauses.append("h.task_id != ?")
+        params.append(exclude_task_id)
+    if cutoff is not None:
+        clauses.append("COALESCE(NULLIF(h.updated_at, ''), t.updated_at) >= ?")
+        params.append(cutoff)
+    sql = (
+        "SELECT 1 FROM task_handoffs AS h JOIN tasks AS t ON t.task_id = h.task_id "
+        f"WHERE {' AND '.join(clauses)} LIMIT 1"
+    )
+    return db.execute(sql, tuple(params)).fetchone() is not None
 
 
 def _txn_of(tx: object) -> Txn:
@@ -269,15 +312,20 @@ class HandoffStore(HandoffStorePort):
             observed_through=None if row[16] is None else str(row[16]),
         )
 
-    def has_open_handoffs(self, *, owner_id: str, repo_id: str, checkout_id: str) -> bool:
+    def has_open_handoffs(
+        self, *, owner_id: str, repo_id: str, checkout_id: str, now: datetime | None = None
+    ) -> bool:
         _require_v8_ready(self._store, self._policy)
-        row = self._store._db.execute(
-            "SELECT 1 FROM task_handoffs AS h JOIN tasks AS t ON t.task_id = h.task_id "
-            "WHERE t.owner_id = ? AND t.repo_id = ? AND t.checkout_id = ? "
-            "AND h.task_state IN ('open', 'in_progress') AND h.current_revision >= 1 LIMIT 1",
-            (owner_id, repo_id, checkout_id),
-        ).fetchone()
-        return row is not None
+        cutoff: str | None = None
+        if now is not None:
+            cutoff = utc_timestamp(require_aware_utc(now)[0] - _DISCOVER_WINDOW)
+        return _has_open_handoffs_in_db(
+            self._store._db,
+            owner_id=owner_id,
+            repo_id=repo_id,
+            checkout_id=checkout_id,
+            cutoff=cutoff,
+        )
 
     def _render_l0_row(
         self,
@@ -1323,6 +1371,7 @@ class HandoffStore(HandoffStorePort):
         exposure_evidence: str,
         degraded_codes: Sequence[str],
         now: datetime,
+        task_id_provided: bool | None = None,
     ) -> CreateWorkTaskResult:
         live_epoch = _require_v8_ready(self._store, self._policy)
         require_opaque_id(delivery_id, label="delivery_id")
@@ -1335,19 +1384,21 @@ class HandoffStore(HandoffStorePort):
             require_sha256_digest(session_ref)
         now_utc, _ = require_aware_utc(now)
         stamp = utc_timestamp(now_utc)
+        cutoff = utc_timestamp(now_utc - _DISCOVER_WINDOW)
         txn = _txn_of(tx)
         db = txn.db
 
         self._validate_seen_refs_in_tx(
             db, owner_id=owner_id, repo_id=repo_id, checkout_id=checkout_id, seen_refs=seen_handoff_refs
         )
-        open_exist_row = db.execute(
-            "SELECT 1 FROM task_handoffs AS h JOIN tasks AS t ON t.task_id = h.task_id "
-            "WHERE t.owner_id = ? AND t.repo_id = ? AND t.checkout_id = ? "
-            "AND h.task_state IN ('open', 'in_progress') AND h.current_revision >= 1 LIMIT 1",
-            (owner_id, repo_id, checkout_id),
-        ).fetchone()
-        has_open_other = open_exist_row is not None
+        has_open_other = _has_open_handoffs_in_db(
+            db,
+            owner_id=owner_id,
+            repo_id=repo_id,
+            checkout_id=checkout_id,
+            cutoff=cutoff,
+            exclude_task_id=task_id,
+        )
 
         res_art_id: str | None = None
         res_epoch: int | None = None
@@ -1417,9 +1468,12 @@ class HandoffStore(HandoffStorePort):
         else:
             eff_exposure = exposure_evidence or "none"
 
-        eff_degraded_codes = list(degraded_codes)
-        if observed_newer and "observed_newer" not in eff_degraded_codes:
-            eff_degraded_codes.append("observed_newer")
+        explicit_task_id = (not create_task) if task_id_provided is None else task_id_provided
+        eff_degraded_codes = _unique_codes(degraded_codes)
+        if not explicit_task_id and has_open_other and _OPEN_HANDOFFS_PRESENT_CODE not in eff_degraded_codes:
+            eff_degraded_codes.append(_OPEN_HANDOFFS_PRESENT_CODE)
+        if observed_newer and _OBSERVED_NEWER_CODE not in eff_degraded_codes:
+            eff_degraded_codes.append(_OBSERVED_NEWER_CODE)
 
         served_ep = eff_live.revision_epoch
         served_rev = eff_live.revision

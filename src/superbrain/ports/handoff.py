@@ -258,7 +258,9 @@ class HandoffStorePort(Protocol):
         ) = None,
     ) -> HandoffMutationOutcome: ...
 
-    def has_open_handoffs(self, *, owner_id: str, repo_id: str, checkout_id: str) -> bool: ...
+    def has_open_handoffs(
+        self, *, owner_id: str, repo_id: str, checkout_id: str, now: datetime | None = None
+    ) -> bool: ...
 
     def bind_session_for_episode(
         self,
@@ -330,6 +332,7 @@ class HandoffStorePort(Protocol):
         exposure_evidence: str,
         degraded_codes: Sequence[str],
         now: datetime,
+        task_id_provided: bool | None = None,
     ) -> CreateWorkTaskResult: ...
 
     def read_delivery_outcome(

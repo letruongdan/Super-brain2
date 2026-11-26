@@ -2331,3 +2331,595 @@ def test_resume_exposure_evidence_distinguishes_unknown_served_only_read_ack_and
         )
     finally:
         rt.close()
+
+
+def test_prepare_task_degraded_codes_discover_work_resume_and_replay(trusted_tmp: Path) -> None:
+    import json
+
+    import jsonschema
+
+    from superbrain.application.continuity_worker import ContinuityWorkerCoordinator
+    from superbrain.application.lineage import register_snapshot
+    from superbrain.composition._daemon_session import build_default_handoff_domain
+    from superbrain.composition.kernel_bridge import KernelBridge
+    from superbrain.core.kernel import SnapshotDescriptor
+    from superbrain.storage.handoffs import HandoffStore
+    from superbrain.storage.sessions import SessionStore
+    from superbrain.workers.executor import PRODUCTION_JOB_HANDLERS, JobExecutor
+    from tests.support.inc2_fixture import kernel_job_service
+
+    unavailable_codes = [
+        "skills_unavailable",
+        "lessons_unavailable",
+        "context_unavailable",
+        "finishing_gates_unavailable",
+    ]
+    schema_path = Path(__file__).resolve().parents[2] / "schemas" / "mcp-tools-v2.json"
+    schema_catalog = json.loads(schema_path.read_text(encoding="utf-8"))
+    discover_validator = jsonschema.Draft202012Validator(
+        {"$defs": schema_catalog["$defs"], "$ref": "#/$defs/PrepareTaskDiscoverResult"}
+    )
+    work_validator = jsonschema.Draft202012Validator(
+        {"$defs": schema_catalog["$defs"], "$ref": "#/$defs/PrepareTaskWorkResult"}
+    )
+
+    clock = FakeClock(dt.datetime(2026, 11, 26, 9, 0, tzinfo=dt.UTC))
+    rt = open_kernel_job_runtime(trusted_tmp / "r3-degraded" / "data", os_adapters(clock=clock), role="sp24-r3")
+    try:
+        cred = seed_principal_and_credential(rt.policy, owner_id="dan", harness_id="claude-code", machine_id="m1")
+        ws = register_workspace_direct(
+            rt,
+            clock,
+            cred.principal,
+            alias="ws-r3",
+            checkout_dir=trusted_tmp / "r3-degraded" / "chk",
+            remote="https://github.example/dan/r3.git",
+        )
+        rt.store.reconcile_policy()
+        scope = Scope(ws.repo_id, ws.checkout_id)
+        domain = build_default_handoff_domain(rt=rt, clock=clock, writer_epoch=rt.lease.epoch)
+        assert domain is not None
+        bridge = KernelBridge(store=rt.store, policy=rt.policy, clock=clock, writer_epoch=rt.lease.epoch, domain=domain)
+
+        svc, kstore = kernel_job_service(rt, clock)
+        desc = SnapshotDescriptor(
+            kind="git",
+            tree_or_head_digest="sha256:" + "a" * 64,
+            dirty=False,
+            dirty_digest=None,
+            observed_at="2026-11-26T09:00:00.000000Z",
+        )
+        kstore.stage_blob(desc.content_bytes())
+        snap_id = kstore.transact(lambda tx: register_snapshot(tx, ws, desc))
+
+        # 1. Empty checkout: discover (sufficient & tiny budget) & work (without/with snapshot) emit accurate codes.
+        disc_empty = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "discover",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "context_budget_tokens": 2000,
+            },
+            cred=cred,
+            scope=scope,
+        )
+        assert disc_empty["continuity"] == []
+        assert disc_empty["degraded_codes"] == unavailable_codes
+        discover_validator.validate(disc_empty)
+
+        disc_empty_small = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {"mode": "discover", "workspace_id": ws.repo_id, "checkout_id": ws.checkout_id, "context_budget_tokens": 1},
+            cred=cred,
+            scope=scope,
+        )
+        assert disc_empty_small["continuity"] == []
+        assert disc_empty_small["degraded_codes"] == unavailable_codes
+        discover_validator.validate(disc_empty_small)
+
+        work_empty_unavail = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "work",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "description": "Task 1 empty checkout without snapshot",
+                "idempotency_key": "idem-r3-empty-unavail",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        assert work_empty_unavail["snapshot_status"] == "unavailable"
+        assert work_empty_unavail["continuity"] == []
+        assert work_empty_unavail["degraded_codes"] == ["snapshot_unavailable", *unavailable_codes]
+        work_validator.validate(work_empty_unavail)
+        task_1 = str(work_empty_unavail["task_id"])
+
+        work_empty_snap = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "work",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "source_snapshot_id": snap_id,
+                "description": "Empty checkout with explicit snapshot",
+                "idempotency_key": "idem-r3-empty-snap01",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        assert work_empty_snap["snapshot_status"] == "available"
+        assert work_empty_snap["source_snapshot_id"] == snap_id
+        assert work_empty_snap["degraded_codes"] == unavailable_codes
+        work_validator.validate(work_empty_snap)
+
+        # 2. Commit an open handoff revision 1 on task_1.
+        sub1 = _call_ok(
+            bridge,
+            rt,
+            "submit_episode",
+            {
+                "task_id": task_1,
+                "session_id": "SID_R3_1",
+                "workspace_id": ws.repo_id,
+                "evidence": [],
+                "base_revision": 0,
+                "fence": work_empty_unavail["handoff_live"]["fence"],
+                "takeover": {"acknowledge_active": True, "reason": "r3 open handoff"},
+                "handoff": {"working_goal": "Open handoff on checkout", "task_state": "open"},
+                "idempotency_key": "idem-r3-sub-t1-0001",
+            },
+            cred=cred,
+            scope=scope,
+        )
+
+        disc_open_ok = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "discover",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "context_budget_tokens": 2000,
+            },
+            cred=cred,
+            scope=scope,
+        )
+        assert len(disc_open_ok["continuity"]) == 1
+        assert disc_open_ok["degraded_codes"] == unavailable_codes
+        discover_validator.validate(disc_open_ok)
+        item_1 = disc_open_ok["continuity"][0]
+
+        disc_open_trunc = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {"mode": "discover", "workspace_id": ws.repo_id, "checkout_id": ws.checkout_id, "context_budget_tokens": 1},
+            cred=cred,
+            scope=scope,
+        )
+        assert disc_open_trunc["continuity"] == []
+        assert "handoff_discover_truncated" not in disc_open_trunc["degraded_codes"]
+        assert disc_open_trunc["degraded_codes"] == [*unavailable_codes, "continuity_truncated"]
+        discover_validator.validate(disc_open_trunc)
+
+        disc_tid_ok = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "discover",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "task_id": task_1,
+                "context_budget_tokens": 2000,
+            },
+            cred=cred,
+            scope=scope,
+        )
+        assert len(disc_tid_ok["continuity"]) == 1
+        assert disc_tid_ok["degraded_codes"] == unavailable_codes
+
+        disc_tid_trunc = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "discover",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "task_id": task_1,
+                "context_budget_tokens": 1,
+            },
+            cred=cred,
+            scope=scope,
+        )
+        assert disc_tid_trunc["continuity"] == []
+        assert disc_tid_trunc["degraded_codes"] == [*unavailable_codes, "continuity_truncated"]
+
+        # Work without task_id on checkout with open handoffs -> includes open_handoffs_present.
+        work_open_no_tid = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "work",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "description": "New work ignoring open handoff",
+                "idempotency_key": "idem-r3-no-tid-open",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        expected_no_tid_open = ["snapshot_unavailable", *unavailable_codes, "open_handoffs_present"]
+        assert work_open_no_tid["continuity"] == []
+        assert work_open_no_tid["degraded_codes"] == expected_no_tid_open
+        work_validator.validate(work_open_no_tid)
+
+        work_open_no_tid_snap = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "work",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "source_snapshot_id": snap_id,
+                "description": "New work with snapshot and open handoff",
+                "idempotency_key": "idem-r3-no-tid-snap",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        assert work_open_no_tid_snap["degraded_codes"] == [*unavailable_codes, "open_handoffs_present"]
+        work_validator.validate(work_open_no_tid_snap)
+
+        work_open_seen = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "work",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "seen_handoff_refs": [
+                    {
+                        "artifact_id": item_1["id"],
+                        "revision_epoch": item_1["revision_epoch"],
+                        "revision": item_1["revision"],
+                        "digest": item_1["digest"],
+                    }
+                ],
+                "description": "New work declaring seen_handoff_refs",
+                "idempotency_key": "idem-r3-no-tid-seen",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        assert work_open_seen["continuity"] == []
+        assert work_open_seen["degraded_codes"] == expected_no_tid_open
+        work_validator.validate(work_open_seen)
+
+        # Work WITH existing or explicit new task_id -> must NOT emit open_handoffs_present.
+        work_existing_tid = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "work",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "task_id": task_1,
+                "description": "Work targeting existing open task",
+                "idempotency_key": "idem-r3-exist-tid-01",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        assert len(work_existing_tid["continuity"]) == 1
+        assert work_existing_tid["degraded_codes"] == ["snapshot_unavailable", *unavailable_codes]
+        work_validator.validate(work_existing_tid)
+
+        work_explicit_new_tid = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "work",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "task_id": "explicit-new-task-r3",
+                "description": "Work with explicit new task_id",
+                "idempotency_key": "idem-r3-new-tid-0001",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        assert work_explicit_new_tid["continuity"] == []
+        assert work_explicit_new_tid["degraded_codes"] == ["snapshot_unavailable", *unavailable_codes]
+
+        with rt.store.transaction() as txn:
+            rows = {
+                str(r[0]): (str(r[1]), json.loads(str(r[2])))
+                for r in txn.db.execute(
+                    "SELECT delivery_id, exposure_evidence, degraded_codes_json "
+                    "FROM deliveries WHERE delivery_id IN (?, ?, ?)",
+                    (
+                        str(work_open_no_tid["delivery_id"]),
+                        str(work_open_seen["delivery_id"]),
+                        str(work_explicit_new_tid["delivery_id"]),
+                    ),
+                ).fetchall()
+            }
+            assert rows[str(work_open_no_tid["delivery_id"])] == ("unreviewed_open_handoffs", expected_no_tid_open)
+            assert rows[str(work_open_seen["delivery_id"])] == ("seen_l0", expected_no_tid_open)
+            assert rows[str(work_explicit_new_tid["delivery_id"])][1] == ["snapshot_unavailable", *unavailable_codes]
+
+        # 3. Observed-only update on task_1: rev 1 resume gets observed_newer and survives close on replay.
+        hs = HandoffStore(rt.store, rt.policy)
+        ss = SessionStore(rt.store, rt.policy)
+        hdr1 = hs.read_header(task_1, principal_id=cred.principal.principal_id, scope=scope)
+        assert hdr1 is not None and hdr1.holder_session_ref is not None
+        ss.record_session_event(
+            session_ref=hdr1.holder_session_ref,
+            repo_id=ws.repo_id,
+            checkout_id=ws.checkout_id,
+            task_id=task_1,
+            producer_stream="stream-r3",
+            event=CaptureEventRecord(
+                event_id="ev-r3-obs-1",
+                producer_stream="stream-r3",
+                sequence=1,
+                harness_id="claude-code",
+                kind="user_message",
+                recorded_at="2026-11-26T09:00:05Z",
+                payload={"role": "user", "text": "Observed update during r3 test"},
+                session_ref=hdr1.holder_session_ref,
+            ),
+            now=clock.now(),
+        )
+        exec_ = JobExecutor(PRODUCTION_JOB_HANDLERS, lambda: 10_000)
+        exec_.start()
+        try:
+            coord = ContinuityWorkerCoordinator(
+                rt=rt, job_service=svc, executor=exec_, clock=clock, mono=lambda: 10_000
+            )
+            clock.advance(dt.timedelta(seconds=65))
+            assert coord.enqueue_if_due(task_id=task_1, now=clock.now()) is not None
+            assert coord.run_next(writer_epoch=rt.lease.epoch, now=clock.now()) is True
+        finally:
+            exec_.close(5.0)
+
+        work_resume_obs = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "work",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "task_id": task_1,
+                "source_snapshot_id": snap_id,
+                "resume_ref": {
+                    "artifact_id": task_1,
+                    "revision": 1,
+                    "handoff_revision": 1,
+                    "fence": sub1["fence"],
+                },
+                "description": "Resume with observed_newer and available snapshot",
+                "idempotency_key": "idem-r3-resume-obs1",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        expected_resume = [*unavailable_codes, "observed_newer"]
+        assert work_resume_obs["degraded_codes"] == expected_resume
+        work_validator.validate(work_resume_obs)
+
+        # Close task_1 so checkout no longer has open handoffs.
+        _call_ok(
+            bridge,
+            rt,
+            "submit_episode",
+            {
+                "task_id": task_1,
+                "session_id": "SID_R3_1",
+                "workspace_id": ws.repo_id,
+                "evidence": [],
+                "base_revision": 1,
+                "fence": sub1["fence"],
+                "handoff": {"task_state": "done"},
+                "idempotency_key": "idem-r3-close-t1-1",
+            },
+            cred=cred,
+            scope=scope,
+        )
+
+        # Replay preserves exact committed degraded_codes even after task_1 closed.
+        replay_open = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "work",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "description": "New work ignoring open handoff",
+                "idempotency_key": "idem-r3-no-tid-open",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        assert replay_open["delivery_id"] == work_open_no_tid["delivery_id"]
+        assert replay_open["degraded_codes"] == expected_no_tid_open
+
+        replay_resume = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "work",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "task_id": task_1,
+                "source_snapshot_id": snap_id,
+                "resume_ref": {
+                    "artifact_id": task_1,
+                    "revision": 1,
+                    "handoff_revision": 1,
+                    "fence": sub1["fence"],
+                },
+                "description": "Resume with observed_newer and available snapshot",
+                "idempotency_key": "idem-r3-resume-obs1",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        assert replay_resume["delivery_id"] == work_resume_obs["delivery_id"]
+        assert replay_resume["degraded_codes"] == expected_resume
+
+        # Fresh work without task_id after task_1 closed -> no open_handoffs_present.
+        work_after_close = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "work",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "description": "Work after all handoffs closed",
+                "idempotency_key": "idem-r3-after-close1",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        assert work_after_close["degraded_codes"] == ["snapshot_unavailable", *unavailable_codes]
+
+        # Closed handoff still reachable directly via discover(task_id=task_1) and obeys budget truncation code.
+        disc_closed_ok = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "discover",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "task_id": task_1,
+                "context_budget_tokens": 2000,
+            },
+            cred=cred,
+            scope=scope,
+        )
+        assert len(disc_closed_ok["continuity"]) == 1
+        assert disc_closed_ok["degraded_codes"] == unavailable_codes
+
+        disc_closed_trunc = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "discover",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "task_id": task_1,
+                "context_budget_tokens": 1,
+            },
+            cred=cred,
+            scope=scope,
+        )
+        assert disc_closed_trunc["continuity"] == []
+        assert disc_closed_trunc["degraded_codes"] == [*unavailable_codes, "continuity_truncated"]
+
+        # 4. 14-day recency window parity between discover and open_handoffs_present.
+        work_stale_prep = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "work",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "task_id": "task-r3-stale-open",
+                "description": "Task to test 14-day window",
+                "idempotency_key": "idem-r3-stale-prep0",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        _call_ok(
+            bridge,
+            rt,
+            "submit_episode",
+            {
+                "task_id": "task-r3-stale-open",
+                "session_id": "SID_R3_2",
+                "workspace_id": ws.repo_id,
+                "evidence": [],
+                "base_revision": 0,
+                "fence": work_stale_prep["handoff_live"]["fence"],
+                "takeover": {"acknowledge_active": True, "reason": "stale window test"},
+                "handoff": {"working_goal": "Open handoff about to age out", "task_state": "open"},
+                "idempotency_key": "idem-r3-stale-sub1",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        work_before_age = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "work",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "description": "Before 14d expiry",
+                "idempotency_key": "idem-r3-before-age",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        assert "open_handoffs_present" in work_before_age["degraded_codes"]
+
+        clock.advance(dt.timedelta(days=15))
+        disc_aged = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "discover",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "context_budget_tokens": 2000,
+            },
+            cred=cred,
+            scope=scope,
+        )
+        assert disc_aged["continuity"] == []
+        work_aged = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "work",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "description": "After 14d expiry",
+                "idempotency_key": "idem-r3-after-age1",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        assert work_aged["degraded_codes"] == ["snapshot_unavailable", *unavailable_codes]
+    finally:
+        rt.close()
