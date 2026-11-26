@@ -125,9 +125,27 @@ def _merge_sp2_report(base: DoctorReport, sp2: Sp2DoctorReport) -> DoctorReport:
             "Recorded Layer-2 verification invalidated by host/config drift or policy restore.",
             "Re-verify Layer-2 native receipts before using terminal approvals or verified_host capture.",
         )
+    eff_term = base.terminal_channel_eligible and sp2.terminal_channel_eligible_effective
+    if eff_term != base.terminal_channel_eligible or tuple(merged_harnesses) != base.layer2_harnesses:
+        l2_status = "ok" if eff_term else ("warn" if merged_harnesses else "ok")
+        l2_detail = (
+            f"terminal_channel_eligible={'true' if eff_term else 'false'} ({len(merged_harnesses)} harnesses)"
+            if merged_harnesses
+            else "terminal_channel_eligible=false (no non-CLI harnesses registered)"
+        )
+        l2_rem = (
+            None
+            if eff_term or not merged_harnesses
+            else "Verify Layer-2 config or re-bootstrap checkout before relying on terminal low-risk confirmation."
+        )
+        if l2_rem is not None and l2_rem not in remediations:
+            remediations.append(l2_rem)
+        checks = [
+            DoctorCheckItem("layer2", l2_status, l2_detail, l2_rem) if c.name == "layer2" else c
+            for c in checks
+        ]
     statuses = {c.status for c in checks}
     overall = "fail" if "error" in statuses else "warn" if "warn" in statuses else "pass"
-    eff_term = base.terminal_channel_eligible and sp2.terminal_channel_eligible_effective
     return replace(
         base,
         overall_status=overall,

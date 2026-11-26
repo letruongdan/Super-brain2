@@ -253,6 +253,22 @@ class PolicyAuthorityMixin:
     def terminal_channel_eligible(self, *, machine_id: str) -> bool:
         return layer2.terminal_channel_eligible(self._read(), machine_id)
 
+    def configured_layer2_checkouts(self) -> dict[str, tuple[str, ...]]:
+        """Persisted ``{harness_id: (norm_checkout_path, ...)}`` configured/verified on disk."""
+        self._check()
+        if self._schema_version < _MIN_AUTHORITY_SCHEMA:
+            return {}
+        return layer2.configured_layer2_checkouts(self._db)
+
+    def record_configured_layer2_checkout(self, *, harness_id: str, checkout_path: str) -> None:
+        """Persist ``(harness_id, checkout_path)`` in ``meta`` when harness config is observed."""
+        with self._authority_tx() as db:
+            layer2.record_configured_layer2_checkout(
+                db,
+                harness_id=harness_id,
+                checkout_path=checkout_path,
+            )
+
     # --- recovery grants and signer reset ----------------------------------------------------------------------
 
     def open_recovery_grant(self, *, approval_id: str, journal_id: str) -> RecoveryGrant:

@@ -267,6 +267,28 @@ def probe_sp2_store_readonly(
     )
 
 
+def _candidate_checkouts(db: sqlite3.Connection, checkout_root: Path | None) -> tuple[Path, ...]:
+    seen: dict[str, Path] = {}
+    if _table_exists(db, "workspace_checkout"):
+        rows = db.execute("SELECT checkout_path FROM workspace_checkout ORDER BY created_at ASC").fetchall()
+        for (raw_path,) in rows:
+            if isinstance(raw_path, str) and raw_path:
+                norm = os.path.normcase(os.path.abspath(raw_path))
+                seen.setdefault(norm, Path(raw_path))
+    if checkout_root is not None:
+        norm = os.path.normcase(os.path.abspath(str(checkout_root)))
+        seen.setdefault(norm, checkout_root)
+    return tuple(seen.values())
+
+
+def _probe_has_presence(chk_path: Path, harness_id: str) -> bool:
+    if harness_id == "claude-code":
+        return os.path.lexists(chk_path / ".claude") or os.path.lexists(chk_path / "CLAUDE.md")
+    if harness_id == "codex":
+        return os.path.lexists(chk_path / ".codex") or os.path.lexists(chk_path / "AGENTS.md")
+    return False
+
+
 def probe_sp2_layer2_readonly(
     policy_db: Path,
     scratch: Path,
@@ -294,6 +316,8 @@ def probe_sp2_layer2_readonly(
             ).fetchall():
                 active_non_cli.add(str(hid))
                 seen.add(str(hid))
+        candidate_checkouts = _candidate_checkouts(db, checkout_root)
+        configured_map = policy_layer2.configured_layer2_checkouts(db)
         if _table_exists(db, "harness_layer2_state"):
             stale_seq = policy_layer2.layer2_stale_through_seq(db)
             for (hid,) in db.execute("SELECT DISTINCT harness_id FROM harness_layer2_state").fetchall():
@@ -309,18 +333,38 @@ def probe_sp2_layer2_readonly(
                 rec_dig = None if row is None else str(row[2])
                 rec_state = Layer2State.UNKNOWN if row is None else Layer2State(str(row[3]))
                 obs_ver = observed_host_versions.get(hid)
-                obs_dig = (
-                    compute_harness_config_digest(hid, checkout_root, os_)
-                    if checkout_root is not None
-                    else None
-                )
+                configured_paths = set(configured_map.get(hid, ()))
+
+                obs_dig: str | None = None
+                drifted_chk_dig: str | None = None
+                cfg_changed = False
+                for chk_p in candidate_checkouts:
+                    norm_chk = os.path.normcase(os.path.abspath(str(chk_p)))
+                    d = compute_harness_config_digest(hid, chk_p, os_)
+                    applies = (
+                        d is not None
+                        or _probe_has_presence(chk_p, hid)
+                        or norm_chk in configured_paths
+                    )
+                    if d is not None and obs_dig is None:
+                        obs_dig = d
+                    if applies and d != rec_dig:
+                        cfg_changed = True
+                        drifted_chk_dig = d
+                        break
+
+                if cfg_changed and drifted_chk_dig is not None:
+                    obs_dig = drifted_chk_dig
+                elif cfg_changed:
+                    obs_dig = None
+
                 eff_state = rec_state
                 inv_reason: str | None = None
                 if rec_state is Layer2State.VERIFIED:
                     if obs_ver is not None and obs_ver != rec_ver:
                         eff_state = Layer2State.UNKNOWN
                         inv_reason = "host_version_changed"
-                    elif checkout_root is not None and obs_dig != rec_dig:
+                    elif cfg_changed:
                         eff_state = Layer2State.UNKNOWN
                         inv_reason = "config_digest_changed"
                     elif row_seq <= stale_seq:
@@ -438,6 +482,11 @@ def reconcile_harness_layer2_in_policy(
             config_digest=eff_dig,
             state=verdict.state,
         )
+        if verdict.state is Layer2State.VERIFIED and cfg_dig is not None:
+            policy.record_configured_layer2_checkout(
+                harness_id=harness_id,
+                checkout_path=str(checkout_root),
+            )
         return verdict.state, verdict.reason
 
     latest = policy.layer2_state(harness_id)

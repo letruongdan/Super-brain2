@@ -232,6 +232,7 @@ class KernelBridge(KernelBlobStagePort):
         require_positive_int(writer_epoch)
         verify_admitted_store_pair(store, policy, writer_epoch=writer_epoch)
         _verify_domain_pair(self._domain, store=store, policy=policy)
+        self._seen_l2.clear()
         self._wire_stores(store, policy, writer_epoch)
         self._coordinator.rebind_writer_epoch(writer_epoch)
 

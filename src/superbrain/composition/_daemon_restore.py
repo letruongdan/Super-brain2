@@ -141,6 +141,7 @@ class DaemonRestoreHandler(RestoreHandler):
         instance_id: str,
         operator: OperatorHandle,
         review_apply_cls: type[ReviewApplyService] = ReviewApplyService,
+        seen_configured_layer2: set[tuple[str, str]] | None = None,
     ) -> None:
         self._session = session
         self._adapters = adapters
@@ -150,6 +151,7 @@ class DaemonRestoreHandler(RestoreHandler):
         self._instance_id = instance_id
         self._operator = operator
         self._review_apply_cls = review_apply_cls
+        self._seen_configured_layer2 = seen_configured_layer2
 
     def preview(self, target: Literal["store", "policy"], backup: Path) -> dict[str, JsonValue]:
         rt = self._session.rt
@@ -401,6 +403,8 @@ class DaemonRestoreHandler(RestoreHandler):
         if svc is not None:
             from superbrain.composition._layer2_live import reconcile_live_layer2_all
 
+            if self._seen_configured_layer2 is not None:
+                self._seen_configured_layer2.clear()
             svc.rebind_authorities(
                 rt.policy,
                 build_review_apply_service(
@@ -413,6 +417,7 @@ class DaemonRestoreHandler(RestoreHandler):
                 live_layer2_check=lambda: reconcile_live_layer2_all(
                     self._session.rt.policy,
                     os_=self._adapters,
+                    seen_configured=self._seen_configured_layer2,
                 ),
             )
         return job_service

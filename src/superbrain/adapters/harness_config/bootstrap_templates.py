@@ -10,9 +10,6 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-from superbrain.adapters.harness_config.json_keys import merge_json_keys, merge_json_multi_keys
-from superbrain.adapters.harness_config.markdown_blocks import merge_markdown_block
-from superbrain.adapters.harness_config.toml_tables import merge_toml_table
 from superbrain.core._kernel_approval import RiskResource
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.jsonvalue import JsonValue
@@ -308,6 +305,9 @@ def plan_claude_bootstrap(
     expected_slice_digests: Mapping[tuple[str, str], str] | None = None,
 ) -> BootstrapPlan:
     """Build checkout-scoped D3 bootstrap plan for Claude Code (`.mcp.json`, `CLAUDE.md`, `settings.local.json`)."""
+    from superbrain.adapters.harness_config.json_keys import merge_json_keys, merge_json_multi_keys
+    from superbrain.adapters.harness_config.markdown_blocks import merge_markdown_block
+
     mcp_merge = merge_json_keys(
         _read_existing(checkout_root, ".mcp.json"),
         key_path=("mcpServers", "super-brain"),
@@ -370,6 +370,10 @@ def plan_codex_bootstrap(
     expected_slice_digests: Mapping[tuple[str, str], str] | None = None,
 ) -> BootstrapPlan:
     """Build checkout-scoped D3 bootstrap plan for Codex (`AGENTS.md`, `.codex/config.toml`, `.codex/hooks.json`)."""
+    from superbrain.adapters.harness_config.json_keys import merge_json_keys
+    from superbrain.adapters.harness_config.markdown_blocks import merge_markdown_block
+    from superbrain.adapters.harness_config.toml_tables import merge_toml_table
+
     md_merge = merge_markdown_block(
         _read_existing(checkout_root, "AGENTS.md"),
         slice_id="super-brain-layer1",

@@ -335,6 +335,7 @@ def _open_owner_session(
                 instance_id=instance_id,
                 operator=operator,
                 review_apply_cls=ReviewApplyService,
+                seen_configured_layer2=seen_configured_layer2,
             )
             operator.bind(
                 build_operator_service(

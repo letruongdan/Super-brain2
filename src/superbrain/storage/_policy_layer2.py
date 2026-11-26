@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 import sqlite3
 from datetime import datetime
 
@@ -14,6 +16,7 @@ from superbrain.core._kernel_approval import (
     RecoveryScope,
 )
 from superbrain.core._kernel_base import OPAQUE_ID_RE, require_sha256_digest
+from superbrain.core.canonical import canonical_json
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.ids import new_id
 from superbrain.core.jsonvalue import JsonValue
@@ -24,6 +27,7 @@ from superbrain.storage.ledger import utc_timestamp
 
 SIGNER_RESET_META_KEY = "signer_reset_recorded"
 LAYER2_STALE_THROUGH_SEQ_KEY = "layer2_stale_through_seq"
+LAYER2_CONFIGURED_CHECKOUTS_KEY = "layer2_configured_checkouts"
 _GRANT_ACTIONS = frozenset({ApprovalAction.APPLY.value, ApprovalAction.ROLLBACK.value})
 _GRANT_COLUMNS = "grant_id, approval_id, journal_id, subject_id, recovery_scope, trust_generation, state, end_reason"
 
@@ -80,6 +84,54 @@ def _stale_through_seq(db: sqlite3.Connection) -> int:
 def layer2_stale_through_seq(db: sqlite3.Connection) -> int:
     """Return the highest ``harness_layer2_state.seq`` invalidated by ``restore_policy`` (0 if none)."""
     return _stale_through_seq(db)
+
+
+def configured_layer2_checkouts(db: sqlite3.Connection) -> dict[str, tuple[str, ...]]:
+    """Return persisted ``{harness_id: (norm_checkout_path, ...)}`` observed as configured."""
+    has_meta = db.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'").fetchone()
+    if has_meta is None:
+        return {}
+    row = db.execute("SELECT value FROM meta WHERE key = ?", (LAYER2_CONFIGURED_CHECKOUTS_KEY,)).fetchone()
+    if row is None or not isinstance(row[0], str):
+        return {}
+    try:
+        raw = json.loads(row[0])
+    except ValueError:
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, tuple[str, ...]] = {}
+    for k, vals in raw.items():
+        if isinstance(k, str) and isinstance(vals, list):
+            clean = sorted({os.path.normcase(os.path.abspath(str(v))) for v in vals if isinstance(v, str) and v})
+            if clean:
+                out[k] = tuple(clean)
+    return out
+
+
+def record_configured_layer2_checkout(
+    db: sqlite3.Connection,
+    *,
+    harness_id: str,
+    checkout_path: str,
+) -> None:
+    """Persist ``(harness_id, checkout_path)`` in ``meta`` so restarts detect deleted harness configs."""
+    has_meta = db.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'").fetchone()
+    if has_meta is None or not checkout_path:
+        return
+    norm = os.path.normcase(os.path.abspath(checkout_path))
+    cur = configured_layer2_checkouts(db)
+    existing = set(cur.get(harness_id, ()))
+    if norm in existing:
+        return
+    merged: dict[str, JsonValue] = {hid: list(paths) for hid, paths in cur.items()}
+    next_paths: list[JsonValue] = []
+    next_paths.extend(sorted(existing | {norm}))
+    merged[harness_id] = next_paths
+    db.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+        (LAYER2_CONFIGURED_CHECKOUTS_KEY, canonical_json(merged).decode("utf-8")),
+    )
 
 
 def mark_restored_layer2_stale(db: sqlite3.Connection) -> None:

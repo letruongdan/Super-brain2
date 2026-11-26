@@ -8,7 +8,6 @@ from collections.abc import Callable, Mapping
 from concurrent.futures import Future
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from pathlib import Path
 
 from superbrain.application._future_notify import safe_set_result
 from superbrain.application.approvals import OperatorHandle
@@ -123,10 +122,7 @@ def build_default_handoff_domain(
     )
 
     def _probe_deep() -> DeepHealthProbeResult:
-        snap = rt.policy.snapshot()
-        chk_paths = [Path(b.checkout_path) for b in snap.checkouts.values()]
-        primary_chk = chk_paths[0] if chk_paths else None
-        sp2 = run_sp2_doctor_probes(rt.root.root, checkout_root=primary_chk, os_=rt.os_, now=clock.now())
+        sp2 = run_sp2_doctor_probes(rt.root.root, checkout_root=None, os_=rt.os_, now=clock.now())
         drifted = any(
             h.recorded_state is Layer2State.VERIFIED and h.effective_state is not Layer2State.VERIFIED
             for h in sp2.layer2_harnesses

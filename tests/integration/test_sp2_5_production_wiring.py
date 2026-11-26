@@ -6,7 +6,9 @@ import base64
 import hashlib
 import inspect
 import json
+import os
 import shlex
+import shutil
 import socket
 import ssl
 import struct
@@ -43,7 +45,8 @@ from superbrain.application.owner_loop import OwnerLoop
 from superbrain.application.review_apply import ReviewApplyService, TargetWriteInput
 from superbrain.cli_api.capture_client import CaptureClient
 from superbrain.cli_api.loopback import LoopbackClient, LoopbackTarget
-from superbrain.composition import daemon_entry, init_entry
+from superbrain.composition import daemon_entry, hook_entry, init_entry
+from superbrain.composition._layer2_live import verify_live_layer2_harness
 from superbrain.composition.capture_drain_entry import drain_outbox
 from superbrain.composition.doctor_entry import run_doctor
 from superbrain.composition.doctor_probes_sp2 import reconcile_harness_layer2_in_policy
@@ -59,7 +62,7 @@ from superbrain.core._kernel_approval import (
     RiskResource,
     SignerEnrollment,
 )
-from superbrain.core.canonical import canonical_json
+from superbrain.core.canonical import canonical_json, digest_bytes
 from superbrain.core.errors import ErrorCode
 from superbrain.core.ids import new_id
 from superbrain.core.kernel import (
@@ -1474,3 +1477,758 @@ def test_p2_finding3_mcp_get_health_deep_and_shallow_contracts(trusted_tmp: Path
         # Domain tables must NOT be mutated by get_health(deep=True).
         after_tables = h.loop.run_owner_action(_snapshot_domain_tables).result(timeout=10.0)
         assert after_tables == before_tables
+
+
+# ---------------------------------------------------------------------------
+# Round-4 Review Regressions (4 findings: malformed host_version, deleted/broken link,
+# hook session_ref & raw key sanitization, multi-checkout doctor/deep health parity)
+# ---------------------------------------------------------------------------
+
+
+def _make_dangling_claude_link(checkout_root: Path) -> None:
+    """Create a real dangling junction (Windows) or symlink (POSIX) at ``checkout_root/.claude``."""
+    link_path = checkout_root / ".claude"
+    if sys.platform == "win32":
+        import _winapi
+
+        missing_target = checkout_root.parent / f"_missing_target_{new_id()}"
+        missing_target.mkdir(parents=True, exist_ok=True)
+        _winapi.CreateJunction(str(missing_target), str(link_path))
+        missing_target.rmdir()
+    else:
+        link_path.symlink_to(checkout_root.parent / f"_missing_target_{new_id()}", target_is_directory=True)
+
+
+def _remove_dangling_claude_link(checkout_root: Path) -> None:
+    link_path = checkout_root / ".claude"
+    if not os.path.lexists(link_path):
+        return
+    if link_path.is_symlink():
+        link_path.unlink()
+    else:
+        link_path.rmdir()
+    assert not os.path.lexists(link_path)
+
+
+def test_r4_finding1_malformed_host_version_and_resolver_error_fail_closed(trusted_tmp: Path) -> None:
+    """Non-opaque/empty/overlong host_version or crashing resolver fails closed to UNKNOWN, never INVALID_INPUT."""
+    clock = FakeClock(datetime.now(UTC).replace(microsecond=0))
+    mono = FakeMonotonicClock(1_000_000_000)
+    os_ = os_adapters(clock=clock, monotonic=mono)
+    _priv, s_enr = _ssh_signer()
+
+    cfg_dir = trusted_tmp / "cfg"
+    data_root = trusted_tmp / "data"
+    chk_a = trusted_tmp / "chk-r4-f1"
+    home_dir = trusted_tmp / "home"
+    for d in (cfg_dir, chk_a, home_dir):
+        d.mkdir(parents=True, exist_ok=True)
+        os_.permissions.secure_directory(d)
+
+    rep = init_entry.init_store(
+        init_entry.InitRequest(
+            data_root=data_root, config_dir=cfg_dir, owner_id=_OWNER, machine_id=_MACHINE, signer=s_enr
+        ),
+        os_,
+    )
+    cfg = read_daemon_config(rep.daemon_config_path, os_)
+    ca_pem = (cfg_dir / "tls" / "ca.pem").read_text(encoding="utf-8")
+    cli_token = rep.cli_credential_path.read_text(encoding="ascii").strip()
+
+    prof_path = cfg_dir / "claude-profile.json"
+    _write_plan_targets(chk_a, plan_claude_bootstrap(checkout_root=chk_a, profile_path=prof_path).targets)
+    c_dig1 = compute_harness_config_digest("claude-code", chk_a, os_)
+    assert c_dig1 is not None
+
+    rt = reopen_kernel_job_runtime(data_root, rep.store_id, os_)
+    try:
+        mcp_c = seed_principal_and_credential(rt.policy, owner_id=_OWNER, harness_id="claude-code", machine_id=_MACHINE)
+        cap_c = seed_principal_and_credential(rt.policy, owner_id=_OWNER, harness_id="claude-code", machine_id=_MACHINE)
+        ws_a = register_workspace_direct(rt, clock, mcp_c.principal, alias="ws-r4-f1", checkout_dir=chk_a)
+        rt.store.reconcile_policy()
+
+        def _reverify_c1() -> None:
+            st, _ = reconcile_harness_layer2_in_policy(
+                rt.policy,
+                harness_id="claude-code",
+                checkout_root=chk_a,
+                observed_host_version=_CLAUDE_VER,
+                os_=os_,
+                receipt=_build_receipt(harness_id="claude-code", host_version=_CLAUDE_VER, config_digest=c_dig1),
+            )
+            assert st is Layer2State.VERIFIED
+
+        # Direct verify_live_layer2_harness checks for non-opaque values & resolver error.
+        for bad_ver in ("2.1.326 (Claude Code)", "", "v" + "9" * 130, "2.1.325-\u00e9"):
+            _reverify_c1()
+            res = verify_live_layer2_harness(
+                rt.policy,
+                harness_id="claude-code",
+                os_=os_,
+                repo_id=ws_a.repo_id,
+                checkout_id=ws_a.checkout_id,
+                reported_host_version=bad_ver,
+            )
+            assert res is None
+            latest = rt.policy.layer2_state("claude-code")
+            assert latest is not None and latest[3] is Layer2State.UNKNOWN
+
+        _reverify_c1()
+
+        def _boom(_hid: str) -> str | None:
+            raise RuntimeError("host version probe crashed")
+
+        res_err = verify_live_layer2_harness(
+            rt.policy,
+            harness_id="claude-code",
+            os_=os_,
+            repo_id=ws_a.repo_id,
+            checkout_id=ws_a.checkout_id,
+            host_version_resolver=_boom,
+        )
+        assert res_err is None
+        latest_err = rt.policy.layer2_state("claude-code")
+        assert latest_err is not None and latest_err[3] is Layer2State.UNKNOWN
+
+        # Re-verify cleanly for live daemon HTTP capture + terminal approval checks.
+        _reverify_c1()
+        prop_space = _create_low_risk_proposal(
+            rt, os_, data_root=data_root, home=home_dir, checkout=chk_a, note_name="r4-f1-space.md"
+        )
+        prop_long = _create_low_risk_proposal(
+            rt, os_, data_root=data_root, home=home_dir, checkout=chk_a, note_name="r4-f1-long.md"
+        )
+    finally:
+        rt.close()
+
+    with _serve_daemon(cfg, os_, clock, mono) as (ready, loop):
+        _publish_capture_creds(loop, [(cap_c, "stream-r4-f1", ws_a)])
+        target = LoopbackTarget(
+            endpoint=ready.endpoint,
+            expected_store_id=rep.store_id,
+            ca_pem=ca_pem,
+            leaf_cert_sha256=ready.leaf_cert_sha256,
+        )
+        cap_client = CaptureClient(LoopbackClient(monotonic_ns=mono.monotonic_ns))
+
+        def _send_ver(seq: int, event_id: str, host_ver: str) -> None:
+            ev = CaptureEventRecord(
+                event_id=event_id,
+                producer_stream="stream-r4-f1",
+                sequence=seq,
+                harness_id="claude-code",
+                kind="command_result",
+                recorded_at=f"2026-11-26T16:00:{seq:02d}Z",
+                payload={"cmd": "pytest", "seq": seq},
+                source_metadata={"host_version": host_ver, "config_digest": c_dig1},
+            ).to_dict()
+            ack = cap_client.post_batch(
+                target,
+                CaptureBatchCommand("stream-r4-f1", ws_a.repo_id, ws_a.checkout_id, (ev,), cap_c.token),
+            )
+            assert ack.accepted_count == 1
+
+        # 1) Non-opaque version with spaces/parens via live capture MUST succeed ingestion as ("unknown", "unverified")
+        # and immediately refuse terminal approvals.
+        _send_ver(1, "ev-r4-f1-space", "2.1.326 (Claude Code)")
+        assert _capture_event_row(loop, "ev-r4-f1-space") == ("unknown", "unverified")
+
+        st_sp, app_sp = _terminal_approve_proposal(ready, ca_pem, cli_token, prop_space)
+        assert app_sp.get("ok") is False, (st_sp, app_sp)
+        assert app_sp["error"]["code"] == ErrorCode.CAPABILITY_UNAVAILABLE.value
+
+        # 2) Re-verify live on owner loop, then send overlong (>128) host_version -> still fails closed without error.
+        def _reverify_live() -> None:
+            session = cast(Any, loop._session)
+            assert session is not None
+            st, _ = reconcile_harness_layer2_in_policy(
+                session._rt.policy,
+                harness_id="claude-code",
+                checkout_root=chk_a,
+                observed_host_version=_CLAUDE_VER,
+                os_=os_,
+                receipt=_build_receipt(harness_id="claude-code", host_version=_CLAUDE_VER, config_digest=c_dig1),
+            )
+            assert st is Layer2State.VERIFIED
+
+        loop.run_owner_action(_reverify_live).result(timeout=10.0)
+        _send_ver(2, "ev-r4-f1-long", "a" * 130)
+        assert _capture_event_row(loop, "ev-r4-f1-long") == ("unknown", "unverified")
+
+        st_ln, app_ln = _terminal_approve_proposal(ready, ca_pem, cli_token, prop_long)
+        assert app_ln.get("ok") is False, (st_ln, app_ln)
+        assert app_ln["error"]["code"] == ErrorCode.CAPABILITY_UNAVAILABLE.value
+
+
+def test_r4_finding2_deleted_config_and_dangling_link_across_restart_and_restore(trusted_tmp: Path) -> None:
+    """Deleted checkout config & dangling links fail closed across fresh daemon restart and consecutive restores."""
+    clock = FakeClock(datetime.now(UTC).replace(microsecond=0))
+    mono = FakeMonotonicClock(1_000_000_000)
+    os_ = os_adapters(clock=clock, monotonic=mono)
+    priv, s_enr = _ssh_signer()
+
+    cfg_dir = trusted_tmp / "cfg"
+    data_root = trusted_tmp / "data"
+    chk_a = trusted_tmp / "chk-r4-f2"
+    home_dir = trusted_tmp / "home"
+    for d in (cfg_dir, chk_a, home_dir):
+        d.mkdir(parents=True, exist_ok=True)
+        os_.permissions.secure_directory(d)
+
+    rep = init_entry.init_store(
+        init_entry.InitRequest(
+            data_root=data_root, config_dir=cfg_dir, owner_id=_OWNER, machine_id=_MACHINE, signer=s_enr
+        ),
+        os_,
+    )
+    cfg = read_daemon_config(rep.daemon_config_path, os_)
+    ca_pem = (cfg_dir / "tls" / "ca.pem").read_text(encoding="utf-8")
+    cli_token = rep.cli_credential_path.read_text(encoding="ascii").strip()
+
+    prof_path = cfg_dir / "claude-profile.json"
+    _write_plan_targets(chk_a, plan_claude_bootstrap(checkout_root=chk_a, profile_path=prof_path).targets)
+    c_dig1 = compute_harness_config_digest("claude-code", chk_a, os_)
+    assert c_dig1 is not None
+
+    rt = reopen_kernel_job_runtime(data_root, rep.store_id, os_)
+    try:
+        mcp_c = seed_principal_and_credential(rt.policy, owner_id=_OWNER, harness_id="claude-code", machine_id=_MACHINE)
+        cap_c = seed_principal_and_credential(rt.policy, owner_id=_OWNER, harness_id="claude-code", machine_id=_MACHINE)
+        ws_a = register_workspace_direct(rt, clock, mcp_c.principal, alias="ws-r4-f2", checkout_dir=chk_a)
+        rt.store.reconcile_policy()
+        assert (
+            reconcile_harness_layer2_in_policy(
+                rt.policy,
+                harness_id="claude-code",
+                checkout_root=chk_a,
+                observed_host_version=_CLAUDE_VER,
+                os_=os_,
+                receipt=_build_receipt(harness_id="claude-code", host_version=_CLAUDE_VER, config_digest=c_dig1),
+            )[0]
+            is Layer2State.VERIFIED
+        )
+        bak_verified = create_policy_backup(rt.policy, os_, clock.now())
+        prop_base = _create_low_risk_proposal(
+            rt, os_, data_root=data_root, home=home_dir, checkout=chk_a, note_name="f2-base.md"
+        )
+        prop_del = _create_low_risk_proposal(
+            rt, os_, data_root=data_root, home=home_dir, checkout=chk_a, note_name="f2-del.md"
+        )
+        prop_lnk = _create_low_risk_proposal(
+            rt, os_, data_root=data_root, home=home_dir, checkout=chk_a, note_name="f2-lnk.md"
+        )
+        prop_r1 = _create_low_risk_proposal(
+            rt, os_, data_root=data_root, home=home_dir, checkout=chk_a, note_name="f2-r1.md"
+        )
+        prop_r2_ok = _create_low_risk_proposal(
+            rt, os_, data_root=data_root, home=home_dir, checkout=chk_a, note_name="f2-r2-ok.md"
+        )
+        prop_r2_del = _create_low_risk_proposal(
+            rt, os_, data_root=data_root, home=home_dir, checkout=chk_a, note_name="f2-r2-del.md"
+        )
+    finally:
+        rt.close()
+
+    # Daemon 1: confirm positive baseline while config is present (persisting configured-checkout marker).
+    with _serve_daemon(cfg, os_, clock, mono) as (ready1, loop1):
+        _publish_capture_creds(loop1, [(cap_c, "stream-r4-f2", ws_a)])
+        st_b, app_b = _terminal_approve_proposal(ready1, ca_pem, cli_token, prop_base)
+        assert st_b == 200 and app_b.get("ok") is True, (st_b, app_b)
+
+    # Delete .claude AND CLAUDE.md completely while daemon is stopped.
+    shutil.rmtree(chk_a / ".claude")
+    (chk_a / "CLAUDE.md").unlink()
+
+    # Daemon 2: fresh start with deleted config MUST fail closed on capture, terminal, AND doctor (with/without
+    # checkout).
+    clock.advance(timedelta(seconds=5))
+    with _serve_daemon(cfg, os_, clock, mono) as (ready2, loop2):
+        _publish_capture_creds(loop2, [(cap_c, "stream-r4-f2", ws_a)])
+        target2 = LoopbackTarget(
+            endpoint=ready2.endpoint,
+            expected_store_id=rep.store_id,
+            ca_pem=ca_pem,
+            leaf_cert_sha256=ready2.leaf_cert_sha256,
+        )
+        cap_client2 = CaptureClient(LoopbackClient(monotonic_ns=mono.monotonic_ns))
+        ev_del = CaptureEventRecord(
+            event_id="ev-r4-f2-deleted",
+            producer_stream="stream-r4-f2",
+            sequence=1,
+            harness_id="claude-code",
+            kind="command_result",
+            recorded_at="2026-11-26T16:02:01Z",
+            payload={"cmd": "pytest"},
+            source_metadata={"host_version": _CLAUDE_VER, "config_digest": c_dig1},
+        ).to_dict()
+        assert (
+            cap_client2.post_batch(
+                target2, CaptureBatchCommand("stream-r4-f2", ws_a.repo_id, ws_a.checkout_id, (ev_del,), cap_c.token)
+            ).accepted_count
+            == 1
+        )
+        assert _capture_event_row(loop2, "ev-r4-f2-deleted") == ("unknown", "unverified")
+
+        st_d, app_d = _terminal_approve_proposal(ready2, ca_pem, cli_token, prop_del)
+        assert app_d.get("ok") is False, (st_d, app_d)
+        assert app_d["error"]["code"] == ErrorCode.CAPABILITY_UNAVAILABLE.value
+
+    for doc_chk in (None, chk_a):
+        doc_del = run_doctor(rep.daemon_config_path, checkout_root=doc_chk, os_=os_)
+        assert doc_del.terminal_channel_eligible is False
+        assert {h.harness_id: h.state for h in doc_del.layer2_harnesses}["claude-code"] is Layer2State.UNKNOWN
+
+    # Part B: Replace .claude with a dangling link -> fail closed on verify_live_layer2_harness, daemon, & doctor.
+    _make_dangling_claude_link(chk_a)
+    try:
+        clock.advance(timedelta(seconds=5))
+        with _serve_daemon(cfg, os_, clock, mono) as (ready3, loop3):
+            _publish_capture_creds(loop3, [(cap_c, "stream-r4-f2", ws_a)])
+
+            def _reverify_then_check_dangling() -> None:
+                session = cast(Any, loop3._session)
+                assert session is not None
+                # Even if an old VERIFIED row existed, live link check must downgrade to UNKNOWN.
+                st_v, _ = reconcile_harness_layer2_in_policy(
+                    session._rt.policy,
+                    harness_id="claude-code",
+                    checkout_root=chk_a,
+                    observed_host_version=_CLAUDE_VER,
+                    os_=os_,
+                    receipt=_build_receipt(harness_id="claude-code", host_version=_CLAUDE_VER, config_digest=c_dig1),
+                )
+                # reconcile_harness_layer2_in_policy already sees None/UNKNOWN; verify direct helper fail-closes too.
+                assert st_v is Layer2State.UNKNOWN
+                assert (
+                    verify_live_layer2_harness(
+                        session._rt.policy,
+                        harness_id="claude-code",
+                        os_=os_,
+                        repo_id=ws_a.repo_id,
+                        checkout_id=ws_a.checkout_id,
+                    )
+                    is None
+                )
+
+            loop3.run_owner_action(_reverify_then_check_dangling).result(timeout=10.0)
+            target3 = LoopbackTarget(
+                endpoint=ready3.endpoint,
+                expected_store_id=rep.store_id,
+                ca_pem=ca_pem,
+                leaf_cert_sha256=ready3.leaf_cert_sha256,
+            )
+            ev_lnk = CaptureEventRecord(
+                event_id="ev-r4-f2-link",
+                producer_stream="stream-r4-f2",
+                sequence=2,
+                harness_id="claude-code",
+                kind="command_result",
+                recorded_at="2026-11-26T16:02:02Z",
+                payload={"cmd": "pytest"},
+                source_metadata={"host_version": _CLAUDE_VER, "config_digest": c_dig1},
+            ).to_dict()
+            assert (
+                CaptureClient(LoopbackClient(monotonic_ns=mono.monotonic_ns))
+                .post_batch(
+                    target3, CaptureBatchCommand("stream-r4-f2", ws_a.repo_id, ws_a.checkout_id, (ev_lnk,), cap_c.token)
+                )
+                .accepted_count
+                == 1
+            )
+            assert _capture_event_row(loop3, "ev-r4-f2-link") == ("unknown", "unverified")
+
+            st_lk, app_lk = _terminal_approve_proposal(ready3, ca_pem, cli_token, prop_lnk)
+            assert app_lk.get("ok") is False, (st_lk, app_lk)
+            assert app_lk["error"]["code"] == ErrorCode.CAPABILITY_UNAVAILABLE.value
+
+        for doc_chk in (None, chk_a):
+            doc_lnk = run_doctor(rep.daemon_config_path, checkout_root=doc_chk, os_=os_)
+            assert doc_lnk.terminal_channel_eligible is False
+            assert {h.harness_id: h.state for h in doc_lnk.layer2_harnesses}["claude-code"] is Layer2State.UNKNOWN
+    finally:
+        _remove_dangling_claude_link(chk_a)
+
+    # Part C: Consecutive online /v2/operator/restore rebinds preserve configured-checkout detection.
+    def _online_restore(ready_obj: Any) -> None:
+        st_p, prev_env = _post_tls(
+            ready_obj, ca_pem, "/v2/operator/restore", cli_token, {"target": "policy", "backup": str(bak_verified)}
+        )
+        assert st_p == 200 and prev_env.get("ok") is True, (st_p, prev_env)
+        ch = cast(dict[str, Any], prev_env["data"]["challenge"])
+        msg = ApprovalMessage(
+            store_id=rep.store_id,
+            owner_id=_OWNER,
+            trust_generation=int(ch["trust_generation"]),
+            action=ApprovalAction.RESTORE,
+            subject_id=str(ch["subject_id"]),
+            subject_revision=1,
+            resource_digests=(ResourceDigest("backup", str(prev_env["data"]["backup_db_digest"])),),
+            target_files=(),
+            risk_level=RiskLevel.HIGH,
+            risk_policy_version=RISK_POLICY_VERSION,
+            recovery_scope=RecoveryScope.NONE,
+            nonce=str(ch["nonce"]),
+            expires_at=datetime.fromisoformat(str(ch["expires_at"]).replace("Z", "+00:00")),
+        )
+        st_e, exec_env = _post_tls(
+            ready_obj,
+            ca_pem,
+            "/v2/operator/restore",
+            cli_token,
+            {
+                "target": "policy",
+                "backup": str(bak_verified),
+                "approval": {
+                    "message": msg.to_dict(),
+                    "channel": ApprovalChannel.SSH_KEY.value,
+                    "signer_id": rep.signer.signer_id,
+                    "signature": _ssh_sig_b64(priv, msg.canonical_bytes()),
+                },
+            },
+        )
+        assert st_e == 200 and exec_env.get("ok") is True, (st_e, exec_env)
+
+    clock.advance(timedelta(seconds=5))
+    with _serve_daemon(cfg, os_, clock, mono) as (ready4, loop4):
+        _publish_capture_creds(loop4, [(cap_c, "stream-r4-f2", ws_a)])
+        # Restore #1 while config is deleted -> must fail closed.
+        _online_restore(ready4)
+        st_r1, app_r1 = _terminal_approve_proposal(ready4, ca_pem, cli_token, prop_r1)
+        assert app_r1.get("ok") is False, (st_r1, app_r1)
+        assert app_r1["error"]["code"] == ErrorCode.CAPABILITY_UNAVAILABLE.value
+
+        # Re-bootstrap, re-verify cleanly, prove terminal succeeds (recording configured checkout in new policy DB).
+        mcp_json = chk_a / ".mcp.json"
+        if mcp_json.exists():
+            mcp_json.unlink()
+        _write_plan_targets(chk_a, plan_claude_bootstrap(checkout_root=chk_a, profile_path=prof_path).targets)
+        assert compute_harness_config_digest("claude-code", chk_a, os_) == c_dig1
+
+        def _reverify_after_r1() -> None:
+            session = cast(Any, loop4._session)
+            assert session is not None
+            st, _ = reconcile_harness_layer2_in_policy(
+                session._rt.policy,
+                harness_id="claude-code",
+                checkout_root=chk_a,
+                observed_host_version=_CLAUDE_VER,
+                os_=os_,
+                receipt=_build_receipt(harness_id="claude-code", host_version=_CLAUDE_VER, config_digest=c_dig1),
+            )
+            assert st is Layer2State.VERIFIED
+
+        loop4.run_owner_action(_reverify_after_r1).result(timeout=10.0)
+        st_r2ok, app_r2ok = _terminal_approve_proposal(ready4, ca_pem, cli_token, prop_r2_ok)
+        assert st_r2ok == 200 and app_r2ok.get("ok") is True, (st_r2ok, app_r2ok)
+
+        # Delete config again and perform consecutive online Restore #2 -> still fails closed!
+        shutil.rmtree(chk_a / ".claude")
+        (chk_a / "CLAUDE.md").unlink()
+        clock.advance(timedelta(seconds=5))
+        _online_restore(ready4)
+        st_r2d, app_r2d = _terminal_approve_proposal(ready4, ca_pem, cli_token, prop_r2_del)
+        assert app_r2d.get("ok") is False, (st_r2d, app_r2d)
+        assert app_r2d["error"]["code"] == ErrorCode.CAPABILITY_UNAVAILABLE.value
+
+
+def test_r4_finding3_hook_session_sanitization_and_minimal_imports(trusted_tmp: Path) -> None:
+    """Hook entry strips raw session keys, rejects forged session_ref, redacts secrets, and skips tomlkit."""
+    os_ = os_adapters()
+    chk_a = trusted_tmp / "chk-r4-f3"
+    outbox_dir = trusted_tmp / "outbox-r4-f3"
+    log_path = trusted_tmp / "hook-r4-f3.log"
+    chk_a.mkdir(parents=True, exist_ok=True)
+    os_.permissions.secure_directory(chk_a)
+
+    # Variant A1: Clean payload with raw_session_id, sessionId, conversation_id -> enqueued with stripped keys,
+    # non-anonymous server-derived session_ref, and zero raw secret in outbox frames or log.
+    secrets = (
+        ("raw_session_id", "secret-raw-sid-999"),
+        ("sessionId", "secret-camelsid-888"),
+        ("conversation_id", "secret-conv-777"),
+    )
+    anon_ref = digest_bytes(f"hook-session:claude-code:{chk_a}:anonymous".encode())
+    seen_refs: list[str] = []
+    for idx, (key_name, secret_val) in enumerate(secrets, start=1):
+        payload = {
+            "event_id": f"ev-r4-f3-san-{idx}",
+            "sequence": idx,
+            "event_name": "PostToolUse",
+            "recorded_at": f"2026-11-26T16:05:0{idx}Z",
+            "cwd": str(chk_a),
+            "producer_stream": "stream-r4-f3-a",
+            key_name: secret_val,
+            "payload": {"command": "pytest -q", "note": f"step-{idx}"},
+        }
+        rc = hook_entry.run_hook(
+            json.dumps(payload).encode("utf-8"),
+            outbox_dir=outbox_dir,
+            log_path=log_path,
+            default_harness_id="claude-code",
+            checkout_root=chk_a,
+        )
+        assert rc == 0
+
+    spool = OutboxSpool(outbox_dir, permissions=os_.permissions)
+    entries = spool.read_pending(limit=20, producer_stream="stream-r4-f3-a")
+    assert len(entries) == len(secrets)
+    for entry in entries:
+        ev_obj = cast(dict[str, Any], json.loads(entry.payload_json))
+        sref = str(ev_obj.get("session_ref") or "")
+        assert sref != ""
+        assert sref != anon_ref
+        seen_refs.append(sref)
+    assert len(set(seen_refs)) == len(secrets)
+
+    # Variant A2: Poisoned payload containing raw_session_id/sessionId/conversation_id secret in tool payload ->
+    # PrivacyGate must fail closed (0 enqueued records) and NEVER leak the secret into outbox frames or logs.
+    for idx, (key_name, secret_val) in enumerate(secrets, start=1):
+        poisoned_payload = {
+            "event_id": f"ev-r4-f3-leak-{idx}",
+            "sequence": idx,
+            "event_name": "PostToolUse",
+            "recorded_at": f"2026-11-26T16:05:1{idx}Z",
+            "cwd": str(chk_a),
+            "producer_stream": "stream-r4-f3-leak",
+            key_name: secret_val,
+            "payload": {"command": f"echo {secret_val}", "note": secret_val},
+        }
+        assert (
+            hook_entry.run_hook(
+                json.dumps(poisoned_payload).encode("utf-8"),
+                outbox_dir=outbox_dir,
+                log_path=log_path,
+                default_harness_id="claude-code",
+                checkout_root=chk_a,
+            )
+            == 0
+        )
+    assert spool.read_pending(limit=20, producer_stream="stream-r4-f3-leak") == []
+
+    # Raw secret must NEVER appear anywhere in outbox frame bytes or log file across both clean & poisoned calls.
+    for frame in (outbox_dir / "streams").rglob("*"):
+        if frame.is_file():
+            raw = frame.read_bytes()
+            for _, secret_val in secrets:
+                assert secret_val.encode("utf-8") not in raw
+    if log_path.exists():
+        log_txt = log_path.read_text(encoding="utf-8", errors="replace")
+        for _, secret_val in secrets:
+            assert secret_val not in log_txt
+
+    # Variant B: Client-forged session_ref must be ignored in favor of server-derived digest (both hosts).
+    forged_ref = digest_bytes(b"custom-client-controlled")
+    for idx, (hid, ev_name) in enumerate(
+        (("claude-code", "PostToolUse"), ("codex", "command_completed")),
+        start=10,
+    ):
+        forged_payload = {
+            "event_id": f"ev-r4-f3-forged-{hid}",
+            "sequence": idx,
+            "event_name": ev_name,
+            "recorded_at": "2026-11-26T16:06:00Z",
+            "cwd": str(chk_a),
+            "producer_stream": f"stream-r4-f3-{hid}",
+            "sessionId": f"real-sid-{hid}-42",
+            "session_ref": forged_ref,
+            "payload": {"command": "git status"},
+        }
+        assert (
+            hook_entry.run_hook(
+                json.dumps(forged_payload).encode("utf-8"),
+                outbox_dir=outbox_dir,
+                log_path=log_path,
+                default_harness_id=hid,
+                checkout_root=chk_a,
+            )
+            == 0
+        )
+        got = spool.read_pending(limit=10, producer_stream=f"stream-r4-f3-{hid}")
+        assert len(got) == 1
+        got_obj = cast(dict[str, Any], json.loads(got[0].payload_json))
+        expected_ref = digest_bytes(f"hook-session:{hid}:{chk_a}:real-sid-{hid}-42".encode())
+        assert got_obj.get("session_ref") != forged_ref
+        assert got_obj.get("session_ref") == expected_ref
+
+    # Variant C: Isolated python -I cold-start import check -> "tomlkit" MUST NOT be imported.
+    script = (
+        "import json, sys\n"
+        "from pathlib import Path\n"
+        "from superbrain.composition import hook_entry\n"
+        "assert 'tomlkit' not in sys.modules, 'tomlkit imported eagerly by hook_entry'\n"
+        "chk = Path(sys.argv[1])\n"
+        "ob = Path(sys.argv[2])\n"
+        "for hid, ev in (('claude-code', 'PostToolUse'), ('codex', 'command_completed')):\n"
+        "    p = {'event_id': f'ev-iso-{hid}', 'sequence': 1, 'event_name': ev, "
+        "'recorded_at': '2026-11-26T16:07:00Z', 'cwd': str(chk), "
+        "'producer_stream': f'stream-iso-{hid}', 'payload': {'command': 'echo ok'}}\n"
+        "    rc = hook_entry.run_hook(json.dumps(p).encode(), outbox_dir=ob, default_harness_id=hid, "
+        "checkout_root=chk)\n"
+        "    assert rc == 0\n"
+        "assert 'tomlkit' not in sys.modules, 'tomlkit imported during run_hook'\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-I", "-c", script, str(chk_a), str(outbox_dir)],
+        env=clean_installed_subprocess_env(),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=15.0,
+        check=False,
+    )
+    assert proc.returncode == 0, (proc.returncode, proc.stdout, proc.stderr)
+
+
+def test_r4_finding4_multi_checkout_doctor_and_deep_health_parity(trusted_tmp: Path) -> None:
+    """Multi-checkout doctor (without --checkout) & MCP get_health(deep=true) agree without false positives."""
+    clock = FakeClock(datetime.now(UTC).replace(microsecond=0))
+    mono = FakeMonotonicClock(1_000_000_000)
+    os_ = os_adapters(clock=clock, monotonic=mono)
+    _priv, s_enr = _ssh_signer()
+
+    cfg_dir = trusted_tmp / "cfg"
+    data_root = trusted_tmp / "data"
+    chk_a = trusted_tmp / "chk-r4-f4-a"
+    chk_b = trusted_tmp / "chk-r4-f4-b"
+    for d in (cfg_dir, chk_a, chk_b):
+        d.mkdir(parents=True, exist_ok=True)
+        os_.permissions.secure_directory(d)
+
+    rep = init_entry.init_store(
+        init_entry.InitRequest(
+            data_root=data_root, config_dir=cfg_dir, owner_id=_OWNER, machine_id=_MACHINE, signer=s_enr
+        ),
+        os_,
+    )
+    cfg = read_daemon_config(rep.daemon_config_path, os_)
+    ca_pem = (cfg_dir / "tls" / "ca.pem").read_text(encoding="utf-8")
+
+    prof_a = cfg_dir / "prof-a.json"
+    prof_b = cfg_dir / "prof-b.json"
+    # Phase A: chk_a configured for claude-code ONLY; chk_b configured for codex ONLY.
+    _write_plan_targets(chk_a, plan_claude_bootstrap(checkout_root=chk_a, profile_path=prof_a).targets)
+    _write_plan_targets(chk_b, plan_codex_bootstrap(checkout_root=chk_b, profile_path=prof_b).targets)
+    c_dig_a = compute_harness_config_digest("claude-code", chk_a, os_)
+    x_dig_b = compute_harness_config_digest("codex", chk_b, os_)
+    assert c_dig_a is not None and x_dig_b is not None
+
+    rt = reopen_kernel_job_runtime(data_root, rep.store_id, os_)
+    try:
+        mcp_c = seed_principal_and_credential(rt.policy, owner_id=_OWNER, harness_id="claude-code", machine_id=_MACHINE)
+        mcp_x = seed_principal_and_credential(rt.policy, owner_id=_OWNER, harness_id="codex", machine_id=_MACHINE)
+        ws_a = register_workspace_direct(
+            rt, clock, mcp_c.principal, alias="ws-f4-a", checkout_dir=chk_a, remote="https://example.invalid/a.git"
+        )
+        ws_b = register_workspace_direct(
+            rt, clock, mcp_c.principal, alias="ws-f4-b", checkout_dir=chk_b, remote="https://example.invalid/b.git"
+        )
+        seed_repo_grant(rt.policy, principal_id=mcp_x.principal.principal_id, repo_id=ws_a.repo_id, owner_id=_OWNER)
+        seed_repo_grant(rt.policy, principal_id=mcp_x.principal.principal_id, repo_id=ws_b.repo_id, owner_id=_OWNER)
+        rt.store.reconcile_policy()
+
+        assert (
+            reconcile_harness_layer2_in_policy(
+                rt.policy,
+                harness_id="claude-code",
+                checkout_root=chk_a,
+                observed_host_version=_CLAUDE_VER,
+                os_=os_,
+                receipt=_build_receipt(harness_id="claude-code", host_version=_CLAUDE_VER, config_digest=c_dig_a),
+            )[0]
+            is Layer2State.VERIFIED
+        )
+        assert (
+            reconcile_harness_layer2_in_policy(
+                rt.policy,
+                harness_id="codex",
+                checkout_root=chk_b,
+                observed_host_version=_CODEX_VER,
+                os_=os_,
+                receipt=_build_receipt(harness_id="codex", host_version=_CODEX_VER, config_digest=x_dig_b),
+            )[0]
+            is Layer2State.VERIFIED
+        )
+    finally:
+        rt.close()
+
+    # Phase A assertion: run_doctor WITHOUT --checkout MUST NOT false-positive on chk_a lacking .codex/ or chk_b
+    # lacking .claude/. Both must stay VERIFIED, terminal_channel_eligible(_effective)=True, layer2 check='ok'.
+    doc_clean = run_doctor(rep.daemon_config_path, os_=os_)
+    doc_clean_dict = doc_clean.to_dict()
+    assert doc_clean.terminal_channel_eligible is True
+    assert cast(dict[str, Any], doc_clean_dict["sp2"])["terminal_channel_eligible_effective"] is True
+    assert {h.harness_id: h.state for h in doc_clean.layer2_harnesses} == {
+        "claude-code": Layer2State.VERIFIED,
+        "codex": Layer2State.VERIFIED,
+    }
+    l2_clean_checks = [c for c in doc_clean.checks if c.name == "layer2"]
+    assert len(l2_clean_checks) == 1 and l2_clean_checks[0].status == "ok"
+
+    # Phase B: chk_b ALSO hosts claude-code and drifts its .claude/settings.local.json while chk_a remains clean!
+    _write_plan_targets(chk_b, plan_claude_bootstrap(checkout_root=chk_b, profile_path=prof_b).targets)
+    b_settings = chk_b / ".claude" / "settings.local.json"
+    b_obj = json.loads(b_settings.read_text(encoding="utf-8"))
+    b_obj["permissions"]["allow"] = ["Bash(pytest *)"]
+    b_settings.write_bytes(canonical_json(b_obj))
+
+    # run_doctor WITHOUT --checkout (both direct API & real CLI) must detect drift on chk_b!
+    doc_drift = run_doctor(rep.daemon_config_path, os_=os_)
+    assert doc_drift.terminal_channel_eligible is False
+    doc_drift_dict = doc_drift.to_dict()
+    assert cast(dict[str, Any], doc_drift_dict["sp2"])["terminal_channel_eligible_effective"] is False
+    assert {h.harness_id: h.state for h in doc_drift.layer2_harnesses}["claude-code"] is Layer2State.UNKNOWN
+    l2_drift_checks = [c for c in doc_drift.checks if c.name == "layer2"]
+    assert len(l2_drift_checks) == 1
+    assert l2_drift_checks[0].status == "warn"
+    assert "terminal_channel_eligible=false" in l2_drift_checks[0].detail
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-m",
+            "superbrain.cli.main",
+            "doctor",
+            "--config",
+            str(rep.daemon_config_path),
+            "--json",
+        ],
+        env=clean_installed_subprocess_env(),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=15.0,
+        check=False,
+    )
+    assert proc.returncode == 0, (proc.returncode, proc.stderr)
+    cli_data = json.loads(proc.stdout)["data"]
+    assert cli_data["terminal_channel_eligible"] is False
+    assert cli_data["sp2"]["terminal_channel_eligible_effective"] is False
+    cli_l2 = [c for c in cli_data["checks"] if c["name"] == "layer2"]
+    assert len(cli_l2) == 1 and cli_l2[0]["status"] == "warn"
+    assert any(c["name"] == "sp2_layer2_drift" and c["status"] == "warn" for c in cli_data["checks"])
+
+    # Live daemon get_health(deep=True) over TLS MUST agree and report layer2_drifted / layer2_unverified.
+    with _serve_daemon(cfg, os_, clock, mono) as (ready, _loop):
+        target = LoopbackTarget(
+            endpoint=ready.endpoint,
+            expected_store_id=rep.store_id,
+            ca_pem=ca_pem,
+            leaf_cert_sha256=ready.leaf_cert_sha256,
+        )
+        deep = LoopbackClient(monotonic_ns=mono.monotonic_ns).call(
+            target,
+            ToolCommand(
+                tool="get_health",
+                arguments={"schema_version": SCHEMA_VERSION, "deep": True, "idempotency_key": f"idem-f4-{new_id()}"},
+                token=mcp_c.token,
+                selected_scope=None,
+            ),
+        )
+        assert deep.get("ok") is True, deep
+        deep_data = cast(dict[str, Any], deep["data"])
+        _validate_get_health_schema(deep_data)
+        assert any(c in ("layer2_drifted", "layer2_unverified") for c in deep_data["degraded_codes"]), deep_data[
+            "degraded_codes"
+        ]
+        assert "terminal_channel_ineligible" in deep_data["degraded_codes"], deep_data["degraded_codes"]
