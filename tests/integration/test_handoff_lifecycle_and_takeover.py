@@ -9,6 +9,7 @@ Requirement sources:
 from __future__ import annotations
 
 import datetime as dt
+import time
 from pathlib import Path
 from typing import Any
 
@@ -512,6 +513,16 @@ def test_production_loopback_daemon_l0_l1_l2_served_receipt_read_ack_and_resume(
                 ),
             )
 
+        def wait_send_state(receipt_id: str, expected: str, *, timeout_s: float = 2.0) -> str | None:
+            deadline = time.perf_counter() + timeout_s
+            while time.perf_counter() < deadline:
+                state = h.get_send_attempt_state(receipt_id)
+                if state == expected:
+                    return state
+                time.sleep(0.005)
+            h.loop.run_owner_action(lambda: None).result(timeout=2.0)
+            return h.get_send_attempt_state(receipt_id)
+
         # 1. Start work task on production loopback daemon (domain=None -> default HandoffKernelDomain).
         prep = call_loop(
             "prepare_task",
@@ -590,15 +601,17 @@ def test_production_loopback_daemon_l0_l1_l2_served_receipt_read_ack_and_resume(
         assert art_l1.get("ok") is True and art_l1["data"]["status"] == "ok", art_l1
         l1_data = art_l1["data"]
         receipt_1 = l1_data["served_receipt_id"]
-        assert h.get_send_attempt_state(receipt_1) == SendAttemptState.SERVED_ONLY
+        assert isinstance(receipt_1, str)
+        assert wait_send_state(receipt_1, SendAttemptState.SERVED_ONLY) == SendAttemptState.SERVED_ONLY
         assert l1_data["resources"][0]["name"] == "handoff_header"
 
         # Replaying SAME get_artifact idempotency_key mints a DISTINCT served_receipt_id (C5 / case 72)!
         art_l1_replay = call_loop("get_artifact", get_l1_args)
         assert art_l1_replay.get("ok") is True
         receipt_2 = art_l1_replay["data"]["served_receipt_id"]
+        assert isinstance(receipt_2, str)
         assert receipt_2 != receipt_1
-        assert h.get_send_attempt_state(receipt_2) == SendAttemptState.SERVED_ONLY
+        assert wait_send_state(receipt_2, SendAttemptState.SERVED_ONLY) == SendAttemptState.SERVED_ONLY
 
         art_l2 = call_loop(
             "get_artifact",
