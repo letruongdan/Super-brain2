@@ -23,6 +23,7 @@ from superbrain.core.kernel import (
     HANDLER_RESERVE_NS,
     IDEMPOTENCY_CLOCK_UNTRUSTED_CODE,
     ArtifactSendSpec,
+    AuthSnapshot,
     Call,
     CallContext,
     CallResult,
@@ -116,6 +117,7 @@ class KernelDispatcher:
         before_enter_commit: Callable[[Reservation | None], None] | None = None,
         on_commit_completed: Callable[[StoredResult], None] | None = None,
         has_capture_gaps: Callable[[], bool] | None = None,
+        effective_snapshot: Callable[[], AuthSnapshot] | None = None,
     ) -> None:
         require_opaque_id(store_id, label="store_id")
         self._store_id = store_id
@@ -132,6 +134,10 @@ class KernelDispatcher:
         self._before_enter_commit = before_enter_commit
         self._on_commit_completed = on_commit_completed
         self._has_capture_gaps = has_capture_gaps
+        self._effective_snapshot = effective_snapshot
+
+    def _current_snapshot(self) -> AuthSnapshot:
+        return self._effective_snapshot() if self._effective_snapshot is not None else self._policy.snapshot()
 
     def dispatch(self, call: Call, ctx: CallContext, *, auth: PrivateRequestAuth) -> CallResult:
         """Execute ``call`` on the owner thread and return a validated v2 ``CallResult`` envelope."""
@@ -162,10 +168,15 @@ class KernelDispatcher:
             raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
         if selected_scope is not None and not isinstance(selected_scope, Scope):
             raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
-        if not self._policy.allows(principal, None, action="get_health"):
+        snap = self._current_snapshot() if self._effective_snapshot is not None else None
+        if not self._policy.allows(principal, None, action="get_health") or (
+            snap is not None and not snap.allows(principal, None, action="get_health")
+        ):
             raise BrainError(ErrorCode.NOT_FOUND, "not found")
-        if selected_scope is not None and not self._policy.allows(
-            principal, selected_scope, action=_scope_action_for_stored(result)
+        action = _scope_action_for_stored(result)
+        if selected_scope is not None and (
+            not self._policy.allows(principal, selected_scope, action=action)
+            or (snap is not None and not snap.allows(principal, selected_scope, action=action))
         ):
             raise BrainError(ErrorCode.NOT_FOUND, "not found")
         if self._domain is None:
@@ -218,7 +229,12 @@ class KernelDispatcher:
         live_principal = self._policy.resolve_credential(auth.token)
         if live_principal != auth.principal or live_principal != ctx.principal:
             raise BrainError(ErrorCode.IDENTITY_MISMATCH, "principal identity mismatch")
-        authorize_call_against_snapshot(self._policy.snapshot(), live_principal, call)
+        snap = self._current_snapshot()
+        if self._effective_snapshot is not None:
+            effective_principal = snap.resolve_credential(auth.token)
+            if effective_principal != live_principal:
+                raise BrainError(ErrorCode.IDENTITY_MISMATCH, "principal identity mismatch")
+        authorize_call_against_snapshot(snap, live_principal, call)
         return live_principal
 
     def _check_handler_budget(self, ctx: CallContext, reservation: Reservation | None) -> None:

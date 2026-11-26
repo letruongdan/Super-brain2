@@ -24,7 +24,6 @@ from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.ids import new_id
 from superbrain.core.jsonvalue import JsonValue
 from superbrain.core.kernel import (
-    CAPABILITY_MCP_TOOL,
     ArtifactSendAttempt,
     AuthGrantStamp,
     AuthSnapshot,
@@ -224,7 +223,11 @@ class KernelBridge(KernelBlobStagePort):
             before_enter_commit=self._before_enter_commit,
             on_commit_completed=self._on_commit_completed,
             has_capture_gaps=self.capture_gaps_present,
+            effective_snapshot=self._effective_policy_snapshot,
         )
+
+    def _effective_policy_snapshot(self) -> AuthSnapshot:
+        return self._auth_state.merge_runtime_capabilities(self._policy.snapshot())
 
     def rebind_stores(self, *, store: Store, policy: PolicyStore, writer_epoch: int) -> None:
         """Rebind the bridge to reopened ``Store`` / ``PolicyStore`` handles after an online restore."""
@@ -246,21 +249,11 @@ class KernelBridge(KernelBlobStagePort):
         self._check_live_pair()
         return self._policy.schema_version
 
-    def _non_mcp_error_envelope(self, credential_id: str) -> CallResult | None:
-        view = self._auth_state.current()
-        cred = view.auth.credentials.get(credential_id) if view is not None else None
-        if cred is None or cred.revoked or CAPABILITY_MCP_TOOL in cred.capabilities:
-            return None
-        return _encoded_error(BrainError(ErrorCode.IDENTITY_MISMATCH, "identity mismatch"))
-
     def _run_reserved_on_owner(
         self, call: Call, ctx: CallContext, auth: PrivateRequestAuth, reservation: Reservation
     ) -> CallResult:
         try:
             self._check_live_pair()
-            non_mcp = self._non_mcp_error_envelope(auth.credential_id)
-            if non_mcp is not None:
-                return non_mcp
         except BrainError as err:
             if err.code in (ErrorCode.IDENTITY_MISMATCH, ErrorCode.POLICY_UNAVAILABLE, ErrorCode.INTEGRITY_FAILURE):
                 self._auth_state.clear()
@@ -470,12 +463,15 @@ class KernelBridge(KernelBlobStagePort):
     def dispatch(self, call: Call, ctx: CallContext, *, auth: PrivateRequestAuth) -> CallResult:
         try:
             self._check_live_pair()
-            non_mcp = self._non_mcp_error_envelope(auth.credential_id)
-            if non_mcp is not None:
-                return non_mcp
         except BrainError as err:
             return _encoded_error(err)
-        return self._dispatcher.dispatch(call, ctx, auth=auth)
+        result = self._dispatcher.dispatch(call, ctx, auth=auth)
+        if result.get("ok") is False:
+            err_obj = result.get("error")
+            err_code = err_obj.get("code") if isinstance(err_obj, Mapping) else None
+            if err_code == ErrorCode.UNAUTHENTICATED.value:
+                self._clear_auth_if_diverged(auth.credential_id)
+        return result
 
     def render_current(self, result: StoredResult, principal: Principal, *, selected_scope: Scope | None) -> JsonValue:
         self._check_live_pair()
@@ -564,7 +560,12 @@ class KernelBridge(KernelBlobStagePort):
             repo_id=command.repo_id,
             checkout_id=command.checkout_id,
         )
-        live_p = self._policy.resolve_credential(command.token)
+        try:
+            live_p = self._policy.resolve_credential(command.token)
+        except BrainError as err:
+            if err.code is ErrorCode.UNAUTHENTICATED:
+                self._verified_auth_view()
+            raise
         if live_p != ram_p:
             raise BrainError(ErrorCode.IDENTITY_MISMATCH, "principal identity mismatch")
         snap = self._policy.snapshot()

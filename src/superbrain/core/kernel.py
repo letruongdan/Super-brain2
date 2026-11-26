@@ -30,6 +30,7 @@ from superbrain.core._kernel_auth import (
     collect_credential_capability_bindings,
     is_trusted_bootstrap_issuer,
     parse_bearer_token,
+    update_credential_capability_bindings,
     verify_secret_digest,
 )
 from superbrain.core._kernel_base import (
@@ -586,6 +587,7 @@ __all__ = [
     "reservation_descriptor",
     "result_descriptor",
     "retry_backoff",
+    "update_credential_capability_bindings",
     "usage_descriptor",
     "verify_secret_digest",
 ]

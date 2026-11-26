@@ -25,10 +25,10 @@ from superbrain.core.kernel import (
     ShallowHealthMeta,
     ToolCommand,
     apply_credential_capability_bindings,
-    collect_credential_capability_bindings,
     is_strict_int,
     parse_bearer_token,
     require_aware_utc,
+    update_credential_capability_bindings,
 )
 from superbrain.core.wire import encode_envelope, make_success_envelope, normalize_call
 from superbrain.ports.clock import Clock, MonotonicClock
@@ -132,13 +132,18 @@ class AuthGate(RequestAuthStatePort):
         if view.auth.store_id != self._identity.store_id:
             with self._lock:
                 self._view = None
+                self._credential_bindings.clear()
             raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
         if health_meta is not None:
             if not isinstance(health_meta, ShallowHealthMeta):
                 raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+            if health_meta.store_id != self._identity.store_id:
+                with self._lock:
+                    self._view = None
+                    self._credential_bindings.clear()
+                raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
             if (
-                health_meta.store_id != self._identity.store_id
-                or health_meta.writer_epoch != self._identity.writer_epoch
+                health_meta.writer_epoch != self._identity.writer_epoch
                 or health_meta.instance_id != self._identity.instance_id
             ):
                 raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
@@ -153,7 +158,9 @@ class AuthGate(RequestAuthStatePort):
                 self._issued_version = view.version
             self._cached_key_id = view.active_request_key_id
             self._cached_key_bytes = view.active_request_key_bytes
-            self._credential_bindings = collect_credential_capability_bindings(view.auth)
+            self._credential_bindings = update_credential_capability_bindings(
+                self._credential_bindings, view.auth
+            )
             if health_meta is not None:
                 self._health_meta = health_meta
             return view
@@ -187,12 +194,12 @@ class AuthGate(RequestAuthStatePort):
         """Atomically advance the admitted writer epoch and publish the refreshed auth view."""
         if not isinstance(view, RequestAuthView) or not isinstance(health_meta, ShallowHealthMeta):
             raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
-        if (
-            view.auth.store_id != self._identity.store_id
-            or health_meta.store_id != self._identity.store_id
-            or health_meta.writer_epoch != new_epoch
-            or health_meta.instance_id != self._identity.instance_id
-        ):
+        if view.auth.store_id != self._identity.store_id or health_meta.store_id != self._identity.store_id:
+            with self._lock:
+                self._view = None
+                self._credential_bindings.clear()
+            raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
+        if health_meta.writer_epoch != new_epoch or health_meta.instance_id != self._identity.instance_id:
             raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
         with self._lock:
             if self._closed:
@@ -206,7 +213,9 @@ class AuthGate(RequestAuthStatePort):
                 self._issued_version = view.version
             self._cached_key_id = view.active_request_key_id
             self._cached_key_bytes = view.active_request_key_bytes
-            self._credential_bindings = collect_credential_capability_bindings(view.auth)
+            self._credential_bindings = update_credential_capability_bindings(
+                self._credential_bindings, view.auth
+            )
             self._health_meta = health_meta
             return view
 
@@ -232,11 +241,7 @@ class AuthGate(RequestAuthStatePort):
         with self._lock:
             if self._closed or self._view is None or self._view.version != generation:
                 return False
-            snap = self._view.auth
-            cred = snap.credentials.get(credential_id)
-            if cred is None or cred.revoked:
-                return False
-            return snap.principals.get(cred.principal.principal_id) == cred.principal
+            return self._view.auth.is_active_mcp_credential(credential_id)
 
     def authorize_stamp(self, stamp: AuthGrantStamp) -> bool:
         if not isinstance(stamp, AuthGrantStamp) or stamp.identity != self._identity:
@@ -246,11 +251,7 @@ class AuthGate(RequestAuthStatePort):
                 return False
             if self._view.version != stamp.generation or self._view.auth.trust_generation != stamp.trust_generation:
                 return False
-            snap = self._view.auth
-            cred = snap.credentials.get(stamp.credential_id)
-            if cred is None or cred.revoked:
-                return False
-            return snap.principals.get(cred.principal.principal_id) == cred.principal
+            return self._view.auth.is_active_mcp_credential(stamp.credential_id)
 
     def close(self) -> None:
         with self._lock:

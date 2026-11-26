@@ -546,6 +546,20 @@ def apply_credential_capability_bindings(
     return snap if merged is None else replace(snap, credentials=merged)
 
 
+def update_credential_capability_bindings(
+    existing: Mapping[str, CredentialCapabilityBinding],
+    snap: AuthSnapshot,
+) -> dict[str, CredentialCapabilityBinding]:
+    """Update cached non-MCP bindings from ``snap`` while retaining bindings for absent credentials."""
+    updated = dict(existing)
+    for cid, rec in snap.credentials.items():
+        if rec.capabilities != _DEFAULT_MCP_CAPABILITIES or rec.capture_binding is not None:
+            updated[cid] = (rec.principal, rec.secret_digest, rec.capabilities, rec.capture_binding)
+        else:
+            updated.pop(cid, None)
+    return updated
+
+
 @dataclass(frozen=True)
 class DirectRefRecord:
     kind: str

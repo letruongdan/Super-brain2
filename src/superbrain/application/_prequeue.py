@@ -26,11 +26,11 @@ from superbrain.core.kernel import (
     ReservationScopeKey,
     Scope,
     apply_credential_capability_bindings,
-    collect_credential_capability_bindings,
     is_strict_int,
     parse_bearer_token,
     require_opaque_id,
     require_positive_int,
+    update_credential_capability_bindings,
 )
 from superbrain.core.wire import canonical_request_payload, normalize_call, parse_json
 from superbrain.ports.kernel import RequestAuthStatePort
@@ -74,7 +74,9 @@ class AtomicRequestAuthState(RequestAuthStatePort):
             self._installed_version = view.version
             if view.version > self._issued_version:
                 self._issued_version = view.version
-            self._credential_bindings = collect_credential_capability_bindings(view.auth)
+            self._credential_bindings = update_credential_capability_bindings(
+                self._credential_bindings, view.auth
+            )
             return view
 
     def merge_runtime_capabilities(self, snap: AuthSnapshot) -> AuthSnapshot:
