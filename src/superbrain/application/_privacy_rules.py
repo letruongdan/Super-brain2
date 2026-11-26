@@ -30,7 +30,8 @@ STATUS_FIELDS: frozenset[str] = frozenset({"schema_version", "status", "outcome"
 _PRINTABLE_AND_WS_BYTES = bytes(range(0x20, 0x7F)) + b"\t\n\r\x0b\x0c"
 _PRINTABLE_NON_WS_BYTES = bytes(range(0x21, 0x7F))
 _JSON_SAFE_NL_BYTES = bytes(range(0x20, 0x7F)) + b"\n"
-_KV_WORDS = ("token", "passw", "pwd", "passphrase", "secret", "key")
+# Stems covering every alternation in ``_KEY_VALUE_SECRET`` (``pass`` covers ``password``/``passwd``/``passphrase``).
+_KV_WORDS = ("token", "pass", "pwd", "secret", "key")
 
 _UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 _STATUS_VALUE_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")

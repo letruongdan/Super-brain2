@@ -9,6 +9,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import datetime as dt
+import json
 import os
 import shutil
 import socket
@@ -22,6 +23,7 @@ import warnings
 from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import Future
 from pathlib import Path
+from typing import Any, NamedTuple, cast
 
 from superbrain.adapters.os import os_adapters
 from superbrain.adapters.os.daemon_config import read_daemon_config
@@ -50,6 +52,7 @@ from superbrain.core.kernel import (
     Call,
     CallContext,
     DaemonConfig,
+    Endpoint,
     ObjectRef,
     OwnerReply,
     Principal,
@@ -182,8 +185,76 @@ def register_workspace_direct(
     return binding
 
 
+class _ParsedHttpFrame(NamedTuple):
+    headers_done: bool
+    status: int | None
+    content_length: int | None
+    header_valid: bool
+    complete: bool
+
+
+_MAX_PARSED_CONTENT_LENGTH = 64 * 1024 * 1024
+
+
+def _parse_status_code(status_line: str) -> int | None:
+    if not status_line.startswith("HTTP/1.1 "):
+        return None
+    rest = status_line[9:]
+    code_str = rest[:3]
+    if (
+        len(rest) < 3
+        or not code_str.isascii()
+        or not code_str.isdigit()
+        or (len(rest) > 3 and rest[3] != " ")
+    ):
+        return None
+    code = int(code_str)
+    return code if 100 <= code <= 599 else None
+
+
+def _parse_content_length(header_lines: list[str]) -> tuple[bool, int | None]:
+    cl_values: list[str] = []
+    for line in header_lines:
+        colon = line.find(":")
+        if colon <= 0:
+            return False, None
+        name_raw = line[:colon]
+        if any(ch in (" ", "\t") for ch in name_raw):
+            return False, None
+        low = name_raw.lower()
+        if low == "transfer-encoding":
+            return False, None
+        if low == "content-length":
+            cl_values.append(line[colon + 1 :].strip(" \t"))
+    if not cl_values:
+        return True, None
+    if len(cl_values) > 1:
+        return False, None
+    raw_cl = cl_values[0]
+    significant = raw_cl.lstrip("0") or "0"
+    if not raw_cl or not raw_cl.isascii() or not raw_cl.isdigit() or len(significant) > 9:
+        return False, None
+    parsed_cl = int(significant)
+    if parsed_cl > _MAX_PARSED_CONTENT_LENGTH:
+        return False, None
+    return True, parsed_cl
+
+
+def _parse_http_frame(raw: bytes) -> _ParsedHttpFrame:
+    """Parse HTTP/1.1 response headers and evaluate ``Content-Length`` frame completeness."""
+    head, sep, body = raw.partition(b"\r\n\r\n")
+    if not sep:
+        return _ParsedHttpFrame(False, None, None, False, False)
+    lines = head.decode("iso-8859-1").split("\r\n")
+    status = _parse_status_code(lines[0])
+    headers_ok, content_length = _parse_content_length(lines[1:])
+    header_valid = status is not None and headers_ok
+    complete = header_valid and content_length is not None and len(body) >= content_length
+    return _ParsedHttpFrame(True, status, content_length, header_valid, complete)
+
+
 def read_raw_http_response(sock: ssl.SSLSocket | socket.socket, timeout: float = 2.0) -> bytes:
-    """Read a complete HTTP/1.1 response from sock until Content-Length is satisfied or EOF."""
+    """Read a complete HTTP/1.1 response from sock until Content-Length is satisfied, invalid headers, or EOF."""
     sock.settimeout(timeout)
     resp = bytearray()
     while True:
@@ -192,18 +263,157 @@ def read_raw_http_response(sock: ssl.SSLSocket | socket.socket, timeout: float =
             if not chunk:
                 break
             resp.extend(chunk)
-            if b"\r\n\r\n" in resp:
-                header_end = resp.index(b"\r\n\r\n")
-                headers = resp[:header_end].decode("iso-8859-1")
-                cl = 0
-                for line in headers.split("\r\n"):
-                    if line.lower().startswith("content-length:"):
-                        cl = int(line.split(":", 1)[1].strip())
-                if len(resp) >= header_end + 4 + cl:
-                    break
+            frame = _parse_http_frame(bytes(resp))
+            if frame.headers_done and (frame.complete or not frame.header_valid):
+                break
         except (TimeoutError, OSError):
             break
     return bytes(resp)
+
+
+_PRE_POST_RETRYABLE_ERRORS: tuple[type[BaseException], ...] = (
+    ConnectionAbortedError,
+    ConnectionResetError,
+    BrokenPipeError,
+    TimeoutError,
+    ssl.SSLEOFError,
+    ssl.SSLZeroReturnError,
+    ssl.SSLSyscallError,
+)
+
+
+def _connect_tcp_nodelay(host: str, port: int, timeout: float) -> socket.socket:
+    """Open a TCP socket to ``(host, port)`` with ``TCP_NODELAY`` enabled."""
+    try:
+        socket.inet_aton(host)
+    except OSError:
+        raw = socket.create_connection((host, port), timeout=timeout)
+    else:
+        raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        raw.settimeout(timeout)
+        try:
+            raw.connect((host, port))
+        except BaseException:
+            raw.close()
+            raise
+    raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    return raw
+
+
+def post_tls_raw(
+    target: Ready | Endpoint,
+    ca_pem: str,
+    path: str,
+    token: str,
+    payload: bytes | object,
+    *,
+    connect_timeout: float = 3.0,
+    ident_timeout: float = 3.0,
+    read_timeout: float = 5.0,
+    max_attempts: int = 3,
+    require_identity_200: bool = True,
+) -> bytes:
+    """Perform ``GET /v2/identity`` followed by ``POST <path>`` over verified loopback TLS.
+
+    Retries ONLY transient pre-POST handshake / identity-probe transport drops or incomplete
+    State-0 frames before any POST byte is written. Never retries after POST begins sending, and
+    fails closed immediately on certificate verification errors or connection refusal.
+    """
+    ep = target.endpoint if isinstance(target, Ready) else target
+    ident_obj = target.identity
+    host = f"{ep.host}:{ep.port}"
+    body = payload if isinstance(payload, bytes) else json.dumps(payload).encode("utf-8")
+    ident_req = f"GET /v2/identity HTTP/1.1\r\nHost: {host}\r\n\r\n".encode("ascii")
+    post_frame = (
+        f"POST {path} HTTP/1.1\r\n"
+        f"Host: {host}\r\n"
+        f"Authorization: Bearer {token}\r\n"
+        f"X-Store-Id: {ident_obj.store_id}\r\n"
+        f"X-Writer-Epoch: {ident_obj.writer_epoch}\r\n"
+        f"X-Superbrain-Instance: {ident_obj.instance_id}\r\n"
+        f"Content-Type: application/json\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        f"Connection: close\r\n\r\n"
+    ).encode("iso-8859-1") + body
+
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.load_verify_locations(cadata=ca_pem)
+    ctx.check_hostname = True
+    server_hostname = "127.0.0.1" if ep.host == "127.0.0.1" else ep.host
+
+    attempts = max(1, max_attempts)
+    for attempt in range(attempts):
+        post_sent = False
+        try:
+            with (
+                _connect_tcp_nodelay(ep.host, ep.port, connect_timeout) as raw,
+                ctx.wrap_socket(
+                    raw,
+                    server_hostname=server_hostname,
+                    do_handshake_on_connect=False,
+                ) as sock,
+            ):
+                sock.settimeout(connect_timeout)
+                sock.do_handshake()
+                sock.settimeout(ident_timeout)
+                sock.sendall(ident_req)
+                ident = read_raw_http_response(sock, timeout=ident_timeout)
+                ident_frame = _parse_http_frame(ident)
+                ident_200_complete = ident_frame.complete and ident_frame.header_valid and ident_frame.status == 200
+                if not ident_200_complete:
+                    ident_non_200_complete = (
+                        ident_frame.complete
+                        and ident_frame.header_valid
+                        and ident_frame.status is not None
+                        and ident_frame.status != 200
+                    )
+                    if ident_non_200_complete or attempt + 1 >= attempts:
+                        if require_identity_200:
+                            raise AssertionError(ident[:200])
+                        return ident
+                    time.sleep(0.01 * (attempt + 1))
+                    continue
+                sock.settimeout(read_timeout)
+                post_sent = True
+                sock.sendall(post_frame)
+                return read_raw_http_response(sock, timeout=read_timeout)
+        except _PRE_POST_RETRYABLE_ERRORS:
+            if post_sent or attempt + 1 >= attempts:
+                raise
+            time.sleep(0.01 * (attempt + 1))
+    raise AssertionError("unreachable")
+
+
+def post_tls_http_json(
+    target: Ready | Endpoint,
+    ca_pem: str,
+    path: str,
+    token: str,
+    payload: bytes | object,
+    *,
+    connect_timeout: float = 3.0,
+    ident_timeout: float = 3.0,
+    read_timeout: float = 5.0,
+) -> tuple[int, dict[str, Any]]:
+    """Call ``post_tls_raw`` and parse a complete ``HTTP/1.1 <status>`` JSON object envelope."""
+    resp = post_tls_raw(
+        target,
+        ca_pem,
+        path,
+        token,
+        payload,
+        connect_timeout=connect_timeout,
+        ident_timeout=ident_timeout,
+        read_timeout=read_timeout,
+        require_identity_200=True,
+    )
+    frame = _parse_http_frame(resp)
+    assert frame.complete and frame.header_valid and frame.status is not None and frame.content_length is not None, (
+        resp[:200]
+    )
+    _, _, data = resp.partition(b"\r\n\r\n")
+    assert len(data) == frame.content_length, resp[:200]
+    return frame.status, cast(dict[str, Any], json.loads(data))
 
 
 @dataclasses.dataclass

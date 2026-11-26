@@ -5,9 +5,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
-import socket
 import sqlite3
-import ssl
 import struct
 import sys
 import threading
@@ -61,7 +59,7 @@ from superbrain.storage.layout import DataRoot
 from tests.support.clock import FakeClock
 from tests.support.fs import digest_tree
 from tests.support.inc2_fixture import reopen_kernel_job_runtime
-from tests.support.inc2_transport import FakeMonotonicClock, read_raw_http_response
+from tests.support.inc2_transport import FakeMonotonicClock, post_tls_raw
 from tests.support.kernel_auth import make_bootstrap_auth, seed_principal_and_credential
 
 OWNER = "dan"
@@ -215,26 +213,16 @@ def _running_daemon(
 def _post_loopback(
     ready: Ready, ca_pem: str, path: str, token: str, payload: object, *, read_timeout: float = 2.0
 ) -> bytes:
-    host = f"{ready.endpoint.host}:{ready.endpoint.port}"
-    body = json.dumps(payload).encode("utf-8")
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    ctx.load_verify_locations(cadata=ca_pem)
-    ctx.check_hostname = True
-    with socket.create_connection((ready.endpoint.host, ready.endpoint.port), timeout=2.0) as raw:
-        with ctx.wrap_socket(raw, server_hostname="127.0.0.1") as sock:
-            sock.settimeout(read_timeout)
-            sock.sendall(f"GET /v2/identity HTTP/1.1\r\nHost: {host}\r\n\r\n".encode("ascii"))
-            ident = read_raw_http_response(sock, timeout=read_timeout)
-            if not ident.startswith(b"HTTP/1.1 200 "):
-                return ident
-            req = (
-                f"POST {path} HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer {token}\r\n"
-                f"X-Store-Id: {ready.identity.store_id}\r\nX-Writer-Epoch: {ready.identity.writer_epoch}\r\n"
-                f"X-Superbrain-Instance: {ready.identity.instance_id}\r\n"
-                f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n\r\n"
-            ).encode("iso-8859-1") + body
-            sock.sendall(req)
-            return read_raw_http_response(sock, timeout=read_timeout)
+    return post_tls_raw(
+        ready,
+        ca_pem,
+        path,
+        token,
+        payload,
+        ident_timeout=read_timeout,
+        read_timeout=read_timeout,
+        require_identity_200=False,
+    )
 
 
 def _envelope(raw_resp: bytes) -> dict[str, Any]:

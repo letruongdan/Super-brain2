@@ -59,7 +59,7 @@ from tests.support.inc2_cli import (
     write_owner_only_bytes,
 )
 from tests.support.inc2_fixture import InstalledEnv, reopen_kernel_job_runtime
-from tests.support.inc2_transport import read_raw_http_response, register_workspace_direct
+from tests.support.inc2_transport import post_tls_http_json, read_raw_http_response, register_workspace_direct
 from tests.support.kernel_auth import seed_principal_and_credential
 
 OWNER = "dan"
@@ -114,28 +114,7 @@ def _passkey_sign(
 
 
 def _post_daemon(endpoint: Endpoint, ca_pem: str, path: str, token: str, obj: object) -> dict[str, Any]:
-    host = f"{endpoint.host}:{endpoint.port}"
-    body = json.dumps(obj).encode("utf-8")
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    ctx.load_verify_locations(cadata=ca_pem)
-    ctx.check_hostname = True
-    with (
-        socket.create_connection((endpoint.host, endpoint.port), timeout=2.0) as raw,
-        ctx.wrap_socket(raw, server_hostname="127.0.0.1") as sock,
-    ):
-        sock.settimeout(3.0)
-        sock.sendall(f"GET /v2/identity HTTP/1.1\r\nHost: {host}\r\n\r\n".encode("ascii"))
-        assert read_raw_http_response(sock, timeout=3.0).startswith(b"HTTP/1.1 200 ")
-        hdr = (
-            f"POST {path} HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer {token}\r\n"
-            f"X-Store-Id: {endpoint.store_id}\r\nX-Writer-Epoch: {endpoint.writer_epoch}\r\n"
-            f"X-Superbrain-Instance: {endpoint.instance_id}\r\n"
-            f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n\r\n"
-        ).encode("iso-8859-1")
-        sock.sendall(hdr + body)
-        resp = read_raw_http_response(sock, timeout=5.0)
-    _, _, payload = resp.partition(b"\r\n\r\n")
-    return cast(dict[str, Any], json.loads(payload))
+    return post_tls_http_json(endpoint, ca_pem, path, token, obj)[1]
 
 
 def _web_http(

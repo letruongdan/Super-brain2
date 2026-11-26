@@ -311,28 +311,32 @@ class _TextScans:
         new = self._userinfo(text)
         if new != text:
             text = new
-            if not reusable or len(new) < len(lowered) - 4096:
+            if not reusable or len(new) < (len(lowered) >> 1):
                 lowered = new.lower()
-        kv_pair = False
-        if "=" in lowered:
-            for pair in _KV_EQ_PAIRS:
-                if pair in lowered:
-                    kv_pair = True
-                    break
-        if not kv_pair and ":" in lowered:
-            for pair in _KV_COLON_PAIRS:
-                if pair in lowered:
-                    kv_pair = True
-                    break
-        if kv_pair:
+        if "=" in lowered or ":" in lowered:
+            has_stem = False
             for word in _KV_WORDS:
                 if word in lowered:
+                    has_stem = True
+                    break
+            if has_stem:
+                kv_pair = False
+                if "=" in lowered:
+                    for pair in _KV_EQ_PAIRS:
+                        if pair in lowered:
+                            kv_pair = True
+                            break
+                if not kv_pair and ":" in lowered:
+                    for pair in _KV_COLON_PAIRS:
+                        if pair in lowered:
+                            kv_pair = True
+                            break
+                if kv_pair:
                     new = self._sub(_KEY_VALUE_SECRET, rf"\1\2{REDACTED}", text)
                     if new != text:
                         text = new
                         if not reusable:
                             lowered = new.lower()
-                    break
         if has_deadline:
             self.tick()
         # The cheap candidate scan keeps the full component matcher as the authority.

@@ -10,10 +10,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import json
 import os
-import socket
-import ssl
 import struct
 import sys
 import threading
@@ -57,7 +54,7 @@ from superbrain.storage.layout import DataRoot
 from superbrain.storage.proposals import PolicyApplyAuthority, StoreProposalAdapter
 from tests.support.clock import FakeClock
 from tests.support.inc2_fixture import reopen_kernel_job_runtime
-from tests.support.inc2_transport import FakeMonotonicClock, read_raw_http_response
+from tests.support.inc2_transport import FakeMonotonicClock, post_tls_http_json
 
 OWNER = "dan"
 MACHINE = "r2-box"
@@ -149,30 +146,7 @@ def _daemon(cfg: DaemonConfig, os_: OsAdapters, clock: FakeClock, mono: FakeMono
 
 
 def _post_tls(ready: Ready, ca_pem: str, path: str, token: str, body_obj: object) -> tuple[int, dict[str, Any]]:
-    host = f"{ready.endpoint.host}:{ready.endpoint.port}"
-    body = json.dumps(body_obj).encode("utf-8")
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    ctx.load_verify_locations(cadata=ca_pem)
-    ctx.check_hostname = True
-    with (
-        socket.create_connection((ready.endpoint.host, ready.endpoint.port), timeout=2.0) as raw,
-        ctx.wrap_socket(raw, server_hostname="127.0.0.1") as sock,
-    ):
-        sock.settimeout(3.0)
-        sock.sendall(f"GET /v2/identity HTTP/1.1\r\nHost: {host}\r\n\r\n".encode("ascii"))
-        assert read_raw_http_response(sock, timeout=3.0).startswith(b"HTTP/1.1 200 ")
-        hdr = (
-            f"POST {path} HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer {token}\r\n"
-            f"X-Store-Id: {ready.identity.store_id}\r\nX-Writer-Epoch: {ready.identity.writer_epoch}\r\n"
-            f"X-Superbrain-Instance: {ready.identity.instance_id}\r\n"
-            f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n\r\n"
-        ).encode("iso-8859-1")
-        sock.sendall(hdr + body)
-        resp = read_raw_http_response(sock, timeout=5.0)
-    head, sep, data = resp.partition(b"\r\n\r\n")
-    assert sep and head.startswith(b"HTTP/1.1 "), resp[:200]
-    status = int(head.splitlines()[0].split()[1])
-    return status, cast(dict[str, Any], json.loads(data))
+    return post_tls_http_json(ready, ca_pem, path, token, body_obj)
 
 
 def _make_dir_link(link: Path, target: Path) -> None:

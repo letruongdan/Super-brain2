@@ -16,9 +16,7 @@ import base64
 import contextlib
 import hashlib
 import json
-import socket
 import sqlite3
-import ssl
 import struct
 import threading
 from collections.abc import Iterator, Mapping
@@ -103,7 +101,7 @@ from tests.support.inc2_fixture import (
 )
 from tests.support.inc2_transport import (
     FakeMonotonicClock,
-    read_raw_http_response,
+    post_tls_http_json,
     register_workspace_direct,
 )
 from tests.support.kernel_auth import seed_principal_and_credential
@@ -262,29 +260,7 @@ def _running_serve(
 
 
 def _post_tls(ready: Ready, ca_pem: str, path: str, token: str, payload: object) -> dict[str, Any]:
-    host = f"{ready.endpoint.host}:{ready.endpoint.port}"
-    body = json.dumps(payload).encode("utf-8")
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    ctx.load_verify_locations(cadata=ca_pem)
-    ctx.check_hostname = True
-    with (
-        socket.create_connection((ready.endpoint.host, ready.endpoint.port), timeout=3.0) as raw,
-        ctx.wrap_socket(raw, server_hostname="127.0.0.1") as sock,
-    ):
-        sock.settimeout(5.0)
-        sock.sendall(f"GET /v2/identity HTTP/1.1\r\nHost: {host}\r\n\r\n".encode("ascii"))
-        assert read_raw_http_response(sock, timeout=3.0).startswith(b"HTTP/1.1 200 ")
-        hdr = (
-            f"POST {path} HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer {token}\r\n"
-            f"X-Store-Id: {ready.identity.store_id}\r\nX-Writer-Epoch: {ready.identity.writer_epoch}\r\n"
-            f"X-Superbrain-Instance: {ready.identity.instance_id}\r\n"
-            f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n\r\n"
-        ).encode("iso-8859-1")
-        sock.sendall(hdr + body)
-        resp = read_raw_http_response(sock, timeout=5.0)
-    head, sep, data = resp.partition(b"\r\n\r\n")
-    assert sep and head.startswith(b"HTTP/1.1 "), resp[:200]
-    return cast(dict[str, Any], json.loads(data))
+    return post_tls_http_json(ready, ca_pem, path, token, payload)[1]
 
 
 def _restore_msg(store_id: str, owner_id: str, ch: dict[str, Any], db_digest: str) -> ApprovalMessage:
