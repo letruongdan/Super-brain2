@@ -38,6 +38,7 @@ import pytest
 from superbrain.adapters.os import os_adapters
 from superbrain.application._log_rotate import rotate_logs
 from superbrain.application.maintenance import restore_offline, restore_offline_preview_payload
+from superbrain.composition._daemon_doctor import DaemonDoctorRunner
 from superbrain.composition._maintenance_wiring import ensure_maintenance_backend
 from superbrain.composition.doctor_entry import run_doctor, run_doctor_cli
 from superbrain.composition.init_entry import reset_signers
@@ -192,14 +193,19 @@ def _seed_queued_doctor_job(env: _Env, *, owner_id: str, payload: dict[str, Any]
     return job_id
 
 
-def _seed_other_owner_runs(js: StagedKernelStore, transact: Callable[[Any], Any], now_str: str, n: int) -> None:
-    """Append ``n`` intact ``doctor.run`` ledger records of other owners through the kernel transaction API."""
+def _stage_other_owner_runs(js: StagedKernelStore, n: int) -> list[tuple[str, bytes]]:
+    """Stage (CAS-publish) ``n`` other-owner DoctorRun documents on ``js``; the next ``js.transact`` may hold them."""
     seeds: list[tuple[str, bytes]] = []
     for i in range(n):
         run_id = new_id()
         data = canonical_json({"schema_version": 1, "doctor_run_id": run_id, "owner_id": f"other-{i:03d}"})
         js.stage_blob(data)
         seeds.append((run_id, data))
+    return seeds
+
+
+def _commit_other_owner_runs(transact: Callable[[Any], Any], seeds: list[tuple[str, bytes]], now_str: str) -> None:
+    """One transaction appending an intact ``doctor.run`` ledger record (and its CAS hold) per staged seed."""
 
     def _op(tx: Any) -> None:
         for i, (run_id, data) in enumerate(seeds):
@@ -222,6 +228,11 @@ def _seed_other_owner_runs(js: StagedKernelStore, transact: Callable[[Any], Any]
             )
 
     transact(_op)
+
+
+def _seed_other_owner_runs(js: StagedKernelStore, transact: Callable[[Any], Any], now_str: str, n: int) -> None:
+    """Append ``n`` intact ``doctor.run`` ledger records of other owners through the kernel transaction API."""
+    _commit_other_owner_runs(transact, _stage_other_owner_runs(js, n), now_str)
 
 
 class _RecordingTx:
@@ -624,59 +635,92 @@ def test_f7_fresh_run_found_behind_many_other_owner_runs(trusted_tmp: Path) -> N
     assert not violations, "F7 fresh lookup stopped at the scan limit:\n" + "\n".join(violations)
 
 
-def test_f7_succeeded_job_dto_loads_behind_many_other_owner_runs(trusted_tmp: Path) -> None:
-    # Setup (R6, host-speed independent): the 200 other-owner runs used to be seeded on the owner thread inside the
-    # CLI DoctorRun commit, i.e. on the critical path of the in-flight report request, so a slow host pushed the
-    # response past the client read timeout. Now the CLI report completes first, the runs are seeded by an owner
-    # action off any request, and the same job's DTO is read again through the report's phase 3 (finish_report, the
-    # call the HTTP report makes after its wait) with the seeded runs newer than the job's run.
-    env = _Env(trusted_tmp, "f7-load")
+@pytest.mark.parametrize("dto_path", ["cached_outcome", "store_succeeded"])
+def test_f7_succeeded_job_dto_loads_behind_many_other_owner_runs(
+    trusted_tmp: Path, monkeypatch: pytest.MonkeyPatch, dto_path: str
+) -> None:
+    """One public TLS doctor report for a fresh job: after the job SUCCEEDED and before the request's finish phase,
+    200 other-owner runs newer than the job's run are committed; the same request must then return the job's own
+    DTO through its real finish phase within the existing deadline.
+
+    Setup (host-speed independent): the 200 seed documents are CAS-staged before the request, and the request is
+    held in its ticket handoff (after ``wait_report`` returns, before ``finish_report``) while one owner transaction
+    appends all 200 ledger records, so no sequential seeding sits on the client's wait. ``dto_path`` selects the
+    finish-phase branch of ``read_doctor_job_outcome_dto``: ``cached_outcome`` keeps the runner's finished-job cache
+    entry; ``store_succeeded`` drops it while the request is held (as the bounded cache would evict it), so the DTO
+    comes from the store's SUCCEEDED row in the same writer epoch (a restart would fence the ticket instead).
+    """
+    env = _Env(trusted_tmp, f"f7-load-{dto_path}")
     seeded = threading.Event()
+    handed_off = threading.Event()
+    proceed = threading.Event()
+    held_job: list[str] = []
+    orig_wait = DaemonDoctorRunner.wait_report
+
+    def _held_wait(self: DaemonDoctorRunner, job_id: str, *, generation: int, timeout_s: float) -> None:
+        orig_wait(self, job_id, generation=generation, timeout_s=timeout_s)
+        if not handed_off.is_set():
+            held_job.append(job_id)
+            handed_off.set()
+            proceed.wait(SEED_SETUP_TIMEOUT_S)
+
+    monkeypatch.setattr(DaemonDoctorRunner, "wait_report", _held_wait)
     with env.serve() as d:
         assert d.loop.wait_doctor_settled(timeout=BOUND_WAIT_S)
         env.clock.advance(timedelta(minutes=16))
-        first = _report(d, env, env.cli_token, wait_ms=10_000)
-        first_data = cast(dict[str, Any], first.get("data") or {})
-        job_id = str(first_data.get("job_id") or "")
-        assert first.get("ok") is True and first_data.get("status") == "completed" and job_id, (
-            f"precondition: the CLI report completed its own job before seeding: {first}"
-        )
+        rt = d.rt
 
-        def _seed() -> None:
-            rt = d.rt
-            js = StagedKernelStore(rt.store, rt.policy, writer_epoch=rt.lease.epoch)
-            _, now_str = require_aware_utc(env.clock.now())
-            _seed_other_owner_runs(js, js.transact, now_str, SEED_OTHER_RUNS)
-            seeded.set()
+        def _stage() -> tuple[StagedKernelStore, list[tuple[str, bytes]]]:
+            js = StagedKernelStore(rt.store, rt.policy, writer_epoch=rt.lease.epoch)  # admitted on the owner thread
+            return js, _stage_other_owner_runs(js, SEED_OTHER_RUNS)
 
-        d.loop.run_owner_action(_seed).result(timeout=SEED_SETUP_TIMEOUT_S)
-        runs = _doctor_runs(env.root)
-        at = next(i for i, r in enumerate(runs) if r.get("job_id") == job_id)
-        newer_others = [r for r in runs[at + 1 :] if r["owner_id"] != OWNER_DAN]
-        assert len(newer_others) == SEED_OTHER_RUNS, (
-            f"precondition: {SEED_OTHER_RUNS} other-owner runs are newer than the job's run, got {len(newer_others)}"
-        )
-        session = cast(Any, d.loop)._session
-        runner = session._doctor_runner
-        generation, writer_epoch = runner._generation, d.ready.identity.writer_epoch
+        js, seeds = d.loop.run_owner_action(_stage).result(timeout=SEED_SETUP_TIMEOUT_S)
+        box: dict[str, Any] = {}
 
-        def _finish() -> dict[str, Any]:
-            return cast(
-                dict[str, Any],
-                runner.finish_report(
-                    owner_id=OWNER_DAN, job_id=job_id, generation=generation, writer_epoch=writer_epoch
-                ),
-            )
+        def _request() -> None:
+            box["res"] = _report(d, env, env.cli_token, wait_ms=10_000)
 
-        res: dict[str, Any]
+        client = threading.Thread(target=_request, name="f7-load-report", daemon=True)
+        client.start()
         try:
-            res = {"ok": True, "data": d.loop.run_owner_action(_finish).result(timeout=BOUND_WAIT_S)}
-        except BrainError as err:
-            res = {"ok": False, "error": {"code": err.code.value}}
+            assert handed_off.wait(SEED_SETUP_TIMEOUT_S), "precondition: the report request reached its ticket handoff"
+            job_id = held_job[0]
+            runner = cast(Any, d.loop)._session._doctor_runner
+
+            def _seed_while_held() -> bool:
+                cached = job_id in runner._finished_jobs
+                _, now_str = require_aware_utc(env.clock.now())
+                _commit_other_owner_runs(js.transact, seeds, now_str)
+                if dto_path == "store_succeeded":
+                    with runner._lock:
+                        runner._finished_jobs.pop(job_id, None)
+                seeded.set()
+                return bool(cached)
+
+            was_cached = d.loop.run_owner_action(_seed_while_held).result(timeout=SEED_SETUP_TIMEOUT_S)
+            runs = _doctor_runs(env.root)
+            at = next(i for i, r in enumerate(runs) if r.get("job_id") == job_id)
+            job_run_id = runs[at]["doctor_run_id"]
+            newer_others = [r for r in runs[at + 1 :] if r["owner_id"] != OWNER_DAN]
+            jobs = {j["job_id"]: j["state"] for j in _doctor_jobs(env.root)}
+        finally:
+            proceed.set()
+            client.join(timeout=10_000 / 1000.0 + 8.0 + BOUND_WAIT_S)
+        res = cast(dict[str, Any], box.get("res") or {})
+
+    assert was_cached, "precondition: the job's outcome was cached when its wait returned"
+    assert jobs.get(job_id) == "succeeded", f"precondition: the job SUCCEEDED before the seed: {jobs.get(job_id)}"
+    assert len(newer_others) == SEED_OTHER_RUNS, (
+        f"precondition: {SEED_OTHER_RUNS} other-owner runs are newer than the job's run, got {len(newer_others)}"
+    )
     assert seeded.is_set(), "precondition: other-owner runs were seeded right after the CLI DoctorRun commit"
     data = cast(dict[str, Any], res.get("data") or {})
     assert res.get("ok") is True and data.get("status") == "completed" and data.get("doctor_run_id"), (
         f"F7: the SUCCEEDED job's committed DoctorRun was not found behind {SEED_OTHER_RUNS} other-owner runs: {res}"
+    )
+    assert data.get("job_id") == job_id and data.get("doctor_run_id") == job_run_id, (
+        f"F7 ({dto_path}): the report returned another run: job={data.get('job_id')} run={data.get('doctor_run_id')}, "
+        f"expected job={job_id} run={job_run_id}"
     )
 
 
