@@ -121,7 +121,7 @@
     "tests/integration/test_i3_rereview_bootstrap_and_handoff.py": "sha256:e3fe04064bd302edb75911e0ae73404a6be24d6e0b00570be80a6dbcb0807436",
     "tests/integration/test_i3_rereview_init_and_accounting.py": "sha256:3f8c7e4502adf1976f3fc00699e121c64e3775e859751088ef21e32d95fbb078",
     "tests/integration/test_i3_wheel_e2e.py": "sha256:6716b4fad47f4636ce1cc1f259bbf0e6a5f6d41f0340894dfac2aea63fdbc056",
-    "tests/integration/test_i4_a1_a2_job_lifecycle.py": "sha256:6c0f8e411cf90d13549f8763fa16698340cc068bd3d0268f1a909df8b9ca9fc1",
+    "tests/integration/test_i4_a1_a2_job_lifecycle.py": "sha256:bbad7a4f6f7f0c3a56c47200c0ddf26c235e8cff91bc5aa675438743d8e6959e",
     "tests/integration/test_i4_f4_f8_remediation.py": "sha256:ed083452e5393576f4dc45c3fb537d854d976053e086448d77dc71a8c2111489",
     "tests/integration/test_i4_owner_thread_remediation.py": "sha256:521bf80029b48af04c1e30394d9a64f6abe9ac0a60fe20cda329d93d371ac13e",
     "tests/integration/test_i4_r10_claim_reconciliation.py": "sha256:6f0674749163bef4c00a85abb69738ee45ea2d54f795f207efeba7447ccfa232",

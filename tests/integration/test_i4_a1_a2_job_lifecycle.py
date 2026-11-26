@@ -27,7 +27,7 @@ import sqlite3
 import threading
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
@@ -1624,7 +1624,7 @@ def test_p2_11_idle_periodic_retry_cadence_and_debounced_gc(
 
 
 class _ControllableOffsetClock:
-    """Thread-safe test clock supporting paused anchors, signed shifts, and capped progression."""
+    """Thread-safe test clock supporting paused anchors, monotonic epochs, signed shifts, and capped progression."""
 
     def __init__(self, start_utc: datetime | None = None) -> None:
         self._lock = threading.Lock()
@@ -1632,11 +1632,42 @@ class _ControllableOffsetClock:
         self._running = False
         self._run_started_mono = 0.0
         self._cap_utc: datetime | None = None
+        self._epoch = 0
+        self._read_seq = 0
+        self._last_read_by_thread: dict[int, tuple[int, int, datetime]] = {}
+        self._one_shot_delay_s = 0.0
+        self._one_shot_delay_min_epoch = 0
+        self._one_shot_delay_tid: int | None = None
+        self._one_shot_delay_done: threading.Event | None = None
 
     @property
     def anchor_utc(self) -> datetime:
         with self._lock:
             return self._anchor_utc
+
+    @property
+    def epoch(self) -> int:
+        with self._lock:
+            return self._epoch
+
+    def last_read_for_thread(self, thread_id: int) -> tuple[int, int, datetime] | None:
+        with self._lock:
+            return self._last_read_by_thread.get(thread_id)
+
+    def arm_one_shot_delay(
+        self, *, min_epoch: int, thread_id: int, delay_s: float, done_event: threading.Event
+    ) -> None:
+        with self._lock:
+            self._one_shot_delay_min_epoch = min_epoch
+            self._one_shot_delay_tid = thread_id
+            self._one_shot_delay_s = delay_s
+            self._one_shot_delay_done = done_event
+
+    def clear_one_shot_delay(self) -> None:
+        with self._lock:
+            self._one_shot_delay_s = 0.0
+            self._one_shot_delay_tid = None
+            self._one_shot_delay_done = None
 
     def _current_locked(self) -> datetime:
         if not self._running:
@@ -1647,30 +1678,65 @@ class _ControllableOffsetClock:
             return self._cap_utc
         return current
 
+    def _pause_locked(self, target_utc: datetime) -> int:
+        self._anchor_utc = target_utc
+        self._running = False
+        self._cap_utc = None
+        self._epoch += 1
+        return self._epoch
+
     def now(self) -> datetime:
-        with self._lock:
-            return self._current_locked()
+        while True:
+            with self._lock:
+                if (
+                    self._one_shot_delay_s > 0.0
+                    and self._epoch >= self._one_shot_delay_min_epoch
+                    and threading.get_ident() == self._one_shot_delay_tid
+                ):
+                    delay_s = self._one_shot_delay_s
+                    self._one_shot_delay_s = 0.0
+                    on_delay = self._one_shot_delay_done
+                else:
+                    current = self._current_locked()
+                    self._read_seq += 1
+                    self._last_read_by_thread[threading.get_ident()] = (self._read_seq, self._epoch, current)
+                    return current
+            time.sleep(delay_s)
+            if on_delay is not None:
+                on_delay.set()
 
     def shift(self, delta_s: float) -> datetime:
         with self._lock:
             self._anchor_utc = self._current_locked() + timedelta(seconds=delta_s)
             if self._running:
                 self._run_started_mono = time.monotonic()
+            self._epoch += 1
             return self._anchor_utc
+
+    def shift_paused(self, delta_s: float) -> tuple[datetime, int]:
+        with self._lock:
+            target_utc = self._current_locked() + timedelta(seconds=delta_s)
+            epoch = self._pause_locked(target_utc)
+            return self._anchor_utc, epoch
 
     def pause_at(self, target_utc: datetime | None = None) -> datetime:
         with self._lock:
-            self._anchor_utc = self._current_locked() if target_utc is None else target_utc
-            self._running = False
-            self._cap_utc = None
+            target = self._current_locked() if target_utc is None else target_utc
+            self._pause_locked(target)
             return self._anchor_utc
 
-    def resume(self, *, cap_utc: datetime | None = None) -> None:
+    def pause_at_epoch(self, target_utc: datetime) -> int:
+        with self._lock:
+            return self._pause_locked(target_utc)
+
+    def resume(self, *, cap_utc: datetime | None = None) -> int:
         with self._lock:
             self._anchor_utc = self._current_locked()
             self._run_started_mono = time.monotonic()
             self._cap_utc = cap_utc
             self._running = True
+            self._epoch += 1
+            return self._epoch
 
 
 class _ScheduleAndCommitSpies:
@@ -1722,102 +1788,123 @@ def _install_schedule_and_commit_spies(monkeypatch: pytest.MonkeyPatch) -> _Sche
     return spies
 
 
+@dataclass(frozen=True)
+class _RecordedWait:
+    """One observed ``owner_wake.wait`` call paired with the clock epoch/timestamp that produced it."""
+
+    timeout: float | None
+    clock_epoch: int | None
+    clock_utc: datetime | None
+    commit_count: int
+
+
 class _OwnerWaitSpy:
-    """Observes ``owner_wake.wait`` timeouts and synchronizes test clock phases without poking the owner."""
+    """Observes ``owner_wake.wait`` timeouts and synchronizes test clock phases by clock epoch."""
 
     def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._all_waits: list[float | None] = []
-        self._post_shift_waits: list[float | None] = []
-        self._post_shift = threading.Event()
-        self._watch_near_due = threading.Event()
-        self._watch_run2 = threading.Event()
-        self._watch_near_due2 = threading.Event()
-        self._near_due_max_s = 0.0
-        self._near_due_timeout: float | None = None
-        self.idle_wait_entered = threading.Event()
-        self.post_shift_wait_entered = threading.Event()
-        self.near_due_wait_entered = threading.Event()
-        self.idle_after_run2_entered = threading.Event()
-        self.near_due2_wait_entered = threading.Event()
+        self._cond = threading.Condition()
+        self._waits: list[_RecordedWait] = []
+        self._staged_clock_by_thread: dict[int, tuple[int | None, datetime | None]] = {}
 
-    def begin_post_shift_window(self) -> None:
-        with self._lock:
-            self._post_shift_waits.clear()
-        self.post_shift_wait_entered.clear()
-        self._post_shift.set()
+    def stage_clock_read(
+        self, thread_id: int, clock_epoch: int | None, clock_utc: datetime | None
+    ) -> None:
+        with self._cond:
+            self._staged_clock_by_thread[thread_id] = (clock_epoch, clock_utc)
 
-    def arm_near_due(self, max_timeout_s: float) -> None:
-        with self._lock:
-            self._near_due_max_s = max_timeout_s
-            self._near_due_timeout = None
-        self.near_due_wait_entered.clear()
-        self._watch_near_due.set()
+    def record_wait(self, thread_id: int, timeout: float | None, commit_count: int) -> None:
+        with self._cond:
+            clock_epoch, clock_utc = self._staged_clock_by_thread.pop(thread_id, (None, None))
+            self._waits.append(
+                _RecordedWait(
+                    timeout=timeout,
+                    clock_epoch=clock_epoch,
+                    clock_utc=clock_utc,
+                    commit_count=commit_count,
+                )
+            )
+            self._cond.notify_all()
 
-    def arm_run2_idle(self) -> None:
-        self.idle_after_run2_entered.clear()
-        self._watch_run2.set()
-
-    def arm_near_due2(self, max_timeout_s: float) -> None:
-        with self._lock:
-            self._near_due_max_s = max_timeout_s
-        self.near_due2_wait_entered.clear()
-        self._watch_near_due2.set()
-
-    def record(self, timeout: float | None, spies: _ScheduleAndCommitSpies) -> None:
-        with self._lock:
-            self._all_waits.append(timeout)
-            if self._post_shift.is_set():
-                self._post_shift_waits.append(timeout)
-                self.post_shift_wait_entered.set()
-            if (
-                self._watch_near_due.is_set()
-                and timeout is not None
-                and 0.0 < timeout <= self._near_due_max_s
-            ):
-                self._near_due_timeout = timeout
-                self.near_due_wait_entered.set()
-            if self._watch_run2.is_set() and spies.commit_count >= 2:
-                self.idle_after_run2_entered.set()
-            if (
-                self._watch_near_due2.is_set()
-                and spies.commit_count >= 2
-                and timeout is not None
-                and 0.0 < timeout <= self._near_due_max_s
-            ):
-                self.near_due2_wait_entered.set()
-        if spies.startup_committed.is_set():
-            self.idle_wait_entered.set()
+    def wait_for(self, predicate: Callable[[_RecordedWait], bool], timeout: float) -> _RecordedWait | None:
+        deadline = time.monotonic() + max(0.0, timeout)
+        with self._cond:
+            while True:
+                for entry in self._waits:
+                    if predicate(entry):
+                        return entry
+                rem = deadline - time.monotonic()
+                if rem <= 0.0:
+                    return None
+                self._cond.wait(timeout=rem)
 
     @property
-    def all_waits(self) -> list[float | None]:
-        with self._lock:
-            return list(self._all_waits)
-
-    @property
-    def post_shift_waits(self) -> list[float | None]:
-        with self._lock:
-            return list(self._post_shift_waits)
-
-    @property
-    def near_due_timeout(self) -> float | None:
-        with self._lock:
-            return self._near_due_timeout
+    def waits(self) -> list[_RecordedWait]:
+        with self._cond:
+            return list(self._waits)
 
 
 def _attach_owner_wait_spy(
-    monkeypatch: pytest.MonkeyPatch, d: _Daemon, spies: _ScheduleAndCommitSpies
+    monkeypatch: pytest.MonkeyPatch,
+    d: _Daemon,
+    spies: _ScheduleAndCommitSpies,
+    clk: _ControllableOffsetClock,
 ) -> _OwnerWaitSpy:
     wait_spy = _OwnerWaitSpy()
+    session = cast(Any, d.loop)._session
+    orig_next_wait = session.next_doctor_wake_wait_s
     owner_wake = cast(threading.Event, cast(Any, d.loop)._owner_wake)
     orig_wait = owner_wake.wait
 
+    def _spied_next_wait() -> float | None:
+        tid = threading.get_ident()
+        before = clk.last_read_for_thread(tid)
+        clock_epoch: int | None = None
+        clock_utc: datetime | None = None
+        try:
+            return cast(float | None, orig_next_wait())
+        finally:
+            after = clk.last_read_for_thread(tid)
+            if after is not None and (before is None or after[0] != before[0]):
+                clock_epoch, clock_utc = after[1], after[2]
+            wait_spy.stage_clock_read(tid, clock_epoch, clock_utc)
+
     def _spied_wait(timeout: float | None = None) -> bool:
-        wait_spy.record(timeout, spies)
+        wait_spy.record_wait(threading.get_ident(), timeout, spies.commit_count)
         return orig_wait(timeout=timeout)
 
+    monkeypatch.setattr(session, "next_doctor_wake_wait_s", _spied_next_wait)
     monkeypatch.setattr(owner_wake, "wait", _spied_wait)
     return wait_spy
+
+
+def _wait_for_idle_epoch(wait_spy: _OwnerWaitSpy, *, min_commits: int, label: str) -> _RecordedWait:
+    idle_wait = wait_spy.wait_for(
+        lambda w: w.commit_count >= min_commits and w.clock_epoch is not None,
+        WAKE_BUDGET_S,
+    )
+    assert idle_wait is not None, (
+        f"P2.12 ({label}): owner did not enter idle wait after commit {min_commits}: {wait_spy.waits}"
+    )
+    return idle_wait
+
+
+def _pause_near_due_and_wait(
+    clk: _ControllableOffsetClock,
+    wait_spy: _OwnerWaitSpy,
+    *,
+    due_utc: datetime,
+    lead_s: float = 0.05,
+    label: str,
+) -> int:
+    near_epoch = clk.pause_at_epoch(due_utc - timedelta(seconds=lead_s))
+    near_wait = wait_spy.wait_for(
+        lambda w: w.clock_epoch == near_epoch and w.timeout is not None and 0.0 < w.timeout <= lead_s + 1e-6,
+        WAKE_BUDGET_S,
+    )
+    assert near_wait is not None, (
+        f"P2.12 ({label}): owner did not observe near-due wait (<= {lead_s}s): {wait_spy.waits}"
+    )
+    return near_epoch
 
 
 def _assert_backward_jump_defers_schedule(
@@ -1830,22 +1917,39 @@ def _assert_backward_jump_defers_schedule(
     interval_s: float,
     label: str,
     shift_s: float = -1.0,
-) -> None:
-    """Verify deadline is in the future pre-shift, shift backward, and prove zero schedule enqueue in the window."""
+) -> int:
+    """Verify pre-shift state, observe frozen post-shift epoch wait, then verify bounded pre-deadline progression."""
     assert clk.now() < due_utc
     assert len(_doctor_runs(root)) == 1 and len(_doctor_jobs(root)) == 1
     assert [c for c in spies.schedule_calls if c[0] == "schedule"] == []
 
-    wait_spy.begin_post_shift_window()
-    clk.shift(shift_s)
-    clk.resume(cap_utc=due_utc - timedelta(milliseconds=150))
-    t_shift = time.monotonic()
-    assert wait_spy.post_shift_wait_entered.wait(timeout=WAKE_BUDGET_S), (
-        f"P2.12 ({label}): owner did not wake and re-arm wait after clock shift: {wait_spy.all_waits}"
+    # Phase 1: keep the clock frozen at post_shift_utc until the owner records a wait on shift_epoch.
+    post_shift_utc, shift_epoch = clk.shift_paused(shift_s)
+    expected_frozen_wait_s = (due_utc - post_shift_utc).total_seconds()
+    assert expected_frozen_wait_s >= interval_s
+    frozen_wait = wait_spy.wait_for(lambda w: w.clock_epoch == shift_epoch, WAKE_BUDGET_S)
+    assert frozen_wait is not None, (
+        f"P2.12 ({label}): owner did not record wait on shift_epoch={shift_epoch}: {wait_spy.waits}"
     )
-    remaining_s = max(0.0, 0.85 - (time.monotonic() - t_shift))
-    if remaining_s > 0.0:
-        time.sleep(remaining_s)
+    assert frozen_wait.timeout is not None
+    assert frozen_wait.clock_utc == post_shift_utc
+    assert frozen_wait.timeout >= expected_frozen_wait_s - 1e-6, (
+        f"P2.12 ({label}): wait timeout did not cover frozen post-shift deadline: {frozen_wait!r}"
+    )
+    assert frozen_wait.timeout >= interval_s, (
+        f"P2.12 ({label}): wait timeout did not extend to cover backward jump: {frozen_wait!r}"
+    )
+    assert [c for c in spies.schedule_calls if c[0] == "schedule"] == [], (
+        f"P2.12 ({label}): periodic schedule enqueued during frozen backward window: {spies.schedule_calls}"
+    )
+    assert len(_doctor_jobs(root)) == 1 and len(_doctor_runs(root)) == 1, (
+        f"P2.12 ({label}): periodic run fired prematurely during frozen shift: "
+        f"jobs={_doctor_jobs(root)} runs={_doctor_runs(root)}"
+    )
+
+    # Phase 2: bounded pre-deadline progression after the frozen wait was recorded.
+    resume_epoch = clk.resume(cap_utc=due_utc - timedelta(milliseconds=150))
+    time.sleep(0.25)
 
     assert [c for c in spies.schedule_calls if c[0] == "schedule"] == [], (
         f"P2.12 ({label}): periodic schedule enqueued during backward window: {spies.schedule_calls}"
@@ -1854,12 +1958,19 @@ def _assert_backward_jump_defers_schedule(
         f"P2.12 ({label}): periodic run fired prematurely after {shift_s:+.1f}s clock jump: "
         f"jobs={_doctor_jobs(root)} runs={_doctor_runs(root)}"
     )
-    assert all(t is not None and t >= 0.0 for t in wait_spy.all_waits), (
-        f"P2.12 ({label}): invalid/negative owner wait timeout observed: {wait_spy.all_waits}"
+    waits = wait_spy.waits
+    assert all(w.timeout is not None and w.timeout >= 0.0 for w in waits), (
+        f"P2.12 ({label}): invalid/negative owner wait timeout observed: {waits}"
     )
-    assert any(t is not None and t >= interval_s for t in wait_spy.post_shift_waits), (
-        f"P2.12 ({label}): wait timeout did not extend to cover backward jump: {wait_spy.post_shift_waits}"
-    )
+    for w in waits:
+        if w.clock_epoch is not None and w.clock_epoch >= shift_epoch and w.clock_utc is not None:
+            assert w.timeout is not None
+            expected_wait_s = max(0.0, (due_utc - w.clock_utc).total_seconds())
+            assert abs(w.timeout - expected_wait_s) <= 1e-3, (
+                f"P2.12 ({label}): recorded wait {w!r} did not match "
+                f"clock_utc={w.clock_utc!r} (expected={expected_wait_s})"
+            )
+    return resume_epoch
 
 
 def _assert_periodic_schedule_settled(root: DataRoot, pokes: list[int], d: _Daemon, *, label: str) -> None:
@@ -1993,10 +2104,8 @@ def test_p2_12_periodic_schedule_dedup_backward_clock_and_restore_reset(
         spies = _install_schedule_and_commit_spies(monkeypatch)
 
         with _serve(cfg, os_=real_os, clock=cast(Any, clk), mono=cast(Any, real_os.monotonic)) as d:
-            wait_spy = _attach_owner_wait_spy(monkeypatch, d, spies)
-            assert wait_spy.idle_wait_entered.wait(timeout=WAKE_BUDGET_S), (
-                "precondition: owner did not enter idle wait after startup DoctorRun"
-            )
+            wait_spy = _attach_owner_wait_spy(monkeypatch, d, spies, clk)
+            _wait_for_idle_epoch(wait_spy, min_commits=1, label=case)
             due_utc = clk.anchor_utc + timedelta(seconds=interval_s)
             _assert_backward_jump_defers_schedule(
                 clk, root, spies, wait_spy, due_utc=due_utc, interval_s=interval_s, label=case
@@ -2050,6 +2159,7 @@ def test_p2_12_periodic_schedule_dedup_backward_clock_and_restore_reset(
         "slow_startup_over_interval",
         "queued_uncommitted_vs_never_enqueued",
         "jump_near_due_and_exact_due_twin",
+        "owner_delayed_over_350ms_near_due",
     ],
 )
 def test_p2_12_backward_clock_jump_slow_startup_uncommitted_and_due_boundary(
@@ -2079,8 +2189,8 @@ def test_p2_12_backward_clock_jump_slow_startup_uncommitted_and_due_boundary(
 
         monkeypatch.setattr(StorageDoctorReader, "read_snapshot", _slow_startup_read)
         with _serve(cfg, os_=real_os, clock=cast(Any, clk), mono=cast(Any, real_os.monotonic)) as d:
-            wait_spy = _attach_owner_wait_spy(monkeypatch, d, spies)
-            assert wait_spy.idle_wait_entered.wait(timeout=WAKE_BUDGET_S)
+            wait_spy = _attach_owner_wait_spy(monkeypatch, d, spies, clk)
+            _wait_for_idle_epoch(wait_spy, min_commits=1, label=edge_case)
             due_utc = clk.anchor_utc + timedelta(seconds=interval_s)
             _assert_backward_jump_defers_schedule(
                 clk, root, spies, wait_spy, due_utc=due_utc, interval_s=interval_s, label=edge_case
@@ -2092,11 +2202,11 @@ def test_p2_12_backward_clock_jump_slow_startup_uncommitted_and_due_boundary(
     if edge_case == "queued_uncommitted_vs_never_enqueued":
         gate = _ReadGate(monkeypatch)
         with _serve(cfg, os_=real_os, clock=cast(Any, clk), mono=cast(Any, real_os.monotonic)) as d:
-            wait_spy = _attach_owner_wait_spy(monkeypatch, d, spies)
-            assert wait_spy.idle_wait_entered.wait(timeout=WAKE_BUDGET_S)
+            wait_spy = _attach_owner_wait_spy(monkeypatch, d, spies, clk)
+            _wait_for_idle_epoch(wait_spy, min_commits=1, label=edge_case)
             due_utc = clk.anchor_utc + timedelta(seconds=interval_s)
             _assert_backward_jump_defers_schedule(
-                clk, root, spies, wait_spy, due_utc=due_utc, interval_s=interval_s, label=edge_case, shift_s=-2.0
+                clk, root, spies, wait_spy, due_utc=due_utc, interval_s=interval_s, label=edge_case, shift_s=-1.2
             )
 
             gate.armed.set()
@@ -2116,17 +2226,52 @@ def test_p2_12_backward_clock_jump_slow_startup_uncommitted_and_due_boundary(
             _assert_periodic_schedule_settled(root, pokes, d, label=edge_case)
         return
 
+    if edge_case == "owner_delayed_over_350ms_near_due":
+        with _serve(cfg, os_=real_os, clock=cast(Any, clk), mono=cast(Any, real_os.monotonic)) as d:
+            wait_spy = _attach_owner_wait_spy(monkeypatch, d, spies, clk)
+            _wait_for_idle_epoch(wait_spy, min_commits=1, label=edge_case)
+            due_utc = clk.anchor_utc + timedelta(seconds=interval_s)
+
+            near_epoch = _pause_near_due_and_wait(clk, wait_spy, due_utc=due_utc, label=edge_case)
+
+            owner_thread = cast(threading.Thread | None, cast(Any, d.loop)._owner_thread)
+            assert owner_thread is not None and owner_thread.ident is not None
+            delayed = threading.Event()
+            clk.arm_one_shot_delay(
+                min_epoch=near_epoch + 1,
+                thread_id=owner_thread.ident,
+                delay_s=0.50,
+                done_event=delayed,
+            )
+            try:
+                resume_epoch = _assert_backward_jump_defers_schedule(
+                    clk, root, spies, wait_spy, due_utc=due_utc, interval_s=interval_s, label=edge_case, shift_s=-1.0
+                )
+            finally:
+                clk.clear_one_shot_delay()
+
+            assert delayed.is_set(), "precondition: >350ms owner delay must have fired during shift_epoch"
+            assert pokes[0] == 0
+            resumed_wait = wait_spy.wait_for(lambda w: w.clock_epoch == resume_epoch, WAKE_BUDGET_S)
+            assert resumed_wait is not None and resumed_wait.timeout is not None, (
+                f"owner did not compute wait on resumed pre-deadline epoch={resume_epoch}: {wait_spy.waits}"
+            )
+            assert 0.0 < resumed_wait.timeout <= 0.15 + 1e-3, (
+                f"resumed capped pre-deadline wait out of expected (0, 0.15s] range: {resumed_wait!r}"
+            )
+            assert [c for c in spies.schedule_calls if c[0] == "schedule"] == []
+            assert len(_doctor_jobs(root)) == 1 and len(_doctor_runs(root)) == 1
+
+            clk.pause_at(due_utc)
+            _assert_periodic_schedule_settled(root, pokes, d, label=edge_case)
+        return
+
     with _serve(cfg, os_=real_os, clock=cast(Any, clk), mono=cast(Any, real_os.monotonic)) as d:
-        wait_spy = _attach_owner_wait_spy(monkeypatch, d, spies)
-        assert wait_spy.idle_wait_entered.wait(timeout=WAKE_BUDGET_S)
+        wait_spy = _attach_owner_wait_spy(monkeypatch, d, spies, clk)
+        _wait_for_idle_epoch(wait_spy, min_commits=1, label=edge_case)
         due_utc = clk.anchor_utc + timedelta(seconds=interval_s)
 
-        wait_spy.arm_near_due(0.05 + 1e-6)
-        clk.pause_at(due_utc - timedelta(seconds=0.05))
-        assert wait_spy.near_due_wait_entered.wait(timeout=WAKE_BUDGET_S), (
-            f"owner did not observe near-due wait (<= 0.05s): {wait_spy.all_waits}"
-        )
-        assert wait_spy.near_due_timeout is not None and 0.0 < wait_spy.near_due_timeout <= 0.05 + 1e-6
+        _pause_near_due_and_wait(clk, wait_spy, due_utc=due_utc, label=edge_case)
 
         _assert_backward_jump_defers_schedule(
             clk, root, spies, wait_spy, due_utc=due_utc, interval_s=interval_s, label=edge_case
@@ -2142,12 +2287,9 @@ def test_p2_12_backward_clock_jump_slow_startup_uncommitted_and_due_boundary(
         assert _job_tuple(root, str(runs[1]["job_id"])) == ("succeeded", 1, None)
 
         # Wall-clock progress between step_owner_work and next_schedule_wait_s past due2 must clamp wait to >= 0.0.
-        wait_spy.arm_run2_idle()
-        assert wait_spy.idle_after_run2_entered.wait(timeout=WAKE_BUDGET_S)
+        _wait_for_idle_epoch(wait_spy, min_commits=2, label=edge_case)
         due2_utc = due_utc + timedelta(seconds=interval_s)
-        wait_spy.arm_near_due2(0.05 + 1e-6)
-        clk.pause_at(due2_utc - timedelta(seconds=0.05))
-        assert wait_spy.near_due2_wait_entered.wait(timeout=WAKE_BUDGET_S)
+        _pause_near_due_and_wait(clk, wait_spy, due_utc=due2_utc, label=edge_case)
 
         session_obj = cast(Any, d.loop)._session
         orig_step = session_obj.step_owner_work
@@ -2163,8 +2305,8 @@ def test_p2_12_backward_clock_jump_slow_startup_uncommitted_and_due_boundary(
         monkeypatch.setattr(session_obj, "step_owner_work", _step_and_advance_past_due)
         assert _wait_until(lambda: len(_doctor_runs(root)) >= 3, WAKE_BUDGET_S)
         assert shifted_past_due.is_set()
-        assert all(t is not None and t >= 0.0 for t in wait_spy.all_waits), (
-            f"negative or None owner wait timeout observed: {wait_spy.all_waits}"
+        assert all(w.timeout is not None and w.timeout >= 0.0 for w in wait_spy.waits), (
+            f"negative or None owner wait timeout observed: {wait_spy.waits}"
         )
         assert pokes[0] == 0
         _assert_clean_stop(d)
