@@ -26,6 +26,7 @@ __all__ = [
     "HANDOFF_UPDATE_MOMENTS",
     "HandoffTakeoverEditDecision",
     "LAYER1_RULE_TEXT",
+    "build_capture_hook_command",
     "evaluate_takeover_edit_gate",
     "plan_claude_bootstrap",
     "plan_codex_bootstrap",
@@ -378,6 +379,33 @@ def plan_codex_bootstrap(
             ),
         ),
     )
+
+
+def build_capture_hook_command(
+    harness_id: str,
+    *,
+    outbox_dir: Path,
+    log_path: Path | None = None,
+    python_executable: str = "python",
+) -> tuple[str, ...]:
+    """Build bounded isolated CLI args invoking ``superbrain.composition.hook_entry``."""
+    if harness_id not in {"claude-code", "codex"}:
+        raise BrainError(ErrorCode.INVALID_INPUT, "unsupported hook harness")
+    if not isinstance(python_executable, str) or not python_executable.strip():
+        raise BrainError(ErrorCode.INVALID_INPUT, "invalid python executable")
+    args: list[str] = [
+        python_executable,
+        "-I",
+        "-m",
+        "superbrain.composition.hook_entry",
+        "--outbox",
+        str(outbox_dir),
+        "--harness",
+        harness_id,
+    ]
+    if log_path is not None:
+        args.extend(["--log", str(log_path)])
+    return tuple(args)
 
 
 class AdapterBootstrapPlanner(BootstrapPlannerPort):

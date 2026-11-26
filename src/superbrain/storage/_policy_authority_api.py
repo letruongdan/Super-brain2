@@ -210,6 +210,23 @@ class PolicyAuthorityMixin:
         except sqlite3.Error as exc:
             raise sqlite_error("cannot read layer2 state", exc) from exc
 
+    def reconcile_layer2_binding(
+        self,
+        *,
+        harness_id: str,
+        current_host_version: str | None,
+        current_config_digest: str | None,
+    ) -> tuple[Layer2State, bool]:
+        """Downgrade a ``VERIFIED`` harness row to ``UNKNOWN`` if live version or config digest changed."""
+        with self._authority_tx() as db:
+            return layer2.reconcile_layer2_binding(
+                db,
+                harness_id=harness_id,
+                current_host_version=current_host_version,
+                current_config_digest=current_config_digest,
+                now=self._now(),
+            )
+
     def set_repo_policy(
         self,
         repo_id: str,

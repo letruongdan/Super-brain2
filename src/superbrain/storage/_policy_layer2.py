@@ -83,6 +83,46 @@ def read_latest_layer2_state(
     return (harness_id, host_ver, cfg_dig, state_val)
 
 
+def reconcile_layer2_binding(
+    db: sqlite3.Connection,
+    *,
+    harness_id: str,
+    current_host_version: str | None,
+    current_config_digest: str | None,
+    now: datetime,
+) -> tuple[Layer2State, bool]:
+    """Downgrade a ``VERIFIED`` harness row to ``UNKNOWN`` if ``(host_version, config_digest)`` drifted."""
+    latest = read_latest_layer2_state(db, harness_id=harness_id)
+    if latest is None:
+        return Layer2State.UNKNOWN, False
+    _, recorded_ver, recorded_dig, cur_state = latest
+    if cur_state is not Layer2State.VERIFIED:
+        return cur_state, False
+    if recorded_ver == current_host_version and recorded_dig == current_config_digest:
+        return Layer2State.VERIFIED, False
+    eff_ver = (
+        current_host_version
+        if isinstance(current_host_version, str) and OPAQUE_ID_RE.fullmatch(current_host_version)
+        else recorded_ver
+    )
+    eff_dig = recorded_dig
+    if isinstance(current_config_digest, str):
+        try:
+            require_sha256_digest(current_config_digest)
+            eff_dig = current_config_digest
+        except BrainError:
+            eff_dig = recorded_dig
+    set_layer2_state(
+        db,
+        harness_id=harness_id,
+        host_version=eff_ver,
+        config_digest=eff_dig,
+        state=Layer2State.UNKNOWN,
+        now=now,
+    )
+    return Layer2State.UNKNOWN, True
+
+
 def set_repo_policy_flags(
     db: sqlite3.Connection,
     *,
@@ -335,6 +375,7 @@ __all__ = [
     "end_recovery_grant",
     "open_recovery_grant",
     "read_recovery_grant",
+    "reconcile_layer2_binding",
     "reset_signers",
     "set_layer2_state",
     "signer_reset_recorded",
