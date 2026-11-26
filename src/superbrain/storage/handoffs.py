@@ -1111,54 +1111,150 @@ class HandoffStore(HandoffStorePort):
         task_id: str,
         observed_ref: str | None,
         now: datetime,
-    ) -> tuple[list[ResolvedSourceContent], list[ResolvedSourceContent]]:
-        """Resolve observed event items & conversation excerpts live at read time (never cached in handoff)."""
+        agent_updated_at: str | None = None,
+        observed_after_agent: bool = True,
+    ) -> tuple[list[ResolvedSourceContent], list[ResolvedSourceContent], int]:
+        """Resolve pinned ``observed_ref`` sources live at read time (never scanning uncommitted events)."""
         _require_v8_ready(self._store, self._policy)
         now_utc, _ = require_aware_utc(now)
+        if observed_ref is None:
+            return [], [], 0
+
+        raw_obs, obs_status = _check_blob_status(
+            self._store._db,
+            self._store,
+            self._policy,
+            observed_ref,
+            holder_id=None,
+            now=now_utc,
+        )
+        if obs_status != "ok" or raw_obs is None:
+            redacted_status = "redacted" if obs_status in {"quarantined", "tombstoned"} else "expired"
+            return (
+                [
+                    ResolvedSourceContent(
+                        source_event_id=observed_ref,
+                        source_digest=observed_ref,
+                        kind="observed_summary",
+                        status=redacted_status,
+                        reason=obs_status,
+                    )
+                ],
+                [],
+                0,
+            )
+
+        try:
+            decoded = json.loads(raw_obs.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return [], [], 0
+        if not isinstance(decoded, Mapping):
+            return [], [], 0
+        raw_sources = decoded.get("source_events")
+        if not isinstance(raw_sources, list):
+            return [], [], 0
+
+        kind_by_eid: dict[str, str] = {}
+        raw_items = decoded.get("items")
+        if isinstance(raw_items, list):
+            for it in raw_items:
+                if (
+                    isinstance(it, Sequence)
+                    and not isinstance(it, (str, bytes))
+                    and len(it) >= 2
+                    and isinstance(it[0], str)
+                    and isinstance(it[1], str)
+                ):
+                    kind_by_eid.setdefault(it[1], it[0])
+
+        pinned_refs: list[tuple[str, int, str, str]] = []
+        seen_keys: set[tuple[str, int, str, str]] = set()
+        for entry in raw_sources:
+            if (
+                not isinstance(entry, Sequence)
+                or isinstance(entry, (str, bytes))
+                or len(entry) < 4
+                or not isinstance(entry[0], str)
+                or type(entry[1]) is not int
+                or not isinstance(entry[2], str)
+                or not isinstance(entry[3], str)
+            ):
+                continue
+            ref_key = (entry[0], entry[1], entry[2], entry[3])
+            if ref_key not in seen_keys:
+                seen_keys.add(ref_key)
+                pinned_refs.append(ref_key)
+
+        agent_dt = parse_iso_utc(agent_updated_at) if agent_updated_at is not None else None
         obs_items: list[ResolvedSourceContent] = []
         conv_items: list[ResolvedSourceContent] = []
+        events_since_agent = 0
 
-        # Query linked events on this task to check quarantine/expiry individually.
-        rows = self._store._db.execute(
-            "SELECT producer_stream, sequence, event_id, kind, recorded_at, payload_digest "
-            "FROM session_task_events WHERE task_id = ? ORDER BY event_order DESC LIMIT 64",
-            (task_id,),
-        ).fetchall()
-        for stream, seq, eid, kind, rec_at, dig in rows:
+        for stream, seq, eid, dig in reversed(pinned_refs):
+            meta_row = self._store._db.execute(
+                "SELECT l.kind, l.recorded_at, e.cas_holder_id "
+                "FROM session_task_events AS l "
+                "LEFT JOIN capture_events AS e "
+                "ON e.producer_stream = l.producer_stream AND e.sequence = l.sequence "
+                "AND e.event_id = l.event_id AND e.payload_digest = l.payload_digest "
+                "WHERE l.task_id = ? AND l.producer_stream = ? AND l.sequence = ? "
+                "AND l.event_id = ? AND l.payload_digest = ?",
+                (task_id, stream, seq, eid, dig),
+            ).fetchone()
+            meta_kind = (
+                str(meta_row[0])
+                if meta_row is not None and isinstance(meta_row[0], str)
+                else kind_by_eid.get(eid, "event")
+            )
+            meta_rec_at = str(meta_row[1]) if meta_row is not None and isinstance(meta_row[1], str) else None
+            cas_hid = str(meta_row[2]) if meta_row is not None and isinstance(meta_row[2], str) else None
+
             rec = live_event_record(
                 self._store,
                 self._policy,
                 task_id=task_id,
-                producer_stream=str(stream),
-                sequence=int(seq),
-                event_id=str(eid),
-                payload_digest=str(dig),
+                producer_stream=stream,
+                sequence=seq,
+                event_id=eid,
+                payload_digest=dig,
                 now=now_utc,
             )
             if rec is None:
-                status = "redacted" if self._policy.is_quarantined(str(dig)) else "expired"
+                is_redacted = self._policy.is_quarantined(dig) or (
+                    cas_hid is not None and is_uuid(cas_hid) and self._policy.is_tombstoned("event", cas_hid)
+                )
+                status = "redacted" if is_redacted else "expired"
                 content = ResolvedSourceContent(
-                    source_event_id=str(eid),
-                    source_digest=str(dig),
-                    kind=str(kind),
+                    source_event_id=eid,
+                    source_digest=dig,
+                    kind=meta_kind,
                     status=status,
                     reason=status,
-                    recorded_at=str(rec_at),
+                    recorded_at=meta_rec_at,
                 )
+                eff_kind = meta_kind
+                eff_rec_at = meta_rec_at
             else:
                 content = ResolvedSourceContent(
                     source_event_id=rec.event_id,
-                    source_digest=str(dig),
+                    source_digest=dig,
                     kind=rec.kind,
                     status="ok",
                     payload=rec.payload,
                     recorded_at=rec.recorded_at,
                 )
-            if str(kind) in {"user_message", "user_prompt"}:
+                eff_kind = rec.kind
+                eff_rec_at = rec.recorded_at
+
+            if eff_kind in {"user_message", "user_prompt"}:
                 conv_items.append(content)
             obs_items.append(content)
-        _ = observed_ref
-        return obs_items, conv_items
+            if agent_dt is None:
+                events_since_agent += 1
+            elif observed_after_agent and (eff_rec_at is None or parse_iso_utc(eff_rec_at) >= agent_dt):
+                events_since_agent += 1
+
+        return obs_items, conv_items, events_since_agent
 
     def bind_session_for_episode(
         self,
@@ -1818,8 +1914,34 @@ class HandoffStore(HandoffStorePort):
             if astatus == "ok" and abytes is not None:
                 agent_state = HandoffAgentState.from_dict(json.loads(abytes.decode("utf-8")))
 
-        obs_items, conv_items = self.resolve_observed_sources(
-            task_id=task_id, observed_ref=hdr.observed_ref, now=now_utc
+        causal_history = self.list_revision_history(
+            artifact_id=artifact_id,
+            task_id=task_id,
+            revision_epoch=revision_epoch,
+            revision=revision,
+            principal_id=principal_id,
+            scope=scope,
+        )
+        observed_after_agent = False
+        if hdr.observed_ref is not None:
+            if hdr.handoff_revision == 0 or hdr.agent_updated_at is None:
+                observed_after_agent = True
+            else:
+                agent_commit_hdr = hdr
+                for anc in causal_history:
+                    if anc.handoff_revision == hdr.handoff_revision:
+                        agent_commit_hdr = anc
+                observed_after_agent = (agent_commit_hdr.observed_ref != hdr.observed_ref) or (
+                    hdr.observed_through is not None
+                    and parse_iso_utc(hdr.observed_through) > parse_iso_utc(hdr.agent_updated_at)
+                )
+
+        obs_items, conv_items, events_since_agent = self.resolve_observed_sources(
+            task_id=task_id,
+            observed_ref=hdr.observed_ref,
+            now=now_utc,
+            agent_updated_at=hdr.agent_updated_at,
+            observed_after_agent=observed_after_agent,
         )
 
         sess_state = hdr.session_state
@@ -1846,16 +1968,7 @@ class HandoffStore(HandoffStorePort):
                 ).fetchone()
                 other_active = orow is not None
 
-        revision_history: tuple[HandoffRevisionHeader, ...] = ()
-        if include_history:
-            revision_history = self.list_revision_history(
-                artifact_id=artifact_id,
-                task_id=task_id,
-                revision_epoch=revision_epoch,
-                revision=revision,
-                principal_id=principal_id,
-                scope=scope,
-            )
+        revision_history: tuple[HandoffRevisionHeader, ...] = causal_history if include_history else ()
 
         return HandoffContentBundle(
             header=hdr,
@@ -1870,6 +1983,7 @@ class HandoffStore(HandoffStorePort):
             session_state=sess_state,
             other_active_warning=other_active,
             revision_history=revision_history,
+            events_since_agent=events_since_agent,
         )
 
     def tx_commit_handoff_mutation(

@@ -108,6 +108,7 @@ class HandoffContentBundle:
     session_state: str | None
     other_active_warning: bool
     revision_history: tuple[HandoffRevisionHeader, ...] = ()
+    events_since_agent: int = 0
 
 
 @dataclass(frozen=True)

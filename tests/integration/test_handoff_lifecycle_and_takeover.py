@@ -3528,3 +3528,544 @@ def test_get_artifact_l1_l2_header_refs_served_receipt_and_revision_history_acro
         assert b3x_post_revs[0]["agent_ref"] == bx_dig
     finally:
         rt2.close()
+
+
+def test_get_artifact_l1_l2_pins_observed_ref_sources_and_events_since_agent_across_restore(
+    trusted_tmp: Path,
+) -> None:
+    import json
+
+    from superbrain.application.continuity_worker import ContinuityWorkerCoordinator
+    from superbrain.composition._daemon_session import build_default_handoff_domain
+    from superbrain.composition.kernel_bridge import KernelBridge
+    from superbrain.ports.policy import IntentKind
+    from superbrain.storage.backup import create_store_backup
+    from superbrain.storage.handoffs import HandoffStore
+    from superbrain.storage.kernel_schema import KERNEL_POLICY_MIGRATIONS, KERNEL_STORE_MIGRATIONS
+    from superbrain.storage.policy_store import PolicyStore
+    from superbrain.storage.restore import restore_store
+    from superbrain.storage.sessions import SessionStore
+    from superbrain.workers.executor import PRODUCTION_JOB_HANDLERS, JobExecutor
+    from tests.storage.conftest import maintenance_lease
+    from tests.support.inc2_fixture import kernel_job_service
+
+    def _extract_obs_and_conv(
+        data: dict[str, Any],
+    ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+        obs_meta: dict[str, Any] = {}
+        obs_items: list[dict[str, Any]] = []
+        conv_items: list[dict[str, Any]] = []
+        for res in data["resources"]:
+            name = str(res["name"])
+            parsed = json.loads(str(res["content"]))
+            if name.startswith("observed_"):
+                assert isinstance(parsed, list)
+                for entry in parsed:
+                    if isinstance(entry, dict) and "events_since_agent" in entry:
+                        obs_meta = entry
+                    else:
+                        obs_items.append(entry)
+            elif name.startswith("l2_history_"):
+                conv_items.extend(parsed[0]["conversation_excerpts"])
+            elif name.startswith("l2_conversation_"):
+                conv_items.extend(parsed["conversation_excerpts"])
+        return obs_meta, obs_items, conv_items
+
+    clock = FakeClock(dt.datetime(2026, 11, 26, 11, 0, tzinfo=dt.UTC))
+    os_ = os_adapters(clock=clock)
+    data_root = trusted_tmp / "r5-obs" / "data"
+    rt = open_kernel_job_runtime(data_root, os_, role="sp24-r5")
+    try:
+        cred = seed_principal_and_credential(rt.policy, owner_id="dan", harness_id="claude-code", machine_id="m1")
+        ws = register_workspace_direct(
+            rt,
+            clock,
+            cred.principal,
+            alias="ws-r5",
+            checkout_dir=trusted_tmp / "r5-obs" / "chk",
+            remote="https://github.example/dan/r5.git",
+        )
+        rt.store.reconcile_policy()
+        scope = Scope(ws.repo_id, ws.checkout_id)
+        domain = build_default_handoff_domain(rt=rt, clock=clock, writer_epoch=rt.lease.epoch)
+        assert domain is not None
+        bridge = KernelBridge(store=rt.store, policy=rt.policy, clock=clock, writer_epoch=rt.lease.epoch, domain=domain)
+        hs = HandoffStore(rt.store, rt.policy)
+        ss = SessionStore(rt.store, rt.policy)
+
+        # 1. Agent rev 1 (observed_ref=None) + later uncommitted Event 1 -> rev 1 must stay empty with count=0.
+        prep = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "work",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "description": "Pinned observed ref task",
+                "idempotency_key": "idem-r5-0000-prep-1",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        tid = str(prep["task_id"])
+        sub1 = _call_ok(
+            bridge,
+            rt,
+            "submit_episode",
+            {
+                "task_id": tid,
+                "session_id": "SID_R5_1",
+                "workspace_id": ws.repo_id,
+                "evidence": [],
+                "base_revision": 0,
+                "fence": prep["handoff_live"]["fence"],
+                "takeover": {"acknowledge_active": True, "reason": "initial hold"},
+                "handoff": {"working_goal": "Agent goal rev 1", "task_state": "open"},
+                "idempotency_key": "idem-r5-0000-sub-01",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        hdr1 = hs.read_revision_header(
+            artifact_id=tid,
+            revision_epoch=0,
+            revision=1,
+            principal_id=cred.principal.principal_id,
+            scope=scope,
+        )
+        assert hdr1 is not None and hdr1.observed_ref is None and hdr1.holder_session_ref is not None
+        sref = hdr1.holder_session_ref
+
+        clock.advance(dt.timedelta(seconds=5))
+        ev1_rec = CaptureEventRecord(
+            event_id="ev-r5-001",
+            producer_stream="stream-r5",
+            sequence=1,
+            harness_id="claude-code",
+            kind="user_message",
+            recorded_at="2026-11-26T11:00:05Z",
+            payload={"role": "user", "text": "Event 1 committed in rev 2"},
+            session_ref=sref,
+        )
+        ss.record_session_event(
+            session_ref=sref,
+            repo_id=ws.repo_id,
+            checkout_id=ws.checkout_id,
+            task_id=tid,
+            producer_stream="stream-r5",
+            event=ev1_rec,
+            now=clock.now(),
+        )
+
+        r1_l1 = _call_ok(
+            bridge,
+            rt,
+            "get_artifact",
+            {
+                "workspace_id": ws.repo_id,
+                "task_id": tid,
+                "artifact_id": tid,
+                "revision_epoch": 0,
+                "revision": 1,
+                "level": "L1",
+                "idempotency_key": "idem-r5-0000-r1-l1",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        r1_l2 = _call_ok(
+            bridge,
+            rt,
+            "get_artifact",
+            {
+                "workspace_id": ws.repo_id,
+                "task_id": tid,
+                "artifact_id": tid,
+                "revision_epoch": 0,
+                "revision": 1,
+                "level": "L2",
+                "idempotency_key": "idem-r5-0000-r1-l2",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        for res_dict in (r1_l1, r1_l2):
+            meta, obs, conv = _extract_obs_and_conv(res_dict)
+            assert meta["events_since_agent"] == 0
+            assert obs == []
+            assert conv == []
+            assert "Event 1 committed in rev 2" not in str(res_dict["resources"])
+
+        # 2. Run worker -> rev 2 pins observed_ref covering Event 1 (events_since_agent == 1).
+        svc, _ = kernel_job_service(rt, clock)
+        exec_ = JobExecutor(PRODUCTION_JOB_HANDLERS, lambda: 10_000)
+        exec_.start()
+        try:
+            coord = ContinuityWorkerCoordinator(
+                rt=rt, job_service=svc, executor=exec_, clock=clock, mono=lambda: 10_000
+            )
+            clock.advance(dt.timedelta(seconds=65))
+            assert coord.enqueue_if_due(task_id=tid, now=clock.now()) is not None
+            assert coord.run_next(writer_epoch=rt.lease.epoch, now=clock.now()) is True
+        finally:
+            exec_.close(5.0)
+
+        r2_l1 = _call_ok(
+            bridge,
+            rt,
+            "get_artifact",
+            {
+                "workspace_id": ws.repo_id,
+                "task_id": tid,
+                "artifact_id": tid,
+                "revision_epoch": 0,
+                "revision": 2,
+                "level": "L1",
+                "idempotency_key": "idem-r5-0000-r2-l1",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        r2_l2 = _call_ok(
+            bridge,
+            rt,
+            "get_artifact",
+            {
+                "workspace_id": ws.repo_id,
+                "task_id": tid,
+                "artifact_id": tid,
+                "revision_epoch": 0,
+                "revision": 2,
+                "level": "L2",
+                "idempotency_key": "idem-r5-0000-r2-l2",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        m2_l1, o2_l1, _ = _extract_obs_and_conv(r2_l1)
+        m2_l2, o2_l2, c2_l2 = _extract_obs_and_conv(r2_l2)
+        assert m2_l1["events_since_agent"] == 1 and m2_l2["events_since_agent"] == 1
+        assert [i["source_event_id"] for i in o2_l1] == ["ev-r5-001"]
+        assert [i["source_event_id"] for i in o2_l2] == ["ev-r5-001"]
+        assert [i["source_event_id"] for i in c2_l2] == ["ev-r5-001"]
+        assert "Event 1 committed in rev 2" in str(o2_l1[0])
+
+        bak_r2 = create_store_backup(rt.store, os_, clock.now())
+
+        # Add Event 2 WITHOUT running worker -> neither replay nor fresh read of rev 2 may include Event 2.
+        clock.advance(dt.timedelta(seconds=5))
+        ss.record_session_event(
+            session_ref=sref,
+            repo_id=ws.repo_id,
+            checkout_id=ws.checkout_id,
+            task_id=tid,
+            producer_stream="stream-r5",
+            event=CaptureEventRecord(
+                event_id="ev-r5-002",
+                producer_stream="stream-r5",
+                sequence=2,
+                harness_id="claude-code",
+                kind="user_message",
+                recorded_at="2026-11-26T11:01:15Z",
+                payload={"role": "user", "text": "Event 2 uncommitted secret"},
+                session_ref=sref,
+            ),
+            now=clock.now(),
+        )
+        for lvl, ikey in (
+            ("L1", "idem-r5-0000-r2-l1"),
+            ("L2", "idem-r5-0000-r2-l2"),
+            ("L1", "idem-r5-0000-r2f-l1"),
+            ("L2", "idem-r5-0000-r2f-l2"),
+        ):
+            r2_chk = _call_ok(
+                bridge,
+                rt,
+                "get_artifact",
+                {
+                    "workspace_id": ws.repo_id,
+                    "task_id": tid,
+                    "artifact_id": tid,
+                    "revision_epoch": 0,
+                    "revision": 2,
+                    "level": lvl,
+                    "idempotency_key": ikey,
+                },
+                cred=cred,
+                scope=scope,
+            )
+            m_chk, o_chk, c_chk = _extract_obs_and_conv(r2_chk)
+            assert m_chk["events_since_agent"] == 1
+            assert [i["source_event_id"] for i in o_chk] == ["ev-r5-001"]
+            assert "Event 2 uncommitted secret" not in str(r2_chk["resources"])
+            if lvl == "L2":
+                assert [i["source_event_id"] for i in c_chk] == ["ev-r5-001"]
+
+        # 3. Subsequent agent patch rev 3 resets events_since_agent to 0 on rev 3 while rev 2 keeps 1.
+        _call_ok(
+            bridge,
+            rt,
+            "submit_episode",
+            {
+                "task_id": tid,
+                "session_id": "SID_R5_1",
+                "workspace_id": ws.repo_id,
+                "evidence": [],
+                "base_revision": 1,
+                "fence": sub1["fence"],
+                "handoff": {"working_goal": "Agent goal rev 3"},
+                "idempotency_key": "idem-r5-0000-sub-03",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        r3_l1 = _call_ok(
+            bridge,
+            rt,
+            "get_artifact",
+            {
+                "workspace_id": ws.repo_id,
+                "task_id": tid,
+                "artifact_id": tid,
+                "revision_epoch": 0,
+                "revision": 3,
+                "level": "L1",
+                "idempotency_key": "idem-r5-0000-r3-l1",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        m3, o3, _ = _extract_obs_and_conv(r3_l1)
+        assert m3["events_since_agent"] == 0
+        assert [i["source_event_id"] for i in o3] == ["ev-r5-001"]
+        assert "Event 2 uncommitted secret" not in str(r3_l1["resources"])
+
+        # 4. Live quarantine on Event 1 redacts Event 1 in rev 2 without leaking Event 2.
+        ev1_dig_row = rt.store._db.execute(
+            "SELECT payload_digest FROM session_task_events WHERE task_id = ? AND event_id = 'ev-r5-001'",
+            (tid,),
+        ).fetchone()
+        assert ev1_dig_row is not None
+        rt.policy.record_intent(IntentKind.QUARANTINE, {"digest": str(ev1_dig_row[0])})
+        rt.store.reconcile_policy()
+        for lvl, ikey in (("L1", "idem-r5-0000-q1-l1"), ("L2", "idem-r5-0000-q1-l2")):
+            rq = _call_ok(
+                bridge,
+                rt,
+                "get_artifact",
+                {
+                    "workspace_id": ws.repo_id,
+                    "task_id": tid,
+                    "artifact_id": tid,
+                    "revision_epoch": 0,
+                    "revision": 2,
+                    "level": lvl,
+                    "idempotency_key": ikey,
+                },
+                cred=cred,
+                scope=scope,
+            )
+            mq, oq, cq = _extract_obs_and_conv(rq)
+            assert mq["events_since_agent"] == 1
+            assert len(oq) == 1 and oq[0]["source_event_id"] == "ev-r5-001" and oq[0]["status"] == "redacted"
+            assert "Event 1 committed in rev 2" not in str(rq["resources"])
+            assert "Event 2 uncommitted secret" not in str(rq["resources"])
+            if lvl == "L2":
+                assert len(cq) == 1 and cq[0]["status"] == "redacted"
+    finally:
+        rt.close()
+
+    # 5. Restore backup from rev 2 -> advance restore_epoch, add Event 3 -> worker rev 3 -> Event 4 uncommitted,
+    #    then test archived (0, 2), live (post_ep, 3), Event 3 source-only expiry, and observed_ref blob expiry.
+    with maintenance_lease(data_root, os_) as (root_obj, lease):
+        pol_handle = PolicyStore.open(root_obj, lease, os_, migrations=KERNEL_POLICY_MIGRATIONS)
+        try:
+            rep = restore_store(
+                root_obj,
+                lease,
+                os_,
+                bak_r2,
+                pol_handle,
+                clock.now(),
+                migrations=KERNEL_STORE_MIGRATIONS,
+            )
+            post_ep = rep.new_epoch
+            assert post_ep > 0
+        finally:
+            pol_handle.close()
+
+    rt2 = open_kernel_job_runtime(data_root, os_, role="sp24-r5")
+    try:
+        domain2 = build_default_handoff_domain(rt=rt2, clock=clock, writer_epoch=rt2.lease.epoch)
+        assert domain2 is not None
+        bridge2 = KernelBridge(
+            store=rt2.store, policy=rt2.policy, clock=clock, writer_epoch=rt2.lease.epoch, domain=domain2
+        )
+        ss2 = SessionStore(rt2.store, rt2.policy)
+        hs2 = HandoffStore(rt2.store, rt2.policy)
+
+        clock.advance(dt.timedelta(seconds=5))
+        ss2.record_session_event(
+            session_ref=sref,
+            repo_id=ws.repo_id,
+            checkout_id=ws.checkout_id,
+            task_id=tid,
+            producer_stream="stream-r5",
+            event=CaptureEventRecord(
+                event_id="ev-r5-003",
+                producer_stream="stream-r5",
+                sequence=3,
+                harness_id="claude-code",
+                kind="user_message",
+                recorded_at="2026-11-26T11:01:20Z",
+                payload={"role": "user", "text": "Event 3 post-restore"},
+                session_ref=sref,
+            ),
+            now=clock.now(),
+        )
+        # Advance 10 days before committing obs_post so Event 3 expires 10 days before observed_ref_post!
+        clock.advance(dt.timedelta(days=10))
+        svc2, _ = kernel_job_service(rt2, clock)
+        exec2 = JobExecutor(PRODUCTION_JOB_HANDLERS, lambda: 10_000)
+        exec2.start()
+        try:
+            coord2 = ContinuityWorkerCoordinator(
+                rt=rt2, job_service=svc2, executor=exec2, clock=clock, mono=lambda: 10_000
+            )
+            assert coord2.enqueue_if_due(task_id=tid, now=clock.now()) is not None
+            assert coord2.run_next(writer_epoch=rt2.lease.epoch, now=clock.now()) is True
+        finally:
+            exec2.close(5.0)
+
+        # Record uncommitted Event 4 after post-restore worker rev 3.
+        clock.advance(dt.timedelta(seconds=5))
+        ss2.record_session_event(
+            session_ref=sref,
+            repo_id=ws.repo_id,
+            checkout_id=ws.checkout_id,
+            task_id=tid,
+            producer_stream="stream-r5",
+            event=CaptureEventRecord(
+                event_id="ev-r5-004",
+                producer_stream="stream-r5",
+                sequence=4,
+                harness_id="claude-code",
+                kind="user_message",
+                recorded_at="2026-11-26T11:01:25Z",
+                payload={"role": "user", "text": "Event 4 post uncommitted"},
+                session_ref=sref,
+            ),
+            now=clock.now(),
+        )
+
+        # Post-restore (post_ep, 3) pins [ev-r5-003] (plus ev-r5-001? NO: worker batch 2 only saw ev-r5-003!).
+        r3y_l2 = _call_ok(
+            bridge2,
+            rt2,
+            "get_artifact",
+            {
+                "workspace_id": ws.repo_id,
+                "task_id": tid,
+                "artifact_id": tid,
+                "revision_epoch": post_ep,
+                "revision": 3,
+                "level": "L2",
+                "idempotency_key": "idem-r5-0000-r3y-l2",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        m3y, o3y, c3y = _extract_obs_and_conv(r3y_l2)
+        assert m3y["events_since_agent"] == 1
+        assert [i["source_event_id"] for i in o3y] == ["ev-r5-003"]
+        assert [i["source_event_id"] for i in c3y] == ["ev-r5-003"]
+        assert "Event 3 post-restore" in str(o3y[0])
+        assert "Event 4 post uncommitted" not in str(r3y_l2["resources"])
+
+        # Archived (0, 2) still pins ONLY [ev-r5-001] (redacted by policy), never Event 3 or 4.
+        r02_post = _call_ok(
+            bridge2,
+            rt2,
+            "get_artifact",
+            {
+                "workspace_id": ws.repo_id,
+                "task_id": tid,
+                "artifact_id": tid,
+                "revision_epoch": 0,
+                "revision": 2,
+                "level": "L1",
+                "idempotency_key": "idem-r5-0000-r02p",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        m02, o02, _ = _extract_obs_and_conv(r02_post)
+        assert m02["events_since_agent"] == 1
+        assert len(o02) == 1 and o02[0]["source_event_id"] == "ev-r5-001" and o02[0]["status"] == "redacted"
+
+        # Advance 82 days (total 92d since Event 3, 82d since obs_post): Event 3 expired, obs_post still live.
+        clock.advance(dt.timedelta(days=82))
+        hdr_p3 = hs2.read_revision_header(
+            artifact_id=tid,
+            revision_epoch=post_ep,
+            revision=3,
+            principal_id=cred.principal.principal_id,
+            scope=scope,
+        )
+        assert hdr_p3 is not None and hdr_p3.observed_ref is not None
+        r3y_exp_ev = _call_ok(
+            bridge2,
+            rt2,
+            "get_artifact",
+            {
+                "workspace_id": ws.repo_id,
+                "task_id": tid,
+                "artifact_id": tid,
+                "revision_epoch": post_ep,
+                "revision": 3,
+                "level": "L2",
+                "idempotency_key": "idem-r5-0000-r3ye",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        m_ee, o_ee, c_ee = _extract_obs_and_conv(r3y_exp_ev)
+        assert m_ee["events_since_agent"] == 1
+        assert len(o_ee) == 1 and o_ee[0]["source_event_id"] == "ev-r5-003" and o_ee[0]["status"] == "expired"
+        assert len(c_ee) == 1 and c_ee[0]["status"] == "expired"
+        assert "Event 3 post-restore" not in str(r3y_exp_ev["resources"])
+        assert "Event 4 post uncommitted" not in str(r3y_exp_ev["resources"])
+
+        # Advance 12 more days (104d since Event 3, 94d since obs_post): observed_ref expired -> fails closed.
+        clock.advance(dt.timedelta(days=12))
+        r3y_exp_ref = _call_ok(
+            bridge2,
+            rt2,
+            "get_artifact",
+            {
+                "workspace_id": ws.repo_id,
+                "task_id": tid,
+                "artifact_id": tid,
+                "revision_epoch": post_ep,
+                "revision": 3,
+                "level": "L2",
+                "idempotency_key": "idem-r5-0000-r3yo",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        m_eo, o_eo, c_eo = _extract_obs_and_conv(r3y_exp_ref)
+        assert m_eo["events_since_agent"] == 0
+        assert o_eo == [
+            {
+                "kind": "observed_summary",
+                "source_event_id": hdr_p3.observed_ref,
+                "source_digest": hdr_p3.observed_ref,
+                "status": "expired",
+                "reason": "expired",
+            }
+        ]
+        assert c_eo == []
+    finally:
+        rt2.close()

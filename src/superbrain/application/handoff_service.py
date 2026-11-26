@@ -701,6 +701,7 @@ class HandoffKernelDomain(KernelToolDomain):
                 task_state=bundle.header.task_state,
                 task_state_source=bundle.header.task_state_source,
                 restore_epoch_for_header=bundle.header.fence.restore_epoch,
+                events_since_agent=bundle.events_since_agent,
             )
             if rec.level == "L1":
                 resources = l1_resources
