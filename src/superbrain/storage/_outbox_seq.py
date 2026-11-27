@@ -28,14 +28,18 @@ from superbrain.ports.capture import (
 )
 from superbrain.storage._outbox_bindings import (
     HookBindingRecord,
+    count_all_bindings,
     lookup_binding,
     parse_binding_row,
+    prepare_binding_upsert,
     upsert_binding,
+    write_prepared_binding_bucket,
 )
 from superbrain.storage._outbox_io import (
     _O_BINARY,
     _O_NOFOLLOW,
     _PART_SUFFIX,
+    _STREAMS_DIR,
     is_link_path,
     parse_frame_filename_identity,
     replace_file_resilient,
@@ -155,7 +159,7 @@ def _parse_legacy_cursor(obj: dict[str, object], *, schema_ver: int, next_seq: i
         parsed.append(HookBindingRecord(key, seq, row[2], rec_at, digest_val))
     return StreamSeqCursor(
         next_seq=next_seq,
-        binding_count=len(parsed),
+        binding_count=len({rec.key for rec in parsed}),
         acked_ranges=merge_acked_ranges(acked_pts),
         pending_binding=None,
         legacy_recent=tuple(parsed),
@@ -217,8 +221,30 @@ def read_stream_cursor(stream_dir: Path, perms: OutboxPermissionsPort) -> Stream
     )
 
 
+def verify_stream_dir_safe(stream_dir: Path, perms: OutboxPermissionsPort) -> bool:
+    """Verify ``stream_dir`` (and ``.streams`` parent if present) are safe non-link dirs; return exists."""
+    parent = stream_dir.parent
+    if os.path.lexists(parent):
+        if is_link_path(parent):
+            raise BrainError(ErrorCode.UNSAFE_PATH, "streams directory is a link")
+        if not stat.S_ISDIR(os.lstat(parent).st_mode):
+            raise BrainError(ErrorCode.INTEGRITY_FAILURE, "streams entry is not a directory")
+        if parent.name == _STREAMS_DIR:
+            verify_owner_only(parent, perms)
+    if not os.path.lexists(stream_dir):
+        return False
+    if is_link_path(stream_dir):
+        raise BrainError(ErrorCode.UNSAFE_PATH, "stream directory is a link")
+    if not stat.S_ISDIR(os.lstat(stream_dir).st_mode):
+        raise BrainError(ErrorCode.INTEGRITY_FAILURE, "stream entry is not a directory")
+    verify_owner_only(stream_dir, perms)
+    return True
+
+
 def write_stream_cursor(stream_dir: Path, cursor: StreamSeqCursor, perms: OutboxPermissionsPort) -> None:
     """Persist v3 ``cursor`` atomically inside ``stream_dir`` (temp -> fsync -> os.replace -> sync_dir)."""
+    if cursor.legacy_recent:
+        raise BrainError(ErrorCode.INTEGRITY_FAILURE, "unflushed legacy cursor bindings")
     final_path = stream_dir / _CURSOR_FILENAME
     tmp_path = stream_dir / f".cursor-{uuid.uuid4().hex}{_PART_SUFFIX}"
     pb = cursor.pending_binding
@@ -267,19 +293,13 @@ def recover_stream_cursor(
     check_deadline: Callable[[], None] | None = None,
 ) -> StreamSeqCursor:
     """Flush any in-flight ``pending_binding`` or ``legacy_recent`` entries to sharded ``.bindings``."""
-    count = cursor.binding_count
-    added_any = False
-    if cursor.legacy_recent:
-        unique_count = 0
-        for item in cursor.legacy_recent:
-            if upsert_binding(stream_dir, item, perms, renamer=renamer, check_deadline=check_deadline):
-                unique_count += 1
-        count = unique_count
-        added_any = True
+    if not cursor.legacy_recent and cursor.pending_binding is None:
+        return cursor
+    for item in cursor.legacy_recent:
+        upsert_binding(stream_dir, item, perms, renamer=renamer, check_deadline=check_deadline)
     if cursor.pending_binding is not None:
         upsert_binding(stream_dir, cursor.pending_binding, perms, renamer=renamer, check_deadline=check_deadline)
-    if not added_any and cursor.pending_binding is None:
-        return cursor
+    count = count_all_bindings(stream_dir, perms)
     recovered = StreamSeqCursor(
         next_seq=cursor.next_seq,
         binding_count=count,
@@ -316,7 +336,7 @@ def persist_cursor_ack(
     renamer: OutboxDirRenamer | None = None,
 ) -> None:
     """Flush pending/legacy bindings to ``.bindings`` and mark event ACK intervals before frame unlink."""
-    if not cursor_exists(stream_dir):
+    if not verify_stream_dir_safe(stream_dir, perms) or not cursor_exists(stream_dir):
         return
     cur = read_stream_cursor(stream_dir, perms)
     if cur.legacy_recent or cur.pending_binding is not None:
@@ -331,11 +351,24 @@ def persist_cursor_ack(
         write_stream_cursor(stream_dir, acked, perms)
 
 
-def advance_cursor_next_seq(stream_dir: Path, sequence: int, perms: OutboxPermissionsPort) -> None:
-    """If ``stream_dir`` already maintains a hook cursor, ensure ``next_seq > sequence``."""
-    if not cursor_exists(stream_dir):
+def advance_cursor_next_seq(
+    stream_dir: Path,
+    sequence: int,
+    perms: OutboxPermissionsPort,
+    *,
+    renamer: OutboxDirRenamer | None = None,
+) -> None:
+    """If ``stream_dir`` already maintains a hook cursor, flush legacy/pending bindings and advance."""
+    if not verify_stream_dir_safe(stream_dir, perms) or not cursor_exists(stream_dir):
         return
     cur = read_stream_cursor(stream_dir, perms)
+    if cur.legacy_recent or cur.pending_binding is not None:
+        cur = recover_stream_cursor(
+            stream_dir,
+            cur,
+            perms,
+            renamer=renamer if renamer is not None else default_outbox_dir_renamer(),
+        )
     bumped = cur.bump_next_seq(sequence)
     if bumped != cur:
         write_stream_cursor(stream_dir, bumped, perms)
@@ -374,6 +407,38 @@ def max_frame_seq_in_paths(frame_paths: Iterable[Path]) -> int:
     return high
 
 
+def backfill_binding_digest_if_missing(
+    stream_dir: Path,
+    cached: HookBindingRecord | None,
+    payload_digest: str,
+    perms: OutboxPermissionsPort,
+    *,
+    renamer: OutboxDirRenamer | None,
+    check_deadline: Callable[[], None] | None,
+) -> None:
+    """Backfill ``payload_digest`` on a v1-migrated binding when first observed on retry."""
+    if cached is None or cached.payload_digest is not None:
+        return
+    updated = HookBindingRecord(cached.key, cached.sequence, cached.event_id, cached.recorded_at, payload_digest)
+    upsert_binding(stream_dir, updated, perms, renamer=renamer, check_deadline=check_deadline)
+
+
+def prepare_hook_binding_upsert(
+    stream_dir: Path,
+    *,
+    dedup_key: str | None,
+    record: CaptureEventRecord,
+    payload_digest: str,
+    perms: OutboxPermissionsPort,
+) -> tuple[HookBindingRecord, str, bytes | None, bool] | None:
+    """Validate and serialize sharded binding update before mutating cursor state."""
+    if dedup_key is None:
+        return None
+    binding = HookBindingRecord(dedup_key, record.sequence, record.event_id, record.recorded_at, payload_digest)
+    bucket_name, payload, added = prepare_binding_upsert(stream_dir, binding, perms)
+    return binding, bucket_name, payload, added
+
+
 def load_or_recover_hook_cursor(
     stream_dir: Path,
     perms: OutboxPermissionsPort,
@@ -382,7 +447,7 @@ def load_or_recover_hook_cursor(
     check_deadline: Callable[[], None] | None,
 ) -> StreamSeqCursor:
     """Load cursor if ``stream_dir`` exists and flush any pending/legacy bindings cleanly."""
-    if not os.path.lexists(stream_dir):
+    if not verify_stream_dir_safe(stream_dir, perms):
         return StreamSeqCursor(1)
     cursor = read_stream_cursor(stream_dir, perms)
     if cursor.legacy_recent or cursor.pending_binding is not None:
@@ -405,12 +470,23 @@ def reconcile_matched_hook_frame_cursor(
     """Ensure sharded binding and cursor ``next_seq`` reflect a pre-existing matched frame."""
     if dedup_key is not None and cached is None:
         b_exist = HookBindingRecord(dedup_key, record.sequence, record.event_id, record.recorded_at, payload_digest)
-        if upsert_binding(stream_dir, b_exist, perms, renamer=renamer, check_deadline=check_deadline):
-            next_c = StreamSeqCursor(
-                max(cursor.next_seq, record.sequence + 1), cursor.binding_count + 1, cursor.acked_ranges
+        bucket_name, payload, added = prepare_binding_upsert(stream_dir, b_exist, perms)
+        next_seq = max(cursor.next_seq, record.sequence + 1)
+        new_count = cursor.binding_count + (1 if added else 0)
+        if payload is not None:
+            bound_c = StreamSeqCursor(next_seq, new_count, cursor.acked_ranges, b_exist)
+            write_stream_cursor(stream_dir, bound_c, perms)
+            write_prepared_binding_bucket(
+                stream_dir, bucket_name, payload, perms, renamer=renamer, check_deadline=check_deadline
             )
-            write_stream_cursor(stream_dir, next_c, perms)
-            return
+        cleared_c = StreamSeqCursor(next_seq, new_count, cursor.acked_ranges)
+        if payload is not None or cleared_c != cursor:
+            write_stream_cursor(stream_dir, cleared_c, perms)
+        return
+    if cached is not None and cached.payload_digest is None:
+        backfill_binding_digest_if_missing(
+            stream_dir, cached, payload_digest, perms, renamer=renamer, check_deadline=check_deadline
+        )
     if cursor.next_seq <= record.sequence:
         write_stream_cursor(stream_dir, cursor.bump_next_seq(record.sequence), perms)
 

@@ -55,8 +55,10 @@ def bucket_name_for_key(dedup_key: str) -> str:
     return f"{dedup_key[7:9]}.json"
 
 
-def verify_bindings_dir(stream_dir: Path, perms: OutboxPermissionsPort) -> Path | None:
-    """Verify ``.bindings`` directory inside ``stream_dir`` is safe and owner-only, sweeping ``.part`` files."""
+def _verify_bindings_dir_node(stream_dir: Path, perms: OutboxPermissionsPort) -> Path | None:
+    """Verify ``stream_dir`` and ``.bindings`` node are non-link, typed, and owner-only without full scan."""
+    if os.path.lexists(stream_dir) and is_link_path(stream_dir):
+        raise BrainError(ErrorCode.UNSAFE_PATH, "stream directory is a link")
     bdir = stream_dir / _BINDINGS_DIR
     if not os.path.lexists(bdir):
         return None
@@ -65,6 +67,14 @@ def verify_bindings_dir(stream_dir: Path, perms: OutboxPermissionsPort) -> Path 
     if not stat.S_ISDIR(os.lstat(bdir).st_mode):
         raise BrainError(ErrorCode.INTEGRITY_FAILURE, "bindings path is not a directory")
     verify_owner_only(bdir, perms)
+    return bdir
+
+
+def verify_bindings_dir(stream_dir: Path, perms: OutboxPermissionsPort) -> Path | None:
+    """Verify ``.bindings`` directory inside ``stream_dir`` is safe and owner-only, sweeping ``.part`` files."""
+    bdir = _verify_bindings_dir_node(stream_dir, perms)
+    if bdir is None:
+        return None
     with os.scandir(bdir) as it:
         for entry in it:
             if entry_is_link(entry):
@@ -105,7 +115,7 @@ def read_binding_bucket(
     stream_dir: Path, bucket_name: str, perms: OutboxPermissionsPort
 ) -> dict[str, HookBindingRecord]:
     """Load and validate one shard file ``.bindings/<bucket_name>``."""
-    bdir = verify_bindings_dir(stream_dir, perms)
+    bdir = _verify_bindings_dir_node(stream_dir, perms)
     if bdir is None:
         return {}
     path = bdir / bucket_name
@@ -143,24 +153,30 @@ def read_binding_bucket(
     return out
 
 
+def count_all_bindings(stream_dir: Path, perms: OutboxPermissionsPort) -> int:
+    """Count distinct durable bindings across every ``.bindings/*.json`` shard in ``stream_dir``."""
+    bdir = verify_bindings_dir(stream_dir, perms)
+    if bdir is None:
+        return 0
+    total = 0
+    with os.scandir(bdir) as it:
+        for entry in it:
+            if entry.name.endswith(".json"):
+                total += len(read_binding_bucket(stream_dir, entry.name, perms))
+    return total
+
+
 def lookup_binding(stream_dir: Path, dedup_key: str, perms: OutboxPermissionsPort) -> HookBindingRecord | None:
     """Look up ``dedup_key`` in its 256-way sharded bucket without loading sibling buckets."""
     bucket = bucket_name_for_key(dedup_key)
     return read_binding_bucket(stream_dir, bucket, perms).get(dedup_key)
 
 
-def upsert_binding(
-    stream_dir: Path,
-    binding: HookBindingRecord,
-    perms: OutboxPermissionsPort,
-    *,
-    renamer: OutboxDirRenamer | None,
-    check_deadline: Callable[[], None] | None = None,
-) -> bool:
-    """Persist ``binding`` atomically in its shard file; returns ``True`` if a new key was added."""
+def prepare_binding_upsert(
+    stream_dir: Path, binding: HookBindingRecord, perms: OutboxPermissionsPort
+) -> tuple[str, bytes | None, bool]:
+    """Validate conflicts and bucket capacity read-only; return ``(bucket, payload_or_none, added)``."""
     bucket_name = bucket_name_for_key(binding.key)
-    bdir = stream_dir / _BINDINGS_DIR
-    ensure_dir_tree_atomic(bdir, perms, renamer, check_deadline=check_deadline)
     entries = read_binding_bucket(stream_dir, bucket_name, perms)
     existing = entries.get(binding.key)
     added = existing is None
@@ -174,7 +190,7 @@ def upsert_binding(
         ):
             raise BrainError(ErrorCode.IDEMPOTENCY_CONFLICT, "idempotency conflict")
         if not (existing.payload_digest is None and binding.payload_digest is not None):
-            return False
+            return bucket_name, None, False
         entries[binding.key] = HookBindingRecord(
             existing.key, existing.sequence, existing.event_id, existing.recorded_at, binding.payload_digest
         )
@@ -188,6 +204,21 @@ def upsert_binding(
     payload = canonical_json({"schema_version": _BINDINGS_SCHEMA_VERSION, "entries": sorted_rows})
     if len(payload) > _MAX_BUCKET_BYTES:
         raise BrainError(ErrorCode.STORAGE_FULL, "hook dedup binding bucket full")
+    return bucket_name, payload, added
+
+
+def write_prepared_binding_bucket(
+    stream_dir: Path,
+    bucket_name: str,
+    payload: bytes,
+    perms: OutboxPermissionsPort,
+    *,
+    renamer: OutboxDirRenamer | None,
+    check_deadline: Callable[[], None] | None = None,
+) -> None:
+    """Persist validated ``payload`` atomically into ``.bindings/<bucket_name>``."""
+    bdir = stream_dir / _BINDINGS_DIR
+    ensure_dir_tree_atomic(bdir, perms, renamer, check_deadline=check_deadline)
     final_path = bdir / bucket_name
     tmp_path = bdir / f".bucket-{uuid.uuid4().hex}{_PART_SUFFIX}"
     fd = -1
@@ -202,7 +233,6 @@ def upsert_binding(
         replace_file_resilient(tmp_path, final_path)
         sync_dir(bdir)
         committed = True
-        return added
     except BrainError:
         raise
     except OSError as err:
@@ -215,3 +245,20 @@ def upsert_binding(
                 pass
         if not committed:
             tmp_path.unlink(missing_ok=True)
+
+
+def upsert_binding(
+    stream_dir: Path,
+    binding: HookBindingRecord,
+    perms: OutboxPermissionsPort,
+    *,
+    renamer: OutboxDirRenamer | None,
+    check_deadline: Callable[[], None] | None = None,
+) -> bool:
+    """Persist ``binding`` atomically in its shard file; returns ``True`` if a new key was added."""
+    bucket_name, payload, added = prepare_binding_upsert(stream_dir, binding, perms)
+    if payload is not None:
+        write_prepared_binding_bucket(
+            stream_dir, bucket_name, payload, perms, renamer=renamer, check_deadline=check_deadline
+        )
+    return added

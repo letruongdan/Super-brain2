@@ -33,9 +33,8 @@ from superbrain.ports.capture import (
 from superbrain.storage._outbox_bindings import (
     _BINDINGS_DIR,
     DEFAULT_MAX_STREAM_BINDING_KEYS,
-    HookBindingRecord,
-    upsert_binding,
     verify_bindings_dir,
+    write_prepared_binding_bucket,
 )
 from superbrain.storage._outbox_io import (
     _FRAME_SUFFIX,
@@ -65,10 +64,12 @@ from superbrain.storage._outbox_io import (
 from superbrain.storage._outbox_seq import (
     StreamSeqCursor,
     advance_cursor_next_seq,
+    backfill_binding_digest_if_missing,
     load_or_recover_hook_cursor,
     lookup_stream_binding,
     max_frame_seq_in_paths,
     persist_cursor_ack,
+    prepare_hook_binding_upsert,
     prepare_outbox_frame_bytes,
     reconcile_matched_hook_frame_cursor,
     resolve_hook_envelope_slot,
@@ -448,18 +449,16 @@ class OutboxSpool:
                 sdir / f"{base}{_FRAME_SUFFIX}", sdir / f"{base}{_PART_SUFFIX}", frame_bytes,
                 crashpoint_name="capture.outbox.after_write_before_fsync", deadline_ns=deadline_ns,
             )
-            advance_cursor_next_seq(sdir, sequence, perms)
+            advance_cursor_next_seq(sdir, sequence, perms, renamer=renamer)
             return entry_id
 
     def enqueue_event(self, record: CaptureEventRecord, *, deadline_ns: int | None = None) -> str:
         """Persist a sanitized ``CaptureEventRecord`` durably; idempotent on matching key, conflict on mismatch."""
         if not isinstance(record, CaptureEventRecord):
             raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
-        return self._enqueue_record(
-            record_kind=OUTBOX_RECORD_EVENT, producer_stream=record.producer_stream,
-            sequence=record.sequence, entry_id=record.event_id,
-            payload_dict=record.to_dict(), deadline_ns=deadline_ns,
-        )
+        return self._enqueue_record(record_kind=OUTBOX_RECORD_EVENT, producer_stream=record.producer_stream,
+            sequence=record.sequence, entry_id=record.event_id, payload_dict=record.to_dict(),
+            deadline_ns=deadline_ns)
 
     def enqueue_hook_event(
         self,
@@ -489,10 +488,9 @@ class OutboxSpool:
                 explicit_event_id=explicit_event_id, dedup_key=dedup_key, fallback_recorded_at=fallback_recorded_at,
             )
             record = build_event(seq, ev_id, rec_at)
-            payload_digest, frame_bytes = prepare_outbox_frame_bytes(
-                record_kind=OUTBOX_RECORD_EVENT, producer_stream=record.producer_stream,
-                sequence=record.sequence, entry_id=record.event_id, payload_dict=record.to_dict(),
-            )
+            payload_digest, frame_bytes = prepare_outbox_frame_bytes(record_kind=OUTBOX_RECORD_EVENT,
+                producer_stream=record.producer_stream, sequence=record.sequence,
+                entry_id=record.event_id, payload_dict=record.to_dict())
             if cached is not None and cached.payload_digest is not None and cached.payload_digest != payload_digest:
                 raise BrainError(ErrorCode.IDEMPOTENCY_CONFLICT, "idempotency conflict")
             target_suffix = f"_{OUTBOX_RECORD_EVENT}_{record.sequence:020d}{_FRAME_SUFFIX}"
@@ -503,31 +501,31 @@ class OutboxSpool:
                 existing = self._decode_frame_file(matched_path)
                 if existing.entry_id != record.event_id or existing.payload_digest != payload_digest:
                     raise BrainError(ErrorCode.IDEMPOTENCY_CONFLICT, "idempotency conflict")
-                reconcile_matched_hook_frame_cursor(
-                    sdir, cursor, dedup_key=dedup_key, cached=cached, record=record,
-                    payload_digest=payload_digest, perms=perms, renamer=renamer, check_deadline=dl_check,
-                )
+                reconcile_matched_hook_frame_cursor(sdir, cursor, dedup_key=dedup_key, cached=cached, record=record,
+                    payload_digest=payload_digest, perms=perms, renamer=renamer, check_deadline=dl_check)
                 return record
             if cached is not None and cursor.is_event_acked(record.sequence):
+                backfill_binding_digest_if_missing(sdir, cached, payload_digest, perms,
+                    renamer=renamer, check_deadline=dl_check)
                 return record
             if used + len(frame_bytes) > self._max_bytes:
                 raise BrainError(ErrorCode.STORAGE_FULL, "storage full")
+            prepared = prepare_hook_binding_upsert(
+                sdir, dedup_key=dedup_key, record=record, payload_digest=payload_digest, perms=perms
+            )
             ensure_dir_tree_atomic(self._root / _STREAMS_DIR, perms, renamer, check_deadline=dl_check)
             ensure_dir_tree_atomic(sdir, perms, renamer, check_deadline=dl_check)
-            binding = (
-                HookBindingRecord(dedup_key, record.sequence, record.event_id, record.recorded_at, payload_digest)
-                if dedup_key is not None
-                else None
-            )
-            new_count = cursor.binding_count + (1 if (binding is not None and cached is None) else 0)
-            bound_c = StreamSeqCursor(
-                max(cursor.next_seq, record.sequence + 1), new_count, cursor.acked_ranges, binding
-            )
+            new_count = cursor.binding_count + (1 if (prepared is not None and prepared[3]) else 0)
+            pending_b = prepared[0] if (prepared is not None and prepared[2] is not None) else None
+            next_seq = max(cursor.next_seq, record.sequence + 1)
+            bound_c = StreamSeqCursor(next_seq, new_count, cursor.acked_ranges, pending_b)
             if bound_c != cursor:
                 write_stream_cursor(sdir, bound_c, perms)
                 cursor = bound_c
-            if binding is not None:
-                upsert_binding(sdir, binding, perms, renamer=renamer, check_deadline=dl_check)
+            if prepared is not None and prepared[2] is not None:
+                write_prepared_binding_bucket(
+                    sdir, prepared[1], prepared[2], perms, renamer=renamer, check_deadline=dl_check
+                )
             base = f"{highest_order + 1:016d}_{OUTBOX_RECORD_EVENT}_{record.sequence:020d}"
             self._atomic_publish_frame(
                 sdir / f"{base}{_FRAME_SUFFIX}", sdir / f"{base}{_PART_SUFFIX}", frame_bytes,
@@ -542,11 +540,8 @@ class OutboxSpool:
         """Persist a ``ProducerCaptureGap`` durably under separated ``record_kind=capture_gap``."""
         if not isinstance(gap, ProducerCaptureGap):
             raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
-        return self._enqueue_record(
-            record_kind=OUTBOX_RECORD_GAP, producer_stream=gap.producer_stream,
-            sequence=gap.sequence, entry_id=gap.gap_id,
-            payload_dict=gap.to_dict(), deadline_ns=deadline_ns,
-        )
+        return self._enqueue_record(record_kind=OUTBOX_RECORD_GAP, producer_stream=gap.producer_stream,
+            sequence=gap.sequence, entry_id=gap.gap_id, payload_dict=gap.to_dict(), deadline_ns=deadline_ns)
 
     def read_pending(
         self, limit: int = MAX_CAPTURE_BATCH_EVENTS, *, producer_stream: str | None = None
