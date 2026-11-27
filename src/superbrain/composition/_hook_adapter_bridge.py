@@ -8,17 +8,17 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from superbrain.adapters.harness.claude_code import ClaudeCodeCaptureAdapter
+    from superbrain.adapters.harness.codex import CodexCaptureAdapter
 
 from superbrain.adapters.harness._common import (
     AdapterCaptureStatus,
     HarnessCaptureContext,
     strip_forbidden_client_keys,
 )
-from superbrain.adapters.harness.claude_code import ClaudeCodeCaptureAdapter
-from superbrain.adapters.harness.codex import CodexCaptureAdapter
-from superbrain.adapters.os.daemon_config import read_client_profile
-from superbrain.adapters.os.workspaces import physical_checkout
 from superbrain.core.canonical import canonical_json, digest_bytes
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.ids import new_id
@@ -214,6 +214,8 @@ def prepare_native_hook(
     checkout_id = "unknown"
     resolved_checkout = checkout_root
     if profile_path is not None:
+        from superbrain.adapters.os.daemon_config import read_client_profile
+
         profile = read_client_profile(profile_path, os_)
         if profile.workspace is None:
             raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
@@ -222,6 +224,8 @@ def prepare_native_hook(
         if resolved_checkout is None:
             resolved_checkout = profile.workspace.checkout_path
         else:
+            from superbrain.adapters.os.workspaces import physical_checkout
+
             p_chk = physical_checkout(str(resolved_checkout)).checkout_path
             p_prof = physical_checkout(str(profile.workspace.checkout_path)).checkout_path
             if p_chk != p_prof:
@@ -249,6 +253,8 @@ def prepare_native_hook(
         if repo_id != "unknown" and checkout_id != "unknown":
             scope_seed = f"{harness_id}:{repo_id}:{checkout_id}"
         else:
+            from superbrain.adapters.os.workspaces import physical_checkout
+
             phys = physical_checkout(str(resolved_checkout)).checkout_path
             scope_seed = f"{harness_id}:{os.path.normcase(os.fspath(phys))}"
         eff_stream = f"hook-{harness_id}-{digest_bytes(scope_seed.encode('utf-8')).removeprefix('sha256:')[:16]}"
@@ -272,7 +278,15 @@ def prepare_native_hook(
     if "channel_kind" not in hook_base:
         hook_base["channel_kind"] = "local_capture"
 
-    adapter = ClaudeCodeCaptureAdapter(os_) if harness_id == "claude-code" else CodexCaptureAdapter(os_)
+    adapter: ClaudeCodeCaptureAdapter | CodexCaptureAdapter
+    if harness_id == "claude-code":
+        from superbrain.adapters.harness.claude_code import ClaudeCodeCaptureAdapter
+
+        adapter = ClaudeCodeCaptureAdapter(os_)
+    else:
+        from superbrain.adapters.harness.codex import CodexCaptureAdapter
+
+        adapter = CodexCaptureAdapter(os_)
     ctx = HarnessCaptureContext(
         checkout_root=resolved_checkout,
         repo_id=repo_id,

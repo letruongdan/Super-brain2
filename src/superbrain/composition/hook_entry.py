@@ -14,12 +14,9 @@ from pathlib import Path
 from superbrain.adapters.os import os_adapters
 from superbrain.adapters.os.locks import OUTBOX_FILE_LOCK
 from superbrain.adapters.os.physical_fs import atomic_append_no_follow
-from superbrain.application.privacy import PrivacyFilter
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.ids import new_id
 from superbrain.core.jsonvalue import JsonValue
-from superbrain.domain.capture.envelope import normalize_capture_record
-from superbrain.domain.capture.privacy_gate import CapturePrivacyGate
 from superbrain.ports.capture import (
     HOOK_HARD_CAP_NS,
     CaptureEventRecord,
@@ -106,7 +103,6 @@ def run_hook(
             or any(k in parsed for k in ("hook_event_name", "event_type", "transcript_path"))
             or ("cwd" in parsed and any(k in parsed for k in ("event_name", "type", "event")))
         )
-        gate = CapturePrivacyGate(PrivacyFilter(monotonic_ns=monotonic_ns), monotonic_ns=monotonic_ns)
         if is_native:
             assert isinstance(parsed, dict)
             from superbrain.composition._hook_adapter_bridge import prepare_native_hook
@@ -132,6 +128,10 @@ def run_hook(
                     prep.fallback_recorded_at,
                 )
                 raise BrainError(ErrorCode.DEADLINE_EXCEEDED, "deadline exceeded")
+            from superbrain.application.privacy import PrivacyFilter
+            from superbrain.domain.capture.privacy_gate import CapturePrivacyGate
+
+            gate = CapturePrivacyGate(PrivacyFilter(monotonic_ns=monotonic_ns), monotonic_ns=monotonic_ns)
             if parsed.get("record_kind") == "capture_gap":
                 gap_rec = prep.build_record(
                     prep.explicit_sequence if prep.explicit_sequence is not None else 1,
@@ -173,6 +173,11 @@ def run_hook(
             )
             return 0
 
+        from superbrain.application.privacy import PrivacyFilter
+        from superbrain.domain.capture.envelope import normalize_capture_record
+        from superbrain.domain.capture.privacy_gate import CapturePrivacyGate
+
+        gate = CapturePrivacyGate(PrivacyFilter(monotonic_ns=monotonic_ns), monotonic_ns=monotonic_ns)
         normalized = normalize_capture_record(parsed, default_harness_id=default_harness_id)
         if int(monotonic_ns()) >= work_deadline_ns:
             raise BrainError(ErrorCode.DEADLINE_EXCEEDED, "deadline exceeded")

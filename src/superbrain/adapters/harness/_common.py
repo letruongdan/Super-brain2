@@ -9,10 +9,10 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
+from superbrain.core._kernel_base import require_opaque_id, require_sha256_digest
 from superbrain.core.canonical import canonical_json, digest_bytes
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.jsonvalue import JsonValue
-from superbrain.core.kernel import require_opaque_id, require_sha256_digest
 from superbrain.ports.capture import (
     FORBIDDEN_CLIENT_CAPTURE_KEYS,
     CaptureEventRecord,
