@@ -500,6 +500,7 @@ _HEAVY_FILE_COST_MS: dict[str, int] = {
     "tests/integration/test_layer2_invalidation.py": 900,
     "tests/storage/test_outbox_r8_migration_and_limits.py": 850,
     "tests/adapters/test_claude_and_codex_capture_adapters.py": 350,
+    "tests/storage/test_outbox_r10_ack_durability.py": 1600,
 }
 
 

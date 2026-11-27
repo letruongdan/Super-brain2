@@ -42,33 +42,35 @@ from superbrain.storage._outbox_io import (
     _O_NOFOLLOW,
     _PART_SUFFIX,
     _STREAMS_DIR,
+    _V4_FENCE_FILE,
     check_safe_path_syntax,
     ensure_dir_tree_atomic,
     ensure_secure_regular_file_atomic,
     entry_is_link,
     is_link_path,
-    maybe_crashpoint,
     parse_frame_filename_identity,
     parse_frame_order,
     parse_verified_outbox_frame,
+    prepare_outbox_frame_bytes,
+    publish_outbox_frame_atomic,
     raise_storage_error,
     read_all_binary,
     reject_links_upward,
-    replace_file_resilient,
     stream_dir_key,
     sync_dir,
     thread_lock_for,
     verify_owner_only,
-    write_all_fd,
+    verify_streams_fence_if_present,
+    verify_v4_fence_file,
 )
 from superbrain.storage._outbox_seq import (
-    advance_cursor_next_seq,
     backfill_binding_digest_if_missing,
+    commit_bumped_cursor,
     load_or_recover_hook_cursor,
     lookup_stream_binding_with_bucket,
     persist_cursor_ack,
+    prepare_cursor_for_direct_enqueue,
     prepare_hook_binding_upsert,
-    prepare_outbox_frame_bytes,
     reconcile_matched_hook_frame_cursor,
     resolve_hook_envelope_slot,
 )
@@ -274,6 +276,9 @@ class OutboxSpool:
                 self._check_deadline(deadline_ns)
                 if entry_is_link(sd_entry):
                     raise BrainError(ErrorCode.UNSAFE_PATH, "stream directory is a link")
+                if sd_entry.name == _V4_FENCE_FILE:
+                    verify_v4_fence_file(Path(sd_entry.path), perms)
+                    continue
                 if sd_entry.name.startswith(".") and ".init-" in sd_entry.name:
                     continue
                 if not stat.S_ISDIR(sd_entry.stat(follow_symlinks=False).st_mode):
@@ -346,6 +351,9 @@ class OutboxSpool:
                 for sd_entry in it:
                     if entry_is_link(sd_entry):
                         raise BrainError(ErrorCode.UNSAFE_PATH, "stream directory is a link")
+                    if sd_entry.name == _V4_FENCE_FILE:
+                        verify_v4_fence_file(Path(sd_entry.path), self._resolve_permissions())
+                        continue
                     if stat.S_ISDIR(sd_entry.stat(follow_symlinks=False).st_mode):
                         paths.extend(self._collect_regular_frames(Path(sd_entry.path)))
         paths.sort(key=parse_frame_order)
@@ -372,36 +380,11 @@ class OutboxSpool:
         crashpoint_name: str | None = None,
         deadline_ns: int | None = None,
     ) -> None:
-        perms = self._resolve_permissions()
-        self._check_deadline(deadline_ns)
-        part_path.unlink(missing_ok=True)
-        fd = -1
-        committed = False
-        try:
-            fd = os.open(part_path, os.O_RDWR | os.O_CREAT | os.O_EXCL | _O_BINARY | _O_NOFOLLOW, 0o600)
-            write_all_fd(fd, frame_bytes)
-            perms.secure_file(part_path)
-            self._check_deadline(deadline_ns)
-            if crashpoint_name is not None:
-                maybe_crashpoint(crashpoint_name)
-            os.fsync(fd)
-            os.close(fd)
-            fd = -1
-            replace_file_resilient(part_path, final_path)
-            sync_dir(final_path.parent)
-            committed = True
-        except BrainError:
-            raise
-        except OSError as err:
-            raise raise_storage_error(err, "cannot write outbox frame") from err
-        finally:
-            if fd != -1:
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
-            if not committed:
-                part_path.unlink(missing_ok=True)
+        dl_check = (lambda: self._check_deadline(deadline_ns)) if deadline_ns is not None else None
+        publish_outbox_frame_atomic(
+            final_path, part_path, frame_bytes, self._resolve_permissions(),
+            crashpoint_name=crashpoint_name, check_deadline=dl_check,
+        )
 
     def _enqueue_record(
         self,
@@ -437,13 +420,16 @@ class OutboxSpool:
             streams_root = self._root / _STREAMS_DIR
             ensure_dir_tree_atomic(streams_root, perms, renamer, check_deadline=dl_check)
             sdir = streams_root / stream_key
+            preflight_cur = prepare_cursor_for_direct_enqueue(
+                sdir, sequence, perms, renamer=renamer, check_deadline=dl_check
+            )
             ensure_dir_tree_atomic(sdir, perms, renamer, check_deadline=dl_check)
             base = f"{highest_order + 1:016d}_{record_kind}_{sequence:020d}"
             self._atomic_publish_frame(
                 sdir / f"{base}{_FRAME_SUFFIX}", sdir / f"{base}{_PART_SUFFIX}", frame_bytes,
                 crashpoint_name="capture.outbox.after_write_before_fsync", deadline_ns=deadline_ns,
             )
-            advance_cursor_next_seq(sdir, sequence, perms, renamer=renamer)
+            commit_bumped_cursor(sdir, preflight_cur, sequence, perms)
             return entry_id
 
     def enqueue_event(self, record: CaptureEventRecord, *, deadline_ns: int | None = None) -> str:
@@ -471,6 +457,7 @@ class OutboxSpool:
         renamer = default_outbox_dir_renamer()
         dl_check = (lambda: self._check_deadline(deadline_ns)) if deadline_ns is not None else None
         with self._locked(create_root=True, sweep=False, deadline_ns=deadline_ns):
+            verify_streams_fence_if_present(self._root / _STREAMS_DIR, perms)
             sdir = self._root / _STREAMS_DIR / stream_key
             cursor = load_or_recover_hook_cursor(sdir, perms, renamer=renamer, check_deadline=dl_check)
             used, highest_order, _mp, max_frame_seq, stream_frames, sdir_ok = self._scan_outbox_with_stream(
@@ -560,18 +547,21 @@ class OutboxSpool:
                     break
             return out
 
-    def apply_ack(self, ack: CaptureBatchAck) -> int:
+    def apply_ack(self, ack: CaptureBatchAck, *, deadline_ns: int | None = None) -> int:
         """Evict only entries proven committed by ``ack`` for its ``producer_stream``; returns evicted count."""
         if not isinstance(ack, CaptureBatchAck):
             raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
         if ack.policy_disabled:
             return 0
-        with self._locked(create_root=False):
+        dl_check = (lambda: self._check_deadline(deadline_ns)) if deadline_ns is not None else None
+        with self._locked(create_root=False, deadline_ns=deadline_ns):
             if not os.path.lexists(self._root):
                 return 0
             perms = self._resolve_permissions()
             sdir = self._root / _STREAMS_DIR / stream_dir_key(ack.producer_stream)
-            persist_cursor_ack(sdir, ack, perms, renamer=default_outbox_dir_renamer())
+            persist_cursor_ack(
+                sdir, ack, perms, renamer=default_outbox_dir_renamer(), check_deadline=dl_check
+            )
             evicted = 0
             for path in self._iter_frame_paths(producer_stream=ack.producer_stream):
                 parsed = parse_frame_filename_identity(path.name)

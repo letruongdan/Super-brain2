@@ -269,12 +269,12 @@ def test_r9_p1_v3_boundary_upgrade_via_pending_binding_and_gap_and_ack_page_cap(
     sdir_c1 = _stream_dir(outbox_c1, stream_c1)
     acks_dir_c1 = sdir_c1 / ".acks"
     assert acks_dir_c1.is_dir()
-    assert (acks_dir_c1 / "p0000000000000000.json").is_file()
+    assert len(list(acks_dir_c1.glob("p0000000000000000*.json"))) == 1
 
     spool_c1.apply_ack(_ack(stream_c1, committed=(2,), contiguous=0))
     c1_obj = json.loads((sdir_c1 / ".seq_cursor.json").read_text(encoding="utf-8"))
     assert c1_obj["contiguous_acked_through"] == 3
-    assert not (acks_dir_c1 / "p0000000000000000.json").exists()
+    assert list(acks_dir_c1.glob("p0000000000000000*.json")) == []
     if acks_dir_c1.exists():
         assert list(acks_dir_c1.glob("*.json")) == []
 

@@ -1,4 +1,4 @@
-"""Crash-safe per-stream outbox sequence cursor with lossless sharded dedup binding support (SP2-5)."""
+"""Crash-safe per-stream outbox sequence cursor with authenticated ACK page manifests (SP2-5)."""
 
 from __future__ import annotations
 
@@ -6,18 +6,16 @@ import json
 import os
 import stat
 import uuid
-import zlib
-from collections.abc import Callable, Iterable
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 from superbrain.core._kernel_base import require_sha256_digest
-from superbrain.core.canonical import canonical_json, digest_bytes
+from superbrain.core.canonical import canonical_json
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.ids import new_id
 from superbrain.core.jsonvalue import JsonValue
 from superbrain.ports.capture import (
-    MAX_CAPTURE_ENTRY_BYTES,
     CaptureBatchAck,
     CaptureEventRecord,
     OutboxDirRenamer,
@@ -27,10 +25,16 @@ from superbrain.ports.capture import (
     require_iso_utc_timestamp,
 )
 from superbrain.storage._outbox_acks import (
+    _ACKS_DIR,
     compute_updated_acks,
+    has_committed_ack_page_files,
     is_seq_acked_in_pages,
-    prune_obsolete_ack_pages,
-    read_ack_pages,
+    merge_acked_ranges,
+    parse_v4_page_refs,
+    prune_unreferenced_ack_pages,
+    read_ack_pages_for_cursor,
+    split_contig_and_sparse,
+    verify_acks_dir,
     write_ack_pages,
 )
 from superbrain.storage._outbox_bindings import (
@@ -47,48 +51,23 @@ from superbrain.storage._outbox_io import (
     _O_NOFOLLOW,
     _PART_SUFFIX,
     _STREAMS_DIR,
+    ensure_v4_fence,
     is_link_path,
-    parse_frame_filename_identity,
     replace_file_resilient,
     sync_dir,
     verify_owner_only,
     write_all_fd,
 )
+from superbrain.storage._outbox_io import verify_stream_dir_safe as verify_stream_dir_safe
 
-_ACKS_SUBDIR = ".acks"
 _CURSOR_FILENAME = ".seq_cursor.json"
 _CURSOR_V3_SCHEMA_VERSION = 3
 _CURSOR_V4_SCHEMA_VERSION = 4
 _MAX_CURSOR_BYTES = 262_144
 _LEGACY_STATES: frozenset[str] = frozenset({"bound", "published", "acked"})
-
-
-def merge_acked_ranges(
-    existing: Iterable[tuple[int, int]],
-    extra: Iterable[tuple[int, int]] = (),
-) -> tuple[tuple[int, int], ...]:
-    """Normalize and merge closed integer intervals ``(lo, hi)`` in ascending order."""
-    intervals: list[tuple[int, int]] = []
-    for lo, hi in (*existing, *extra):
-        if lo <= hi and lo >= 1:
-            intervals.append((lo, hi))
-    if not intervals:
-        return ()
-    intervals.sort()
-    merged: list[tuple[int, int]] = [intervals[0]]
-    for lo, hi in intervals[1:]:
-        prev_lo, prev_hi = merged[-1]
-        if prev_hi + 1 >= lo:
-            merged[-1] = (prev_lo, max(prev_hi, hi))
-        else:
-            merged.append((lo, hi))
-    return tuple(merged)
-
-
-def _split_contig_and_sparse(ranges: tuple[tuple[int, int], ...]) -> tuple[int, tuple[tuple[int, int], ...]]:
-    if ranges and ranges[0][0] == 1:
-        return ranges[0][1], ranges[1:]
-    return 0, ranges
+_V4_CURSOR_KEYS: frozenset[str] = frozenset(
+    {"schema_version", "next_seq", "binding_count", "contiguous_acked_through", "acked_pages", "pending_binding"}
+)
 
 
 @dataclass(frozen=True)
@@ -102,6 +81,7 @@ class StreamSeqCursor:
     legacy_recent: tuple[HookBindingRecord, ...] = ()
     contiguous_acked_through: int = 0
     acked_pages: tuple[tuple[int, bytes], ...] = ()
+    acked_page_refs: tuple[tuple[int, str], ...] = ()
     legacy_acked_ranges: tuple[tuple[int, int], ...] = ()
     schema_v4: bool = False
 
@@ -120,7 +100,7 @@ class StreamSeqCursor:
         binding_count: int | None = None,
         pending_binding: HookBindingRecord | None = None,
     ) -> StreamSeqCursor:
-        """Return updated cursor preserving ACK watermark, sparse pages, and schema version state."""
+        """Return updated cursor preserving ACK watermark, sparse page manifest, and schema state."""
         return StreamSeqCursor(
             next_seq=self.next_seq if next_seq is None else next_seq,
             binding_count=self.binding_count if binding_count is None else binding_count,
@@ -129,20 +109,21 @@ class StreamSeqCursor:
             legacy_recent=self.legacy_recent,
             contiguous_acked_through=self.contiguous_acked_through,
             acked_pages=self.acked_pages,
+            acked_page_refs=self.acked_page_refs,
             legacy_acked_ranges=self.legacy_acked_ranges,
             schema_v4=self.schema_v4,
         )
 
     def mark_acked(self, ack: CaptureBatchAck) -> StreamSeqCursor:
-        """Compute updated ACK watermark and sparse bitset pages for ``ack``."""
-        acked, _obsolete, _dirty = _apply_ack_update(self, ack)
+        """Compute updated ACK watermark and sparse bitset page manifest for ``ack``."""
+        acked, _dirty = _apply_ack_update(self, ack)
         return acked
 
     def bump_next_seq(self, sequence: int) -> StreamSeqCursor:
         """Ensure ``next_seq > sequence`` without disturbing bindings or ACK state."""
-        if self.next_seq > sequence:
-            return self
-        return self.with_binding_state(next_seq=sequence + 1, pending_binding=self.pending_binding)
+        return self if self.next_seq > sequence else self.with_binding_state(
+            next_seq=sequence + 1, pending_binding=self.pending_binding
+        )
 
 
 def cursor_exists(stream_dir: Path) -> bool:
@@ -158,29 +139,25 @@ def _parse_legacy_cursor(obj: dict[str, object], *, schema_ver: int, next_seq: i
     parsed: list[HookBindingRecord] = []
     acked_pts: list[tuple[int, int]] = []
     for row in raw_recent:
-        if (
-            not isinstance(row, list)
-            or len(row) != expected_len
-            or not isinstance(row[0], str)
-            or not isinstance(row[2], str)
-            or not row[2]
-        ):
+        if not isinstance(row, list) or len(row) != expected_len or not isinstance(row[0], str) or not isinstance(
+            row[2], str
+        ) or not row[2]:
             raise BrainError(ErrorCode.INTEGRITY_FAILURE, "corrupt stream cursor entry")
-        key = require_sha256_digest(row[0])
-        seq, rec_at = require_capture_sequence(row[1]), require_iso_utc_timestamp(row[3])
+        key, seq, rec_at = require_sha256_digest(row[0]), require_capture_sequence(row[1]), require_iso_utc_timestamp(
+            row[3]
+        )
         digest_val: str | None = None
         if schema_ver == 2:
-            state_val = row[4]
-            if not isinstance(state_val, str) or state_val not in _LEGACY_STATES:
+            if not isinstance(row[4], str) or row[4] not in _LEGACY_STATES:
                 raise BrainError(ErrorCode.INTEGRITY_FAILURE, "corrupt stream cursor state")
             if row[5] is not None:
                 if not isinstance(row[5], str):
                     raise BrainError(ErrorCode.INTEGRITY_FAILURE, "corrupt stream cursor digest")
                 digest_val = require_sha256_digest(row[5])
-            if state_val == "acked":
+            if row[4] == "acked":
                 acked_pts.append((seq, seq))
         parsed.append(HookBindingRecord(key, seq, row[2], rec_at, digest_val))
-    contig, sparse = _split_contig_and_sparse(merge_acked_ranges(acked_pts))
+    contig, sparse = split_contig_and_sparse(merge_acked_ranges(acked_pts))
     return StreamSeqCursor(
         next_seq=next_seq, binding_count=len({rec.key for rec in parsed}),
         legacy_recent=tuple(parsed), contiguous_acked_through=contig,
@@ -192,13 +169,27 @@ def _needs_cursor_recovery(cursor: StreamSeqCursor) -> bool:
     return bool(cursor.legacy_recent or cursor.legacy_acked_ranges or cursor.pending_binding is not None)
 
 
+def _parse_v3_ranges(raw_ranges: object) -> tuple[int, tuple[tuple[int, int], ...]]:
+    if not isinstance(raw_ranges, list):
+        raise BrainError(ErrorCode.INTEGRITY_FAILURE, "corrupt stream cursor acked_ranges")
+    parsed_ranges: list[tuple[int, int]] = []
+    for rng in raw_ranges:
+        if not isinstance(rng, list) or len(rng) != 2:
+            raise BrainError(ErrorCode.INTEGRITY_FAILURE, "corrupt stream cursor range")
+        lo, hi = require_capture_sequence(rng[0]), require_capture_sequence(rng[1])
+        if lo > hi:
+            raise BrainError(ErrorCode.INTEGRITY_FAILURE, "corrupt stream cursor range order")
+        parsed_ranges.append((lo, hi))
+    return split_contig_and_sparse(merge_acked_ranges(parsed_ranges))
+
+
 def read_stream_cursor(stream_dir: Path, perms: OutboxPermissionsPort) -> StreamSeqCursor:
-    """Load and validate ``.seq_cursor.json`` (v1, v2, v3, or v4) and ``.acks`` inside ``stream_dir``."""
+    """Load and validate ``.seq_cursor.json`` (v1, v2, v3, or v4) and pinned ``.acks`` pages."""
     path = stream_dir / _CURSOR_FILENAME
-    has_acks_dir = os.path.lexists(stream_dir / _ACKS_SUBDIR)
+    has_acks_dir = os.path.lexists(stream_dir / _ACKS_DIR)
     if not os.path.lexists(path):
-        if has_acks_dir:
-            read_ack_pages(stream_dir, perms)
+        if has_acks_dir and has_committed_ack_page_files(stream_dir, perms):
+            raise BrainError(ErrorCode.INTEGRITY_FAILURE, "orphan acks directory without cursor")
         return StreamSeqCursor(next_seq=1)
     if is_link_path(path):
         raise BrainError(ErrorCode.UNSAFE_PATH, "stream cursor is a link")
@@ -224,12 +215,9 @@ def read_stream_cursor(stream_dir: Path, perms: OutboxPermissionsPort) -> Stream
     next_seq = require_capture_sequence(obj.get("next_seq"))
     if schema_ver in (1, 2):
         legacy_c = _parse_legacy_cursor(obj, schema_ver=schema_ver, next_seq=next_seq)
-        pages = read_ack_pages(stream_dir, perms) if has_acks_dir else ()
-        return StreamSeqCursor(
-            next_seq=legacy_c.next_seq, binding_count=legacy_c.binding_count, legacy_recent=legacy_c.legacy_recent,
-            contiguous_acked_through=legacy_c.contiguous_acked_through, acked_pages=pages,
-            legacy_acked_ranges=legacy_c.legacy_acked_ranges, schema_v4=legacy_c.schema_v4 or bool(pages),
-        )
+        if has_acks_dir:
+            verify_acks_dir(stream_dir, perms)
+        return legacy_c
     binding_count = obj.get("binding_count", 0)
     if type(binding_count) is not int or binding_count < 0:
         raise BrainError(ErrorCode.INTEGRITY_FAILURE, "corrupt stream cursor binding_count")
@@ -237,51 +225,21 @@ def read_stream_cursor(stream_dir: Path, perms: OutboxPermissionsPort) -> Stream
     pending = parse_binding_row(raw_pending) if raw_pending is not None else None
     if schema_ver == _CURSOR_V4_SCHEMA_VERSION:
         raw_contig = obj.get("contiguous_acked_through")
-        if "acked_ranges" in obj or type(raw_contig) is not int or raw_contig < 0:
+        if set(obj.keys()) != _V4_CURSOR_KEYS or type(raw_contig) is not int or raw_contig < 0:
             raise BrainError(ErrorCode.INTEGRITY_FAILURE, "corrupt stream cursor schema")
-        pages = read_ack_pages(stream_dir, perms)
+        page_refs = parse_v4_page_refs(obj["acked_pages"])
+        pages = read_ack_pages_for_cursor(stream_dir, perms, expected_refs=page_refs, contig=raw_contig)
         return StreamSeqCursor(
             next_seq=next_seq, binding_count=binding_count, pending_binding=pending,
-            contiguous_acked_through=raw_contig, acked_pages=pages, schema_v4=True,
+            contiguous_acked_through=raw_contig, acked_pages=pages, acked_page_refs=page_refs, schema_v4=True,
         )
-    raw_ranges = obj.get("acked_ranges", [])
-    if not isinstance(raw_ranges, list):
-        raise BrainError(ErrorCode.INTEGRITY_FAILURE, "corrupt stream cursor acked_ranges")
-    parsed_ranges: list[tuple[int, int]] = []
-    for rng in raw_ranges:
-        if not isinstance(rng, list) or len(rng) != 2:
-            raise BrainError(ErrorCode.INTEGRITY_FAILURE, "corrupt stream cursor range")
-        lo, hi = require_capture_sequence(rng[0]), require_capture_sequence(rng[1])
-        if lo > hi:
-            raise BrainError(ErrorCode.INTEGRITY_FAILURE, "corrupt stream cursor range order")
-        parsed_ranges.append((lo, hi))
-    contig, sparse = _split_contig_and_sparse(merge_acked_ranges(parsed_ranges))
-    pages = read_ack_pages(stream_dir, perms) if has_acks_dir else ()
+    contig, sparse = _parse_v3_ranges(obj.get("acked_ranges", []))
+    if has_acks_dir:
+        verify_acks_dir(stream_dir, perms)
     return StreamSeqCursor(
         next_seq=next_seq, binding_count=binding_count, pending_binding=pending,
-        contiguous_acked_through=contig, acked_pages=pages,
-        legacy_acked_ranges=sparse, schema_v4=bool(sparse or pages),
+        contiguous_acked_through=contig, legacy_acked_ranges=sparse, schema_v4=bool(sparse),
     )
-
-
-def verify_stream_dir_safe(stream_dir: Path, perms: OutboxPermissionsPort) -> bool:
-    """Verify ``stream_dir`` (and ``.streams`` parent if present) are safe non-link dirs; return exists."""
-    parent = stream_dir.parent
-    if os.path.lexists(parent):
-        if is_link_path(parent):
-            raise BrainError(ErrorCode.UNSAFE_PATH, "streams directory is a link")
-        if not stat.S_ISDIR(os.lstat(parent).st_mode):
-            raise BrainError(ErrorCode.INTEGRITY_FAILURE, "streams entry is not a directory")
-        if parent.name == _STREAMS_DIR:
-            verify_owner_only(parent, perms)
-    if not os.path.lexists(stream_dir):
-        return False
-    if is_link_path(stream_dir):
-        raise BrainError(ErrorCode.UNSAFE_PATH, "stream directory is a link")
-    if not stat.S_ISDIR(os.lstat(stream_dir).st_mode):
-        raise BrainError(ErrorCode.INTEGRITY_FAILURE, "stream entry is not a directory")
-    verify_owner_only(stream_dir, perms)
-    return True
 
 
 def _persist_cursor_payload(stream_dir: Path, payload: bytes, perms: OutboxPermissionsPort) -> None:
@@ -315,18 +273,18 @@ def _persist_cursor_payload(stream_dir: Path, payload: bytes, perms: OutboxPermi
             tmp_path.unlink(missing_ok=True)
 
 
-def write_stream_cursor(stream_dir: Path, cursor: StreamSeqCursor, perms: OutboxPermissionsPort) -> None:
-    """Persist v3/v4 ``cursor`` atomically inside ``stream_dir`` enforcing ``_MAX_CURSOR_BYTES``."""
+def _serialize_cursor_bytes(cursor: StreamSeqCursor) -> bytes:
     if cursor.legacy_recent or cursor.legacy_acked_ranges or cursor.acked_ranges:
         raise BrainError(ErrorCode.INTEGRITY_FAILURE, "unflushed legacy cursor state")
     pb = cursor.pending_binding
     pending_row: JsonValue = (
         [pb.key, pb.sequence, pb.event_id, pb.recorded_at, pb.payload_digest] if pb is not None else None
     )
-    if cursor.schema_v4 or cursor.acked_pages:
+    if cursor.schema_v4 or cursor.acked_pages or cursor.acked_page_refs:
         body: dict[str, JsonValue] = {
             "schema_version": _CURSOR_V4_SCHEMA_VERSION, "next_seq": cursor.next_seq,
             "binding_count": cursor.binding_count, "contiguous_acked_through": cursor.contiguous_acked_through,
+            "acked_pages": [[p, h] for p, h in cursor.acked_page_refs],
             "pending_binding": pending_row,
         }
     else:
@@ -336,7 +294,39 @@ def write_stream_cursor(stream_dir: Path, cursor: StreamSeqCursor, perms: Outbox
             "binding_count": cursor.binding_count, "acked_ranges": [[1, contig]] if contig > 0 else [],
             "pending_binding": pending_row,
         }
-    _persist_cursor_payload(stream_dir, canonical_json(body), perms)
+    payload = canonical_json(body)
+    if len(payload) > _MAX_CURSOR_BYTES:
+        raise BrainError(ErrorCode.STORAGE_FULL, "stream cursor exceeds size bound")
+    return payload
+
+
+def write_stream_cursor(stream_dir: Path, cursor: StreamSeqCursor, perms: OutboxPermissionsPort) -> None:
+    """Persist v3/v4 ``cursor`` atomically inside ``stream_dir`` enforcing ``_MAX_CURSOR_BYTES``."""
+    _persist_cursor_payload(stream_dir, _serialize_cursor_bytes(cursor), perms)
+
+
+def _commit_v4_pages_and_cursor(
+    stream_dir: Path,
+    *,
+    prior_refs: tuple[tuple[int, str], ...],
+    new_cursor: StreamSeqCursor,
+    dirty_payloads: dict[tuple[int, str], bytes],
+    perms: OutboxPermissionsPort,
+    renamer: OutboxDirRenamer | None,
+    check_deadline: Callable[[], None] | None,
+) -> None:
+    _serialize_cursor_bytes(new_cursor)
+    if new_cursor.schema_v4 and stream_dir.parent.name == _STREAMS_DIR:
+        ensure_v4_fence(stream_dir.parent, perms, renamer=renamer, check_deadline=check_deadline)
+    if os.path.lexists(stream_dir / _ACKS_DIR):
+        prune_unreferenced_ack_pages(stream_dir, prior_refs, perms)
+    if dirty_payloads:
+        write_ack_pages(stream_dir, dirty_payloads, perms, renamer=renamer, check_deadline=check_deadline)
+    if check_deadline is not None:
+        check_deadline()
+    write_stream_cursor(stream_dir, new_cursor, perms)
+    if os.path.lexists(stream_dir / _ACKS_DIR):
+        prune_unreferenced_ack_pages(stream_dir, new_cursor.acked_page_refs, perms)
 
 
 def recover_stream_cursor(
@@ -347,9 +337,23 @@ def recover_stream_cursor(
     renamer: OutboxDirRenamer | None,
     check_deadline: Callable[[], None] | None = None,
 ) -> StreamSeqCursor:
-    """Flush any in-flight ``pending_binding``, ``legacy_recent``, or ``legacy_acked_ranges``."""
+    """Validate capacity pre-mutation, flush bindings and ACK pages, then commit cursor."""
     if not _needs_cursor_recovery(cursor):
         return cursor
+    contig, pages, page_refs, dirty = compute_updated_acks(
+        contiguous_acked_through=cursor.contiguous_acked_through,
+        existing_pages=cursor.acked_pages,
+        existing_refs=dict(cursor.acked_page_refs),
+        extra_ranges=cursor.legacy_acked_ranges,
+    )
+    target_v4 = cursor.schema_v4 or bool(pages) or bool(cursor.legacy_acked_ranges)
+    est_count = cursor.binding_count + len(cursor.legacy_recent) + (1 if cursor.pending_binding else 0)
+    _serialize_cursor_bytes(
+        StreamSeqCursor(
+            next_seq=cursor.next_seq, binding_count=est_count, contiguous_acked_through=contig,
+            acked_pages=pages, acked_page_refs=page_refs, schema_v4=target_v4,
+        )
+    )
     if cursor.legacy_recent or cursor.pending_binding is not None:
         for item in cursor.legacy_recent:
             upsert_binding(stream_dir, item, perms, renamer=renamer, check_deadline=check_deadline)
@@ -358,21 +362,14 @@ def recover_stream_cursor(
         count = count_all_bindings(stream_dir, perms)
     else:
         count = cursor.binding_count
-    contig, pages, obsolete, dirty = compute_updated_acks(
-        contiguous_acked_through=cursor.contiguous_acked_through,
-        existing_pages=cursor.acked_pages,
-        extra_ranges=cursor.legacy_acked_ranges,
-    )
-    if dirty:
-        write_ack_pages(stream_dir, dirty, perms, renamer=renamer, check_deadline=check_deadline)
     recovered = StreamSeqCursor(
-        next_seq=cursor.next_seq, binding_count=count,
-        contiguous_acked_through=contig, acked_pages=pages,
-        schema_v4=cursor.schema_v4 or bool(pages) or bool(cursor.legacy_acked_ranges),
+        next_seq=cursor.next_seq, binding_count=count, contiguous_acked_through=contig,
+        acked_pages=pages, acked_page_refs=page_refs, schema_v4=target_v4,
     )
-    write_stream_cursor(stream_dir, recovered, perms)
-    if obsolete:
-        prune_obsolete_ack_pages(stream_dir, obsolete, perms)
+    _commit_v4_pages_and_cursor(
+        stream_dir, prior_refs=cursor.acked_page_refs, new_cursor=recovered, dirty_payloads=dirty,
+        perms=perms, renamer=renamer, check_deadline=check_deadline,
+    )
     return recovered
 
 
@@ -400,86 +397,89 @@ def lookup_stream_binding(
 
 def _apply_ack_update(
     cur: StreamSeqCursor, ack: CaptureBatchAck
-) -> tuple[StreamSeqCursor, tuple[int, ...], dict[int, bytes]]:
+) -> tuple[StreamSeqCursor, dict[tuple[int, str], bytes]]:
     ev_max = (max(ack.committed_event_sequences) + 1) if ack.committed_event_sequences else 1
     gap_max = (max(ack.acked_producer_gap_sequences) + 1) if ack.acked_producer_gap_sequences else 1
     next_val = max(cur.next_seq, ack.contiguous_event_acked_through + 1, ev_max, gap_max)
-    contig, pages, obsolete, dirty = compute_updated_acks(
+    contig, pages, page_refs, dirty = compute_updated_acks(
         contiguous_acked_through=cur.contiguous_acked_through, existing_pages=cur.acked_pages,
-        extra_sequences=ack.committed_event_sequences, floor_contiguous=ack.contiguous_event_acked_through,
+        existing_refs=dict(cur.acked_page_refs), extra_sequences=ack.committed_event_sequences,
+        floor_contiguous=ack.contiguous_event_acked_through,
     )
     acked = StreamSeqCursor(
-        next_seq=next_val, binding_count=cur.binding_count,
-        contiguous_acked_through=contig, acked_pages=pages, schema_v4=True,
+        next_seq=next_val, binding_count=cur.binding_count, contiguous_acked_through=contig,
+        acked_pages=pages, acked_page_refs=page_refs, schema_v4=True,
     )
-    return acked, obsolete, dirty
+    return acked, dirty
 
 
 def persist_cursor_ack(
-    stream_dir: Path, ack: CaptureBatchAck, perms: OutboxPermissionsPort, *, renamer: OutboxDirRenamer | None = None
+    stream_dir: Path,
+    ack: CaptureBatchAck,
+    perms: OutboxPermissionsPort,
+    *,
+    renamer: OutboxDirRenamer | None = None,
+    check_deadline: Callable[[], None] | None = None,
 ) -> None:
-    """Flush pending/legacy state and persist sharded ACK pages before cursor bump & frame unlink."""
-    if not verify_stream_dir_safe(stream_dir, perms) or not cursor_exists(stream_dir):
+    """Flush pending/legacy state and persist authenticated ACK pages before cursor bump & frame unlink."""
+    if not verify_stream_dir_safe(stream_dir, perms):
+        return
+    if not cursor_exists(stream_dir):
+        if os.path.lexists(stream_dir / _ACKS_DIR) and has_committed_ack_page_files(stream_dir, perms):
+            raise BrainError(ErrorCode.INTEGRITY_FAILURE, "orphan acks directory without cursor")
         return
     ren = renamer if renamer is not None else default_outbox_dir_renamer()
     cur = read_stream_cursor(stream_dir, perms)
     if _needs_cursor_recovery(cur):
-        cur = recover_stream_cursor(stream_dir, cur, perms, renamer=ren)
-    acked, obsolete, dirty = _apply_ack_update(cur, ack)
-    if dirty:
-        write_ack_pages(stream_dir, dirty, perms, renamer=ren)
+        cur = recover_stream_cursor(stream_dir, cur, perms, renamer=ren, check_deadline=check_deadline)
+    acked, dirty = _apply_ack_update(cur, ack)
     if acked != cur:
-        write_stream_cursor(stream_dir, acked, perms)
-    if obsolete:
-        prune_obsolete_ack_pages(stream_dir, obsolete, perms)
+        _commit_v4_pages_and_cursor(
+            stream_dir, prior_refs=cur.acked_page_refs, new_cursor=acked, dirty_payloads=dirty,
+            perms=perms, renamer=ren, check_deadline=check_deadline,
+        )
+
+
+def prepare_cursor_for_direct_enqueue(
+    stream_dir: Path,
+    sequence: int,
+    perms: OutboxPermissionsPort,
+    *,
+    renamer: OutboxDirRenamer | None = None,
+    check_deadline: Callable[[], None] | None = None,
+) -> StreamSeqCursor | None:
+    """Fence/recover stream cursor and pre-check capacity BEFORE publishing a direct frame."""
+    if not verify_stream_dir_safe(stream_dir, perms):
+        return None
+    if not cursor_exists(stream_dir):
+        if os.path.lexists(stream_dir / _ACKS_DIR) and has_committed_ack_page_files(stream_dir, perms):
+            raise BrainError(ErrorCode.INTEGRITY_FAILURE, "orphan acks directory without cursor")
+        return None
+    ren = renamer if renamer is not None else default_outbox_dir_renamer()
+    cur = read_stream_cursor(stream_dir, perms)
+    if _needs_cursor_recovery(cur):
+        cur = recover_stream_cursor(stream_dir, cur, perms, renamer=ren, check_deadline=check_deadline)
+    _serialize_cursor_bytes(cur.bump_next_seq(sequence))
+    return cur
+
+
+def commit_bumped_cursor(
+    stream_dir: Path, cur: StreamSeqCursor | None, sequence: int, perms: OutboxPermissionsPort
+) -> None:
+    """Persist bumped ``next_seq`` after a direct frame publication completes."""
+    if cur is None:
+        return
+    bumped = cur.bump_next_seq(sequence)
+    if bumped != cur:
+        write_stream_cursor(stream_dir, bumped, perms)
 
 
 def advance_cursor_next_seq(
     stream_dir: Path, sequence: int, perms: OutboxPermissionsPort, *, renamer: OutboxDirRenamer | None = None
 ) -> None:
     """If ``stream_dir`` already maintains a hook cursor, flush legacy/pending state and advance."""
-    if not verify_stream_dir_safe(stream_dir, perms) or not cursor_exists(stream_dir):
-        return
-    cur = read_stream_cursor(stream_dir, perms)
-    if _needs_cursor_recovery(cur):
-        ren = renamer if renamer is not None else default_outbox_dir_renamer()
-        cur = recover_stream_cursor(stream_dir, cur, perms, renamer=ren)
-    bumped = cur.bump_next_seq(sequence)
-    if bumped != cur:
-        write_stream_cursor(stream_dir, bumped, perms)
-
-
-def prepare_outbox_frame_bytes(
-    *,
-    record_kind: str,
-    producer_stream: str,
-    sequence: int,
-    entry_id: str,
-    payload_dict: dict[str, JsonValue],
-) -> tuple[str, bytes]:
-    """Serialize, bound-check, and CRC32-wrap an outbox frame."""
-    payload_bytes = canonical_json(payload_dict)
-    if len(payload_bytes) > MAX_CAPTURE_ENTRY_BYTES:
-        raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
-    payload_json = payload_bytes.decode("utf-8")
-    payload_digest = digest_bytes(payload_bytes)
-    core_fields: dict[str, JsonValue] = {
-        "byte_size": len(payload_bytes), "entry_id": entry_id, "payload_digest": payload_digest,
-        "payload_json": payload_json, "producer_stream": producer_stream,
-        "record_kind": record_kind, "sequence": sequence,
-    }
-    core_fields["frame_crc32"] = f"{zlib.crc32(canonical_json(core_fields)) & 0xFFFFFFFF:08x}"
-    return payload_digest, canonical_json(core_fields) + b"\n"
-
-
-def max_frame_seq_in_paths(frame_paths: Iterable[Path]) -> int:
-    """Return the highest frame sequence number across ``frame_paths``, or ``0`` if none."""
-    high = 0
-    for fp in frame_paths:
-        ident = parse_frame_filename_identity(fp.name)
-        if ident is not None and ident[1] > high:
-            high = ident[1]
-    return high
+    cur = prepare_cursor_for_direct_enqueue(stream_dir, sequence, perms, renamer=renamer)
+    commit_bumped_cursor(stream_dir, cur, sequence, perms)
 
 
 def backfill_binding_digest_if_missing(

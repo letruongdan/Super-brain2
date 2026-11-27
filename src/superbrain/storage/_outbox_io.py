@@ -18,7 +18,9 @@ from pathlib import Path
 from superbrain.core._kernel_base import require_sha256_digest
 from superbrain.core.canonical import canonical_json, digest_bytes
 from superbrain.core.errors import BrainError, ErrorCode
+from superbrain.core.jsonvalue import JsonValue
 from superbrain.ports.capture import (
+    MAX_CAPTURE_ENTRY_BYTES,
     OutboxDirRenamer,
     OutboxEntry,
     OutboxPermissionsPort,
@@ -29,6 +31,7 @@ _REPARSE_POINT = 0x400
 _PART_SUFFIX = ".part"
 _FRAME_SUFFIX = ".frame"
 _STREAMS_DIR = "streams"
+_V4_FENCE_FILE = ".v4_fence"
 _LOCK_FILE = ".spool.lock"
 _PROCESS_LOCKS_GUARD = threading.Lock()
 _PROCESS_LOCKS: dict[str, threading.RLock] = {}
@@ -379,3 +382,172 @@ def parse_verified_outbox_frame(raw: bytes) -> tuple[OutboxEntry, int]:
         entry_id=entry_id, payload_json=payload_json, payload_digest=payload_digest, byte_size=byte_size,
     )
     return entry, nl_idx
+
+
+def verify_v4_fence_file(path: Path, perms: OutboxPermissionsPort) -> None:
+    """Validate ``streams/.v4_fence`` is a link-free regular owner-only file at supported version <= 4."""
+    if is_link_path(path):
+        raise BrainError(ErrorCode.UNSAFE_PATH, "streams version fence is a link")
+    if not stat.S_ISREG(os.lstat(path).st_mode):
+        raise BrainError(ErrorCode.INTEGRITY_FAILURE, "streams version fence is not a regular file")
+    verify_owner_only(path, perms)
+    fd = os.open(path, os.O_RDONLY | _O_BINARY | _O_NOFOLLOW)
+    try:
+        raw = os.read(fd, 257)
+    finally:
+        os.close(fd)
+    if len(raw) > 256:
+        raise BrainError(ErrorCode.INTEGRITY_FAILURE, "corrupt streams version fence")
+    try:
+        obj = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as err:
+        raise BrainError(ErrorCode.INTEGRITY_FAILURE, "corrupt streams version fence") from err
+    if (
+        not isinstance(obj, dict)
+        or set(obj.keys()) != {"schema_version"}
+        or type(obj.get("schema_version")) is not int
+        or obj["schema_version"] != 4
+    ):
+        raise BrainError(ErrorCode.INTEGRITY_FAILURE, "unsupported streams version fence")
+
+
+def verify_streams_fence_if_present(streams_dir: Path, perms: OutboxPermissionsPort) -> None:
+    """Reject links or unsupported future version fences on ``streams`` before any write."""
+    if not os.path.lexists(streams_dir):
+        return
+    if is_link_path(streams_dir):
+        raise BrainError(ErrorCode.UNSAFE_PATH, "streams directory is a link")
+    if not stat.S_ISDIR(os.lstat(streams_dir).st_mode):
+        raise BrainError(ErrorCode.INTEGRITY_FAILURE, "streams entry is not a directory")
+    verify_owner_only(streams_dir, perms)
+    fence = streams_dir / _V4_FENCE_FILE
+    if os.path.lexists(fence):
+        verify_v4_fence_file(fence, perms)
+
+
+def ensure_v4_fence(
+    streams_dir: Path,
+    perms: OutboxPermissionsPort,
+    *,
+    renamer: OutboxDirRenamer | None,
+    check_deadline: Callable[[], None] | None = None,
+) -> None:
+    """Create owner-only ``streams/.v4_fence`` before writing v4 state so legacy writers fail closed."""
+    ensure_dir_tree_atomic(streams_dir, perms, renamer, check_deadline=check_deadline)
+    fence = streams_dir / _V4_FENCE_FILE
+    if os.path.lexists(fence):
+        verify_v4_fence_file(fence, perms)
+        return
+    tmp = streams_dir / f".v4_fence-{uuid.uuid4().hex}{_PART_SUFFIX}"
+    fd = -1
+    committed = False
+    try:
+        fd = os.open(tmp, os.O_RDWR | os.O_CREAT | os.O_EXCL | _O_BINARY | _O_NOFOLLOW, 0o600)
+        write_all_fd(fd, canonical_json({"schema_version": 4}))
+        perms.secure_file(tmp)
+        if check_deadline is not None:
+            check_deadline()
+        os.fsync(fd)
+        os.close(fd)
+        fd = -1
+        replace_file_resilient(tmp, fence)
+        sync_dir(streams_dir)
+        committed = True
+    except BrainError:
+        raise
+    except OSError as err:
+        raise raise_storage_error(err, "cannot write streams version fence") from err
+    finally:
+        if fd != -1:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if not committed:
+            tmp.unlink(missing_ok=True)
+
+
+def prepare_outbox_frame_bytes(
+    *,
+    record_kind: str,
+    producer_stream: str,
+    sequence: int,
+    entry_id: str,
+    payload_dict: dict[str, JsonValue],
+) -> tuple[str, bytes]:
+    """Serialize, bound-check, and CRC32-wrap an outbox frame."""
+    payload_bytes = canonical_json(payload_dict)
+    if len(payload_bytes) > MAX_CAPTURE_ENTRY_BYTES:
+        raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+    payload_json = payload_bytes.decode("utf-8")
+    payload_digest = digest_bytes(payload_bytes)
+    core_fields: dict[str, JsonValue] = {
+        "byte_size": len(payload_bytes), "entry_id": entry_id, "payload_digest": payload_digest,
+        "payload_json": payload_json, "producer_stream": producer_stream,
+        "record_kind": record_kind, "sequence": sequence,
+    }
+    core_fields["frame_crc32"] = f"{zlib.crc32(canonical_json(core_fields)) & 0xFFFFFFFF:08x}"
+    return payload_digest, canonical_json(core_fields) + b"\n"
+
+
+def verify_stream_dir_safe(stream_dir: Path, perms: OutboxPermissionsPort) -> bool:
+    """Verify ``stream_dir`` (and ``streams`` parent if present) are safe non-link dirs; return exists."""
+    parent = stream_dir.parent
+    if os.path.lexists(parent):
+        if is_link_path(parent):
+            raise BrainError(ErrorCode.UNSAFE_PATH, "streams directory is a link")
+        if not stat.S_ISDIR(os.lstat(parent).st_mode):
+            raise BrainError(ErrorCode.INTEGRITY_FAILURE, "streams entry is not a directory")
+        if parent.name == _STREAMS_DIR:
+            verify_owner_only(parent, perms)
+    if not os.path.lexists(stream_dir):
+        return False
+    if is_link_path(stream_dir):
+        raise BrainError(ErrorCode.UNSAFE_PATH, "stream directory is a link")
+    if not stat.S_ISDIR(os.lstat(stream_dir).st_mode):
+        raise BrainError(ErrorCode.INTEGRITY_FAILURE, "stream entry is not a directory")
+    verify_owner_only(stream_dir, perms)
+    return True
+
+
+def publish_outbox_frame_atomic(
+    final_path: Path,
+    part_path: Path,
+    frame_bytes: bytes,
+    perms: OutboxPermissionsPort,
+    *,
+    crashpoint_name: str | None = None,
+    check_deadline: Callable[[], None] | None = None,
+) -> None:
+    """Write ``part_path``, fsync, check crashpoint/deadline, replace ``final_path``, and sync dir."""
+    if check_deadline is not None:
+        check_deadline()
+    part_path.unlink(missing_ok=True)
+    fd = -1
+    committed = False
+    try:
+        fd = os.open(part_path, os.O_RDWR | os.O_CREAT | os.O_EXCL | _O_BINARY | _O_NOFOLLOW, 0o600)
+        write_all_fd(fd, frame_bytes)
+        perms.secure_file(part_path)
+        if check_deadline is not None:
+            check_deadline()
+        if crashpoint_name is not None:
+            maybe_crashpoint(crashpoint_name)
+        os.fsync(fd)
+        os.close(fd)
+        fd = -1
+        replace_file_resilient(part_path, final_path)
+        sync_dir(final_path.parent)
+        committed = True
+    except BrainError:
+        raise
+    except OSError as err:
+        raise raise_storage_error(err, "cannot write outbox frame") from err
+    finally:
+        if fd != -1:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if not committed:
+            part_path.unlink(missing_ok=True)
