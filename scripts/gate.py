@@ -493,6 +493,13 @@ _HEAVY_FILE_COST_MS: dict[str, int] = {
     "tests/integration/test_handoff_lifecycle_and_takeover.py": 3560,
     "tests/storage/test_handoff_restore_and_epochs.py": 1860,
     "tests/domain/test_handoff_limits_and_budget.py": 100,
+    "tests/integration/test_sp2_5_production_wiring.py": 76000,
+    "tests/integration/test_capture_mcp_coexistence_r2.py": 2000,
+    "tests/integration/test_capture_mcp_coexistence.py": 1800,
+    "tests/storage/test_outbox_r9_ack_cursor_bounds.py": 1100,
+    "tests/integration/test_layer2_invalidation.py": 900,
+    "tests/storage/test_outbox_r8_migration_and_limits.py": 850,
+    "tests/adapters/test_claude_and_codex_capture_adapters.py": 350,
 }
 
 
