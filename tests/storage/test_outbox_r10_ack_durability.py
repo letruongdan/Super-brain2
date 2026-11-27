@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from pathlib import Path
 from typing import Any
@@ -431,3 +432,119 @@ def test_r10_f6_recovery_write_ack_pages_checks_deadline_between_pages(
     cur = read_stream_cursor(sdir, perms)
     assert all(cur.is_event_acked(s) for s in (5_000, 9_000, 13_000))
     assert cur.is_event_acked(4_999) is False
+
+
+def test_r10_f7_interrupted_v4_fence_part_recovers_cleanly(trusted_tmp: Path) -> None:
+    """Crash leaving streams/.v4_fence-*.part must sweep cleanly on reopen rather than bricking outbox."""
+    perms = os_adapters().permissions
+    outbox, stream = trusted_tmp / "outbox-r10-f7", "stream-r10-f7"
+    spool = OutboxSpool(outbox, permissions=perms)
+    spool.enqueue_event(_mk_event(stream, 1))
+
+    staged = outbox / _STREAMS_DIR / (".v4_fence-" + ("a" * 32) + ".part")
+    staged.write_bytes(b'{"schema_version":4}')
+    perms.secure_file(staged)
+
+    reopened = OutboxSpool(outbox, permissions=perms)
+    assert staged.exists()
+    assert [e.sequence for e in reopened.read_pending(limit=10, producer_stream=stream)] == [1]
+    assert not staged.exists()
+
+    staged2 = outbox / _STREAMS_DIR / (".v4_fence-" + ("b" * 32) + ".part")
+    staged2.write_bytes(b'{"schema_version":4}')
+    perms.secure_file(staged2)
+    assert reopened.apply_ack(_ack(stream, committed=(1,))) == 1
+    assert not staged2.exists()
+    ev = _enqueue_hook(reopened, stream=stream, dk=digest_bytes(b"r10-f7-hook"), explicit_seq=2)
+    assert ev.sequence == 2
+
+
+def test_r10_f8_read_pending_verifies_cursor_acks_and_v4_fence(trusted_tmp: Path) -> None:
+    """read_pending() and read_pending(producer_stream=...) must fail closed on missing acks/orphan/future fence."""
+    perms = os_adapters().permissions
+
+    outbox_a, stream_a = trusted_tmp / "outbox-r10-f8-missing", "stream-r10-f8-missing"
+    spool_a = OutboxSpool(outbox_a, permissions=perms)
+    _enqueue_hook(spool_a, stream=stream_a, dk=digest_bytes(b"r10-f8-a"))
+    spool_a.apply_ack(_ack(stream_a, committed=(5_000,)))
+    page_file = next((_stream_dir(outbox_a, stream_a) / ".acks").glob("*.json"))
+    page_file.unlink()
+    for filtered in (None, stream_a):
+        with pytest.raises(BrainError) as err:
+            spool_a.read_pending(limit=10, producer_stream=filtered)
+        assert err.value.code is ErrorCode.INTEGRITY_FAILURE
+
+    outbox_b, stream_b = trusted_tmp / "outbox-r10-f8-fence", "stream-r10-f8-fence"
+    spool_b = OutboxSpool(outbox_b, permissions=perms)
+    _enqueue_hook(spool_b, stream=stream_b, dk=digest_bytes(b"r10-f8-b"))
+    spool_b.apply_ack(_ack(stream_b, committed=(5_000,)))
+    fence = next((outbox_b / _STREAMS_DIR).glob(".*fence*"))
+    fence.write_bytes(canonical_json({"schema_version": 5}))
+    perms.secure_file(fence)
+    for filtered in (None, stream_b):
+        with pytest.raises(BrainError) as err_f:
+            spool_b.read_pending(limit=10, producer_stream=filtered)
+        assert err_f.value.code is ErrorCode.INTEGRITY_FAILURE
+
+    outbox_c, stream_c = trusted_tmp / "outbox-r10-f8-orphan", "stream-r10-f8-orphan"
+    spool_c = OutboxSpool(outbox_c, permissions=perms)
+    _enqueue_hook(spool_c, stream=stream_c, dk=digest_bytes(b"r10-f8-c"))
+    spool_c.apply_ack(_ack(stream_c, committed=(5_000,)))
+    (_stream_dir(outbox_c, stream_c) / ".seq_cursor.json").unlink()
+    for filtered in (None, stream_c):
+        with pytest.raises(BrainError) as err_o:
+            spool_c.read_pending(limit=10, producer_stream=filtered)
+        assert err_o.value.code is ErrorCode.INTEGRITY_FAILURE
+
+
+def test_r10_f9_write_ack_pages_skips_replace_after_fsync_deadline(
+    trusted_tmp: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If deadline expires during fsync, write_ack_pages must clean temp file and publish zero pages."""
+    perms = os_adapters().permissions
+    now = [0]
+    outbox, stream = trusted_tmp / "outbox-r10-f9", "stream-r10-f9"
+    spool = OutboxSpool(outbox, permissions=perms, monotonic_ns=lambda: now[0])
+    _enqueue_hook(spool, stream=stream, dk=digest_bytes(b"r10-f9-init"))
+    spool.apply_ack(_ack(stream, committed=(5_000,)))
+    sdir = _stream_dir(outbox, stream)
+    cur_path = sdir / ".seq_cursor.json"
+    initial_cur = cur_path.read_bytes()
+    before_files = {p.name for p in (sdir / ".acks").iterdir()}
+
+    real_fsync = os.fsync
+
+    def _expire_during_fsync(fd: int) -> None:
+        real_fsync(fd)
+        now[0] = 2_000
+
+    with monkeypatch.context() as mp:
+        mp.setattr(_outbox_acks.os, "fsync", _expire_during_fsync)
+        with pytest.raises(BrainError) as err:
+            spool.apply_ack(_ack(stream, committed=(9_000,)), deadline_ns=1_000)
+        assert err.value.code is ErrorCode.DEADLINE_EXCEEDED
+
+    after_files = {p.name for p in (sdir / ".acks").iterdir()}
+    assert cur_path.read_bytes() == initial_cur
+    assert after_files == before_files
+
+
+def test_r10_f10_recovery_capacity_overflow_is_pure_preflight(trusted_tmp: Path) -> None:
+    """v3 cursor recovery fitting at 1024 pages must still reject an overflowing apply_ack with zero disk writes."""
+    perms = os_adapters().permissions
+    outbox, stream = trusted_tmp / "outbox-r10-f10", "stream-r10-f10"
+    spool = OutboxSpool(outbox, permissions=perms)
+    ranges = [[i * 4096 + 1, i * 4096 + 1] for i in range(1, 1025)]
+    pending = [digest_bytes(b"r10-f10-pending"), 1, "ev-f10-pending", _REC_AT, digest_bytes(b"payload-f10")]
+    cur_obj: dict[str, Any] = {
+        "schema_version": 3, "next_seq": 4_300_000, "binding_count": 0,
+        "acked_ranges": ranges, "pending_binding": pending,
+    }
+    cur_path, initial_bytes = _write_cursor_json(outbox, stream, cur_obj, perms)
+    with pytest.raises(BrainError) as err:
+        spool.apply_ack(_ack(stream, committed=(1025 * 4096 + 1,)))
+    assert err.value.code is ErrorCode.STORAGE_FULL
+    sdir = _stream_dir(outbox, stream)
+    assert cur_path.read_bytes() == initial_bytes
+    assert not (sdir / ".bindings").exists()
+    assert not (sdir / ".acks").exists()

@@ -411,8 +411,13 @@ def verify_v4_fence_file(path: Path, perms: OutboxPermissionsPort) -> None:
         raise BrainError(ErrorCode.INTEGRITY_FAILURE, "unsupported streams version fence")
 
 
+def is_v4_fence_part_name(name: str) -> bool:
+    """Return ``True`` for an interrupted staging file of ``streams/.v4_fence``."""
+    return name.startswith(f"{_V4_FENCE_FILE}-") and name.endswith(_PART_SUFFIX)
+
+
 def verify_streams_fence_if_present(streams_dir: Path, perms: OutboxPermissionsPort) -> None:
-    """Reject links or unsupported future version fences on ``streams`` before any write."""
+    """Reject links or unsupported future version fences on ``streams`` and sweep fence staging files."""
     if not os.path.lexists(streams_dir):
         return
     if is_link_path(streams_dir):
@@ -420,9 +425,14 @@ def verify_streams_fence_if_present(streams_dir: Path, perms: OutboxPermissionsP
     if not stat.S_ISDIR(os.lstat(streams_dir).st_mode):
         raise BrainError(ErrorCode.INTEGRITY_FAILURE, "streams entry is not a directory")
     verify_owner_only(streams_dir, perms)
-    fence = streams_dir / _V4_FENCE_FILE
-    if os.path.lexists(fence):
-        verify_v4_fence_file(fence, perms)
+    with os.scandir(streams_dir) as it:
+        for entry in it:
+            if entry.name == _V4_FENCE_FILE:
+                verify_v4_fence_file(Path(entry.path), perms)
+            elif is_v4_fence_part_name(entry.name):
+                if entry_is_link(entry):
+                    raise BrainError(ErrorCode.UNSAFE_PATH, "streams version fence staging file is a link")
+                Path(entry.path).unlink(missing_ok=True)
 
 
 def ensure_v4_fence(

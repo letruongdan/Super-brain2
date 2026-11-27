@@ -48,6 +48,7 @@ from superbrain.storage._outbox_io import (
     ensure_secure_regular_file_atomic,
     entry_is_link,
     is_link_path,
+    is_v4_fence_part_name,
     parse_frame_filename_identity,
     parse_frame_order,
     parse_verified_outbox_frame,
@@ -73,6 +74,7 @@ from superbrain.storage._outbox_seq import (
     prepare_hook_binding_upsert,
     reconcile_matched_hook_frame_cursor,
     resolve_hook_envelope_slot,
+    verify_stream_cursor_integrity,
 )
 from superbrain.storage._outbox_seq import write_stream_cursor as write_stream_cursor
 
@@ -279,6 +281,9 @@ class OutboxSpool:
                 if sd_entry.name == _V4_FENCE_FILE:
                     verify_v4_fence_file(Path(sd_entry.path), perms)
                     continue
+                if is_v4_fence_part_name(sd_entry.name):
+                    Path(sd_entry.path).unlink(missing_ok=True)
+                    continue
                 if sd_entry.name.startswith(".") and ".init-" in sd_entry.name:
                     continue
                 if not stat.S_ISDIR(sd_entry.stat(follow_symlinks=False).st_mode):
@@ -335,16 +340,21 @@ class OutboxSpool:
                     found.append(Path(entry.path))
         return found
 
-    def _iter_frame_paths(self, *, producer_stream: str | None = None) -> list[Path]:
+    def _iter_frame_paths(
+        self, *, producer_stream: str | None = None, verify_cursor: bool = True
+    ) -> list[Path]:
+        perms = self._resolve_permissions()
         streams_root = self._root / _STREAMS_DIR
         if not os.path.lexists(streams_root):
             return []
-        if is_link_path(streams_root):
-            raise BrainError(ErrorCode.UNSAFE_PATH, "streams directory is a link")
-        verify_owner_only(streams_root, self._resolve_permissions())
+        verify_streams_fence_if_present(streams_root, perms)
         if producer_stream is not None:
             sdir = streams_root / stream_dir_key(producer_stream)
-            paths = self._collect_regular_frames(sdir) if os.path.lexists(sdir) else []
+            if not os.path.lexists(sdir):
+                return []
+            if verify_cursor:
+                verify_stream_cursor_integrity(sdir, perms)
+            paths = self._collect_regular_frames(sdir)
         else:
             paths = []
             with os.scandir(streams_root) as it:
@@ -352,10 +362,16 @@ class OutboxSpool:
                     if entry_is_link(sd_entry):
                         raise BrainError(ErrorCode.UNSAFE_PATH, "stream directory is a link")
                     if sd_entry.name == _V4_FENCE_FILE:
-                        verify_v4_fence_file(Path(sd_entry.path), self._resolve_permissions())
+                        verify_v4_fence_file(Path(sd_entry.path), perms)
+                        continue
+                    if is_v4_fence_part_name(sd_entry.name):
+                        Path(sd_entry.path).unlink(missing_ok=True)
                         continue
                     if stat.S_ISDIR(sd_entry.stat(follow_symlinks=False).st_mode):
-                        paths.extend(self._collect_regular_frames(Path(sd_entry.path)))
+                        sdir_path = Path(sd_entry.path)
+                        if verify_cursor:
+                            verify_stream_cursor_integrity(sdir_path, perms)
+                        paths.extend(self._collect_regular_frames(sdir_path))
         paths.sort(key=parse_frame_order)
         return paths
 
@@ -563,7 +579,7 @@ class OutboxSpool:
                 sdir, ack, perms, renamer=default_outbox_dir_renamer(), check_deadline=dl_check
             )
             evicted = 0
-            for path in self._iter_frame_paths(producer_stream=ack.producer_stream):
+            for path in self._iter_frame_paths(producer_stream=ack.producer_stream, verify_cursor=False):
                 parsed = parse_frame_filename_identity(path.name)
                 if parsed is not None and not ack.allows_eviction(parsed[0], parsed[1]):
                     continue

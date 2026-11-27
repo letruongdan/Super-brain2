@@ -418,6 +418,8 @@ def write_ack_pages(
             os.fsync(fd)
             os.close(fd)
             fd = -1
+            if check_deadline is not None:
+                check_deadline()
             replace_file_resilient(tmp_path, final_path)
             committed = True
         except BrainError:

@@ -329,6 +329,21 @@ def _commit_v4_pages_and_cursor(
         prune_unreferenced_ack_pages(stream_dir, new_cursor.acked_page_refs, perms)
 
 
+def _preview_recovered_cursor(cursor: StreamSeqCursor) -> tuple[StreamSeqCursor, dict[tuple[int, str], bytes]]:
+    contig, pages, page_refs, dirty = compute_updated_acks(
+        contiguous_acked_through=cursor.contiguous_acked_through, existing_pages=cursor.acked_pages,
+        existing_refs=dict(cursor.acked_page_refs), extra_ranges=cursor.legacy_acked_ranges,
+    )
+    target_v4 = cursor.schema_v4 or bool(pages) or bool(cursor.legacy_acked_ranges)
+    est_count = cursor.binding_count + len(cursor.legacy_recent) + (1 if cursor.pending_binding else 0)
+    preview = StreamSeqCursor(
+        next_seq=cursor.next_seq, binding_count=est_count, contiguous_acked_through=contig,
+        acked_pages=pages, acked_page_refs=page_refs, schema_v4=target_v4,
+    )
+    _serialize_cursor_bytes(preview)
+    return preview, dirty
+
+
 def recover_stream_cursor(
     stream_dir: Path,
     cursor: StreamSeqCursor,
@@ -340,20 +355,7 @@ def recover_stream_cursor(
     """Validate capacity pre-mutation, flush bindings and ACK pages, then commit cursor."""
     if not _needs_cursor_recovery(cursor):
         return cursor
-    contig, pages, page_refs, dirty = compute_updated_acks(
-        contiguous_acked_through=cursor.contiguous_acked_through,
-        existing_pages=cursor.acked_pages,
-        existing_refs=dict(cursor.acked_page_refs),
-        extra_ranges=cursor.legacy_acked_ranges,
-    )
-    target_v4 = cursor.schema_v4 or bool(pages) or bool(cursor.legacy_acked_ranges)
-    est_count = cursor.binding_count + len(cursor.legacy_recent) + (1 if cursor.pending_binding else 0)
-    _serialize_cursor_bytes(
-        StreamSeqCursor(
-            next_seq=cursor.next_seq, binding_count=est_count, contiguous_acked_through=contig,
-            acked_pages=pages, acked_page_refs=page_refs, schema_v4=target_v4,
-        )
-    )
+    preview, dirty = _preview_recovered_cursor(cursor)
     if cursor.legacy_recent or cursor.pending_binding is not None:
         for item in cursor.legacy_recent:
             upsert_binding(stream_dir, item, perms, renamer=renamer, check_deadline=check_deadline)
@@ -362,10 +364,7 @@ def recover_stream_cursor(
         count = count_all_bindings(stream_dir, perms)
     else:
         count = cursor.binding_count
-    recovered = StreamSeqCursor(
-        next_seq=cursor.next_seq, binding_count=count, contiguous_acked_through=contig,
-        acked_pages=pages, acked_page_refs=page_refs, schema_v4=target_v4,
-    )
+    recovered = preview.with_binding_state(binding_count=count, pending_binding=None)
     _commit_v4_pages_and_cursor(
         stream_dir, prior_refs=cursor.acked_page_refs, new_cursor=recovered, dirty_payloads=dirty,
         perms=perms, renamer=renamer, check_deadline=check_deadline,
@@ -413,13 +412,15 @@ def _apply_ack_update(
     return acked, dirty
 
 
+def verify_stream_cursor_integrity(stream_dir: Path, perms: OutboxPermissionsPort) -> None:
+    """Validate existing cursor and pinned ``.acks`` pages (or reject orphan ``.acks``) read-only."""
+    if cursor_exists(stream_dir) or os.path.lexists(stream_dir / _ACKS_DIR):
+        read_stream_cursor(stream_dir, perms)
+
+
 def persist_cursor_ack(
-    stream_dir: Path,
-    ack: CaptureBatchAck,
-    perms: OutboxPermissionsPort,
-    *,
-    renamer: OutboxDirRenamer | None = None,
-    check_deadline: Callable[[], None] | None = None,
+    stream_dir: Path, ack: CaptureBatchAck, perms: OutboxPermissionsPort,
+    *, renamer: OutboxDirRenamer | None = None, check_deadline: Callable[[], None] | None = None,
 ) -> None:
     """Flush pending/legacy state and persist authenticated ACK pages before cursor bump & frame unlink."""
     if not verify_stream_dir_safe(stream_dir, perms):
@@ -431,6 +432,9 @@ def persist_cursor_ack(
     ren = renamer if renamer is not None else default_outbox_dir_renamer()
     cur = read_stream_cursor(stream_dir, perms)
     if _needs_cursor_recovery(cur):
+        preview, _ = _preview_recovered_cursor(cur)
+        acked_pre, _ = _apply_ack_update(preview, ack)
+        _serialize_cursor_bytes(acked_pre)
         cur = recover_stream_cursor(stream_dir, cur, perms, renamer=ren, check_deadline=check_deadline)
     acked, dirty = _apply_ack_update(cur, ack)
     if acked != cur:
@@ -441,12 +445,8 @@ def persist_cursor_ack(
 
 
 def prepare_cursor_for_direct_enqueue(
-    stream_dir: Path,
-    sequence: int,
-    perms: OutboxPermissionsPort,
-    *,
-    renamer: OutboxDirRenamer | None = None,
-    check_deadline: Callable[[], None] | None = None,
+    stream_dir: Path, sequence: int, perms: OutboxPermissionsPort,
+    *, renamer: OutboxDirRenamer | None = None, check_deadline: Callable[[], None] | None = None,
 ) -> StreamSeqCursor | None:
     """Fence/recover stream cursor and pre-check capacity BEFORE publishing a direct frame."""
     if not verify_stream_dir_safe(stream_dir, perms):
@@ -458,6 +458,8 @@ def prepare_cursor_for_direct_enqueue(
     ren = renamer if renamer is not None else default_outbox_dir_renamer()
     cur = read_stream_cursor(stream_dir, perms)
     if _needs_cursor_recovery(cur):
+        preview, _ = _preview_recovered_cursor(cur)
+        _serialize_cursor_bytes(preview.bump_next_seq(sequence))
         cur = recover_stream_cursor(stream_dir, cur, perms, renamer=ren, check_deadline=check_deadline)
     _serialize_cursor_bytes(cur.bump_next_seq(sequence))
     return cur
@@ -534,16 +536,9 @@ def load_or_recover_hook_cursor(
 
 
 def reconcile_matched_hook_frame_cursor(
-    stream_dir: Path,
-    cursor: StreamSeqCursor,
-    *,
-    dedup_key: str | None,
-    cached: HookBindingRecord | None,
-    record: CaptureEventRecord,
-    payload_digest: str,
-    perms: OutboxPermissionsPort,
-    renamer: OutboxDirRenamer | None,
-    check_deadline: Callable[[], None] | None,
+    stream_dir: Path, cursor: StreamSeqCursor, *, dedup_key: str | None,
+    cached: HookBindingRecord | None, record: CaptureEventRecord, payload_digest: str,
+    perms: OutboxPermissionsPort, renamer: OutboxDirRenamer | None, check_deadline: Callable[[], None] | None,
 ) -> None:
     """Ensure sharded binding and cursor ``next_seq`` reflect a pre-existing matched frame."""
     if dedup_key is not None and cached is None:
