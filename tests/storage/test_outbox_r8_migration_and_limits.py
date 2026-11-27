@@ -285,9 +285,11 @@ def test_r8_finding2_interrupted_migration_and_frame_reconcile_preserve_binding_
 
     with monkeypatch.context() as mp:
         mp.setattr(_outbox_seq, "upsert_binding", _fail_4th_upsert)
-        with pytest.raises(BrainError) as mig_err:
-            _enqueue_hook(spool_a, stream=stream_a, dk=keys_a[0], note="m1")
-        assert mig_err.value.code is ErrorCode.DEADLINE_EXCEEDED
+        # The event is already acknowledged: a deadline in recovery upkeep is deferred to the next recovery and never
+        # reported as a failure the hook would record as a lost event (owner decision 2026-11-27, R11-4 / SR-1).
+        deferred_a1 = _enqueue_hook(spool_a, stream=stream_a, dk=keys_a[0], note="m1")
+        assert (deferred_a1.event_id, deferred_a1.sequence) == (evs_a[0].event_id, 1)
+        assert calls[0] >= 4
 
     assert json.loads(cursor_path_a.read_text(encoding="utf-8"))["schema_version"] == 2
 
@@ -320,16 +322,16 @@ def test_r8_finding2_interrupted_migration_and_frame_reconcile_preserve_binding_
     with monkeypatch.context() as mp:
         mp.setattr(_outbox_seq, "write_stream_cursor", _crash_post_bucket)
         mp.setattr(outbox_mod, "write_stream_cursor", _crash_post_bucket)
-        with pytest.raises(BrainError) as rec_err:
-            _enqueue_hook(
-                spool_b,
-                stream=stream_b,
-                dk=dk_b1,
-                note="rec1",
-                explicit_seq=1,
-                explicit_ev_id=ev_b1.event_id,
-            )
-        assert rec_err.value.code is ErrorCode.DEADLINE_EXCEEDED
+        # The frame is already published: the upkeep stop is deferred, not reported (R11-4 / SR-1).
+        deferred_b1 = _enqueue_hook(
+            spool_b,
+            stream=stream_b,
+            dk=dk_b1,
+            note="rec1",
+            explicit_seq=1,
+            explicit_ev_id=ev_b1.event_id,
+        )
+        assert (deferred_b1.event_id, deferred_b1.sequence) == (ev_b1.event_id, 1)
 
     spool_b_re: OutboxSpool = cast(Any, OutboxSpool)(outbox_b, permissions=perms, max_binding_keys=1)
     rb1 = _enqueue_hook(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import stat
 import time
@@ -33,8 +34,9 @@ from superbrain.storage._outbox_bindings import (
     _BINDINGS_DIR,
     DEFAULT_MAX_STREAM_BINDING_KEYS,
     _verify_bindings_dir_node,
-    backfill_binding_digest_if_missing,
+    bucket_name_for_key,
     prepare_hook_binding_upsert,
+    project_recovered_buckets,
     verify_bindings_dir,
     write_prepared_binding_bucket,
 )
@@ -46,9 +48,9 @@ from superbrain.storage._outbox_seq import (
     preflight_hook_cursor_size,
     prepare_cursor_for_direct_enqueue,
     read_hook_cursor_readonly,
-    reconcile_matched_hook_frame_cursor,
     recover_stream_cursor,
     resolve_hook_envelope_slot,
+    settle_published_hook_frame,
     verify_stream_cursor_integrity,
 )
 from superbrain.storage._outbox_seq import (
@@ -137,12 +139,15 @@ class OutboxSpool:
             fd = os.open(lock_path, os.O_RDWR | _io._O_BINARY | _io._O_NOFOLLOW)
             locked = False
             dl_tok = _io.push_deadline_check(dl_check)
+            rem_tok = _io.push_deadline_remaining(
+                (lambda: deadline_ns - int(self._monotonic_ns())) if deadline_ns is not None else None)
             try:
                 locked = self._acquire_file_lock(fd, adapter=adapter, deadline_ns=deadline_ns)
                 if sweep:
                     self._scan_outbox(deadline_ns=deadline_ns)
                 yield
             finally:
+                _io.reset_deadline_remaining(rem_tok)
                 _io.reset_deadline_check(dl_tok)
                 try:
                     if locked:
@@ -192,7 +197,7 @@ class OutboxSpool:
                     verify_acks_dir(sdir, perms) if sweep else _verify_acks_dir_node(sdir, perms)
                     continue
                 if name.endswith(_io._PART_SUFFIX):
-                    Path(fe.path).unlink(missing_ok=True)
+                    _io.unlink_before_deadline(Path(fe.path))
                     continue
                 if name.endswith(_io._FRAME_SUFFIX):
                     st = fe.stat(follow_symlinks=False)
@@ -240,7 +245,7 @@ class OutboxSpool:
                     raise BrainError(ErrorCode.UNSAFE_PATH, "symlink detected in outbox")
                 rname = re_entry.name
                 if rname.endswith(_io._PART_SUFFIX):
-                    Path(re_entry.path).unlink(missing_ok=True)
+                    _io.unlink_before_deadline(Path(re_entry.path))
                 elif rname == _io._STREAMS_DIR:
                     st_r = re_entry.stat(follow_symlinks=False)
                     if not stat.S_ISDIR(st_r.st_mode):
@@ -261,7 +266,7 @@ class OutboxSpool:
                     _io.verify_v4_fence_file(Path(sd_entry.path), perms)
                     continue
                 if _io.is_v4_fence_part_name(sd_entry.name):
-                    Path(sd_entry.path).unlink(missing_ok=True)
+                    _io.unlink_before_deadline(Path(sd_entry.path))
                     continue
                 if sd_entry.name.startswith(".") and ".init-" in sd_entry.name:
                     continue
@@ -344,7 +349,7 @@ class OutboxSpool:
                         _io.verify_v4_fence_file(Path(sd_entry.path), perms)
                         continue
                     if _io.is_v4_fence_part_name(sd_entry.name):
-                        Path(sd_entry.path).unlink(missing_ok=True)
+                        _io.unlink_before_deadline(Path(sd_entry.path))
                         continue
                     if stat.S_ISDIR(sd_entry.stat(follow_symlinks=False).st_mode):
                         sdir_path = Path(sd_entry.path)
@@ -426,7 +431,8 @@ class OutboxSpool:
                 sdir / f"{base}{_io._FRAME_SUFFIX}", sdir / f"{base}{_io._PART_SUFFIX}", frame_bytes,
                 crashpoint_name="capture.outbox.after_write_before_fsync", deadline_ns=deadline_ns,
             )
-            commit_bumped_cursor(sdir, preflight_cur, sequence, perms)
+            with contextlib.suppress(BrainError):  # frame is published; the next recovery repairs the cursor
+                commit_bumped_cursor(sdir, preflight_cur, sequence, perms)
             return entry_id
 
     def enqueue_event(self, record: CaptureEventRecord, *, deadline_ns: int | None = None) -> str:
@@ -483,20 +489,19 @@ class OutboxSpool:
                 existing = self._decode_frame_file(matched_path)
                 if existing.entry_id != record.event_id or existing.payload_digest != payload_digest:
                     raise BrainError(ErrorCode.IDEMPOTENCY_CONFLICT, "idempotency conflict")
-                cursor = recover_stream_cursor(sdir, raw_cur, perms, renamer=renamer, check_deadline=dl_check)
-                reconcile_matched_hook_frame_cursor(sdir, cursor, dedup_key=dedup_key, cached=cached, record=record,
-                    payload_digest=payload_digest, perms=perms, renamer=renamer, check_deadline=dl_check)
-                return record
-            if cached is not None and preview_cur.is_event_acked(record.sequence):
-                recover_stream_cursor(sdir, raw_cur, perms, renamer=renamer, check_deadline=dl_check)
-                backfill_binding_digest_if_missing(sdir, cached, payload_digest, perms,
-                    renamer=renamer, check_deadline=dl_check)
+            if matched_path is not None or (cached is not None and preview_cur.is_event_acked(record.sequence)):
+                settle_published_hook_frame(sdir, raw_cur, matched=matched_path is not None, dedup_key=dedup_key,
+                    cached=cached, record=record, payload_digest=payload_digest, perms=perms, renamer=renamer,
+                    check_deadline=dl_check)
                 return record
             if used + len(frame_bytes) > self._max_bytes:
                 raise BrainError(ErrorCode.STORAGE_FULL, "storage full")
+            pending = (*raw_cur.legacy_recent, *((raw_cur.pending_binding,) if raw_cur.pending_binding else ()))
+            projected = project_recovered_buckets(sdir, pending, perms)
+            target = projected.get(bucket_name_for_key(dedup_key)) if dedup_key is not None else None
             prepared = prepare_hook_binding_upsert(
                 sdir, dedup_key=dedup_key, record=record, payload_digest=payload_digest,
-                perms=perms, preloaded_entries=bucket_entries,
+                perms=perms, preloaded_entries=target if target is not None else bucket_entries,
             )
             preflight_hook_cursor_size(sdir, preview_cur, sequence=record.sequence, prepared=prepared)
             cursor = recover_stream_cursor(sdir, raw_cur, perms, renamer=renamer, check_deadline=dl_check)
@@ -522,7 +527,8 @@ class OutboxSpool:
             )
             pub_c = cursor.with_binding_state(pending_binding=None)
             if pub_c != cursor:
-                write_stream_cursor(sdir, pub_c, perms)
+                with contextlib.suppress(BrainError):  # frame is published; recovery clears pending_binding
+                    write_stream_cursor(sdir, pub_c, perms)
             return record
 
     def enqueue_gap(self, gap: ProducerCaptureGap, *, deadline_ns: int | None = None) -> str:

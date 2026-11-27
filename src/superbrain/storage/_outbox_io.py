@@ -9,11 +9,9 @@ import os
 import shutil
 import stat
 import threading
-import time
 import uuid
 import zlib
 from collections.abc import Callable
-from contextvars import ContextVar, Token
 from pathlib import Path
 
 from superbrain.core._kernel_base import require_sha256_digest
@@ -25,8 +23,18 @@ from superbrain.ports.capture import (
     OutboxDirRenamer,
     OutboxEntry,
     OutboxPermissionsPort,
-    default_outbox_dir_sync,
 )
+from superbrain.storage._outbox_durable import (
+    _ACTIVE_DEADLINE_CHECK as _ACTIVE_DEADLINE_CHECK,
+)
+from superbrain.storage._outbox_durable import active_deadline_check as active_deadline_check
+from superbrain.storage._outbox_durable import push_deadline_check as push_deadline_check
+from superbrain.storage._outbox_durable import push_deadline_remaining as push_deadline_remaining
+from superbrain.storage._outbox_durable import replace_file_resilient as replace_file_resilient
+from superbrain.storage._outbox_durable import reset_deadline_check as reset_deadline_check
+from superbrain.storage._outbox_durable import reset_deadline_remaining as reset_deadline_remaining
+from superbrain.storage._outbox_durable import sync_dir as sync_dir
+from superbrain.storage._outbox_durable import unlink_before_deadline as unlink_before_deadline
 
 _REPARSE_POINT = 0x400
 _PART_SUFFIX = ".part"
@@ -37,27 +45,9 @@ _LOCK_FILE = ".spool.lock"
 _PROCESS_LOCKS_GUARD = threading.Lock()
 _PROCESS_LOCKS: dict[str, threading.RLock] = {}
 _ENOSPC_WINERROR = 112
-_BUSY_REPLACE_WINERRORS = frozenset({5, 32})
-_BUSY_REPLACE_DELAYS = (0.01, 0.02, 0.05, 0.1, 0.2)
 _O_BINARY = getattr(os, "O_BINARY", 0)
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _ORIG_PATH_IS_SYMLINK = Path.is_symlink
-_ACTIVE_DEADLINE_CHECK: ContextVar[Callable[[], None] | None] = ContextVar("_outbox_deadline_check", default=None)
-
-
-def push_deadline_check(fn: Callable[[], None] | None) -> Token[Callable[[], None] | None]:
-    """Bind active deadline callback for locked outbox I/O retries and replace operations."""
-    return _ACTIVE_DEADLINE_CHECK.set(fn)
-
-
-def reset_deadline_check(tok: Token[Callable[[], None] | None]) -> None:
-    """Restore prior deadline callback on lock exit."""
-    _ACTIVE_DEADLINE_CHECK.reset(tok)
-
-
-def active_deadline_check() -> Callable[[], None] | None:
-    """Return active bound deadline callback, if any."""
-    return _ACTIVE_DEADLINE_CHECK.get()
 
 
 def thread_lock_for(path: Path) -> threading.RLock:
@@ -170,36 +160,10 @@ def parse_frame_filename_identity(name: str) -> tuple[str, int] | None:
     return (kind_part, seq)
 
 
-def replace_file_resilient(src: Path, dst: Path) -> None:
-    """Replace ``dst`` with ``src``, enforcing active deadline before attempt and before each busy retry."""
-    for delay in (*_BUSY_REPLACE_DELAYS, None):
-        dl = _ACTIVE_DEADLINE_CHECK.get()
-        if dl is not None:
-            dl()
-        try:
-            os.replace(src, dst)
-            return
-        except OSError as err:
-            if delay is None or getattr(err, "winerror", None) not in _BUSY_REPLACE_WINERRORS:
-                raise
-            time.sleep(delay)
 
 
-def sync_dir(directory: Path) -> None:
-    registered = default_outbox_dir_sync()
-    if registered is not None:
-        registered(directory)
-        return
-    try:
-        fd = os.open(directory, os.O_RDONLY)
-    except OSError:
-        return
-    try:
-        os.fsync(fd)
-    except OSError:
-        pass
-    finally:
-        os.close(fd)
+
+
 
 
 def write_all_fd(fd: int, data: bytes) -> None:
@@ -452,7 +416,7 @@ def verify_streams_fence_if_present(streams_dir: Path, perms: OutboxPermissionsP
             elif is_v4_fence_part_name(entry.name):
                 if entry_is_link(entry):
                     raise BrainError(ErrorCode.UNSAFE_PATH, "streams version fence staging file is a link")
-                Path(entry.path).unlink(missing_ok=True)
+                unlink_before_deadline(Path(entry.path))
 
 
 def ensure_v4_fence(

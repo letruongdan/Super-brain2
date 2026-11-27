@@ -6,7 +6,7 @@ import json
 import os
 import stat
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -30,6 +30,7 @@ from superbrain.storage._outbox_io import (
     is_link_path,
     replace_file_resilient,
     sync_dir,
+    unlink_before_deadline,
     verify_owner_only,
     write_all_fd,
 )
@@ -82,7 +83,7 @@ def verify_bindings_dir(stream_dir: Path, perms: OutboxPermissionsPort) -> Path 
             if entry_is_link(entry):
                 raise BrainError(ErrorCode.UNSAFE_PATH, "binding bucket is a link")
             if entry.name.endswith(_PART_SUFFIX):
-                Path(entry.path).unlink(missing_ok=True)
+                unlink_before_deadline(Path(entry.path))
     return bdir
 
 
@@ -183,6 +184,48 @@ def lookup_binding_with_bucket(
     return entries.get(dedup_key), bucket, entries
 
 
+def _merge_binding(entries: dict[str, HookBindingRecord], binding: HookBindingRecord) -> tuple[bool, bool]:
+    """Apply upsert semantics in memory and return ``(changed, added)``; a conflicting slot raises."""
+    existing = entries.get(binding.key)
+    if existing is None:
+        entries[binding.key] = binding
+        return True, True
+    if existing.sequence != binding.sequence or existing.event_id != binding.event_id:
+        raise BrainError(ErrorCode.IDEMPOTENCY_CONFLICT, "idempotency conflict")
+    if None not in (existing.payload_digest, binding.payload_digest) and (
+        existing.payload_digest != binding.payload_digest
+    ):
+        raise BrainError(ErrorCode.IDEMPOTENCY_CONFLICT, "idempotency conflict")
+    if existing.payload_digest is None and binding.payload_digest is not None:
+        entries[binding.key] = HookBindingRecord(
+            existing.key, existing.sequence, existing.event_id, existing.recorded_at, binding.payload_digest
+        )
+        return True, False
+    return False, False
+
+
+def _serialize_bucket(entries: dict[str, HookBindingRecord]) -> bytes:
+    rows = [[e.key, e.sequence, e.event_id, e.recorded_at, e.payload_digest] for _k, e in sorted(entries.items())]
+    payload = canonical_json({"schema_version": _BINDINGS_SCHEMA_VERSION, "entries": rows})
+    if len(payload) > _MAX_BUCKET_BYTES:
+        raise BrainError(ErrorCode.STORAGE_FULL, "hook dedup binding bucket full")
+    return payload
+
+
+def project_recovered_buckets(
+    stream_dir: Path, items: Sequence[HookBindingRecord], perms: OutboxPermissionsPort
+) -> dict[str, dict[str, HookBindingRecord]]:
+    """Read-only: each bucket as recovery will publish it after flushing ``items`` in order (size-checked)."""
+    projected: dict[str, dict[str, HookBindingRecord]] = {}
+    for item in items:
+        name = bucket_name_for_key(item.key)
+        if name not in projected:
+            projected[name] = read_binding_bucket(stream_dir, name, perms)
+        if _merge_binding(projected[name], item)[0]:
+            _serialize_bucket(projected[name])
+    return projected
+
+
 def prepare_binding_upsert(
     stream_dir: Path,
     binding: HookBindingRecord,
@@ -197,33 +240,8 @@ def prepare_binding_upsert(
         if preloaded_entries is not None
         else read_binding_bucket(stream_dir, bucket_name, perms)
     )
-    existing = entries.get(binding.key)
-    added = existing is None
-    if existing is not None:
-        if existing.sequence != binding.sequence or existing.event_id != binding.event_id:
-            raise BrainError(ErrorCode.IDEMPOTENCY_CONFLICT, "idempotency conflict")
-        if (
-            existing.payload_digest is not None
-            and binding.payload_digest is not None
-            and existing.payload_digest != binding.payload_digest
-        ):
-            raise BrainError(ErrorCode.IDEMPOTENCY_CONFLICT, "idempotency conflict")
-        if not (existing.payload_digest is None and binding.payload_digest is not None):
-            return bucket_name, None, False
-        entries[binding.key] = HookBindingRecord(
-            existing.key, existing.sequence, existing.event_id, existing.recorded_at, binding.payload_digest
-        )
-    else:
-        entries[binding.key] = binding
-
-    sorted_rows = [
-        [entries[k].key, entries[k].sequence, entries[k].event_id, entries[k].recorded_at, entries[k].payload_digest]
-        for k in sorted(entries)
-    ]
-    payload = canonical_json({"schema_version": _BINDINGS_SCHEMA_VERSION, "entries": sorted_rows})
-    if len(payload) > _MAX_BUCKET_BYTES:
-        raise BrainError(ErrorCode.STORAGE_FULL, "hook dedup binding bucket full")
-    return bucket_name, payload, added
+    changed, added = _merge_binding(entries, binding)
+    return bucket_name, (_serialize_bucket(entries) if changed else None), added
 
 
 def write_prepared_binding_bucket(

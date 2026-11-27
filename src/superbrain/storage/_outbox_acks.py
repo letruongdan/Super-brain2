@@ -22,6 +22,7 @@ from superbrain.storage._outbox_io import (
     is_link_path,
     replace_file_resilient,
     sync_dir,
+    unlink_before_deadline,
     verify_owner_only,
     write_all_fd,
 )
@@ -83,7 +84,7 @@ def verify_acks_dir(stream_dir: Path, perms: OutboxPermissionsPort) -> Path | No
             if entry_is_link(entry):
                 raise BrainError(ErrorCode.UNSAFE_PATH, "ack page is a link")
             if entry.name.endswith(_PART_SUFFIX):
-                Path(entry.path).unlink(missing_ok=True)
+                unlink_before_deadline(Path(entry.path))
                 continue
             if _parse_ack_page_filename(entry.name) is None:
                 raise BrainError(ErrorCode.INTEGRITY_FAILURE, "unexpected entry in acks directory")
@@ -364,6 +365,7 @@ def prune_unreferenced_ack_pages(
     stream_dir: Path,
     keep_refs: Iterable[tuple[int, str]],
     perms: OutboxPermissionsPort,
+    check_deadline: Callable[[], None] | None = None,
 ) -> None:
     """Remove any ``.acks`` page files not referenced by ``keep_refs``."""
     keep_names = {ack_page_filename(page, hex64) for page, hex64 in keep_refs}
@@ -378,7 +380,7 @@ def prune_unreferenced_ack_pages(
             if entry.name.endswith(_PART_SUFFIX) or (
                 _parse_ack_page_filename(entry.name) is not None and entry.name not in keep_names
             ):
-                Path(entry.path).unlink(missing_ok=True)
+                unlink_before_deadline(Path(entry.path), check_deadline)
                 removed = True
     if removed:
         sync_dir(adir)

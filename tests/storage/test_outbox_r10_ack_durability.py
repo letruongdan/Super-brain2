@@ -792,3 +792,404 @@ def test_r10_f14_hook_binding_cap_and_byte_cap_preflight_before_recovery(
 
     retried = _enqueue_hook(spool, stream=stream, dk=digest_bytes(b"r10-f14-k1"), explicit_seq=1)
     assert retried.sequence == 1
+
+
+# --- R11 regressions (Codex review sp2-5-remediation-r11) ------------------------------------------------------
+
+
+def _same_bucket_keys(tag: str) -> tuple[str, str]:
+    seen: dict[str, str] = {}
+    for i in range(4096):
+        key = digest_bytes(f"{tag}-{i}".encode())
+        bucket = key[7:9]
+        if bucket in seen:
+            return seen[bucket], key
+        seen[bucket] = key
+    raise AssertionError("no two keys share a bucket")
+
+
+def _bucket_keys(sdir: Path, key: str) -> set[str]:
+    path = sdir / ".bindings" / f"{key[7:9]}.json"
+    if not path.exists():
+        return set()
+    return {row[0] for row in json.loads(path.read_text(encoding="utf-8"))["entries"]}
+
+
+def test_r10_f15_recovered_pending_binding_survives_new_key_in_same_bucket(trusted_tmp: Path) -> None:
+    """R11-1: a bucket published after recovery keeps every committed binding and matches ``binding_count``."""
+    perms = os_adapters().permissions
+    outbox, stream = trusted_tmp / "outbox-r11-f15", "stream-r11-f15"
+    spool = cast(Any, OutboxSpool)(outbox, permissions=perms, max_binding_keys=2)
+    k1, k2 = _same_bucket_keys("r11-f15")
+
+    def _fail_bucket(*_a: Any, **_kw: Any) -> None:
+        raise BrainError(ErrorCode.IO_ERROR, "simulated crash before bucket write")
+
+    outbox_mod = sys.modules["superbrain.storage.outbox"]
+    orig_write = outbox_mod.write_prepared_binding_bucket
+    outbox_mod.write_prepared_binding_bucket = _fail_bucket
+    try:
+        with pytest.raises(BrainError) as err_k1:
+            _enqueue_hook(spool, stream=stream, dk=k1, note="k1", explicit_seq=1)
+        assert err_k1.value.code is ErrorCode.IO_ERROR
+    finally:
+        outbox_mod.write_prepared_binding_bucket = orig_write
+    sdir = _stream_dir(outbox, stream)
+    assert json.loads((sdir / ".seq_cursor.json").read_text(encoding="utf-8"))["pending_binding"][0] == k1
+
+    rec_k2 = _enqueue_hook(spool, stream=stream, dk=k2, note="k2")
+    assert rec_k2.sequence == 2
+    assert _bucket_keys(sdir, k1) == {k1, k2}
+    cursor = json.loads((sdir / ".seq_cursor.json").read_text(encoding="utf-8"))
+    assert cursor["binding_count"] == 2
+    assert cursor["pending_binding"] is None
+
+    retried = _enqueue_hook(spool, stream=stream, dk=k1, note="k1", explicit_seq=1)
+    assert retried.sequence == 1
+    assert _bucket_keys(sdir, k1) == {k1, k2}
+
+
+def _has_v4_artifact(outbox: Path) -> bool:
+    streams = outbox / _STREAMS_DIR
+    if (streams / ".v4_fence").exists():
+        return True
+    for cur in streams.glob("*/.seq_cursor.json"):
+        if json.loads(cur.read_text(encoding="utf-8")).get("schema_version") == 4:
+            return True
+    return any(streams.glob("*/.acks/*.json"))
+
+
+def _legacy_probe_script(legacy_src: Path, cases: list[tuple[str, str, str]]) -> str:
+    return (
+        "import json, sys\n"
+        "from pathlib import Path\n"
+        f"sys.path.insert(0, {str(legacy_src)!r})\n"
+        "from superbrain.adapters.os import os_adapters\n"
+        "from superbrain.core.canonical import digest_bytes\n"
+        "from superbrain.core.errors import BrainError\n"
+        "from superbrain.ports.capture import CaptureBatchAck, CaptureEventRecord, ProducerCaptureGap\n"
+        "from superbrain.storage.outbox import OutboxSpool\n"
+        f"cases = {cases!r}\n"
+        "out = {}\n"
+        "def ev(stream, seq, eid):\n"
+        "    return CaptureEventRecord(event_id=eid, producer_stream=stream, sequence=seq, harness_id='claude-code',\n"
+        f"        kind='command_result', recorded_at={_REC_AT!r}, payload={{'n': 'legacy'}})\n"
+        "def ack(stream):\n"
+        "    return CaptureBatchAck(producer_stream=stream, repo_id='r', checkout_id='c',\n"
+        "        committed_event_sequences=(1,), contiguous_event_acked_through=0, acked_producer_gap_sequences=(),\n"
+        "        accepted_count=1, deduped_count=0, policy_disabled=False)\n"
+        "for root, sa, sb in cases:\n"
+        "    spool = OutboxSpool(Path(root), permissions=os_adapters().permissions)\n"
+        "    ops = {\n"
+        "        'apply_ack_a': lambda: spool.apply_ack(ack(sa)),\n"
+        "        'apply_ack_b': lambda: spool.apply_ack(ack(sb)),\n"
+        "        'hook_b': lambda: spool.enqueue_hook_event(producer_stream=sb,\n"
+        "            build_event=lambda s, e, r: ev(sb, s, e), dedup_key=digest_bytes(b'legacy-hook-b'),\n"
+        f"            fallback_recorded_at={_REC_AT!r}),\n"
+        "        'hook_a': lambda: spool.enqueue_hook_event(producer_stream=sa,\n"
+        "            build_event=lambda s, e, r: ev(sa, s, e), dedup_key=digest_bytes(b'legacy-hook-a'),\n"
+        f"            fallback_recorded_at={_REC_AT!r}),\n"
+        "        'event_a': lambda: spool.enqueue_event(ev(sa, 9, 'ev-legacy-a9')),\n"
+        "        'gap_b': lambda: spool.enqueue_gap(ProducerCaptureGap(gap_id='gap-legacy-b9', producer_stream=sb,\n"
+        f"            sequence=9, reason='hook_timeout', recorded_at={_REC_AT!r}, estimated_count=1, duration_ms=1)),\n"
+        "    }\n"
+        "    res = {}\n"
+        "    for name, op in ops.items():\n"
+        "        try:\n"
+        "            op()\n"
+        "            res[name] = 'ok'\n"
+        "        except BrainError as err:\n"
+        "            res[name] = 'refused:' + err.code.value\n"
+        "    out[root] = res\n"
+        "print(json.dumps(out))\n"
+    )
+
+
+def _seed_r11_f16_outbox(outbox: Path, stream_a: str, stream_b: str, perms: OutboxPermissionsPort) -> OutboxSpool:
+    spool = OutboxSpool(outbox, permissions=perms)
+    _enqueue_hook(spool, stream=stream_a, dk=digest_bytes(b"r11-f16-a1"), explicit_seq=1)
+    pending_a = [digest_bytes(b"r11-f16-a-pending"), 2, "ev-f16-a2", _REC_AT, digest_bytes(b"payload-f16-a2")]
+    pending_b = [digest_bytes(b"r11-f16-b-pending"), 1, "ev-f16-b1", _REC_AT, digest_bytes(b"payload-f16-b1")]
+    # Sparse acked range + pending binding: the target's own recovery commits v4 directly, so the fence is published
+    # while the target cursor on disk still carries its pending binding.
+    _write_cursor_json(outbox, stream_a, {"schema_version": 3, "next_seq": 4, "binding_count": 1,
+        "acked_ranges": [[3, 3]], "pending_binding": pending_a}, perms)
+    _write_cursor_json(outbox, stream_b, {"schema_version": 3, "next_seq": 2, "binding_count": 0,
+        "acked_ranges": [], "pending_binding": pending_b}, perms)
+    return spool
+
+
+def test_r10_f16_v4_migration_interrupted_at_any_step_never_admits_legacy_writes(
+    trusted_tmp: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R11-2: once any v4 artifact is durable, every legacy 36bf08d9 write path refuses before mutating."""
+    perms = os_adapters().permissions
+    stream_a, stream_b = "stream-r11-f16-a", "stream-r11-f16-b"
+    sdir_names = {stream_dir_key(stream_a)}
+    outbox_io_mod = sys.modules["superbrain.storage._outbox_io"]
+
+    def _boom(*_a: Any, **_kw: Any) -> None:
+        raise BrainError(ErrorCode.IO_ERROR, "simulated interruption")
+
+    orig_recover = _outbox_seq.recover_stream_cursor
+    orig_write_cursor = _outbox_seq.write_stream_cursor
+
+    def _recover_sibling_boom(*args: Any, **kwargs: Any) -> Any:
+        if kwargs.get("skip_fence"):
+            raise BrainError(ErrorCode.IO_ERROR, "simulated interruption in sibling upgrade")
+        return orig_recover(*args, **kwargs)
+
+    def _target_v4_cursor_boom(stream_dir: Path, cursor: Any, p: Any) -> None:
+        if stream_dir.name in sdir_names and cursor.schema_v4:
+            raise BrainError(ErrorCode.IO_ERROR, "simulated interruption at target v4 cursor")
+        orig_write_cursor(stream_dir, cursor, p)
+
+    interrupts: dict[str, tuple[Any, str, Any]] = {
+        "fence": (outbox_io_mod, "ensure_v4_fence", _boom),
+        "sibling": (_outbox_seq, "recover_stream_cursor", _recover_sibling_boom),
+        "pages": (_outbox_acks, "write_ack_pages", _boom),
+        "target_cursor": (_outbox_seq, "write_stream_cursor", _target_v4_cursor_boom),
+    }
+    roots: dict[str, Path] = {}
+    for name, (mod, attr, fake) in interrupts.items():
+        outbox = trusted_tmp / f"outbox-r11-f16-{name}"
+        spool = _seed_r11_f16_outbox(outbox, stream_a, stream_b, perms)
+        with monkeypatch.context() as mp:
+            mp.setattr(mod, attr, fake)
+            with pytest.raises(BrainError):
+                spool.apply_ack(_ack(stream_a, committed=(1, 5_000)))
+        roots[name] = outbox
+    completed = trusted_tmp / "outbox-r11-f16-completed"
+    spool_done = _seed_r11_f16_outbox(completed, stream_a, stream_b, perms)
+    spool_done.apply_ack(_ack(stream_a, committed=(1, 5_000)))
+    roots["completed"] = completed
+    assert _has_v4_artifact(completed)
+
+    repo_root = _repo_root_with_36bf08d9()
+    if repo_root is None:
+        return
+    legacy_root = trusted_tmp / "legacy-src-36bf08d9-f16"
+    legacy_root.mkdir(parents=True)
+    tar_bytes = subprocess.check_output(["git", "-C", str(repo_root), "archive", "--format=tar", "36bf08d9", "src"])
+    with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:") as tf:
+        tf.extractall(legacy_root, filter="data")
+    guarded = {name: root for name, root in roots.items() if _has_v4_artifact(root)}
+    assert "completed" in guarded
+    before = {name: _snapshot_tree_bytes(root) for name, root in guarded.items()}
+    script = _legacy_probe_script(legacy_root / "src", [(str(r), stream_a, stream_b) for r in guarded.values()])
+    proc = subprocess.run([sys.executable, "-I", "-c", script], capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    results = json.loads(proc.stdout.strip().splitlines()[-1])
+    for name, root in guarded.items():
+        res = results[str(root)]
+        assert all(v.startswith("refused:") for v in res.values()), (name, res)
+        assert _snapshot_tree_bytes(root) == before[name], name
+
+
+def test_r10_f17_directory_sync_io_error_stops_before_cursor_publication(
+    trusted_tmp: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R11-3: a real I/O error syncing ``.acks`` or the cursor dir stops before the next publication step."""
+    import errno
+
+    from superbrain.adapters.os import durable
+
+    perms = os_adapters().permissions
+    real_fsync_dir = durable._fsync_directory
+
+    def _seed(name: str) -> tuple[OutboxSpool, str, Path]:
+        outbox, stream = trusted_tmp / f"outbox-r11-f17-{name}", f"stream-r11-f17-{name}"
+        spool = OutboxSpool(outbox, permissions=perms)
+        _enqueue_hook(spool, stream=stream, dk=digest_bytes(f"r11-f17-{name}".encode()), explicit_seq=1)
+        return spool, stream, _stream_dir(outbox, stream)
+
+    # (a) EIO syncing .acks: no cursor change, frame kept.
+    spool_a, stream_a, sdir_a = _seed("acks")
+    cur_a = (sdir_a / ".seq_cursor.json").read_bytes()
+
+    def _eio_on_acks(path: Path, **kw: Any) -> bool:
+        if Path(path).name == ".acks":
+            raise OSError(errno.EIO, "injected EIO")
+        return bool(real_fsync_dir(path, **kw))
+
+    with monkeypatch.context() as mp:
+        mp.setattr(durable, "_fsync_directory", _eio_on_acks)
+        with pytest.raises(BrainError) as err_a:
+            spool_a.apply_ack(_ack(stream_a, committed=(1, 5_000)))
+        assert err_a.value.code is ErrorCode.IO_ERROR
+    assert (sdir_a / ".seq_cursor.json").read_bytes() == cur_a
+    assert [e.sequence for e in spool_a.read_pending(limit=10, producer_stream=stream_a)] == [1]
+
+    # (b) EIO syncing the cursor directory: frames are not evicted.
+    spool_b, stream_b, sdir_b = _seed("cursor")
+
+    def _eio_on_stream_dir(path: Path, **kw: Any) -> bool:
+        if Path(path) == sdir_b:
+            raise OSError(errno.EIO, "injected EIO")
+        return bool(real_fsync_dir(path, **kw))
+
+    with monkeypatch.context() as mp:
+        mp.setattr(durable, "_fsync_directory", _eio_on_stream_dir)
+        with pytest.raises(BrainError) as err_b:
+            spool_b.apply_ack(_ack(stream_b, committed=(1, 5_000)))
+        assert err_b.value.code is ErrorCode.IO_ERROR
+    assert [e.sequence for e in spool_b.read_pending(limit=10, producer_stream=stream_b)] == [1]
+
+    # (c) Positive twin: a filesystem that cannot fsync directories (unsupported) still completes.
+    spool_c, stream_c, _sdir_c = _seed("unsupported")
+    with monkeypatch.context() as mp:
+        mp.setattr(durable, "_fsync_directory", lambda _p, **_kw: False)
+        assert spool_c.apply_ack(_ack(stream_c, committed=(1, 5_000))) == 1
+
+
+
+def test_r10_f18_enqueue_never_reports_failure_after_frame_publication(
+    trusted_tmp: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R11-4: a frame published before the deadline is never followed by a ``CaptureGap`` for the same slot."""
+    from superbrain.composition.hook_entry import run_hook
+
+    perms = os_adapters().permissions
+    io_mod = sys.modules["superbrain.storage._outbox_io"]
+    real_replace = io_mod.replace_file_resilient
+
+    # (a) run_hook direct path: deadline hits right after the event frame is published.
+    outbox_a, stream_a = trusted_tmp / "outbox-r11-f18-run", "stream-r11-f18-run"
+    now = [0]
+    seed = OutboxSpool(outbox_a, permissions=perms)
+    _enqueue_hook(seed, stream=stream_a, dk=digest_bytes(b"r11-f18-seed"), explicit_seq=1)
+
+    def _expire_after_frame(src: Path, dst: Path) -> None:
+        real_replace(src, dst)
+        if str(dst).endswith(".frame"):
+            now[0] = 1_960_000_000
+
+    raw = json.dumps({
+        "event_id": "ev-r11-f18-2", "producer_stream": stream_a, "sequence": 2, "harness_id": "claude-code",
+        "kind": "tool_post", "recorded_at": "2026-11-27T08:00:00Z", "payload": {"tool": "Read", "seq": 2},
+    }).encode()
+    with monkeypatch.context() as mp:
+        mp.setattr(io_mod, "replace_file_resilient", _expire_after_frame)
+        rc = run_hook(
+            raw, outbox_dir=outbox_a, monotonic_ns=lambda: now[0],
+            spool_factory=lambda d: OutboxSpool(d, permissions=perms, monotonic_ns=lambda: now[0]),
+        )
+    assert rc == 0
+    entries = OutboxSpool(outbox_a, permissions=perms).read_pending(limit=10, producer_stream=stream_a)
+    assert [(e.record_kind, e.sequence) for e in entries] == [("event", 1), ("event", 2)]
+
+    # (b) Spool hook path: the post-publication cursor update cannot turn a published event into an error.
+    outbox_b, stream_b = trusted_tmp / "outbox-r11-f18-hook", "stream-r11-f18-hook"
+    clock = [0]
+    spool_b = OutboxSpool(outbox_b, permissions=perms, monotonic_ns=lambda: clock[0])
+
+    def _expire_after_frame_b(src: Path, dst: Path) -> None:
+        real_replace(src, dst)
+        if str(dst).endswith(".frame"):
+            clock[0] = 2_000
+
+    with monkeypatch.context() as mp:
+        mp.setattr(io_mod, "replace_file_resilient", _expire_after_frame_b)
+        rec = _enqueue_hook(spool_b, stream=stream_b, dk=digest_bytes(b"r11-f18-hook"), deadline_ns=1_000)
+    assert rec.sequence == 1
+    assert [e.sequence for e in spool_b.read_pending(limit=10, producer_stream=stream_b)] == [1]
+
+    # (c) Retry of the same key while its frame is already published: upkeep that hits the deadline is deferred,
+    # never reported as a failure that the hook would turn into a CaptureGap.
+    clock[0] = 0
+    upkeep_calls = [0]
+
+    def _expire_before_first_upkeep_write(src: Path, dst: Path) -> None:
+        upkeep_calls[0] += 1
+        if upkeep_calls[0] == 1:
+            clock[0] = 2_000
+        real_replace(src, dst)
+
+    with monkeypatch.context() as mp:
+        mp.setattr(io_mod, "replace_file_resilient", _expire_before_first_upkeep_write)
+        retried = _enqueue_hook(spool_b, stream=stream_b, dk=digest_bytes(b"r11-f18-hook"), deadline_ns=1_000)
+    assert retried.sequence == 1
+    assert upkeep_calls[0] >= 1
+    assert [(e.record_kind, e.sequence) for e in spool_b.read_pending(limit=10, producer_stream=stream_b)] == [
+        ("event", 1)
+    ]
+    clock[0] = 0
+    _enqueue_hook(spool_b, stream=stream_b, dk=digest_bytes(b"r11-f18-hook-2"))
+    cursor_b = json.loads((_stream_dir(outbox_b, stream_b) / ".seq_cursor.json").read_text(encoding="utf-8"))
+    assert cursor_b["pending_binding"] is None
+
+
+def test_r10_f19_ack_cleanup_and_busy_backoff_check_the_cutoff(
+    trusted_tmp: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R11-5: every unlink and every retry wait checks the remaining budget right before it happens."""
+    perms = os_adapters().permissions
+    io_mod = sys.modules["superbrain.storage._outbox_io"]
+
+    # (a) Deadline expires while syncing the committed cursor: the superseded ACK page is not deleted.
+    now_a = [0]
+    outbox_a, stream_a = trusted_tmp / "outbox-r11-f19-prune", "stream-r11-f19-prune"
+    _spool_seed, sdir_a, acks_a, cur_path = _setup_v4_two_pages(outbox_a, stream_a, perms)
+    pages_before = {p.name for p in acks_a.glob("*.json")}
+    cur_before = cur_path.read_bytes()
+    spool_a = OutboxSpool(outbox_a, permissions=perms, monotonic_ns=lambda: now_a[0])
+    real_sync = io_mod.sync_dir
+
+    def _expire_after_cursor_commit(directory: Path) -> None:
+        real_sync(directory)
+        if Path(directory) == sdir_a and cur_path.read_bytes() != cur_before:
+            now_a[0] = 2_000
+
+    with monkeypatch.context() as mp:
+        mp.setattr(io_mod, "sync_dir", _expire_after_cursor_commit)
+        with pytest.raises(BrainError) as err_a:
+            spool_a.apply_ack(_ack(stream_a, committed=(5_001,)), deadline_ns=1_000)
+        assert err_a.value.code is ErrorCode.DEADLINE_EXCEEDED
+    assert cur_path.read_bytes() != cur_before
+    assert pages_before <= {p.name for p in acks_a.glob("*.json")}
+
+    # (b) A busy replace that ends past the cutoff does not sleep before failing.
+    now_b: list[int] = [0]
+    sleeps_b: list[float] = []
+    spool_b = OutboxSpool(trusted_tmp / "outbox-r11-f19-busy", permissions=perms, monotonic_ns=lambda: now_b[0])
+    orig_replace = os.replace
+    calls_b = [0]
+
+    def _busy_and_expire(src: Path | str, dst: Path | str) -> None:
+        calls_b[0] += 1
+        if calls_b[0] == 1:
+            now_b[0] = 2_000
+            err = OSError("sharing violation")
+            err.winerror = 32
+            raise err
+        orig_replace(src, dst)
+
+    with monkeypatch.context() as mp:
+        mp.setattr(os, "replace", _busy_and_expire)
+        mp.setattr(time, "sleep", sleeps_b.append)
+        with pytest.raises(BrainError) as err_b:
+            spool_b.enqueue_gap(_mk_gap("s-r11-f19-b", 1), deadline_ns=1_000)
+        assert err_b.value.code is ErrorCode.DEADLINE_EXCEEDED
+    assert sleeps_b == []
+
+    # (c) A busy replace with 3 ms left waits at most the remaining budget.
+    now_c: list[int] = [0]
+    sleeps_c: list[float] = []
+    spool_c = OutboxSpool(trusted_tmp / "outbox-r11-f19-bound", permissions=perms, monotonic_ns=lambda: now_c[0])
+    calls_c = [0]
+
+    def _busy_near_deadline(src: Path | str, dst: Path | str) -> None:
+        calls_c[0] += 1
+        if calls_c[0] == 1:
+            now_c[0] = 1_000_000_000 - 3_000_000
+            err = OSError("sharing violation")
+            err.winerror = 32
+            raise err
+        orig_replace(src, dst)
+
+    with monkeypatch.context() as mp:
+        mp.setattr(os, "replace", _busy_near_deadline)
+        mp.setattr(time, "sleep", sleeps_c.append)
+        spool_c.enqueue_gap(_mk_gap("s-r11-f19-c", 1), deadline_ns=1_000_000_000)
+    assert sleeps_c, sleeps_c
+    assert max(sleeps_c) <= 0.003 + 1e-9, sleeps_c

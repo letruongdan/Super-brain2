@@ -13,7 +13,6 @@ from pathlib import Path
 from superbrain.core._kernel_base import require_sha256_digest
 from superbrain.core.canonical import canonical_json
 from superbrain.core.errors import BrainError, ErrorCode
-from superbrain.core.ids import new_id
 from superbrain.core.jsonvalue import JsonValue
 from superbrain.ports.capture import (
     CaptureBatchAck,
@@ -39,6 +38,9 @@ from superbrain.storage._outbox_bindings import (
     write_prepared_binding_bucket,
 )
 from superbrain.storage._outbox_io import verify_stream_dir_safe as verify_stream_dir_safe
+from superbrain.storage._outbox_slots import allocate_event_id as allocate_event_id
+from superbrain.storage._outbox_slots import resolve_hook_envelope_slot as resolve_hook_envelope_slot
+from superbrain.storage._outbox_slots import serialize_v3_normalized
 
 _CURSOR_FILENAME = ".seq_cursor.json"
 _CURSOR_V3_SCHEMA_VERSION = 3
@@ -295,32 +297,49 @@ def write_stream_cursor(stream_dir: Path, cursor: StreamSeqCursor, perms: Outbox
     _persist_cursor_payload(stream_dir, _serialize_cursor_bytes(target), perms)
 
 
-def _upgrade_sibling_streams_before_v4_fence(
-    streams_dir: Path, exclude_stream_dir: Path, perms: OutboxPermissionsPort,
+def _normalize_v3_cursor(
+    sdir: Path, cur: StreamSeqCursor, perms: OutboxPermissionsPort,
+    *, renamer: OutboxDirRenamer | None, check_deadline: Callable[[], None] | None,
+) -> StreamSeqCursor:
+    for item in (*cur.legacy_recent, *((cur.pending_binding,) if cur.pending_binding is not None else ())):
+        upsert_binding(sdir, item, perms, renamer=renamer, check_deadline=check_deadline)
+    count = count_all_bindings(sdir, perms)
+    _persist_cursor_payload(sdir, serialize_v3_normalized(cur, count, _MAX_CURSOR_BYTES), perms)
+    return read_stream_cursor(sdir, perms)
+
+
+def _publish_v4_fence(
+    stream_dir: Path, perms: OutboxPermissionsPort,
     *, renamer: OutboxDirRenamer | None, check_deadline: Callable[[], None] | None,
 ) -> None:
+    """Single v4 commit point: every v3 cursor is first left pending-free in v3 form (what the previous binary's
+    own recovery writes), then ``.v4_fence`` is published, and only then do sibling cursors move to v4."""
+    streams_dir = stream_dir.parent
     _io.ensure_dir_tree_atomic(streams_dir, perms, renamer, check_deadline=check_deadline)
-    if os.path.lexists(streams_dir / _io._V4_FENCE_FILE):
-        return
-    pending: list[tuple[Path, StreamSeqCursor]] = []
+    found: list[tuple[Path, StreamSeqCursor]] = []
     with os.scandir(streams_dir) as it:
         for sd_entry in it:
             if check_deadline is not None:
                 check_deadline()
             if _io.is_link_path(Path(sd_entry.path)):
                 raise BrainError(ErrorCode.UNSAFE_PATH, "stream directory is a link")
-            sdir_path = Path(sd_entry.path)
-            if sdir_path == exclude_stream_dir or not stat.S_ISDIR(sd_entry.stat(follow_symlinks=False).st_mode):
-                continue
-            if cursor_exists(sdir_path):
-                sib = read_stream_cursor(sdir_path, perms)
-                if _needs_cursor_recovery(sib) or not sib.schema_v4:
-                    _preview_recovered_cursor(sib, force_v4=True)
-                    pending.append((sdir_path, sib))
-    for sib_dir, sib in pending:
-        recover_stream_cursor(
-            sib_dir, sib, perms, renamer=renamer, check_deadline=check_deadline, force_v4=True, skip_fence=True
-        )
+            if stat.S_ISDIR(sd_entry.stat(follow_symlinks=False).st_mode) and cursor_exists(Path(sd_entry.path)):
+                found.append((Path(sd_entry.path), read_stream_cursor(Path(sd_entry.path), perms)))
+    # On-disk schema, not the parsed upgrade flag: a v3 cursor with sparse ranges parses as schema_v4.
+    dirty = [(d, c) for d, c in found if (c.pending_binding is not None or c.legacy_recent)
+             and json.loads((d / _CURSOR_FILENAME).read_bytes()).get("schema_version") != 4]
+    for _d, c in dirty:
+        serialize_v3_normalized(c, c.binding_count + len(c.legacy_recent) + 1, _MAX_CURSOR_BYTES)
+    upgrade = [(d, c) for d, c in found if d != stream_dir and (_needs_cursor_recovery(c) or not c.schema_v4)]
+    for _d, c in upgrade:
+        _preview_recovered_cursor(c, force_v4=True)
+    normalized = {d: _normalize_v3_cursor(d, c, perms, renamer=renamer, check_deadline=check_deadline)
+                  for d, c in dirty}
+    _io.ensure_v4_fence(streams_dir, perms, renamer=renamer, check_deadline=check_deadline)
+    for d, c in upgrade:
+        recover_stream_cursor(d, normalized.get(d, c), perms, renamer=renamer, check_deadline=check_deadline,
+                              force_v4=True, skip_fence=True)
+
 
 
 def _commit_v4_pages_and_cursor(
@@ -331,19 +350,17 @@ def _commit_v4_pages_and_cursor(
     _serialize_cursor_bytes(new_cursor)
     if not skip_fence and new_cursor.schema_v4 and stream_dir.parent.name == _io._STREAMS_DIR:
         if not os.path.lexists(stream_dir.parent / _io._V4_FENCE_FILE):
-            _upgrade_sibling_streams_before_v4_fence(
-                stream_dir.parent, stream_dir, perms, renamer=renamer, check_deadline=check_deadline
-            )
+            _publish_v4_fence(stream_dir, perms, renamer=renamer, check_deadline=check_deadline)
         _io.ensure_v4_fence(stream_dir.parent, perms, renamer=renamer, check_deadline=check_deadline)
     if os.path.lexists(stream_dir / _acks._ACKS_DIR):
-        _acks.prune_unreferenced_ack_pages(stream_dir, prior_refs, perms)
+        _acks.prune_unreferenced_ack_pages(stream_dir, prior_refs, perms, check_deadline)
     if dirty_payloads:
         _acks.write_ack_pages(stream_dir, dirty_payloads, perms, renamer=renamer, check_deadline=check_deadline)
     if check_deadline is not None:
         check_deadline()
     write_stream_cursor(stream_dir, new_cursor, perms)
     if os.path.lexists(stream_dir / _acks._ACKS_DIR):
-        _acks.prune_unreferenced_ack_pages(stream_dir, new_cursor.acked_page_refs, perms)
+        _acks.prune_unreferenced_ack_pages(stream_dir, new_cursor.acked_page_refs, perms, check_deadline)
 
 
 def _preview_recovered_cursor(
@@ -401,13 +418,6 @@ def lookup_stream_binding_with_bucket(
     if not os.path.lexists(stream_dir):
         return None, None, None
     return lookup_binding_with_bucket(stream_dir, dedup_key, perms)
-
-
-def lookup_stream_binding(
-    stream_dir: Path, cursor: StreamSeqCursor, dedup_key: str, perms: OutboxPermissionsPort
-) -> HookBindingRecord | None:
-    """Look up ``dedup_key`` in pending/legacy cursor state first, then in sharded ``.bindings``."""
-    return lookup_stream_binding_with_bucket(stream_dir, cursor, dedup_key, perms)[0]
 
 
 def _apply_ack_update(
@@ -489,14 +499,6 @@ def commit_bumped_cursor(
         write_stream_cursor(stream_dir, bumped, perms)
 
 
-def advance_cursor_next_seq(
-    stream_dir: Path, sequence: int, perms: OutboxPermissionsPort, *, renamer: OutboxDirRenamer | None = None
-) -> None:
-    """If ``stream_dir`` already maintains a hook cursor, flush legacy/pending state and advance."""
-    cur = prepare_cursor_for_direct_enqueue(stream_dir, sequence, perms, renamer=renamer)
-    commit_bumped_cursor(stream_dir, cur, sequence, perms)
-
-
 def read_hook_cursor_readonly(stream_dir: Path, perms: OutboxPermissionsPort) -> StreamSeqCursor:
     """Read stream cursor without mutating disk (returns fresh cursor when stream absent)."""
     return read_stream_cursor(stream_dir, perms) if verify_stream_dir_safe(stream_dir, perms) else StreamSeqCursor(1)
@@ -536,13 +538,24 @@ def preflight_hook_cursor_size(
     _serialize_cursor_bytes(bound_c.with_binding_state(pending_binding=None))
 
 
-def load_or_recover_hook_cursor(
-    stream_dir: Path, perms: OutboxPermissionsPort,
-    *, renamer: OutboxDirRenamer | None, check_deadline: Callable[[], None] | None,
-) -> StreamSeqCursor:
-    """Load cursor if ``stream_dir`` exists and flush any pending/legacy bindings or ACKs."""
-    raw = read_hook_cursor_readonly(stream_dir, perms)
-    return recover_stream_cursor(stream_dir, raw, perms, renamer=renamer, check_deadline=check_deadline)
+def settle_published_hook_frame(
+    stream_dir: Path, raw_cur: StreamSeqCursor, *, matched: bool, dedup_key: str | None,
+    cached: HookBindingRecord | None, record: CaptureEventRecord, payload_digest: str, perms: OutboxPermissionsPort,
+    renamer: OutboxDirRenamer | None, check_deadline: Callable[[], None] | None,
+) -> None:
+    """Upkeep for an event whose frame is already published (or acknowledged). A deadline or capacity stop here is
+    left to the next recovery, never reported as a failure the hook would record as a lost event."""
+    try:
+        cursor = recover_stream_cursor(stream_dir, raw_cur, perms, renamer=renamer, check_deadline=check_deadline)
+        if matched:
+            reconcile_matched_hook_frame_cursor(stream_dir, cursor, dedup_key=dedup_key, cached=cached, record=record,
+                payload_digest=payload_digest, perms=perms, renamer=renamer, check_deadline=check_deadline)
+        else:
+            backfill_binding_digest_if_missing(stream_dir, cached, payload_digest, perms,
+                renamer=renamer, check_deadline=check_deadline)
+    except BrainError as err:
+        if err.code not in (ErrorCode.DEADLINE_EXCEEDED, ErrorCode.STORAGE_FULL):
+            raise
 
 
 def reconcile_matched_hook_frame_cursor(
@@ -572,26 +585,3 @@ def reconcile_matched_hook_frame_cursor(
         )
     if cursor.next_seq <= record.sequence:
         write_stream_cursor(stream_dir, cursor.bump_next_seq(record.sequence), perms)
-
-
-def allocate_event_id(dedup_key: str | None) -> str:
-    """Derive a collision-free opaque ``event_id`` (deterministic when ``dedup_key`` is given)."""
-    if dedup_key is not None and dedup_key.startswith("sha256:"):
-        return f"ev-{dedup_key.removeprefix('sha256:')[:24]}"
-    return f"ev-{new_id()}"
-
-
-def resolve_hook_envelope_slot(
-    cursor: StreamSeqCursor, *, cached: HookBindingRecord | None = None, max_frame_seq: int,
-    explicit_sequence: int | None, explicit_event_id: str | None, dedup_key: str | None, fallback_recorded_at: str,
-) -> tuple[int, str, str]:
-    """Choose deterministic retry slot from ``cached`` binding or allocate next monotonic stream sequence."""
-    if cached is not None:
-        if (explicit_sequence is not None and explicit_sequence != cached.sequence) or (
-            explicit_event_id is not None and explicit_event_id != cached.event_id
-        ):
-            raise BrainError(ErrorCode.IDEMPOTENCY_CONFLICT, "idempotency conflict")
-        return cached.sequence, cached.event_id, cached.recorded_at
-    seq = explicit_sequence if explicit_sequence is not None else max(cursor.next_seq, max_frame_seq + 1)
-    ev_id = explicit_event_id if explicit_event_id is not None else allocate_event_id(dedup_key)
-    return seq, ev_id, fallback_recorded_at
