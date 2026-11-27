@@ -493,7 +493,7 @@ _HEAVY_FILE_COST_MS: dict[str, int] = {
     "tests/integration/test_handoff_lifecycle_and_takeover.py": 3560,
     "tests/storage/test_handoff_restore_and_epochs.py": 1860,
     "tests/domain/test_handoff_limits_and_budget.py": 100,
-    "tests/integration/test_sp2_5_production_wiring.py": 105000,
+    "tests/integration/test_sp2_5_production_wiring.py": 120000,
     "tests/integration/test_capture_mcp_coexistence_r2.py": 2000,
     "tests/integration/test_capture_mcp_coexistence.py": 1800,
     "tests/storage/test_outbox_r9_ack_cursor_bounds.py": 1100,
@@ -537,7 +537,11 @@ def _order_bucket_for_io_stagger(shard_idx: int, group: list[str]) -> list[str]:
     if shard_idx == 1:
         return [*storage, *non_storage, *wheel]
     if shard_idx >= 3 and shard_idx % 2 == 1:
-        return [*reversed(non_storage), *storage, *wheel]
+        if len(non_storage) >= 2:
+            staggered_ns = [non_storage[1], non_storage[0], *reversed(non_storage[2:])]
+        else:
+            staggered_ns = list(non_storage)
+        return [*staggered_ns, *storage, *wheel]
     return [*non_storage, *storage, *wheel]
 
 

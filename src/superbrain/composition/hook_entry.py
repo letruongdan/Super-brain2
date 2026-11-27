@@ -10,26 +10,16 @@ import threading
 import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from superbrain.adapters.os import os_adapters
-from superbrain.adapters.os.locks import OUTBOX_FILE_LOCK
-from superbrain.adapters.os.physical_fs import atomic_append_no_follow
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.ids import new_id
 from superbrain.core.jsonvalue import JsonValue
-from superbrain.ports.capture import (
-    HOOK_HARD_CAP_NS,
-    CaptureEventRecord,
-    ProducerCaptureGap,
-    default_outbox_dir_renamer,
-)
-from superbrain.storage._outbox_io import (
-    ensure_dir_tree_atomic,
-    ensure_secure_regular_file_atomic,
-    reject_links_upward,
-    thread_lock_for,
-)
-from superbrain.storage.outbox import OutboxSpool
+from superbrain.ports.capture import HOOK_HARD_CAP_NS, CaptureEventRecord, ProducerCaptureGap
+
+if TYPE_CHECKING:
+    from superbrain.storage.outbox import OutboxSpool
 
 _MAX_STDIN_BYTES = 2 * 1024 * 1024
 
@@ -44,6 +34,15 @@ def _write_static_log(
     if log_path is None:
         return
     try:
+        from superbrain.adapters.os.physical_fs import atomic_append_no_follow
+        from superbrain.ports.capture import default_outbox_dir_renamer
+        from superbrain.storage._outbox_io import (
+            ensure_dir_tree_atomic,
+            ensure_secure_regular_file_atomic,
+            reject_links_upward,
+            thread_lock_for,
+        )
+
         resolved = log_path if log_path.is_absolute() else log_path.absolute()
         reject_links_upward(resolved)
         perms = os_adapters().permissions
@@ -59,6 +58,9 @@ def _write_static_log(
 def _make_spool(outbox_dir: Path, spool_factory: Callable[[Path], OutboxSpool] | None) -> OutboxSpool:
     if spool_factory is not None:
         return spool_factory(outbox_dir)
+    from superbrain.adapters.os.locks import OUTBOX_FILE_LOCK
+    from superbrain.storage.outbox import OutboxSpool
+
     return OutboxSpool(outbox_dir, permissions=os_adapters().permissions, file_lock=OUTBOX_FILE_LOCK)
 
 
