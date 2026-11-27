@@ -168,16 +168,33 @@ def count_all_bindings(stream_dir: Path, perms: OutboxPermissionsPort) -> int:
 
 def lookup_binding(stream_dir: Path, dedup_key: str, perms: OutboxPermissionsPort) -> HookBindingRecord | None:
     """Look up ``dedup_key`` in its 256-way sharded bucket without loading sibling buckets."""
+    rec, _bucket, _entries = lookup_binding_with_bucket(stream_dir, dedup_key, perms)
+    return rec
+
+
+def lookup_binding_with_bucket(
+    stream_dir: Path, dedup_key: str, perms: OutboxPermissionsPort
+) -> tuple[HookBindingRecord | None, str, dict[str, HookBindingRecord]]:
+    """Look up ``dedup_key`` and return ``(record_or_none, bucket_name, bucket_entries)``."""
     bucket = bucket_name_for_key(dedup_key)
-    return read_binding_bucket(stream_dir, bucket, perms).get(dedup_key)
+    entries = read_binding_bucket(stream_dir, bucket, perms)
+    return entries.get(dedup_key), bucket, entries
 
 
 def prepare_binding_upsert(
-    stream_dir: Path, binding: HookBindingRecord, perms: OutboxPermissionsPort
+    stream_dir: Path,
+    binding: HookBindingRecord,
+    perms: OutboxPermissionsPort,
+    *,
+    preloaded_entries: dict[str, HookBindingRecord] | None = None,
 ) -> tuple[str, bytes | None, bool]:
     """Validate conflicts and bucket capacity read-only; return ``(bucket, payload_or_none, added)``."""
     bucket_name = bucket_name_for_key(binding.key)
-    entries = read_binding_bucket(stream_dir, bucket_name, perms)
+    entries = (
+        dict(preloaded_entries)
+        if preloaded_entries is not None
+        else read_binding_bucket(stream_dir, bucket_name, perms)
+    )
     existing = entries.get(binding.key)
     added = existing is None
     if existing is not None:
@@ -217,8 +234,10 @@ def write_prepared_binding_bucket(
     check_deadline: Callable[[], None] | None = None,
 ) -> None:
     """Persist validated ``payload`` atomically into ``.bindings/<bucket_name>``."""
-    bdir = stream_dir / _BINDINGS_DIR
-    ensure_dir_tree_atomic(bdir, perms, renamer, check_deadline=check_deadline)
+    bdir = _verify_bindings_dir_node(stream_dir, perms)
+    if bdir is None:
+        bdir = stream_dir / _BINDINGS_DIR
+        ensure_dir_tree_atomic(bdir, perms, renamer, check_deadline=check_deadline)
     final_path = bdir / bucket_name
     tmp_path = bdir / f".bucket-{uuid.uuid4().hex}{_PART_SUFFIX}"
     fd = -1

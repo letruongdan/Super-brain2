@@ -107,6 +107,12 @@ def _fsync_directory(path: Path, *, nt: bool = os.name == "nt") -> bool:
         os.close(descriptor)
 
 
+def sync_directory_best_effort(path: Path) -> None:
+    """Persist directory entries for ``OutboxSpool`` metadata updates, suppressing unsupported-OS errors."""
+    with contextlib.suppress(OSError):
+        _fsync_directory(path)
+
+
 # --------------------------------------------------------------------------------------------------
 # Filesystem detection
 

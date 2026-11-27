@@ -183,10 +183,12 @@ class OutboxFileLockPort(Protocol):
 
 
 OutboxDirRenamer = Callable[[Path, Path], None]
+OutboxDirSync = Callable[[Path], None]
 
 _DEFAULT_OUTBOX_FILE_LOCK: OutboxFileLockPort | None = None
 _DEFAULT_OUTBOX_PERMISSIONS: OutboxPermissionsPort | None = None
 _DEFAULT_OUTBOX_DIR_RENAMER: OutboxDirRenamer | None = None
+_DEFAULT_OUTBOX_DIR_SYNC: OutboxDirSync | None = None
 
 
 def register_outbox_file_lock(adapter: OutboxFileLockPort) -> None:
@@ -220,6 +222,17 @@ def register_outbox_dir_renamer(renamer: OutboxDirRenamer) -> None:
 def default_outbox_dir_renamer() -> OutboxDirRenamer | None:
     """Return the registered atomic directory renamer, or ``None`` if OS adapters have not loaded."""
     return _DEFAULT_OUTBOX_DIR_RENAMER
+
+
+def register_outbox_dir_sync(sync_fn: OutboxDirSync) -> None:
+    """Register the process-wide OS directory-fsync helper used by ``OutboxSpool``."""
+    global _DEFAULT_OUTBOX_DIR_SYNC
+    _DEFAULT_OUTBOX_DIR_SYNC = sync_fn
+
+
+def default_outbox_dir_sync() -> OutboxDirSync | None:
+    """Return the registered directory-fsync helper, or ``None`` if OS adapters have not loaded."""
+    return _DEFAULT_OUTBOX_DIR_SYNC
 
 
 @dataclass(frozen=True)
@@ -515,10 +528,7 @@ class CaptureBatchAck:
         if self.policy_disabled:
             return False
         if record_kind == OUTBOX_RECORD_EVENT:
-            return (
-                sequence <= self.contiguous_event_acked_through
-                or sequence in self.committed_event_sequences
-            )
+            return sequence <= self.contiguous_event_acked_through or sequence in self.committed_event_sequences
         return sequence in self.acked_producer_gap_sequences
 
     def to_dict(self) -> dict[str, JsonValue]:
@@ -533,27 +543,23 @@ class CaptureBatchAck:
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, JsonValue]) -> CaptureBatchAck:
-        expected = {
-            "producer_stream", "repo_id", "checkout_id", "committed_event_sequences",
-            "contiguous_event_acked_through", "acked_producer_gap_sequences",
-            "accepted_count", "deduped_count", "policy_disabled",
-        }
+        expected = {"producer_stream", "repo_id", "checkout_id", "committed_event_sequences",
+            "contiguous_event_acked_through", "acked_producer_gap_sequences", "accepted_count", "deduped_count",
+            "policy_disabled"}
         if not isinstance(raw, Mapping) or set(raw) != expected:
             raise _invalid()
         ev_raw, gap_raw = raw["committed_event_sequences"], raw["acked_producer_gap_sequences"]
-        if not isinstance(ev_raw, list) or not isinstance(gap_raw, list):
-            raise _invalid()
-        ev_seqs = tuple(require_capture_sequence(x) for x in ev_raw)
-        gap_seqs = tuple(require_capture_sequence(x) for x in gap_raw)
-        policy_disabled = raw["policy_disabled"]
-        if not isinstance(policy_disabled, bool):
+        pd = raw["policy_disabled"]
+        if not isinstance(ev_raw, list) or not isinstance(gap_raw, list) or not isinstance(pd, bool):
             raise _invalid()
         return cls(
             producer_stream=_req_str_field(raw, "producer_stream"), repo_id=_req_str_field(raw, "repo_id"),
-            checkout_id=_req_str_field(raw, "checkout_id"), committed_event_sequences=ev_seqs,
+            checkout_id=_req_str_field(raw, "checkout_id"),
+            committed_event_sequences=tuple(require_capture_sequence(x) for x in ev_raw),
             contiguous_event_acked_through=_req_int_field(raw, "contiguous_event_acked_through"),
-            acked_producer_gap_sequences=gap_seqs, accepted_count=_req_int_field(raw, "accepted_count"),
-            deduped_count=_req_int_field(raw, "deduped_count"), policy_disabled=policy_disabled,
+            acked_producer_gap_sequences=tuple(require_capture_sequence(x) for x in gap_raw),
+            accepted_count=_req_int_field(raw, "accepted_count"), deduped_count=_req_int_field(raw, "deduped_count"),
+            policy_disabled=pd,
         )
 
 
@@ -567,32 +573,27 @@ class CaptureHealthSnapshot:
     producer_gaps: int
 
     def __post_init__(self) -> None:
-        require_non_negative_int(self.total_events)
-        require_non_negative_int(self.open_gaps)
-        require_non_negative_int(self.closed_gaps)
-        require_non_negative_int(self.producer_gaps)
+        for val in (self.total_events, self.open_gaps, self.closed_gaps, self.producer_gaps):
+            require_non_negative_int(val)
 
     @property
     def has_gaps(self) -> bool:
         return (self.open_gaps + self.closed_gaps + self.producer_gaps) > 0
 
     def to_dict(self) -> dict[str, JsonValue]:
-        return {
-            "total_events": self.total_events, "open_gaps": self.open_gaps,
-            "closed_gaps": self.closed_gaps, "producer_gaps": self.producer_gaps, "has_gaps": self.has_gaps,
-        }
+        return {"total_events": self.total_events, "open_gaps": self.open_gaps, "closed_gaps": self.closed_gaps,
+            "producer_gaps": self.producer_gaps, "has_gaps": self.has_gaps}
 
 
 __all__ = [
     "CAPTURE_GAP_REASONS", "CAPTURE_WIRE_OVERHEAD_RESERVE_BYTES", "DEFAULT_OUTBOX_MAX_BYTES",
-    "EVENT_SOURCES", "EVENT_SOURCE_VERIFICATIONS", "FORBIDDEN_CLIENT_CAPTURE_KEYS",
-    "HOOK_HARD_CAP_NS", "HOOK_TARGET_BUDGET_NS", "MAX_CAPTURE_BATCH_EVENTS",
-    "MAX_CAPTURE_ENTRY_BYTES", "MAX_CAPTURE_SEQUENCE", "OUTBOX_RECORD_EVENT", "OUTBOX_RECORD_GAP",
-    "CaptureBatchAck", "CaptureEventRecord", "CaptureHealthSnapshot",
-    "CapturePrivacyFilterPort", "CaptureStorePort", "OutboxDirRenamer", "OutboxEntry",
+    "EVENT_SOURCES", "EVENT_SOURCE_VERIFICATIONS", "FORBIDDEN_CLIENT_CAPTURE_KEYS", "HOOK_HARD_CAP_NS",
+    "HOOK_TARGET_BUDGET_NS", "MAX_CAPTURE_BATCH_EVENTS", "MAX_CAPTURE_ENTRY_BYTES", "MAX_CAPTURE_SEQUENCE",
+    "OUTBOX_RECORD_EVENT", "OUTBOX_RECORD_GAP", "CaptureBatchAck", "CaptureEventRecord", "CaptureHealthSnapshot",
+    "CapturePrivacyFilterPort", "CaptureStorePort", "OutboxDirRenamer", "OutboxDirSync", "OutboxEntry",
     "OutboxFileLockPort", "OutboxPermissionsPort", "ProducerCaptureGap", "StagedCaptureEvent",
     "assert_no_forbidden_capture_keys", "clone_json_mapping", "compute_contiguous_event_acked_through",
-    "default_outbox_dir_renamer", "default_outbox_file_lock", "default_outbox_permissions",
-    "freeze_json_mapping", "register_outbox_dir_renamer", "register_outbox_file_lock",
-    "register_outbox_permissions", "require_capture_sequence", "require_iso_utc_timestamp",
+    "default_outbox_dir_renamer", "default_outbox_dir_sync", "default_outbox_file_lock",
+    "default_outbox_permissions", "freeze_json_mapping", "register_outbox_dir_renamer", "register_outbox_dir_sync",
+    "register_outbox_file_lock", "register_outbox_permissions", "require_capture_sequence", "require_iso_utc_timestamp",
 ]

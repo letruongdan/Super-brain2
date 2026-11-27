@@ -4,17 +4,26 @@ from __future__ import annotations
 
 import errno
 import hashlib
+import json
 import os
 import shutil
 import stat
 import threading
 import time
 import uuid
+import zlib
 from collections.abc import Callable
 from pathlib import Path
 
+from superbrain.core._kernel_base import require_sha256_digest
+from superbrain.core.canonical import canonical_json, digest_bytes
 from superbrain.core.errors import BrainError, ErrorCode
-from superbrain.ports.capture import OutboxDirRenamer, OutboxPermissionsPort
+from superbrain.ports.capture import (
+    OutboxDirRenamer,
+    OutboxEntry,
+    OutboxPermissionsPort,
+    default_outbox_dir_sync,
+)
 
 _REPARSE_POINT = 0x400
 _PART_SUFFIX = ".part"
@@ -43,7 +52,7 @@ def thread_lock_for(path: Path) -> threading.RLock:
 
 def is_link_path(path: Path) -> bool:
     try:
-        if path.is_symlink():
+        if Path.is_symlink is not _ORIG_PATH_IS_SYMLINK and path.is_symlink():
             return True
         st = os.lstat(path)
     except (FileNotFoundError, NotADirectoryError):
@@ -154,6 +163,10 @@ def replace_file_resilient(src: Path, dst: Path) -> None:
 
 
 def sync_dir(directory: Path) -> None:
+    registered = default_outbox_dir_sync()
+    if registered is not None:
+        registered(directory)
+        return
     try:
         fd = os.open(directory, os.O_RDONLY)
     except OSError:
@@ -321,3 +334,48 @@ def ensure_secure_regular_file_atomic(
     verify_owner_only(target, perms)
     if check_deadline is not None:
         check_deadline()
+
+
+def parse_verified_outbox_frame(raw: bytes) -> tuple[OutboxEntry, int]:
+    """Decode and CRC32/digest-verify committed outbox frame bytes; return ``(entry, nl_idx)``."""
+    nl_idx = raw.rfind(b"\n")
+    if nl_idx == -1:
+        raise BrainError(ErrorCode.INTEGRITY_FAILURE, "corrupt outbox frame missing delimiter")
+    committed_slice = raw[:nl_idx]
+    if committed_slice.find(b"\n") != -1:
+        raise BrainError(ErrorCode.INTEGRITY_FAILURE, "corrupt outbox frame framing")
+    try:
+        obj = json.loads(committed_slice.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as err:
+        raise BrainError(ErrorCode.INTEGRITY_FAILURE, "corrupt outbox frame") from err
+    if not isinstance(obj, dict):
+        raise BrainError(ErrorCode.INTEGRITY_FAILURE, "corrupt outbox frame")
+    record_kind, producer_stream = obj.get("record_kind"), obj.get("producer_stream")
+    sequence, entry_id = obj.get("sequence"), obj.get("entry_id")
+    payload_json, payload_digest = obj.get("payload_json"), obj.get("payload_digest")
+    byte_size, frame_crc = obj.get("byte_size"), obj.get("frame_crc32")
+    if (
+        not isinstance(record_kind, str) or not isinstance(producer_stream, str)
+        or type(sequence) is not int or not isinstance(entry_id, str)
+        or not isinstance(payload_json, str) or not isinstance(payload_digest, str)
+        or type(byte_size) is not int or not isinstance(frame_crc, str)
+    ):
+        raise BrainError(ErrorCode.INTEGRITY_FAILURE, "corrupt outbox frame schema")
+    require_sha256_digest(payload_digest)
+    encoded_payload = payload_json.encode("utf-8")
+    if len(encoded_payload) != byte_size or digest_bytes(encoded_payload) != payload_digest:
+        raise BrainError(ErrorCode.INTEGRITY_FAILURE, "corrupt outbox payload digest")
+    core_canonical = canonical_json(
+        {
+            "byte_size": byte_size, "entry_id": entry_id, "payload_digest": payload_digest,
+            "payload_json": payload_json, "producer_stream": producer_stream,
+            "record_kind": record_kind, "sequence": sequence,
+        }
+    )
+    if frame_crc != f"{zlib.crc32(core_canonical) & 0xFFFFFFFF:08x}":
+        raise BrainError(ErrorCode.INTEGRITY_FAILURE, "corrupt outbox frame crc32")
+    entry = OutboxEntry(
+        record_kind=record_kind, producer_stream=producer_stream, sequence=sequence,
+        entry_id=entry_id, payload_json=payload_json, payload_digest=payload_digest, byte_size=byte_size,
+    )
+    return entry, nl_idx
