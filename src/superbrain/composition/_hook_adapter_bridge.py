@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -137,7 +138,14 @@ def _resolve_recorded_at(parsed: Mapping[str, Any], os_: OsAdapters) -> str:
                 except ValueError as err:
                     raise BrainError(ErrorCode.INVALID_INPUT, "invalid input") from err
         if isinstance(val, (int, float)) and not isinstance(val, bool):
-            return datetime.fromtimestamp(float(val), tz=UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
+            epoch_val = float(val)
+            if not math.isfinite(epoch_val):
+                raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+            try:
+                dt_epoch = datetime.fromtimestamp(epoch_val, tz=UTC)
+                return dt_epoch.isoformat(timespec="microseconds").replace("+00:00", "Z")
+            except (ValueError, OverflowError, OSError) as err:
+                raise BrainError(ErrorCode.INVALID_INPUT, "invalid input") from err
         raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
     return os_.clock.now().astimezone(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
 

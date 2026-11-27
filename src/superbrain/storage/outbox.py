@@ -57,10 +57,13 @@ from superbrain.storage._outbox_io import (
 )
 from superbrain.storage._outbox_seq import (
     StreamSeqCursor,
+    advance_and_persist_cursor,
+    advance_cursor_next_seq,
+    persist_cursor_ack,
     read_stream_cursor,
     resolve_hook_envelope_slot,
-    write_stream_cursor,
 )
+from superbrain.storage._outbox_seq import write_stream_cursor as write_stream_cursor
 
 _DEADLINE_CHECK_STRIDE = 64
 
@@ -451,6 +454,7 @@ class OutboxSpool:
                 sdir / f"{base}{_FRAME_SUFFIX}", sdir / f"{base}{_PART_SUFFIX}", frame_bytes,
                 crashpoint_name="capture.outbox.after_write_before_fsync", deadline_ns=deadline_ns,
             )
+            advance_cursor_next_seq(sdir, sequence, perms)
             return entry_id
 
     def enqueue_event(self, record: CaptureEventRecord, *, deadline_ns: int | None = None) -> str:
@@ -474,7 +478,7 @@ class OutboxSpool:
         fallback_recorded_at: str,
         deadline_ns: int | None = None,
     ) -> CaptureEventRecord:
-        """Allocate/reuse durable stream sequence under lock, sanitize via ``build_event``, and enqueue atomically."""
+        """Allocate/reuse durable write-ahead hook binding, sanitize via ``build_event``, and enqueue atomically."""
         stream_key = stream_dir_key(producer_stream)
         perms = self._resolve_permissions()
         renamer = default_outbox_dir_renamer()
@@ -488,6 +492,7 @@ class OutboxSpool:
                     ident = parse_frame_filename_identity(fp.name)
                     if ident is not None and ident[1] > max_frame_seq:
                         max_frame_seq = ident[1]
+            cached = cursor.lookup(dedup_key) if dedup_key is not None else None
             seq, ev_id, rec_at = resolve_hook_envelope_slot(
                 cursor, max_frame_seq=max_frame_seq, explicit_sequence=explicit_sequence,
                 explicit_event_id=explicit_event_id, dedup_key=dedup_key, fallback_recorded_at=fallback_recorded_at,
@@ -497,30 +502,40 @@ class OutboxSpool:
                 record_kind=OUTBOX_RECORD_EVENT, producer_stream=record.producer_stream,
                 sequence=record.sequence, entry_id=record.event_id, payload_dict=record.to_dict(),
             )
+            if cached is not None and cached.payload_digest is not None and cached.payload_digest != payload_digest:
+                raise BrainError(ErrorCode.IDEMPOTENCY_CONFLICT, "idempotency conflict")
             target_suffix = f"_{OUTBOX_RECORD_EVENT}_{record.sequence:020d}{_FRAME_SUFFIX}"
             used, highest_order, matched_path = self._scan_outbox(
                 deadline_ns=deadline_ns, match_stream_key=stream_key, match_suffix=target_suffix
             )
-            next_c = cursor.advance(
-                sequence=record.sequence, dedup_key=dedup_key, event_id=record.event_id, recorded_at=record.recorded_at
-            )
             if matched_path is not None:
                 existing = self._decode_frame_file(matched_path)
-                if existing.entry_id == record.event_id and existing.payload_digest == payload_digest:
-                    if next_c != cursor:
-                        write_stream_cursor(sdir, next_c, perms)
-                    return record
-                raise BrainError(ErrorCode.IDEMPOTENCY_CONFLICT, "idempotency conflict")
+                if existing.entry_id != record.event_id or existing.payload_digest != payload_digest:
+                    raise BrainError(ErrorCode.IDEMPOTENCY_CONFLICT, "idempotency conflict")
+                advance_and_persist_cursor(
+                    sdir, cursor, record=record, dedup_key=dedup_key,
+                    payload_digest=payload_digest, state="published", perms=perms,
+                )
+                return record
+            if cached is not None and cached.state == "acked":
+                return record
             if used + len(frame_bytes) > self._max_bytes:
                 raise BrainError(ErrorCode.STORAGE_FULL, "storage full")
             ensure_dir_tree_atomic(self._root / _STREAMS_DIR, perms, renamer, check_deadline=dl_check)
             ensure_dir_tree_atomic(sdir, perms, renamer, check_deadline=dl_check)
+            cursor = advance_and_persist_cursor(
+                sdir, cursor, record=record, dedup_key=dedup_key,
+                payload_digest=payload_digest, state="bound", perms=perms,
+            )
             base = f"{highest_order + 1:016d}_{OUTBOX_RECORD_EVENT}_{record.sequence:020d}"
             self._atomic_publish_frame(
                 sdir / f"{base}{_FRAME_SUFFIX}", sdir / f"{base}{_PART_SUFFIX}", frame_bytes,
                 crashpoint_name="capture.outbox.after_write_before_fsync", deadline_ns=deadline_ns,
             )
-            write_stream_cursor(sdir, next_c, perms)
+            advance_and_persist_cursor(
+                sdir, cursor, record=record, dedup_key=dedup_key,
+                payload_digest=payload_digest, state="published", perms=perms,
+            )
             return record
 
     def enqueue_gap(self, gap: ProducerCaptureGap, *, deadline_ns: int | None = None) -> str:
@@ -534,10 +549,7 @@ class OutboxSpool:
         )
 
     def read_pending(
-        self,
-        limit: int = MAX_CAPTURE_BATCH_EVENTS,
-        *,
-        producer_stream: str | None = None,
+        self, limit: int = MAX_CAPTURE_BATCH_EVENTS, *, producer_stream: str | None = None
     ) -> list[OutboxEntry]:
         """Return up to ``limit`` pending entries in insertion order."""
         require_positive_int(limit)
@@ -562,6 +574,9 @@ class OutboxSpool:
         with self._locked(create_root=False):
             if not os.path.lexists(self._root):
                 return 0
+            perms = self._resolve_permissions()
+            sdir = self._root / _STREAMS_DIR / stream_dir_key(ack.producer_stream)
+            persist_cursor_ack(sdir, ack, perms)
             evicted = 0
             for path in self._iter_frame_paths(producer_stream=ack.producer_stream):
                 parsed = parse_frame_filename_identity(path.name)
@@ -571,10 +586,8 @@ class OutboxSpool:
                 if ack.allows_eviction(entry.record_kind, entry.sequence):
                     path.unlink(missing_ok=True)
                     evicted += 1
-            if evicted:
-                sdir = self._root / _STREAMS_DIR / stream_dir_key(ack.producer_stream)
-                if sdir.exists():
-                    sync_dir(sdir)
+            if evicted and sdir.exists():
+                sync_dir(sdir)
             return evicted
 
     def total_bytes(self) -> int:

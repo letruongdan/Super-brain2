@@ -64,7 +64,7 @@ from superbrain.core._kernel_approval import (
     SignerEnrollment,
 )
 from superbrain.core.canonical import canonical_json, digest_bytes
-from superbrain.core.errors import ErrorCode
+from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.ids import new_id
 from superbrain.core.kernel import (
     CAPABILITY_CAPTURE_PRODUCER,
@@ -78,7 +78,13 @@ from superbrain.core.kernel import (
 )
 from superbrain.core.proposals import ManagedFormat
 from superbrain.core.wire import SCHEMA_VERSION
-from superbrain.ports.capture import CaptureEventRecord, require_iso_utc_timestamp
+from superbrain.ports.capture import (
+    OUTBOX_RECORD_EVENT,
+    OUTBOX_RECORD_GAP,
+    CaptureBatchAck,
+    CaptureEventRecord,
+    require_iso_utc_timestamp,
+)
 from superbrain.ports.os import OsAdapters
 from superbrain.storage.backup import create_policy_backup
 from superbrain.storage.kernel_schema import KERNEL_POLICY_MIGRATIONS
@@ -2892,3 +2898,469 @@ def test_r5_finding2_active_host_version_drift_on_terminal_and_doctor(
         assert app_ms.get("ok") is False, (st_ms, app_ms)
         assert app_ms["error"]["code"] == ErrorCode.CAPABILITY_UNAVAILABLE.value
         assert loop.run_owner_action(_read_claude_l2_state).result(timeout=10.0) is Layer2State.UNKNOWN
+
+
+# ---------------------------------------------------------------------------
+# Round-6 Review Regression (P1: durable hook envelope binding across crashes,
+# post-ACK retry, gap fallback, and post-ACK payload conflict)
+# ---------------------------------------------------------------------------
+
+
+def _observed_claude_post_tool(chk: Path, *, tool_use_id: str, cmd: str) -> dict[str, Any]:
+    return {
+        "cwd": str(chk),
+        "hook_event_name": "PostToolUse",
+        "session_id": "claude-sid-r6",
+        "tool_name": "Bash",
+        "tool_input": {"command": cmd},
+        "tool_response": {"exit_code": 0, "stdout": "ok"},
+        "tool_use_id": tool_use_id,
+        "duration_ms": 25,
+        "permission_mode": "default",
+        "effort": "medium",
+    }
+
+
+def _pending_event_tuples(spool: OutboxSpool, *, producer_stream: str | None = None) -> list[tuple[int, str]]:
+    entries = spool.read_pending(limit=20, producer_stream=producer_stream)
+    out: list[tuple[int, str]] = []
+    for ent in entries:
+        if ent.record_kind != OUTBOX_RECORD_EVENT:
+            continue
+        obj = cast(dict[str, Any], json.loads(ent.payload_json))
+        out.append((ent.sequence, str(obj["event_id"])))
+    return out
+
+
+def _capture_gaps_for_stream(loop: OwnerLoop, producer_stream: str) -> list[tuple[Any, ...]]:
+    def _read() -> list[tuple[Any, ...]]:
+        session = cast(Any, loop._session)
+        assert session is not None
+        return [
+            tuple(r)
+            for r in session._rt.store._db.execute(
+                "SELECT gap_id, sequence, reason, status FROM capture_gaps WHERE producer_stream = ? ORDER BY sequence",
+                (producer_stream,),
+            ).fetchall()
+        ]
+
+    return loop.run_owner_action(_read).result(timeout=10.0)
+
+
+def _run_hook_cli_subproc(
+    outbox_dir: Path,
+    chk: Path,
+    payload: dict[str, Any],
+    *,
+    producer_stream: str | None = None,
+    crashpoint: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    cmd = [
+        sys.executable,
+        "-I",
+        "-m",
+        "superbrain.composition.hook_entry",
+        "--outbox",
+        str(outbox_dir),
+        "--harness",
+        "claude-code",
+        "--checkout",
+        str(chk),
+    ]
+    if producer_stream is not None:
+        cmd.extend(["--producer-stream", producer_stream])
+    extra = {"SUPERBRAIN_CRASHPOINT": crashpoint} if crashpoint is not None else None
+    return subprocess.run(
+        cmd,
+        cwd=chk,
+        env=clean_installed_subprocess_env(extra=extra),
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=15.0,
+        check=False,
+    )
+
+
+def _run_hook_crash_post_publish_cursor(
+    outbox_dir: Path,
+    chk: Path,
+    payload: dict[str, Any],
+    *,
+    producer_stream: str,
+) -> subprocess.CompletedProcess[str]:
+    script = (
+        "import os, sys\n"
+        "from pathlib import Path\n"
+        "import superbrain.storage.outbox as ob_mod\n"
+        "import superbrain.storage._outbox_seq as seq_mod\n"
+        "from superbrain.composition import hook_entry\n"
+        "orig_write = ob_mod.write_stream_cursor\n"
+        "def _crash_after_frame(sdir, cursor, perms):\n"
+        "    if any(Path(sdir).glob('*.frame')):\n"
+        "        sys.stderr.write('CRASHPOINT_HIT post_publish_cursor\\n')\n"
+        "        sys.stderr.flush()\n"
+        "        os._exit(86)\n"
+        "    return orig_write(sdir, cursor, perms)\n"
+        "ob_mod.write_stream_cursor = _crash_after_frame\n"
+        "seq_mod.write_stream_cursor = _crash_after_frame\n"
+        "raise SystemExit(hook_entry.main(sys.argv[1:]))\n"
+    )
+    return subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            script,
+            "--outbox",
+            str(outbox_dir),
+            "--harness",
+            "claude-code",
+            "--checkout",
+            str(chk),
+            "--producer-stream",
+            producer_stream,
+        ],
+        cwd=chk,
+        env=clean_installed_subprocess_env(),
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=15.0,
+        check=False,
+    )
+
+
+def test_r6_finding1_hook_binding_survives_pre_and_post_publish_crashes_and_post_ack_retry(
+    trusted_tmp: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Hook binding keeps exact (stream, sequence, event_id) across pre/post-publish crashes, ACK, & conflict."""
+    _install_fake_host_bins(trusted_tmp, monkeypatch)
+    clock = FakeClock(datetime.now(UTC).replace(microsecond=0))
+    mono = FakeMonotonicClock(1_000_000_000)
+    os_ = os_adapters(clock=clock, monotonic=mono)
+    _priv, s_enr = _ssh_signer()
+
+    cfg_dir = trusted_tmp / "cfg"
+    data_root = trusted_tmp / "data"
+    chk_a = trusted_tmp / "chk-r6"
+    for d in (cfg_dir, chk_a):
+        d.mkdir(parents=True, exist_ok=True)
+        os_.permissions.secure_directory(d)
+
+    rep = init_entry.init_store(
+        init_entry.InitRequest(
+            data_root=data_root, config_dir=cfg_dir, owner_id=_OWNER, machine_id=_MACHINE, signer=s_enr
+        ),
+        os_,
+    )
+    cfg = read_daemon_config(rep.daemon_config_path, os_)
+    ca_pem = (cfg_dir / "tls" / "ca.pem").read_text(encoding="utf-8")
+
+    rt = reopen_kernel_job_runtime(data_root, rep.store_id, os_)
+    try:
+        mcp_c = seed_principal_and_credential(rt.policy, owner_id=_OWNER, harness_id="claude-code", machine_id=_MACHINE)
+        cap_a = seed_principal_and_credential(rt.policy, owner_id=_OWNER, harness_id="claude-code", machine_id=_MACHINE)
+        cap_b = seed_principal_and_credential(rt.policy, owner_id=_OWNER, harness_id="claude-code", machine_id=_MACHINE)
+        cap_c2 = seed_principal_and_credential(
+            rt.policy, owner_id=_OWNER, harness_id="claude-code", machine_id=_MACHINE
+        )
+        ws_a = register_workspace_direct(rt, clock, mcp_c.principal, alias="ws-r6", checkout_dir=chk_a)
+        rt.store.reconcile_policy()
+    finally:
+        rt.close()
+
+    with _serve_daemon(cfg, os_, clock, mono) as (ready, loop):
+        target = LoopbackTarget(
+            endpoint=ready.endpoint,
+            expected_store_id=rep.store_id,
+            ca_pem=ca_pem,
+            leaf_cert_sha256=ready.leaf_cert_sha256,
+        )
+        cap_client = CaptureClient(LoopbackClient(monotonic_ns=mono.monotonic_ns))
+
+        # --- Case A: Window 1 crash (before frame publish via SUPERBRAIN_CRASHPOINT) ---
+        outbox_a = trusted_tmp / "outbox-r6-w1"
+        ev_w1_1 = _observed_claude_post_tool(chk_a, tool_use_id="toolu_r6_w1", cmd="pytest -k w1")
+        ev_w1_2 = _observed_claude_post_tool(chk_a, tool_use_id="toolu_r6_w1_2", cmd="pytest -k w1_2")
+
+        p_w1_crash = _run_hook_cli_subproc(
+            outbox_a,
+            chk_a,
+            ev_w1_1,
+            crashpoint="capture.outbox.after_write_before_fsync",
+        )
+        assert p_w1_crash.returncode == 86, (p_w1_crash.returncode, p_w1_crash.stderr)
+        assert "CRASHPOINT_HIT capture.outbox.after_write_before_fsync" in p_w1_crash.stderr
+
+        spool_a = OutboxSpool(outbox_a, permissions=os_.permissions)
+        assert spool_a.read_pending(limit=10) == []
+
+        p_w1_retry = _run_hook_cli_subproc(outbox_a, chk_a, ev_w1_1)
+        assert p_w1_retry.returncode == 0, p_w1_retry.stderr
+        pend_a1 = _pending_event_tuples(spool_a)
+        assert len(pend_a1) == 1 and pend_a1[0][0] == 1
+        ev_id_1 = pend_a1[0][1]
+        stream_a = spool_a.read_pending(limit=10)[0].producer_stream
+
+        p_w1_next = _run_hook_cli_subproc(outbox_a, chk_a, ev_w1_2)
+        assert p_w1_next.returncode == 0, p_w1_next.stderr
+        pend_a2 = _pending_event_tuples(spool_a, producer_stream=stream_a)
+        assert len(pend_a2) == 2
+        assert pend_a2[0] == (1, ev_id_1)
+        assert pend_a2[1][0] == 2 and pend_a2[1][1] != ev_id_1
+        ev_id_2 = pend_a2[1][1]
+
+        _publish_capture_creds(loop, [(cap_a, stream_a, ws_a)])
+        ack_a = drain_outbox(
+            spool_a,
+            client=cap_client,
+            target=target,
+            producer_stream=stream_a,
+            repo_id=ws_a.repo_id,
+            checkout_id=ws_a.checkout_id,
+            token=cap_a.token,
+        )
+        assert ack_a is not None and ack_a.accepted_count == 2
+        assert ack_a.contiguous_event_acked_through == 2
+        assert [(r[0], r[1]) for r in _capture_events_for_stream(loop, stream_a)] == [(1, ev_id_1), (2, ev_id_2)]
+        assert _capture_gaps_for_stream(loop, stream_a) == []
+
+        # --- Case B: Window 2 crash (AFTER frame publish, BEFORE post-publish cursor update) + retry while pending ---
+        outbox_b = trusted_tmp / "outbox-r6-w2a"
+        stream_b = "stream-r6-w2a"
+        ev_w2a_1 = _observed_claude_post_tool(chk_a, tool_use_id="toolu_r6_w2a", cmd="pytest -k w2a")
+        ev_w2a_2 = _observed_claude_post_tool(chk_a, tool_use_id="toolu_r6_w2a_2", cmd="pytest -k w2a_2")
+
+        p_w2a_crash = _run_hook_crash_post_publish_cursor(outbox_b, chk_a, ev_w2a_1, producer_stream=stream_b)
+        assert p_w2a_crash.returncode == 86, (p_w2a_crash.returncode, p_w2a_crash.stderr)
+
+        spool_b = OutboxSpool(outbox_b, permissions=os_.permissions)
+        pend_b1 = _pending_event_tuples(spool_b, producer_stream=stream_b)
+        assert len(pend_b1) == 1 and pend_b1[0][0] == 1
+        ev_id_a = pend_b1[0][1]
+
+        p_w2a_retry = _run_hook_cli_subproc(outbox_b, chk_a, ev_w2a_1, producer_stream=stream_b)
+        assert p_w2a_retry.returncode == 0, p_w2a_retry.stderr
+        assert _pending_event_tuples(spool_b, producer_stream=stream_b) == [(1, ev_id_a)]
+
+        p_w2a_next = _run_hook_cli_subproc(outbox_b, chk_a, ev_w2a_2, producer_stream=stream_b)
+        assert p_w2a_next.returncode == 0, p_w2a_next.stderr
+        pend_b2 = _pending_event_tuples(spool_b, producer_stream=stream_b)
+        assert len(pend_b2) == 2 and pend_b2[0] == (1, ev_id_a) and pend_b2[1][0] == 2
+        ev_id_b = pend_b2[1][1]
+        assert ev_id_b != ev_id_a
+
+        _publish_capture_creds(loop, [(cap_a, stream_a, ws_a), (cap_b, stream_b, ws_a)])
+        ack_b = drain_outbox(
+            spool_b,
+            client=cap_client,
+            target=target,
+            producer_stream=stream_b,
+            repo_id=ws_a.repo_id,
+            checkout_id=ws_a.checkout_id,
+            token=cap_b.token,
+        )
+        assert ack_b is not None and ack_b.accepted_count == 2
+        assert ack_b.contiguous_event_acked_through == 2
+        assert [(r[0], r[1]) for r in _capture_events_for_stream(loop, stream_b)] == [(1, ev_id_a), (2, ev_id_b)]
+        assert _capture_gaps_for_stream(loop, stream_b) == []
+
+        # --- Case C: Window 2 crash + drain/ACK eviction FIRST + retry AFTER ACK + subsequent new event ---
+        outbox_c = trusted_tmp / "outbox-r6-w2b"
+        stream_c = "stream-r6-w2b"
+        ev_w2b_1 = _observed_claude_post_tool(chk_a, tool_use_id="toolu_r6_w2b", cmd="pytest -k w2b")
+        ev_w2b_2 = _observed_claude_post_tool(chk_a, tool_use_id="toolu_r6_w2b_2", cmd="pytest -k w2b_2")
+
+        p_w2b_crash = _run_hook_crash_post_publish_cursor(outbox_c, chk_a, ev_w2b_1, producer_stream=stream_c)
+        assert p_w2b_crash.returncode == 86, (p_w2b_crash.returncode, p_w2b_crash.stderr)
+
+        spool_c = OutboxSpool(outbox_c, permissions=os_.permissions)
+        pend_c1 = _pending_event_tuples(spool_c, producer_stream=stream_c)
+        assert len(pend_c1) == 1 and pend_c1[0][0] == 1
+        ev_id_b1 = pend_c1[0][1]
+
+        _publish_capture_creds(
+            loop,
+            [(cap_a, stream_a, ws_a), (cap_b, stream_b, ws_a), (cap_c2, stream_c, ws_a)],
+        )
+        ack_c1 = drain_outbox(
+            spool_c,
+            client=cap_client,
+            target=target,
+            producer_stream=stream_c,
+            repo_id=ws_a.repo_id,
+            checkout_id=ws_a.checkout_id,
+            token=cap_c2.token,
+        )
+        assert ack_c1 is not None and ack_c1.accepted_count == 1
+        assert ack_c1.contiguous_event_acked_through == 1
+        assert spool_c.read_pending(limit=10, producer_stream=stream_c) == []
+
+        p_w2b_retry = _run_hook_cli_subproc(outbox_c, chk_a, ev_w2b_1, producer_stream=stream_c)
+        assert p_w2b_retry.returncode == 0, p_w2b_retry.stderr
+        pend_c_retry = _pending_event_tuples(spool_c, producer_stream=stream_c)
+        assert pend_c_retry in ([], [(1, ev_id_b1)]), f"retry must never allocate seq=2: {pend_c_retry}"
+        if pend_c_retry:
+            ack_cr = drain_outbox(
+                spool_c,
+                client=cap_client,
+                target=target,
+                producer_stream=stream_c,
+                repo_id=ws_a.repo_id,
+                checkout_id=ws_a.checkout_id,
+                token=cap_c2.token,
+            )
+            assert ack_cr is not None and ack_cr.accepted_count == 0 and ack_cr.deduped_count == 1
+
+        p_w2b_next = _run_hook_cli_subproc(outbox_c, chk_a, ev_w2b_2, producer_stream=stream_c)
+        assert p_w2b_next.returncode == 0, p_w2b_next.stderr
+        pend_c2 = _pending_event_tuples(spool_c, producer_stream=stream_c)
+        assert len(pend_c2) == 1 and pend_c2[0][0] == 2 and pend_c2[0][1] != ev_id_b1
+        ev_id_b2 = pend_c2[0][1]
+
+        ack_c2 = drain_outbox(
+            spool_c,
+            client=cap_client,
+            target=target,
+            producer_stream=stream_c,
+            repo_id=ws_a.repo_id,
+            checkout_id=ws_a.checkout_id,
+            token=cap_c2.token,
+        )
+        assert ack_c2 is not None and ack_c2.accepted_count == 1
+        assert ack_c2.contiguous_event_acked_through == 2
+        assert [(r[0], r[1]) for r in _capture_events_for_stream(loop, stream_c)] == [(1, ev_id_b1), (2, ev_id_b2)]
+        assert _capture_gaps_for_stream(loop, stream_c) == []
+
+    # --- Case D1: Gap fallback uses bound sequence, retry publishes event at seq=1, next gets seq=2 ---
+    outbox_d1 = trusted_tmp / "outbox-r6-d1"
+    stream_d1 = "stream-r6-d1"
+    ev_d1_1 = _observed_claude_post_tool(chk_a, tool_use_id="toolu_r6_d1", cmd="pytest -k d1")
+    ev_d1_2 = _observed_claude_post_tool(chk_a, tool_use_id="toolu_r6_d1_2", cmd="pytest -k d1_2")
+
+    publish_failed = [False]
+
+    class _FailPublishOnceSpool(OutboxSpool):
+        def _atomic_publish_frame(
+            self,
+            final_path: Path,
+            part_path: Path,
+            frame_bytes: bytes,
+            *,
+            crashpoint_name: str | None = None,
+            deadline_ns: int | None = None,
+        ) -> None:
+            if f"_{OUTBOX_RECORD_EVENT}_" in final_path.name and not publish_failed[0]:
+                publish_failed[0] = True
+                raise BrainError(ErrorCode.DEADLINE_EXCEEDED, "simulated frame publish deadline exceeded")
+            super()._atomic_publish_frame(
+                final_path,
+                part_path,
+                frame_bytes,
+                crashpoint_name=crashpoint_name,
+                deadline_ns=deadline_ns,
+            )
+
+    assert (
+        hook_entry.run_hook(
+            json.dumps(ev_d1_1).encode("utf-8"),
+            outbox_dir=outbox_d1,
+            default_harness_id="claude-code",
+            checkout_root=chk_a,
+            producer_stream=stream_d1,
+            spool_factory=lambda ob: _FailPublishOnceSpool(ob, permissions=os_.permissions),
+        )
+        == 0
+    )
+    spool_d1 = OutboxSpool(outbox_d1, permissions=os_.permissions)
+    d1_gap_entries = spool_d1.read_pending(limit=10, producer_stream=stream_d1)
+    assert len(d1_gap_entries) == 1
+    assert d1_gap_entries[0].record_kind == OUTBOX_RECORD_GAP
+    assert d1_gap_entries[0].sequence == 1
+
+    assert (
+        hook_entry.run_hook(
+            json.dumps(ev_d1_1).encode("utf-8"),
+            outbox_dir=outbox_d1,
+            default_harness_id="claude-code",
+            checkout_root=chk_a,
+            producer_stream=stream_d1,
+        )
+        == 0
+    )
+    d1_ev_pend = _pending_event_tuples(spool_d1, producer_stream=stream_d1)
+    assert len(d1_ev_pend) == 1 and d1_ev_pend[0][0] == 1
+    ev_id_d1 = d1_ev_pend[0][1]
+
+    assert (
+        hook_entry.run_hook(
+            json.dumps(ev_d1_2).encode("utf-8"),
+            outbox_dir=outbox_d1,
+            default_harness_id="claude-code",
+            checkout_root=chk_a,
+            producer_stream=stream_d1,
+        )
+        == 0
+    )
+    d1_ev_pend2 = _pending_event_tuples(spool_d1, producer_stream=stream_d1)
+    assert len(d1_ev_pend2) == 2 and d1_ev_pend2[0] == (1, ev_id_d1) and d1_ev_pend2[1][0] == 2
+
+    # --- Case D2: Payload conflict on same dedup_key AFTER ACK fails closed with IDEMPOTENCY_CONFLICT ---
+    outbox_d2 = trusted_tmp / "outbox-r6-d2"
+    spool_d2 = OutboxSpool(outbox_d2, permissions=os_.permissions)
+    stream_d2 = "stream-r6-d2"
+    dk_d2 = digest_bytes(b"r6-conflict-dedup-key")
+
+    rec_orig = spool_d2.enqueue_hook_event(
+        producer_stream=stream_d2,
+        build_event=lambda seq, ev_id, rec_at: CaptureEventRecord(
+            event_id=ev_id,
+            producer_stream=stream_d2,
+            sequence=seq,
+            harness_id="claude-code",
+            kind="command_result",
+            recorded_at=rec_at,
+            payload={"command": "pytest -k original"},
+        ),
+        dedup_key=dk_d2,
+        fallback_recorded_at="2026-11-27T05:00:00Z",
+    )
+    assert rec_orig.sequence == 1
+    assert (
+        spool_d2.apply_ack(
+            CaptureBatchAck(
+                producer_stream=stream_d2,
+                repo_id="repo-d2",
+                checkout_id="chk-d2",
+                committed_event_sequences=(1,),
+                contiguous_event_acked_through=1,
+                acked_producer_gap_sequences=(),
+                accepted_count=1,
+                deduped_count=0,
+                policy_disabled=False,
+            )
+        )
+        == 1
+    )
+    assert spool_d2.read_pending(limit=10, producer_stream=stream_d2) == []
+
+    with pytest.raises(BrainError) as conflict_err:
+        spool_d2.enqueue_hook_event(
+            producer_stream=stream_d2,
+            build_event=lambda seq, ev_id, rec_at: CaptureEventRecord(
+                event_id=ev_id,
+                producer_stream=stream_d2,
+                sequence=seq,
+                harness_id="claude-code",
+                kind="command_result",
+                recorded_at=rec_at,
+                payload={"command": "pytest -k tampered-different-payload"},
+            ),
+            dedup_key=dk_d2,
+            fallback_recorded_at="2026-11-27T05:00:05Z",
+        )
+    assert conflict_err.value.code is ErrorCode.IDEMPOTENCY_CONFLICT
