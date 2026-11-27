@@ -13,6 +13,7 @@ import time
 import uuid
 import zlib
 from collections.abc import Callable
+from contextvars import ContextVar, Token
 from pathlib import Path
 
 from superbrain.core._kernel_base import require_sha256_digest
@@ -41,6 +42,22 @@ _BUSY_REPLACE_DELAYS = (0.01, 0.02, 0.05, 0.1, 0.2)
 _O_BINARY = getattr(os, "O_BINARY", 0)
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _ORIG_PATH_IS_SYMLINK = Path.is_symlink
+_ACTIVE_DEADLINE_CHECK: ContextVar[Callable[[], None] | None] = ContextVar("_outbox_deadline_check", default=None)
+
+
+def push_deadline_check(fn: Callable[[], None] | None) -> Token[Callable[[], None] | None]:
+    """Bind active deadline callback for locked outbox I/O retries and replace operations."""
+    return _ACTIVE_DEADLINE_CHECK.set(fn)
+
+
+def reset_deadline_check(tok: Token[Callable[[], None] | None]) -> None:
+    """Restore prior deadline callback on lock exit."""
+    _ACTIVE_DEADLINE_CHECK.reset(tok)
+
+
+def active_deadline_check() -> Callable[[], None] | None:
+    """Return active bound deadline callback, if any."""
+    return _ACTIVE_DEADLINE_CHECK.get()
 
 
 def thread_lock_for(path: Path) -> threading.RLock:
@@ -154,8 +171,11 @@ def parse_frame_filename_identity(name: str) -> tuple[str, int] | None:
 
 
 def replace_file_resilient(src: Path, dst: Path) -> None:
-    """Replace ``dst`` with ``src``, retrying briefly on transient OS sharing/access-denied locks."""
+    """Replace ``dst`` with ``src``, enforcing active deadline before attempt and before each busy retry."""
     for delay in (*_BUSY_REPLACE_DELAYS, None):
+        dl = _ACTIVE_DEADLINE_CHECK.get()
+        if dl is not None:
+            dl()
         try:
             os.replace(src, dst)
             return
@@ -455,11 +475,14 @@ def ensure_v4_fence(
         fd = os.open(tmp, os.O_RDWR | os.O_CREAT | os.O_EXCL | _O_BINARY | _O_NOFOLLOW, 0o600)
         write_all_fd(fd, canonical_json({"schema_version": 4}))
         perms.secure_file(tmp)
-        if check_deadline is not None:
-            check_deadline()
+        dl = check_deadline or _ACTIVE_DEADLINE_CHECK.get()
+        if dl is not None:
+            dl()
         os.fsync(fd)
         os.close(fd)
         fd = -1
+        if dl is not None:
+            dl()
         replace_file_resilient(tmp, fence)
         sync_dir(streams_dir)
         committed = True
@@ -539,13 +562,16 @@ def publish_outbox_frame_atomic(
         fd = os.open(part_path, os.O_RDWR | os.O_CREAT | os.O_EXCL | _O_BINARY | _O_NOFOLLOW, 0o600)
         write_all_fd(fd, frame_bytes)
         perms.secure_file(part_path)
-        if check_deadline is not None:
-            check_deadline()
+        dl = check_deadline or _ACTIVE_DEADLINE_CHECK.get()
+        if dl is not None:
+            dl()
         if crashpoint_name is not None:
             maybe_crashpoint(crashpoint_name)
         os.fsync(fd)
         os.close(fd)
         fd = -1
+        if dl is not None:
+            dl()
         replace_file_resilient(part_path, final_path)
         sync_dir(final_path.parent)
         committed = True

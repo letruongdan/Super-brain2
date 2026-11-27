@@ -14,6 +14,7 @@ from superbrain.core._kernel_base import require_sha256_digest
 from superbrain.core.canonical import canonical_json
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.ports.capture import (
+    CaptureEventRecord,
     OutboxDirRenamer,
     OutboxPermissionsPort,
     require_capture_sequence,
@@ -23,6 +24,7 @@ from superbrain.storage._outbox_io import (
     _O_BINARY,
     _O_NOFOLLOW,
     _PART_SUFFIX,
+    active_deadline_check,
     ensure_dir_tree_atomic,
     entry_is_link,
     is_link_path,
@@ -246,9 +248,14 @@ def write_prepared_binding_bucket(
         fd = os.open(tmp_path, os.O_RDWR | os.O_CREAT | os.O_EXCL | _O_BINARY | _O_NOFOLLOW, 0o600)
         write_all_fd(fd, payload)
         perms.secure_file(tmp_path)
+        dl = check_deadline or active_deadline_check()
+        if dl is not None:
+            dl()
         os.fsync(fd)
         os.close(fd)
         fd = -1
+        if dl is not None:
+            dl()
         replace_file_resilient(tmp_path, final_path)
         sync_dir(bdir)
         committed = True
@@ -281,3 +288,38 @@ def upsert_binding(
             stream_dir, bucket_name, payload, perms, renamer=renamer, check_deadline=check_deadline
         )
     return added
+
+
+def backfill_binding_digest_if_missing(
+    stream_dir: Path,
+    cached: HookBindingRecord | None,
+    payload_digest: str,
+    perms: OutboxPermissionsPort,
+    *,
+    renamer: OutboxDirRenamer | None,
+    check_deadline: Callable[[], None] | None,
+) -> None:
+    """Backfill ``payload_digest`` on a v1-migrated binding when first observed on retry."""
+    if cached is None or cached.payload_digest is not None:
+        return
+    updated = HookBindingRecord(cached.key, cached.sequence, cached.event_id, cached.recorded_at, payload_digest)
+    upsert_binding(stream_dir, updated, perms, renamer=renamer, check_deadline=check_deadline)
+
+
+def prepare_hook_binding_upsert(
+    stream_dir: Path,
+    *,
+    dedup_key: str | None,
+    record: CaptureEventRecord,
+    payload_digest: str,
+    perms: OutboxPermissionsPort,
+    preloaded_entries: dict[str, HookBindingRecord] | None = None,
+) -> tuple[HookBindingRecord, str, bytes | None, bool] | None:
+    """Validate and serialize sharded binding update before mutating cursor state."""
+    if dedup_key is None:
+        return None
+    binding = HookBindingRecord(dedup_key, record.sequence, record.event_id, record.recorded_at, payload_digest)
+    bucket_name, payload, added = prepare_binding_upsert(
+        stream_dir, binding, perms, preloaded_entries=preloaded_entries
+    )
+    return binding, bucket_name, payload, added

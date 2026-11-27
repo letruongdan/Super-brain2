@@ -16,6 +16,7 @@ from superbrain.storage._outbox_io import (
     _O_BINARY,
     _O_NOFOLLOW,
     _PART_SUFFIX,
+    active_deadline_check,
     ensure_dir_tree_atomic,
     entry_is_link,
     is_link_path,
@@ -413,13 +414,14 @@ def write_ack_pages(
             fd = os.open(tmp_path, os.O_RDWR | os.O_CREAT | os.O_EXCL | _O_BINARY | _O_NOFOLLOW, 0o600)
             write_all_fd(fd, payload)
             perms.secure_file(tmp_path)
-            if check_deadline is not None:
-                check_deadline()
+            dl = check_deadline or active_deadline_check()
+            if dl is not None:
+                dl()
             os.fsync(fd)
             os.close(fd)
             fd = -1
-            if check_deadline is not None:
-                check_deadline()
+            if dl is not None:
+                dl()
             replace_file_resilient(tmp_path, final_path)
             committed = True
         except BrainError:

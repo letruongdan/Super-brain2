@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import shutil
+import subprocess
+import sys
+import tarfile
+import time
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -14,7 +19,7 @@ from superbrain.adapters.os import os_adapters
 from superbrain.core.canonical import canonical_json, digest_bytes
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.ports.capture import CaptureBatchAck, CaptureEventRecord, OutboxPermissionsPort, ProducerCaptureGap
-from superbrain.storage import _outbox_acks, _outbox_seq
+from superbrain.storage import _outbox_acks, _outbox_bindings, _outbox_seq
 from superbrain.storage._outbox_io import _STREAMS_DIR, replace_file_resilient, stream_dir_key
 from superbrain.storage._outbox_seq import read_stream_cursor
 from superbrain.storage.outbox import OutboxSpool
@@ -548,3 +553,242 @@ def test_r10_f10_recovery_capacity_overflow_is_pure_preflight(trusted_tmp: Path)
     assert cur_path.read_bytes() == initial_bytes
     assert not (sdir / ".bindings").exists()
     assert not (sdir / ".acks").exists()
+
+
+def _snapshot_tree_bytes(directory: Path) -> dict[str, bytes]:
+    if not directory.exists():
+        return {}
+    return {
+        p.relative_to(directory).as_posix(): p.read_bytes()
+        for p in sorted(directory.rglob("*"))
+        if p.is_file()
+    }
+
+
+def _repo_root_with_36bf08d9() -> Path | None:
+    cur = Path(__file__).resolve().parent
+    while cur != cur.parent:
+        if (cur / ".git").exists():
+            chk = subprocess.run(
+                ["git", "-C", str(cur), "cat-file", "-e", "36bf08d9^{commit}"],
+                capture_output=True,
+                check=False,
+            )
+            if chk.returncode == 0:
+                return cur
+        cur = cur.parent
+    return None
+
+
+def test_r10_f11_legacy_binary_blocked_before_sibling_cursor_recovery(trusted_tmp: Path) -> None:
+    """Upgrading stream A to v4 fences all existing sibling cursors so legacy 36bf08d9 mutates zero bytes on B."""
+    perms = os_adapters().permissions
+    outbox = trusted_tmp / "outbox-r10-f11"
+    stream_a, stream_b = "stream-r10-f11-a", "stream-r10-f11-b"
+    spool = OutboxSpool(outbox, permissions=perms)
+    _enqueue_hook(spool, stream=stream_a, dk=digest_bytes(b"r10-f11-a1"), explicit_seq=1)
+
+    pending_b = [digest_bytes(b"r10-f11-b-pending"), 1, "ev-f11-b1", _REC_AT, digest_bytes(b"payload-f11-b")]
+    cur_b_obj: dict[str, Any] = {
+        "schema_version": 3, "next_seq": 2, "binding_count": 0, "acked_ranges": [], "pending_binding": pending_b,
+    }
+    cur_b_path, _ = _write_cursor_json(outbox, stream_b, cur_b_obj, perms)
+    cur_a_obj: dict[str, Any] = {
+        "schema_version": 3, "next_seq": 2, "binding_count": 1, "acked_ranges": [], "pending_binding": None,
+    }
+    _write_cursor_json(outbox, stream_a, cur_a_obj, perms)
+
+    spool.apply_ack(_ack(stream_a, committed=(1,)))
+    cur_b_after = json.loads(cur_b_path.read_text(encoding="utf-8"))
+    assert cur_b_after["schema_version"] == 4
+    assert cur_b_after["pending_binding"] is None
+
+    repo_root = _repo_root_with_36bf08d9()
+    if repo_root is None:
+        return
+    legacy_root = trusted_tmp / "legacy-src-36bf08d9"
+    legacy_root.mkdir(parents=True)
+    tar_bytes = subprocess.check_output(["git", "-C", str(repo_root), "archive", "--format=tar", "36bf08d9", "src"])
+    with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:") as tf:
+        tf.extractall(legacy_root, filter="data")
+    sdir_b = _stream_dir(outbox, stream_b)
+    snap_before = _snapshot_tree_bytes(sdir_b)
+    probe_script = (
+        "import sys\n"
+        "from pathlib import Path\n"
+        f"sys.path.insert(0, {str(legacy_root / 'src')!r})\n"
+        "from superbrain.adapters.os import os_adapters\n"
+        "from superbrain.core.canonical import digest_bytes\n"
+        "from superbrain.core.errors import BrainError, ErrorCode\n"
+        "from superbrain.ports.capture import CaptureEventRecord, ProducerCaptureGap\n"
+        "from superbrain.storage.outbox import OutboxSpool\n"
+        f"spool = OutboxSpool(Path({str(outbox)!r}), permissions=os_adapters().permissions)\n"
+        "try:\n"
+        "    spool.enqueue_hook_event(\n"
+        f"        producer_stream={stream_b!r},\n"
+        "        build_event=lambda s, e, r: CaptureEventRecord(\n"
+        f"            event_id=e, producer_stream={stream_b!r}, sequence=s, harness_id='claude-code',\n"
+        "            kind='command_result', recorded_at=r, payload={'n': 'legacy'},\n"
+        "        ),\n"
+        "        dedup_key=digest_bytes(b'r10-f11-legacy-b2'),\n"
+        f"        fallback_recorded_at={_REC_AT!r},\n"
+        "    )\n"
+        "    raise AssertionError('expected INTEGRITY_FAILURE')\n"
+        "except BrainError as err:\n"
+        "    assert err.code is ErrorCode.INTEGRITY_FAILURE, err\n"
+    )
+    proc = subprocess.run([sys.executable, "-I", "-c", probe_script], capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    assert _snapshot_tree_bytes(sdir_b) == snap_before
+
+
+def test_r10_f12_cursor_frame_fence_and_eviction_honor_cutoff(
+    trusted_tmp: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Deadline expiration during fsync or busy-replace stops frame/cursor publication and frame eviction."""
+    perms = os_adapters().permissions
+    real_fsync = os.fsync
+
+    # (a) Frame fsync expiration -> no frame published on direct enqueue_gap
+    now_a = [0]
+    spool_a = OutboxSpool(trusted_tmp / "outbox-r10-f12-frame", permissions=perms, monotonic_ns=lambda: now_a[0])
+
+    def _expire_on_fsync_a(fd: int) -> None:
+        real_fsync(fd)
+        now_a[0] = 2_000
+
+    with monkeypatch.context() as mp:
+        mp.setattr(os, "fsync", _expire_on_fsync_a)
+        with pytest.raises(BrainError) as err_a:
+            spool_a.enqueue_gap(_mk_gap("s-f12-a", 1), deadline_ns=1_000)
+        assert err_a.value.code is ErrorCode.DEADLINE_EXCEEDED
+    assert spool_a.read_pending(limit=10, producer_stream="s-f12-a") == []
+
+    # (b) Cursor fsync expiration during apply_ack -> cursor untouched, frames kept
+    now_b, hit_b = [0], [0]
+    outbox_b, stream_b = trusted_tmp / "outbox-r10-f12-cur", "s-f12-b"
+    spool_b = OutboxSpool(outbox_b, permissions=perms, monotonic_ns=lambda: now_b[0])
+    spool_b.enqueue_event(_mk_event(stream_b, 1))
+    cur_b_init: dict[str, Any] = {
+        "schema_version": 4, "next_seq": 2, "binding_count": 0,
+        "contiguous_acked_through": 0, "acked_pages": [], "pending_binding": None,
+    }
+    cur_b = _write_cursor_json(outbox_b, stream_b, cur_b_init, perms)[0]
+    cur_before = cur_b.read_bytes()
+
+    def _expire_on_first_fsync_b(fd: int) -> None:
+        real_fsync(fd)
+        hit_b[0] += 1
+        if hit_b[0] == 1:
+            now_b[0] = 2_000
+
+    with monkeypatch.context() as mp:
+        mp.setattr(os, "fsync", _expire_on_first_fsync_b)
+        with pytest.raises(BrainError) as err_b:
+            spool_b.apply_ack(_ack(stream_b, committed=(1,)), deadline_ns=1_000)
+        assert err_b.value.code is ErrorCode.DEADLINE_EXCEEDED
+    assert cur_b.read_bytes() == cur_before
+    assert [e.sequence for e in spool_b.read_pending(limit=10, producer_stream=stream_b)] == [1]
+
+    # (c) replace_file_resilient sharing violation retry honors active deadline
+    now_c, calls_c = [0], [0]
+    orig_replace = os.replace
+    spool_c = OutboxSpool(trusted_tmp / "outbox-r10-f12-retry", permissions=perms, monotonic_ns=lambda: now_c[0])
+    (trusted_tmp / "outbox-r10-f12-retry").mkdir(parents=True, exist_ok=True)
+    perms.secure_directory(trusted_tmp / "outbox-r10-f12-retry")
+
+    def _busy_then_expire(src: Path | str, dst: Path | str) -> None:
+        calls_c[0] += 1
+        if calls_c[0] == 1:
+            now_c[0] = 2_000
+            err = OSError("sharing violation")
+            err.winerror = 32
+            raise err
+        orig_replace(src, dst)
+
+    with monkeypatch.context() as mp:
+        mp.setattr(os, "replace", _busy_then_expire)
+        mp.setattr(time, "sleep", lambda _d: None)
+        with pytest.raises(BrainError) as err_c:
+            spool_c.enqueue_gap(_mk_gap("s-f12-c", 1), deadline_ns=1_000)
+        assert err_c.value.code is ErrorCode.DEADLINE_EXCEEDED
+    assert calls_c[0] == 1
+
+    # (d) apply_ack eviction loop stops before remaining unlinks once deadline expires
+    now_d = [0]
+    outbox_d, stream_d = trusted_tmp / "outbox-r10-f12-evict", "s-f12-d"
+    spool_d = OutboxSpool(outbox_d, permissions=perms, monotonic_ns=lambda: now_d[0])
+    spool_d.enqueue_event(_mk_event(stream_d, 1))
+    spool_d.enqueue_event(_mk_event(stream_d, 2))
+    orig_decode = OutboxSpool._decode_frame_file
+    dec_count = [0]
+
+    def _expire_on_second_decode(self: OutboxSpool, path: Path) -> Any:
+        dec_count[0] += 1
+        if dec_count[0] == 2:
+            now_d[0] = 2_000
+        return orig_decode(self, path)
+
+    with monkeypatch.context() as mp:
+        mp.setattr(OutboxSpool, "_decode_frame_file", _expire_on_second_decode)
+        with pytest.raises(BrainError) as err_d:
+            spool_d.apply_ack(_ack(stream_d, committed=(1, 2)), deadline_ns=1_000)
+        assert err_d.value.code is ErrorCode.DEADLINE_EXCEEDED
+    assert [e.sequence for e in spool_d.read_pending(limit=10, producer_stream=stream_d)] == [2]
+
+
+def test_r10_f13_direct_enqueue_matched_retry_fails_on_missing_ack_page(trusted_tmp: Path) -> None:
+    """Matched direct enqueue_gap/enqueue_event retry must fail closed if a committed .acks page is missing."""
+    perms = os_adapters().permissions
+    outbox, stream = trusted_tmp / "outbox-r10-f13", "stream-r10-f13"
+    spool = OutboxSpool(outbox, permissions=perms)
+    _enqueue_hook(spool, stream=stream, dk=digest_bytes(b"r10-f13-hook"))
+    spool.apply_ack(_ack(stream, committed=(5_000,)))
+
+    gap = _mk_gap(stream, 1, gap_id="gap-r10-f13")
+    ev = _mk_event(stream, 2, event_id="ev-r10-f13")
+    spool.enqueue_gap(gap)
+    spool.enqueue_event(ev)
+
+    next((_stream_dir(outbox, stream) / ".acks").glob("*.json")).unlink()
+    with pytest.raises(BrainError) as err_gap:
+        spool.enqueue_gap(gap)
+    assert err_gap.value.code is ErrorCode.INTEGRITY_FAILURE
+    with pytest.raises(BrainError) as err_ev:
+        spool.enqueue_event(ev)
+    assert err_ev.value.code is ErrorCode.INTEGRITY_FAILURE
+
+
+def test_r10_f14_hook_binding_cap_and_byte_cap_preflight_before_recovery(
+    trusted_tmp: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """enqueue_hook_event hitting max_binding_keys after interrupted pending_binding must leave disk unchanged."""
+    perms = os_adapters().permissions
+    outbox, stream = trusted_tmp / "outbox-r10-f14", "stream-r10-f14"
+    spool = cast(Any, OutboxSpool)(outbox, permissions=perms, max_binding_keys=1)
+
+    def _fail_bucket(*_a: Any, **_kw: Any) -> None:
+        raise BrainError(ErrorCode.IO_ERROR, "simulated bucket crash")
+
+    outbox_mod_ref = sys.modules["superbrain.storage.outbox"]
+    with monkeypatch.context() as mp:
+        mp.setattr(outbox_mod_ref, "write_prepared_binding_bucket", _fail_bucket)
+        mp.setattr(_outbox_bindings, "write_prepared_binding_bucket", _fail_bucket)
+        with pytest.raises(BrainError) as err_init:
+            _enqueue_hook(spool, stream=stream, dk=digest_bytes(b"r10-f14-k1"), explicit_seq=1)
+        assert err_init.value.code is ErrorCode.IO_ERROR
+    del outbox_mod_ref
+
+    sdir = _stream_dir(outbox, stream)
+    cur_path = sdir / ".seq_cursor.json"
+    initial_cursor = cur_path.read_bytes()
+    assert not (sdir / ".bindings").exists()
+
+    with pytest.raises(BrainError) as err_cap:
+        _enqueue_hook(spool, stream=stream, dk=digest_bytes(b"r10-f14-k2"))
+    assert err_cap.value.code is ErrorCode.STORAGE_FULL
+    assert cur_path.read_bytes() == initial_cursor
+    assert not (sdir / ".bindings").exists()
+
+    retried = _enqueue_hook(spool, stream=stream, dk=digest_bytes(b"r10-f14-k1"), explicit_seq=1)
+    assert retried.sequence == 1
