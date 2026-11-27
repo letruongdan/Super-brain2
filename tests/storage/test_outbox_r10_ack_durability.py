@@ -519,7 +519,7 @@ def test_r10_f9_write_ack_pages_skips_replace_after_fsync_deadline(
         now[0] = 2_000
 
     with monkeypatch.context() as mp:
-        mp.setattr(_outbox_acks.os, "fsync", _expire_during_fsync)
+        mp.setattr(os, "fsync", _expire_during_fsync)
         with pytest.raises(BrainError) as err:
             spool.apply_ack(_ack(stream, committed=(9_000,)), deadline_ns=1_000)
         assert err.value.code is ErrorCode.DEADLINE_EXCEEDED
