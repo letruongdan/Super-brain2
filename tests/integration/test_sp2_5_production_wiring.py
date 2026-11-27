@@ -3364,3 +3364,219 @@ def test_r6_finding1_hook_binding_survives_pre_and_post_publish_crashes_and_post
             fallback_recorded_at="2026-11-27T05:00:05Z",
         )
     assert conflict_err.value.code is ErrorCode.IDEMPOTENCY_CONFLICT
+
+
+# ---------------------------------------------------------------------------
+# Round-7 Review Regression (P1: durable hook dedup across >=512 ACKed entries
+# and fail-closed binding cap)
+# ---------------------------------------------------------------------------
+
+
+def test_r7_finding1_hook_dedup_survives_512_entries_and_fails_closed_at_cap(
+    trusted_tmp: Path,
+) -> None:
+    """Hook dedup preserves exact (stream, sequence, event_id) past 512 entries & fails closed at cap."""
+    os_ = os_adapters()
+    chk_a = trusted_tmp / "chk-r7"
+    chk_a.mkdir(parents=True, exist_ok=True)
+    os_.permissions.secure_directory(chk_a)
+
+    def _enqueue_seq(
+        sp: OutboxSpool,
+        *,
+        stream: str,
+        dk: str,
+        payload: dict[str, Any],
+        rec_at: str = "2026-11-27T07:00:00Z",
+    ) -> CaptureEventRecord:
+        return sp.enqueue_hook_event(
+            producer_stream=stream,
+            build_event=lambda seq, ev_id, ts: CaptureEventRecord(
+                event_id=ev_id,
+                producer_stream=stream,
+                sequence=seq,
+                harness_id="claude-code",
+                kind="command_result",
+                recorded_at=ts,
+                payload=payload,
+            ),
+            dedup_key=dk,
+            fallback_recorded_at=rec_at,
+        )
+
+    def _ack_range(sp: OutboxSpool, *, stream: str, start_seq: int, end_seq: int) -> None:
+        evicted = sp.apply_ack(
+            CaptureBatchAck(
+                producer_stream=stream,
+                repo_id="repo-r7",
+                checkout_id="chk-r7",
+                committed_event_sequences=tuple(range(start_seq, end_seq + 1)),
+                contiguous_event_acked_through=end_seq,
+                acked_producer_gap_sequences=(),
+                accepted_count=end_seq - start_seq + 1,
+                deduped_count=0,
+                policy_disabled=False,
+            )
+        )
+        assert evicted == end_seq - start_seq + 1
+
+    # --- Case A (MUST RUN FIRST): Default OutboxSpool past 511 / 512 / 513 ACKed entries + in-flight 514 ---
+    outbox_a = trusted_tmp / "outbox-r7-default"
+    stream_a = "stream-r7-default"
+    spool = OutboxSpool(outbox_a, permissions=os_.permissions)
+
+    dk_1 = digest_bytes(b"r7-dk-1")
+    ev_1 = _enqueue_seq(spool, stream=stream_a, dk=dk_1, payload={"idx": 1})
+    assert ev_1.sequence == 1
+    _ack_range(spool, stream=stream_a, start_seq=1, end_seq=1)
+
+    batch_start = 2
+    ev_513: CaptureEventRecord | None = None
+    for idx in range(2, 514):
+        rec = _enqueue_seq(spool, stream=stream_a, dk=digest_bytes(f"r7-dk-{idx}".encode()), payload={"idx": idx})
+        if idx in (511, 512, 513):
+            assert rec.sequence == idx
+        if idx == 513:
+            ev_513 = rec
+        if idx in (100, 200, 300, 400, 510, 511, 512, 513):
+            _ack_range(spool, stream=stream_a, start_seq=batch_start, end_seq=idx)
+            batch_start = idx + 1
+    assert ev_513 is not None
+    assert spool.read_pending(limit=10, producer_stream=stream_a) == []
+
+    # In-flight "bound" event at seq=514 via python -I crash before frame publish.
+    ev_inflight_514 = _observed_claude_post_tool(chk_a, tool_use_id="toolu_r7_inflight_514", cmd="pytest -k r7_514")
+    p_crash = _run_hook_cli_subproc(
+        outbox_a,
+        chk_a,
+        ev_inflight_514,
+        producer_stream=stream_a,
+        crashpoint="capture.outbox.after_write_before_fsync",
+    )
+    assert p_crash.returncode == 86, (p_crash.returncode, p_crash.stderr)
+    assert spool.read_pending(limit=10, producer_stream=stream_a) == []
+
+    # Reopen spool (simulating restart) and verify retries, conflict, in-flight retry, and next sequence.
+    spool2 = OutboxSpool(outbox_a, permissions=os_.permissions)
+
+    retry_1 = _enqueue_seq(spool2, stream=stream_a, dk=dk_1, payload={"idx": 1})
+    assert (retry_1.event_id, retry_1.sequence) == (ev_1.event_id, 1)
+    assert spool2.read_pending(limit=10, producer_stream=stream_a) == []
+
+    dk_513 = digest_bytes(b"r7-dk-513")
+    retry_513 = _enqueue_seq(spool2, stream=stream_a, dk=dk_513, payload={"idx": 513})
+    assert (retry_513.event_id, retry_513.sequence) == (ev_513.event_id, 513)
+    assert spool2.read_pending(limit=10, producer_stream=stream_a) == []
+
+    with pytest.raises(BrainError) as err_tamper:
+        _enqueue_seq(spool2, stream=stream_a, dk=dk_1, payload={"idx": 1, "tampered": True})
+    assert err_tamper.value.code is ErrorCode.IDEMPOTENCY_CONFLICT
+
+    p_retry_514 = _run_hook_cli_subproc(outbox_a, chk_a, ev_inflight_514, producer_stream=stream_a)
+    assert p_retry_514.returncode == 0, p_retry_514.stderr
+    pend_514 = _pending_event_tuples(spool2, producer_stream=stream_a)
+    assert len(pend_514) == 1 and pend_514[0][0] == 514
+    ev_514_id = pend_514[0][1]
+
+    ev_515 = _enqueue_seq(spool2, stream=stream_a, dk=digest_bytes(b"r7-dk-515"), payload={"idx": 515})
+    assert ev_515.sequence == 515
+    assert _pending_event_tuples(spool2, producer_stream=stream_a) == [(514, ev_514_id), (515, ev_515.event_id)]
+
+    # --- Case B: Explicit contract cap boundary max_binding_keys=512 at 511 / 512 / 513 ---
+    outbox_b = trusted_tmp / "outbox-r7-cap512"
+    stream_b = "stream-r7-cap512"
+    spool_b: OutboxSpool = cast(Any, OutboxSpool)(outbox_b, permissions=os_.permissions, max_binding_keys=512)
+
+    dk_1_b = digest_bytes(b"r7b-dk-1")
+    ev_1_b = _enqueue_seq(spool_b, stream=stream_b, dk=dk_1_b, payload={"idx": 1})
+    assert ev_1_b.sequence == 1
+
+    b_batch_start = 1
+    ev_511_b: CaptureEventRecord | None = None
+    for idx in range(2, 512):
+        rec_b = _enqueue_seq(spool_b, stream=stream_b, dk=digest_bytes(f"r7b-dk-{idx}".encode()), payload={"idx": idx})
+        if idx == 511:
+            assert rec_b.sequence == 511
+            ev_511_b = rec_b
+        if idx in (100, 200, 300, 400, 500, 511):
+            _ack_range(spool_b, stream=stream_b, start_seq=b_batch_start, end_seq=idx)
+            b_batch_start = idx + 1
+    assert ev_511_b is not None
+    assert spool_b.read_pending(limit=10, producer_stream=stream_b) == []
+
+    # Bind Event 512 as in-flight "bound" (no .frame published) right at cap 512.
+    class _FailBound512Spool(OutboxSpool):
+        def _atomic_publish_frame(
+            self,
+            final_path: Path,
+            part_path: Path,
+            frame_bytes: bytes,
+            *,
+            crashpoint_name: str | None = None,
+            deadline_ns: int | None = None,
+        ) -> None:
+            raise BrainError(ErrorCode.DEADLINE_EXCEEDED, "simulated pre-publish failure at cap 512")
+
+    dk_512_b = digest_bytes(b"r7b-dk-512")
+    bound_512_ids: list[str] = []
+    spool_b_fail: OutboxSpool = cast(Any, _FailBound512Spool)(
+        outbox_b, permissions=os_.permissions, max_binding_keys=512
+    )
+
+    def _build_512(seq: int, ev_id: str, ts: str) -> CaptureEventRecord:
+        bound_512_ids.append(ev_id)
+        return CaptureEventRecord(
+            event_id=ev_id,
+            producer_stream=stream_b,
+            sequence=seq,
+            harness_id="claude-code",
+            kind="command_result",
+            recorded_at=ts,
+            payload={"idx": 512},
+        )
+
+    with pytest.raises(BrainError) as err_512:
+        spool_b_fail.enqueue_hook_event(
+            producer_stream=stream_b,
+            build_event=_build_512,
+            dedup_key=dk_512_b,
+            fallback_recorded_at="2026-11-27T07:05:12Z",
+        )
+    assert err_512.value.code is ErrorCode.DEADLINE_EXCEEDED
+    assert len(bound_512_ids) == 1
+    ev_512_expected_id = bound_512_ids[0]
+    assert spool_b.read_pending(limit=10, producer_stream=stream_b) == []
+
+    # Reopen with max_binding_keys=512 and verify exact cap semantics.
+    spool_b2: OutboxSpool = cast(Any, OutboxSpool)(outbox_b, permissions=os_.permissions, max_binding_keys=512)
+
+    rb_1 = _enqueue_seq(spool_b2, stream=stream_b, dk=dk_1_b, payload={"idx": 1})
+    assert (rb_1.event_id, rb_1.sequence) == (ev_1_b.event_id, 1)
+    assert spool_b2.read_pending(limit=10, producer_stream=stream_b) == []
+
+    dk_511_b = digest_bytes(b"r7b-dk-511")
+    rb_511 = _enqueue_seq(spool_b2, stream=stream_b, dk=dk_511_b, payload={"idx": 511})
+    assert (rb_511.event_id, rb_511.sequence) == (ev_511_b.event_id, 511)
+    assert spool_b2.read_pending(limit=10, producer_stream=stream_b) == []
+
+    dk_513_b = digest_bytes(b"r7b-dk-513")
+    with pytest.raises(BrainError) as full_err_1:
+        _enqueue_seq(spool_b2, stream=stream_b, dk=dk_513_b, payload={"idx": 513})
+    assert full_err_1.value.code is ErrorCode.STORAGE_FULL
+
+    rb_512 = _enqueue_seq(
+        spool_b2, stream=stream_b, dk=dk_512_b, payload={"idx": 512}, rec_at="2026-11-27T07:05:12Z"
+    )
+    assert (rb_512.event_id, rb_512.sequence) == (ev_512_expected_id, 512)
+    assert _pending_event_tuples(spool_b2, producer_stream=stream_b) == [(512, ev_512_expected_id)]
+
+    rb_1_again = _enqueue_seq(spool_b2, stream=stream_b, dk=dk_1_b, payload={"idx": 1})
+    assert (rb_1_again.event_id, rb_1_again.sequence) == (ev_1_b.event_id, 1)
+    assert _pending_event_tuples(spool_b2, producer_stream=stream_b) == [(512, ev_512_expected_id)]
+
+    _ack_range(spool_b2, stream=stream_b, start_seq=512, end_seq=512)
+    assert spool_b2.read_pending(limit=10, producer_stream=stream_b) == []
+
+    with pytest.raises(BrainError) as full_err_2:
+        _enqueue_seq(spool_b2, stream=stream_b, dk=dk_513_b, payload={"idx": 513})
+    assert full_err_2.value.code is ErrorCode.STORAGE_FULL

@@ -18,7 +18,6 @@ from superbrain.core.jsonvalue import JsonValue
 from superbrain.ports.capture import (
     DEFAULT_OUTBOX_MAX_BYTES,
     MAX_CAPTURE_BATCH_EVENTS,
-    MAX_CAPTURE_ENTRY_BYTES,
     OUTBOX_RECORD_EVENT,
     OUTBOX_RECORD_GAP,
     CaptureBatchAck,
@@ -30,6 +29,13 @@ from superbrain.ports.capture import (
     default_outbox_dir_renamer,
     default_outbox_file_lock,
     default_outbox_permissions,
+)
+from superbrain.storage._outbox_bindings import (
+    _BINDINGS_DIR,
+    DEFAULT_MAX_STREAM_BINDING_KEYS,
+    HookBindingRecord,
+    upsert_binding,
+    verify_bindings_dir,
 )
 from superbrain.storage._outbox_io import (
     _FRAME_SUFFIX,
@@ -49,6 +55,7 @@ from superbrain.storage._outbox_io import (
     raise_storage_error,
     read_all_binary,
     reject_links_upward,
+    replace_file_resilient,
     stream_dir_key,
     sync_dir,
     thread_lock_for,
@@ -57,10 +64,13 @@ from superbrain.storage._outbox_io import (
 )
 from superbrain.storage._outbox_seq import (
     StreamSeqCursor,
-    advance_and_persist_cursor,
     advance_cursor_next_seq,
+    load_or_recover_hook_cursor,
+    lookup_stream_binding,
+    max_frame_seq_in_paths,
     persist_cursor_ack,
-    read_stream_cursor,
+    prepare_outbox_frame_bytes,
+    reconcile_matched_hook_frame_cursor,
     resolve_hook_envelope_slot,
 )
 from superbrain.storage._outbox_seq import write_stream_cursor as write_stream_cursor
@@ -76,15 +86,18 @@ class OutboxSpool:
         path: Path,
         *,
         max_bytes: int = DEFAULT_OUTBOX_MAX_BYTES,
+        max_binding_keys: int = DEFAULT_MAX_STREAM_BINDING_KEYS,
         monotonic_ns: Callable[[], int] = time.monotonic_ns,
         permissions: OutboxPermissionsPort | None = None,
         file_lock: OutboxFileLockPort | None = None,
     ) -> None:
         check_safe_path_syntax(path)
         require_positive_int(max_bytes)
+        require_positive_int(max_binding_keys)
         reject_links_upward(path)
         self._root = path if path.is_absolute() else path.absolute()
         self._max_bytes = max_bytes
+        self._max_binding_keys = max_binding_keys
         self._monotonic_ns = monotonic_ns
         self._permissions = permissions
         self._file_lock = file_lock
@@ -187,6 +200,9 @@ class OutboxSpool:
                 if entry_is_link(fe):
                     raise BrainError(ErrorCode.UNSAFE_PATH, "frame file is a link")
                 name = fe.name
+                if name == _BINDINGS_DIR:
+                    verify_bindings_dir(sdir, perms)
+                    continue
                 if name.endswith(_PART_SUFFIX):
                     Path(fe.path).unlink(missing_ok=True)
                     continue
@@ -376,7 +392,7 @@ class OutboxSpool:
             os.fsync(fd)
             os.close(fd)
             fd = -1
-            os.replace(part_path, final_path)
+            replace_file_resilient(part_path, final_path)
             sync_dir(final_path.parent)
             committed = True
         except BrainError:
@@ -392,28 +408,6 @@ class OutboxSpool:
             if not committed:
                 part_path.unlink(missing_ok=True)
 
-    def _prepare_frame_bytes(
-        self,
-        *,
-        record_kind: str,
-        producer_stream: str,
-        sequence: int,
-        entry_id: str,
-        payload_dict: dict[str, JsonValue],
-    ) -> tuple[str, bytes]:
-        payload_bytes = canonical_json(payload_dict)
-        if len(payload_bytes) > MAX_CAPTURE_ENTRY_BYTES:
-            raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
-        payload_json = payload_bytes.decode("utf-8")
-        payload_digest = digest_bytes(payload_bytes)
-        core_fields: dict[str, JsonValue] = {
-            "byte_size": len(payload_bytes), "entry_id": entry_id, "payload_digest": payload_digest,
-            "payload_json": payload_json, "producer_stream": producer_stream,
-            "record_kind": record_kind, "sequence": sequence,
-        }
-        core_fields["frame_crc32"] = f"{zlib.crc32(canonical_json(core_fields)) & 0xFFFFFFFF:08x}"
-        return payload_digest, canonical_json(core_fields) + b"\n"
-
     def _enqueue_record(
         self,
         *,
@@ -425,7 +419,7 @@ class OutboxSpool:
         deadline_ns: int | None,
     ) -> str:
         self._check_deadline(deadline_ns)
-        payload_digest, frame_bytes = self._prepare_frame_bytes(
+        payload_digest, frame_bytes = prepare_outbox_frame_bytes(
             record_kind=record_kind, producer_stream=producer_stream, sequence=sequence,
             entry_id=entry_id, payload_dict=payload_dict,
         )
@@ -478,27 +472,24 @@ class OutboxSpool:
         fallback_recorded_at: str,
         deadline_ns: int | None = None,
     ) -> CaptureEventRecord:
-        """Allocate/reuse durable write-ahead hook binding, sanitize via ``build_event``, and enqueue atomically."""
+        """Allocate/reuse durable sharded hook binding, sanitize via ``build_event``, and enqueue atomically."""
         stream_key = stream_dir_key(producer_stream)
         perms = self._resolve_permissions()
         renamer = default_outbox_dir_renamer()
         dl_check = (lambda: self._check_deadline(deadline_ns)) if deadline_ns is not None else None
         with self._locked(create_root=True, sweep=False, deadline_ns=deadline_ns):
             sdir = self._root / _STREAMS_DIR / stream_key
-            cursor = read_stream_cursor(sdir, perms) if os.path.lexists(sdir) else StreamSeqCursor(1, ())
-            max_frame_seq = 0
-            if os.path.lexists(sdir):
-                for fp in self._collect_regular_frames(sdir):
-                    ident = parse_frame_filename_identity(fp.name)
-                    if ident is not None and ident[1] > max_frame_seq:
-                        max_frame_seq = ident[1]
-            cached = cursor.lookup(dedup_key) if dedup_key is not None else None
+            cursor = load_or_recover_hook_cursor(sdir, perms, renamer=renamer, check_deadline=dl_check)
+            max_frame_seq = max_frame_seq_in_paths(self._collect_regular_frames(sdir)) if os.path.lexists(sdir) else 0
+            cached = lookup_stream_binding(sdir, cursor, dedup_key, perms) if dedup_key is not None else None
+            if dedup_key is not None and cached is None and cursor.binding_count >= self._max_binding_keys:
+                raise BrainError(ErrorCode.STORAGE_FULL, "hook dedup binding window full")
             seq, ev_id, rec_at = resolve_hook_envelope_slot(
-                cursor, max_frame_seq=max_frame_seq, explicit_sequence=explicit_sequence,
+                cursor, cached=cached, max_frame_seq=max_frame_seq, explicit_sequence=explicit_sequence,
                 explicit_event_id=explicit_event_id, dedup_key=dedup_key, fallback_recorded_at=fallback_recorded_at,
             )
             record = build_event(seq, ev_id, rec_at)
-            payload_digest, frame_bytes = self._prepare_frame_bytes(
+            payload_digest, frame_bytes = prepare_outbox_frame_bytes(
                 record_kind=OUTBOX_RECORD_EVENT, producer_stream=record.producer_stream,
                 sequence=record.sequence, entry_id=record.event_id, payload_dict=record.to_dict(),
             )
@@ -512,30 +503,39 @@ class OutboxSpool:
                 existing = self._decode_frame_file(matched_path)
                 if existing.entry_id != record.event_id or existing.payload_digest != payload_digest:
                     raise BrainError(ErrorCode.IDEMPOTENCY_CONFLICT, "idempotency conflict")
-                advance_and_persist_cursor(
-                    sdir, cursor, record=record, dedup_key=dedup_key,
-                    payload_digest=payload_digest, state="published", perms=perms,
+                reconcile_matched_hook_frame_cursor(
+                    sdir, cursor, dedup_key=dedup_key, cached=cached, record=record,
+                    payload_digest=payload_digest, perms=perms, renamer=renamer, check_deadline=dl_check,
                 )
                 return record
-            if cached is not None and cached.state == "acked":
+            if cached is not None and cursor.is_event_acked(record.sequence):
                 return record
             if used + len(frame_bytes) > self._max_bytes:
                 raise BrainError(ErrorCode.STORAGE_FULL, "storage full")
             ensure_dir_tree_atomic(self._root / _STREAMS_DIR, perms, renamer, check_deadline=dl_check)
             ensure_dir_tree_atomic(sdir, perms, renamer, check_deadline=dl_check)
-            cursor = advance_and_persist_cursor(
-                sdir, cursor, record=record, dedup_key=dedup_key,
-                payload_digest=payload_digest, state="bound", perms=perms,
+            binding = (
+                HookBindingRecord(dedup_key, record.sequence, record.event_id, record.recorded_at, payload_digest)
+                if dedup_key is not None
+                else None
             )
+            new_count = cursor.binding_count + (1 if (binding is not None and cached is None) else 0)
+            bound_c = StreamSeqCursor(
+                max(cursor.next_seq, record.sequence + 1), new_count, cursor.acked_ranges, binding
+            )
+            if bound_c != cursor:
+                write_stream_cursor(sdir, bound_c, perms)
+                cursor = bound_c
+            if binding is not None:
+                upsert_binding(sdir, binding, perms, renamer=renamer, check_deadline=dl_check)
             base = f"{highest_order + 1:016d}_{OUTBOX_RECORD_EVENT}_{record.sequence:020d}"
             self._atomic_publish_frame(
                 sdir / f"{base}{_FRAME_SUFFIX}", sdir / f"{base}{_PART_SUFFIX}", frame_bytes,
                 crashpoint_name="capture.outbox.after_write_before_fsync", deadline_ns=deadline_ns,
             )
-            advance_and_persist_cursor(
-                sdir, cursor, record=record, dedup_key=dedup_key,
-                payload_digest=payload_digest, state="published", perms=perms,
-            )
+            pub_c = StreamSeqCursor(cursor.next_seq, cursor.binding_count, cursor.acked_ranges)
+            if pub_c != cursor:
+                write_stream_cursor(sdir, pub_c, perms)
             return record
 
     def enqueue_gap(self, gap: ProducerCaptureGap, *, deadline_ns: int | None = None) -> str:
@@ -576,7 +576,7 @@ class OutboxSpool:
                 return 0
             perms = self._resolve_permissions()
             sdir = self._root / _STREAMS_DIR / stream_dir_key(ack.producer_stream)
-            persist_cursor_ack(sdir, ack, perms)
+            persist_cursor_ack(sdir, ack, perms, renamer=default_outbox_dir_renamer())
             evicted = 0
             for path in self._iter_frame_paths(producer_stream=ack.producer_stream):
                 parsed = parse_frame_filename_identity(path.name)

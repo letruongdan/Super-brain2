@@ -8,6 +8,7 @@ import os
 import shutil
 import stat
 import threading
+import time
 import uuid
 from collections.abc import Callable
 from pathlib import Path
@@ -23,6 +24,8 @@ _LOCK_FILE = ".spool.lock"
 _PROCESS_LOCKS_GUARD = threading.Lock()
 _PROCESS_LOCKS: dict[str, threading.RLock] = {}
 _ENOSPC_WINERROR = 112
+_BUSY_REPLACE_WINERRORS = frozenset({5, 32})
+_BUSY_REPLACE_DELAYS = (0.01, 0.02, 0.05, 0.1, 0.2)
 _O_BINARY = getattr(os, "O_BINARY", 0)
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _ORIG_PATH_IS_SYMLINK = Path.is_symlink
@@ -136,6 +139,18 @@ def parse_frame_filename_identity(name: str) -> tuple[str, int] | None:
     if seq <= 0 or not kind_part:
         return None
     return (kind_part, seq)
+
+
+def replace_file_resilient(src: Path, dst: Path) -> None:
+    """Replace ``dst`` with ``src``, retrying briefly on transient OS sharing/access-denied locks."""
+    for delay in (*_BUSY_REPLACE_DELAYS, None):
+        try:
+            os.replace(src, dst)
+            return
+        except OSError as err:
+            if delay is None or getattr(err, "winerror", None) not in _BUSY_REPLACE_WINERRORS:
+                raise
+            time.sleep(delay)
 
 
 def sync_dir(directory: Path) -> None:
