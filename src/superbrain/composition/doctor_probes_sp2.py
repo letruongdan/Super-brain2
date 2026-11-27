@@ -7,11 +7,12 @@ import shutil
 import sqlite3
 import stat
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from superbrain.adapters.harness.host_version import probe_installed_host_version
 from superbrain.adapters.harness.layer2_probe import (
     NativeHostReceipt,
     compute_harness_config_digest,
@@ -294,7 +295,8 @@ def probe_sp2_layer2_readonly(
     scratch: Path,
     *,
     checkout_root: Path | None,
-    observed_host_versions: Mapping[str, str],
+    observed_host_versions: Mapping[str, str] | None,
+    host_version_resolver: Callable[[str], str | None] | None = None,
     os_: OsAdapters,
     errors: list[str],
 ) -> tuple[tuple[Sp2Layer2HarnessProbe, ...], bool]:
@@ -332,7 +334,21 @@ def probe_sp2_layer2_readonly(
                 rec_ver = None if row is None else str(row[1])
                 rec_dig = None if row is None else str(row[2])
                 rec_state = Layer2State.UNKNOWN if row is None else Layer2State(str(row[3]))
-                obs_ver = observed_host_versions.get(hid)
+                eff_resolver = (
+                    host_version_resolver if host_version_resolver is not None else probe_installed_host_version
+                )
+                if observed_host_versions is not None:
+                    raw_obs_ver: object = observed_host_versions.get(hid)
+                else:
+                    try:
+                        raw_obs_ver = eff_resolver(hid)
+                    except Exception:  # noqa: BLE001
+                        raw_obs_ver = None
+                obs_ver = (
+                    raw_obs_ver
+                    if isinstance(raw_obs_ver, str) and OPAQUE_ID_RE.fullmatch(raw_obs_ver)
+                    else None
+                )
                 configured_paths = set(configured_map.get(hid, ()))
 
                 obs_dig: str | None = None
@@ -361,7 +377,12 @@ def probe_sp2_layer2_readonly(
                 eff_state = rec_state
                 inv_reason: str | None = None
                 if rec_state is Layer2State.VERIFIED:
-                    if obs_ver is not None and obs_ver != rec_ver:
+                    if obs_ver is None:
+                        eff_state = Layer2State.UNKNOWN
+                        inv_reason = (
+                            "host_version_unverified" if raw_obs_ver is None else "host_version_changed"
+                        )
+                    elif obs_ver != rec_ver:
                         eff_state = Layer2State.UNKNOWN
                         inv_reason = "host_version_changed"
                     elif cfg_changed:
@@ -402,13 +423,13 @@ def run_sp2_doctor_probes(
     outbox_dir: Path | None = None,
     checkout_root: Path | None = None,
     observed_host_versions: Mapping[str, str] | None = None,
+    host_version_resolver: Callable[[str], str | None] | None = None,
     os_: OsAdapters,
     now: datetime | None = None,
 ) -> Sp2DoctorReport:
     """Run all SP2 read-only diagnostic probes across outbox, ``brain.db``, ``policy.db`` & checkout."""
     root = DataRoot.at(data_root)
     eff_now = now if now is not None else os_.clock.now()
-    eff_versions = observed_host_versions if observed_host_versions is not None else {}
     errors: list[str] = []
     outbox = (
         probe_outbox_readonly(outbox_dir)
@@ -436,7 +457,8 @@ def run_sp2_doctor_probes(
             root.policy_db,
             scratch,
             checkout_root=checkout_root,
-            observed_host_versions=eff_versions,
+            observed_host_versions=observed_host_versions,
+            host_version_resolver=host_version_resolver,
             os_=os_,
             errors=errors,
         )

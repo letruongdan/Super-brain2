@@ -237,7 +237,14 @@ def test_native_host_receipt_verification_and_invalidation_on_host_version_and_c
         rt.store.reconcile_policy()
         domain = build_default_handoff_domain(rt=rt, clock=clock, writer_epoch=rt.lease.epoch)
         bridge = KernelBridge(
-            store=rt.store, policy=rt.policy, clock=clock, writer_epoch=rt.lease.epoch, domain=domain
+            store=rt.store,
+            policy=rt.policy,
+            clock=clock,
+            writer_epoch=rt.lease.epoch,
+            domain=domain,
+            host_version_resolver=lambda hid: (
+                "2.1.325" if hid == "claude-code" else ("26.1111.2228.0" if hid == "codex" else None)
+            ),
         )
         _grant_capture_producer(bridge, rt, c_cred, stream="stream-claude-1", ws=ws)
         _grant_capture_producer(bridge, rt, x_cred, stream="stream-codex-1", ws=ws)

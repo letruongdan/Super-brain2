@@ -71,14 +71,8 @@ def verify_live_layer2_harness(
         try:
             obs_ver: object = host_version_resolver(harness_id)
         except Exception:  # noqa: BLE001
-            policy.set_layer2_state(
-                harness_id=harness_id,
-                host_version=recorded_ver,
-                config_digest=recorded_dig,
-                state=Layer2State.UNKNOWN,
-            )
-            return None
-        if obs_ver is not None and obs_ver != recorded_ver:
+            obs_ver = _HOST_VERSION_DRIFT_UNSET
+        if not isinstance(obs_ver, str) or not OPAQUE_ID_RE.fullmatch(obs_ver) or obs_ver != recorded_ver:
             policy.set_layer2_state(
                 harness_id=harness_id,
                 host_version=_safe_opaque_version(obs_ver, recorded_ver),

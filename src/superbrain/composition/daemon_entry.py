@@ -198,40 +198,35 @@ def _open_owner_session(
             elif session_box:
                 session_box[0].record_request_drained()
 
+        from superbrain.adapters.harness.host_version import probe_installed_host_version
         from superbrain.composition._layer2_live import reconcile_live_layer2_all
 
         seen_configured_layer2: set[tuple[str, str]] = set()
+        resolved_hv_resolver = (
+            hooks.host_version_resolver if hooks.host_version_resolver is not None else probe_installed_host_version
+        )
         composite_domain = _DaemonCompositeDomain(
-            job_service,
-            domain,
+            job_service, domain,
             fallback_factory=(
-                make_default_handoff_domain_factory(rt=rt, clock=resolved_clock, writer_epoch=rt.lease.epoch)
-                if domain is None
-                else None
+                make_default_handoff_domain_factory(
+                    rt=rt, clock=resolved_clock, writer_epoch=rt.lease.epoch,
+                    host_version_resolver=resolved_hv_resolver,
+                ) if domain is None else None
             ),
         )
         bridge = KernelBridge(
-            store=rt.store,
-            policy=rt.policy,
-            clock=resolved_clock,
-            monotonic_clock=resolved_mono,
-            writer_epoch=rt.lease.epoch,
-            instance_id=instance_id,
-            max_queue_size=DAEMON_QUEUE_DEPTH,
-            domain=composite_domain,
-            before_enter_commit=hooks.before_enter_commit,
-            recover_pending_on_init=False,
-            auth_state=auth_gate,
-            before_auth_gate_publish=hooks.before_auth_gate_publish,
-            after_reserve_before_enqueue=hooks.after_reserve_before_enqueue,
-            on_reservation_change=arbiter_wake,
-            on_queue_wake=owner_wake,
-            on_owner_reply_ready=_on_reply_ready,
-            on_owner_finished=_on_owner_finished,
+            store=rt.store, policy=rt.policy, clock=resolved_clock, monotonic_clock=resolved_mono,
+            writer_epoch=rt.lease.epoch, instance_id=instance_id, max_queue_size=DAEMON_QUEUE_DEPTH,
+            domain=composite_domain, before_enter_commit=hooks.before_enter_commit, recover_pending_on_init=False,
+            auth_state=auth_gate, before_auth_gate_publish=hooks.before_auth_gate_publish,
+            after_reserve_before_enqueue=hooks.after_reserve_before_enqueue, on_reservation_change=arbiter_wake,
+            on_queue_wake=owner_wake, on_owner_reply_ready=_on_reply_ready, on_owner_finished=_on_owner_finished,
             on_clock_untrusted_changed=auth_gate.update_clock_untrusted,
-            on_capture_gaps_changed=auth_gate.update_capture_gaps_present,
-            os_=adapters,
-            seen_configured_layer2=seen_configured_layer2,
+            on_capture_gaps_changed=auth_gate.update_capture_gaps_present, os_=adapters,
+            host_version_resolver=resolved_hv_resolver, seen_configured_layer2=seen_configured_layer2,
+        )
+        reconcile_live_layer2_all(
+            rt.policy, os_=adapters, host_version_resolver=resolved_hv_resolver, seen_configured=seen_configured_layer2
         )
         bridge.recover_pending_send_attempts()
 
@@ -327,27 +322,20 @@ def _open_owner_session(
                 service_cls=ReviewApplyService,
             )
             restore_handler = DaemonRestoreHandler(
-                session=session,
-                adapters=adapters,
-                clock=resolved_clock,
-                executor=executor,
-                composite_domain=composite_domain,
-                instance_id=instance_id,
-                operator=operator,
-                review_apply_cls=ReviewApplyService,
-                seen_configured_layer2=seen_configured_layer2,
+                session=session, adapters=adapters, clock=resolved_clock, executor=executor,
+                composite_domain=composite_domain, instance_id=instance_id, operator=operator,
+                review_apply_cls=ReviewApplyService, seen_configured_layer2=seen_configured_layer2,
+                host_version_resolver=resolved_hv_resolver,
             )
             operator.bind(
                 build_operator_service(
-                    rt.policy,
-                    os_=adapters,
-                    review_apply=review_apply,
-                    restore_handler=restore_handler,
+                    rt.policy, os_=adapters, review_apply=review_apply, restore_handler=restore_handler,
                     expected_endpoint_path=rt.root.endpoint_path,
                     expected_leaf_cert_sha256=verified_tls.leaf_cert_sha256,
                     server_cert_path=verified_tls.cert_path,
                     live_layer2_check=lambda: reconcile_live_layer2_all(
-                        session.rt.policy, os_=adapters, seen_configured=seen_configured_layer2
+                        session.rt.policy, os_=adapters, host_version_resolver=resolved_hv_resolver,
+                        seen_configured=seen_configured_layer2,
                     ),
                 )
             )

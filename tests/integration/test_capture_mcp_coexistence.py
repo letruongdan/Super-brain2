@@ -23,6 +23,7 @@ from superbrain.adapters.harness_config.bootstrap_templates import (
 from superbrain.adapters.os import os_adapters
 from superbrain.adapters.os.workspaces import build_registration
 from superbrain.cli_api.capture_client import CaptureClient
+from superbrain.composition.daemon_entry import DaemonTestHooks
 from superbrain.composition.doctor_probes_sp2 import reconcile_harness_layer2_in_policy
 from superbrain.core._kernel_approval import Layer2State
 from superbrain.core.errors import BrainError, ErrorCode
@@ -263,7 +264,12 @@ def test_capture_and_mcp_coexistence_across_claude_and_codex_live_daemon(trusted
     scope_a = Scope(ws_a.repo_id, ws_a.checkout_id)
     expected_digest = load_catalog().schema_digest
 
-    with open_test_loopback_transport(tpl, name="sp25-coexist", domain=None) as h:
+    hooks = DaemonTestHooks(
+        host_version_resolver=lambda hid: (
+            _CLAUDE_VERSION if hid == "claude-code" else (_CODEX_VERSION if hid == "codex" else None)
+        )
+    )
+    with open_test_loopback_transport(tpl, name="sp25-coexist", domain=None, hooks=hooks) as h:
         seeded = _seed_coexistence_credentials(h, ws_a, include_codex=True, verify_layer2_dir=trusted_tmp)
         mcp_c = cast(SeededCredential, seeded["mcp_c"])
         mcp_x = cast(SeededCredential, seeded["mcp_x"])

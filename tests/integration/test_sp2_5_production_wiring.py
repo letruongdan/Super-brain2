@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import jsonschema
+import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
@@ -77,7 +78,7 @@ from superbrain.core.kernel import (
 )
 from superbrain.core.proposals import ManagedFormat
 from superbrain.core.wire import SCHEMA_VERSION
-from superbrain.ports.capture import CaptureEventRecord
+from superbrain.ports.capture import CaptureEventRecord, require_iso_utc_timestamp
 from superbrain.ports.os import OsAdapters
 from superbrain.storage.backup import create_policy_backup
 from superbrain.storage.kernel_schema import KERNEL_POLICY_MIGRATIONS
@@ -404,8 +405,30 @@ def _validate_get_health_schema(data: dict[str, Any]) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_p1_finding1_live_layer2_config_drift_and_host_version_drift_fail_closed(trusted_tmp: Path) -> None:
+def _install_fake_host_bins(
+    trusted_tmp: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    claude_ver: str = _CLAUDE_VER,
+    codex_ver: str = _CODEX_VER,
+) -> Path:
+    bin_dir = trusted_tmp / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    os_adapters().permissions.secure_directory(bin_dir)
+    _write_fake_host_bin(bin_dir, "claude", f"{claude_ver} (Claude Code)")
+    _write_fake_host_bin(bin_dir, "codex", f"codex-cli {codex_ver}")
+    ssh_dir = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "OpenSSH"
+    isolated_path = f"{bin_dir}{os.pathsep}{ssh_dir}" if sys.platform == "win32" else str(bin_dir)
+    monkeypatch.setenv("PATH", isolated_path)
+    return bin_dir
+
+
+def test_p1_finding1_live_layer2_config_drift_and_host_version_drift_fail_closed(
+    trusted_tmp: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Checkout config drift & host version drift fail-close capture and terminal approval without helper calls."""
+    _install_fake_host_bins(trusted_tmp, monkeypatch)
     clock = FakeClock(datetime.now(UTC).replace(microsecond=0))
     mono = FakeMonotonicClock(1_000_000_000)
     os_ = os_adapters(clock=clock, monotonic=mono)
@@ -605,8 +628,12 @@ def test_p1_finding1_live_layer2_config_drift_and_host_version_drift_fail_closed
         assert app_vd["error"]["code"] == ErrorCode.CAPABILITY_UNAVAILABLE.value
 
 
-def test_p1_finding1_policy_restore_with_old_verified_row_fails_closed(trusted_tmp: Path) -> None:
+def test_p1_finding1_policy_restore_with_old_verified_row_fails_closed(
+    trusted_tmp: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Restoring a policy backup with an old VERIFIED row (online or offline) fails-closes terminal & capture."""
+    _install_fake_host_bins(trusted_tmp, monkeypatch)
     clock = FakeClock(datetime.now(UTC).replace(microsecond=0))
     mono = FakeMonotonicClock(1_000_000_000)
     os_ = os_adapters(clock=clock, monotonic=mono)
@@ -1660,8 +1687,12 @@ def test_r4_finding1_malformed_host_version_and_resolver_error_fail_closed(trust
         assert app_ln["error"]["code"] == ErrorCode.CAPABILITY_UNAVAILABLE.value
 
 
-def test_r4_finding2_deleted_config_and_dangling_link_across_restart_and_restore(trusted_tmp: Path) -> None:
+def test_r4_finding2_deleted_config_and_dangling_link_across_restart_and_restore(
+    trusted_tmp: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Deleted checkout config & dangling links fail closed across fresh daemon restart and consecutive restores."""
+    _install_fake_host_bins(trusted_tmp, monkeypatch)
     clock = FakeClock(datetime.now(UTC).replace(microsecond=0))
     mono = FakeMonotonicClock(1_000_000_000)
     os_ = os_adapters(clock=clock, monotonic=mono)
@@ -2079,8 +2110,12 @@ def test_r4_finding3_hook_session_sanitization_and_minimal_imports(trusted_tmp: 
     assert proc.returncode == 0, (proc.returncode, proc.stdout, proc.stderr)
 
 
-def test_r4_finding4_multi_checkout_doctor_and_deep_health_parity(trusted_tmp: Path) -> None:
+def test_r4_finding4_multi_checkout_doctor_and_deep_health_parity(
+    trusted_tmp: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Multi-checkout doctor (without --checkout) & MCP get_health(deep=true) agree without false positives."""
+    _install_fake_host_bins(trusted_tmp, monkeypatch)
     clock = FakeClock(datetime.now(UTC).replace(microsecond=0))
     mono = FakeMonotonicClock(1_000_000_000)
     os_ = os_adapters(clock=clock, monotonic=mono)
@@ -2232,3 +2267,628 @@ def test_r4_finding4_multi_checkout_doctor_and_deep_health_parity(trusted_tmp: P
             "degraded_codes"
         ]
         assert "terminal_channel_ineligible" in deep_data["degraded_codes"], deep_data["degraded_codes"]
+
+
+# ---------------------------------------------------------------------------
+# Round-5 Review Regressions (2 x P1: observed host hook payloads & active host_version drift)
+# ---------------------------------------------------------------------------
+
+
+def _run_installed_hook_cmd(cmd: list[str], payload: dict[str, Any], *, cwd: Path) -> None:
+    run_cmd = [sys.executable, *cmd[1:]] if Path(cmd[0]).name.lower().startswith("python") else cmd
+    t0 = time.perf_counter()
+    proc = subprocess.run(
+        run_cmd,
+        cwd=cwd,
+        env=clean_installed_subprocess_env(),
+        input=json.dumps(payload).encode("utf-8"),
+        capture_output=True,
+        timeout=5.0,
+        check=False,
+    )
+    elapsed = time.perf_counter() - t0
+    assert proc.returncode == 0, (proc.returncode, proc.stdout, proc.stderr)
+    assert elapsed < 2.0
+
+
+def _capture_events_for_stream(loop: OwnerLoop, producer_stream: str) -> list[tuple[int, str, str]]:
+    def _read() -> list[tuple[int, str, str]]:
+        session = cast(Any, loop._session)
+        assert session is not None
+        rows = session._rt.store._db.execute(
+            "SELECT sequence, event_id, kind FROM capture_events WHERE producer_stream = ? ORDER BY sequence",
+            (producer_stream,),
+        ).fetchall()
+        return [(int(r[0]), str(r[1]), str(r[2])) for r in rows]
+
+    return loop.run_owner_action(_read).result(timeout=10.0)
+
+
+def _write_fake_host_bin(bin_dir: Path, name: str, stdout_line: str) -> Path:
+    if sys.platform == "win32":
+        p = bin_dir / f"{name}.cmd"
+        p.write_text(f"@echo off\r\necho {stdout_line}\r\n", encoding="ascii")
+    else:
+        p = bin_dir / name
+        p.write_text(f"#!/bin/sh\nprintf '%s\\n' '{stdout_line}'\n", encoding="utf-8")
+        p.chmod(0o755)
+    return p
+
+
+def test_r5_finding1_observed_host_payloads_consecutive_retry_and_ws_switch(trusted_tmp: Path) -> None:
+    """Installed bootstrap hooks convert observed Claude/Codex host payloads -> drain ACK, retry, & ws switch."""
+    clock = FakeClock(datetime.now(UTC).replace(microsecond=0))
+    mono = FakeMonotonicClock(1_000_000_000)
+    os_ = os_adapters(clock=clock, monotonic=mono)
+    priv, s_enr = _ssh_signer()
+
+    cfg_dir = trusted_tmp / "cfg"
+    data_root = trusted_tmp / "data"
+    chk_a = trusted_tmp / "chk-r5-f1-a"
+    chk_b = trusted_tmp / "chk-r5-f1-b"
+    prof_dir = trusted_tmp / "profiles"
+    for d in (cfg_dir, chk_a, chk_b, prof_dir):
+        d.mkdir(parents=True, exist_ok=True)
+        os_.permissions.secure_directory(d)
+
+    rep = init_entry.init_store(
+        init_entry.InitRequest(
+            data_root=data_root, config_dir=cfg_dir, owner_id=_OWNER, machine_id=_MACHINE, signer=s_enr
+        ),
+        os_,
+    )
+    cfg = read_daemon_config(rep.daemon_config_path, os_)
+    ca_path = cfg_dir / "tls" / "ca.pem"
+    ca_pem = ca_path.read_text(encoding="utf-8")
+    cli_token = rep.cli_credential_path.read_text(encoding="ascii").strip()
+
+    rt = reopen_kernel_job_runtime(data_root, rep.store_id, os_)
+    try:
+        mcp_c = seed_principal_and_credential(rt.policy, owner_id=_OWNER, harness_id="claude-code", machine_id=_MACHINE)
+        mcp_x = seed_principal_and_credential(rt.policy, owner_id=_OWNER, harness_id="codex", machine_id=_MACHINE)
+        cap_c = seed_principal_and_credential(rt.policy, owner_id=_OWNER, harness_id="claude-code", machine_id=_MACHINE)
+        cap_x = seed_principal_and_credential(rt.policy, owner_id=_OWNER, harness_id="codex", machine_id=_MACHINE)
+        ws_a = register_workspace_direct(
+            rt,
+            clock,
+            mcp_c.principal,
+            alias="ws-r5-a",
+            checkout_dir=chk_a,
+            remote="https://github.example/dan/repo-r5-a.git",
+        )
+        ws_b = register_workspace_direct(
+            rt,
+            clock,
+            mcp_c.principal,
+            alias="ws-r5-b",
+            checkout_dir=chk_b,
+            remote="https://github.example/dan/repo-r5-b.git",
+        )
+        for pid in (mcp_x.principal.principal_id, cap_x.principal.principal_id):
+            seed_repo_grant(rt.policy, principal_id=pid, repo_id=ws_a.repo_id, owner_id=_OWNER)
+            seed_repo_grant(rt.policy, principal_id=pid, repo_id=ws_b.repo_id, owner_id=_OWNER)
+        rt.store.reconcile_policy()
+    finally:
+        rt.close()
+
+    with _serve_daemon(cfg, os_, clock, mono) as (ready, loop):
+        ep_path = data_root / "endpoint.json"
+        cred_c_file = write_credential_file(prof_dir / "claude.cred", mcp_c.token)
+        cred_x_file = write_credential_file(prof_dir / "codex.cred", mcp_x.token)
+
+        def _make_profile(name: str, cred_file: Path, ws: WorkspaceBinding, chk: Path) -> Path:
+            p, _ = write_client_profile_file(
+                prof_dir / name,
+                endpoint_path=ep_path,
+                expected_store_id=rep.store_id,
+                ca_file=ca_path,
+                leaf_cert_sha256=ready.leaf_cert_sha256,
+                credential_file=cred_file,
+                workspace={
+                    "alias": ws.alias,
+                    "expected_workspace_id": ws.repo_id,
+                    "expected_checkout_id": ws.checkout_id,
+                    "checkout_path": str(chk),
+                },
+            )
+            return p
+
+        prof_a_claude = _make_profile("a-claude.json", cred_c_file, ws_a, chk_a)
+        prof_a_codex = _make_profile("a-codex.json", cred_x_file, ws_a, chk_a)
+
+        def _bootstrap_apply(harness: str, chk: Path, prof: Path) -> None:
+            st_b, b_env = _post_tls(
+                ready,
+                ca_pem,
+                "/v2/operator/proposal/bootstrap",
+                cli_token,
+                {"harness": harness, "checkout_root": str(chk), "harness_profile_path": str(prof)},
+            )
+            assert st_b == 200 and b_env.get("ok") is True, (st_b, b_env)
+            pid = str(b_env["data"]["proposal"]["proposal_id"])
+            for op_path in ("/v2/operator/proposal/approve", "/v2/operator/proposal/apply"):
+                st_c, ch_env = _post_tls(ready, ca_pem, op_path, cli_token, {"proposal_id": pid})
+                assert st_c == 200 and ch_env.get("ok") is True, (op_path, ch_env)
+                ch = cast(dict[str, Any], ch_env["data"]["challenge"])
+                msg = ApprovalMessage.from_dict(ch)
+                st_x, ex_env = _post_tls(
+                    ready,
+                    ca_pem,
+                    op_path,
+                    cli_token,
+                    {
+                        "proposal_id": pid,
+                        "approval": {
+                            "message": ch,
+                            "channel": ApprovalChannel.SSH_KEY.value,
+                            "signer_id": rep.signer.signer_id,
+                            "signature": _ssh_sig_b64(priv, msg.canonical_bytes()),
+                        },
+                    },
+                )
+                assert st_x == 200 and ex_env.get("ok") is True, (op_path, ex_env)
+
+        _bootstrap_apply("claude-code", chk_a, prof_a_claude)
+        _bootstrap_apply("codex", chk_a, prof_a_codex)
+
+        cfg_claude = json.loads((chk_a / ".claude" / "settings.local.json").read_text(encoding="utf-8"))
+        cfg_codex = json.loads((chk_a / ".codex" / "hooks.json").read_text(encoding="utf-8"))
+
+        cmd_claude = _find_hook_commands(cfg_claude["hooks"]["PreToolUse"]["super_brain"]["command"])[0]
+        cmd_codex = _find_hook_commands(cfg_codex["hooks"]["PreToolUse"]["super_brain"]["command"])[0]
+        assert "--producer-stream" not in cmd_claude and "--sequence" not in cmd_claude
+        assert "--producer-stream" not in cmd_codex and "--sequence" not in cmd_codex
+
+        outbox_c = Path(_extract_outbox_arg(cmd_claude))
+        outbox_x = Path(_extract_outbox_arg(cmd_codex))
+        assert outbox_c.resolve() != outbox_x.resolve()
+
+        target = LoopbackTarget(
+            endpoint=ready.endpoint,
+            expected_store_id=rep.store_id,
+            ca_pem=ca_pem,
+            leaf_cert_sha256=ready.leaf_cert_sha256,
+        )
+        cap_client = CaptureClient(LoopbackClient(monotonic_ns=mono.monotonic_ns))
+
+        # --- Harness 1: Claude Code observed host payload (no envelope keys, no transcript_path) ---
+        claude_ev1: dict[str, Any] = {
+            "cwd": str(chk_a),
+            "hook_event_name": "PostToolUse",
+            "session_id": "claude-sid-r5-1",
+            "tool_name": "Bash",
+            "tool_input": {"command": "pytest -q"},
+            "tool_response": {"exit_code": 0, "stdout": "ok"},
+            "tool_use_id": "toolu_r5_1",
+            "duration_ms": 42,
+            "permission_mode": "default",
+            "effort": "medium",
+        }
+        _run_installed_hook_cmd(cmd_claude, claude_ev1, cwd=chk_a)
+
+        spool_c = OutboxSpool(outbox_c, permissions=os_.permissions)
+        pending_c1 = spool_c.read_pending(limit=10)
+        assert len(pending_c1) == 1, f"expected 1 outbox event for observed PostToolUse, got {pending_c1}"
+        ev_c1 = cast(dict[str, Any], json.loads(pending_c1[0].payload_json))
+        assert "session_id" not in ev_c1
+        assert "claude-sid-r5-1" not in pending_c1[0].payload_json
+        assert str(ev_c1["session_ref"]).startswith("sha256:")
+        assert isinstance(ev_c1["payload"], dict) and ev_c1["payload"]
+        require_iso_utc_timestamp(str(ev_c1["recorded_at"]))
+        c_seq1 = pending_c1[0].sequence
+        c_ev1_id = str(ev_c1["event_id"])
+        stream_c = pending_c1[0].producer_stream
+        assert c_seq1 >= 1 and stream_c
+
+        # Idempotent retry BEFORE drain: re-sending identical Event 1 keeps a single pending entry.
+        _run_installed_hook_cmd(cmd_claude, claude_ev1, cwd=chk_a)
+        pending_c1_retry = spool_c.read_pending(limit=10)
+        assert len(pending_c1_retry) == 1
+        assert pending_c1_retry[0].sequence == c_seq1
+
+        _publish_capture_creds(loop, [(cap_c, stream_c, ws_a)])
+        ack_c1 = drain_outbox(
+            spool_c,
+            client=cap_client,
+            target=target,
+            producer_stream=stream_c,
+            repo_id=ws_a.repo_id,
+            checkout_id=ws_a.checkout_id,
+            token=cap_c.token,
+        )
+        assert ack_c1 is not None and ack_c1.accepted_count == 1
+        assert c_seq1 in ack_c1.committed_event_sequences
+        assert spool_c.read_pending(limit=10) == []
+
+        # Consecutive Event 2 (PostToolUse with toolu_r5_2) -> strictly higher monotonic sequence -> drain ACK.
+        claude_ev2: dict[str, Any] = {
+            "cwd": str(chk_a),
+            "hook_event_name": "PostToolUse",
+            "session_id": "claude-sid-r5-1",
+            "tool_name": "Read",
+            "tool_input": {"file_path": str(chk_a / "CLAUDE.md")},
+            "tool_response": {"bytes": 120},
+            "tool_use_id": "toolu_r5_2",
+            "duration_ms": 12,
+            "permission_mode": "default",
+            "effort": "low",
+        }
+        _run_installed_hook_cmd(cmd_claude, claude_ev2, cwd=chk_a)
+        pending_c2 = spool_c.read_pending(limit=10)
+        assert len(pending_c2) == 1
+        assert pending_c2[0].producer_stream == stream_c
+        c_seq2 = pending_c2[0].sequence
+        assert c_seq2 > c_seq1
+
+        ack_c2 = drain_outbox(
+            spool_c,
+            client=cap_client,
+            target=target,
+            producer_stream=stream_c,
+            repo_id=ws_a.repo_id,
+            checkout_id=ws_a.checkout_id,
+            token=cap_c.token,
+        )
+        assert ack_c2 is not None and ack_c2.accepted_count == 1
+        assert c_seq2 in ack_c2.committed_event_sequences
+        assert spool_c.read_pending(limit=10) == []
+        rows_c = _capture_events_for_stream(loop, stream_c)
+        assert len(rows_c) == 2
+
+        # Idempotent retry AFTER drain: either skipped locally (0 pending) or same (seq1, event_id) deduped by daemon.
+        _run_installed_hook_cmd(cmd_claude, claude_ev1, cwd=chk_a)
+        pending_c_after = spool_c.read_pending(limit=10)
+        if pending_c_after:
+            assert len(pending_c_after) == 1
+            re_obj = cast(dict[str, Any], json.loads(pending_c_after[0].payload_json))
+            assert pending_c_after[0].sequence == c_seq1
+            assert str(re_obj["event_id"]) == c_ev1_id
+            ack_cr = drain_outbox(
+                spool_c,
+                client=cap_client,
+                target=target,
+                producer_stream=stream_c,
+                repo_id=ws_a.repo_id,
+                checkout_id=ws_a.checkout_id,
+                token=cap_c.token,
+            )
+            assert ack_cr is not None and ack_cr.accepted_count == 0 and ack_cr.deduped_count == 1
+        assert len(_capture_events_for_stream(loop, stream_c)) == 2
+
+        # Workspace switch for chk_a Claude hook: cwd=chk_b -> rc=0, 0 new events, zero chk_b leak.
+        _run_installed_hook_cmd(
+            cmd_claude,
+            {
+                "cwd": str(chk_b),
+                "hook_event_name": "PostToolUse",
+                "session_id": "claude-sid-ws-b",
+                "tool_name": "Bash",
+                "tool_input": {"command": "echo secret-chk-b-only"},
+                "tool_response": {"exit_code": 0},
+                "tool_use_id": "toolu_r5_ws_b",
+                "duration_ms": 5,
+                "permission_mode": "default",
+                "effort": "low",
+            },
+            cwd=chk_b,
+        )
+        assert spool_c.read_pending(limit=10) == []
+        assert len(_capture_events_for_stream(loop, stream_c)) == 2
+
+        # --- Harness 2: Codex native payload on supported mode (no envelope keys) ---
+        codex_ev1: dict[str, Any] = {
+            "cwd": str(chk_a),
+            "event_type": "command_completed",
+            "session_id": "codex-sid-r5-1",
+            "call_id": "call_codex_r5_1",
+            "command": "pytest -q tests/unit",
+            "exit_code": 0,
+        }
+        _run_installed_hook_cmd(cmd_codex, codex_ev1, cwd=chk_a)
+        spool_x = OutboxSpool(outbox_x, permissions=os_.permissions)
+        pending_x1 = spool_x.read_pending(limit=10)
+        assert len(pending_x1) == 1, f"expected 1 outbox event for Codex command_completed, got {pending_x1}"
+        ev_x1 = cast(dict[str, Any], json.loads(pending_x1[0].payload_json))
+        assert "session_id" not in ev_x1
+        assert "codex-sid-r5-1" not in pending_x1[0].payload_json
+        assert str(ev_x1["session_ref"]).startswith("sha256:")
+        assert isinstance(ev_x1["payload"], dict) and ev_x1["payload"]
+        require_iso_utc_timestamp(str(ev_x1["recorded_at"]))
+        x_seq1 = pending_x1[0].sequence
+        x_ev1_id = str(ev_x1["event_id"])
+        stream_x = pending_x1[0].producer_stream
+        assert x_seq1 >= 1 and stream_x != stream_c
+
+        _run_installed_hook_cmd(cmd_codex, codex_ev1, cwd=chk_a)
+        assert len(spool_x.read_pending(limit=10)) == 1
+
+        _publish_capture_creds(loop, [(cap_c, stream_c, ws_a), (cap_x, stream_x, ws_a)])
+        ack_x1 = drain_outbox(
+            spool_x,
+            client=cap_client,
+            target=target,
+            producer_stream=stream_x,
+            repo_id=ws_a.repo_id,
+            checkout_id=ws_a.checkout_id,
+            token=cap_x.token,
+        )
+        assert ack_x1 is not None and ack_x1.accepted_count == 1
+        assert x_seq1 in ack_x1.committed_event_sequences
+        assert spool_x.read_pending(limit=10) == []
+
+        codex_ev2: dict[str, Any] = {
+            "cwd": str(chk_a),
+            "event_type": "agent_turn_end",
+            "session_id": "codex-sid-r5-1",
+            "turn_id": "turn_codex_r5_2",
+            "summary": "All unit tests passed",
+        }
+        _run_installed_hook_cmd(cmd_codex, codex_ev2, cwd=chk_a)
+        pending_x2 = spool_x.read_pending(limit=10)
+        assert len(pending_x2) == 1
+        x_seq2 = pending_x2[0].sequence
+        assert x_seq2 > x_seq1
+
+        ack_x2 = drain_outbox(
+            spool_x,
+            client=cap_client,
+            target=target,
+            producer_stream=stream_x,
+            repo_id=ws_a.repo_id,
+            checkout_id=ws_a.checkout_id,
+            token=cap_x.token,
+        )
+        assert ack_x2 is not None and ack_x2.accepted_count == 1
+        assert x_seq2 in ack_x2.committed_event_sequences
+        assert len(_capture_events_for_stream(loop, stream_x)) == 2
+
+        # Codex retry after drain + workspace switch.
+        _run_installed_hook_cmd(cmd_codex, codex_ev1, cwd=chk_a)
+        pending_x_after = spool_x.read_pending(limit=10)
+        if pending_x_after:
+            assert len(pending_x_after) == 1
+            rx_obj = cast(dict[str, Any], json.loads(pending_x_after[0].payload_json))
+            assert pending_x_after[0].sequence == x_seq1 and str(rx_obj["event_id"]) == x_ev1_id
+            ack_xr = drain_outbox(
+                spool_x,
+                client=cap_client,
+                target=target,
+                producer_stream=stream_x,
+                repo_id=ws_a.repo_id,
+                checkout_id=ws_a.checkout_id,
+                token=cap_x.token,
+            )
+            assert ack_xr is not None and ack_xr.accepted_count == 0 and ack_xr.deduped_count == 1
+        assert len(_capture_events_for_stream(loop, stream_x)) == 2
+
+        _run_installed_hook_cmd(
+            cmd_codex,
+            {
+                "cwd": str(chk_b),
+                "event_type": "command_completed",
+                "session_id": "codex-sid-ws-b",
+                "call_id": "call_codex_ws_b",
+                "command": "echo secret-codex-b",
+                "exit_code": 0,
+            },
+            cwd=chk_b,
+        )
+        assert spool_x.read_pending(limit=10) == []
+        assert len(_capture_events_for_stream(loop, stream_x)) == 2
+
+
+def test_r5_finding2_active_host_version_drift_on_terminal_and_doctor(
+    trusted_tmp: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Host upgrade or unverifiable binary fails closed on already-running daemon terminal & doctor without capture."""
+    clock = FakeClock(datetime.now(UTC).replace(microsecond=0))
+    mono = FakeMonotonicClock(1_000_000_000)
+    os_ = os_adapters(clock=clock, monotonic=mono)
+    _priv, s_enr = _ssh_signer()
+
+    bin_dir = trusted_tmp / "bin"
+    cfg_dir = trusted_tmp / "cfg"
+    data_root = trusted_tmp / "data"
+    chk_a = trusted_tmp / "chk-r5-f2"
+    home_dir = trusted_tmp / "home"
+    for d in (bin_dir, cfg_dir, chk_a, home_dir):
+        d.mkdir(parents=True, exist_ok=True)
+        os_.permissions.secure_directory(d)
+
+    claude_bin = _write_fake_host_bin(bin_dir, "claude", f"{_CLAUDE_VER} (Claude Code)")
+    _write_fake_host_bin(bin_dir, "codex", "codex-cli 0.171.0")
+    ssh_dir = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "OpenSSH"
+    isolated_path = f"{bin_dir}{os.pathsep}{ssh_dir}" if sys.platform == "win32" else str(bin_dir)
+    monkeypatch.setenv("PATH", isolated_path)
+
+    rep = init_entry.init_store(
+        init_entry.InitRequest(
+            data_root=data_root, config_dir=cfg_dir, owner_id=_OWNER, machine_id=_MACHINE, signer=s_enr
+        ),
+        os_,
+    )
+    cfg = read_daemon_config(rep.daemon_config_path, os_)
+    ca_pem = (cfg_dir / "tls" / "ca.pem").read_text(encoding="utf-8")
+    cli_token = rep.cli_credential_path.read_text(encoding="ascii").strip()
+
+    prof_path = cfg_dir / "claude-profile.json"
+    _write_plan_targets(chk_a, plan_claude_bootstrap(checkout_root=chk_a, profile_path=prof_path).targets)
+    _write_plan_targets(chk_a, plan_codex_bootstrap(checkout_root=chk_a, profile_path=prof_path).targets)
+    c_dig = compute_harness_config_digest("claude-code", chk_a, os_)
+    x_dig = compute_harness_config_digest("codex", chk_a, os_)
+    assert c_dig is not None and x_dig is not None
+
+    rt = reopen_kernel_job_runtime(data_root, rep.store_id, os_)
+    try:
+        mcp_c = seed_principal_and_credential(rt.policy, owner_id=_OWNER, harness_id="claude-code", machine_id=_MACHINE)
+        seed_principal_and_credential(rt.policy, owner_id=_OWNER, harness_id="codex", machine_id=_MACHINE)
+        register_workspace_direct(rt, clock, mcp_c.principal, alias="ws-r5-f2", checkout_dir=chk_a)
+        rt.store.reconcile_policy()
+        assert (
+            reconcile_harness_layer2_in_policy(
+                rt.policy,
+                harness_id="claude-code",
+                checkout_root=chk_a,
+                observed_host_version=_CLAUDE_VER,
+                os_=os_,
+                receipt=_build_receipt(harness_id="claude-code", host_version=_CLAUDE_VER, config_digest=c_dig),
+            )[0]
+            is Layer2State.VERIFIED
+        )
+        assert (
+            reconcile_harness_layer2_in_policy(
+                rt.policy,
+                harness_id="codex",
+                checkout_root=chk_a,
+                observed_host_version="0.171.0",
+                os_=os_,
+                receipt=_build_receipt(harness_id="codex", host_version="0.171.0", config_digest=x_dig),
+            )[0]
+            is Layer2State.VERIFIED
+        )
+    finally:
+        rt.close()
+
+    with _serve_daemon(cfg, os_, clock, mono) as (ready, loop):
+        def _new_prop(note_name: str) -> str:
+            def _make() -> str:
+                session = cast(Any, loop._session)
+                assert session is not None
+                return _create_low_risk_proposal(
+                    session._rt, os_, data_root=data_root, home=home_dir, checkout=chk_a, note_name=note_name
+                )
+
+            return loop.run_owner_action(_make).result(timeout=10.0)
+
+        # Positive twin: live daemon (default hooks, NO custom resolver override) + run_doctor (NO observed override)
+        # report VERIFIED / pass / terminal_channel_eligible=True, and TERMINAL approval succeeds.
+        doc_ok = run_doctor(rep.daemon_config_path, checkout_root=chk_a, os_=os_)
+        assert doc_ok.terminal_channel_eligible is True
+        assert doc_ok.overall_status == "pass"
+        assert {h.harness_id: h.state for h in doc_ok.layer2_harnesses} == {
+            "claude-code": Layer2State.VERIFIED,
+            "codex": Layer2State.VERIFIED,
+        }
+
+        prop_ok = _new_prop("r5-f2-ok.md")
+        st_ok, app_ok = _terminal_approve_proposal(ready, ca_pem, cli_token, prop_ok)
+        assert st_ok == 200 and app_ok.get("ok") is True, (st_ok, app_ok)
+
+        # Upgrade claude binary to 2.1.332 WITHOUT changing checkout config on disk and BEFORE next capture batch!
+        _write_fake_host_bin(bin_dir, "claude", "2.1.332 (Claude Code)")
+
+        # a) Read-only doctor (direct + CLI subprocess, NO observed_host_versions) detects host_version_changed.
+        def _l2_row_count() -> int:
+            session = cast(Any, loop._session)
+            assert session is not None
+            return int(session._rt.policy._db.execute("SELECT COUNT(*) FROM harness_layer2_state").fetchone()[0])
+
+        l2_rows_before = loop.run_owner_action(_l2_row_count).result(timeout=10.0)
+        snap_chk = digest_tree(chk_a)
+        doc_upg = run_doctor(rep.daemon_config_path, checkout_root=chk_a, os_=os_)
+        assert doc_upg.terminal_channel_eligible is False
+        assert doc_upg.overall_status == "warn"
+        assert any(c.name == "layer2" and c.status == "warn" for c in doc_upg.checks)
+        assert any(c.name == "sp2_layer2_drift" and c.status == "warn" for c in doc_upg.checks)
+        sp2_upg = cast(dict[str, Any], doc_upg.to_dict()["sp2"])
+        assert sp2_upg["terminal_channel_eligible_effective"] is False
+        upg_by_id = {str(h["harness_id"]): h for h in cast(list[dict[str, Any]], sp2_upg["layer2_harnesses"])}
+        assert upg_by_id["claude-code"]["effective_state"] == Layer2State.UNKNOWN.value
+        assert upg_by_id["claude-code"]["invalidated_reason"] == "host_version_changed"
+
+        cli_proc = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-m",
+                "superbrain.cli.main",
+                "doctor",
+                "--config",
+                str(rep.daemon_config_path),
+                "--checkout",
+                str(chk_a),
+                "--json",
+            ],
+            env=clean_installed_subprocess_env(),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=15.0,
+            check=False,
+        )
+        assert cli_proc.returncode == 0, (cli_proc.returncode, cli_proc.stderr)
+        cli_doc = json.loads(cli_proc.stdout)["data"]
+        assert cli_doc["terminal_channel_eligible"] is False
+        assert cli_doc["overall_status"] == "warn"
+        cli_l2 = {str(h["harness_id"]): h for h in cli_doc["sp2"]["layer2_harnesses"]}
+        assert cli_l2["claude-code"]["effective_state"] == Layer2State.UNKNOWN.value
+        assert cli_l2["claude-code"]["invalidated_reason"] == "host_version_changed"
+        assert loop.run_owner_action(_l2_row_count).result(timeout=10.0) == l2_rows_before
+        assert digest_tree(chk_a) == snap_chk
+
+        # b) Already-running daemon BEFORE any capture batch MUST detect 2.1.332 != 2.1.325, downgrade in DB,
+        # and REFUSE terminal approval with CAPABILITY_UNAVAILABLE!
+        prop_upgrade = _new_prop("r5-f2-upg.md")
+        st_up, app_up = _terminal_approve_proposal(ready, ca_pem, cli_token, prop_upgrade)
+        assert app_up.get("ok") is False, (st_up, app_up)
+        assert app_up["error"]["code"] == ErrorCode.CAPABILITY_UNAVAILABLE.value
+
+        def _read_claude_l2_state() -> Layer2State | None:
+            session = cast(Any, loop._session)
+            assert session is not None
+            latest = session._rt.policy.layer2_state("claude-code")
+            return None if latest is None else latest[3]
+
+        assert loop.run_owner_action(_read_claude_l2_state).result(timeout=10.0) is Layer2State.UNKNOWN
+
+        # Part 3: Unverifiable host binary (removed from PATH / resolver returns None) -> MUST fail closed.
+        _write_fake_host_bin(bin_dir, "claude", f"{_CLAUDE_VER} (Claude Code)")
+
+        def _reverify_claude() -> None:
+            session = cast(Any, loop._session)
+            assert session is not None
+            st_rv, _ = reconcile_harness_layer2_in_policy(
+                session._rt.policy,
+                harness_id="claude-code",
+                checkout_root=chk_a,
+                observed_host_version=_CLAUDE_VER,
+                os_=os_,
+                receipt=_build_receipt(harness_id="claude-code", host_version=_CLAUDE_VER, config_digest=c_dig),
+            )
+            assert st_rv is Layer2State.VERIFIED
+
+        loop.run_owner_action(_reverify_claude).result(timeout=10.0)
+        claude_bin.unlink()
+
+        # Check verify_live_layer2_harness fails closed when resolver returns None.
+        def _check_resolver_none() -> Layer2State | None:
+            session = cast(Any, loop._session)
+            assert session is not None
+            assert (
+                verify_live_layer2_harness(
+                    session._rt.policy,
+                    harness_id="claude-code",
+                    os_=os_,
+                    host_version_resolver=lambda _: None,
+                )
+                is None
+            )
+            latest = session._rt.policy.layer2_state("claude-code")
+            return None if latest is None else latest[3]
+
+        assert loop.run_owner_action(_check_resolver_none).result(timeout=10.0) is Layer2State.UNKNOWN
+
+        # Re-verify once more to test doctor & running daemon terminal with claude binary missing from PATH!
+        loop.run_owner_action(_reverify_claude).result(timeout=10.0)
+        doc_miss = run_doctor(rep.daemon_config_path, checkout_root=chk_a, os_=os_)
+        assert doc_miss.terminal_channel_eligible is False
+        sp2_miss = cast(dict[str, Any], doc_miss.to_dict()["sp2"])
+        miss_by_id = {str(h["harness_id"]): h for h in cast(list[dict[str, Any]], sp2_miss["layer2_harnesses"])}
+        assert miss_by_id["claude-code"]["effective_state"] == Layer2State.UNKNOWN.value
+
+        prop_missing = _new_prop("r5-f2-miss.md")
+        st_ms, app_ms = _terminal_approve_proposal(ready, ca_pem, cli_token, prop_missing)
+        assert app_ms.get("ok") is False, (st_ms, app_ms)
+        assert app_ms["error"]["code"] == ErrorCode.CAPABILITY_UNAVAILABLE.value
+        assert loop.run_owner_action(_read_claude_l2_state).result(timeout=10.0) is Layer2State.UNKNOWN

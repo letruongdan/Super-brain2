@@ -17,12 +17,21 @@ from superbrain.adapters.harness._common import (
 from superbrain.ports.os import OsAdapters
 
 CODEX_EVENT_KIND_MAP: dict[str, str] = {
+    "UserPromptSubmit": "user_prompt",
+    "PreToolUse": "tool_use",
+    "PostToolUse": "command_result",
+    "Stop": "session_end",
+    "SubagentStop": "subagent_stop",
+    "Notification": "notification",
+    "SessionStart": "session_resumed",
+    "SessionEnd": "session_ended",
     "user_prompt": "user_prompt",
     "user_message": "user_message",
     "command_started": "command_started",
     "command_completed": "command_result",
     "command_result": "command_result",
     "agent_turn_end": "assistant_response",
+    "agent-turn-complete": "assistant_response",
     "assistant_response": "assistant_response",
     "session_start": "session_resumed",
     "session_end": "session_end",

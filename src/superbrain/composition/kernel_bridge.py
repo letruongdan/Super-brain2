@@ -165,7 +165,12 @@ class KernelBridge(KernelBlobStagePort):
         self._on_clock_untrusted_changed = on_clock_untrusted_changed
         self._on_capture_gaps_changed = on_capture_gaps_changed
         self._os = os_ if os_ is not None else os_adapters(clock=clock, monotonic=resolved_mono)
-        self._host_version_resolver = host_version_resolver
+        if host_version_resolver is None:
+            from superbrain.adapters.harness.host_version import probe_installed_host_version
+
+            self._host_version_resolver: Callable[[str], str | None] = probe_installed_host_version
+        else:
+            self._host_version_resolver = host_version_resolver
         self._seen_l2: set[tuple[str, str]] = set() if seen_configured_layer2 is None else seen_configured_layer2
         self.on_continuity_tasks: Callable[[tuple[str, ...]], None] | None = None  # owner thread
         self._wire_stores(store, policy, writer_epoch)

@@ -202,7 +202,12 @@ def test_capture_auth_scope_privacy_cas_policy_and_source_attribution() -> None:
     domain = TransportTestDomain(ws_a=ws_a)
     stream = "claude-stream-a"
 
-    with open_test_loopback_transport(tpl, name="sp22-ingest", domain=domain) as h:
+    with open_test_loopback_transport(
+        tpl,
+        name="sp22-ingest",
+        domain=domain,
+        hooks=DaemonTestHooks(host_version_resolver=lambda hid: "2.1.325" if hid == "claude-code" else None),
+    ) as h:
         cap_cred, _cli_cred = _setup_capture_and_cli(h, ws_a, stream=stream)
         cap_client = CaptureClient(h.open_client())
         target = h.make_target()
@@ -849,7 +854,12 @@ def test_capture_only_policy_keeps_payload_and_source_when_manual_submission_dis
     stream = "caponly-f1-stream"
     cfg_dig = "sha256:" + ("c" * 64)
 
-    with open_test_loopback_transport(tpl, name="sp22-f1-caponly", domain=TransportTestDomain(ws_a=ws_a)) as h:
+    with open_test_loopback_transport(
+        tpl,
+        name="sp22-f1-caponly",
+        domain=TransportTestDomain(ws_a=ws_a),
+        hooks=DaemonTestHooks(host_version_resolver=lambda hid: "2.1.325" if hid == "claude-code" else None),
+    ) as h:
         cap_cred, _cli_cred = _setup_capture_and_cli(h, ws_a, stream=stream)
         cap_client = CaptureClient(h.open_client())
         target = h.make_target()

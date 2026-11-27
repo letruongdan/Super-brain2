@@ -78,6 +78,7 @@ class DaemonTestHooks:
     before_enter_commit: Callable[[Reservation | None], None] | None = None
     after_reserve_before_enqueue: Callable[[Reservation], None] | None = None
     before_runtime_close: Callable[[Runtime], None] | None = None
+    host_version_resolver: Callable[[str], str | None] | None = None
 
 
 _DEFAULT_HANDOFF_TOOLS: frozenset[str] = frozenset({"prepare_task", "get_artifact", "submit_episode", "get_health"})
@@ -96,6 +97,7 @@ def build_default_handoff_domain(
     clock: Clock,
     writer_epoch: int,
     deep_health: bool = False,
+    host_version_resolver: Callable[[str], str | None] | None = None,
 ) -> KernelToolDomain | None:
     """Build the production SP2-4/5 ``HandoffKernelDomain`` when store v8 and policy v5 are admitted."""
     if rt.store.schema_version < 8 or rt.policy.schema_version < 5:
@@ -122,7 +124,13 @@ def build_default_handoff_domain(
     )
 
     def _probe_deep() -> DeepHealthProbeResult:
-        sp2 = run_sp2_doctor_probes(rt.root.root, checkout_root=None, os_=rt.os_, now=clock.now())
+        sp2 = run_sp2_doctor_probes(
+            rt.root.root,
+            checkout_root=None,
+            host_version_resolver=host_version_resolver,
+            os_=rt.os_,
+            now=clock.now(),
+        )
         drifted = any(
             h.recorded_state is Layer2State.VERIFIED and h.effective_state is not Layer2State.VERIFIED
             for h in sp2.layer2_harnesses
@@ -157,13 +165,20 @@ def make_default_handoff_domain_factory(
     rt: Runtime,
     clock: Clock,
     writer_epoch: int,
+    host_version_resolver: Callable[[str], str | None] | None = None,
 ) -> Callable[[], KernelToolDomain | None] | None:
     """Return a lazy builder for ``HandoffKernelDomain`` when store v8 and policy v5 are admitted."""
     if rt.store.schema_version < 8 or rt.policy.schema_version < 5:
         return None
 
     def _build() -> KernelToolDomain | None:
-        return build_default_handoff_domain(rt=rt, clock=clock, writer_epoch=writer_epoch, deep_health=True)
+        return build_default_handoff_domain(
+            rt=rt,
+            clock=clock,
+            writer_epoch=writer_epoch,
+            deep_health=True,
+            host_version_resolver=host_version_resolver,
+        )
 
     return _build
 

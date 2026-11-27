@@ -11,6 +11,11 @@ from superbrain.adapters.harness._common import (
 )
 from superbrain.adapters.harness.claude_code import CLAUDE_EVENT_KIND_MAP, ClaudeCodeCaptureAdapter
 from superbrain.adapters.harness.codex import CODEX_EVENT_KIND_MAP, CodexCaptureAdapter
+from superbrain.adapters.harness.host_version import (
+    find_host_executable,
+    probe_installed_host_version,
+    probe_observed_host_versions,
+)
 from superbrain.adapters.harness.layer2_probe import (
     NATIVE_HOST_RECEIPT_SCHEMA_VERSION,
     AuthorityCommandProbeResult,
@@ -35,5 +40,8 @@ __all__ = [
     "NativeHostReceipt",
     "TranscriptReadResult",
     "compute_harness_config_digest",
+    "find_host_executable",
+    "probe_installed_host_version",
+    "probe_observed_host_versions",
     "verify_native_host_receipt",
 ]

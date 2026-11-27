@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -166,6 +166,7 @@ def run_doctor(
     os_: OsAdapters | None = None,
     outbox_dir: Path | None = None,
     observed_host_versions: Mapping[str, str] | None = None,
+    host_version_resolver: Callable[[str], str | None] | None = None,
 ) -> DoctorReport:
     """Inspect storage + checkout state strictly read-only and return a ``DoctorReport``."""
     adapters = os_ if os_ is not None else os_adapters()
@@ -199,6 +200,7 @@ def run_doctor(
         outbox_dir=outbox_dir,
         checkout_root=resolved_checkout,
         observed_host_versions=observed_host_versions,
+        host_version_resolver=host_version_resolver,
         os_=adapters,
     )
     return _merge_sp2_report(report, sp2_report)

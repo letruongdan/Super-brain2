@@ -103,13 +103,15 @@ def run_hook(
         is_native = isinstance(parsed, dict) and (
             checkout_root is not None
             or profile_path is not None
-            or any(k in parsed for k in ("event_name", "hook_event_name", "event_type", "transcript_path"))
+            or any(k in parsed for k in ("hook_event_name", "event_type", "transcript_path"))
+            or ("cwd" in parsed and any(k in parsed for k in ("event_name", "type", "event")))
         )
+        gate = CapturePrivacyGate(PrivacyFilter(monotonic_ns=monotonic_ns), monotonic_ns=monotonic_ns)
         if is_native:
             assert isinstance(parsed, dict)
-            from superbrain.composition._hook_adapter_bridge import adapt_native_hook_payload
+            from superbrain.composition._hook_adapter_bridge import prepare_native_hook
 
-            adapted, effective_raw_sid, skip_code = adapt_native_hook_payload(
+            prep = prepare_native_hook(
                 parsed,
                 os_=os_adapters(),
                 default_harness_id=default_harness_id,
@@ -119,16 +121,62 @@ def run_hook(
                 sequence=sequence,
                 raw_session_id=raw_session_id,
             )
-            if adapted is None:
-                _write_static_log(log_path, phase="hook_adapter", code=skip_code or "unavailable")
+            effective_raw_sid = prep.raw_session_id
+            if prep.build_record is None:
+                _write_static_log(log_path, phase="hook_adapter", code=prep.skip_code or "unavailable")
                 return 0
-            normalized = adapted
-        else:
-            normalized = normalize_capture_record(parsed, default_harness_id=default_harness_id)
+            if int(monotonic_ns()) >= work_deadline_ns:
+                normalized = prep.build_record(
+                    prep.explicit_sequence if prep.explicit_sequence is not None else 1,
+                    prep.explicit_event_id or f"ev-{new_id()}",
+                    prep.fallback_recorded_at,
+                )
+                raise BrainError(ErrorCode.DEADLINE_EXCEEDED, "deadline exceeded")
+            if parsed.get("record_kind") == "capture_gap":
+                gap_rec = prep.build_record(
+                    prep.explicit_sequence if prep.explicit_sequence is not None else 1,
+                    prep.explicit_event_id or f"gap-{new_id()}",
+                    prep.fallback_recorded_at,
+                )
+                assert isinstance(gap_rec, ProducerCaptureGap)
+                normalized = gap_rec
+                validated_gap = gate.validate_gap(
+                    gap_rec,
+                    raw_session_id=effective_raw_sid,
+                    deadline_ns=work_deadline_ns,
+                )
+                spool = _make_spool(outbox_dir, spool_factory)
+                spool.enqueue_gap(validated_gap, deadline_ns=work_deadline_ns)
+                return 0
+
+            def _build_sanitized(seq_val: int, ev_id_val: str, rec_at_val: str) -> CaptureEventRecord:
+                nonlocal normalized
+                assert prep.build_record is not None
+                built = prep.build_record(seq_val, ev_id_val, rec_at_val)
+                assert isinstance(built, CaptureEventRecord)
+                normalized = built
+                return gate.sanitize_event(
+                    built,
+                    raw_session_id=effective_raw_sid,
+                    deadline_ns=work_deadline_ns,
+                )
+
+            spool = _make_spool(outbox_dir, spool_factory)
+            spool.enqueue_hook_event(
+                producer_stream=prep.producer_stream,
+                build_event=_build_sanitized,
+                explicit_sequence=prep.explicit_sequence,
+                explicit_event_id=prep.explicit_event_id,
+                dedup_key=prep.dedup_key,
+                fallback_recorded_at=prep.fallback_recorded_at,
+                deadline_ns=work_deadline_ns,
+            )
+            return 0
+
+        normalized = normalize_capture_record(parsed, default_harness_id=default_harness_id)
         if int(monotonic_ns()) >= work_deadline_ns:
             raise BrainError(ErrorCode.DEADLINE_EXCEEDED, "deadline exceeded")
 
-        gate = CapturePrivacyGate(PrivacyFilter(monotonic_ns=monotonic_ns), monotonic_ns=monotonic_ns)
         if isinstance(normalized, ProducerCaptureGap):
             validated_gap = gate.validate_gap(
                 normalized,

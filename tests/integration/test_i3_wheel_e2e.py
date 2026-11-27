@@ -8,9 +8,11 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 import socket
 import ssl
 import struct
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
@@ -809,9 +811,26 @@ def test_i3_wheel_synthetic_lifecycle_e2e(inc2_installed_env: InstalledEnv, trus
     finally:
         rt_rec.close()
 
+    bin_dir = trusted_tmp / "fake-host-bins"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    os_.permissions.secure_directory(bin_dir)
+    for host_bin in ("claude", "codex"):
+        if sys.platform == "win32":
+            (bin_dir / f"{host_bin}.cmd").write_text("@echo off\r\necho 1.0.0\r\n", encoding="ascii")
+        else:
+            p_bin = bin_dir / host_bin
+            p_bin.write_text("#!/bin/sh\nprintf '1.0.0\\n'\n", encoding="utf-8")
+            p_bin.chmod(0o755)
+    ssh_dir = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "OpenSSH"
+    fake_path = f"{bin_dir}{os.pathsep}{ssh_dir}" if sys.platform == "win32" else str(bin_dir)
+
     doc_clean = json.loads(
         run_installed_command(
-            inc2_installed_env, "brain", ["doctor", "--config", str(daemon_cfg_path), "--json"], cwd=cwd
+            inc2_installed_env,
+            "brain",
+            ["doctor", "--config", str(daemon_cfg_path), "--json"],
+            cwd=cwd,
+            extra_env={"PATH": fake_path},
         ).stdout
     )["data"]
     assert doc_clean["unresolved_accounting_locks"] == [] and doc_clean["overall_status"] == "pass"

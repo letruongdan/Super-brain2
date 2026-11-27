@@ -132,7 +132,14 @@ def run_fixture_rehearsal(work_dir: Path, *, output_path: Path | None = None) ->
         rt.store.reconcile_policy()
         domain = build_default_handoff_domain(rt=rt, clock=clock, writer_epoch=rt.lease.epoch)
         bridge = KernelBridge(
-            store=rt.store, policy=rt.policy, clock=clock, writer_epoch=rt.lease.epoch, domain=domain
+            store=rt.store,
+            policy=rt.policy,
+            clock=clock,
+            writer_epoch=rt.lease.epoch,
+            domain=domain,
+            host_version_resolver=lambda hid: (
+                "2.1.325" if hid == "claude-code" else ("26.1111.2228.0" if hid == "codex" else None)
+            ),
         )
 
         # Grant separate capture_producer credential for Claude Code and verify Layer-2 receipts for both hosts.

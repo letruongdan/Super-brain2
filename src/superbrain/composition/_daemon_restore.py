@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import threading
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
@@ -142,12 +143,14 @@ class DaemonRestoreHandler(RestoreHandler):
         operator: OperatorHandle,
         review_apply_cls: type[ReviewApplyService] = ReviewApplyService,
         seen_configured_layer2: set[tuple[str, str]] | None = None,
+        host_version_resolver: Callable[[str], str | None] | None = None,
     ) -> None:
         self._session = session
         self._adapters = adapters
         self._clock = clock
         self._executor = executor
         self._composite_domain = composite_domain
+        self._host_version_resolver = host_version_resolver
         self._instance_id = instance_id
         self._operator = operator
         self._review_apply_cls = review_apply_cls
@@ -417,6 +420,7 @@ class DaemonRestoreHandler(RestoreHandler):
                 live_layer2_check=lambda: reconcile_live_layer2_all(
                     self._session.rt.policy,
                     os_=self._adapters,
+                    host_version_resolver=self._host_version_resolver,
                     seen_configured=self._seen_configured_layer2,
                 ),
             )
