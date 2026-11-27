@@ -825,7 +825,7 @@ def test_r10_f15_recovered_pending_binding_survives_new_key_in_same_bucket(trust
     def _fail_bucket(*_a: Any, **_kw: Any) -> None:
         raise BrainError(ErrorCode.IO_ERROR, "simulated crash before bucket write")
 
-    outbox_mod = sys.modules["superbrain.storage.outbox"]
+    outbox_mod = cast(Any, sys.modules["superbrain.storage.outbox"])
     orig_write = outbox_mod.write_prepared_binding_bucket
     outbox_mod.write_prepared_binding_bucket = _fail_bucket
     try:
