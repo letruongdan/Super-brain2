@@ -227,7 +227,7 @@ def run_hook(
                 estimated_count=1,
                 duration_ms=duration_ms,
             )
-            gap_deadline_ns = min(hard_deadline_ns, cur_ns + reserve_ns)
+            gap_deadline_ns = hard_deadline_ns
             try:
                 spool = _make_spool(outbox_dir, spool_factory)
                 spool.enqueue_gap(gap, deadline_ns=gap_deadline_ns)
