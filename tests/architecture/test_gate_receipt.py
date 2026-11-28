@@ -1375,13 +1375,31 @@ def ci_matrix_list(name: str, job: str = "gate") -> list[str]:
 
 
 def test_ci_three_jobs_workflow_contract() -> None:
-    """The 3-job CI workflow: gate (POSIX), gate-windows-worker (sharded partitions), gate-windows-aggregate."""
+    """CI workflow: gate (Ubuntu), partitioned workers plus an aggregate for Windows and for macOS."""
     jobs = ci_jobs()
-    expected_jobs = {"gate", "gate-windows-worker", "gate-windows-aggregate"}
+    expected_jobs = {
+        "gate", "gate-windows-worker", "gate-windows-aggregate", "gate-macos-worker", "gate-macos-aggregate"
+    }
     assert set(jobs.keys()) == expected_jobs, f"Expected jobs {expected_jobs}, found {set(jobs.keys())}"
 
     # 1. POSIX gate job
-    assert set(ci_matrix_list("os", "gate")) == {"macos-latest", "ubuntu-latest"}
+    # Owner decision 2026-11-28: macOS moved to its own partitioned workers (serial deadline phase, 300 s budget).
+    assert set(ci_matrix_list("os", "gate")) == {"ubuntu-latest"}
+    for os_name, job_os, parts in (("macos", "macos-latest", ["0", "1"]),):
+        assert jobs[f"gate-{os_name}-worker"].get("runs-on") == job_os
+        assert ci_matrix_list("partition", f"gate-{os_name}-worker") == parts
+        assert ci_matrix_list("python", f"gate-{os_name}-worker") == ["3.11", "3.14"]
+        m_worker = next(s for s in ci_steps(f"gate-{os_name}-worker") if "scripts/gate.py" in s)
+        assert f"--partition ${{{{ matrix.partition }}}}/{len(parts)}" in m_worker, m_worker
+        m_agg_job = jobs[f"gate-{os_name}-aggregate"]
+        assert m_agg_job.get("runs-on") == job_os and "always()" in str(m_agg_job.get("if", ""))
+        m_agg_steps = ci_steps(f"gate-{os_name}-aggregate")
+        m_agg = next(s for s in m_agg_steps if "scripts/gate.py aggregate" in s)
+        assert f"--partition-count {len(parts)}" in m_agg, m_agg
+        m_downloads = [s for s in m_agg_steps if "download-artifact" in s and f"gate-worker-{os_name}-" in s]
+        assert len(m_downloads) == len(parts)
+        m_bench = next(i for i, s in enumerate(m_agg_steps) if "tests.integration.test_kernel_performance" in s)
+        assert m_bench > m_agg_steps.index(m_agg)
     assert ci_matrix_list("python", "gate") == ["3.11", "3.14"]
     gate_steps = ci_steps("gate")
     gate_at = next((i for i, s in enumerate(gate_steps) if "scripts/gate.py" in s), None)

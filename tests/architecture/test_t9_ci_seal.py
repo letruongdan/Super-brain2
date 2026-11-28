@@ -20,7 +20,9 @@ ANCHOR = "T9_TEST_SEAL_R19_SHA256"
 def test_ci_checks_externally_anchored_seal_before_and_after_acceptance() -> None:
     """A reviewer-owned anchor must guard all cells across all 3 CI jobs and still check a failed acceptance run."""
     jobs = ci_jobs()
-    expected_jobs = {"gate", "gate-windows-worker", "gate-windows-aggregate"}
+    expected_jobs = {
+        "gate", "gate-windows-worker", "gate-windows-aggregate", "gate-macos-worker", "gate-macos-aggregate"
+    }
     assert set(jobs.keys()) == expected_jobs, (
         f"CI workflow must define exactly jobs {expected_jobs}, found {set(jobs.keys())}"
     )
@@ -31,7 +33,9 @@ def test_ci_checks_externally_anchored_seal_before_and_after_acceptance() -> Non
     )
     assert ".verification/test_lock.py seal" not in workflow, "CI must not approve its own input bytes"
 
-    for job_name in ("gate", "gate-windows-worker", "gate-windows-aggregate"):
+    for job_name in (
+        "gate", "gate-windows-worker", "gate-windows-aggregate", "gate-macos-worker", "gate-macos-aggregate"
+    ):
         steps = ci_steps(job_name)
         checks = [(i, step) for i, step in enumerate(steps) if ".verification/test_lock.py check" in step]
         assert len(checks) == 2, (

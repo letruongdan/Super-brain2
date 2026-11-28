@@ -42,7 +42,10 @@ def _job_git_environment(job_name: str = "gate") -> dict[str, str]:
     return values
 
 
-@pytest.mark.parametrize("job_name", ["gate", "gate-windows-worker", "gate-windows-aggregate"])
+@pytest.mark.parametrize(
+    "job_name",
+    ["gate", "gate-windows-worker", "gate-windows-aggregate", "gate-macos-worker", "gate-macos-aggregate"],
+)
 def test_ci_initial_and_gate_checkouts_use_reviewed_bytes_with_hostile_git_defaults(
     tmp_path: Path, job_name: str
 ) -> None:
@@ -108,7 +111,7 @@ def test_ci_initial_and_gate_checkouts_use_reviewed_bytes_with_hostile_git_defau
     status = git(checkout, "status", "--porcelain", env=job_env)
     assert not status, f"CI primary checkout in {job_name} must be clean"
 
-    if job_name in ("gate", "gate-windows-worker"):
+    if job_name in ("gate", "gate-windows-worker", "gate-macos-worker"):
         gate_checkout = tmp_path / f"gate-checkout_{job_name}"
         git(checkout, "worktree", "add", "--detach", str(gate_checkout), "HEAD", env=job_env)
         for relative, contents in expected.items():
@@ -122,9 +125,13 @@ def test_ci_initial_and_gate_checkouts_use_reviewed_bytes_with_hostile_git_defau
 def test_ci_checkout_steps_require_full_history_fetch_depth_zero() -> None:
     """R2: actions/checkout@v4 across all CI jobs must specify with: fetch-depth: 0."""
     jobs = ci_jobs()
-    expected_jobs = {"gate", "gate-windows-worker", "gate-windows-aggregate"}
+    expected_jobs = {
+        "gate", "gate-windows-worker", "gate-windows-aggregate", "gate-macos-worker", "gate-macos-aggregate"
+    }
     assert set(jobs.keys()) == expected_jobs, f"Expected jobs {expected_jobs}, found {set(jobs.keys())}"
-    for job_name in ("gate", "gate-windows-worker", "gate-windows-aggregate"):
+    for job_name in (
+        "gate", "gate-windows-worker", "gate-windows-aggregate", "gate-macos-worker", "gate-macos-aggregate"
+    ):
         steps = ci_steps(job_name)
         checkout_steps = [s for s in steps if "actions/checkout@v4" in s]
         assert len(checkout_steps) >= 1, f"Job {job_name} missing actions/checkout@v4 step"
@@ -143,6 +150,8 @@ def test_ci_forbids_pwsh_and_mandates_bash_for_test_execution_steps() -> None:
         "gate": ["Run the gate", "Benchmark"],
         "gate-windows-worker": ["Run partitioned worker gate"],
         "gate-windows-aggregate": ["Run aggregate receipt validation", "Benchmark"],
+        "gate-macos-worker": ["Run partitioned worker gate"],
+        "gate-macos-aggregate": ["Run aggregate receipt validation", "Benchmark"],
     }
     for job_name, step_names in required_bash_steps.items():
         steps = ci_steps(job_name)
