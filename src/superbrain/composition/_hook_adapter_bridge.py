@@ -295,24 +295,8 @@ def prepare_native_hook(
         session_ref=session_ref,
     )
 
-    raw_tr = parsed.get("transcript_path")
-    if raw_tr is not None:
-        if not isinstance(raw_tr, str) or not raw_tr:
-            return PreparedNativeHook(
-                eff_stream, eff_raw_sid, explicit_seq, explicit_ev_id, None, recorded_at_default, "unavailable", None
-            )
-        tr_res = adapter.read_scoped_transcript(Path(raw_tr), context=ctx, allowed_roots=(resolved_checkout,))
-        if tr_res.status is not AdapterCaptureStatus.OK:
-            return PreparedNativeHook(
-                eff_stream,
-                eff_raw_sid,
-                explicit_seq,
-                explicit_ev_id,
-                None,
-                recorded_at_default,
-                tr_res.status.value,
-                None,
-            )
+    # Hosts pass ``transcript_path`` under their own data directory, outside the checkout. The hook event on stdin is
+    # the observation; the transcript file is never read here.
 
     dedup_key = _compute_dedup_key(
         parsed,

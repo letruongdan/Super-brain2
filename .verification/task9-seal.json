@@ -23,6 +23,7 @@
     "tests/adapters/test_durable.py": "sha256:879334d821b67fd3b039eeb6d0de692a18d652d33ef6a03bc43e96ca49caf259",
     "tests/adapters/test_i3_2_hygiene_regressions.py": "sha256:197d5d87fdab8a0a6e830228b191e26fbcbfe4ca787fa968421d5c855d98ef0b",
     "tests/adapters/test_native_hook_config_schema.py": "sha256:7cef6cddb36c0539c88c688b81dfc11ac70aaf1ea3e650f5fae164add10735fa",
+    "tests/adapters/test_native_host_payload_capture.py": "sha256:df443ee98ade569a992afc5a0ed807005c1a864a66d1ca7d91d0cf71fd99957f",
     "tests/adapters/test_paths.py": "sha256:1d47dec2352022466ba65d65e99f63c49c08c71eb2b1e9908d0e6df7ff22557e",
     "tests/adapters/test_permissions.py": "sha256:4cb8f0f11c9ee5f0a040914afd5f9ae0ff0288494ebe3c4a55b429b32d7fd499",
     "tests/adapters/test_physical_fs_and_no_replace.py": "sha256:0b89ab42a43c14cc843fed2fac7daf6d5f43da81ffb66ebb23024d6f45ad84be",
