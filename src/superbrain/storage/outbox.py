@@ -45,6 +45,7 @@ from superbrain.storage._outbox_hookseq import (
     slot_holds_event,
 )
 from superbrain.storage._outbox_seq import (
+    StreamSeqCursor,
     commit_bumped_cursor,
     lookup_stream_binding_with_bucket,
     persist_cursor_ack,
@@ -85,6 +86,7 @@ class OutboxSpool:
         self._resolve_permissions()
         self._resolve_file_lock()
         self._thread_lock = _io.thread_lock_for(self._root)
+        self._lock_depth = 0  # >0 while this thread already holds the spool lock (nested operation)
         self._verify_existing_root_readonly()
 
     @property
@@ -126,6 +128,12 @@ class OutboxSpool:
         wait_s = -1.0 if deadline_ns is None else max(0.0, (deadline_ns - int(self._monotonic_ns())) / 1e9)
         if not self._thread_lock.acquire(timeout=wait_s):
             raise BrainError(ErrorCode.DEADLINE_EXCEEDED, "deadline exceeded")
+        if self._lock_depth:
+            try:
+                yield from self._nested_lock(deadline_ns, dl_check)
+            finally:
+                self._thread_lock.release()
+            return
         try:
             self._check_deadline(deadline_ns)
             if not os.path.lexists(self._root):
@@ -147,7 +155,11 @@ class OutboxSpool:
                 locked = self._acquire_file_lock(fd, adapter=adapter, deadline_ns=deadline_ns)
                 if sweep:
                     self._scan_outbox(deadline_ns=deadline_ns)
-                yield
+                self._lock_depth = 1
+                try:
+                    yield
+                finally:
+                    self._lock_depth = 0
             finally:
                 _io.reset_deadline_remaining(rem_tok)
                 _io.reset_deadline_check(dl_tok)
@@ -158,6 +170,20 @@ class OutboxSpool:
                     os.close(fd)
         finally:
             self._thread_lock.release()
+
+    def _nested_lock(self, deadline_ns: int | None, dl_check: Callable[[], None] | None) -> Iterator[None]:
+        """Inner operation of a thread that already holds the spool lock: same lock, its own deadline."""
+        self._check_deadline(deadline_ns)
+        dl_tok = _io.push_deadline_check(dl_check)
+        rem_tok = _io.push_deadline_remaining(
+            (lambda: deadline_ns - int(self._monotonic_ns())) if deadline_ns is not None else None)
+        self._lock_depth += 1
+        try:
+            yield
+        finally:
+            self._lock_depth -= 1
+            _io.reset_deadline_remaining(rem_tok)
+            _io.reset_deadline_check(dl_tok)
 
     def _acquire_file_lock(self, fd: int, *, adapter: OutboxFileLockPort, deadline_ns: int | None) -> bool:
         while True:
@@ -283,6 +309,8 @@ class OutboxSpool:
         dl_check = (lambda: self._check_deadline(deadline_ns)) if deadline_ns is not None else None
         perms = self._resolve_permissions()
         renamer = default_outbox_dir_renamer()
+        if not os.path.lexists(self._root) and len(frame_bytes) > self._max_bytes:
+            raise BrainError(ErrorCode.STORAGE_FULL, "storage full")  # refused before the spool is created
         with self._locked(create_root=True, sweep=False, deadline_ns=deadline_ns):
             used, highest_order, matched_path = self._scan_outbox(
                 deadline_ns=deadline_ns, match_stream_key=stream_key, match_suffix=target_suffix, sweep=False
@@ -291,13 +319,12 @@ class OutboxSpool:
             sdir = streams_root / stream_key
             if os.path.lexists(streams_root) and os.path.lexists(sdir):
                 verify_stream_cursor_integrity(sdir, perms)
+                sync_stream_metadata(sdir)
             if matched_path is not None:
                 existing_entry = self._decode_frame_file(matched_path)
                 if existing_entry.entry_id == entry_id and existing_entry.payload_digest == payload_digest:
                     return existing_entry.entry_id
                 raise BrainError(ErrorCode.IDEMPOTENCY_CONFLICT, "idempotency conflict")
-            if os.path.isdir(sdir):
-                sync_stream_metadata(sdir)
             if used + len(frame_bytes) > self._max_bytes:
                 raise BrainError(ErrorCode.STORAGE_FULL, "storage full")
             _io.ensure_dir_tree_atomic(streams_root, perms, renamer, check_deadline=dl_check)
@@ -341,6 +368,9 @@ class OutboxSpool:
         perms = self._resolve_permissions()
         renamer = default_outbox_dir_renamer()
         dl_check = (lambda: self._check_deadline(deadline_ns)) if deadline_ns is not None else None
+        if not os.path.lexists(self._root):
+            self._refuse_oversized_first_hook(build_event, explicit_sequence, explicit_event_id, dedup_key,
+                                              fallback_recorded_at)
         with self._locked(create_root=True, sweep=False, deadline_ns=deadline_ns):
             _io.verify_streams_fence_if_present(self._root / _io._STREAMS_DIR, perms)
             sdir = self._root / _io._STREAMS_DIR / stream_key
@@ -348,6 +378,8 @@ class OutboxSpool:
             used, highest_order, _mp, max_frame_seq, stream_frames, sdir_ok = self._scan_outbox_with_stream(
                 deadline_ns=deadline_ns, match_stream_key=stream_key, sweep=False, collect_stream_frames=True
             )
+            if sdir_ok:
+                sync_stream_metadata(sdir)  # before any replay, settle or fresh path acts on what was read
             cached, _bname, bucket_entries = (
                 lookup_stream_binding_with_bucket(sdir, raw_cur, dedup_key, perms)
                 if dedup_key is not None else (None, None, None)
@@ -389,8 +421,6 @@ class OutboxSpool:
             if not sdir_ok:
                 _io.ensure_dir_tree_atomic(self._root / _io._STREAMS_DIR, perms, renamer, check_deadline=dl_check)
                 _io.ensure_dir_tree_atomic(sdir, perms, renamer, check_deadline=dl_check)
-            else:
-                sync_stream_metadata(sdir)
             cursor = recover_stream_cursor(sdir, raw_cur, perms, renamer=renamer, check_deadline=dl_check)
             new_count = cursor.binding_count + (1 if (prepared is not None and prepared[3]) else 0)
             pending_b = prepared[0] if (prepared is not None and prepared[2] is not None) else None
@@ -425,14 +455,54 @@ class OutboxSpool:
         return self._enqueue_record(record_kind=OUTBOX_RECORD_GAP, producer_stream=gap.producer_stream,
             sequence=gap.sequence, entry_id=gap.gap_id, payload_dict=gap.to_dict(), deadline_ns=deadline_ns)
 
-    def holds_event(self, producer_stream: str, sequence: int, *, deadline_ns: int | None = None) -> bool:
-        """Read-only: whether ``sequence`` already holds a published or acknowledged event in ``producer_stream``.
-        A stream without a cursor keeps no record of an event that was acknowledged and evicted."""
-        with self._locked(create_root=False, sweep=False, deadline_ns=deadline_ns):
-            if not os.path.lexists(self._root / _io._STREAMS_DIR):
-                return False
-            sdir = self._root / _io._STREAMS_DIR / _io.stream_dir_key(producer_stream)
-            return slot_holds_event(sdir, sequence, self._resolve_permissions())
+    def enqueue_fallback_gap(
+        self, gap_for: Callable[[int], ProducerCaptureGap], *, producer_stream: str, sequence: int | None,
+        dedup_key: str | None, deadline_ns: int | None = None,
+    ) -> str | None:
+        """Write a gap standing in for an event that may not have been published, under one spool lock. Its slot is
+        ``sequence`` when known, else the binding of ``dedup_key``, else the next free slot; when that slot already
+        holds a published or acknowledged event nothing is written and ``None`` is returned."""
+        if not os.path.lexists(self._root):
+            probe = gap_for(sequence if sequence is not None else 1)
+            _digest, frame = _io.prepare_outbox_frame_bytes(record_kind=OUTBOX_RECORD_GAP,
+                producer_stream=probe.producer_stream, sequence=probe.sequence, entry_id=probe.gap_id,
+                payload_dict=probe.to_dict())
+            if len(frame) > self._max_bytes:
+                raise BrainError(ErrorCode.STORAGE_FULL, "storage full")  # refused before the spool is created
+        with self._locked(create_root=True, sweep=False, deadline_ns=deadline_ns):
+            perms = self._resolve_permissions()
+            key = _io.stream_dir_key(producer_stream)
+            sdir = self._root / _io._STREAMS_DIR / key
+            if sequence is None:
+                raw_cur = read_hook_cursor_readonly(sdir, perms)
+                cached = (lookup_stream_binding_with_bucket(sdir, raw_cur, dedup_key, perms)[0]
+                          if dedup_key is not None else None)
+                if cached is not None:
+                    sequence = cached.sequence
+                else:
+                    max_seq = self._scan_outbox_with_stream(deadline_ns=deadline_ns, match_stream_key=key,
+                                                            sweep=False, collect_stream_frames=True)[3]
+                    preview, _count = compute_projected_hook_recovery(sdir, raw_cur, perms)
+                    sequence = max(preview.next_seq, max_seq + 1)
+            if slot_holds_event(sdir, sequence, perms):
+                return None
+            return self.enqueue_gap(gap_for(sequence), deadline_ns=deadline_ns)
+
+    def _refuse_oversized_first_hook(
+        self, build_event: Callable[[int, str, str], CaptureEventRecord], explicit_sequence: int | None,
+        explicit_event_id: str | None, dedup_key: str | None, fallback_recorded_at: str,
+    ) -> None:
+        # A spool that does not exist yet holds nothing: the first slot is fixed, so the frame size is exact.
+        seq, ev_id, rec_at = resolve_hook_envelope_slot(
+            StreamSeqCursor(1), cached=None, max_frame_seq=0, explicit_sequence=explicit_sequence,
+            explicit_event_id=explicit_event_id, dedup_key=dedup_key, fallback_recorded_at=fallback_recorded_at,
+        )
+        record = build_event(seq, ev_id, rec_at)
+        _digest, frame = _io.prepare_outbox_frame_bytes(record_kind=OUTBOX_RECORD_EVENT,
+            producer_stream=record.producer_stream, sequence=record.sequence, entry_id=record.event_id,
+            payload_dict=record.to_dict())
+        if len(frame) > self._max_bytes:
+            raise BrainError(ErrorCode.STORAGE_FULL, "storage full")  # refused before the spool is created
 
     def read_pending(
         self, limit: int = MAX_CAPTURE_BATCH_EVENTS, *, producer_stream: str | None = None

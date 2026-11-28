@@ -37,6 +37,7 @@ def _write_static_log(
         from superbrain.adapters.os.physical_fs import atomic_append_no_follow
         from superbrain.ports.capture import default_outbox_dir_renamer
         from superbrain.storage._outbox_io import (
+            FOREIGN_STAGE_MARKER,
             ensure_dir_tree_atomic,
             ensure_secure_regular_file_atomic,
             reject_links_upward,
@@ -48,8 +49,10 @@ def _write_static_log(
         perms = os_adapters().permissions
         renamer = default_outbox_dir_renamer()
         with thread_lock_for(resolved):
-            ensure_dir_tree_atomic(resolved.parent, perms, renamer, verify_existing=False)
-            ensure_secure_regular_file_atomic(resolved, perms)
+            # The log may sit inside a spool; its stages must not look like spool stages to a sweep.
+            ensure_dir_tree_atomic(resolved.parent, perms, renamer, verify_existing=False,
+                                   stage_marker=FOREIGN_STAGE_MARKER)
+            ensure_secure_regular_file_atomic(resolved, perms, stage_marker=FOREIGN_STAGE_MARKER)
             atomic_append_no_follow(resolved, f"phase={phase} error.code={code}\n".encode(), timeout_s=timeout_s)
     except (OSError, BrainError):
         pass
@@ -88,6 +91,8 @@ def run_hook(
     reserve_ns = min(max(1, cap_ns // 10), 50_000_000)
     work_deadline_ns = start_ns + max(1, cap_ns - reserve_ns)
     normalized: CaptureEventRecord | ProducerCaptureGap | None = None
+    slot_known = False  # True once ``normalized.sequence`` is the slot the spool assigned or the producer chose
+    slot_dedup_key: str | None = None
     effective_raw_sid = raw_session_id
     try:
         if not isinstance(raw_bytes, bytes) or len(raw_bytes) > _MAX_STDIN_BYTES:
@@ -123,12 +128,14 @@ def run_hook(
             if prep.build_record is None:
                 _write_static_log(log_path, phase="hook_adapter", code=prep.skip_code or "unavailable")
                 return 0
+            slot_dedup_key = prep.dedup_key
             if int(monotonic_ns()) >= work_deadline_ns:
                 normalized = prep.build_record(
                     prep.explicit_sequence if prep.explicit_sequence is not None else 1,
                     prep.explicit_event_id or f"ev-{new_id()}",
                     prep.fallback_recorded_at,
                 )
+                slot_known = prep.explicit_sequence is not None
                 raise BrainError(ErrorCode.DEADLINE_EXCEEDED, "deadline exceeded")
             from superbrain.application.privacy import PrivacyFilter
             from superbrain.domain.capture.privacy_gate import CapturePrivacyGate
@@ -152,11 +159,12 @@ def run_hook(
                 return 0
 
             def _build_sanitized(seq_val: int, ev_id_val: str, rec_at_val: str) -> CaptureEventRecord:
-                nonlocal normalized
+                nonlocal normalized, slot_known
                 assert prep.build_record is not None
                 built = prep.build_record(seq_val, ev_id_val, rec_at_val)
                 assert isinstance(built, CaptureEventRecord)
                 normalized = built
+                slot_known = True
                 return gate.sanitize_event(
                     built,
                     raw_session_id=effective_raw_sid,
@@ -181,6 +189,7 @@ def run_hook(
 
         gate = CapturePrivacyGate(PrivacyFilter(monotonic_ns=monotonic_ns), monotonic_ns=monotonic_ns)
         normalized = normalize_capture_record(parsed, default_harness_id=default_harness_id)
+        slot_known = True
         if int(monotonic_ns()) >= work_deadline_ns:
             raise BrainError(ErrorCode.DEADLINE_EXCEEDED, "deadline exceeded")
 
@@ -218,23 +227,23 @@ def run_hook(
         ):
             reason = "hook_timeout" if err.code is ErrorCode.DEADLINE_EXCEEDED else "outbox_full"
             duration_ms = max(0, (cur_ns - start_ns) // 1_000_000)
-            gap = ProducerCaptureGap(
-                gap_id=f"gap-{new_id()}",
-                producer_stream=normalized.producer_stream,
-                sequence=normalized.sequence,
-                reason=reason,
-                recorded_at=normalized.recorded_at,
-                estimated_count=1,
-                duration_ms=duration_ms,
-            )
-            gap_deadline_ns = hard_deadline_ns
+            event: CaptureEventRecord = normalized
+
+            def _gap_for(seq: int) -> ProducerCaptureGap:
+                return ProducerCaptureGap(gap_id=f"gap-{new_id()}", producer_stream=event.producer_stream,
+                    sequence=seq, reason=reason, recorded_at=event.recorded_at, estimated_count=1,
+                    duration_ms=duration_ms)
+
             try:
                 spool = _make_spool(outbox_dir, spool_factory)
-                # shortcut: check and write take the lock separately; a concurrent hook publishing the same
-                # (stream, sequence) in between can still leave a gap beside its event. Upgrade if hooks overlap.
-                if spool.holds_event(gap.producer_stream, gap.sequence, deadline_ns=gap_deadline_ns):
-                    raise BrainError(ErrorCode.IDEMPOTENCY_CONFLICT, "sequence already holds an event")
-                spool.enqueue_gap(gap, deadline_ns=gap_deadline_ns)
+                # One spool lock covers the slot decision and the gap write; an unknown slot is resolved there.
+                written = spool.enqueue_fallback_gap(
+                    _gap_for, producer_stream=event.producer_stream,
+                    sequence=event.sequence if slot_known else None, dedup_key=slot_dedup_key,
+                    deadline_ns=hard_deadline_ns,
+                )
+                if written is None:
+                    _write_static_log(log_path, phase="hook_gap", code=ErrorCode.IDEMPOTENCY_CONFLICT.value)
             except BrainError as gap_err:
                 _write_static_log(log_path, phase="hook_gap", code=gap_err.code.value)
             except Exception:  # noqa: BLE001

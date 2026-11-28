@@ -45,6 +45,9 @@ _FRAME_SUFFIX = ".frame"
 _STREAMS_DIR = "streams"
 _V4_FENCE_FILE = ".v4_fence"
 _LOCK_FILE = ".spool.lock"
+# Creation stages made by the spool carry this marker; a sweep removes only these (``.init-`` is any other writer's).
+_SPOOL_STAGE_MARKER = ".sbstage-"
+FOREIGN_STAGE_MARKER = ".init-"
 _PROCESS_LOCKS_GUARD = threading.Lock()
 _PROCESS_LOCKS: dict[str, threading.RLock] = {}
 _ENOSPC_WINERROR = 112
@@ -217,11 +220,12 @@ def atomic_create_dir(
     rename_dir_fn: OutboxDirRenamer | None,
     *,
     check_deadline: Callable[[], None] | None = None,
+    stage_marker: str = _SPOOL_STAGE_MARKER,
 ) -> bool:
     """Create ``target`` via hardened staging dir + non-replacing rename; return ``True`` if created."""
     created = False
     if not os.path.lexists(target):
-        stage = target.parent / f".{target.name}.init-{os.getpid()}-{threading.get_ident()}-{uuid.uuid4().hex}"
+        stage = target.parent / f".{target.name}{stage_marker}{os.getpid()}-{threading.get_ident()}-{uuid.uuid4().hex}"
         try:
             stage.mkdir(mode=0o700)
             perms.secure_directory(stage)
@@ -260,6 +264,7 @@ def ensure_dir_tree_atomic(
     *,
     check_deadline: Callable[[], None] | None = None,
     verify_existing: bool = True,
+    stage_marker: str = _SPOOL_STAGE_MARKER,
 ) -> None:
     missing: list[Path] = []
     cur = directory
@@ -272,13 +277,13 @@ def ensure_dir_tree_atomic(
     reject_links_upward(cur)
     if not missing:
         if verify_existing:
-            atomic_create_dir(directory, perms, rename_dir_fn, check_deadline=check_deadline)
+            atomic_create_dir(directory, perms, rename_dir_fn, check_deadline=check_deadline, stage_marker=stage_marker)
             return
         if is_link_path(directory) or not stat.S_ISDIR(os.lstat(directory).st_mode):
             raise BrainError(ErrorCode.UNSAFE_PATH, "log parent directory is not a valid directory")
         return
     for item in reversed(missing):
-        atomic_create_dir(item, perms, rename_dir_fn, check_deadline=check_deadline)
+        atomic_create_dir(item, perms, rename_dir_fn, check_deadline=check_deadline, stage_marker=stage_marker)
 
 
 def ensure_secure_regular_file_atomic(
@@ -286,12 +291,15 @@ def ensure_secure_regular_file_atomic(
     perms: OutboxPermissionsPort,
     *,
     check_deadline: Callable[[], None] | None = None,
+    stage_marker: str = _SPOOL_STAGE_MARKER,
 ) -> None:
-    """Create missing ``target`` with owner-only ACLs prior to publishing, or verify existing owner-only file."""
+    """Create missing ``target`` with owner-only ACLs prior to publishing, or verify existing owner-only file. A
+    stage removed by a concurrent sweep is accepted when ``target`` exists by then."""
     if is_link_path(target):
         raise BrainError(ErrorCode.UNSAFE_PATH, f"file is a link: {target}")
     if not os.path.lexists(target):
-        stage = target.with_name(f".{target.name}.init-{os.getpid()}-{threading.get_ident()}-{uuid.uuid4().hex}")
+        stage = target.with_name(
+            f".{target.name}{stage_marker}{os.getpid()}-{threading.get_ident()}-{uuid.uuid4().hex}")
         fd_s = -1
         try:
             fd_s = os.open(stage, os.O_CREAT | os.O_EXCL | os.O_RDWR | _O_BINARY | _O_NOFOLLOW, 0o600)
@@ -304,6 +312,9 @@ def ensure_secure_regular_file_atomic(
                 os.link(stage, target)
             except FileExistsError:
                 pass
+        except FileNotFoundError as err:
+            if not os.path.lexists(target):
+                raise raise_storage_error(err, f"cannot create file {target}") from err
         except OSError as err:
             raise raise_storage_error(err, f"cannot create file {target}") from err
         finally:
@@ -312,7 +323,8 @@ def ensure_secure_regular_file_atomic(
                     os.close(fd_s)
                 except OSError:
                     pass
-            stage.unlink(missing_ok=True)
+            if staging_cleanup_allowed(check_deadline):
+                stage.unlink(missing_ok=True)
     if is_link_path(target):
         raise BrainError(ErrorCode.UNSAFE_PATH, f"file is a link: {target}")
     try:
@@ -521,9 +533,7 @@ def publish_outbox_frame_atomic(
     check_deadline: Callable[[], None] | None = None,
 ) -> None:
     """Write ``part_path``, fsync, check crashpoint/deadline, replace ``final_path``, and sync dir."""
-    if check_deadline is not None:
-        check_deadline()
-    part_path.unlink(missing_ok=True)
+    unlink_before_deadline(part_path, check_deadline)
     fd = -1
     committed = False
     try:

@@ -296,6 +296,7 @@ def _normalize_v3_cursor(
     sdir: Path, cur: StreamSeqCursor, perms: OutboxPermissionsPort,
     *, renamer: OutboxDirRenamer | None, check_deadline: Callable[[], None] | None,
 ) -> StreamSeqCursor:
+    sync_stream_metadata(sdir)
     for item in (*cur.legacy_recent, *((cur.pending_binding,) if cur.pending_binding is not None else ())):
         upsert_binding(sdir, item, perms, renamer=renamer, check_deadline=check_deadline)
     count = count_all_bindings(sdir, perms)
@@ -455,6 +456,15 @@ def persist_cursor_ack(
     if not cursor_exists(stream_dir):
         if os.path.lexists(stream_dir / _acks._ACKS_DIR) and _acks.has_committed_ack_page_files(stream_dir, perms):
             raise BrainError(ErrorCode.INTEGRITY_FAILURE, "orphan acks directory without cursor")
+        if not ack.committed_event_sequences and ack.contiguous_event_acked_through <= 0:
+            return
+        # A stream of direct frames gets a cursor once events are acknowledged, so an acknowledged and evicted slot
+        # stays distinguishable from an empty one.
+        sync_stream_metadata(stream_dir)
+        acked0, dirty0 = _apply_ack_update(StreamSeqCursor(1), ack)
+        _commit_v4_pages_and_cursor(stream_dir, prior_refs=(), new_cursor=acked0, dirty_payloads=dirty0, perms=perms,
+                                    renamer=renamer if renamer is not None else default_outbox_dir_renamer(),
+                                    check_deadline=check_deadline)
         return
     sync_stream_metadata(stream_dir)
     ren = renamer if renamer is not None else default_outbox_dir_renamer()

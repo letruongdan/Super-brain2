@@ -20,12 +20,14 @@ ScanResult = tuple[int, int, Path | None, int, dict[str, Path], bool]
 
 
 def _is_creation_stage(name: str) -> bool:
-    return name.startswith(".") and ".init-" in name
+    return name.startswith(".") and _io._SPOOL_STAGE_MARKER in name
 
 
 def _is_root_stage(name: str) -> bool:
-    # The lock file's own stage is created before the lock is held, so only the streams directory stage is swept.
-    return name.startswith(f".{_io._STREAMS_DIR}.init-")
+    # The lock file stage may be swept: a bootstrap whose stage vanished accepts the lock file that exists by then.
+    return name.startswith(
+        (f".{_io._STREAMS_DIR}{_io._SPOOL_STAGE_MARKER}", f".{_io._LOCK_FILE}{_io._SPOOL_STAGE_MARKER}")
+    )
 
 
 def _sweep_stage(entry: os.DirEntry[str]) -> None:
@@ -126,6 +128,8 @@ def scan_outbox(
                 if sweep:
                     _sweep_stage(sd_entry)
                 continue
+            if sd_entry.name.startswith(".") and _io.FOREIGN_STAGE_MARKER in sd_entry.name:
+                continue  # an older binary's creation stage: never a stream, never ours to delete
             if not stat.S_ISDIR(sd_entry.stat(follow_symlinks=False).st_mode):
                 raise BrainError(ErrorCode.INTEGRITY_FAILURE, "stream entry is not a directory")
             is_target = match_stream_key is not None and sd_entry.name == match_stream_key
