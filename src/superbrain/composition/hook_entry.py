@@ -1,5 +1,6 @@
 """Thin fail-open, bounded capture hook entrypoint (target < 100 ms warm, 2 s hard cap, always exits 0)."""
 
+# ruff: noqa: E402 - the process-entry timestamp must precede the imports whose time it counts
 from __future__ import annotations
 
 import argparse
