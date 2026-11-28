@@ -273,6 +273,27 @@ def parse_collected(text: str) -> list[str]:
     return ids
 
 
+# Tests asserting wall-clock product deadlines (hook 2 s cap, request budgets, short doctor periods). Parallel
+# shards deselect them and one serial pytest runs them after the shards, inside the same test-job deadline, so a
+# loaded machine cannot fail them by contention. Deadlines and assertions in the tests stay unchanged.
+SERIAL_NODE_PREFIXES: tuple[str, ...] = (
+    "tests/integration/test_hook_deadline_gap.py",
+    "tests/integration/test_sp2_5_production_wiring.py::test_p1_finding2_bootstrap_and_installed_hook_adapters_end_to_end",
+    "tests/integration/test_sp2_5_production_wiring.py::test_r5_finding1_observed_host_payloads_consecutive_retry_and_ws_switch",
+    "tests/integration/test_sp2_5_production_wiring.py::test_r6_finding1_hook_binding_survives_pre_and_post_publish_crashes_and_post_ack_retry",
+    "tests/integration/test_i4_a1_a2_job_lifecycle.py::test_p2_12_",
+    "tests/integration/test_kernel_crash_recovery.py::test_crash_before_commit_leaves_no_effect_and_one_retry_applies",
+    "tests/integration/test_doctor_sp2_probes.py::test_m1_incomplete_journal_drift_permissions_deep_health_and_cross_owner_checkout_isolation",
+)
+
+
+def split_serial(collected_ids: Sequence[str]) -> tuple[list[str], list[str]]:
+    """``(parallel_ids, serial_ids)``: node IDs under ``SERIAL_NODE_PREFIXES`` run in the serial phase."""
+    serial = [nid for nid in collected_ids if nid.startswith(SERIAL_NODE_PREFIXES)]
+    chosen = set(serial)
+    return [nid for nid in collected_ids if nid not in chosen], serial
+
+
 _WHEEL_SETUP_COST_MS = 3_000
 _DEFAULT_CASE_COST_MS = 20
 _WHEEL_FIXTURE_FILES: frozenset[str] = frozenset(
@@ -1305,37 +1326,55 @@ def run_gate(
                 extra.append(f"{prefix}: {node} is XPASS in the terminal but {observed[node]} in JUnit")
         return ids, observed
 
-    def run_sharded_pytest(groups: list[list[str]], deadline: float) -> tuple[PhaseResult, float]:
+    def run_sharded_pytest(
+        groups: list[list[str]], deadline: float, serial_ids: Sequence[str] = ()
+    ) -> tuple[PhaseResult, float]:
         started = time.monotonic()
-        paths = [junit.with_name(f"{junit.stem}-shard-{index}.xml") for index in range(len(groups))]
+        parallel = len(groups)
+        serial_args = sorted({p for p in SERIAL_NODE_PREFIXES if any(n.startswith(p) for n in serial_ids)})
+        # shards deselect by prefix; the serial run names each node (pytest takes no partial node ID as a path)
+        all_groups = [*groups, sorted(serial_ids)] if serial_args else list(groups)
+        names = [f"pytest-shard-{i}" for i in range(parallel)] + (["pytest-serial"] if serial_args else [])
+        paths = [junit.with_name(f"{junit.stem}-{name.removeprefix('pytest-')}.xml") for name in names]
         junit_paths.extend(paths)
-        results: list[tuple[int | None, str, float, str | None] | None] = [None] * len(groups)
+        results: list[tuple[int | None, str, float, str | None] | None] = [None] * len(all_groups)
+        serial_set = set(serial_ids)
+        expected: list[set[str]] = [set() for _ in all_groups]
+        for node in target_ids:
+            if node in serial_set:
+                expected[-1].add(node)
+                continue
+            file = node.split("::", 1)[0]
+            expected[next(i for i in range(parallel) if file in groups[i])].add(node)
 
         def run_shard(index: int) -> None:
             timeout = min(max(PHASE_TIMEOUTS_S["pytest"], time_budget_s), deadline - time.monotonic())
             if timeout <= 0:
                 return
-            cmd = _uv(worktree, python, "pytest", f"--junitxml={paths[index]}", "-q", "-rfEX", *groups[index])
-            result = step(f"pytest-shard-{index}", cmd, worktree, timeout)
+            deselect = [] if index >= parallel else [
+                f"--deselect={p}" for p in serial_args if p.split("::", 1)[0] in groups[index]
+            ]
+            cmd = _uv(worktree, python, "pytest", f"--junitxml={paths[index]}", "-q", "-rfEX", *deselect,
+                      *all_groups[index])
+            result = step(names[index], cmd, worktree, timeout)
             with record_lock:
                 results[index] = result
 
         execution_failed = False
         try:
-            with ThreadPoolExecutor(max_workers=len(groups)) as pool:
-                for _ in pool.map(run_shard, range(len(groups))):
+            with ThreadPoolExecutor(max_workers=parallel) as pool:
+                for _ in pool.map(run_shard, range(parallel)):
                     pass
+            if serial_args:  # alone, after every shard: no contention for the wall-clock deadline tests
+                run_shard(parallel)
         except Exception as err:  # noqa: BLE001 - drained workers still have evidence to collect
             execution_failed = True
             extra.append(f"phase pytest shard launch or execution failed: {type(err).__name__}: {err}")
         ended = time.monotonic()
         codes: list[int | None] = []
         runner_error = execution_failed
-        expected: dict[str, set[str]] = {file: set() for group in groups for file in group}
-        for node in target_ids:
-            expected[node.split("::", 1)[0]].add(node)
         for index, result in enumerate(results):
-            name = f"pytest-shard-{index}"
+            name = names[index]
             if result is None:
                 reason = (
                     "shard execution failed"
@@ -1359,11 +1398,12 @@ def run_gate(
             if code != 0:
                 log.append(f"--- {name} (exit {code}) ---\n{output[-4000:]}")
             try:
-                ids, observed = read_report(paths[index], f"junit-shard-{index}.xml", output, shard=name)
+                evidence_name = f"junit-{name.removeprefix('pytest-')}.xml"
+                ids, observed = read_report(paths[index], evidence_name, output, shard=name)
             except OSError as err:
                 extra.append(f"junit {name}: the report could not be read: {err}")
                 continue
-            if set(ids) != set().union(*(expected[file] for file in groups[index])):
+            if set(ids) != expected[index]:
                 extra.append(f"inventory {name}: JUnit node IDs differ from this shard's collected IDs")
             duplicates = outcomes.keys() & observed.keys()
             if duplicates:
@@ -1468,14 +1508,15 @@ def run_gate(
                     target_ids = [nid for nid in collected if nid.split("::", 1)[0] in selected_set]
                     ev.write("collected-full.json", canonical_json(sorted(collected)))
                     ev.write("collected-partition.json", canonical_json(sorted(target_ids)))
-                groups = shard_files(target_ids, shards)
+                parallel_ids, serial_ids = split_serial(target_ids) if shards > 1 else (target_ids, [])
+                groups = shard_files(parallel_ids, shards)
                 for name in REQUIRED_PHASES:
                     cap = PHASE_TIMEOUTS_S[name]
                     timeout = bounded(f"phase {name}", max(cap, time_budget_s) if name == "pytest" else cap)
                     if timeout is None:
                         continue
                     if name == "pytest" and len(groups) > 1:
-                        phase, job_ended = run_sharded_pytest(groups, deadline)
+                        phase, job_ended = run_sharded_pytest(groups, deadline, serial_ids)
                         phases.append(phase)
                         continue
                     if name == "pytest" and partition is not None and not groups:

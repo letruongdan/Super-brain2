@@ -3389,6 +3389,9 @@ def test_r7_finding1_hook_dedup_survives_512_entries_and_fails_closed_at_cap(
 ) -> None:
     """Hook dedup preserves exact (stream, sequence, event_id) past 512 entries & fails closed at cap."""
     os_ = os_adapters()
+    # Seeding the first ~510 entries only fills the dedup window; skipping fsync there (about 70% of an enqueue)
+    # keeps the test off the gate's critical path. Every boundary entry, crash and retry below 511 runs real fsync.
+    seeding = pytest.MonkeyPatch()
     chk_a = trusted_tmp / "chk-r7"
     chk_a.mkdir(parents=True, exist_ok=True)
     os_.permissions.secure_directory(chk_a)
@@ -3444,7 +3447,10 @@ def test_r7_finding1_hook_dedup_survives_512_entries_and_fails_closed_at_cap(
 
     batch_start = 2
     ev_513: CaptureEventRecord | None = None
+    seeding.setattr(os, "fsync", lambda _fd: None)
     for idx in range(2, 514):
+        if idx == 511:
+            seeding.undo()
         rec = _enqueue_seq(spool, stream=stream_a, dk=digest_bytes(f"r7-dk-{idx}".encode()), payload={"idx": idx})
         if idx in (511, 512, 513):
             assert rec.sequence == idx
@@ -3505,7 +3511,10 @@ def test_r7_finding1_hook_dedup_survives_512_entries_and_fails_closed_at_cap(
 
     b_batch_start = 1
     ev_511_b: CaptureEventRecord | None = None
+    seeding.setattr(os, "fsync", lambda _fd: None)
     for idx in range(2, 512):
+        if idx == 511:
+            seeding.undo()
         rec_b = _enqueue_seq(spool_b, stream=stream_b, dk=digest_bytes(f"r7b-dk-{idx}".encode()), payload={"idx": idx})
         if idx == 511:
             assert rec_b.sequence == 511
