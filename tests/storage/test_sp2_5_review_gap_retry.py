@@ -1,10 +1,12 @@
 import json
+from pathlib import Path
+
 from superbrain.adapters.os import os_adapters
 from superbrain.composition.hook_entry import run_hook
 from superbrain.storage.outbox import OutboxSpool
 
 
-def test_retry_reuses_gap_slot_reserved_for_native_notification(trusted_tmp):
+def test_retry_reuses_gap_slot_reserved_for_native_notification(trusted_tmp: Path) -> None:
     checkout = trusted_tmp / "checkout"
     checkout.mkdir()
     perms = os_adapters().permissions
@@ -18,9 +20,9 @@ def test_retry_reuses_gap_slot_reserved_for_native_notification(trusted_tmp):
         "tool_response": {"content": "synthetic example"},
     }).encode()
 
-    def hook(expire):
+    def hook(expire: bool) -> int:
         clock_reads = 0
-        def mono():
+        def mono() -> int:
             nonlocal clock_reads
             clock_reads += 1
             return 1_960_000_000 if expire and clock_reads >= 3 else 0

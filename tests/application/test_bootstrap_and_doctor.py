@@ -22,6 +22,7 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from superbrain.adapters.harness_config.bootstrap_templates import (
     AUTHORITY_ASK_COMMANDS,
     LAYER1_RULE_TEXT,
+    MANAGED_HOOK_EVENTS,
     plan_claude_bootstrap,
     plan_codex_bootstrap,
 )
@@ -185,11 +186,15 @@ def test_bootstrap_templates_embed_section_7_4_handoff_rules_and_nonblocking_hoo
         assert_not_stored_policy_not_holder_ack_pair()
         assert "# User Prose" in md_text or "# Agents Prose" in md_text
         hook_text = by_rel[hook_name].preview_text
-        for cmd in AUTHORITY_ASK_COMMANDS:
-            assert cmd in hook_text
         hook_json = json.loads(hook_text)
-        assert "hooks" in hook_json
-        assert "non_blocking" in hook_text or "remind" in hook_text.lower()
+        if hook_name == ".claude/settings.local.json":
+            for cmd in AUTHORITY_ASK_COMMANDS:
+                assert cmd in hook_text
+        # host schema: matcher groups whose command handler runs the capture hook (which never blocks: exit 0)
+        for event in MANAGED_HOOK_EVENTS:
+            groups = hook_json["hooks"][event]
+            assert [h["type"] for g in groups for h in g["hooks"]] == ["command"]
+            assert "superbrain.composition.hook_entry" in json.dumps(groups)
 
 
 def test_takeover_edit_gate_scopes_not_stored_policy_to_open_handoff_takeover() -> None:

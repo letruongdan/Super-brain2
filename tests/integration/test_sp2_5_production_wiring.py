@@ -35,6 +35,7 @@ from superbrain.adapters.harness.layer2_probe import (
 )
 from superbrain.adapters.harness_config.bootstrap_templates import (
     AUTHORITY_ASK_COMMANDS,
+    MANAGED_HOOK_EVENTS,
     plan_claude_bootstrap,
     plan_codex_bootstrap,
 )
@@ -360,7 +361,14 @@ def _split_cmd(val: str) -> list[str]:
 def _find_hook_commands(node: Any) -> list[list[str]]:
     found: list[list[str]] = []
     if isinstance(node, dict):
+        args = node.get("args")
+        if isinstance(node.get("command"), str) and isinstance(args, list) and any(
+            isinstance(x, str) and "superbrain.composition.hook_entry" in x for x in args
+        ):
+            return [[str(node["command"]), *(str(x) for x in args)]]  # Claude Code exec-form handler
         for key, val in node.items():
+            if key in {"commandWindows", "command_windows"}:
+                continue  # same argv as "command", spelled for Windows
             if key in {"command", "args"} and isinstance(val, str) and "superbrain.composition.hook_entry" in val:
                 found.append(_split_cmd(val))
             elif (
@@ -1063,11 +1071,12 @@ def test_p1_finding2_bootstrap_and_installed_hook_adapters_end_to_end(trusted_tm
         cfg_a_codex = json.loads((chk_a / ".codex" / "hooks.json").read_text(encoding="utf-8"))
         cfg_b_codex = json.loads((chk_b / ".codex" / "hooks.json").read_text(encoding="utf-8"))
 
-        # Preserve non_blocking/remind and all 11 AUTHORITY_ASK_COMMANDS.
+        # Host schema: per managed event one all-tools matcher group with a command handler; all 11 ask rules.
         for cfg_obj in (cfg_a_claude, cfg_b_claude, cfg_a_codex, cfg_b_codex):
-            sb = cfg_obj["hooks"]["PreToolUse"]["super_brain"]
-            assert sb["mode"] == "remind" and sb["non_blocking"] is True
-            assert tuple(sb["authority_ask_commands"]) == AUTHORITY_ASK_COMMANDS
+            for event in MANAGED_HOOK_EVENTS:
+                groups = cfg_obj["hooks"][event]
+                assert isinstance(groups, list) and len(groups) == 1 and groups[0]["matcher"] == "*"
+                assert [h["type"] for h in groups[0]["hooks"]] == ["command"]
         assert len(cfg_a_claude["permissions"]["ask"]) == len(AUTHORITY_ASK_COMMANDS)
 
         cmds_a_claude = _find_hook_commands(cfg_a_claude)
@@ -2440,8 +2449,8 @@ def test_r5_finding1_observed_host_payloads_consecutive_retry_and_ws_switch(trus
         cfg_claude = json.loads((chk_a / ".claude" / "settings.local.json").read_text(encoding="utf-8"))
         cfg_codex = json.loads((chk_a / ".codex" / "hooks.json").read_text(encoding="utf-8"))
 
-        cmd_claude = _find_hook_commands(cfg_claude["hooks"]["PreToolUse"]["super_brain"]["command"])[0]
-        cmd_codex = _find_hook_commands(cfg_codex["hooks"]["PreToolUse"]["super_brain"]["command"])[0]
+        cmd_claude = _find_hook_commands(cfg_claude["hooks"]["PostToolUse"])[0]
+        cmd_codex = _find_hook_commands(cfg_codex["hooks"]["PostToolUse"])[0]
         assert "--producer-stream" not in cmd_claude and "--sequence" not in cmd_claude
         assert "--producer-stream" not in cmd_codex and "--sequence" not in cmd_codex
 

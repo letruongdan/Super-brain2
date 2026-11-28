@@ -462,6 +462,7 @@ hook/transcript → adapter dịch sang envelope v2 → privacy filter → outbo
 - **Hook:**
   - Mục tiêu dưới 100 ms. Trần cứng 2 giây; quá trần thì thoát với mã thành công cho harness và ghi CaptureGap.
   - Lỗi không bao giờ làm harness dừng. Lỗi ghi vào log cục bộ (không chứa payload) và hiện trong `get_health`.
+  - **Cấu hình hook do bootstrap ghi** theo đúng schema của từng host: `hooks.<Event>` là mảng nhóm matcher, mỗi nhóm có `hooks` gồm handler `type: "command"` và `timeout` (giây). Bootstrap quản lý một nhóm `matcher: "*"` cho `PreToolUse` và `PostToolUse`; Claude Code dùng dạng exec (`command` là trình thông dịch, `args` là phần còn lại, không qua shell), Codex dùng chuỗi lệnh `command` và `commandWindows`. Slice quản lý `hooks#super-brain` là các nhóm có handler chạy `superbrain.composition.hook_entry`; merge, cập nhật và rollback chỉ chạm các nhóm này, hook khác của người dùng trong cùng event được giữ nguyên. Hook project của Codex chỉ chạy sau khi người dùng tin cậy (`/hooks`).
 - **Outbox:**
   - Có giới hạn, mặc định 100 MB mỗi harness. Đầy hoặc đĩa đầy thì ghi CaptureGap; không âm thầm bỏ sự kiện.
   - Chỉ xóa sự kiện khỏi outbox sau khi daemon ACK theo mục 5.4.

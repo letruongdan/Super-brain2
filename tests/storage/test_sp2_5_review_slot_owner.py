@@ -1,18 +1,23 @@
+from pathlib import Path
+
 import pytest
 
 from superbrain.core.canonical import digest_bytes
 from superbrain.core.errors import BrainError, ErrorCode
+from superbrain.ports.capture import CaptureEventRecord
 from superbrain.storage.outbox import OutboxSpool
 from tests.storage.test_outbox_durability_and_limits import _mk_event
 
 
-def test_direct_event_cannot_take_slot_reserved_by_pending_hook(trusted_tmp, monkeypatch):
+def test_direct_event_cannot_take_slot_reserved_by_pending_hook(
+    trusted_tmp: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     path = trusted_tmp / "outbox"
     stream = "review-stream"
     spool = OutboxSpool(path)
     key = digest_bytes(b"synthetic pending observation")
 
-    def enqueue_owner(target):
+    def enqueue_owner(target: OutboxSpool) -> CaptureEventRecord:
         return target.enqueue_hook_event(
             producer_stream=stream,
             build_event=lambda seq, event_id, at: _mk_event(seq, event_id=event_id, stream=stream),
@@ -20,7 +25,7 @@ def test_direct_event_cannot_take_slot_reserved_by_pending_hook(trusted_tmp, mon
             fallback_recorded_at="2026-11-28T00:00:00Z",
         )
 
-    def stop_before_publish(*a, **kw):
+    def stop_before_publish(*a: object, **kw: object) -> None:
         raise BrainError(ErrorCode.IO_ERROR, "simulated failure before frame publish")
 
     with monkeypatch.context() as patch:

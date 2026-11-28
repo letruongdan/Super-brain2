@@ -1,11 +1,13 @@
 import json
+from pathlib import Path
+
 from superbrain.adapters.os import os_adapters
 from superbrain.composition.hook_entry import run_hook
 from superbrain.ports.capture import CaptureBatchAck
 from superbrain.storage.outbox import OutboxSpool
 
 
-def test_fallback_retry_after_gap_ack_cannot_create_new_gap_identity(trusted_tmp):
+def test_fallback_retry_after_gap_ack_cannot_create_new_gap_identity(trusted_tmp: Path) -> None:
     checkout = trusted_tmp / "checkout"
     checkout.mkdir()
     perms = os_adapters().permissions
@@ -19,9 +21,9 @@ def test_fallback_retry_after_gap_ack_cannot_create_new_gap_identity(trusted_tmp
         "tool_response": {"content": "synthetic example"},
     }).encode()
 
-    def hook():
+    def hook() -> int:
         clock_reads = 0
-        def mono():
+        def mono() -> int:
             nonlocal clock_reads
             clock_reads += 1
             return 1_960_000_000 if clock_reads >= 3 else 0
