@@ -27,6 +27,7 @@ from superbrain.storage import _outbox_io as _io
 from superbrain.storage._outbox_bindings import (
     _BINDINGS_DIR,
     HookBindingRecord,
+    binding_row,
     count_all_bindings,
     lookup_binding_with_bucket,
     parse_binding_row,
@@ -257,9 +258,7 @@ def _serialize_cursor_bytes(cursor: StreamSeqCursor) -> bytes:
     if cursor.legacy_recent or cursor.legacy_acked_ranges or cursor.acked_ranges:
         raise BrainError(ErrorCode.INTEGRITY_FAILURE, "unflushed legacy cursor state")
     pb = cursor.pending_binding
-    pending_row: JsonValue = (
-        [pb.key, pb.sequence, pb.event_id, pb.recorded_at, pb.payload_digest] if pb is not None else None
-    )
+    pending_row: JsonValue = binding_row(pb) if pb is not None else None
     if cursor.schema_v4 or cursor.acked_pages or cursor.acked_page_refs:
         body: dict[str, JsonValue] = {
             "schema_version": _CURSOR_V4_SCHEMA_VERSION, "next_seq": cursor.next_seq,
@@ -268,6 +267,8 @@ def _serialize_cursor_bytes(cursor: StreamSeqCursor) -> bytes:
             "pending_binding": pending_row,
         }
     else:
+        if pb is not None and pb.gap is not None:
+            raise BrainError(ErrorCode.INTEGRITY_FAILURE, "slot reservation requires a v4 cursor")
         contig = cursor.contiguous_acked_through
         body = {
             "schema_version": _CURSOR_V3_SCHEMA_VERSION, "next_seq": cursor.next_seq,

@@ -27,6 +27,7 @@ from superbrain.ports.capture import (
     default_outbox_file_lock,
     default_outbox_permissions,
 )
+from superbrain.storage import _outbox_fallback as _fallback
 from superbrain.storage import _outbox_io as _io
 from superbrain.storage import _outbox_scan as _scan
 from superbrain.storage._outbox_bindings import (
@@ -42,7 +43,7 @@ from superbrain.storage._outbox_hookseq import (
     preflight_hook_cursor_size,
     read_hook_cursor_readonly,
     settle_published_hook_frame,
-    slot_holds_event,
+    slot_owner,
 )
 from superbrain.storage._outbox_seq import (
     StreamSeqCursor,
@@ -325,6 +326,10 @@ class OutboxSpool:
                 if existing_entry.entry_id == entry_id and existing_entry.payload_digest == payload_digest:
                     return existing_entry.entry_id
                 raise BrainError(ErrorCode.IDEMPOTENCY_CONFLICT, "idempotency conflict")
+            if record_kind == OUTBOX_RECORD_EVENT:
+                owner = slot_owner(sdir, sequence, perms)
+                if owner is not None and owner.event_id != entry_id:
+                    raise BrainError(ErrorCode.IDEMPOTENCY_CONFLICT, "slot reserved by another notification")
             if used + len(frame_bytes) > self._max_bytes:
                 raise BrainError(ErrorCode.STORAGE_FULL, "storage full")
             _io.ensure_dir_tree_atomic(streams_root, perms, renamer, check_deadline=dl_check)
@@ -384,6 +389,10 @@ class OutboxSpool:
                 lookup_stream_binding_with_bucket(sdir, raw_cur, dedup_key, perms)
                 if dedup_key is not None else (None, None, None)
             )
+            if cached is None and explicit_sequence is not None:
+                owner = slot_owner(sdir, explicit_sequence, perms)
+                if owner is not None and owner.key != dedup_key:
+                    raise BrainError(ErrorCode.IDEMPOTENCY_CONFLICT, "slot reserved by another notification")
             preview_cur, projected_bcount = compute_projected_hook_recovery(sdir, raw_cur, perms)
             if dedup_key is not None and cached is None and projected_bcount >= self._max_binding_keys:
                 raise BrainError(ErrorCode.STORAGE_FULL, "hook dedup binding window full")
@@ -456,37 +465,18 @@ class OutboxSpool:
             sequence=gap.sequence, entry_id=gap.gap_id, payload_dict=gap.to_dict(), deadline_ns=deadline_ns)
 
     def enqueue_fallback_gap(
-        self, gap_for: Callable[[int], ProducerCaptureGap], *, producer_stream: str, sequence: int | None,
-        dedup_key: str | None, deadline_ns: int | None = None,
+        self, *, producer_stream: str, sequence: int | None, dedup_key: str | None, reason: str, recorded_at: str,
+        duration_ms: int, deadline_ns: int | None = None,
     ) -> str | None:
-        """Write a gap standing in for an event that may not have been published, under one spool lock. Its slot is
-        ``sequence`` when known, else the binding of ``dedup_key``, else the next free slot; when that slot already
-        holds a published or acknowledged event nothing is written and ``None`` is returned."""
-        if not os.path.lexists(self._root):
-            probe = gap_for(sequence if sequence is not None else 1)
-            _digest, frame = _io.prepare_outbox_frame_bytes(record_kind=OUTBOX_RECORD_GAP,
-                producer_stream=probe.producer_stream, sequence=probe.sequence, entry_id=probe.gap_id,
-                payload_dict=probe.to_dict())
-            if len(frame) > self._max_bytes:
-                raise BrainError(ErrorCode.STORAGE_FULL, "storage full")  # refused before the spool is created
-        with self._locked(create_root=True, sweep=False, deadline_ns=deadline_ns):
-            perms = self._resolve_permissions()
-            key = _io.stream_dir_key(producer_stream)
-            sdir = self._root / _io._STREAMS_DIR / key
-            if sequence is None:
-                raw_cur = read_hook_cursor_readonly(sdir, perms)
-                cached = (lookup_stream_binding_with_bucket(sdir, raw_cur, dedup_key, perms)[0]
-                          if dedup_key is not None else None)
-                if cached is not None:
-                    sequence = cached.sequence
-                else:
-                    max_seq = self._scan_outbox_with_stream(deadline_ns=deadline_ns, match_stream_key=key,
-                                                            sweep=False, collect_stream_frames=True)[3]
-                    preview, _count = compute_projected_hook_recovery(sdir, raw_cur, perms)
-                    sequence = max(preview.next_seq, max_seq + 1)
-            if slot_holds_event(sdir, sequence, perms):
-                return None
-            return self.enqueue_gap(gap_for(sequence), deadline_ns=deadline_ns)
+        """Write the gap standing in for an event that may not have been published, under one spool lock. Its slot is
+        ``sequence`` when known, else the binding of ``dedup_key``, else the next free slot. With a ``dedup_key`` the
+        slot is reserved by a binding stamped with the gap identity before the gap is published, so a retry, a late
+        event and a repeat after the gap ACK all land on that slot with that gap. Returns ``None`` without writing
+        when the slot already holds a published or acknowledged event."""
+        return _fallback.enqueue_fallback_gap(
+            self, producer_stream=producer_stream, sequence=sequence, dedup_key=dedup_key, reason=reason,
+            recorded_at=recorded_at, duration_ms=duration_ms, deadline_ns=deadline_ns,
+        )
 
     def _refuse_oversized_first_hook(
         self, build_event: Callable[[int, str, str], CaptureEventRecord], explicit_sequence: int | None,

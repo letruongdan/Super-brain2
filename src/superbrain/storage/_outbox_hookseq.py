@@ -22,6 +22,7 @@ from superbrain.storage._outbox_bindings import (
     count_all_bindings,
     lookup_binding,
     prepare_binding_upsert,
+    read_binding_bucket,
     write_prepared_binding_bucket,
 )
 from superbrain.storage._outbox_io import verify_stream_dir_safe
@@ -29,6 +30,29 @@ from superbrain.storage._outbox_seq import StreamSeqCursor, read_stream_cursor
 
 # Upkeep after a frame is published may stop on these; the next recovery repairs it, so the enqueue still succeeds.
 DEFERRABLE_AFTER_PUBLISH = (ErrorCode.DEADLINE_EXCEEDED, ErrorCode.STORAGE_FULL)
+
+
+def slot_owner(stream_dir: Path, sequence: int, perms: OutboxPermissionsPort) -> HookBindingRecord | None:
+    """The binding that reserved ``sequence`` in this stream (pending, legacy or sharded), if any."""
+    if not verify_stream_dir_safe(stream_dir, perms):
+        return None
+    if _seq.cursor_exists(stream_dir):
+        cur = read_stream_cursor(stream_dir, perms)
+        held: list[HookBindingRecord] = list(cur.legacy_recent)
+        if cur.pending_binding is not None:
+            held.append(cur.pending_binding)
+        for item in held:
+            if item.sequence == sequence:
+                return item
+    bdir = stream_dir / _BINDINGS_DIR
+    if not os.path.isdir(bdir):
+        return None
+    for name in sorted(os.listdir(bdir)):
+        if name.endswith(".json"):
+            for rec in read_binding_bucket(stream_dir, name, perms).values():
+                if rec.sequence == sequence:
+                    return rec
+    return None
 
 
 def slot_holds_event(stream_dir: Path, sequence: int, perms: OutboxPermissionsPort) -> bool:

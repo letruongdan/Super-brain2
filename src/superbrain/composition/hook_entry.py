@@ -228,18 +228,12 @@ def run_hook(
             reason = "hook_timeout" if err.code is ErrorCode.DEADLINE_EXCEEDED else "outbox_full"
             duration_ms = max(0, (cur_ns - start_ns) // 1_000_000)
             event: CaptureEventRecord = normalized
-
-            def _gap_for(seq: int) -> ProducerCaptureGap:
-                return ProducerCaptureGap(gap_id=f"gap-{new_id()}", producer_stream=event.producer_stream,
-                    sequence=seq, reason=reason, recorded_at=event.recorded_at, estimated_count=1,
-                    duration_ms=duration_ms)
-
             try:
                 spool = _make_spool(outbox_dir, spool_factory)
-                # One spool lock covers the slot decision and the gap write; an unknown slot is resolved there.
+                # One spool lock covers the slot decision, its reservation and the gap write.
                 written = spool.enqueue_fallback_gap(
-                    _gap_for, producer_stream=event.producer_stream,
-                    sequence=event.sequence if slot_known else None, dedup_key=slot_dedup_key,
+                    producer_stream=event.producer_stream, sequence=event.sequence if slot_known else None,
+                    dedup_key=slot_dedup_key, reason=reason, recorded_at=event.recorded_at, duration_ms=duration_ms,
                     deadline_ns=hard_deadline_ns,
                 )
                 if written is None:

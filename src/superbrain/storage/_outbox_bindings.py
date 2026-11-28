@@ -7,13 +7,15 @@ import os
 import stat
 import uuid
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from superbrain.core._kernel_base import require_sha256_digest
 from superbrain.core.canonical import canonical_json
 from superbrain.core.errors import BrainError, ErrorCode
+from superbrain.core.jsonvalue import JsonValue
 from superbrain.ports.capture import (
+    CAPTURE_GAP_REASONS,
     CaptureEventRecord,
     OutboxDirRenamer,
     OutboxPermissionsPort,
@@ -24,6 +26,8 @@ from superbrain.storage._outbox_io import (
     _O_BINARY,
     _O_NOFOLLOW,
     _PART_SUFFIX,
+    _STREAMS_DIR,
+    _V4_FENCE_FILE,
     active_deadline_check,
     ensure_dir_tree_atomic,
     entry_is_link,
@@ -51,6 +55,30 @@ class HookBindingRecord:
     event_id: str
     recorded_at: str
     payload_digest: str | None = None
+    # (gap_id, reason, recorded_at, duration_ms) of the fallback gap that stands in for this slot; fixed once written
+    gap: tuple[str, str, str, int] | None = None
+
+
+def binding_row(rec: HookBindingRecord) -> list[JsonValue]:
+    """Serialized row: five elements, plus the gap stamp as a sixth when the slot carries a fallback gap."""
+    row: list[JsonValue] = [rec.key, rec.sequence, rec.event_id, rec.recorded_at, rec.payload_digest]
+    if rec.gap is not None:
+        row.append(list(rec.gap))
+    return row
+
+
+def _parse_gap_stamp(raw: object) -> tuple[str, str, str, int]:
+    if (
+        not isinstance(raw, list) or len(raw) != 4 or not isinstance(raw[0], str) or not raw[0]
+        or not isinstance(raw[1], str) or raw[1] not in CAPTURE_GAP_REASONS
+        or type(raw[3]) is not int or raw[3] < 0
+    ):
+        raise BrainError(ErrorCode.INTEGRITY_FAILURE, "corrupt hook binding gap stamp")
+    return raw[0], raw[1], require_iso_utc_timestamp(raw[2]), raw[3]
+
+
+def _is_fenced(stream_dir: Path) -> bool:
+    return stream_dir.parent.name == _STREAMS_DIR and os.path.lexists(stream_dir.parent / _V4_FENCE_FILE)
 
 
 def bucket_name_for_key(dedup_key: str) -> str:
@@ -89,10 +117,10 @@ def verify_bindings_dir(stream_dir: Path, perms: OutboxPermissionsPort, *, sweep
 
 
 def parse_binding_row(row: object) -> HookBindingRecord:
-    """Validate and decode a serialized 5-element binding row."""
+    """Validate and decode a serialized 5-element binding row (6 with a gap stamp)."""
     if (
         not isinstance(row, list)
-        or len(row) != 5
+        or len(row) not in (5, 6)
         or not isinstance(row[0], str)
         or not isinstance(row[2], str)
         or not row[2]
@@ -112,7 +140,8 @@ def parse_binding_row(row: object) -> HookBindingRecord:
             require_sha256_digest(digest_val)
         except BrainError as err:
             raise BrainError(ErrorCode.INTEGRITY_FAILURE, "corrupt hook binding digest") from err
-    return HookBindingRecord(key, seq, row[2], rec_at, digest_val)
+    gap = _parse_gap_stamp(row[5]) if len(row) == 6 else None
+    return HookBindingRecord(key, seq, row[2], rec_at, digest_val, gap)
 
 
 def read_binding_bucket(
@@ -197,16 +226,16 @@ def _merge_binding(entries: dict[str, HookBindingRecord], binding: HookBindingRe
         existing.payload_digest != binding.payload_digest
     ):
         raise BrainError(ErrorCode.IDEMPOTENCY_CONFLICT, "idempotency conflict")
-    if existing.payload_digest is None and binding.payload_digest is not None:
-        entries[binding.key] = HookBindingRecord(
-            existing.key, existing.sequence, existing.event_id, existing.recorded_at, binding.payload_digest
-        )
+    merged = replace(existing, payload_digest=existing.payload_digest or binding.payload_digest,
+                     gap=existing.gap or binding.gap)  # a stored gap stamp is never replaced
+    if merged != existing:
+        entries[binding.key] = merged
         return True, False
     return False, False
 
 
 def _serialize_bucket(entries: dict[str, HookBindingRecord]) -> bytes:
-    rows = [[e.key, e.sequence, e.event_id, e.recorded_at, e.payload_digest] for _k, e in sorted(entries.items())]
+    rows: list[JsonValue] = [binding_row(e) for _k, e in sorted(entries.items())]
     payload = canonical_json({"schema_version": _BINDINGS_SCHEMA_VERSION, "entries": rows})
     if len(payload) > _MAX_BUCKET_BYTES:
         raise BrainError(ErrorCode.STORAGE_FULL, "hook dedup binding bucket full")
@@ -242,6 +271,9 @@ def prepare_binding_upsert(
         else read_binding_bucket(stream_dir, bucket_name, perms)
     )
     changed, added = _merge_binding(entries, binding)
+    if changed and any(e.gap is not None for e in entries.values()) and not _is_fenced(stream_dir):
+        # gap-stamped rows are a v4 format: the fence must stop the previous binary before it can read them
+        raise BrainError(ErrorCode.INTEGRITY_FAILURE, "slot reservation requires the v4 fence")
     return bucket_name, (_serialize_bucket(entries) if changed else None), added
 
 
@@ -321,7 +353,7 @@ def backfill_binding_digest_if_missing(
     """Backfill ``payload_digest`` on a v1-migrated binding when first observed on retry."""
     if cached is None or cached.payload_digest is not None:
         return
-    updated = HookBindingRecord(cached.key, cached.sequence, cached.event_id, cached.recorded_at, payload_digest)
+    updated = replace(cached, payload_digest=payload_digest)
     upsert_binding(stream_dir, updated, perms, renamer=renamer, check_deadline=check_deadline)
 
 
