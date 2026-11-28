@@ -139,3 +139,64 @@ def test_user_hooks_survive_merge_replan_and_rollback(trusted_tmp: Path) -> None
     assert left["theme"] == "dark" and "permissions" not in left
     assert left["hooks"] == {"PreToolUse": [user_pre], "Stop": doc["hooks"]["Stop"]}
     assert HOOK_GROUPS_SLICE in target.slice_id
+
+
+def _legacy_object(chk: Path, prof: Path) -> dict[str, Any]:
+    """What bootstrap wrote before the matcher-group schema: ``hooks.PreToolUse = {"super_brain": {...}}``."""
+    return {"super_brain": {"mode": "remind", "non_blocking": True, "profile": str(prof),
+                            "command": _expected_argv("claude-code", chk, prof)}}
+
+
+def test_a_checkout_bootstrapped_with_the_legacy_hook_object_upgrades_to_matcher_groups(trusted_tmp: Path) -> None:
+    chk, prof = _checkout(trusted_tmp, "chk-legacy")
+    settings = chk / ".claude" / "settings.local.json"
+    _write(settings, json.dumps({"theme": "dark", "hooks": {"PreToolUse": _legacy_object(chk, prof)}}))
+    doc = _preview(plan_claude_bootstrap(checkout_root=chk, profile_path=prof), ".claude/settings.local.json")
+    assert doc["theme"] == "dark"
+    handlers = _validate(doc, _CLAUDE_EVENTS, _CLAUDE_HANDLER)  # every event is a list of matcher groups now
+    assert handlers and "super_brain" not in json.dumps(doc["hooks"])
+
+
+def test_a_legacy_hook_object_the_user_extended_is_a_conflict_not_a_deletion(trusted_tmp: Path) -> None:
+    chk, prof = _checkout(trusted_tmp, "chk-legacy-user")
+    legacy = _legacy_object(chk, prof) | {"my_tool": {"command": "echo mine"}}
+    _write(chk / ".claude" / "settings.local.json", json.dumps({"hooks": {"PreToolUse": legacy}}))
+    with pytest.raises(BrainError) as err:
+        plan_claude_bootstrap(checkout_root=chk, profile_path=prof)
+    assert err.value.code is ErrorCode.REVISION_CONFLICT
+
+
+def test_a_user_handler_sharing_the_capture_handlers_group_survives_replan_and_rollback(trusted_tmp: Path) -> None:
+    chk, prof = _checkout(trusted_tmp, "chk-shared-group")
+    settings = chk / ".claude" / "settings.local.json"
+    target = next(t for t in plan_claude_bootstrap(checkout_root=chk, profile_path=prof).targets
+                  if t.rel_path == ".claude/settings.local.json")
+    doc = json.loads(target.preview_text)
+    user_handler = {"type": "command", "command": "echo user-also-here", "timeout": 3}
+    doc["hooks"]["PreToolUse"][0]["hooks"].append(user_handler)  # the user added theirs into our group
+    _write(settings, json.dumps(doc))
+    expected = {(".claude/settings.local.json", target.slice_id): target.slice_digest}
+    replan = plan_claude_bootstrap(checkout_root=chk, profile_path=prof, expected_slice_digests=expected)
+    replanned = json.loads(next(t for t in replan.targets if t.rel_path == ".claude/settings.local.json").preview_text)
+    assert user_handler in [h for g in replanned["hooks"]["PreToolUse"] for h in g["hooks"]]
+    removed = SharedConfigMergerAdapter().remove_slice(
+        json.dumps(replanned), managed_format=ManagedFormat.JSON, slice_id=target.slice_id, expected_slice_digest=None)
+    left = json.loads(removed.updated_text)
+    assert [h for g in left["hooks"]["PreToolUse"] for h in g["hooks"]] == [user_handler]
+
+
+def test_a_command_that_only_mentions_the_hook_module_is_not_managed() -> None:
+    mention = {"matcher": "Bash", "hooks": [{"type": "command", "command": "echo superbrain.composition.hook_entry"}]}
+    runs = {"matcher": "*", "hooks": [{"type": "command", "command": "python",
+                                       "args": ["-I", "-m", "superbrain.composition.hook_entry", "--outbox", "x"]}]}
+    assert not is_managed_group(mention)
+    assert is_managed_group(runs)
+
+
+def test_a_codex_checkout_with_the_legacy_hook_object_upgrades_to_matcher_groups(trusted_tmp: Path) -> None:
+    chk, prof = _checkout(trusted_tmp, "chk-legacy-codex")
+    legacy = {"super_brain": {"mode": "remind", "command": _expected_argv("codex", chk, prof)}}
+    _write(chk / ".codex" / "hooks.json", json.dumps({"hooks": {"PreToolUse": legacy}}))
+    doc = _preview(plan_codex_bootstrap(checkout_root=chk, profile_path=prof), ".codex/hooks.json")
+    handlers = _validate(doc, _CODEX_EVENTS, _CODEX_HANDLER)
+    assert handlers and "super_brain" not in json.dumps(doc["hooks"])

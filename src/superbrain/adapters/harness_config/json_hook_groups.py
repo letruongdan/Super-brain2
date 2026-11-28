@@ -1,15 +1,17 @@
-"""Managed hook matcher groups inside a host's ``hooks`` object (Claude Code settings, Codex ``hooks.json``).
+"""Managed hook handlers inside a host's ``hooks`` object (Claude Code settings, Codex ``hooks.json``).
 
 Both hosts read ``{"hooks": {"<Event>": [{"matcher": ..., "hooks": [{"type": "command", ...}]}]}}``. The managed
-slice ``hooks#super-brain`` is the set of matcher groups whose handler runs ``superbrain.composition.hook_entry``;
-merging or removing it never touches the user's own groups in the same events.
+slice ``hooks#super-brain`` is the set of handlers that run ``-m superbrain.composition.hook_entry``, kept in their
+matcher groups; merging or removing it never touches the user's own handlers, even in a shared group. The object
+form an earlier bootstrap wrote (``{"super_brain": {...}}``) is upgraded in place when it holds nothing else.
 """
 
 from __future__ import annotations
 
 import json
+import shlex
 from collections.abc import Mapping, Sequence
-from typing import Any
+from typing import Any, cast
 
 from superbrain.adapters.harness_config._common import digest_json_value, invalid_config, revision_conflict
 from superbrain.adapters.harness_config.json_keys import _parse_json_root, _validate_path
@@ -18,28 +20,66 @@ from superbrain.ports.proposals import MergeOutput
 
 HOOK_GROUPS_SLICE = "hooks#super-brain"
 _HOOK_MODULE = "superbrain.composition.hook_entry"
-_HANDLER_COMMAND_FIELDS = ("command", "commandWindows", "command_windows", "args")
+_QUOTE = '"'
 
 
-def _mentions_hook(value: object) -> bool:
-    if isinstance(value, str):
-        return _HOOK_MODULE in value
-    return isinstance(value, list) and any(isinstance(v, str) and _HOOK_MODULE in v for v in value)
+def _argv_runs_hook(argv: Sequence[object]) -> bool:
+    return any(argv[i] == "-m" and argv[i + 1] == _HOOK_MODULE for i in range(len(argv) - 1))
+
+
+def _tokens(command: object, *, posix: bool) -> list[str]:
+    if not isinstance(command, str):
+        return []
+    try:
+        parts = shlex.split(command, posix=posix)
+    except ValueError:
+        return []
+    return [part.strip(_QUOTE) for part in parts]
+
+
+def is_managed_handler(handler: object) -> bool:
+    """The handler runs the capture hook (``-m superbrain.composition.hook_entry``); a mention is not enough."""
+    if not isinstance(handler, Mapping):
+        return False
+    args = handler.get("args")
+    if isinstance(args, list) and _argv_runs_hook([handler.get("command"), *args]):
+        return True
+    return _argv_runs_hook(_tokens(handler.get("command"), posix=True)) or any(
+        _argv_runs_hook(_tokens(handler.get(field), posix=False)) for field in ("commandWindows", "command_windows")
+    )
 
 
 def is_managed_group(group: object) -> bool:
-    """A matcher group is managed when one of its handlers runs the Super-brain capture hook."""
+    """A matcher group holds at least one managed handler."""
     handlers = group.get("hooks") if isinstance(group, Mapping) else None
-    return isinstance(handlers, list) and any(
-        isinstance(h, Mapping) and any(_mentions_hook(h.get(f)) for f in _HANDLER_COMMAND_FIELDS) for h in handlers
-    )
+    return isinstance(handlers, list) and any(is_managed_handler(h) for h in handlers)
+
+
+def _is_legacy_object(value: object) -> bool:
+    """The object form an earlier bootstrap owned whole: ``{"super_brain": {..., "command": [...]}}``."""
+    if not isinstance(value, Mapping) or "super_brain" not in value:
+        return False
+    owned = value["super_brain"]
+    command = owned.get("command") if isinstance(owned, Mapping) else None
+    if not (isinstance(command, list) and _argv_runs_hook(command)):
+        return False
+    if set(value) != {"super_brain"}:
+        raise revision_conflict("legacy hook object also holds user entries")  # never delete what is not ours
+    return True
 
 
 def _event_list(hooks: Mapping[str, Any], event: str) -> list[Any]:
     cur = hooks.get(event, [])
+    if _is_legacy_object(cur):
+        return []
     if not isinstance(cur, list):
         raise invalid_config("hook event entry is not a list of matcher groups")
     return cur
+
+
+def _managed_only(group: Mapping[str, Any]) -> dict[str, Any]:
+    return {**{k: v for k, v in group.items() if k != "hooks"},
+            "hooks": [h for h in group["hooks"] if is_managed_handler(h)]}
 
 
 def extract_hook_groups(doc: Mapping[str, Any]) -> dict[str, JsonValue]:
@@ -51,9 +91,9 @@ def extract_hook_groups(doc: Mapping[str, Any]) -> dict[str, JsonValue]:
         raise invalid_config("hooks entry is not an object")
     out: dict[str, JsonValue] = {}
     for event in sorted(hooks):
-        managed = [g for g in _event_list(hooks, event) if is_managed_group(g)]
+        managed = [_managed_only(g) for g in _event_list(hooks, event) if is_managed_group(g)]
         if managed:
-            out[event] = managed
+            out[event] = cast(JsonValue, managed)
     return out
 
 
@@ -74,14 +114,23 @@ def _set_hook_groups(doc: dict[str, Any], groups: Mapping[str, Any]) -> None:
     if not isinstance(hooks, dict):
         raise invalid_config("hooks entry is not an object")
     for event in list(hooks):
-        kept = [g for g in _event_list(hooks, event) if not is_managed_group(g)]
+        kept = []
+        for group in _event_list(hooks, event):  # a legacy object reads as no groups and is replaced
+            if not is_managed_group(group):
+                kept.append(group)
+                continue
+            rest = [h for h in group["hooks"] if not is_managed_handler(h)]
+            if rest:  # the user's handlers in a shared group stay where they were
+                kept.append({**group, "hooks": rest})
         if kept:
             hooks[event] = kept
         else:
             del hooks[event]
     for event, event_groups in groups.items():
-        if not isinstance(event_groups, list) or not all(is_managed_group(g) for g in event_groups):
-            raise invalid_config("managed hook slice holds a group that does not run the capture hook")
+        if not isinstance(event_groups, list) or not all(
+            is_managed_group(g) and all(is_managed_handler(h) for h in g["hooks"]) for g in event_groups
+        ):
+            raise invalid_config("managed hook slice holds a handler that does not run the capture hook")
         hooks[event] = [*_event_list(hooks, event), *event_groups]
     if not hooks:
         del doc["hooks"]
