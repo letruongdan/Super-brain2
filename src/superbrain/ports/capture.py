@@ -19,7 +19,7 @@ from superbrain.core._kernel_base import (
     require_sha256_digest,
 )
 from superbrain.core._kernel_workspace import FilterPolicy, SafePayload
-from superbrain.core.canonical import canonical_json, validate_json
+from superbrain.core.canonical import canonical_json, digest_bytes, validate_json
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.jsonvalue import JsonValue
 
@@ -585,6 +585,12 @@ class CaptureHealthSnapshot:
             "producer_gaps": self.producer_gaps, "has_gaps": self.has_gaps}
 
 
+def fallback_gap_id(producer_stream: str, sequence: int) -> str:
+    """Gap id derived from the slot, so every fallback for one slot names the same gap (hook/daemon contract)."""
+    slot = (producer_stream + "\n" + str(sequence)).encode()
+    return "gap-" + digest_bytes(slot)[7:39]
+
+
 __all__ = [
     "CAPTURE_GAP_REASONS", "CAPTURE_WIRE_OVERHEAD_RESERVE_BYTES", "DEFAULT_OUTBOX_MAX_BYTES",
     "EVENT_SOURCES", "EVENT_SOURCE_VERIFICATIONS", "FORBIDDEN_CLIENT_CAPTURE_KEYS", "HOOK_HARD_CAP_NS",
@@ -593,7 +599,7 @@ __all__ = [
     "CapturePrivacyFilterPort", "CaptureStorePort", "OutboxDirRenamer", "OutboxDirSync", "OutboxEntry",
     "OutboxFileLockPort", "OutboxPermissionsPort", "ProducerCaptureGap", "StagedCaptureEvent",
     "assert_no_forbidden_capture_keys", "clone_json_mapping", "compute_contiguous_event_acked_through",
-    "default_outbox_dir_renamer", "default_outbox_dir_sync", "default_outbox_file_lock",
+    "default_outbox_dir_renamer", "fallback_gap_id", "default_outbox_dir_sync", "default_outbox_file_lock",
     "default_outbox_permissions", "freeze_json_mapping", "register_outbox_dir_renamer", "register_outbox_dir_sync",
     "register_outbox_file_lock", "register_outbox_permissions", "require_capture_sequence", "require_iso_utc_timestamp",
 ]

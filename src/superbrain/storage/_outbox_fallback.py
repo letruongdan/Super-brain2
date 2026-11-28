@@ -9,9 +9,9 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from superbrain.core.canonical import digest_bytes
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.ports.capture import OUTBOX_RECORD_GAP, ProducerCaptureGap, default_outbox_dir_renamer
+from superbrain.ports.capture import fallback_gap_id as fallback_gap_id
 from superbrain.storage import _outbox_io as _io
 from superbrain.storage import _outbox_seq as _seq
 from superbrain.storage._outbox_bindings import (
@@ -32,10 +32,6 @@ if TYPE_CHECKING:
     from superbrain.storage.outbox import OutboxSpool
 
 
-def fallback_gap_id(producer_stream: str, sequence: int) -> str:
-    """Gap id derived from the slot, so every fallback for one slot names the same gap."""
-    slot = (producer_stream + "\n" + str(sequence)).encode()
-    return "gap-" + digest_bytes(slot)[7:39]
 
 
 def enqueue_fallback_gap(

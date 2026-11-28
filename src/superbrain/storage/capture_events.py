@@ -20,6 +20,7 @@ from superbrain.ports.capture import (
     CaptureStorePort,
     ProducerCaptureGap,
     StagedCaptureEvent,
+    fallback_gap_id,
     require_capture_sequence,
 )
 from superbrain.storage.errors import sqlite_error
@@ -95,18 +96,34 @@ def _query_existing_events(
 
 def _query_existing_prod_gaps(
     db: sqlite3.Connection, producer_stream: str, seqs: Iterable[int]
-) -> dict[int, tuple[str, str, str]]:
-    out: dict[int, tuple[str, str, str]] = {}
+) -> dict[int, tuple[tuple[str, str, str], str, str]]:
+    """Stored producer gap per sequence: ``(identity, repo_id, checkout_id)``."""
+    out: dict[int, tuple[tuple[str, str, str], str, str]] = {}
     for chunk in _chunk_ints(seqs):
         placeholders = ",".join("?" for _ in chunk)
         rows = db.execute(
-            "SELECT sequence, gap_id, reason, recorded_at FROM capture_gaps "
+            "SELECT sequence, gap_id, reason, recorded_at, repo_id, checkout_id FROM capture_gaps "
             f"WHERE producer_stream = ? AND gap_origin = 'producer' AND sequence IN ({placeholders})",
             (producer_stream, *chunk),
         ).fetchall()
         for row in rows:
-            out[int(row[0])] = (str(row[1]), str(row[2]), str(row[3]))
+            out[int(row[0])] = ((str(row[1]), str(row[2]), str(row[3])), str(row[4]), str(row[5]))
     return out
+
+
+def _gap_replay_is_dedup(
+    stored: tuple[tuple[str, str, str], str, str], gap: ProducerCaptureGap, *, repo_id: str, checkout_id: str,
+) -> bool:
+    """Same identity, or (owner-approved upgrade rule) a slot-derived fallback gap replayed onto a gap an earlier
+    binary committed with a random id at the same slot and scope: the hook cannot recover that id once the old frame
+    was ACKed and deleted, so the stored gap stays and the replay is a dedup. Anything else stays a conflict."""
+    identity, stored_repo, stored_checkout = stored
+    if identity == _gap_identity(gap):
+        return True
+    return (
+        gap.gap_id == fallback_gap_id(gap.producer_stream, gap.sequence)
+        and (stored_repo, stored_checkout) == (repo_id, checkout_id)
+    )
 
 
 def _load_daemon_spans(db: sqlite3.Connection, producer_stream: str) -> list[_DaemonGapSpan]:
@@ -346,7 +363,9 @@ class KernelCaptureStore(CaptureStorePort):
 
         for seq, gap in seen_gaps.items():
             stored_gap = existing_prod_gaps.get(seq)
-            if stored_gap is not None and stored_gap != _gap_identity(gap):
+            if stored_gap is not None and not _gap_replay_is_dedup(
+                stored_gap, gap, repo_id=repo_id, checkout_id=checkout_id
+            ):
                 raise BrainError(ErrorCode.IDEMPOTENCY_CONFLICT, "idempotency conflict")
 
         any_fresh_commit = False
@@ -406,7 +425,7 @@ class KernelCaptureStore(CaptureStorePort):
                 g_ident = _gap_identity(gap)
                 stored_g = cur_prod_gaps.get(seq)
                 if stored_g is not None:
-                    if stored_g != g_ident:
+                    if not _gap_replay_is_dedup(stored_g, gap, repo_id=repo_id, checkout_id=checkout_id):
                         raise BrainError(ErrorCode.IDEMPOTENCY_CONFLICT, "idempotency conflict")
                     deduped_count += 1
                     acked_gap_seqs.add(seq)
@@ -421,7 +440,7 @@ class KernelCaptureStore(CaptureStorePort):
                         gap.estimated_count, gap.duration_ms, repo_id, checkout_id, gap.recorded_at,
                     ),
                 )
-                cur_prod_gaps[seq] = g_ident
+                cur_prod_gaps[seq] = (g_ident, repo_id, checkout_id)
                 newly_covered.add(seq)
                 accepted_count += 1
                 any_fresh_commit = True
