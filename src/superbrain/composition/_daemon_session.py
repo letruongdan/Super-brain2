@@ -9,15 +9,19 @@ from concurrent.futures import Future
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from superbrain.application._future_notify import safe_set_result
 from superbrain.application.approvals import OperatorHandle
 from superbrain.application.continuity_worker import ContinuityWorkerCoordinator
 from superbrain.application.deadlines import Reservation
 from superbrain.application.dispatch import KernelToolDomain, PreparedEffect
 from superbrain.application.jobs import JobService
 from superbrain.application.owner_loop import AuthGate, OwnerSession
-from superbrain.composition._daemon_job_recovery import UNREADABLE, LeasedAttempts
-from superbrain.composition._endpoint import BoundLoopbackListener, remove_own_endpoint
+from superbrain.composition import _daemon_session_work
+from superbrain.composition._daemon_handoff_factory import build_default_handoff_domain as build_default_handoff_domain
+from superbrain.composition._daemon_handoff_factory import (
+    make_default_handoff_domain_factory as make_default_handoff_domain_factory,
+)
+from superbrain.composition._daemon_job_recovery import LeasedAttempts
+from superbrain.composition._endpoint import BoundLoopbackListener
 from superbrain.composition.kernel_bridge import KernelBridge
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.jsonvalue import JsonValue
@@ -40,7 +44,6 @@ from superbrain.core.kernel import (
     Scope,
     SendAttemptCompletion,
     ShutdownReport,
-    ShutdownState,
     StoredResult,
     ToolCommand,
     WorkerCommand,
@@ -56,7 +59,7 @@ from superbrain.ports.continuity import CONTINUITY_REFRESH_JOB_KIND
 from superbrain.ports.policy import Intent
 from superbrain.storage.idempotency import StagedKernelStore
 from superbrain.storage.runtime import Runtime
-from superbrain.workers.executor import JobExecutor, WorkItem
+from superbrain.workers.executor import JobExecutor
 
 _DAEMON_WORKER_ITEM_BUDGET_NS = 60_000_000_000
 _LOGGER = logging.getLogger(__name__)
@@ -89,98 +92,6 @@ _STORED_REF_TOOL: dict[str, str] = {
     "episode_result": "submit_episode",
     "health_result": "get_health",
 }
-
-
-def build_default_handoff_domain(
-    *,
-    rt: Runtime,
-    clock: Clock,
-    writer_epoch: int,
-    deep_health: bool = False,
-    host_version_resolver: Callable[[str], str | None] | None = None,
-) -> KernelToolDomain | None:
-    """Build the production SP2-4/5 ``HandoffKernelDomain`` when store v8 and policy v5 are admitted."""
-    if rt.store.schema_version < 8 or rt.policy.schema_version < 5:
-        return None
-    from superbrain.application._deep_health import DeepHealthProbeResult
-    from superbrain.application.handoff_service import HandoffKernelDomain
-    from superbrain.application.idempotency import is_idempotency_expired
-    from superbrain.composition.doctor_probes_sp2 import run_sp2_doctor_probes
-    from superbrain.core._kernel_approval import Layer2State
-    from superbrain.storage.handoffs import HandoffStore
-    from superbrain.storage.idempotency import KernelIdempotencyStore
-    from superbrain.storage.send_attempts import KernelSendAttemptStore
-
-    idem_store = (
-        KernelIdempotencyStore(
-            rt.store,
-            rt.policy,
-            policy_view=rt.policy,
-            writer_epoch=writer_epoch,
-            is_expired=is_idempotency_expired,
-        )
-        if deep_health
-        else None
-    )
-
-    def _probe_deep() -> DeepHealthProbeResult:
-        sp2 = run_sp2_doctor_probes(
-            rt.root.root,
-            checkout_root=None,
-            host_version_resolver=host_version_resolver,
-            os_=rt.os_,
-            now=clock.now(),
-        )
-        drifted = any(
-            h.recorded_state is Layer2State.VERIFIED and h.effective_state is not Layer2State.VERIFIED
-            for h in sp2.layer2_harnesses
-        )
-        untrusted = idem_store.clock_untrusted() if idem_store is not None else False
-        return DeepHealthProbeResult(
-            store_id=rt.store.store_id,
-            writer_epoch=writer_epoch,
-            store_schema_version=rt.store.schema_version,
-            policy_schema_version=rt.policy.schema_version,
-            clock_untrusted=untrusted,
-            has_open_gaps=sp2.gaps.open_daemon_gaps > 0 or sp2.gaps.producer_gaps > 0,
-            outbox_pending=sp2.outbox.pending_event_count + sp2.outbox.pending_gap_count,
-            active_sessions=sp2.sessions.active_sessions,
-            layer2_degraded=not sp2.terminal_channel_eligible_effective,
-            layer2_drifted=drifted,
-            probe_errors=sp2.integrity_errors,
-        )
-
-    return HandoffKernelDomain(
-        handoffs=HandoffStore(rt.store, rt.policy),
-        policy=rt.policy,
-        clock=clock,
-        send_attempts=KernelSendAttemptStore(rt.store, rt.policy, writer_epoch=writer_epoch),
-        deep_health_probe=_probe_deep if deep_health else None,
-        read_blob=rt.store.cas.read if deep_health else None,
-    )
-
-
-def make_default_handoff_domain_factory(
-    *,
-    rt: Runtime,
-    clock: Clock,
-    writer_epoch: int,
-    host_version_resolver: Callable[[str], str | None] | None = None,
-) -> Callable[[], KernelToolDomain | None] | None:
-    """Return a lazy builder for ``HandoffKernelDomain`` when store v8 and policy v5 are admitted."""
-    if rt.store.schema_version < 8 or rt.policy.schema_version < 5:
-        return None
-
-    def _build() -> KernelToolDomain | None:
-        return build_default_handoff_domain(
-            rt=rt,
-            clock=clock,
-            writer_epoch=writer_epoch,
-            deep_health=True,
-            host_version_resolver=host_version_resolver,
-        )
-
-    return _build
 
 
 class _DaemonCompositeDomain:
@@ -457,21 +368,7 @@ class _AdmittedOwnerSession(OwnerSession):
         holder: list[Reservation],
         envelope: CallResult,
     ) -> None:
-        stamp: AuthGrantStamp | None = None
-        completion: SendAttemptCompletion | None = None
-        if holder:
-            with self._reply_meta_lock:
-                meta = self._reply_meta.pop(holder[0].reservation_id, None)
-            if envelope.get("ok") is True and meta is not None:
-                stamp, completion = meta
-        safe_set_result(
-            future,
-            OwnerReply(
-                envelope=envelope,
-                grant_stamp=stamp,
-                send_completion=completion,
-            ),
-        )
+        _daemon_session_work._resolve_reply_future(self, future, holder, envelope)
 
     def arbitrate_deadlines(self) -> bool:
         self._bridge.arbitrate_deadlines()
@@ -481,26 +378,7 @@ class _AdmittedOwnerSession(OwnerSession):
         return self._bridge.next_deadline_ns()
 
     def step_owner_work(self, *, allow_new_jobs: bool) -> bool:
-        did_work = False
-        if self._executor is not None:
-            self._leased.retry_unfinished()
-            while (wcmd := self._executor.next_command(0.0)) is not None:
-                if self._bridge.reservations.expire_shutdown_if_due():
-                    break
-                try:
-                    self._dispatch_worker_command(wcmd)
-                except BrainError as err:
-                    # The command is consumed: without a fenced retry the job would stay running with no work.
-                    _LOGGER.warning("daemon job completion failed (code=%s)", err.code.value)
-                    if err.code in UNREADABLE and isinstance(wcmd, (WorkerCompleted, WorkerFailed)):
-                        self._leased.retry(wcmd.lease)
-                did_work = True
-            if allow_new_jobs:
-                self._scan_continuity_if_due()
-                did_work = self._claim_and_submit_job() or did_work
-        if self._bridge.process_next_queued(block=False):
-            did_work = True
-        return did_work
+        return _daemon_session_work.step_owner_work(self, allow_new_jobs=allow_new_jobs)
 
     def _is_stopping(self) -> bool:
         with self._metrics_lock:
@@ -529,53 +407,7 @@ class _AdmittedOwnerSession(OwnerSession):
                 self._executor.close(0.0)
 
     def _claim_and_submit_job(self) -> bool:
-        assert self._executor is not None
-        if self._is_stopping() or self._executor.is_closed or self._executor.in_flight != 0:
-            return False
-        if not self._is_claim_open():
-            return False
-        try:
-            lease = self._job_service.lease_next(self._rt.lease.epoch, self._clock.now())
-        except BrainError as err:
-            if err.code is ErrorCode.POLICY_UNAVAILABLE:
-                self._auth_gate.invalidate()
-            _LOGGER.warning("daemon job lease failed (code=%s)", err.code.value)
-            return False
-        if lease is None:
-            return False
-        if not self._can_start_claimed_job():
-            return True
-        try:
-            spec = self._job_service.resolve_leased_spec(lease)
-            if spec is None:
-                return True
-            if not self._can_start_claimed_job():
-                return True
-            if spec.kind == CONTINUITY_REFRESH_JOB_KIND:
-                run_spec = self._continuity_worker.admit_claimed(lease, spec, now=self._clock.now())
-                if run_spec is None:
-                    return True
-                self._leased.remember_spec(lease, spec)  # task and cutoff for the completion, without a re-read
-                spec = run_spec
-            else:
-                self._job_service.start(lease)
-            item = WorkItem(
-                lease=lease,
-                spec=spec,
-                invocation_ids=(),
-                deadline_ns=self._monotonic_clock.monotonic_ns() + _DAEMON_WORKER_ITEM_BUDGET_NS,
-            )
-            self._executor.submit(item)
-            return True
-        except BrainError as err:
-            if err.code in (ErrorCode.REVISION_CONFLICT, ErrorCode.DAEMON_UNAVAILABLE):
-                return True
-            if err.code is ErrorCode.POLICY_UNAVAILABLE:
-                self._auth_gate.invalidate()
-            _LOGGER.warning("daemon job claim failed (code=%s)", err.code.value)
-            if err.code in UNREADABLE:
-                self._leased.retry(lease)  # leased but not handed to the worker: queue the attempt again
-            return False
+        return _daemon_session_work._claim_and_submit_job(self)
 
     def has_pending_owner_work(self) -> bool:
         return self._bridge.queue_depth() > 0
@@ -687,63 +519,7 @@ class _AdmittedOwnerSession(OwnerSession):
         return self._bridge.register_workspace(registration, authorization)
 
     def teardown_on_owner(self, *, overrun: bool, cancelled_requests: int = 0) -> ShutdownReport:
-        self._listener.close()
-        self._auth_gate.close()
-        if self._operator is not None:
-            self._operator.unbind()
-        self._close_claim_gate()
-        drained, worker_drained = self.shutdown_metrics()
-        removed = False
-        try:
-            removed = remove_own_endpoint(self._rt.root, self._rt.lease, self._ready.endpoint, self._rt.os_)
-        except BrainError as err:
-            return ShutdownReport(
-                state=ShutdownState.CLOSE_FAILED,
-                drained_requests=drained,
-                cancelled_requests=cancelled_requests,
-                worker_drained=worker_drained,
-                endpoint_removed=False,
-                error_code=err.code,
-            )
-        try:
-            if self._hooks.before_runtime_close is not None:
-                self._hooks.before_runtime_close(self._rt)
-            self._rt.close()
-        except BrainError as err:
-            return ShutdownReport(
-                state=ShutdownState.CLOSE_FAILED,
-                drained_requests=drained,
-                cancelled_requests=cancelled_requests,
-                worker_drained=worker_drained,
-                endpoint_removed=removed,
-                error_code=err.code,
-            )
-        except Exception:  # noqa: BLE001
-            return ShutdownReport(
-                state=ShutdownState.CLOSE_FAILED,
-                drained_requests=drained,
-                cancelled_requests=cancelled_requests,
-                worker_drained=worker_drained,
-                endpoint_removed=removed,
-                error_code=ErrorCode.IO_ERROR,
-            )
-        if overrun:
-            return ShutdownReport(
-                state=ShutdownState.OVERRUN,
-                drained_requests=drained,
-                cancelled_requests=cancelled_requests,
-                worker_drained=worker_drained,
-                endpoint_removed=removed,
-                error_code=ErrorCode.DEADLINE_EXCEEDED,
-            )
-        return ShutdownReport(
-            state=ShutdownState.STOPPED,
-            drained_requests=drained,
-            cancelled_requests=cancelled_requests,
-            worker_drained=worker_drained,
-            endpoint_removed=removed,
-            error_code=None,
-        )
+        return _daemon_session_work.teardown_on_owner(self, overrun=overrun, cancelled_requests=cancelled_requests)
 
     def adopt_after_owner_exit(self, exited_owner: threading.Thread) -> None:
         if exited_owner.ident is None or exited_owner.is_alive():

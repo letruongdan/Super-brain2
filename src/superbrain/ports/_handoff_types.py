@@ -7,15 +7,16 @@ from dataclasses import dataclass
 from enum import Enum
 
 from superbrain.core._kernel_base import (
-    is_strict_int,
     require_non_negative_int,
     require_opaque_id,
     require_positive_int,
-    require_sha256_digest,
 )
 from superbrain.core._wire_handoff import _VALID_CLOSED_RESOLUTIONS, _VALID_PLAN_STATUSES, _VALID_TASK_STATES
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.jsonvalue import JsonValue
+from superbrain.ports._handoff_state_types import HandoffAgentState as HandoffAgentState
+from superbrain.ports._handoff_state_types import HandoffRevisionHeader as HandoffRevisionHeader
+from superbrain.ports._handoff_state_types import ResolvedSourceContent as ResolvedSourceContent
 
 
 class Unset(Enum):
@@ -540,144 +541,6 @@ def parse_handoff_patch(raw: Mapping[str, JsonValue]) -> HandoffPatch:
         long_running=long_running,
         task_state=task_state,
     )
-
-
-@dataclass(frozen=True)
-class HandoffAgentState:
-    """Canonical agent-reported section stored as an immutable CAS blob referenced by ``agent_ref``."""
-
-    working_goal: str | None = None
-    plan: tuple[HandoffPlanStep, ...] = ()
-    decisions: tuple[HandoffDecision, ...] = ()
-    rejected: tuple[HandoffRejected, ...] = ()
-    user_constraints: tuple[HandoffConstraint, ...] = ()
-    constraint_changes: tuple[HandoffConstraintChange, ...] = ()
-    closed_changes: tuple[HandoffClosedChange, ...] = ()
-    tooling: tuple[HandoffTooling, ...] = ()
-    hypotheses: tuple[str, ...] = ()
-    next_action: HandoffNextAction | None = None
-    long_running: HandoffLongRunning | None = None
-    task_state: str = "open"
-
-    def to_dict(self) -> dict[str, JsonValue]:
-        return {
-            "working_goal": self.working_goal,
-            "plan": [s.to_dict() for s in self.plan],
-            "decisions": [d.to_dict() for d in self.decisions],
-            "rejected": [r.to_dict() for r in self.rejected],
-            "user_constraints": [c.to_dict() for c in self.user_constraints],
-            "constraint_changes": [c.to_dict() for c in self.constraint_changes],
-            "closed_changes": [c.to_dict() for c in self.closed_changes],
-            "tooling": [t.to_dict() for t in self.tooling],
-            "hypotheses": list(self.hypotheses),
-            "next_action": None if self.next_action is None else self.next_action.to_dict(),
-            "long_running": None if self.long_running is None else self.long_running.to_dict(),
-            "task_state": self.task_state,
-        }
-
-    @classmethod
-    def from_dict(cls, raw: Mapping[str, JsonValue]) -> HandoffAgentState:
-        obj = _req_dict(raw)
-        wg = obj.get("working_goal")
-        na = obj.get("next_action")
-        lr = obj.get("long_running")
-        ts = obj.get("task_state", "open")
-        if not isinstance(ts, str) or ts not in _VALID_TASK_STATES:
-            raise _invalid()
-
-        def _seq(key: str) -> Sequence[JsonValue]:
-            val = obj.get(key, [])
-            if not isinstance(val, Sequence) or isinstance(val, (str, bytes)):
-                raise _invalid()
-            return val
-
-        return cls(
-            working_goal=None if wg is None else _req_nonempty_str(wg),
-            plan=tuple(HandoffPlanStep.from_dict(_req_dict(x)) for x in _seq("plan")),
-            decisions=tuple(HandoffDecision.from_dict(_req_dict(x)) for x in _seq("decisions")),
-            rejected=tuple(HandoffRejected.from_dict(_req_dict(x)) for x in _seq("rejected")),
-            user_constraints=tuple(HandoffConstraint.from_dict(_req_dict(x)) for x in _seq("user_constraints")),
-            constraint_changes=tuple(
-                HandoffConstraintChange.from_dict(_req_dict(x), allow_status=True) for x in _seq("constraint_changes")
-            ),
-            closed_changes=tuple(HandoffClosedChange.from_dict(_req_dict(x)) for x in _seq("closed_changes")),
-            tooling=tuple(HandoffTooling.from_dict(_req_dict(x)) for x in _seq("tooling")),
-            hypotheses=tuple(_req_nonempty_str(x) for x in _seq("hypotheses")),
-            next_action=None if na is None else HandoffNextAction.from_dict(_req_dict(na)),
-            long_running=None if lr is None else HandoffLongRunning.from_dict(_req_dict(lr)),
-            task_state=ts,
-        )
-
-
-@dataclass(frozen=True)
-class HandoffRevisionHeader:
-    """Immutable snapshot header committed at ``(artifact_id, revision_epoch, revision)`` (§7.4)."""
-
-    artifact_id: str
-    revision_epoch: int
-    revision: int
-    handoff_revision: int
-    task_id: str
-    task_state: str
-    task_state_source: str
-    fence: HandoffFence
-    holder_harness_id: str | None
-    holder_principal: str | None
-    holder_session_ref: str | None
-    session_state: str | None
-    agent_ref: str | None
-    observed_ref: str | None
-    agent_updated_at: str | None
-    observed_through: str | None
-    events_since_agent: int = 0
-
-    def __post_init__(self) -> None:
-        require_opaque_id(self.artifact_id)
-        require_non_negative_int(self.revision_epoch)
-        require_positive_int(self.revision)
-        require_non_negative_int(self.handoff_revision)
-        require_non_negative_int(self.events_since_agent)
-        require_opaque_id(self.task_id)
-        if not is_strict_int(self.fence.restore_epoch):
-            raise _invalid()
-        if self.agent_ref is not None:
-            require_sha256_digest(self.agent_ref)
-        if self.observed_ref is not None:
-            require_sha256_digest(self.observed_ref)
-
-    def to_dict(self) -> dict[str, JsonValue]:
-        return {
-            "artifact_id": self.artifact_id,
-            "revision_epoch": self.revision_epoch,
-            "revision": self.revision,
-            "handoff_revision": self.handoff_revision,
-            "task_id": self.task_id,
-            "task_state": self.task_state,
-            "task_state_source": self.task_state_source,
-            "fence": self.fence.to_dict(),
-            "holder_harness_id": self.holder_harness_id,
-            "holder_principal": self.holder_principal,
-            "holder_session_ref": self.holder_session_ref,
-            "session_state": self.session_state,
-            "agent_ref": self.agent_ref,
-            "observed_ref": self.observed_ref,
-            "agent_updated_at": self.agent_updated_at,
-            "observed_through": self.observed_through,
-            "events_since_agent": self.events_since_agent,
-        }
-
-
-@dataclass(frozen=True)
-class ResolvedSourceContent:
-    """Read-time resolved observed or history item from live CAS + policy checks (never pre-copied into handoffs)."""
-
-    source_event_id: str
-    source_digest: str
-    kind: str
-    status: str  # "ok" | "redacted" | "expired"
-    payload: Mapping[str, JsonValue] | None = None
-    reason: str | None = None
-    recorded_at: str | None = None
 
 
 __all__ = [
