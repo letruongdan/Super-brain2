@@ -1134,7 +1134,7 @@ class TestTransportLifecycleAndRelease:
                 entered_lock = threading.Lock()
                 import superbrain.cli_api._loopback_server as lb_server
 
-                orig_handle_id = lb_server.handle_identity_request  # type: ignore[attr-defined]
+                orig_handle_id = lb_server.handle_identity_request
 
                 def wrap_handle_id(*args: Any, **kwargs: Any) -> Any:
                     nonlocal entered_count
@@ -2324,7 +2324,7 @@ class TestTransportLifecycleAndRelease:
         import superbrain.cli_api._loopback_server as loopback_server
 
         entered_read_cmd = threading.Event()
-        orig_read_cmd = loopback_server.read_admitted_tool_command  # type: ignore[attr-defined]
+        orig_read_cmd = loopback_server.read_admitted_tool_command
 
         def _hooked_read_cmd(*args: Any, **kwargs: Any) -> Any:
             entered_read_cmd.set()

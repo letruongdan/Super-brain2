@@ -49,7 +49,7 @@ def test_socket_readiness_causal_barrier_waits_for_slow_lookup_and_preserves_sig
         monkeypatch.setenv("SUPERBRAIN_TEST_SOCKET_READINESS", token)
         eq_live: queue.Queue[dict[str, Any] | None] = queue.Queue()
         os_pid = os.getpid()
-        orig_handle_ident: Any = _loopback_server.handle_identity_request  # type: ignore[attr-defined]
+        orig_handle_ident: Any = _loopback_server.handle_identity_request
         ident_seen_before_lookup: list[bool] = []
         lookup_finished_ev = threading.Event()
         lookup_observed: dict[str, Any] = {}
