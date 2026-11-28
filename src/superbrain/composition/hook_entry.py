@@ -230,6 +230,10 @@ def run_hook(
             gap_deadline_ns = hard_deadline_ns
             try:
                 spool = _make_spool(outbox_dir, spool_factory)
+                # shortcut: check and write take the lock separately; a concurrent hook publishing the same
+                # (stream, sequence) in between can still leave a gap beside its event. Upgrade if hooks overlap.
+                if spool.holds_event(gap.producer_stream, gap.sequence, deadline_ns=gap_deadline_ns):
+                    raise BrainError(ErrorCode.IDEMPOTENCY_CONFLICT, "sequence already holds an event")
                 spool.enqueue_gap(gap, deadline_ns=gap_deadline_ns)
             except BrainError as gap_err:
                 _write_static_log(log_path, phase="hook_gap", code=gap_err.code.value)

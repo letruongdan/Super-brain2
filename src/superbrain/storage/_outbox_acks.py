@@ -21,6 +21,7 @@ from superbrain.storage._outbox_io import (
     entry_is_link,
     is_link_path,
     replace_file_resilient,
+    staging_cleanup_allowed,
     sync_dir,
     unlink_before_deadline,
     verify_owner_only,
@@ -72,8 +73,8 @@ def _verify_acks_dir_node(stream_dir: Path, perms: OutboxPermissionsPort) -> Pat
     return adir
 
 
-def verify_acks_dir(stream_dir: Path, perms: OutboxPermissionsPort) -> Path | None:
-    """Verify ``.acks`` directory and sweep ``.part`` files, rejecting links and unexpected entries."""
+def verify_acks_dir(stream_dir: Path, perms: OutboxPermissionsPort, *, sweep: bool = False) -> Path | None:
+    """Verify ``.acks`` directory, rejecting links and unexpected entries; remove ``.part`` only on a sweep."""
     adir = _verify_acks_dir_node(stream_dir, perms)
     if adir is None:
         return None
@@ -84,7 +85,8 @@ def verify_acks_dir(stream_dir: Path, perms: OutboxPermissionsPort) -> Path | No
             if entry_is_link(entry):
                 raise BrainError(ErrorCode.UNSAFE_PATH, "ack page is a link")
             if entry.name.endswith(_PART_SUFFIX):
-                unlink_before_deadline(Path(entry.path))
+                if sweep:
+                    unlink_before_deadline(Path(entry.path))
                 continue
             if _parse_ack_page_filename(entry.name) is None:
                 raise BrainError(ErrorCode.INTEGRITY_FAILURE, "unexpected entry in acks directory")
@@ -436,6 +438,6 @@ def write_ack_pages(
                     os.close(fd)
                 except OSError:
                     pass
-            if not committed:
+            if not committed and staging_cleanup_allowed():
                 tmp_path.unlink(missing_ok=True)
     sync_dir(adir)

@@ -59,6 +59,28 @@ def unlink_before_deadline(path: Path, check_deadline: Callable[[], None] | None
     path.unlink(missing_ok=True)
 
 
+def staging_cleanup_allowed(check_deadline: Callable[[], None] | None = None) -> bool:
+    """True while the deadline still has budget; past the cutoff a failed step leaves its staging to the next sweep
+    and the step's own error is kept."""
+    dl = check_deadline or _ACTIVE_DEADLINE_CHECK.get()
+    if dl is None:
+        return True
+    try:
+        dl()
+    except BrainError:
+        return False
+    return True
+
+
+def wait_within_budget(wait: float) -> None:
+    """Sleep ``wait`` seconds after checking the deadline, never longer than the remaining budget."""
+    dl = _ACTIVE_DEADLINE_CHECK.get()
+    if dl is not None:
+        dl()
+    remaining = _ACTIVE_DEADLINE_REMAINING.get()
+    time.sleep(wait if remaining is None else min(wait, max(0, remaining()) / 1e9))
+
+
 def replace_file_resilient(src: Path, dst: Path) -> None:
     """Replace ``dst`` with ``src``; the deadline is checked before every attempt and every busy wait, and a wait
     never outlasts the remaining budget."""
@@ -73,10 +95,7 @@ def replace_file_resilient(src: Path, dst: Path) -> None:
             if delay is None or getattr(err, "winerror", None) not in _BUSY_REPLACE_WINERRORS:
                 raise
             wait = delay
-        if dl is not None:
-            dl()
-        remaining = _ACTIVE_DEADLINE_REMAINING.get()
-        time.sleep(wait if remaining is None else min(wait, max(0, remaining()) / 1e9))
+        wait_within_budget(wait)
 
 
 def _fallback_sync_dir(directory: Path) -> None:
@@ -93,6 +112,13 @@ def _fallback_sync_dir(directory: Path) -> None:
             raise
     finally:
         os.close(fd)
+
+
+def sync_existing_dirs(*directories: Path) -> None:
+    """Sync every directory that exists, so entries an earlier attempt could not confirm are durable before use."""
+    for directory in directories:
+        if os.path.isdir(directory):
+            sync_dir(directory)
 
 
 def sync_dir(directory: Path) -> None:

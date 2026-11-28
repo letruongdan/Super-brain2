@@ -465,6 +465,7 @@ hook/transcript → adapter dịch sang envelope v2 → privacy filter → outbo
 - **Outbox:**
   - Có giới hạn, mặc định 100 MB mỗi harness. Đầy hoặc đĩa đầy thì ghi CaptureGap; không âm thầm bỏ sự kiện.
   - Chỉ xóa sự kiện khỏi outbox sau khi daemon ACK theo mục 5.4.
+  - **Mức độ bền của outbox trên Windows là `process_crash_durable`.** Outbox công bố frame, cursor, ACK page, bucket binding và `streams/.v4_fence` bằng `os.replace` (`MoveFileExW` với `MOVEFILE_REPLACE_EXISTING`, không có `MOVEFILE_WRITE_THROUGH`), và Windows không fsync được thư mục. Vì vậy chỉ bảo đảm khi tiến trình chết: một bước công bố đã trả về thì còn nguyên sau khi tiến trình chết. Không bảo đảm thứ tự hay sự tồn tại của directory entry khi mất điện; khi đó recovery có thể thấy một cursor trỏ tới ACK page bị mất và trả `INTEGRITY_FAILURE` (fail closed), không âm thầm mất sự kiện. Trên Linux/macOS, outbox fsync thư mục sau mỗi bước công bố và dừng trước bước kế tiếp nếu gặp lỗi I/O thật. Filesystem báo không hỗ trợ fsync thư mục cũng chỉ đạt `process_crash_durable`.
 - **Privacy filter** áp dụng ở mọi đường vào bền vững (mục 14.2), không chỉ ở capture.
 - **Sự kiện harness không cung cấp được** thì ghi là `unavailable`, không đoán.
 - **Các tín hiệu worker nhận diện:**

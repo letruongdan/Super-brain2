@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import os
 import stat
 import time
@@ -29,35 +28,35 @@ from superbrain.ports.capture import (
     default_outbox_permissions,
 )
 from superbrain.storage import _outbox_io as _io
-from superbrain.storage._outbox_acks import _ACKS_DIR, _verify_acks_dir_node, verify_acks_dir
+from superbrain.storage import _outbox_scan as _scan
 from superbrain.storage._outbox_bindings import (
-    _BINDINGS_DIR,
     DEFAULT_MAX_STREAM_BINDING_KEYS,
-    _verify_bindings_dir_node,
     bucket_name_for_key,
     prepare_hook_binding_upsert,
     project_recovered_buckets,
-    verify_bindings_dir,
     write_prepared_binding_bucket,
+)
+from superbrain.storage._outbox_hookseq import (
+    DEFERRABLE_AFTER_PUBLISH,
+    compute_projected_hook_recovery,
+    preflight_hook_cursor_size,
+    read_hook_cursor_readonly,
+    settle_published_hook_frame,
+    slot_holds_event,
 )
 from superbrain.storage._outbox_seq import (
     commit_bumped_cursor,
-    compute_projected_hook_recovery,
     lookup_stream_binding_with_bucket,
     persist_cursor_ack,
-    preflight_hook_cursor_size,
     prepare_cursor_for_direct_enqueue,
-    read_hook_cursor_readonly,
     recover_stream_cursor,
     resolve_hook_envelope_slot,
-    settle_published_hook_frame,
+    sync_stream_metadata,
     verify_stream_cursor_integrity,
 )
 from superbrain.storage._outbox_seq import (
     write_stream_cursor as write_stream_cursor,
 )
-
-_DEADLINE_CHECK_STRIDE = 64
 
 
 class OutboxSpool:
@@ -124,7 +123,10 @@ class OutboxSpool:
         adapter = self._resolve_file_lock()
         renamer = default_outbox_dir_renamer()
         dl_check = (lambda: self._check_deadline(deadline_ns)) if deadline_ns is not None else None
-        with self._thread_lock:
+        wait_s = -1.0 if deadline_ns is None else max(0.0, (deadline_ns - int(self._monotonic_ns())) / 1e9)
+        if not self._thread_lock.acquire(timeout=wait_s):
+            raise BrainError(ErrorCode.DEADLINE_EXCEEDED, "deadline exceeded")
+        try:
             self._check_deadline(deadline_ns)
             if not os.path.lexists(self._root):
                 if not create_root:
@@ -154,6 +156,8 @@ class OutboxSpool:
                         adapter.unlock_fd(fd)
                 finally:
                     os.close(fd)
+        finally:
+            self._thread_lock.release()
 
     def _acquire_file_lock(self, fd: int, *, adapter: OutboxFileLockPort, deadline_ns: int | None) -> bool:
         while True:
@@ -163,58 +167,7 @@ class OutboxSpool:
                     return True
             except OSError as err:
                 raise _io.raise_storage_error(err, "cannot lock outbox") from err
-            time.sleep(0.002)
-
-    def _scan_stream_dir(
-        self,
-        sdir: Path,
-        *,
-        perms: OutboxPermissionsPort,
-        deadline_ns: int | None,
-        match_suffix: str | None,
-        counter: list[int],
-        sweep: bool = True,
-        frames_out: dict[str, Path] | None = None,
-    ) -> tuple[int, int, Path | None, int]:
-        _io.verify_owner_only(sdir, perms)
-        self._check_deadline(deadline_ns)
-        total_bytes = 0
-        highest_order = 0
-        max_frame_seq = 0
-        matched_path: Path | None = None
-        with os.scandir(sdir) as sit:
-            for fe in sit:
-                counter[0] += 1
-                if (counter[0] & (_DEADLINE_CHECK_STRIDE - 1)) == 0:
-                    self._check_deadline(deadline_ns)
-                if _io.entry_is_link(fe):
-                    raise BrainError(ErrorCode.UNSAFE_PATH, "frame file is a link")
-                name = fe.name
-                if name == _BINDINGS_DIR:
-                    verify_bindings_dir(sdir, perms) if sweep else _verify_bindings_dir_node(sdir, perms)
-                    continue
-                if name == _ACKS_DIR:
-                    verify_acks_dir(sdir, perms) if sweep else _verify_acks_dir_node(sdir, perms)
-                    continue
-                if name.endswith(_io._PART_SUFFIX):
-                    _io.unlink_before_deadline(Path(fe.path))
-                    continue
-                if name.endswith(_io._FRAME_SUFFIX):
-                    st = fe.stat(follow_symlinks=False)
-                    if not stat.S_ISREG(st.st_mode):
-                        raise BrainError(ErrorCode.INTEGRITY_FAILURE, "frame entry is not a regular file")
-                    total_bytes += st.st_size
-                    order = _io.parse_frame_order(Path(fe.path))[0]
-                    if order > highest_order:
-                        highest_order = order
-                    if frames_out is not None:
-                        frames_out[name] = Path(fe.path)
-                        ident = _io.parse_frame_filename_identity(name)
-                        if ident is not None and ident[1] > max_frame_seq:
-                            max_frame_seq = ident[1]
-                    if match_suffix is not None and name.endswith(match_suffix):
-                        matched_path = Path(fe.path)
-        return total_bytes, highest_order, matched_path, max_frame_seq
+            _io.wait_within_budget(0.002)
 
     def _scan_outbox_with_stream(
         self,
@@ -224,73 +177,13 @@ class OutboxSpool:
         match_suffix: str | None = None,
         sweep: bool = True,
         collect_stream_frames: bool = False,
-    ) -> tuple[int, int, Path | None, int, dict[str, Path], bool]:
-        """Single-pass scandir: reject links, sweep .part files, sum bytes, optionally collect one stream."""
-        stream_frames: dict[str, Path] = {}
-        if not os.path.lexists(self._root):
-            return 0, 0, None, 0, stream_frames, False
-        perms = self._resolve_permissions()
-        total_bytes, highest_order, max_stream_seq = 0, 0, 0
-        matched_path: Path | None = None
-        stream_verified = False
-        counter = [0]
-        streams_dir: Path | None = None
-
-        with os.scandir(self._root) as root_it:
-            for re_entry in root_it:
-                counter[0] += 1
-                if (counter[0] & (_DEADLINE_CHECK_STRIDE - 1)) == 0:
-                    self._check_deadline(deadline_ns)
-                if _io.entry_is_link(re_entry):
-                    raise BrainError(ErrorCode.UNSAFE_PATH, "symlink detected in outbox")
-                rname = re_entry.name
-                if rname.endswith(_io._PART_SUFFIX):
-                    _io.unlink_before_deadline(Path(re_entry.path))
-                elif rname == _io._STREAMS_DIR:
-                    st_r = re_entry.stat(follow_symlinks=False)
-                    if not stat.S_ISDIR(st_r.st_mode):
-                        raise BrainError(ErrorCode.INTEGRITY_FAILURE, "streams entry is not a directory")
-                    streams_dir = Path(re_entry.path)
-
-        if streams_dir is None:
-            return 0, 0, None, 0, stream_frames, False
-        _io.verify_owner_only(streams_dir, perms)
-        self._check_deadline(deadline_ns)
-
-        with os.scandir(streams_dir) as st_it:
-            for sd_entry in st_it:
-                self._check_deadline(deadline_ns)
-                if _io.entry_is_link(sd_entry):
-                    raise BrainError(ErrorCode.UNSAFE_PATH, "stream directory is a link")
-                if sd_entry.name == _io._V4_FENCE_FILE:
-                    _io.verify_v4_fence_file(Path(sd_entry.path), perms)
-                    continue
-                if _io.is_v4_fence_part_name(sd_entry.name):
-                    _io.unlink_before_deadline(Path(sd_entry.path))
-                    continue
-                if sd_entry.name.startswith(".") and ".init-" in sd_entry.name:
-                    continue
-                if not stat.S_ISDIR(sd_entry.stat(follow_symlinks=False).st_mode):
-                    raise BrainError(ErrorCode.INTEGRITY_FAILURE, "stream entry is not a directory")
-                sd_path = Path(sd_entry.path)
-                is_target = match_stream_key is not None and sd_entry.name == match_stream_key
-                want_suffix = match_suffix if is_target else None
-                want_frames = stream_frames if (collect_stream_frames and is_target) else None
-                if is_target:
-                    stream_verified = True
-                sb, so, mp, s_max_seq = self._scan_stream_dir(
-                    sd_path, perms=perms, deadline_ns=deadline_ns, match_suffix=want_suffix,
-                    counter=counter, sweep=sweep, frames_out=want_frames,
-                )
-                total_bytes += sb
-                if so > highest_order:
-                    highest_order = so
-                if s_max_seq > max_stream_seq:
-                    max_stream_seq = s_max_seq
-                if mp is not None:
-                    matched_path = mp
-        self._check_deadline(deadline_ns)
-        return total_bytes, highest_order, matched_path, max_stream_seq, stream_frames, stream_verified
+    ) -> _scan.ScanResult:
+        """Single-pass scandir: reject links, sweep staging when asked, sum bytes, optionally collect one stream."""
+        return _scan.scan_outbox(
+            self._root, perms=self._resolve_permissions(), check=lambda: self._check_deadline(deadline_ns),
+            match_stream_key=match_stream_key, match_suffix=match_suffix, sweep=sweep,
+            collect_stream_frames=collect_stream_frames,
+        )
 
     def _scan_outbox(
         self,
@@ -307,22 +200,7 @@ class OutboxSpool:
         return total, order, matched
 
     def _collect_regular_frames(self, directory: Path) -> list[Path]:
-        perms = self._resolve_permissions()
-        if _io.is_link_path(directory):
-            raise BrainError(ErrorCode.UNSAFE_PATH, "stream directory is a link")
-        if not stat.S_ISDIR(os.lstat(directory).st_mode):
-            raise BrainError(ErrorCode.INTEGRITY_FAILURE, "stream path is not a directory")
-        _io.verify_owner_only(directory, perms)
-        found: list[Path] = []
-        with os.scandir(directory) as it:
-            for entry in it:
-                if _io.entry_is_link(entry):
-                    raise BrainError(ErrorCode.UNSAFE_PATH, "frame file is a link")
-                if entry.name.endswith(_io._FRAME_SUFFIX):
-                    if not stat.S_ISREG(entry.stat(follow_symlinks=False).st_mode):
-                        raise BrainError(ErrorCode.INTEGRITY_FAILURE, "frame entry is not a regular file")
-                    found.append(Path(entry.path))
-        return found
+        return _scan.collect_regular_frames(directory, self._resolve_permissions())
 
     def _iter_frame_paths(
         self, *, producer_stream: str | None = None, verify_cursor: bool = True
@@ -349,7 +227,6 @@ class OutboxSpool:
                         _io.verify_v4_fence_file(Path(sd_entry.path), perms)
                         continue
                     if _io.is_v4_fence_part_name(sd_entry.name):
-                        _io.unlink_before_deadline(Path(sd_entry.path))
                         continue
                     if stat.S_ISDIR(sd_entry.stat(follow_symlinks=False).st_mode):
                         sdir_path = Path(sd_entry.path)
@@ -419,6 +296,8 @@ class OutboxSpool:
                 if existing_entry.entry_id == entry_id and existing_entry.payload_digest == payload_digest:
                     return existing_entry.entry_id
                 raise BrainError(ErrorCode.IDEMPOTENCY_CONFLICT, "idempotency conflict")
+            if os.path.isdir(sdir):
+                sync_stream_metadata(sdir)
             if used + len(frame_bytes) > self._max_bytes:
                 raise BrainError(ErrorCode.STORAGE_FULL, "storage full")
             _io.ensure_dir_tree_atomic(streams_root, perms, renamer, check_deadline=dl_check)
@@ -431,8 +310,11 @@ class OutboxSpool:
                 sdir / f"{base}{_io._FRAME_SUFFIX}", sdir / f"{base}{_io._PART_SUFFIX}", frame_bytes,
                 crashpoint_name="capture.outbox.after_write_before_fsync", deadline_ns=deadline_ns,
             )
-            with contextlib.suppress(BrainError):  # frame is published; the next recovery repairs the cursor
+            try:
                 commit_bumped_cursor(sdir, preflight_cur, sequence, perms)
+            except BrainError as err:  # frame is published; the next recovery repairs a stopped cursor bump
+                if err.code not in DEFERRABLE_AFTER_PUBLISH:
+                    raise
             return entry_id
 
     def enqueue_event(self, record: CaptureEventRecord, *, deadline_ns: int | None = None) -> str:
@@ -504,10 +386,12 @@ class OutboxSpool:
                 perms=perms, preloaded_entries=target if target is not None else bucket_entries,
             )
             preflight_hook_cursor_size(sdir, preview_cur, sequence=record.sequence, prepared=prepared)
-            cursor = recover_stream_cursor(sdir, raw_cur, perms, renamer=renamer, check_deadline=dl_check)
             if not sdir_ok:
                 _io.ensure_dir_tree_atomic(self._root / _io._STREAMS_DIR, perms, renamer, check_deadline=dl_check)
                 _io.ensure_dir_tree_atomic(sdir, perms, renamer, check_deadline=dl_check)
+            else:
+                sync_stream_metadata(sdir)
+            cursor = recover_stream_cursor(sdir, raw_cur, perms, renamer=renamer, check_deadline=dl_check)
             new_count = cursor.binding_count + (1 if (prepared is not None and prepared[3]) else 0)
             pending_b = prepared[0] if (prepared is not None and prepared[2] is not None) else None
             bound_c = cursor.with_binding_state(
@@ -527,8 +411,11 @@ class OutboxSpool:
             )
             pub_c = cursor.with_binding_state(pending_binding=None)
             if pub_c != cursor:
-                with contextlib.suppress(BrainError):  # frame is published; recovery clears pending_binding
+                try:
                     write_stream_cursor(sdir, pub_c, perms)
+                except BrainError as err:  # frame is published; the next recovery clears a stale pending_binding
+                    if err.code not in DEFERRABLE_AFTER_PUBLISH:
+                        raise
             return record
 
     def enqueue_gap(self, gap: ProducerCaptureGap, *, deadline_ns: int | None = None) -> str:
@@ -537,6 +424,15 @@ class OutboxSpool:
             raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
         return self._enqueue_record(record_kind=OUTBOX_RECORD_GAP, producer_stream=gap.producer_stream,
             sequence=gap.sequence, entry_id=gap.gap_id, payload_dict=gap.to_dict(), deadline_ns=deadline_ns)
+
+    def holds_event(self, producer_stream: str, sequence: int, *, deadline_ns: int | None = None) -> bool:
+        """Read-only: whether ``sequence`` already holds a published or acknowledged event in ``producer_stream``.
+        A stream without a cursor keeps no record of an event that was acknowledged and evicted."""
+        with self._locked(create_root=False, sweep=False, deadline_ns=deadline_ns):
+            if not os.path.lexists(self._root / _io._STREAMS_DIR):
+                return False
+            sdir = self._root / _io._STREAMS_DIR / _io.stream_dir_key(producer_stream)
+            return slot_holds_event(sdir, sequence, self._resolve_permissions())
 
     def read_pending(
         self, limit: int = MAX_CAPTURE_BATCH_EVENTS, *, producer_stream: str | None = None

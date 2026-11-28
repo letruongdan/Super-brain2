@@ -110,7 +110,8 @@ def _fsync_directory(path: Path, *, nt: bool = os.name == "nt") -> bool:
 def sync_directory_strict(path: Path) -> None:
     """Persist directory entries for ``OutboxSpool`` metadata updates. A filesystem that cannot fsync a directory is
     accepted (``_fsync_directory`` returns ``False``); ``EIO``, ``ENOSPC`` and every other error propagate so the
-    outbox stops before its next publication step."""
+    outbox stops before its next publication step. On Windows nothing is flushed here and the outbox renames with
+    ``os.replace`` (no write-through), so the outbox there is ``process_crash_durable`` (spec 7.1)."""
     _fsync_directory(path)
 
 

@@ -29,6 +29,7 @@ from superbrain.storage._outbox_io import (
     entry_is_link,
     is_link_path,
     replace_file_resilient,
+    staging_cleanup_allowed,
     sync_dir,
     unlink_before_deadline,
     verify_owner_only,
@@ -73,8 +74,8 @@ def _verify_bindings_dir_node(stream_dir: Path, perms: OutboxPermissionsPort) ->
     return bdir
 
 
-def verify_bindings_dir(stream_dir: Path, perms: OutboxPermissionsPort) -> Path | None:
-    """Verify ``.bindings`` directory inside ``stream_dir`` is safe and owner-only, sweeping ``.part`` files."""
+def verify_bindings_dir(stream_dir: Path, perms: OutboxPermissionsPort, *, sweep: bool = False) -> Path | None:
+    """Verify ``.bindings`` directory inside ``stream_dir`` is safe and owner-only; remove ``.part`` only on a sweep."""
     bdir = _verify_bindings_dir_node(stream_dir, perms)
     if bdir is None:
         return None
@@ -82,7 +83,7 @@ def verify_bindings_dir(stream_dir: Path, perms: OutboxPermissionsPort) -> Path 
         for entry in it:
             if entry_is_link(entry):
                 raise BrainError(ErrorCode.UNSAFE_PATH, "binding bucket is a link")
-            if entry.name.endswith(_PART_SUFFIX):
+            if sweep and entry.name.endswith(_PART_SUFFIX):
                 unlink_before_deadline(Path(entry.path))
     return bdir
 
@@ -287,7 +288,7 @@ def write_prepared_binding_bucket(
                 os.close(fd)
             except OSError:
                 pass
-        if not committed:
+        if not committed and staging_cleanup_allowed():
             tmp_path.unlink(missing_ok=True)
 
 

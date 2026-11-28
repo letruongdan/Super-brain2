@@ -33,8 +33,11 @@ from superbrain.storage._outbox_durable import push_deadline_remaining as push_d
 from superbrain.storage._outbox_durable import replace_file_resilient as replace_file_resilient
 from superbrain.storage._outbox_durable import reset_deadline_check as reset_deadline_check
 from superbrain.storage._outbox_durable import reset_deadline_remaining as reset_deadline_remaining
+from superbrain.storage._outbox_durable import staging_cleanup_allowed as staging_cleanup_allowed
 from superbrain.storage._outbox_durable import sync_dir as sync_dir
+from superbrain.storage._outbox_durable import sync_existing_dirs as sync_existing_dirs
 from superbrain.storage._outbox_durable import unlink_before_deadline as unlink_before_deadline
+from superbrain.storage._outbox_durable import wait_within_budget as wait_within_budget
 
 _REPARSE_POINT = 0x400
 _PART_SUFFIX = ".part"
@@ -233,7 +236,7 @@ def atomic_create_dir(
         except OSError as err:
             raise raise_storage_error(err, f"cannot create directory {target}") from err
         finally:
-            if stage.exists():
+            if stage.exists() and staging_cleanup_allowed(check_deadline):
                 shutil.rmtree(stage, ignore_errors=True)
     if is_link_path(target):
         raise BrainError(ErrorCode.UNSAFE_PATH, "directory must not be a link")
@@ -400,8 +403,8 @@ def is_v4_fence_part_name(name: str) -> bool:
     return name.startswith(f"{_V4_FENCE_FILE}-") and name.endswith(_PART_SUFFIX)
 
 
-def verify_streams_fence_if_present(streams_dir: Path, perms: OutboxPermissionsPort) -> None:
-    """Reject links or unsupported future version fences on ``streams`` and sweep fence staging files."""
+def verify_streams_fence_if_present(streams_dir: Path, perms: OutboxPermissionsPort, *, sweep: bool = False) -> None:
+    """Reject links or unsupported future version fences on ``streams``; remove fence staging only on a sweep."""
     if not os.path.lexists(streams_dir):
         return
     if is_link_path(streams_dir):
@@ -416,7 +419,8 @@ def verify_streams_fence_if_present(streams_dir: Path, perms: OutboxPermissionsP
             elif is_v4_fence_part_name(entry.name):
                 if entry_is_link(entry):
                     raise BrainError(ErrorCode.UNSAFE_PATH, "streams version fence staging file is a link")
-                unlink_before_deadline(Path(entry.path))
+                if sweep:
+                    unlink_before_deadline(Path(entry.path))
 
 
 def ensure_v4_fence(
@@ -460,7 +464,7 @@ def ensure_v4_fence(
                 os.close(fd)
             except OSError:
                 pass
-        if not committed:
+        if not committed and staging_cleanup_allowed(check_deadline):
             tmp.unlink(missing_ok=True)
 
 
@@ -549,5 +553,5 @@ def publish_outbox_frame_atomic(
                 os.close(fd)
             except OSError:
                 pass
-        if not committed:
+        if not committed and staging_cleanup_allowed(check_deadline):
             part_path.unlink(missing_ok=True)

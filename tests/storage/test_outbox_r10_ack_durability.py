@@ -505,7 +505,8 @@ def test_r10_f8_read_pending_verifies_cursor_acks_and_v4_fence(trusted_tmp: Path
 def test_r10_f9_write_ack_pages_skips_replace_after_fsync_deadline(
     trusted_tmp: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """If deadline expires during fsync, write_ack_pages must clean temp file and publish zero pages."""
+    """If deadline expires during fsync, write_ack_pages publishes zero pages and leaves its staging file to the next
+    sweep (no unlink after the cutoff; owner-approved oracle change for Codex R12-6, 2026-11-27)."""
     perms = os_adapters().permissions
     now = [0]
     outbox, stream = trusted_tmp / "outbox-r10-f9", "stream-r10-f9"
@@ -531,7 +532,12 @@ def test_r10_f9_write_ack_pages_skips_replace_after_fsync_deadline(
 
     after_files = {p.name for p in (sdir / ".acks").iterdir()}
     assert cur_path.read_bytes() == initial_cur
-    assert after_files == before_files
+    added = after_files - before_files
+    assert before_files <= after_files
+    assert added and all(name.endswith(".part") for name in added), added
+    now[0] = 0
+    spool.read_pending(limit=10)
+    assert {p.name for p in (sdir / ".acks").iterdir()} == before_files
 
 
 def test_r10_f10_recovery_capacity_overflow_is_pure_preflight(trusted_tmp: Path) -> None:
