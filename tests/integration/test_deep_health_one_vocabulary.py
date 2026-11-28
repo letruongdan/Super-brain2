@@ -75,3 +75,73 @@ def test_a_layer2_config_change_after_the_latest_doctor_run_shows_in_deep_health
         settings = env["chk"] / ".claude" / "settings.local.json"
         settings.write_bytes(settings.read_bytes().replace(b'"hooks"', b'"theme":"dark","hooks"', 1))
         assert "harness.layer2" in _deep()  # same DoctorRun, but the checkout config no longer matches
+
+
+def test_a_host_version_change_after_the_latest_doctor_run_shows_in_deep_health(
+    trusted_tmp: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tests.integration.test_sp2_5_production_wiring import _write_fake_host_bin
+
+    env = _verified_store(trusted_tmp, monkeypatch)
+    rt = reopen_kernel_job_runtime(env["data_root"], env["rep"].store_id, env["os_"])
+    try:
+        mcp = seed_principal_and_credential(rt.policy, owner_id=_OWNER, harness_id="claude-code", machine_id=_MACHINE)
+    finally:
+        rt.close()
+    with _serve_daemon(env["cfg"], env["os_"], env["clock"], env["mono"]) as (ready, _loop):
+        target = LoopbackTarget(endpoint=ready.endpoint, expected_store_id=env["rep"].store_id, ca_pem=env["ca_pem"],
+                                leaf_cert_sha256=ready.leaf_cert_sha256)
+        client = LoopbackClient(monotonic_ns=env["mono"].monotonic_ns)
+
+        def _deep() -> list[str]:
+            res = client.call(target, ToolCommand(
+                "get_health", {"schema_version": SCHEMA_VERSION, "deep": True, "idempotency_key": f"idem-{new_id()}"},
+                token=mcp.token,
+            ))
+            assert res.get("ok") is True, res
+            return [str(c) for c in cast(dict[str, Any], res["data"])["degraded_codes"]]
+
+        assert "harness.layer2" not in _deep()
+        _write_fake_host_bin(trusted_tmp / "bin", "claude", "9.9.9 (Claude Code)")  # host upgraded, config unchanged
+        assert "harness.layer2" in _deep()
+
+
+@pytest.mark.parametrize("state", ["valid", "missing", "quarantined"])
+def test_a_replayed_sp2_era_health_result_still_validates_its_stored_object(trusted_tmp: Path, state: str) -> None:
+    import datetime as dt
+
+    from superbrain.adapters.os import os_adapters
+    from superbrain.composition._daemon_deep_health import render_deep_health
+    from superbrain.core.canonical import canonical_json, digest_bytes
+    from superbrain.core.errors import BrainError, ErrorCode
+    from superbrain.ports.policy import IntentKind
+    from superbrain.storage.kinds import RetentionClass
+    from tests.support.inc2_fixture import open_kernel_job_runtime
+
+    now = dt.datetime(2026, 11, 28, 12, 0, tzinfo=dt.UTC)
+    rt = open_kernel_job_runtime(trusted_tmp / "store", os_adapters())
+    try:
+        blob = canonical_json({"ready": True, "degraded_codes": ["layer2_unverified"]})
+        digest, rid = digest_bytes(blob), new_id()
+        if state != "missing":
+            rt.store.cas.put(blob)
+            with rt.store.transaction() as txn:
+                txn.hold(digest, "event", rid, RetentionClass.DURABLE, now + dt.timedelta(days=30))
+        if state == "quarantined":
+            rt.policy.record_intent(IntentKind.QUARANTINE, {"digest": digest})
+        stored = StoredResult(result_id=rid, assignment_id=None,
+                              refs=(ObjectRef(kind="health_result", id=rid, revision=1, digest=digest),))
+
+        def _render() -> dict[str, Any]:
+            return render_deep_health(rt, cast(Any, None), stored, cast(Any, None), now=now,
+                                      tls_not_after=now + dt.timedelta(days=30), clock_untrusted_fn=lambda: False)
+
+        if state == "valid":
+            data = _render()
+            assert data["doctor_run_id"] is None and "layer2_unverified" not in data["degraded_codes"]
+        else:
+            with pytest.raises(BrainError) as err:
+                _render()
+            assert err.value.code is (ErrorCode.NOT_FOUND if state == "missing" else ErrorCode.QUARANTINED)
+    finally:
+        rt.close()

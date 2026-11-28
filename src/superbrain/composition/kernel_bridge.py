@@ -20,7 +20,7 @@ from superbrain.application.deadlines import (
 from superbrain.application.dispatch import KernelDispatcher, KernelToolDomain
 from superbrain.application.idempotency import is_idempotency_expired
 from superbrain.application.privacy import PrivacyFilter
-from superbrain.composition._layer2_live import apply_recorded_layer2, make_live_layer2_lookup
+from superbrain.composition._layer2_live import Layer2ApplyTracker, make_live_layer2_lookup
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.ids import new_id
 from superbrain.core.jsonvalue import JsonValue
@@ -129,6 +129,7 @@ class KernelBridge(KernelBlobStagePort):
         os_: OsAdapters | None = None,
         host_version_resolver: Callable[[str], str | None] | None = None,
         seen_configured_layer2: set[tuple[str, str]] | None = None,
+        layer2_apply: Layer2ApplyTracker | None = None,
     ) -> None:
         if not isinstance(recover_pending_on_init, bool):
             raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
@@ -172,7 +173,7 @@ class KernelBridge(KernelBlobStagePort):
         else:
             self._host_version_resolver = host_version_resolver
         self._seen_l2: set[tuple[str, str]] = set() if seen_configured_layer2 is None else seen_configured_layer2
-        self._l2_apply_pending = False
+        self._l2_apply = layer2_apply if layer2_apply is not None else Layer2ApplyTracker()
         self.on_continuity_tasks: Callable[[tuple[str, ...]], None] | None = None  # owner thread
         self._wire_stores(store, policy, writer_epoch)
         if recover_pending_on_init:
@@ -593,7 +594,6 @@ class KernelBridge(KernelBlobStagePort):
             return ack
         finally:
             # ingest's transaction is closed here; a failed apply is retried on the next batch
-            needed = bool(l2_recorded) or self._l2_apply_pending
-            self._l2_apply_pending = not apply_recorded_layer2(self._store, needed)
+            self._l2_apply.apply(self._store, bool(l2_recorded), quiet=True)
             if self._on_capture_gaps_changed is not None:
                 self._on_capture_gaps_changed(self._capture_store.has_gaps())

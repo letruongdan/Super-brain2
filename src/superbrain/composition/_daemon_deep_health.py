@@ -116,10 +116,10 @@ def historical_codes(run_doc: dict[str, JsonValue]) -> tuple[str, ...]:
     return tuple(c for c in map(str, cast(list[object], stored)) if c not in _LIVE_CODES)
 
 
-def _live_layer2_degraded(rt: Runtime) -> bool:
+def _live_layer2_degraded(rt: Runtime, host_version_resolver: Callable[[str], str | None] | None) -> bool:
     """Doctor ``harness.layer2`` WARN, read live: terminal not eligible for a connected non-CLI harness, or a
     VERIFIED harness whose checkout config changed on disk since (read-only; the next live check records it)."""
-    if layer2_drift_detected(rt.policy, os_=rt.os_):
+    if layer2_drift_detected(rt.policy, os_=rt.os_, host_version_resolver=host_version_resolver):
         return True
     snap = rt.policy.snapshot()
     machines = {
@@ -140,13 +140,16 @@ def render_deep_health(
     now: datetime,
     tls_not_after: datetime,
     clock_untrusted_fn: Callable[[], bool],
+    host_version_resolver: Callable[[str], str | None] | None = None,
 ) -> dict[str, JsonValue]:
     """Render ``get_health(deep=True)`` from CAS descriptor & live policy/quarantine/clock/capture-gap checks."""
     # live like clock trust: a gap opened after the latest DoctorRun must still show (SP2-5 deep health contract)
     gaps_now = KernelCaptureStore(rt.store).has_gaps() if rt.store.schema_version >= 6 else False
-    l2_now = (_m._LAYER2_CHECK_CODE,) if _live_layer2_degraded(rt) else ()
+    l2_now = (_m._LAYER2_CHECK_CODE,) if _live_layer2_degraded(rt, host_version_resolver) else ()
     if result.refs and result.refs[0].kind == "health_result":
-        # a result stored by the SP2-5 deep-health producer (before the SP1-I4 merge): same live codes, no run
+        # a result stored by the SP2-5 deep-health producer (before the SP1-I4 merge): the stored object must still
+        # be readable and not quarantined, as before; the answer then carries the same live codes, no run
+        _require_stored_health_result(rt, result, now=now)
         return _live_only(rt, now=now, tls_not_after=tls_not_after, clock_untrusted_fn=clock_untrusted_fn,
                           gaps_now=gaps_now, l2_now=l2_now, job_id=None)
     desc_ref: ObjectRef | None = None
@@ -244,6 +247,20 @@ def render_deep_health(
 
     return _live_only(rt, now=now, tls_not_after=tls_not_after, clock_untrusted_fn=clock_untrusted_fn,
                       gaps_now=gaps_now, l2_now=l2_now, job_id=job_id)
+
+
+def _require_stored_health_result(rt: Runtime, result: StoredResult, *, now: datetime) -> None:
+    ref = result.refs[0]
+    if rt.policy.is_quarantined(ref.digest):
+        raise BrainError(ErrorCode.QUARANTINED, "quarantined")
+    now_utc, _ = require_aware_utc(now)
+    with rt.store.transaction() as txn:
+        blob = read_held_blob_or_none(txn.db, rt.store.cas, rt.policy, ref.digest, holder_kind="event",
+                                      holder_id=result.result_id, now=now_utc)
+    if blob is None:
+        raise BrainError(ErrorCode.NOT_FOUND, "not found")
+    if not isinstance(parse_json(blob), dict):
+        raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
 
 
 def _live_only(

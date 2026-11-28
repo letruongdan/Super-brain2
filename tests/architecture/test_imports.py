@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import ast
-import warnings
 from collections.abc import Iterator, Mapping
 from pathlib import Path
 
@@ -177,9 +176,9 @@ def test_package_graph_is_acyclic() -> None:
     assert find_package_cycles(SRC / "superbrain") == []
 
 
-def test_report_files_over_600_lines() -> None:
-    for path, count in files_over(SRC, 600):
-        warnings.warn(f"{path} has {count} lines (>600)", stacklevel=1)
+def test_no_src_file_is_over_600_lines() -> None:
+    # owner rule (2026-11-23): every src/ file stays within 600 lines; a warning let an over-long file pass the gate
+    assert [(str(path), count) for path, count in files_over(SRC, 600)] == []
 
 
 def test_checker_detects_cycle_between_packages_in_one_layer(tmp_path: Path) -> None:

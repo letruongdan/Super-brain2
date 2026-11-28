@@ -20,9 +20,9 @@ from superbrain.ports.capture import (
     CaptureStorePort,
     ProducerCaptureGap,
     StagedCaptureEvent,
-    fallback_gap_id,
     require_capture_sequence,
 )
+from superbrain.ports.capture_slots import fallback_gap_id
 from superbrain.storage.errors import sqlite_error
 from superbrain.storage.kinds import RetentionClass
 from superbrain.storage.store import Store
@@ -120,8 +120,10 @@ def _gap_replay_is_dedup(
     identity, stored_repo, stored_checkout = stored
     if identity == _gap_identity(gap):
         return True
+    slot_id = fallback_gap_id(gap.producer_stream, gap.sequence)
     return (
-        gap.gap_id == fallback_gap_id(gap.producer_stream, gap.sequence)
+        gap.gap_id == slot_id
+        and identity[0] != slot_id  # the stored gap is an earlier binary's random id, never one of ours
         and (stored_repo, stored_checkout) == (repo_id, checkout_id)
     )
 

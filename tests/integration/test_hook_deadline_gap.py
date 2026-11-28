@@ -63,6 +63,8 @@ def _run_main(
         raise SystemExit(code)
 
     monkeypatch.setattr(hook_entry, "HOOK_HARD_CAP_NS", _CAP_NS)
+    # the simulated slow gap write spends 0.2 s of the reserve; the real one (macOS F_FULLFSYNC) still needs room
+    monkeypatch.setattr(hook_entry, "_GAP_RESERVE_NS", 500_000_000)
     monkeypatch.setattr(hook_entry, "_hard_exit", _fake_exit)
     monkeypatch.setattr(hook_entry, "_make_spool", lambda d, _f: _StallingSpool(d, permissions=perms))
     monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(_event_stdin())))
@@ -115,3 +117,48 @@ def test_a_slow_diagnostic_log_cannot_spend_the_capture_gap_reserve(
     assert seen["rc"] == 0
     gaps = seen["gap_at_exit"] if seen["exit_called"] else seen["gaps_after"]
     assert gaps is not None and len(gaps) == 1, seen  # the gap is written before the log, not after it
+
+
+_SLOW_START = (
+    "import time, runpy, sys\n"
+    "time.sleep(1.0)  # a cold interpreter start: the host has been waiting since the spawn\n"
+    "sys.argv = ['hook_entry', '--outbox', sys.argv[1], '--log', sys.argv[2], '--harness', 'claude-code']\n"
+    "runpy.run_module('superbrain.composition.hook_entry', run_name='__main__')\n"
+)
+
+
+def test_the_hard_cap_is_counted_from_the_hosts_spawn(trusted_tmp: Path) -> None:
+    import subprocess
+
+    from superbrain.adapters.os.process_start import process_start_monotonic_ns
+
+    if process_start_monotonic_ns() is None:
+        pytest.skip("this OS does not report the process creation time; the cap then counts from module entry")
+    t0 = time.monotonic()
+    proc = subprocess.Popen(
+        [sys.executable, "-I", "-c", _SLOW_START, str(trusted_tmp / "outbox"), str(trusted_tmp / "hook.log")],
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+    )
+    try:
+        assert proc.stdin is not None
+        proc.stdin.write(b'{"partial": ')  # never EOF: only the watchdog ends the hook
+        proc.stdin.flush()
+        rc = proc.wait(timeout=10.0)
+        elapsed = time.monotonic() - t0
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+    assert rc == 0
+    assert elapsed < 2.6, f"the host waited {elapsed:.2f} s although the cap is 2 s from its spawn"
+
+
+def test_process_start_is_before_now_and_recent() -> None:
+    from superbrain.adapters.os.process_start import process_start_monotonic_ns
+
+    start = process_start_monotonic_ns()
+    if sys.platform in ("win32", "darwin") or sys.platform.startswith("linux"):
+        assert start is not None
+    if start is not None:
+        now = time.monotonic_ns()
+        assert now - 24 * 3600 * 10**9 < start <= now

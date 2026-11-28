@@ -283,3 +283,28 @@ def test_fallback_adopts_a_pending_gap_an_earlier_binary_wrote_for_the_slot(trus
     _fallback(OutboxSpool(root, permissions=perms), stream, dk, duration=43)
     after_ack = _frames(spool, stream)
     assert after_ack == [] or [(k, s, i) for k, s, i, _d in after_ack] == [("capture_gap", 1, "gap-legacy-random-1")]
+
+
+def test_adopting_a_pending_gap_runs_the_replay_durability_barrier(
+    trusted_tmp: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A visible gap frame whose directory sync may have failed is only reported after the same barrier a replay
+    through enqueue_gap runs (stream metadata synced)."""
+    from superbrain.ports.capture import ProducerCaptureGap
+    from superbrain.storage import _outbox_seq
+
+    perms = os_adapters().permissions
+    root = trusted_tmp / "outbox-slot-adopt-barrier"
+    stream = "s-slot-adopt-barrier"
+    spool = OutboxSpool(root, permissions=perms)
+    spool.enqueue_gap(ProducerCaptureGap(gap_id="gap-legacy-random-9", producer_stream=stream, sequence=1,
+                                         reason="hook_timeout", recorded_at=_AT, estimated_count=1, duration_ms=1))
+    synced: list[Path] = []
+    real_sync = _outbox_seq.sync_stream_metadata
+    def _spy(stream_dir: Path) -> None:
+        synced.append(Path(stream_dir))
+        real_sync(stream_dir)
+
+    monkeypatch.setattr(_outbox_seq, "sync_stream_metadata", _spy)
+    assert _fallback(OutboxSpool(root, permissions=perms), stream, None, seq=1) == "gap-legacy-random-9"
+    assert synced, "the adopted gap was reported without the replay barrier"

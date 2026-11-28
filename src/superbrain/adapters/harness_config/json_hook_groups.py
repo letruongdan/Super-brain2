@@ -21,10 +21,19 @@ from superbrain.ports.proposals import MergeOutput
 HOOK_GROUPS_SLICE = "hooks#super-brain"
 _HOOK_MODULE = "superbrain.composition.hook_entry"
 _QUOTE = '"'
+_HOOK_HARNESSES = frozenset({"claude-code", "codex"})
 
 
 def _argv_runs_hook(argv: Sequence[object]) -> bool:
-    return any(argv[i] == "-m" and argv[i + 1] == _HOOK_MODULE for i in range(len(argv) - 1))
+    """The exact shape ``build_capture_hook_command`` produces: ``<python> -I -m <hook> --outbox <dir> ... --harness
+    <id>``. A command that merely contains the module name (``echo -m superbrain...``) is not ours."""
+    if len(argv) < 8 or not all(isinstance(a, str) for a in argv):
+        return False
+    exe = str(argv[0]).replace("\\", "/").rsplit("/", 1)[-1].lower()
+    if not exe.startswith("python") or list(argv[1:5]) != ["-I", "-m", _HOOK_MODULE, "--outbox"]:
+        return False
+    flags = list(argv[4:])
+    return "--harness" in flags[:-1] and flags[flags.index("--harness") + 1] in _HOOK_HARNESSES
 
 
 def _tokens(command: object, *, posix: bool) -> list[str]:
@@ -42,11 +51,11 @@ def is_managed_handler(handler: object) -> bool:
     if not isinstance(handler, Mapping):
         return False
     args = handler.get("args")
-    if isinstance(args, list) and _argv_runs_hook([handler.get("command"), *args]):
-        return True
-    return _argv_runs_hook(_tokens(handler.get("command"), posix=True)) or any(
-        _argv_runs_hook(_tokens(handler.get(field), posix=False)) for field in ("commandWindows", "command_windows")
-    )
+    if isinstance(args, list):  # Claude exec form
+        return _argv_runs_hook([handler.get("command"), *args])
+    # Codex: every command field present must be ours, or the handler (partly the user's) is left alone
+    fields = [(f, handler[f]) for f in ("command", "commandWindows", "command_windows") if f in handler]
+    return bool(fields) and all(_argv_runs_hook(_tokens(v, posix=f == "command")) for f, v in fields)
 
 
 def is_managed_group(group: object) -> bool:
@@ -148,8 +157,24 @@ def _set_key_path(doc: dict[str, Any], part: str, value: object) -> None:
     cursor[key_path[-1]] = value
 
 
+def verify_legacy_slice(existing_text: str | None, *, parts: Sequence[str], expected_digest: str) -> None:
+    """Prove the key paths an earlier bootstrap applied as one slice still hold exactly what it recorded (its stored
+    digest); anything else is the user's and the upgrade is a conflict."""
+    doc = _parse_json_root(existing_text) if existing_text is not None else {}
+    current: dict[str, JsonValue] = {}
+    for part in parts:
+        present, value = _current_part(doc, part)
+        if not present:
+            raise revision_conflict("legacy managed slice is missing")
+        current[part] = value
+    recorded = current[parts[0]] if len(parts) == 1 else current
+    if digest_json_value(recorded) != expected_digest:
+        raise revision_conflict("legacy managed slice modified out-of-band")
+
+
 def merge_json_slices(
     existing_text: str | None, *, entries: Sequence[tuple[str, JsonValue]], expected_slice_digest: str | None,
+    adopt_existing: bool = False,
 ) -> MergeOutput:
     """Insert or update one combined managed slice made of key paths and/or ``hooks#super-brain``. A key path that
     exists without an expected digest is an unmanaged collision; managed hook groups are recognised by their hook."""
@@ -162,7 +187,7 @@ def merge_json_slices(
     for part, _value in entries:
         present, value = _current_part(doc, part)
         if present:
-            if expected_slice_digest is None and part != HOOK_GROUPS_SLICE:
+            if expected_slice_digest is None and part != HOOK_GROUPS_SLICE and not adopt_existing:
                 raise revision_conflict("unmanaged collision on existing JSON key")
             current[part] = value
         else:

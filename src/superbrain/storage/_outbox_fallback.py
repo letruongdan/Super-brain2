@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.ports.capture import OUTBOX_RECORD_GAP, ProducerCaptureGap, default_outbox_dir_renamer
-from superbrain.ports.capture import fallback_gap_id as fallback_gap_id
+from superbrain.ports.capture_slots import fallback_gap_id as fallback_gap_id
 from superbrain.storage import _outbox_io as _io
 from superbrain.storage import _outbox_seq as _seq
 from superbrain.storage._outbox_bindings import (
@@ -86,7 +86,10 @@ def enqueue_fallback_gap(
                                         cached.payload_digest if cached else None, stamp)
             reserved = _reserve_slot(spool, sdir, binding, new_key=cached is None, check=dl_check)
         if adopted is not None:
-            gap_id = adopted[0]  # that gap is already pending for the slot: keep it, publish nothing new
+            # that gap is already pending for the slot: keep it, publish nothing new, but report it only after the
+            # barrier a replay through enqueue_gap runs (its directory sync may have failed before)
+            _seq.sync_stream_metadata(sdir)
+            gap_id = adopted[0]
         else:
             gap = ProducerCaptureGap(gap_id=stamp[0], producer_stream=producer_stream, sequence=seq, reason=stamp[1],
                                      recorded_at=stamp[2], estimated_count=1, duration_ms=stamp[3])

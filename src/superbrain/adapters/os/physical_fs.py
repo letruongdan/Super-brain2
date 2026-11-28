@@ -327,6 +327,21 @@ def stat_physical_identity(path: Path) -> PhysicalObjectId | None:
 _POSIX_APPEND_LOCK_OFFSET = 1_073_741_824  # 1 GiB sentinel range for whole-record POSIX lockf
 
 
+def _single_unlocked_append(fd: int, path: Path, data: bytes) -> None:
+    while True:
+        try:
+            n = os.write(fd, data)
+            break
+        except OSError as err:
+            if err.errno == errno.EINTR:
+                continue
+            if err.errno in (errno.ENOSPC, errno.EDQUOT):
+                raise BrainError(ErrorCode.STORAGE_FULL, "storage full") from err
+            raise BrainError(ErrorCode.IO_ERROR, f"cannot append to {path}: {err}") from err
+    if n != len(data):  # without the lock a partial record cannot be rolled back safely
+        raise BrainError(ErrorCode.IO_ERROR, f"short unlocked append to {path}")
+
+
 def _posix_atomic_append_no_follow(path: Path, data: bytes, *, timeout_ns: int) -> None:
     fcntl: Any = importlib.import_module("fcntl")
 
@@ -365,8 +380,13 @@ def _posix_atomic_append_no_follow(path: Path, data: bytes, *, timeout_ns: int) 
                 if err.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
                     raise BrainError(ErrorCode.IO_ERROR, f"cannot lock {path} for atomic append: {err}") from err
             if time.monotonic_ns() >= deadline_ns:
-                raise BrainError(ErrorCode.IO_ERROR, f"timed out locking {path} for atomic append")
+                # macOS: a whole-file flock (the outbox lock) can block this lockf for as long as it is held. Never drop
+                # the record: one O_APPEND write is atomic for a regular file, without the lock.
+                break
             time.sleep(_APPEND_LOCK_POLL_S)
+        if not locked:
+            _single_unlocked_append(fd, path, data)
+            return
 
         initial_size = os.fstat(fd).st_size
         view = memoryview(data)

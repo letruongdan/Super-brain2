@@ -157,9 +157,9 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
         claim_guard: Callable[[], bool] | None = None,
         fix_hooks: DoctorFixHooks | None = None,
         sp2_probe: Callable[[Path, Path | None], Sp2DoctorReport] | None = None,
+        host_version_resolver: Callable[[str], str | None] | None = None,
     ) -> None:
-        self._rt = rt
-        self._sp2_probe = sp2_probe
+        self._rt, self._sp2_probe, self._hv_resolver = rt, sp2_probe, host_version_resolver
         self._job_store = job_store
         self._job_service = job_service
         self._adapters = adapters
@@ -593,4 +593,5 @@ class DaemonDoctorRunner(DoctorOperatorHandler):
         return render_deep_health(
             self._rt, self._job_store, result, principal, now=self._clock.now(),
             tls_not_after=self._tls_not_after, clock_untrusted_fn=self._clock_untrusted_fn,
+            host_version_resolver=self._hv_resolver,
         )

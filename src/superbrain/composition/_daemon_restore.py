@@ -23,6 +23,7 @@ from superbrain.application.maintenance import (
 from superbrain.application.review_apply import ReviewApplyService
 from superbrain.composition._daemon_session import _AdmittedOwnerSession, _DaemonCompositeDomain
 from superbrain.composition._endpoint import publish_endpoint
+from superbrain.composition._layer2_live import Layer2ApplyTracker
 from superbrain.composition._maintenance_wiring import ensure_maintenance_backend
 from superbrain.composition.kernel_projections import kernel_store_extensions
 from superbrain.core._kernel_approval import ApprovalChannel, ApprovalMessage, canonical_utc
@@ -143,6 +144,7 @@ class DaemonRestoreHandler(RestoreHandler):
         operator: OperatorHandle,
         review_apply_cls: type[ReviewApplyService] = ReviewApplyService,
         seen_configured_layer2: set[tuple[str, str]] | None = None,
+        layer2_apply: Layer2ApplyTracker | None = None,
         host_version_resolver: Callable[[str], str | None] | None = None,
     ) -> None:
         self._session = session
@@ -155,6 +157,7 @@ class DaemonRestoreHandler(RestoreHandler):
         self._operator = operator
         self._review_apply_cls = review_apply_cls
         self._seen_configured_layer2 = seen_configured_layer2
+        self._layer2_apply = layer2_apply
 
     def preview(self, target: Literal["store", "policy"], backup: Path) -> dict[str, JsonValue]:
         rt = self._session.rt
@@ -425,6 +428,7 @@ class DaemonRestoreHandler(RestoreHandler):
                     os_=self._adapters,
                     host_version_resolver=self._host_version_resolver,
                     seen_configured=self._seen_configured_layer2,
+                    apply_tracker=self._layer2_apply,
                 ),
             )
         return job_service

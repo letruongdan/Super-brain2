@@ -202,9 +202,10 @@ def _open_owner_session(
                 session_box[0].record_request_drained()
 
         from superbrain.adapters.harness.host_version import probe_installed_host_version
-        from superbrain.composition._layer2_live import reconcile_live_layer2_all
+        from superbrain.composition._layer2_live import Layer2ApplyTracker, reconcile_live_layer2_all
 
         seen_configured_layer2: set[tuple[str, str]] = set()
+        l2_apply = Layer2ApplyTracker()  # one per daemon: capture, approval checks and restore share it
         resolved_hv_resolver = (
             hooks.host_version_resolver if hooks.host_version_resolver is not None else probe_installed_host_version
         )
@@ -226,10 +227,11 @@ def _open_owner_session(
             on_clock_untrusted_changed=auth_gate.update_clock_untrusted,
             on_capture_gaps_changed=auth_gate.update_capture_gaps_present, os_=adapters,
             host_version_resolver=resolved_hv_resolver, seen_configured_layer2=seen_configured_layer2,
+            layer2_apply=l2_apply,
         )
         reconcile_live_layer2_all(
             rt.policy, store=rt.store, os_=adapters, host_version_resolver=resolved_hv_resolver,
-            seen_configured=seen_configured_layer2,
+            seen_configured=seen_configured_layer2, apply_tracker=l2_apply,
         )
         bridge.recover_pending_send_attempts()
 
@@ -306,6 +308,7 @@ def _open_owner_session(
             wake_owner=owner_wake,
             claim_guard=lambda: not session_box or session_box[0].doctor_claim_guard(),
             fix_hooks=doctor_fix_hooks,
+            host_version_resolver=resolved_hv_resolver,
             sp2_probe=lambda data_root, checkout: run_sp2_doctor_probes(
                 data_root, checkout_root=checkout, host_version_resolver=resolved_hv_resolver, os_=adapters
             ),
@@ -349,6 +352,7 @@ def _open_owner_session(
                 session=session, adapters=adapters, clock=resolved_clock, executor=executor,
                 composite_domain=composite_domain, instance_id=instance_id, operator=operator,
                 review_apply_cls=ReviewApplyService, seen_configured_layer2=seen_configured_layer2,
+                layer2_apply=l2_apply,
                 host_version_resolver=resolved_hv_resolver,
             )
             operator.bind(
@@ -364,6 +368,7 @@ def _open_owner_session(
                     live_layer2_check=lambda: reconcile_live_layer2_all(
                         session.rt.policy, store=session.rt.store, os_=adapters,
                         host_version_resolver=resolved_hv_resolver, seen_configured=seen_configured_layer2,
+                        apply_tracker=l2_apply,
                     ),
                 )
             )

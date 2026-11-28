@@ -331,5 +331,16 @@ def _hard_exit(code: int) -> None:
     os._exit(code)
 
 
+def _entry_start_ns() -> int:
+    """The host's spawn time when the OS reports it (interpreter start-up counts against the cap), else module entry;
+    never earlier than one cap before module entry, so an odd clock cannot make the hook give up at once."""
+    from superbrain.adapters.os.process_start import process_start_monotonic_ns
+
+    spawned = process_start_monotonic_ns()
+    if spawned is None:
+        return _PROCESS_T0_NS
+    return max(min(spawned, _PROCESS_T0_NS), _PROCESS_T0_NS - HOOK_HARD_CAP_NS)
+
+
 if __name__ == "__main__":
-    raise SystemExit(main(start_ns=_PROCESS_T0_NS))
+    raise SystemExit(main(start_ns=_entry_start_ns()))

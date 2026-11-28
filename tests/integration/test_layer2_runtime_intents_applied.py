@@ -174,3 +174,33 @@ def test_a_failed_downgrade_apply_is_retried_while_the_daemon_serves(
         settled = calls[0]
         assert _post(3, {}) == 1
         assert calls[0] == settled  # nothing pending: a clean batch never pays the O(intents) reconcile
+
+
+def test_a_failed_apply_on_the_approval_path_is_retried_by_the_next_check_on_any_path(
+    trusted_tmp: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from superbrain.composition._layer2_live import Layer2ApplyTracker
+
+    env = _verified_store(trusted_tmp, monkeypatch)
+    settings = env["chk"] / ".claude" / "settings.local.json"
+    settings.write_bytes(settings.read_bytes().replace(b'"hooks"', b'"theme":"dark","hooks"', 1))
+    real_reconcile = Store.reconcile_policy
+    failures = [1]
+
+    def _busy_once(self: Store) -> int:
+        if failures[0]:
+            failures[0] -= 1
+            raise BrainError(ErrorCode.STORE_BUSY, "store busy")
+        return real_reconcile(self)
+
+    tracker = Layer2ApplyTracker()  # one per daemon, shared by capture, approval checks and restore
+    rt = reopen_kernel_job_runtime(env["data_root"], env["rep"].store_id, env["os_"])
+    monkeypatch.setattr(Store, "reconcile_policy", _busy_once)  # after open: the open itself reconciles
+    try:
+        with pytest.raises(BrainError):  # the approval check records the downgrade, then the apply hits a busy store
+            reconcile_live_layer2_all(rt.policy, store=rt.store, os_=env["os_"], apply_tracker=tracker)
+        assert _unapplied(rt) == ["layer2_state_set"]
+        reconcile_live_layer2_all(rt.policy, store=rt.store, os_=env["os_"], apply_tracker=tracker)  # nothing new
+        assert _unapplied(rt) == []
+    finally:
+        rt.close()

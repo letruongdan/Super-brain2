@@ -25,8 +25,8 @@ from superbrain.ports.capture import (
     CaptureEventRecord,
     ProducerCaptureGap,
     StagedCaptureEvent,
-    fallback_gap_id,
 )
+from superbrain.ports.capture_slots import fallback_gap_id
 from superbrain.storage.capture_events import KernelCaptureStore
 from superbrain.storage.runtime import Runtime
 from tests.storage.test_outbox_r10_ack_durability import _repo_root_with_36bf08d9
@@ -143,13 +143,16 @@ def test_upgrade_replays_a_slot_derived_gap_onto_an_acked_legacy_gap(trusted_tmp
         rt.close()
 
 
-@pytest.mark.parametrize("variant", ["random-id", "other-checkout"])
+@pytest.mark.parametrize("variant", ["random-id", "other-checkout", "slot-derived-stored-other-reason"])
 def test_other_gap_mismatches_at_a_committed_slot_stay_conflicts(trusted_tmp: Path, variant: str) -> None:
     rt = open_kernel_job_runtime(trusted_tmp / "store", os_adapters())
     try:
-        _commit(rt, gaps=(_gap("gap-legacy-random-1"),))
+        stored_id = fallback_gap_id(_STREAM, 1) if variant.startswith("slot-derived") else "gap-legacy-random-1"
+        _commit(rt, gaps=(_gap(stored_id),))
         with pytest.raises(BrainError) as err:
-            if variant == "random-id":  # not a slot-derived fallback: identity mismatch is still a conflict
+            if variant == "slot-derived-stored-other-reason":  # the stored gap is not legacy: no exception applies
+                _commit(rt, gaps=(_gap(fallback_gap_id(_STREAM, 1), reason="outbox_full"),))
+            elif variant == "random-id":  # not a slot-derived fallback: identity mismatch is still a conflict
                 _commit(rt, gaps=(_gap("gap-another-random-2"),))
             else:  # slot-derived, but another checkout's scope
                 _commit(rt, gaps=(_gap(fallback_gap_id(_STREAM, 1)),), checkout_id="chk-someone-else")

@@ -293,6 +293,24 @@ def _managed_hook_groups(
     return {event: [{"matcher": "*", "hooks": [handler]}] for event in MANAGED_HOOK_EVENTS}
 
 
+def _adopt_legacy(
+    existing_text: str | None,
+    expected_slice_digests: Mapping[tuple[str, str], str] | None,
+    rel_path: str,
+    legacy_slice_id: str,
+    parts: tuple[str, ...],
+) -> bool:
+    """``True`` when an earlier bootstrap's slice is on record and still holds exactly what it applied (verified by
+    its stored digest; a mismatch raises a conflict); ``False`` when there is no such record."""
+    from superbrain.adapters.harness_config.json_hook_groups import verify_legacy_slice
+
+    legacy = _expected_digest(expected_slice_digests, rel_path, legacy_slice_id)
+    if legacy is None:
+        return False
+    verify_legacy_slice(existing_text, parts=parts, expected_digest=legacy)
+    return True
+
+
 def _expected_digest(
     expected_slice_digests: Mapping[tuple[str, str], str] | None,
     rel_path: str,
@@ -329,10 +347,16 @@ def plan_claude_bootstrap(
     ask_rules = [f"Bash({cmd} *)" for cmd in AUTHORITY_ASK_COMMANDS]
     hook_groups = _managed_hook_groups(profile_path, harness_id="claude-code", checkout_root=checkout_root)
     settings_slice = f"permissions.ask,{HOOK_GROUPS_SLICE}"
+    settings_text = _read_existing(checkout_root, ".claude", "settings.local.json")
+    settings_expected = _expected_digest(expected_slice_digests, ".claude/settings.local.json", settings_slice)
     settings_merge = merge_json_slices(
-        _read_existing(checkout_root, ".claude", "settings.local.json"),
+        settings_text,
         entries=[("permissions.ask", list(ask_rules)), (HOOK_GROUPS_SLICE, hook_groups)],
-        expected_slice_digest=_expected_digest(expected_slice_digests, ".claude/settings.local.json", settings_slice),
+        expected_slice_digest=settings_expected,
+        adopt_existing=settings_expected is None and _adopt_legacy(
+            settings_text, expected_slice_digests, ".claude/settings.local.json",
+            "permissions.ask,hooks.PreToolUse", ("permissions.ask", "hooks.PreToolUse"),
+        ),
     )
     return BootstrapPlan(
         harness_id="claude-code",
@@ -390,11 +414,16 @@ def plan_codex_bootstrap(
             expected_slice_digests, ".codex/config.toml", "mcp_servers.super-brain"
         ),
     )
+    hooks_text = _read_existing(checkout_root, ".codex", "hooks.json")
+    hooks_expected = _expected_digest(expected_slice_digests, ".codex/hooks.json", HOOK_GROUPS_SLICE)
+    if hooks_expected is None:  # a stored legacy digest must still match before its object is upgraded
+        _adopt_legacy(hooks_text, expected_slice_digests, ".codex/hooks.json", "hooks.PreToolUse",
+                      ("hooks.PreToolUse",))
     hooks_merge = merge_json_slices(
-        _read_existing(checkout_root, ".codex", "hooks.json"),
+        hooks_text,
         entries=[(HOOK_GROUPS_SLICE, _managed_hook_groups(profile_path, harness_id="codex",
                                                           checkout_root=checkout_root))],
-        expected_slice_digest=_expected_digest(expected_slice_digests, ".codex/hooks.json", HOOK_GROUPS_SLICE),
+        expected_slice_digest=hooks_expected,
     )
     return BootstrapPlan(
         harness_id="codex",

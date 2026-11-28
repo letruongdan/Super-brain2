@@ -188,7 +188,8 @@ def test_a_user_handler_sharing_the_capture_handlers_group_survives_replan_and_r
 def test_a_command_that_only_mentions_the_hook_module_is_not_managed() -> None:
     mention = {"matcher": "Bash", "hooks": [{"type": "command", "command": "echo superbrain.composition.hook_entry"}]}
     runs = {"matcher": "*", "hooks": [{"type": "command", "command": "python",
-                                       "args": ["-I", "-m", "superbrain.composition.hook_entry", "--outbox", "x"]}]}
+                                       "args": ["-I", "-m", "superbrain.composition.hook_entry", "--outbox", "x",
+                                                "--harness", "claude-code"]}]}
     assert not is_managed_group(mention)
     assert is_managed_group(runs)
 
@@ -200,3 +201,47 @@ def test_a_codex_checkout_with_the_legacy_hook_object_upgrades_to_matcher_groups
     doc = _preview(plan_codex_bootstrap(checkout_root=chk, profile_path=prof), ".codex/hooks.json")
     handlers = _validate(doc, _CODEX_EVENTS, _CODEX_HANDLER)
     assert handlers and "super_brain" not in json.dumps(doc["hooks"])
+
+
+def _legacy_applied_claude(chk: Path, prof: Path) -> tuple[Path, dict[tuple[str, str], str]]:
+    """The settings file and the stored slice digest an earlier, fully applied Claude bootstrap left behind."""
+    from superbrain.adapters.harness_config._common import digest_json_value
+
+    ask: list[Any] = [f"Bash({cmd} *)" for cmd in ("brain review", "brain restore")]
+    legacy = _legacy_object(chk, prof)
+    settings = chk / ".claude" / "settings.local.json"
+    _write(settings, json.dumps({"permissions": {"ask": ask}, "hooks": {"PreToolUse": legacy}}))
+    digest = digest_json_value({"permissions.ask": ask, "hooks.PreToolUse": legacy})
+    return settings, {(".claude/settings.local.json", "permissions.ask,hooks.PreToolUse"): digest}
+
+
+def test_a_fully_applied_legacy_claude_bootstrap_upgrades_with_its_stored_digest(trusted_tmp: Path) -> None:
+    chk, prof = _checkout(trusted_tmp, "chk-legacy-applied")
+    _settings, stored = _legacy_applied_claude(chk, prof)
+    doc = _preview(plan_claude_bootstrap(checkout_root=chk, profile_path=prof, expected_slice_digests=stored),
+                   ".claude/settings.local.json")
+    assert _validate(doc, _CLAUDE_EVENTS, _CLAUDE_HANDLER)
+    assert "super_brain" not in json.dumps(doc["hooks"])
+
+
+def test_a_drifted_legacy_claude_bootstrap_is_a_conflict(trusted_tmp: Path) -> None:
+    chk, prof = _checkout(trusted_tmp, "chk-legacy-drifted")
+    settings, stored = _legacy_applied_claude(chk, prof)
+    doc = json.loads(settings.read_text(encoding="utf-8"))
+    doc["permissions"]["ask"].append("Bash(rm *)")  # edited after the legacy apply
+    _write(settings, json.dumps(doc))
+    with pytest.raises(BrainError) as err:
+        plan_claude_bootstrap(checkout_root=chk, profile_path=prof, expected_slice_digests=stored)
+    assert err.value.code is ErrorCode.REVISION_CONFLICT
+
+
+def test_handlers_that_only_imitate_the_hook_or_mix_owners_are_not_managed() -> None:
+    from superbrain.adapters.harness_config.json_hook_groups import is_managed_handler
+
+    ours = ["C:/py/python.exe", "-I", "-m", "superbrain.composition.hook_entry", "--outbox", "o", "--harness", "codex"]
+    assert is_managed_handler({"type": "command", "command": ours[0], "args": ours[1:]})
+    echo = ["echo", *ours[1:]]
+    assert not is_managed_handler({"type": "command", "command": "echo", "args": echo[1:]})
+    assert not is_managed_handler({"type": "command", "command": "echo -m superbrain.composition.hook_entry"})
+    mixed = {"type": "command", "command": shlex.join(ours), "commandWindows": "my-own-windows-hook.cmd"}
+    assert not is_managed_handler(mixed)  # one field belongs to the user: the handler is not ours to remove
