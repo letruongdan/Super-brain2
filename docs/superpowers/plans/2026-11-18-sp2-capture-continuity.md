@@ -237,6 +237,12 @@
 - [ ] **Step 2: Niêm phong test, triển khai hai adapter, `layer2_probe.py`, `doctor_probes_sp2.py` và chạy full gate tự động `< 300 s`**
   Triển khai các hàm đọc trạng thái outbox/gap/session/layer2 để nối vào `get_health(deep=true)` / `doctor`. Cân bằng shard trong `scripts/gate.py` (nếu cần, có reseal) và xác minh toàn bộ bộ test tự động đạt 0 fail/error/XPASS với `test_job_seconds < 300 s` (local Windows `< 275 s`).
   Run: `uv run --locked python scripts/gate.py --python 3.11 && uv run --locked python scripts/gate.py --python 3.14`
+
+  **Ngưỡng tạm toàn lượt full gate local sau tích hợp `main` (SP1-I4), ghi ngày 28/11/2026 trước lượt đo chính thức** (theo [chính sách ngân sách full gate](2026-11-10-super-brain2-parallel-development.md#ngân-sách-full-gate)):
+  - *Phạm vi:* hai lượt Windows local Python 3.11 và 3.14, 8 shard, chạy lần lượt, trên nhánh tích hợp `sp2-5-integration` (merge `5099ab2` và các commit sau trên nhánh này). Hosted giữ `< 300 s` mỗi ô.
+  - *Căn cứ:* full suite tuần tự tăng từ 725 s (`03fb4f5`, trước tích hợp) lên 1095 s sau khi nhận test I4 (`sp2-5-integration-fullsuite-4.log`); lượt chẩn đoán đủ inventory với `--time-budget-s 600` đo `test_job_seconds` 410,3 s (3.14) và 412,7 s (3.11) (`gate-int-5099ab2-diag600`). Lượt chẩn đoán này không là bằng chứng nghiệm thu.
+  - *Ngưỡng:* `--time-budget-s 420` cho mỗi lượt local, giống ngưỡng I4. Deadline trong test, assertion, inventory và yêu cầu 0 fail/error/XPASS giữ nguyên.
+  - *Mục tiêu quay lại:* `< 275 s` cho cả hai lượt local, ghi thành mục tối ưu riêng sau nghiệm thu.
   Expected: `accepted: true` trên cả hai interpreter, `test_job_seconds < 300.0`, 0 fail/error/XPASS.
 - [ ] **Step 3: Dựng và chạy bài diễn tập M1 có chủ dự án duyệt trên hai checkout nháp `A` và `B`**
   Sau khi có bootstrap của I3, mặt kiểm `doctor` tích hợp và chủ dự án phê duyệt lượt chạy native:
