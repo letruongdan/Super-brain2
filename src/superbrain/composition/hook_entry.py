@@ -97,6 +97,7 @@ def run_hook(
     normalized: CaptureEventRecord | ProducerCaptureGap | None = None
     slot_known = False  # True once ``normalized.sequence`` is the slot the spool assigned or the producer chose
     slot_dedup_key: str | None = None
+    slot_event_id: str | None = None  # the producer's own event_id, kept by a fallback reservation
     effective_raw_sid = raw_session_id
     try:
         if not isinstance(raw_bytes, bytes) or len(raw_bytes) > _MAX_STDIN_BYTES:
@@ -133,6 +134,7 @@ def run_hook(
                 _write_static_log(log_path, phase="hook_adapter", code=prep.skip_code or "unavailable")
                 return 0
             slot_dedup_key = prep.dedup_key
+            slot_event_id = prep.explicit_event_id
             if int(monotonic_ns()) >= work_deadline_ns:
                 normalized = prep.build_record(
                     prep.explicit_sequence if prep.explicit_sequence is not None else 1,
@@ -238,6 +240,7 @@ def run_hook(
                 written = spool.enqueue_fallback_gap(
                     producer_stream=event.producer_stream, sequence=event.sequence if slot_known else None,
                     dedup_key=slot_dedup_key, reason=reason, recorded_at=event.recorded_at, duration_ms=duration_ms,
+                    event_id=slot_event_id,
                     deadline_ns=hard_deadline_ns,
                 )
                 if written is None:

@@ -28,13 +28,14 @@ from superbrain.storage._outbox_io import (
     _O_NOFOLLOW,
     _PART_SUFFIX,
     _STREAMS_DIR,
-    _V4_FENCE_FILE,
+    GAP_STAMP_FENCE_VERSION,
     active_deadline_check,
     ensure_dir_tree_atomic,
     entry_is_link,
     is_link_path,
     replace_file_resilient,
     staging_cleanup_allowed,
+    streams_fence_version,
     sync_dir,
     unlink_before_deadline,
     verify_owner_only,
@@ -43,6 +44,7 @@ from superbrain.storage._outbox_io import (
 
 _BINDINGS_DIR = ".bindings"
 _BINDINGS_SCHEMA_VERSION = 3
+_GAP_BINDINGS_SCHEMA_VERSION = 4  # a bucket holding a gap-stamped row; 4e33772 reads schema 3 only
 _MAX_BUCKET_BYTES = 262_144
 DEFAULT_MAX_STREAM_BINDING_KEYS = 65_536
 
@@ -78,8 +80,10 @@ def _parse_gap_stamp(raw: object) -> tuple[str, str, str, int]:
     return raw[0], raw[1], require_iso_utc_timestamp(raw[2]), raw[3]
 
 
-def _is_fenced(stream_dir: Path) -> bool:
-    return stream_dir.parent.name == _STREAMS_DIR and os.path.lexists(stream_dir.parent / _V4_FENCE_FILE)
+def _gap_fenced(stream_dir: Path, perms: OutboxPermissionsPort) -> bool:
+    return stream_dir.parent.name == _STREAMS_DIR and (
+        streams_fence_version(stream_dir.parent, perms) >= GAP_STAMP_FENCE_VERSION
+    )
 
 
 def bucket_name_for_key(dedup_key: str) -> str:
@@ -174,7 +178,7 @@ def read_binding_bucket(
     if (
         not isinstance(obj, dict)
         or type(obj.get("schema_version")) is not int
-        or obj.get("schema_version") != _BINDINGS_SCHEMA_VERSION
+        or obj.get("schema_version") not in (_BINDINGS_SCHEMA_VERSION, _GAP_BINDINGS_SCHEMA_VERSION)
         or not isinstance(obj.get("entries"), list)
     ):
         raise BrainError(ErrorCode.INTEGRITY_FAILURE, "corrupt binding bucket schema")
@@ -237,7 +241,9 @@ def _merge_binding(entries: dict[str, HookBindingRecord], binding: HookBindingRe
 
 def _serialize_bucket(entries: dict[str, HookBindingRecord]) -> bytes:
     rows: list[JsonValue] = [binding_row(e) for _k, e in sorted(entries.items())]
-    payload = canonical_json({"schema_version": _BINDINGS_SCHEMA_VERSION, "entries": rows})
+    stamped = any(e.gap is not None for e in entries.values())
+    version = _GAP_BINDINGS_SCHEMA_VERSION if stamped else _BINDINGS_SCHEMA_VERSION
+    payload = canonical_json({"schema_version": version, "entries": rows})
     if len(payload) > _MAX_BUCKET_BYTES:
         raise BrainError(ErrorCode.STORAGE_FULL, "hook dedup binding bucket full")
     return payload
@@ -272,9 +278,9 @@ def prepare_binding_upsert(
         else read_binding_bucket(stream_dir, bucket_name, perms)
     )
     changed, added = _merge_binding(entries, binding)
-    if changed and any(e.gap is not None for e in entries.values()) and not _is_fenced(stream_dir):
-        # gap-stamped rows are a v4 format: the fence must stop the previous binary before it can read them
-        raise BrainError(ErrorCode.INTEGRITY_FAILURE, "slot reservation requires the v4 fence")
+    if changed and any(e.gap is not None for e in entries.values()) and not _gap_fenced(stream_dir, perms):
+        # gap-stamped rows: fence 5 must stop every earlier binary (4e33772 reads five-field rows) before they exist
+        raise BrainError(ErrorCode.INTEGRITY_FAILURE, "slot reservation requires the version 5 fence")
     return bucket_name, (_serialize_bucket(entries) if changed else None), added
 
 

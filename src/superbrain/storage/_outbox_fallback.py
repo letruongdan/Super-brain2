@@ -3,6 +3,8 @@ binding stamped with the gap identity, and publishes the gap (audit 2026-11-28 g
 
 from __future__ import annotations
 
+import json
+import os
 from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -38,7 +40,7 @@ def fallback_gap_id(producer_stream: str, sequence: int) -> str:
 
 def enqueue_fallback_gap(
     spool: OutboxSpool, *, producer_stream: str, sequence: int | None, dedup_key: str | None, reason: str,
-    recorded_at: str, duration_ms: int, deadline_ns: int | None,
+    recorded_at: str, duration_ms: int, deadline_ns: int | None, event_id: str | None = None,
 ) -> str | None:
     """See ``OutboxSpool.enqueue_fallback_gap``."""
     if not spool.root.exists():
@@ -60,7 +62,9 @@ def enqueue_fallback_gap(
         cached = (_seq.lookup_stream_binding_with_bucket(sdir, raw_cur, dedup_key, perms)[0]
                   if dedup_key is not None else None)
         if cached is not None:
-            if sequence is not None and sequence != cached.sequence:
+            if (sequence is not None and sequence != cached.sequence) or (
+                event_id is not None and event_id != cached.event_id
+            ):
                 raise BrainError(ErrorCode.IDEMPOTENCY_CONFLICT, "idempotency conflict")
             seq = cached.sequence
         elif sequence is not None:
@@ -73,18 +77,24 @@ def enqueue_fallback_gap(
             seq = max(compute_projected_hook_recovery(sdir, raw_cur, perms)[0].next_seq, max_seq + 1)
         if slot_holds_event(sdir, seq, perms):
             return None
-        stamp = (cached.gap if cached is not None and cached.gap is not None else
+        adopted = None if cached is not None and cached.gap is not None else _pending_gap_stamp(spool, sdir, seq)
+        stamp = (cached.gap if cached is not None and cached.gap is not None else adopted if adopted is not None else
                  (fallback_gap_id(producer_stream, seq), reason, cached.recorded_at if cached else recorded_at,
                   duration_ms))
         reserved = False
         if dedup_key is not None and (cached is None or cached.gap is None):
-            binding = HookBindingRecord(dedup_key, seq, cached.event_id if cached else allocate_event_id(dedup_key),
+            # the producer's own event_id when it gave one, as the hook path binds it (resolve_hook_envelope_slot)
+            new_id = event_id if event_id is not None else allocate_event_id(dedup_key)
+            binding = HookBindingRecord(dedup_key, seq, cached.event_id if cached else new_id,
                                         cached.recorded_at if cached else recorded_at,
                                         cached.payload_digest if cached else None, stamp)
             reserved = _reserve_slot(spool, sdir, binding, new_key=cached is None, check=dl_check)
-        gap = ProducerCaptureGap(gap_id=stamp[0], producer_stream=producer_stream, sequence=seq, reason=stamp[1],
-                                 recorded_at=stamp[2], estimated_count=1, duration_ms=stamp[3])
-        gap_id = spool.enqueue_gap(gap, deadline_ns=deadline_ns)
+        if adopted is not None:
+            gap_id = adopted[0]  # that gap is already pending for the slot: keep it, publish nothing new
+        else:
+            gap = ProducerCaptureGap(gap_id=stamp[0], producer_stream=producer_stream, sequence=seq, reason=stamp[1],
+                                     recorded_at=stamp[2], estimated_count=1, duration_ms=stamp[3])
+            gap_id = spool.enqueue_gap(gap, deadline_ns=deadline_ns)
         if reserved:
             try:
                 now = _seq.read_stream_cursor(sdir, perms)
@@ -94,6 +104,19 @@ def enqueue_fallback_gap(
                 if err.code not in DEFERRABLE_AFTER_PUBLISH:
                     raise
         return gap_id
+
+
+def _pending_gap_stamp(spool: OutboxSpool, sdir: Path, seq: int) -> tuple[str, str, str, int] | None:
+    """Identity of a gap frame already pending at ``seq`` (an earlier binary's random id), or ``None``."""
+    if not sdir.is_dir():
+        return None
+    suffix = f"_{OUTBOX_RECORD_GAP}_{seq:020d}{_io._FRAME_SUFFIX}"
+    with os.scandir(sdir) as it:
+        path = next((Path(e.path) for e in it if e.name.endswith(suffix)), None)
+    if path is None:
+        return None
+    gap = ProducerCaptureGap.from_dict(json.loads(spool._decode_frame_file(path).payload_json))
+    return gap.gap_id, gap.reason, gap.recorded_at, gap.duration_ms if gap.duration_ms is not None else 0
 
 
 def _reserve_slot(
@@ -110,8 +133,9 @@ def _reserve_slot(
     _io.ensure_dir_tree_atomic(streams_dir, perms, renamer, check_deadline=check)
     _io.ensure_dir_tree_atomic(sdir, perms, renamer, check_deadline=check)
     if not (streams_dir / _io._V4_FENCE_FILE).exists():
-        # gap-stamped bindings are a v4 format: the fence goes first so the previous binary refuses before reading
         _seq._publish_v4_fence(sdir, perms, renamer=renamer, check_deadline=check)
+    # gap-stamped rows: fence 5 goes first so every earlier binary (incl. v4 4e33772) refuses before reading them
+    _io.raise_fence_for_gap_stamps(streams_dir, perms, check_deadline=check)
     cursor = _seq.recover_stream_cursor(sdir, read_hook_cursor_readonly(sdir, perms), perms, renamer=renamer,
                                         check_deadline=check)
     try:

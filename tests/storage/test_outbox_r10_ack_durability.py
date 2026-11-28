@@ -370,7 +370,7 @@ def test_r10_f5_version_fence_blocks_legacy_writers_and_future_versions_pre_publ
     version_keys = [k for k, v in fence_obj.items() if type(v) is int and "version" in k]
     assert version_keys
     for k in version_keys:
-        fence_obj[k] = 5
+        fence_obj[k] = 6  # 5 is the gap-stamp fence now; 6 is still a future version
     future_fence_raw = canonical_json(fence_obj)
 
     for op_name in ("gap", "event", "hook", "ack"):
@@ -485,7 +485,7 @@ def test_r10_f8_read_pending_verifies_cursor_acks_and_v4_fence(trusted_tmp: Path
     _enqueue_hook(spool_b, stream=stream_b, dk=digest_bytes(b"r10-f8-b"))
     spool_b.apply_ack(_ack(stream_b, committed=(5_000,)))
     fence = next((outbox_b / _STREAMS_DIR).glob(".*fence*"))
-    fence.write_bytes(canonical_json({"schema_version": 5}))
+    fence.write_bytes(canonical_json({"schema_version": 6}))  # a future version (5 is the gap-stamp fence)
     perms.secure_file(fence)
     for filtered in (None, stream_b):
         with pytest.raises(BrainError) as err_f:

@@ -45,6 +45,10 @@ _PART_SUFFIX = ".part"
 _FRAME_SUFFIX = ".frame"
 _STREAMS_DIR = "streams"
 _V4_FENCE_FILE = ".v4_fence"
+# 4: v4 cursors and bindings. 5: binding rows may carry a gap stamp; 4e33772 parses five-field rows only and accepts
+# only 4, so publishing 5 makes it refuse the spool before any durable change (Codex review, finding 2).
+_FENCE_VERSIONS = (4, 5)
+GAP_STAMP_FENCE_VERSION = 5
 _LOCK_FILE = ".spool.lock"
 # Creation stages made by the spool carry this marker; a sweep removes only these (``.init-`` is any other writer's).
 _SPOOL_STAGE_MARKER = ".sbstage-"
@@ -374,7 +378,7 @@ def parse_verified_outbox_frame(raw: bytes) -> tuple[OutboxEntry, int]:
     return entry, nl_idx
 
 
-def verify_v4_fence_file(path: Path, perms: OutboxPermissionsPort) -> None:
+def verify_v4_fence_file(path: Path, perms: OutboxPermissionsPort) -> int:
     """Validate ``streams/.v4_fence`` is a link-free regular owner-only file at supported version <= 4."""
     if is_link_path(path):
         raise BrainError(ErrorCode.UNSAFE_PATH, "streams version fence is a link")
@@ -396,9 +400,16 @@ def verify_v4_fence_file(path: Path, perms: OutboxPermissionsPort) -> None:
         not isinstance(obj, dict)
         or set(obj.keys()) != {"schema_version"}
         or type(obj.get("schema_version")) is not int
-        or obj["schema_version"] != 4
+        or obj["schema_version"] not in _FENCE_VERSIONS
     ):
         raise BrainError(ErrorCode.INTEGRITY_FAILURE, "unsupported streams version fence")
+    return int(obj["schema_version"])
+
+
+def streams_fence_version(streams_dir: Path, perms: OutboxPermissionsPort) -> int:
+    """The published fence version of ``streams`` (``0`` when there is none)."""
+    fence = streams_dir / _V4_FENCE_FILE
+    return verify_v4_fence_file(fence, perms) if os.path.lexists(fence) else 0
 
 
 def is_v4_fence_part_name(name: str) -> bool:
@@ -439,12 +450,27 @@ def ensure_v4_fence(
     if os.path.lexists(fence):
         verify_v4_fence_file(fence, perms)
         return
+    _write_fence(streams_dir, 4, perms, check_deadline=check_deadline)
+
+
+def raise_fence_for_gap_stamps(
+    streams_dir: Path, perms: OutboxPermissionsPort, *, check_deadline: Callable[[], None] | None = None,
+) -> None:
+    """Move an existing v4 fence to version 5 before the first gap-stamped binding row is written."""
+    if streams_fence_version(streams_dir, perms) < GAP_STAMP_FENCE_VERSION:
+        _write_fence(streams_dir, GAP_STAMP_FENCE_VERSION, perms, check_deadline=check_deadline)
+
+
+def _write_fence(
+    streams_dir: Path, version: int, perms: OutboxPermissionsPort, *, check_deadline: Callable[[], None] | None,
+) -> None:
+    fence = streams_dir / _V4_FENCE_FILE
     tmp = streams_dir / f".v4_fence-{uuid.uuid4().hex}{_PART_SUFFIX}"
     fd = -1
     committed = False
     try:
         fd = os.open(tmp, os.O_RDWR | os.O_CREAT | os.O_EXCL | _O_BINARY | _O_NOFOLLOW, 0o600)
-        write_all_fd(fd, canonical_json({"schema_version": 4}))
+        write_all_fd(fd, canonical_json({"schema_version": version}))
         perms.secure_file(tmp)
         dl = check_deadline or _ACTIVE_DEADLINE_CHECK.get()
         if dl is not None:

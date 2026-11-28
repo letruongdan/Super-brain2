@@ -466,16 +466,17 @@ class OutboxSpool:
 
     def enqueue_fallback_gap(
         self, *, producer_stream: str, sequence: int | None, dedup_key: str | None, reason: str, recorded_at: str,
-        duration_ms: int, deadline_ns: int | None = None,
+        duration_ms: int, deadline_ns: int | None = None, event_id: str | None = None,
     ) -> str | None:
         """Write the gap standing in for an event that may not have been published, under one spool lock. Its slot is
         ``sequence`` when known, else the binding of ``dedup_key``, else the next free slot. With a ``dedup_key`` the
         slot is reserved by a binding stamped with the gap identity before the gap is published, so a retry, a late
         event and a repeat after the gap ACK all land on that slot with that gap. Returns ``None`` without writing
-        when the slot already holds a published or acknowledged event."""
+        when the slot already holds a published or acknowledged event. ``event_id`` is the producer's own id, if any:
+        the reservation binds it so the retry with that id lands on the slot."""
         return _fallback.enqueue_fallback_gap(
             self, producer_stream=producer_stream, sequence=sequence, dedup_key=dedup_key, reason=reason,
-            recorded_at=recorded_at, duration_ms=duration_ms, deadline_ns=deadline_ns,
+            recorded_at=recorded_at, duration_ms=duration_ms, deadline_ns=deadline_ns, event_id=event_id,
         )
 
     def _refuse_oversized_first_hook(
