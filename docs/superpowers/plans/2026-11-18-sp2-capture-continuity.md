@@ -243,6 +243,11 @@
   - *Căn cứ:* full suite tuần tự tăng từ 725 s (`03fb4f5`, trước tích hợp) lên 1095 s sau khi nhận test I4 (`sp2-5-integration-fullsuite-4.log`); lượt chẩn đoán đủ inventory với `--time-budget-s 600` đo `test_job_seconds` 410,3 s (3.14) và 412,7 s (3.11) (`gate-int-5099ab2-diag600`). Lượt chẩn đoán này không là bằng chứng nghiệm thu.
   - *Ngưỡng:* `--time-budget-s 420` cho mỗi lượt local, giống ngưỡng I4. Deadline trong test, assertion, inventory và yêu cầu 0 fail/error/XPASS giữ nguyên.
   - *Mục tiêu quay lại:* `< 275 s` cho cả hai lượt local, ghi thành mục tối ưu riêng sau nghiệm thu.
+
+  **Điều chỉnh ngày 28/11/2026 (chủ dự án duyệt: "3 trước, nếu không ổn nữa thì nâng ngưỡng lên"), ghi trước lượt đo chính thức:**
+  - *Lý do:* với 8 shard, các test khẳng định deadline sản phẩm (hook 2 s, ngân sách request, chu kỳ doctor ngắn) fail ngẫu nhiên do tranh chấp CPU (`gate-int-ed3d269`, `gate-int-ed3d269-diag6`). Gate thêm pha tuần tự `SERIAL_NODE_PREFIXES` chạy sau các shard trong cùng deadline (`4bb0962`); deadline và assertion giữ nguyên. Đã thử tối ưu test nặng trước: phần lớn thời gian còn lại là chi phí mở file của Windows, không giảm đáng kể bằng sửa test.
+  - *Căn cứ:* lượt chẩn đoán đủ inventory với pha tuần tự (`gate-int-4bb0962-diag-serial`, 8 shard, ngân sách 600 s): 3.14 417,2 s, 3.11 423,8 s, cả hai 0 fail/error/XPASS; pha tuần tự khoảng 51 s.
+  - *Ngưỡng:* `--time-budget-s 460` cho mỗi lượt Windows local (8 shard + pha tuần tự), thay cho 420 s ở trên. Hosted giữ `< 300 s` mỗi ô. Mục tiêu quay lại `< 275 s` giữ nguyên.
   Expected: `accepted: true` trên cả hai interpreter, `test_job_seconds < 300.0`, 0 fail/error/XPASS.
 - [ ] **Step 3: Dựng và chạy bài diễn tập M1 có chủ dự án duyệt trên hai checkout nháp `A` và `B`**
   Sau khi có bootstrap của I3, mặt kiểm `doctor` tích hợp và chủ dự án phê duyệt lượt chạy native:
