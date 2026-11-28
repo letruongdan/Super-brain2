@@ -12,29 +12,44 @@ from pathlib import Path
 
 from superbrain.core._kernel_approval import Layer2State, SignerRecord
 from superbrain.core.canonical import digest_bytes
-from superbrain.core.errors import BrainError, ErrorCode
+from superbrain.core.errors import BrainError, ErrorCode, describe_exception
 from superbrain.core.proposals import ChangeProposal, ProposalStatus, ProposalTarget
 from superbrain.ports.doctor import (
+    CaptureDoctorProbePort,
+    CaptureDoctorProbeResult,
     DoctorAccountingLock,
     DoctorBootstrapDrift,
+    DoctorDaemonStats,
     DoctorJournalInfo,
     DoctorLayer2HarnessStatus,
     DoctorPendingTombstones,
     DoctorProposalSummary,
+    DoctorScanLimits,
     DoctorSchemaVersions,
     DoctorSnapshot,
     DoctorSnapshotReaderPort,
     DoctorTurnIntentInfo,
+    PrivacyCanaryProbeResult,
+    PrivacyRescanSummary,
+    PrivacyScannerPort,
 )
 from superbrain.ports.os import OsAdapters
 from superbrain.storage import _policy_approvals as policy_approvals
 from superbrain.storage import _policy_layer2 as policy_layer2
+from superbrain.storage._doctor_probes import (
+    check_permissions_strict,
+    probe_daemon_state,
+    probe_identity_and_jev,
+    probe_storage_and_retention,
+    run_capture_probe_bounded,
+    run_privacy_rescan,
+)
 from superbrain.storage._proposal_codec import decode_proposal
 from superbrain.storage._restore_epoch import read_restore_epoch
 from superbrain.storage.cas import blob_path, file_digest
 from superbrain.storage.kernel_schema import KERNEL_POLICY_MIGRATIONS, KERNEL_STORE_MIGRATIONS
 from superbrain.storage.layout import DataRoot
-from superbrain.storage.schema import SchemaInfo, code_version, read_schema_info
+from superbrain.storage.schema import SchemaInfo, code_version, ensure_readable, read_schema_info
 from superbrain.storage.sqlite import open_readonly
 
 __all__ = ["StorageDoctorReader", "read_doctor_snapshot"]
@@ -72,7 +87,7 @@ def _read_pending_tombstones(root: DataRoot, os_: OsAdapters) -> DoctorPendingTo
         )
     except (BrainError, OSError, UnicodeDecodeError, ValueError) as exc:
         return DoctorPendingTombstones(
-            present=True, restore_epoch=None, expired_holders_count=0, corrupt_error=str(exc)
+            present=True, restore_epoch=None, expired_holders_count=0, corrupt_error=describe_exception(exc)
         )
 
 
@@ -86,14 +101,25 @@ def _is_safe_path(path: Path, os_: OsAdapters, errors: list[str], label: str) ->
                 return False
         return True
     except (BrainError, OSError) as exc:
-        errors.append(f"{label}: {exc}")
+        errors.append(f"{label}: {describe_exception(exc)}")
         return False
+
+
+def _try_open_shared_ro(path: Path, safe: bool, scratch: Path) -> sqlite3.Connection | None:
+    if not (safe and os.path.exists(path)):
+        return None
+    try:
+        return open_readonly(path, scratch_dir=scratch)
+    except (BrainError, sqlite3.Error, OSError):
+        return None
 
 
 def _read_policy_state(
     policy_db_path: Path,
     scratch: Path,
     errors: list[str],
+    *,
+    policy_conn: sqlite3.Connection | None = None,
 ) -> tuple[
     int | None,
     bool,
@@ -105,9 +131,10 @@ def _read_policy_state(
 ]:
     if not os.path.exists(policy_db_path):
         return None, False, (), False, (), (), ()
-    db: sqlite3.Connection | None = None
+    opened: sqlite3.Connection | None = None
     try:
-        db = open_readonly(policy_db_path, scratch_dir=scratch)
+        db = policy_conn if policy_conn is not None else open_readonly(policy_db_path, scratch_dir=scratch)
+        opened = None if policy_conn is not None else db
         trust_row = (
             db.execute("SELECT generation FROM trust WHERE id = 1").fetchone() if _table_exists(db, "trust") else None
         )
@@ -196,11 +223,11 @@ def _read_policy_state(
                 )
         return trust_gen, reset_rec, signers, term_ok, tuple(harnesses), tuple(locks), tuple(intents)
     except (BrainError, sqlite3.Error, ValueError) as exc:
-        errors.append(f"policy read error: {exc}")
+        errors.append(f"policy read error: {describe_exception(exc)}")
         return None, False, (), False, (), (), ()
     finally:
-        if db is not None:
-            db.close()
+        if opened is not None:
+            opened.close()
 
 
 def _inspect_single_target(
@@ -263,17 +290,19 @@ def _read_store_proposals(
     errors: list[str],
     *,
     cas_ok: bool,
+    store_conn: sqlite3.Connection | None = None,
 ) -> tuple[tuple[DoctorProposalSummary, ...], tuple[DoctorBootstrapDrift, ...], tuple[DoctorJournalInfo, ...]]:
     if not os.path.exists(root.store_db):
         return (), (), ()
-    db: sqlite3.Connection | None = None
+    opened: sqlite3.Connection | None = None
     pending: list[DoctorProposalSummary] = []
     drifts: list[DoctorBootstrapDrift] = []
     incomplete_journals: list[DoctorJournalInfo] = []
     latest_by_target: dict[tuple[str, str], tuple[ChangeProposal, ProposalTarget]] = {}
     resolved_checkout = os.path.normcase(str(checkout_root)) if checkout_root is not None else None
     try:
-        db = open_readonly(root.store_db, scratch_dir=scratch)
+        db = store_conn if store_conn is not None else open_readonly(root.store_db, scratch_dir=scratch)
+        opened = None if store_conn is not None else db
         if _table_exists(db, "p_proposals_journals"):
             j_rows = db.execute(
                 "SELECT journal_id, proposal_id, direction, status, grant_id, updated_at "
@@ -345,26 +374,34 @@ def _read_store_proposals(
             _inspect_single_target(prop, target, os_, drifts)
         return tuple(pending), tuple(drifts), tuple(incomplete_journals)
     except (BrainError, sqlite3.Error, OSError, ValueError) as exc:
-        errors.append(f"store proposal read error: {exc}")
+        errors.append(f"store proposal read error: {describe_exception(exc)}")
         return tuple(pending), tuple(drifts), tuple(incomplete_journals)
     finally:
-        if db is not None:
-            db.close()
+        if opened is not None:
+            opened.close()
 
 
 def read_doctor_snapshot(
     data_root: Path,
     os_: OsAdapters,
     *,
+    db_root: Path | None = None,
     checkout_root: Path | None = None,
     expected_store_id: str | None = None,
+    privacy_scanner: PrivacyScannerPort | None = None,
+    capture_probe: CaptureDoctorProbePort | None = None,
+    limits: DoctorScanLimits | None = None,
 ) -> DoctorSnapshot:
     """Inspect ``data_root`` and optional ``checkout_root`` strictly read-only without leases or WAL creation."""
+    scan_limits = limits if limits is not None else DoctorScanLimits()
     root = DataRoot.at(data_root)
+    db_layout = DataRoot.at(db_root) if db_root is not None else root
     expected_store = code_version(KERNEL_STORE_MIGRATIONS)
     expected_policy = code_version(KERNEL_POLICY_MIGRATIONS)
     errors: list[str] = []
     perm_problems: list[str] = []
+    ancestor_problems: list[str] = []
+    backup_problems: list[str] = []
 
     data_ok = _is_safe_path(data_root, os_, errors, "data_root")
     store_ok = (
@@ -380,70 +417,90 @@ def read_doctor_snapshot(
     cas_ok = data_ok and _is_safe_path(root.cas_dir, os_, errors, "cas_dir")
 
     if data_ok and os.path.lexists(data_root):
-        try:
-            perm_problems.extend(str(p) for p in os_.permissions.check_ancestors(data_root))
-            perm_problems.extend(str(p) for p in os_.permissions.object_problems(data_root))
-        except (BrainError, OSError) as exc:
-            errors.append(f"permission check error: {exc}")
+        check_permissions_strict(
+            root,
+            os_,
+            errors,
+            perm_problems,
+            ancestor_problems,
+            backup_problems,
+        )
+
+    daemon_stats: DoctorDaemonStats | None
+    if data_ok and os.path.lexists(data_root):
+        daemon_stats = probe_daemon_state(root, os_, errors)
+    else:
+        daemon_stats = DoctorDaemonStats(
+            writer_lock_present=False,
+            writer_lock_held=False,
+            lock_error="data_root missing or unsafe",
+            endpoint_valid=False,
+            endpoint_detail="data_root missing or unsafe",
+        )
+
+    capture_result: CaptureDoctorProbeResult | None = run_capture_probe_bounded(
+        data_root, capture_probe, os_, scan_limits
+    )
 
     raw_tmp = os_.traits.resolved_temp_dir()
     temp_base = str(raw_tmp) if raw_tmp is not None else None
     scratch = Path(tempfile.mkdtemp(prefix="sb-doctor-", dir=temp_base))
+    store_conn: sqlite3.Connection | None = None
+    policy_conn: sqlite3.Connection | None = None
     try:
+        store_conn = _try_open_shared_ro(db_layout.store_db, store_ok, scratch)
+        policy_conn = _try_open_shared_ro(db_layout.policy_db, policy_ok, scratch)
         store_info: SchemaInfo | None = None
         policy_info: SchemaInfo | None = None
+        store_readable = False
+        policy_readable = False
         if store_ok:
             try:
-                store_info = read_schema_info(root.store_db, scratch_dir=scratch)
+                store_info = read_schema_info(db_layout.store_db, scratch_dir=scratch, db=store_conn)
+                if store_info is not None:
+                    ensure_readable(store_info, KERNEL_STORE_MIGRATIONS)
+                    store_readable = True
             except BrainError as exc:
-                errors.append(f"store schema read error: {exc}")
+                errors.append(f"store schema read error: {describe_exception(exc)}")
         if policy_ok:
             try:
-                policy_info = read_schema_info(root.policy_db, scratch_dir=scratch)
+                policy_info = read_schema_info(db_layout.policy_db, scratch_dir=scratch, db=policy_conn)
+                if policy_info is not None:
+                    ensure_readable(policy_info, KERNEL_POLICY_MIGRATIONS)
+                    policy_readable = True
             except BrainError as exc:
-                errors.append(f"policy schema read error: {exc}")
+                errors.append(f"policy schema read error: {describe_exception(exc)}")
 
         restore_epoch: int | None = None
-        if store_ok and store_info is not None:
+        if store_ok and store_readable and store_info is not None:
             try:
-                restore_epoch = read_restore_epoch(root, schema_version=store_info.schema_version, os_=os_)
+                restore_epoch = read_restore_epoch(db_layout, schema_version=store_info.schema_version, os_=os_)
             except BrainError as exc:
-                errors.append(f"restore_epoch error: {exc}")
+                errors.append(f"restore_epoch error: {describe_exception(exc)}")
 
-        if policy_ok:
+        if policy_ok and policy_readable:
             trust_gen, reset_rec, signers, term_ok, l2_statuses, locks, turn_intents = _read_policy_state(
-                root.policy_db, scratch, errors
+                db_layout.policy_db, scratch, errors, policy_conn=policy_conn
             )
         else:
-            trust_gen, reset_rec, signers, term_ok, l2_statuses, locks, turn_intents = (
-                None,
-                False,
-                (),
-                False,
-                (),
-                (),
-                (),
-            )
+            trust_gen, reset_rec, signers, term_ok = None, False, (), False
+            l2_statuses, locks, turn_intents = (), (), ()
         tombstones = (
-            _read_pending_tombstones(root, os_)
+            _read_pending_tombstones(db_layout, os_)
             if store_ok
             else DoctorPendingTombstones(present=False, restore_epoch=None, expired_holders_count=0)
         )
         if tombstones.corrupt_error is not None:
             errors.append(f"pending_restore_tombstones error: {tombstones.corrupt_error}")
-        if store_ok:
+        if store_ok and store_readable:
             pending_props, drifts, incomplete_journals = _read_store_proposals(
-                root, scratch, checkout_root, os_, errors, cas_ok=cas_ok
+                root, scratch, checkout_root, os_, errors, cas_ok=cas_ok, store_conn=store_conn
             )
         else:
             pending_props, drifts, incomplete_journals = (), (), ()
 
         store_id = (
-            store_info.store_id
-            if store_info is not None
-            else policy_info.store_id
-            if policy_info is not None
-            else None
+            store_info.store_id if store_info is not None else policy_info.store_id if policy_info is not None else None
         )
         if store_info is not None and policy_info is not None and store_info.store_id != policy_info.store_id:
             errors.append("store_id mismatch between store and policy databases")
@@ -453,31 +510,49 @@ def read_doctor_snapshot(
             if policy_info is not None and policy_info.store_id != expected_store_id:
                 errors.append(f"expected_store_id mismatch in policy/policy.db ({policy_info.store_id})")
 
+        identity_stats, jev_stats = probe_identity_and_jev(
+            root.policy_db, root.store_db, scratch,
+            policy_readable=policy_ok and policy_readable, store_readable=store_ok and store_readable,
+            errors=errors, policy_conn=policy_conn, store_conn=store_conn,
+        )
+        storage_stats, retention_stats, cas_items = probe_storage_and_retention(
+            root, os_, scratch, store_info, policy_info, scan_limits, errors,
+            store_readable=store_ok and store_readable, policy_readable=policy_ok and policy_readable,
+            store_safe=store_ok, policy_safe=policy_ok, cas_safe=cas_ok,
+            store_conn=store_conn, policy_conn=policy_conn,
+        )
+        privacy_canaries: tuple[PrivacyCanaryProbeResult, ...] = (
+            privacy_scanner.check_canary_channels() if privacy_scanner is not None else ()
+        )
+        privacy_rescan: PrivacyRescanSummary = (
+            run_privacy_rescan(root, cas_items, scan_limits, privacy_scanner)
+            if data_ok
+            else PrivacyRescanSummary(error="data_root missing or unsafe")
+        )
         return DoctorSnapshot(
-            data_root=data_root,
-            store_id=store_id,
+            data_root=data_root, store_id=store_id,
             schema=DoctorSchemaVersions(
                 store_version=store_info.schema_version if store_info is not None else None,
                 policy_version=policy_info.schema_version if policy_info is not None else None,
-                expected_store_version=expected_store,
-                expected_policy_version=expected_policy,
+                expected_store_version=expected_store, expected_policy_version=expected_policy,
+                min_store_reader_version=store_info.min_reader_version if store_info is not None else None,
+                min_policy_reader_version=policy_info.min_reader_version if policy_info is not None else None,
             ),
-            restore_epoch=restore_epoch,
-            trust_generation=trust_gen,
-            signer_reset_recorded=reset_rec,
-            signers=signers,
-            terminal_channel_eligible=term_ok,
-            layer2_harnesses=l2_statuses,
-            unresolved_accounting_locks=locks,
-            pending_restore_tombstones=tombstones,
-            pending_proposals=pending_props,
-            bootstrap_drifts=drifts,
-            integrity_errors=tuple(errors),
-            active_turn_intents=turn_intents,
-            incomplete_journals=incomplete_journals,
-            permission_problems=tuple(perm_problems),
+            restore_epoch=restore_epoch, trust_generation=trust_gen, signer_reset_recorded=reset_rec,
+            signers=signers, terminal_channel_eligible=term_ok, layer2_harnesses=l2_statuses,
+            unresolved_accounting_locks=locks, pending_restore_tombstones=tombstones,
+            pending_proposals=pending_props, bootstrap_drifts=drifts, integrity_errors=tuple(errors),
+            active_turn_intents=turn_intents, incomplete_journals=incomplete_journals,
+            permission_problems=tuple(perm_problems), ancestor_permission_problems=tuple(ancestor_problems),
+            backup_permission_problems=tuple(backup_problems), daemon_stats=daemon_stats,
+            identity_stats=identity_stats, storage_stats=storage_stats, retention_stats=retention_stats,
+            privacy_canaries=privacy_canaries, privacy_rescan=privacy_rescan,
+            capture_probe_result=capture_result, jev_stats=jev_stats, limits=scan_limits,
         )
     finally:
+        for conn in (store_conn, policy_conn):
+            if conn is not None:
+                conn.close()
         shutil.rmtree(scratch, ignore_errors=True)
 
 
@@ -491,12 +566,20 @@ class StorageDoctorReader(DoctorSnapshotReaderPort):
         self,
         data_root: Path,
         *,
+        db_root: Path | None = None,
         checkout_root: Path | None = None,
         expected_store_id: str | None = None,
+        privacy_scanner: PrivacyScannerPort | None = None,
+        capture_probe: CaptureDoctorProbePort | None = None,
+        limits: DoctorScanLimits | None = None,
     ) -> DoctorSnapshot:
         return read_doctor_snapshot(
             data_root,
             self._os,
+            db_root=db_root,
             checkout_root=checkout_root,
             expected_store_id=expected_store_id,
+            privacy_scanner=privacy_scanner,
+            capture_probe=capture_probe,
+            limits=limits,
         )

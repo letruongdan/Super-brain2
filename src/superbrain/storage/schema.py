@@ -123,7 +123,9 @@ def _meta(db: sqlite3.Connection, path: Path) -> SchemaInfo:
     return SchemaInfo(schema_version, min_reader, store_id)
 
 
-def read_schema_info(path: Path, *, scratch_dir: Path | None = None) -> SchemaInfo | None:
+def read_schema_info(
+    path: Path, *, scratch_dir: Path | None = None, db: sqlite3.Connection | None = None
+) -> SchemaInfo | None:
     """The committed ``meta`` of the database at ``path``; ``None`` if the file does not exist.
 
     Reads through ``open_readonly``, so committed WAL frames count even without a ``-shm``, and the database files
@@ -131,10 +133,11 @@ def read_schema_info(path: Path, *, scratch_dir: Path | None = None) -> SchemaIn
     """
     if not path.exists():
         return None
-    db: sqlite3.Connection | None = None
+    opened: sqlite3.Connection | None = None
     try:
-        db = open_readonly(path, scratch_dir=scratch_dir)
-        return _meta(db, path)
+        conn = db if db is not None else open_readonly(path, scratch_dir=scratch_dir)
+        opened = None if db is not None else conn
+        return _meta(conn, path)
     except BrainError:
         raise
     except sqlite3.OperationalError as exc:
@@ -144,8 +147,8 @@ def read_schema_info(path: Path, *, scratch_dir: Path | None = None) -> SchemaIn
     except (sqlite3.Error, OSError) as exc:
         raise BrainError(ErrorCode.IO_ERROR, f"cannot read {path}: {exc}") from exc
     finally:
-        if db is not None:
-            db.close()
+        if opened is not None:
+            opened.close()
 
 
 def ensure_writable(info: SchemaInfo, migrations: Sequence[Migration]) -> None:

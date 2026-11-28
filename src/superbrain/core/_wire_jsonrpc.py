@@ -11,6 +11,7 @@ from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.jsonvalue import JsonValue
 
 JSONRPC_VERSION = "2.0"
+MCP_PROTOCOL_VERSION = "2025-06-18"
 MAX_JSONRPC_ID_BYTES = 128
 
 JSONRPC_PARSE_ERROR = -32700

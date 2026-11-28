@@ -24,7 +24,7 @@ from superbrain.adapters.os import os_adapters
 from superbrain.adapters.os.workspaces import build_registration
 from superbrain.cli_api.capture_client import CaptureClient
 from superbrain.composition.daemon_entry import DaemonTestHooks
-from superbrain.composition.doctor_probes_sp2 import reconcile_harness_layer2_in_policy
+from superbrain.composition.doctor_probes_sp2_store import reconcile_harness_layer2_in_policy
 from superbrain.core._kernel_approval import Layer2State
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.ids import new_id

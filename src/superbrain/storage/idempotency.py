@@ -14,6 +14,7 @@ from superbrain.core.faults import crashpoint
 from superbrain.core.kernel import (
     IDEMPOTENCY_TTL,
     IdempotencyRow,
+    RetentionClass,
     StagedBlob,
     StoredResult,
     is_strict_int,
@@ -37,8 +38,8 @@ from superbrain.storage._idempotency_sql import (
 )
 from superbrain.storage._pair_admission import verify_admitted_store_pair, verify_live_store_handle
 from superbrain.storage.cas import ContentStore
-from superbrain.storage.kinds import RetentionClass, is_uuid
-from superbrain.storage.ledger import Txn
+from superbrain.storage.kinds import is_uuid
+from superbrain.storage.ledger import Txn, normalize_hold_args
 from superbrain.storage.policy_store import PolicyStore
 from superbrain.storage.store import Store
 from superbrain.storage.workspaces import StoreKernelTx
@@ -85,7 +86,15 @@ class StrictKernelTx(StoreKernelTx):
         self._store_id = store_id
         self._staged_by_digest = MappingProxyType(by_digest)
 
-    def hold_blob(self, data: bytes, *, holder_id: str) -> str:
+    def hold_blob(
+        self,
+        data: bytes,
+        *,
+        holder_id: str,
+        retention: RetentionClass = RetentionClass.DURABLE,
+        expires_at: datetime | str | None = None,
+    ) -> str:
+        norm_ret, norm_exp = normalize_hold_args(retention, expires_at)
         if type(data) is not bytes or not is_uuid(holder_id):
             raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
         digest = digest_bytes(data)
@@ -94,7 +103,7 @@ class StrictKernelTx(StoreKernelTx):
             raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
         self._cas._check()
         try:
-            self._txn.hold(digest, _HOLDER_KIND, holder_id, RetentionClass.DURABLE, None)
+            self._txn.hold(digest, _HOLDER_KIND, holder_id, norm_ret, norm_exp)
         except BrainError as err:
             if err.code is ErrorCode.NOT_FOUND:
                 raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure") from err

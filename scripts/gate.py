@@ -52,6 +52,8 @@ PHASE_TIMEOUTS_S = {"ruff": 120.0, "mypy": 300.0, "lint-imports": 120.0, "pytest
 GIT_TIMEOUT_S = 120.0
 SYNC_TIMEOUT_S = 600.0
 COLLECT_TIMEOUT_S = 300.0
+# An explicit local budget is a plan-recorded temporary threshold (acceptance policy); hosted workers keep the default.
+MAX_TEST_JOB_BUDGET_S = 600.0
 def default_pytest_shards(platform_name: str = sys.platform, cpu_count: int | None = None) -> int:
     """Return the platform default pytest shard count."""
     del platform_name
@@ -278,6 +280,8 @@ _WHEEL_FIXTURE_FILES: frozenset[str] = frozenset(
         "tests/contract/test_mcp_v2_schema.py",
         "tests/integration/test_apply_journal_crash_matrix.py",
         "tests/integration/test_capture_ack_and_crash_matrix.py",
+        "tests/integration/test_doctor_cli.py",
+        "tests/integration/test_doctor_fix.py",
         "tests/integration/test_i3_wheel_e2e.py",
         "tests/integration/test_kernel_cli.py",
         "tests/integration/test_kernel_crash_recovery.py",
@@ -295,6 +299,7 @@ _WHEEL_FIXTURE_FILES: frozenset[str] = frozenset(
 # plus session wheel setup overhead across the two wheel shards. _WHEEL_SETUP_COST_MS=3000 and 300s budget intact.
 # Recalibrated on 2026-11-25 from Python 3.14 and 3.11 Windows 6-shard diagnostic runs
 # (diag-remediate-v11/py3.14 and py3.11 on commit 4ce42af) across all 194 collected test files.
+# Integration with main (SP1-I4): its doctor/I4 files keep main's measured weights.
 _HEAVY_FILE_COST_MS: dict[str, int] = {
     "tests/integration/test_kernel_crash_recovery.py": 70022,
     "tests/integration/test_apply_journal_crash_matrix.py": 63762,
@@ -501,6 +506,30 @@ _HEAVY_FILE_COST_MS: dict[str, int] = {
     "tests/storage/test_outbox_r8_migration_and_limits.py": 850,
     "tests/adapters/test_claude_and_codex_capture_adapters.py": 350,
     "tests/storage/test_outbox_r10_ack_durability.py": 1600,
+    # SP1-I4 files merged from main (main's calibration, 2026-11-28 integration)
+    "tests/integration/test_doctor_fix.py": 78365,
+    "tests/integration/test_doctor_cli.py": 65325,
+    "tests/integration/test_i4_r3_remediation.py": 43434,
+    "tests/integration/test_i4_f4_f8_remediation.py": 39295,
+    "tests/integration/test_i4_r5_legacy_job_replay.py": 25171,
+    "tests/integration/test_i4_rereview_remediation.py": 20242,
+    "tests/integration/test_i4_a1_a2_job_lifecycle.py": 62300,
+    "tests/integration/test_i4_r6_maintenance_snapshot.py": 12000,
+    "tests/integration/test_i4_r4_remediation.py": 20018,
+    "tests/integration/test_doctor_sp2_probes.py": 18137,
+    "tests/integration/test_i4_r6_job_payload_holder.py": 15548,
+    "tests/integration/test_i4_r7_leased_payload_settlement.py": 13293,
+    "tests/storage/test_doctor_snapshot.py": 12530,
+    "tests/integration/test_doctor_jobs.py": 12410,
+    "tests/integration/test_i4_r9_doctor_payload_fault_classification.py": 10786,
+    "tests/integration/test_i4_r8_doctor_integrity_settle.py": 10567,
+    "tests/integration/test_i4_review_remediation.py": 9195,
+    "tests/integration/test_i4_owner_thread_remediation.py": 8307,
+    "tests/integration/test_i4_r8_blob_verify_transient.py": 6942,
+    "tests/integration/test_i4_r10_claim_reconciliation.py": 3512,
+    "tests/integration/test_i4_vanished_entry_walk.py": 1350,
+    "tests/integration/test_i4_r7_remediation.py": 1500,
+    "tests/architecture/test_gate_time_budget.py": 142,
 }
 
 
@@ -1174,11 +1203,13 @@ def run_gate(
     evidence_dir: Path | None = None,
     shards: int = PYTEST_SHARDS,
     partition: tuple[int, int] | None = None,
+    time_budget_s: float = TEST_JOB_BUDGET_S,
 ) -> tuple[dict[str, JsonValue], str]:
     """Run the gate in a detached worktree of the resolved HEAD. Returns the receipt and a printable log.
 
-    One monotonic deadline of ``TEST_JOB_BUDGET_S`` starts just before the interpreter preflight; collect and every
-    phase get ``min(cap, remaining)`` and no step starts once it is spent. Pytest shards partition the collected
+    One monotonic deadline of ``time_budget_s`` (default ``TEST_JOB_BUDGET_S``) starts just before the interpreter
+    preflight; collect and every phase get ``min(cap, remaining)`` and no step starts once it is spent. Collect and
+    pytest are capped by the budget itself when it exceeds their default caps. Pytest shards partition the collected
     files under that same deadline. With ``evidence_dir`` every step's
     command, cwd, PID, start, exit, time and output, the raw JUnit report and the terminal receipt (written last)
     go into a new attempt dir under it, outside the worktree; only failing to create that dir raises
@@ -1281,7 +1312,7 @@ def run_gate(
         results: list[tuple[int | None, str, float, str | None] | None] = [None] * len(groups)
 
         def run_shard(index: int) -> None:
-            timeout = min(PHASE_TIMEOUTS_S["pytest"], deadline - time.monotonic())
+            timeout = min(max(PHASE_TIMEOUTS_S["pytest"], time_budget_s), deadline - time.monotonic())
             if timeout <= 0:
                 return
             cmd = _uv(worktree, python, "pytest", f"--junitxml={paths[index]}", "-q", "-rfEX", *groups[index])
@@ -1309,7 +1340,7 @@ def run_gate(
                 reason = (
                     "shard execution failed"
                     if execution_failed
-                    else f"the {TEST_JOB_BUDGET_S:.0f}s test-job budget was spent"
+                    else f"the {time_budget_s:.0f}s test-job budget was spent"
                 )
                 extra.append(f"phase {name} not started: {reason}")
                 codes.append(None)
@@ -1372,7 +1403,7 @@ def run_gate(
                 log.append(output)
             else:
                 job_began = time.monotonic()
-                deadline = job_began + TEST_JOB_BUDGET_S
+                deadline = job_began + time_budget_s
                 halted: str | None = None  # why no further step of the test job may start
 
                 def bounded(name: str, cap: float) -> float | None:
@@ -1382,7 +1413,7 @@ def run_gate(
                         extra.append(f"{name} not started: {halted}")
                         return None
                     if left <= 0:
-                        extra.append(f"{name} not started: the {TEST_JOB_BUDGET_S:.0f}s test-job budget was spent")
+                        extra.append(f"{name} not started: the {time_budget_s:.0f}s test-job budget was spent")
                         return None
                     return min(cap, left)
 
@@ -1412,7 +1443,7 @@ def run_gate(
                             extra.append("interpreter preflight output was not understood")
                             log.append(output)
 
-                timeout = bounded("pytest --collect-only", COLLECT_TIMEOUT_S)
+                timeout = bounded("pytest --collect-only", max(COLLECT_TIMEOUT_S, time_budget_s))
                 if timeout is not None:
                     code, output, _, error = step(
                         "collect", _uv(worktree, python, "pytest", "--collect-only", "-q"), worktree, timeout
@@ -1439,7 +1470,8 @@ def run_gate(
                     ev.write("collected-partition.json", canonical_json(sorted(target_ids)))
                 groups = shard_files(target_ids, shards)
                 for name in REQUIRED_PHASES:
-                    timeout = bounded(f"phase {name}", PHASE_TIMEOUTS_S[name])
+                    cap = PHASE_TIMEOUTS_S[name]
+                    timeout = bounded(f"phase {name}", max(cap, time_budget_s) if name == "pytest" else cap)
                     if timeout is None:
                         continue
                     if name == "pytest" and len(groups) > 1:
@@ -1518,6 +1550,7 @@ def run_gate(
         cleanup_error=cleanup_error,
         extra_reasons=[*extra, *ev.errors],
         environment=environment,
+        time_budget_s=time_budget_s,
     )
     receipt["resolved_commit"] = resolved
     receipt["timing"] = {
@@ -1958,10 +1991,28 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--evidence-dir", help="absolute directory; each run writes a new attempt dir under it")
     parser.add_argument("--shards", type=int, default=PYTEST_SHARDS, help="maximum parallel pytest processes")
     parser.add_argument("--partition", help="optional worker partition '<index>/<count>'")
+    parser.add_argument(
+        "--time-budget-s",
+        type=float,
+        default=None,
+        help=f"test-job budget in seconds (default {TEST_JOB_BUDGET_S:.0f}); only a plan-recorded local threshold",
+    )
     args = parser.parse_args(argv_list)
     if args.shards < 1:
         print("gate refused: --shards must be at least 1", file=sys.stderr)
         return 2
+    time_budget_s = TEST_JOB_BUDGET_S
+    if args.time_budget_s is not None:
+        if args.partition is not None:
+            print("gate refused: --time-budget-s cannot be combined with --partition", file=sys.stderr)
+            return 2
+        if not math.isfinite(args.time_budget_s) or not 0 < args.time_budget_s <= MAX_TEST_JOB_BUDGET_S:
+            print(
+                f"gate refused: --time-budget-s must be finite and in (0, {MAX_TEST_JOB_BUDGET_S:.0f}]",
+                file=sys.stderr,
+            )
+            return 2
+        time_budget_s = args.time_budget_s
     partition: tuple[int, int] | None = None
     if args.partition is not None:
         try:
@@ -1983,7 +2034,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("gate refused: the working tree has uncommitted changes to tracked files", file=sys.stderr)
         return 2
     try:
-        receipt, log = run_gate(repo, args.python, evidence_dir=evidence, shards=args.shards, partition=partition)
+        receipt, log = run_gate(
+            repo, args.python, evidence_dir=evidence, shards=args.shards, partition=partition,
+            time_budget_s=time_budget_s,
+        )
     except EvidenceDirError as err:  # the attempt dir could not be created; nothing ran
         print(f"gate refused: the evidence dir could not be prepared: {err}", file=sys.stderr)
         return 2

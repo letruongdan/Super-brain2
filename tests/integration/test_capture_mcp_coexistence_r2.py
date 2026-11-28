@@ -839,9 +839,12 @@ def test_f5_double_online_policy_restore_and_explicit_demote_to_mcp(trusted_tmp:
         lb_client = LoopbackClient(monotonic_ns=mono.monotonic_ns)
         cap_client = CaptureClient(lb_client)
 
-        def _run_online_policy_restore(backup_path: Path) -> None:
+        def _run_online_policy_restore(backup_path: Path) -> LoopbackTarget:
+            """Restore online and return a target for the live endpoint (restore bumps the writer epoch)."""
+            live = loop.ready
+            assert live is not None
             st_p, prev_env = _post_tls(
-                ready, ca_pem, "/v2/operator/restore", cli_token, {"target": "policy", "backup": str(backup_path)}
+                live, ca_pem, "/v2/operator/restore", cli_token, {"target": "policy", "backup": str(backup_path)}
             )
             assert st_p == 200 and prev_env.get("ok") is True, (st_p, prev_env)
             ch = cast(dict[str, Any], prev_env["data"]["challenge"])
@@ -861,7 +864,7 @@ def test_f5_double_online_policy_restore_and_explicit_demote_to_mcp(trusted_tmp:
                 expires_at=datetime.fromisoformat(str(ch["expires_at"]).replace("Z", "+00:00")),
             )
             st_e, exec_env = _post_tls(
-                ready,
+                live,
                 ca_pem,
                 "/v2/operator/restore",
                 cli_token,
@@ -877,6 +880,14 @@ def test_f5_double_online_policy_restore_and_explicit_demote_to_mcp(trusted_tmp:
                 },
             )
             assert st_e == 200 and exec_env.get("ok") is True, (st_e, exec_env)
+            after = loop.ready
+            assert after is not None
+            return LoopbackTarget(
+                endpoint=after.endpoint,
+                expected_store_id=rep.store_id,
+                ca_pem=ca_pem,
+                leaf_cert_sha256=after.leaf_cert_sha256,
+            )
 
         def _ev(seq: int) -> dict[str, JsonValue]:
             return CaptureEventRecord(
@@ -904,7 +915,7 @@ def test_f5_double_online_policy_restore_and_explicit_demote_to_mcp(trusted_tmp:
         )
 
         # Online restore #1 -> backup WITHOUT cap_c.
-        _run_online_policy_restore(bak_without_cap)
+        target = _run_online_policy_restore(bak_without_cap)
         view_r1 = loop.auth_gate.current()
         assert view_r1 is not None and cap_c.credential_id not in view_r1.auth.credentials
         with pytest.raises(BrainError) as exc_r1:
@@ -914,7 +925,7 @@ def test_f5_double_online_policy_restore_and_explicit_demote_to_mcp(trusted_tmp:
         assert exc_r1.value.code is ErrorCode.UNAUTHENTICATED
 
         # Online restore #2 -> backup WITH cap_c.
-        _run_online_policy_restore(bak_with_cap)
+        target = _run_online_policy_restore(bak_with_cap)
         view_r2 = loop.auth_gate.current()
         assert view_r2 is not None
         restored_cap = view_r2.auth.credentials[cap_c.credential_id]

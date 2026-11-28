@@ -52,6 +52,11 @@ def system_temp_dir() -> Path:
     return _system_temp_dir()
 
 
+def host_platform() -> str:
+    """The running host OS as ``sys.platform`` names it (the value native capture receipts record)."""
+    return sys.platform
+
+
 def _find_in_abs_dirs(name: str, dirs: list[str], *, exts: tuple[str, ...]) -> Path | None:
     for raw_dir in dirs:
         if not raw_dir:
@@ -88,6 +93,7 @@ def platform_traits(platform: str = sys.platform) -> PlatformTraits:
             default_scratch_base=_default_windows_scratch_base,
             resolve_temp_links=False,
             temp_dir=_system_temp_dir,
+            stage_private_dirs=True,
         )
     if platform == "darwin":
         return PlatformTraits(

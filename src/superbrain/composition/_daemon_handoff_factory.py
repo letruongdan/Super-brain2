@@ -23,7 +23,7 @@ def build_default_handoff_domain(
     from superbrain.application._deep_health import DeepHealthProbeResult
     from superbrain.application.handoff_service import HandoffKernelDomain
     from superbrain.application.idempotency import is_idempotency_expired
-    from superbrain.composition.doctor_probes_sp2 import run_sp2_doctor_probes
+    from superbrain.composition.doctor_probes_sp2_store import run_sp2_doctor_probes
     from superbrain.core._kernel_approval import Layer2State
     from superbrain.storage.handoffs import HandoffStore
     from superbrain.storage.idempotency import KernelIdempotencyStore

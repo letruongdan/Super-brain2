@@ -9,7 +9,7 @@ import stat
 import sys
 from datetime import timedelta
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import pytest
 
@@ -835,20 +835,59 @@ def test_preadmission_scratch_resists_squatted_tmp_and_rejects_symlink_scratch_b
         assert exc_link.value.code is ErrorCode.UNSAFE_PATH
     assert digest_tree(wal_root) == snap_before_link
 
-    # 3. Race during creation of a missing scratch_base (no exist_ok=True): if another actor plants an insecure
-    # directory right before mkdir runs, mkdir must NOT swallow FileExistsError + re-secure it; must refuse!
+    # 3. Race during creation/publication of a missing scratch_base: if another actor plants an insecure
+    # directory right before Path.mkdir or stage-to-target rename runs, _ensure_scratch_base must NOT swallow
+    # FileExistsError + re-secure it; must refuse!
     raced_scratch = trusted_tmp / "raced-scratch"
     real_mkdir = Path.mkdir
+    real_os_mkdir = os.mkdir
+    real_rename = os.rename
+    real_replace = os.replace
+    pub_cls = type(os_.publisher)
+    real_rename_dir = pub_cls.rename_dir
+    planted = [False]
+    raced_key = os.path.normcase(os.path.abspath(raced_scratch))
 
-    def racing_mkdir(self: Path, mode: int = 0o777, parents: bool = False, exist_ok: bool = False) -> None:
-        if self == raced_scratch and not raced_scratch.exists():
+    def _same_target(candidate: object) -> bool:
+        if not isinstance(candidate, (str, os.PathLike)):
+            return False
+        return os.path.normcase(os.path.abspath(os.fspath(candidate))) == raced_key
+
+    def _plant_once(candidate: object) -> None:
+        if not planted[0] and _same_target(candidate) and not os.path.lexists(raced_scratch):
+            planted[0] = True
             real_mkdir(raced_scratch, mode=0o700, parents=False, exist_ok=False)
             _loosen_file(raced_scratch)
+
+    def racing_mkdir(self: Path, mode: int = 0o777, parents: bool = False, exist_ok: bool = False) -> None:
+        _plant_once(self)
         real_mkdir(self, mode=mode, parents=parents, exist_ok=exist_ok)
+
+    def racing_os_mkdir(path: Any, mode: int = 0o777, **kwargs: Any) -> None:
+        _plant_once(path)
+        real_os_mkdir(path, mode=mode, **kwargs)
+
+    def racing_rename(src: Any, dst: Any, *args: Any, **kwargs: Any) -> None:
+        _plant_once(dst)
+        real_rename(src, dst, *args, **kwargs)
+
+    def racing_replace(src: Any, dst: Any, *args: Any, **kwargs: Any) -> None:
+        _plant_once(dst)
+        real_replace(src, dst, *args, **kwargs)
+
+    def racing_rename_dir(self_pub: Any, src: Path, dst: Path) -> None:
+        _plant_once(dst)
+        real_rename_dir(self_pub, src, dst)
 
     with monkeypatch.context() as mp:
         mp.setattr(Path, "mkdir", racing_mkdir)
+        mp.setattr(os, "mkdir", racing_os_mkdir)
+        mp.setattr(os, "rename", racing_rename)
+        mp.setattr(os, "replace", racing_replace)
+        mp.setattr(pub_cls, "rename_dir", racing_rename_dir)
         with pytest.raises(BrainError) as exc_race:
             admit_existing_pair(wal_root, store_id, os_, purpose="serve", scratch_base=raced_scratch)
         assert exc_race.value.code is ErrorCode.INSECURE_PERMISSIONS
+        assert planted[0], "race injector never fired during scratch_base creation/publication"
+    assert os_.permissions.object_problems(raced_scratch), "squatted scratch_base must not be silently re-secured"
     assert digest_tree(wal_root) == snap_before_link

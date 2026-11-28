@@ -66,7 +66,7 @@ def _conn_worker(self: _m.LoopbackServer, conn_id: int, raw_sock: socket.socket,
         if not _m.handle_identity_request(
             ssl_sock,
             reader,
-            self._ready,
+            self._live_ready(),
             deadline_ns=ident_deadline_ns,
             monotonic_ns=self._monotonic_ns,
         ):
@@ -79,7 +79,7 @@ def _conn_worker(self: _m.LoopbackServer, conn_id: int, raw_sock: socket.socket,
         handled, op_clean = try_handle_operator_request(
             ssl_sock,
             reader,
-            self._ready,
+            self._live_ready,
             auth_gate=lambda: self._owner.auth_gate,
             operator=self._operator,
             deadline_ns=tool_deadline_ns,
@@ -94,7 +94,7 @@ def _conn_worker(self: _m.LoopbackServer, conn_id: int, raw_sock: socket.socket,
         command = _m.read_admitted_tool_command(
             ssl_sock,
             reader,
-            self._ready,
+            self._live_ready,
             deadline_ns=tool_deadline_ns,
             monotonic_ns=self._monotonic_ns,
         )

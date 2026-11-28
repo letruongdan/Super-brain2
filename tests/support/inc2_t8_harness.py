@@ -162,6 +162,7 @@ def fixture_daemon(
         loop.interrupt_send_attempt = tracked_interrupt  # type: ignore[method-assign]
         server.start()
         started = True
+        loop.wait_doctor_settled(timeout=5.0)
         yield harness, proxy, tracker
     finally:
         if server is not None and started:

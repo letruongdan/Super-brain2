@@ -51,7 +51,7 @@ from superbrain.composition import daemon_entry, hook_entry, init_entry
 from superbrain.composition._layer2_live import verify_live_layer2_harness
 from superbrain.composition.capture_drain_entry import drain_outbox
 from superbrain.composition.doctor_entry import run_doctor
-from superbrain.composition.doctor_probes_sp2 import reconcile_harness_layer2_in_policy
+from superbrain.composition.doctor_probes_sp2_store import reconcile_harness_layer2_in_policy
 from superbrain.core._kernel_approval import (
     APPROVAL_NAMESPACE,
     RISK_POLICY_VERSION,
@@ -211,6 +211,8 @@ def _serve_daemon(
     thr.start()
     try:
         assert ready_evt.wait(timeout=5.0), f"daemon not ready (exits={exits})"
+        # the startup DoctorRun (SP1-I4) writes CAS before its holder commits; let it settle before tests read storage
+        assert cast(OwnerLoop, box["loop"]).wait_doctor_settled(timeout=10.0)
         yield cast(Ready, box["ready"]), cast(OwnerLoop, box["loop"])
     finally:
         stop_evt.set()
@@ -725,7 +727,8 @@ def test_p1_finding1_policy_restore_with_old_verified_row_fails_closed(
     finally:
         rt.close()
 
-    def _run_online_restore(ready_obj: Any) -> None:
+    def _run_online_restore(ready_obj: Any, loop_obj: Any) -> Any:
+        """Restore online; returns the live ``Ready`` (restore bumps the writer epoch)."""
         st_p, prev_env = _post_tls(
             ready_obj, ca_pem, "/v2/operator/restore", cli_token, {"target": "policy", "backup": str(bak_verified)}
         )
@@ -763,12 +766,13 @@ def test_p1_finding1_policy_restore_with_old_verified_row_fails_closed(
             },
         )
         assert st_e == 200 and exec_env.get("ok") is True, (st_e, exec_env)
+        return loop_obj.ready
 
     # Subcase 1c-match: Restore bak_verified WHILE disk checkout config still matches c_dig1/x_dig1 (no drift).
     # Restored policy MUST STILL fail-close both terminal & capture until explicitly re-verified!
     with _serve_daemon(cfg, os_, clock, mono) as (ready0, loop0):
         _publish_capture_creds(loop0, [(cap_c, "stream-claude-r-match", ws_a)])
-        _run_online_restore(ready0)
+        ready0 = _run_online_restore(ready0, loop0)
 
         st_same, app_same = _terminal_approve_proposal(ready0, ca_pem, cli_token, prop_same_cfg)
         assert app_same.get("ok") is False, (st_same, app_same)
@@ -840,7 +844,7 @@ def test_p1_finding1_policy_restore_with_old_verified_row_fails_closed(
     clock.advance(timedelta(seconds=5))
     with _serve_daemon(cfg, os_, clock, mono) as (ready, loop):
         _publish_capture_creds(loop, [(cap_c, "stream-claude-r", ws_a)])
-        _run_online_restore(ready)
+        ready = _run_online_restore(ready, loop)
 
         st_term_on, app_term_on = _terminal_approve_proposal(ready, ca_pem, cli_token, prop_online)
         assert app_term_on.get("ok") is False, (st_term_on, app_term_on)
@@ -1895,7 +1899,8 @@ def test_r4_finding2_deleted_config_and_dangling_link_across_restart_and_restore
         _remove_dangling_claude_link(chk_a)
 
     # Part C: Consecutive online /v2/operator/restore rebinds preserve configured-checkout detection.
-    def _online_restore(ready_obj: Any) -> None:
+    def _online_restore(ready_obj: Any, loop_obj: Any) -> Any:
+        """Restore online; returns the live ``Ready`` (restore bumps the writer epoch)."""
         st_p, prev_env = _post_tls(
             ready_obj, ca_pem, "/v2/operator/restore", cli_token, {"target": "policy", "backup": str(bak_verified)}
         )
@@ -1933,12 +1938,13 @@ def test_r4_finding2_deleted_config_and_dangling_link_across_restart_and_restore
             },
         )
         assert st_e == 200 and exec_env.get("ok") is True, (st_e, exec_env)
+        return loop_obj.ready
 
     clock.advance(timedelta(seconds=5))
     with _serve_daemon(cfg, os_, clock, mono) as (ready4, loop4):
         _publish_capture_creds(loop4, [(cap_c, "stream-r4-f2", ws_a)])
         # Restore #1 while config is deleted -> must fail closed.
-        _online_restore(ready4)
+        ready4 = _online_restore(ready4, loop4)
         st_r1, app_r1 = _terminal_approve_proposal(ready4, ca_pem, cli_token, prop_r1)
         assert app_r1.get("ok") is False, (st_r1, app_r1)
         assert app_r1["error"]["code"] == ErrorCode.CAPABILITY_UNAVAILABLE.value
@@ -1971,7 +1977,7 @@ def test_r4_finding2_deleted_config_and_dangling_link_across_restart_and_restore
         shutil.rmtree(chk_a / ".claude")
         (chk_a / "CLAUDE.md").unlink()
         clock.advance(timedelta(seconds=5))
-        _online_restore(ready4)
+        ready4 = _online_restore(ready4, loop4)
         st_r2d, app_r2d = _terminal_approve_proposal(ready4, ca_pem, cli_token, prop_r2_del)
         assert app_r2d.get("ok") is False, (st_r2d, app_r2d)
         assert app_r2d["error"]["code"] == ErrorCode.CAPABILITY_UNAVAILABLE.value
@@ -2211,8 +2217,8 @@ def test_r4_finding4_multi_checkout_doctor_and_deep_health_parity(
         "claude-code": Layer2State.VERIFIED,
         "codex": Layer2State.VERIFIED,
     }
-    l2_clean_checks = [c for c in doc_clean.checks if c.name == "layer2"]
-    assert len(l2_clean_checks) == 1 and l2_clean_checks[0].status == "ok"
+    l2_clean_checks = [c for c in doc_clean.checks if c.name == "harness.layer2"]
+    assert len(l2_clean_checks) == 1 and l2_clean_checks[0].status == "PASS"
 
     # Phase B: chk_b ALSO hosts claude-code and drifts its .claude/settings.local.json while chk_a remains clean!
     _write_plan_targets(chk_b, plan_claude_bootstrap(checkout_root=chk_b, profile_path=prof_b).targets)
@@ -2227,9 +2233,9 @@ def test_r4_finding4_multi_checkout_doctor_and_deep_health_parity(
     doc_drift_dict = doc_drift.to_dict()
     assert cast(dict[str, Any], doc_drift_dict["sp2"])["terminal_channel_eligible_effective"] is False
     assert {h.harness_id: h.state for h in doc_drift.layer2_harnesses}["claude-code"] is Layer2State.UNKNOWN
-    l2_drift_checks = [c for c in doc_drift.checks if c.name == "layer2"]
+    l2_drift_checks = [c for c in doc_drift.checks if c.name == "harness.layer2"]
     assert len(l2_drift_checks) == 1
-    assert l2_drift_checks[0].status == "warn"
+    assert l2_drift_checks[0].status == "WARN"
     assert "terminal_channel_eligible=false" in l2_drift_checks[0].detail
 
     proc = subprocess.run(
@@ -2254,11 +2260,11 @@ def test_r4_finding4_multi_checkout_doctor_and_deep_health_parity(
     cli_data = json.loads(proc.stdout)["data"]
     assert cli_data["terminal_channel_eligible"] is False
     assert cli_data["sp2"]["terminal_channel_eligible_effective"] is False
-    cli_l2 = [c for c in cli_data["checks"] if c["name"] == "layer2"]
-    assert len(cli_l2) == 1 and cli_l2[0]["status"] == "warn"
-    assert any(c["name"] == "sp2_layer2_drift" and c["status"] == "warn" for c in cli_data["checks"])
+    cli_l2 = [c for c in cli_data["checks"] if c["name"] == "harness.layer2"]
+    assert len(cli_l2) == 1 and cli_l2[0]["status"] == "WARN"
+    assert any(c["name"] == "sp2.layer2_drift" and c["status"] == "WARN" for c in cli_data["checks"])
 
-    # Live daemon get_health(deep=True) over TLS MUST agree and report layer2_drifted / layer2_unverified.
+    # Live daemon get_health(deep=True) over TLS MUST agree: the doctor's harness.layer2 code is degraded.
     with _serve_daemon(cfg, os_, clock, mono) as (ready, _loop):
         target = LoopbackTarget(
             endpoint=ready.endpoint,
@@ -2278,10 +2284,7 @@ def test_r4_finding4_multi_checkout_doctor_and_deep_health_parity(
         assert deep.get("ok") is True, deep
         deep_data = cast(dict[str, Any], deep["data"])
         _validate_get_health_schema(deep_data)
-        assert any(c in ("layer2_drifted", "layer2_unverified") for c in deep_data["degraded_codes"]), deep_data[
-            "degraded_codes"
-        ]
-        assert "terminal_channel_ineligible" in deep_data["degraded_codes"], deep_data["degraded_codes"]
+        assert "harness.layer2" in deep_data["degraded_codes"], deep_data["degraded_codes"]
 
 
 # ---------------------------------------------------------------------------
@@ -2804,8 +2807,8 @@ def test_r5_finding2_active_host_version_drift_on_terminal_and_doctor(
         doc_upg = run_doctor(rep.daemon_config_path, checkout_root=chk_a, os_=os_)
         assert doc_upg.terminal_channel_eligible is False
         assert doc_upg.overall_status == "warn"
-        assert any(c.name == "layer2" and c.status == "warn" for c in doc_upg.checks)
-        assert any(c.name == "sp2_layer2_drift" and c.status == "warn" for c in doc_upg.checks)
+        assert any(c.name == "harness.layer2" and c.status == "WARN" for c in doc_upg.checks)
+        assert any(c.name == "sp2.layer2_drift" and c.status == "WARN" for c in doc_upg.checks)
         sp2_upg = cast(dict[str, Any], doc_upg.to_dict()["sp2"])
         assert sp2_upg["terminal_channel_eligible_effective"] is False
         upg_by_id = {str(h["harness_id"]): h for h in cast(list[dict[str, Any]], sp2_upg["layer2_harnesses"])}

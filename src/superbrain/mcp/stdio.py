@@ -3,15 +3,16 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from typing import BinaryIO, Literal, TypeAlias
+from typing import TYPE_CHECKING, BinaryIO, Literal, TypeAlias
 
-from superbrain.core._wire_catalog import EXPECTED_TOOL_ORDER
+from superbrain.core._json_parse import MAX_WIRE_BODY_BYTES, parse_json
 from superbrain.core._wire_jsonrpc import (
     JSONRPC_INVALID_PARAMS,
     JSONRPC_INVALID_REQUEST,
     JSONRPC_METHOD_NOT_FOUND,
     JSONRPC_PARSE_ERROR,
     JSONRPC_VERSION,
+    MCP_PROTOCOL_VERSION,
     JsonRpcError,
     JsonRpcId,
     encode_jsonrpc_error,
@@ -21,15 +22,9 @@ from superbrain.core._wire_jsonrpc import (
 from superbrain.core.canonical import canonical_json, validate_json
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.jsonvalue import JsonValue
-from superbrain.core.kernel import CallResult
-from superbrain.core.wire import (
-    MAX_WIRE_BODY_BYTES,
-    MCP_PROTOCOL_VERSION,
-    load_catalog,
-    make_error_envelope,
-    make_mcp_tool_result,
-    parse_json,
-)
+
+if TYPE_CHECKING:
+    from superbrain.core.kernel import CallResult
 
 __all__ = [
     "MCP_PROTOCOL_VERSION",
@@ -45,12 +40,21 @@ SERVER_VERSION = "0.1.0"
 
 JSONRPC_INTERNAL_ERROR = -32603
 _READ_CHUNK_BYTES = 65_536
-_KNOWN_TOOLS: frozenset[str] = frozenset(EXPECTED_TOOL_ORDER)
+_KNOWN_TOOLS: frozenset[str] | None = None
 _UNCERTAIN_TEXT = (
     "daemon_unavailable: daemon unavailable; request_may_have_run=true; retry with the same idempotency_key"
 )
 
-ToolCaller: TypeAlias = Callable[[str, dict[str, JsonValue]], CallResult]
+
+def _known_tools() -> frozenset[str]:
+    global _KNOWN_TOOLS
+    if _KNOWN_TOOLS is None:
+        from superbrain.core._wire_catalog import EXPECTED_TOOL_ORDER
+
+        _KNOWN_TOOLS = frozenset(EXPECTED_TOOL_ORDER)
+    return _KNOWN_TOOLS
+
+ToolCaller: TypeAlias = Callable[[str, dict[str, JsonValue]], "CallResult"]
 _SessionState: TypeAlias = Literal["new", "waiting_initialized", "ready"]
 
 
@@ -121,8 +125,10 @@ def _execute_tool_call(
         return encode_jsonrpc_error(request_id, JSONRPC_INVALID_PARAMS)
     tool_name = params.get("name")
     arguments = params.get("arguments")
-    if not isinstance(tool_name, str) or tool_name not in _KNOWN_TOOLS or not isinstance(arguments, dict):
+    if not isinstance(tool_name, str) or tool_name not in _known_tools() or not isinstance(arguments, dict):
         return encode_jsonrpc_error(request_id, JSONRPC_INVALID_PARAMS)
+
+    from superbrain.core.wire import make_error_envelope, make_mcp_tool_result
 
     clean_args: dict[str, JsonValue] = dict(arguments)
     try:
@@ -201,6 +207,8 @@ def _dispatch_line(
     if method == "tools/list":
         if not _valid_tools_list_params(params):
             return state, encode_jsonrpc_error(req_id, JSONRPC_INVALID_PARAMS)
+        from superbrain.core.wire import load_catalog
+
         tools_payload: dict[str, JsonValue] = {"tools": list(load_catalog().mcp_tools_list())}
         return state, _encode_result(req_id, tools_payload)
 

@@ -29,6 +29,7 @@ from superbrain.core.kernel import (
     MirrorCandidate,
     Principal,
     RequestAuthView,
+    RetentionClass,
     Scope,
     SendAttemptCompletion,
     SnapshotObservation,
@@ -93,8 +94,15 @@ class KernelTx(Protocol):
         """Validate and append ``record`` to the ledger, applying every projection in the same transaction."""
         ...
 
-    def hold_blob(self, data: bytes, *, holder_id: str) -> str:
-        """Publish ``data`` durably (verified if already present), then hold it for ``holder_id``; its digest."""
+    def hold_blob(
+        self,
+        data: bytes,
+        *,
+        holder_id: str,
+        retention: RetentionClass = RetentionClass.DURABLE,
+        expires_at: datetime | str | None = None,
+    ) -> str:
+        """Publish ``data`` (verified if already present), then hold it for ``holder_id`` under ``retention``."""
         ...
 
     def blob_restricted(self, digest: str) -> bool:
@@ -178,6 +186,20 @@ class KernelTx(Protocol):
 
     def due_jobs(self, now: datetime, limit: int) -> tuple[JobRecord, ...]:
         """Up to ``limit`` queued jobs with ``retry_at <= now``, in ``(retry_at, job_id)`` order."""
+        ...
+
+    def due_jobs_by_kinds(
+        self, now: datetime, kinds: Sequence[str], limit: int, *, exclude: bool = False
+    ) -> tuple[JobRecord, ...]:
+        """Up to ``limit`` queued jobs matching (or excluding) ``kinds`` with ``retry_at <= now``."""
+        ...
+
+    def active_jobs_by_kinds(self, kinds: Sequence[str], limit: int) -> tuple[JobRecord, ...]:
+        """Up to ``limit`` ``queued|leased|running`` jobs matching ``kinds`` in ``(sequence, job_id)`` order."""
+        ...
+
+    def claimed_jobs_by_kinds(self, kinds: Sequence[str], epoch: int, limit: int) -> tuple[JobRecord, ...]:
+        """Up to ``limit`` ``leased|running`` jobs matching ``kinds`` leased in writer ``epoch``, by ``job_id``."""
         ...
 
     def stale_jobs(self, epoch: int, limit: int) -> tuple[JobRecord, ...]:

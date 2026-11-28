@@ -30,7 +30,8 @@ STATUS_FIELDS: frozenset[str] = frozenset({"schema_version", "status", "outcome"
 _PRINTABLE_AND_WS_BYTES = bytes(range(0x20, 0x7F)) + b"\t\n\r\x0b\x0c"
 _PRINTABLE_NON_WS_BYTES = bytes(range(0x21, 0x7F))
 _JSON_SAFE_NL_BYTES = bytes(range(0x20, 0x7F)) + b"\n"
-_KV_WORDS = ("token", "passw", "pwd", "passphrase", "secret", "key")
+# Stems covering every alternation in ``_KEY_VALUE_SECRET`` (``pass`` covers ``password``/``passwd``/``passphrase``).
+_KV_WORDS = ("token", "pass", "pwd", "secret", "key")
 
 _UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 _STATUS_VALUE_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
@@ -72,6 +73,7 @@ _WORD_BOUNDARY = re.compile(
     r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])|(?<=[A-Za-z])(?=[0-9])|(?<=[0-9])(?=[A-Za-z])"
 )
 _KEY_WORD_SPLIT = re.compile(r"[^0-9a-z]+")
+_ASCII_WORD_SPLIT = re.compile(r"[0-9]+|[A-Z]+(?![a-z])|[A-Z]?[a-z]+")
 _ID_SEGMENTS = re.compile(r"[._-]")
 _BENIGN_NEXT_WORDS: dict[str, frozenset[str]] = {
     "token": frozenset({"estimator", "estimate", "budget", "count", "counts", "limit", "usage", "total"}),
@@ -93,8 +95,8 @@ class _Deadline(Exception):
 def _key_words(key: str) -> list[str]:
     """NFKC + casefold words of a key, split at separators, camelCase, acronym->Camel and letter<->digit."""
     if key.isascii():
-        folded = _WORD_BOUNDARY.sub(" ", key).lower()
-        return [word for word in _KEY_WORD_SPLIT.split(folded) if word]
+        words = _ASCII_WORD_SPLIT.findall(key)
+        return words if key.islower() else [word.lower() for word in words]
     normalized = unicodedata.normalize("NFKC", key)
     return [word for word in _KEY_WORD_SPLIT.split(_WORD_BOUNDARY.sub(" ", normalized).casefold()) if word]
 

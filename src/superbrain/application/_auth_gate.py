@@ -286,9 +286,9 @@ def evaluate_shallow_health(
         selected_scope=command.selected_scope,
         correlation_id=command.correlation_id,
     )
+    authorize_call_against_snapshot(view.auth, principal, call)
     if call.selected_scope is not None:
         raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
-    authorize_call_against_snapshot(view.auth, principal, call)
 
     if monotonic_clock.monotonic_ns() >= deadline_ns - HANDLER_RESERVE_NS:
         raise BrainError(ErrorCode.DEADLINE_EXCEEDED, "deadline exceeded")

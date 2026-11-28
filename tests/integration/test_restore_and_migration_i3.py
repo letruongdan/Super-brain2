@@ -8,13 +8,12 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
-import socket
-import ssl
 import struct
 import subprocess
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
@@ -26,6 +25,7 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from superbrain.adapters.harness_config.markdown_blocks import merge_markdown_block
 from superbrain.adapters.harness_config.merger import SharedConfigMergerAdapter
 from superbrain.adapters.os import os_adapters
+from superbrain.adapters.os.daemon_config import read_client_endpoint
 from superbrain.application.journal_recovery import reconcile_and_classify_journals
 from superbrain.application.review_apply import ReviewApplyService, TargetWriteInput
 from superbrain.cli_api.operator import OPERATOR_PATHS
@@ -71,7 +71,7 @@ from tests.support.inc2_fixture import (
     open_kernel_job_runtime,
     reopen_kernel_job_runtime,
 )
-from tests.support.inc2_transport import FakeMonotonicClock, read_raw_http_response
+from tests.support.inc2_transport import FakeMonotonicClock, post_tls_http_json
 from tests.support.inc3_i34_crash_cases import I34_CHILD, I34CrashCase, prepare_i34_seed, run_i34_crash_case
 from tests.support.kernel_auth import seed_principal_and_credential
 from tests.support.seed_clone import restore_migration_fixture_clone
@@ -166,31 +166,7 @@ def _daemon(cfg: DaemonConfig, os_: Any, clock: FakeClock, mono: FakeMonotonicCl
 
 
 def _post_tls(ready: Ready, ca_pem: str, path: str, token: str, payload: bytes | object) -> dict[str, Any]:
-    host, body = (
-        f"{ready.endpoint.host}:{ready.endpoint.port}",
-        payload if isinstance(payload, bytes) else json.dumps(payload).encode("utf-8"),
-    )
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    ctx.load_verify_locations(cadata=ca_pem)
-    ctx.check_hostname = True
-    with (
-        socket.create_connection((ready.endpoint.host, ready.endpoint.port), timeout=2.0) as raw,
-        ctx.wrap_socket(raw, server_hostname="127.0.0.1") as sock,
-    ):
-        sock.settimeout(3.0)
-        sock.sendall(f"GET /v2/identity HTTP/1.1\r\nHost: {host}\r\n\r\n".encode("ascii"))
-        assert read_raw_http_response(sock, timeout=3.0).startswith(b"HTTP/1.1 200 ")
-        hdr = (
-            f"POST {path} HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer {token}\r\n"
-            f"X-Store-Id: {ready.identity.store_id}\r\nX-Writer-Epoch: {ready.identity.writer_epoch}\r\n"
-            f"X-Superbrain-Instance: {ready.identity.instance_id}\r\n"
-            f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n\r\n"
-        ).encode("iso-8859-1")
-        sock.sendall(hdr + body)
-        resp = read_raw_http_response(sock, timeout=5.0)
-    head, sep, data = resp.partition(b"\r\n\r\n")
-    assert sep and head.startswith(b"HTTP/1.1 "), resp[:200]
-    return cast(dict[str, Any], json.loads(data))
+    return post_tls_http_json(ready, ca_pem, path, token, payload)[1]
 
 
 @pytest.mark.parametrize("case", I3_4_CRASH_CASES, ids=lambda c: c.node_id)
@@ -398,7 +374,12 @@ def test_online_operator_restore_route_auth_preview_and_immediate_effect(trusted
         signed_body = {**base, "approval": ssh_ap}
         done = _post_tls(ready, ca_pem, "/v2/operator/restore", cli_token, signed_body)
         assert done["ok"] is True and int(done["data"]["trust_generation"]) > int(ch["trust_generation"])
-        replay = _post_tls(ready, ca_pem, "/v2/operator/restore", cli_token, signed_body)
+        post_ep = read_client_endpoint(DataRoot.at(cfg.data_root).endpoint_path, os_)
+        assert post_ep.writer_epoch == int(done["data"]["new_epoch"]) > ready.identity.writer_epoch
+        post_ready = replace(ready, endpoint=post_ep, identity=post_ep.identity)
+        stale = _post_tls(ready, ca_pem, "/v2/operator/restore", cli_token, signed_body)
+        assert stale["ok"] is False and stale["error"]["code"] == ErrorCode.IDENTITY_MISMATCH.value
+        replay = _post_tls(post_ready, ca_pem, "/v2/operator/restore", cli_token, signed_body)
         assert replay["ok"] is False and replay["error"]["code"] in {
             ErrorCode.UNAUTHENTICATED.value,
             ErrorCode.REVISION_CONFLICT.value,

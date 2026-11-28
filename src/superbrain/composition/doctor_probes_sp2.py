@@ -1,545 +1,597 @@
-"""Strictly read-only SP2 diagnostic probes (outbox, gaps, sessions, Layer-2) & policy reconciliation (SP2-5)."""
+"""SP2 capture probe adapter, M1 handover readiness evaluator, and port contract re-exports."""
 
 from __future__ import annotations
 
-import os
-import shutil
-import sqlite3
-import stat
-import tempfile
+import math
+import threading
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
+from typing import cast
 
-from superbrain.adapters.harness.host_version import probe_installed_host_version
-from superbrain.adapters.harness.layer2_probe import (
-    NativeHostReceipt,
-    compute_harness_config_digest,
-    verify_native_host_receipt,
+from superbrain.adapters.os import os_adapters
+from superbrain.adapters.os.daemon_config import read_client_profile, read_daemon_config
+from superbrain.adapters.os.workspaces import verify_launch_checkout
+from superbrain.application.doctor import DoctorReport, KernelPrivacyScanner, inspect_doctor_snapshot
+from superbrain.composition._doctor_sp2_eval import (
+    DEGRADED_LAYER2,
+    STATUS_RANK,
+    StatusLit,
+    SurfaceState,
+    classify_capture_provenance,
+    count_applied_bootstrap_evidence,
+    norm_status,
+    pick_worse,
+    resolve_checkout_scope,
+    sanitize_text,
+    serialize_harnesses,
+    surface_entry,
 )
 from superbrain.core._kernel_approval import CLI_HARNESS_ID, Layer2State
-from superbrain.core._kernel_base import OPAQUE_ID_RE
-from superbrain.core.errors import BrainError
+from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.jsonvalue import JsonValue
-from superbrain.ports.capture import OUTBOX_RECORD_EVENT, OUTBOX_RECORD_GAP
-from superbrain.ports.continuity import SessionState, decide_session_liveness
-from superbrain.ports.os import OsAdapters
-from superbrain.storage import _policy_layer2 as policy_layer2
-from superbrain.storage._outbox_io import (
-    _PART_SUFFIX,
-    _REPARSE_POINT,
-    _STREAMS_DIR,
-    entry_is_link,
-    is_link_path,
-    parse_frame_filename_identity,
-    reject_links_upward,
+from superbrain.ports.doctor import (
+    CaptureDoctorProbePort,
+    CaptureDoctorProbeResult,
+    CaptureDoctorSnapshot,
+    CaptureHarnessDoctorStatus,
+    DoctorLayer2HarnessStatus,
+    DoctorSnapshot,
+    OutboxReplayPort,
+    OutboxReplayResult,
+    PrivacyScannerPort,
+    SupervisorControlPort,
+    SupervisorRestartResult,
 )
-from superbrain.storage._sessions_sql import parse_iso_utc
+from superbrain.ports.os import OsAdapters
+from superbrain.storage._doctor_reader import read_doctor_snapshot
 from superbrain.storage.layout import DataRoot
-from superbrain.storage.policy_store import PolicyStore
-from superbrain.storage.sqlite import open_readonly
 
+M1_SURFACE_DEEP_HEALTH = "get_health(deep=true)"
+M1_SURFACE_PERMISSIONS = "permissions.data_root"
+M1_SURFACE_CAPTURE = "capture.sp2_probes"
+M1_SURFACE_LAYER2 = "harness.layer2"
+M1_SURFACE_BOOTSTRAP_DRIFT = "harness.bootstrap_drift"
 
-def _table_exists(db: sqlite3.Connection, name: str) -> bool:
-    row = db.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)).fetchone()
-    return row is not None
-
-
-@dataclass(frozen=True)
-class Sp2OutboxStatus:
-    present: bool
-    pending_event_count: int
-    pending_gap_count: int
-    incomplete_part_count: int
-    total_bytes: int
-    errors: tuple[str, ...] = ()
-
-    def to_dict(self) -> dict[str, JsonValue]:
-        return {
-            "present": self.present,
-            "pending_event_count": self.pending_event_count,
-            "pending_gap_count": self.pending_gap_count,
-            "incomplete_part_count": self.incomplete_part_count,
-            "total_bytes": self.total_bytes,
-            "errors": list(self.errors),
-        }
-
-
-@dataclass(frozen=True)
-class Sp2GapStatus:
-    open_daemon_gaps: int
-    closed_daemon_gaps: int
-    producer_gaps: int
-
-    def to_dict(self) -> dict[str, JsonValue]:
-        return {
-            "open_daemon_gaps": self.open_daemon_gaps,
-            "closed_daemon_gaps": self.closed_daemon_gaps,
-            "producer_gaps": self.producer_gaps,
-        }
-
-
-@dataclass(frozen=True)
-class Sp2SessionStatus:
-    total_sessions: int
-    active_sessions: int
-    in_progress_unknown_sessions: int
-    ended_sessions: int
-    pending_refresh_events: int
-    dirty_tasks: int
-
-    def to_dict(self) -> dict[str, JsonValue]:
-        return {
-            "total_sessions": self.total_sessions,
-            "active_sessions": self.active_sessions,
-            "in_progress_unknown_sessions": self.in_progress_unknown_sessions,
-            "ended_sessions": self.ended_sessions,
-            "pending_refresh_events": self.pending_refresh_events,
-            "dirty_tasks": self.dirty_tasks,
-        }
-
-
-@dataclass(frozen=True)
-class Sp2Layer2HarnessProbe:
-    harness_id: str
-    recorded_state: Layer2State
-    effective_state: Layer2State
-    recorded_host_version: str | None
-    recorded_config_digest: str | None
-    observed_host_version: str | None
-    observed_config_digest: str | None
-    invalidated_reason: str | None = None
-
-    def to_dict(self) -> dict[str, JsonValue]:
-        return {
-            "harness_id": self.harness_id,
-            "recorded_state": self.recorded_state.value,
-            "effective_state": self.effective_state.value,
-            "recorded_host_version": self.recorded_host_version,
-            "recorded_config_digest": self.recorded_config_digest,
-            "observed_host_version": self.observed_host_version,
-            "observed_config_digest": self.observed_config_digest,
-            "invalidated_reason": self.invalidated_reason,
-        }
-
-
-@dataclass(frozen=True)
-class Sp2DoctorReport:
-    outbox: Sp2OutboxStatus
-    gaps: Sp2GapStatus
-    sessions: Sp2SessionStatus
-    layer2_harnesses: tuple[Sp2Layer2HarnessProbe, ...]
-    terminal_channel_eligible_effective: bool
-    integrity_errors: tuple[str, ...] = ()
-
-    def to_dict(self) -> dict[str, JsonValue]:
-        return {
-            "outbox": self.outbox.to_dict(),
-            "gaps": self.gaps.to_dict(),
-            "sessions": self.sessions.to_dict(),
-            "layer2_harnesses": [h.to_dict() for h in self.layer2_harnesses],
-            "terminal_channel_eligible_effective": self.terminal_channel_eligible_effective,
-            "integrity_errors": list(self.integrity_errors),
-        }
-
-
-def probe_outbox_readonly(outbox_dir: Path) -> Sp2OutboxStatus:
-    """Inspect ``outbox_dir`` via ``scandir`` with zero file creation, locking, or ``.part`` sweeping."""
-    if not os.path.lexists(outbox_dir):
-        return Sp2OutboxStatus(False, 0, 0, 0, 0)
-    errors: list[str] = []
-    try:
-        reject_links_upward(outbox_dir)
-        st_root = os.lstat(outbox_dir)
-        if not stat.S_ISDIR(st_root.st_mode) or (getattr(st_root, "st_file_attributes", 0) & _REPARSE_POINT) != 0:
-            return Sp2OutboxStatus(True, 0, 0, 0, 0, errors=("outbox root is not a regular directory",))
-    except (BrainError, OSError) as exc:
-        return Sp2OutboxStatus(True, 0, 0, 0, 0, errors=(f"outbox path error: {exc}",))
-
-    ev_cnt = 0
-    gap_cnt = 0
-    part_cnt = 0
-    total_bytes = 0
-    streams_dir: Path | None = None
-    try:
-        with os.scandir(outbox_dir) as root_it:
-            for entry in root_it:
-                if entry_is_link(entry):
-                    errors.append(f"unsafe link in outbox: {entry.name}")
-                    continue
-                if entry.name.endswith(_PART_SUFFIX):
-                    part_cnt += 1
-                    total_bytes += entry.stat(follow_symlinks=False).st_size
-                elif entry.name == _STREAMS_DIR:
-                    st = entry.stat(follow_symlinks=False)
-                    if stat.S_ISDIR(st.st_mode):
-                        streams_dir = Path(entry.path)
-        if streams_dir is not None:
-            with os.scandir(streams_dir) as s_it:
-                for sd in s_it:
-                    if entry_is_link(sd):
-                        errors.append(f"unsafe link in streams: {sd.name}")
-                        continue
-                    if not stat.S_ISDIR(sd.stat(follow_symlinks=False).st_mode):
-                        continue
-                    with os.scandir(sd.path) as f_it:
-                        for fe in f_it:
-                            if entry_is_link(fe):
-                                errors.append(f"unsafe link frame: {fe.name}")
-                                continue
-                            if fe.name.endswith(_PART_SUFFIX):
-                                part_cnt += 1
-                                total_bytes += fe.stat(follow_symlinks=False).st_size
-                                continue
-                            ident = parse_frame_filename_identity(fe.name)
-                            if ident is None:
-                                continue
-                            st_f = fe.stat(follow_symlinks=False)
-                            if not stat.S_ISREG(st_f.st_mode):
-                                continue
-                            total_bytes += st_f.st_size
-                            if ident[0] == OUTBOX_RECORD_EVENT:
-                                ev_cnt += 1
-                            elif ident[0] == OUTBOX_RECORD_GAP:
-                                gap_cnt += 1
-    except (BrainError, OSError) as exc:
-        errors.append(f"outbox scan error: {exc}")
-    return Sp2OutboxStatus(True, ev_cnt, gap_cnt, part_cnt, total_bytes, errors=tuple(errors))
-
-
-def probe_sp2_store_readonly(
-    store_db: Path,
-    scratch: Path,
-    *,
-    now: datetime,
-    errors: list[str],
-) -> tuple[Sp2GapStatus, Sp2SessionStatus]:
-    """Read gap, session liveness, and continuity worker counts from ``brain.db`` read-only."""
-    if not os.path.exists(store_db):
-        return Sp2GapStatus(0, 0, 0), Sp2SessionStatus(0, 0, 0, 0, 0, 0)
-    db: sqlite3.Connection | None = None
-    open_g = closed_g = prod_g = 0
-    total_s = active_s = unk_s = ended_s = 0
-    pending_ev = dirty_tasks = 0
-    try:
-        db = open_readonly(store_db, scratch_dir=scratch)
-        if _table_exists(db, "capture_gaps"):
-            for status, cnt in db.execute(
-                "SELECT status, COUNT(*) FROM capture_gaps GROUP BY status"
-            ).fetchall():
-                st_str = str(status)
-                if st_str == "open":
-                    open_g += int(cnt)
-                elif st_str == "closed":
-                    closed_g += int(cnt)
-                elif st_str == "producer":
-                    prod_g += int(cnt)
-        if _table_exists(db, "sessions"):
-            for rec_state, last_at in db.execute("SELECT state, last_event_at FROM sessions").fetchall():
-                total_s += 1
-                dec = decide_session_liveness(
-                    recorded_state=SessionState(str(rec_state)),
-                    last_event_at=parse_iso_utc(str(last_at)),
-                    now=now,
-                )
-                if dec.state is SessionState.ACTIVE:
-                    active_s += 1
-                elif dec.state is SessionState.IN_PROGRESS_UNKNOWN:
-                    unk_s += 1
-                elif dec.state is SessionState.ENDED:
-                    ended_s += 1
-        if _table_exists(db, "continuity_refresh_state"):
-            row = db.execute(
-                "SELECT COALESCE(SUM(pending_event_count), 0), COALESCE(SUM(dirty_flag), 0) "
-                "FROM continuity_refresh_state"
-            ).fetchone()
-            if row is not None:
-                pending_ev = int(row[0])
-                dirty_tasks = int(row[1])
-    except (BrainError, sqlite3.Error, ValueError) as exc:
-        errors.append(f"store sp2 read error: {exc}")
-    finally:
-        if db is not None:
-            db.close()
-    return (
-        Sp2GapStatus(open_g, closed_g, prod_g),
-        Sp2SessionStatus(total_s, active_s, unk_s, ended_s, pending_ev, dirty_tasks),
-    )
-
-
-def _candidate_checkouts(db: sqlite3.Connection, checkout_root: Path | None) -> tuple[Path, ...]:
-    seen: dict[str, Path] = {}
-    if _table_exists(db, "workspace_checkout"):
-        rows = db.execute("SELECT checkout_path FROM workspace_checkout ORDER BY created_at ASC").fetchall()
-        for (raw_path,) in rows:
-            if isinstance(raw_path, str) and raw_path:
-                norm = os.path.normcase(os.path.abspath(raw_path))
-                seen.setdefault(norm, Path(raw_path))
-    if checkout_root is not None:
-        norm = os.path.normcase(os.path.abspath(str(checkout_root)))
-        seen.setdefault(norm, checkout_root)
-    return tuple(seen.values())
-
-
-def _probe_has_presence(chk_path: Path, harness_id: str) -> bool:
-    if harness_id == "claude-code":
-        return os.path.lexists(chk_path / ".claude") or os.path.lexists(chk_path / "CLAUDE.md")
-    if harness_id == "codex":
-        return os.path.lexists(chk_path / ".codex") or os.path.lexists(chk_path / "AGENTS.md")
-    return False
-
-
-def probe_sp2_layer2_readonly(
-    policy_db: Path,
-    scratch: Path,
-    *,
-    checkout_root: Path | None,
-    observed_host_versions: Mapping[str, str] | None,
-    host_version_resolver: Callable[[str], str | None] | None = None,
-    os_: OsAdapters,
-    errors: list[str],
-) -> tuple[tuple[Sp2Layer2HarnessProbe, ...], bool]:
-    """Read Layer-2 bindings read-only and detect effective version/config drift without mutating."""
-    if not os.path.exists(policy_db):
-        return (), False
-    db: sqlite3.Connection | None = None
-    probes: list[Sp2Layer2HarnessProbe] = []
-    active_non_cli: set[str] = set()
-    seen: set[str] = set()
-    try:
-        db = open_readonly(policy_db, scratch_dir=scratch)
-        if _table_exists(db, "principal") and _table_exists(db, "credential"):
-            for (hid,) in db.execute(
-                "SELECT DISTINCT p.harness_id FROM principal AS p "
-                "WHERE p.harness_id != ? AND EXISTS ("
-                "SELECT 1 FROM credential AS c WHERE c.principal_id = p.id AND c.revoked_intent_id IS NULL)",
-                (CLI_HARNESS_ID,),
-            ).fetchall():
-                active_non_cli.add(str(hid))
-                seen.add(str(hid))
-        candidate_checkouts = _candidate_checkouts(db, checkout_root)
-        configured_map = policy_layer2.configured_layer2_checkouts(db)
-        if _table_exists(db, "harness_layer2_state"):
-            stale_seq = policy_layer2.layer2_stale_through_seq(db)
-            for (hid,) in db.execute("SELECT DISTINCT harness_id FROM harness_layer2_state").fetchall():
-                seen.add(str(hid))
-            for hid in sorted(seen):
-                row = db.execute(
-                    "SELECT seq, host_version, config_digest, state FROM harness_layer2_state "
-                    "WHERE harness_id = ? ORDER BY seq DESC LIMIT 1",
-                    (hid,),
-                ).fetchone()
-                row_seq = 0 if row is None else int(row[0])
-                rec_ver = None if row is None else str(row[1])
-                rec_dig = None if row is None else str(row[2])
-                rec_state = Layer2State.UNKNOWN if row is None else Layer2State(str(row[3]))
-                eff_resolver = (
-                    host_version_resolver if host_version_resolver is not None else probe_installed_host_version
-                )
-                if observed_host_versions is not None:
-                    raw_obs_ver: object = observed_host_versions.get(hid)
-                else:
-                    try:
-                        raw_obs_ver = eff_resolver(hid)
-                    except Exception:  # noqa: BLE001
-                        raw_obs_ver = None
-                obs_ver = (
-                    raw_obs_ver
-                    if isinstance(raw_obs_ver, str) and OPAQUE_ID_RE.fullmatch(raw_obs_ver)
-                    else None
-                )
-                configured_paths = set(configured_map.get(hid, ()))
-
-                obs_dig: str | None = None
-                drifted_chk_dig: str | None = None
-                cfg_changed = False
-                for chk_p in candidate_checkouts:
-                    norm_chk = os.path.normcase(os.path.abspath(str(chk_p)))
-                    d = compute_harness_config_digest(hid, chk_p, os_)
-                    applies = (
-                        d is not None
-                        or _probe_has_presence(chk_p, hid)
-                        or norm_chk in configured_paths
-                    )
-                    if d is not None and obs_dig is None:
-                        obs_dig = d
-                    if applies and d != rec_dig:
-                        cfg_changed = True
-                        drifted_chk_dig = d
-                        break
-
-                if cfg_changed and drifted_chk_dig is not None:
-                    obs_dig = drifted_chk_dig
-                elif cfg_changed:
-                    obs_dig = None
-
-                eff_state = rec_state
-                inv_reason: str | None = None
-                if rec_state is Layer2State.VERIFIED:
-                    if obs_ver is None:
-                        eff_state = Layer2State.UNKNOWN
-                        inv_reason = (
-                            "host_version_unverified" if raw_obs_ver is None else "host_version_changed"
-                        )
-                    elif obs_ver != rec_ver:
-                        eff_state = Layer2State.UNKNOWN
-                        inv_reason = "host_version_changed"
-                    elif cfg_changed:
-                        eff_state = Layer2State.UNKNOWN
-                        inv_reason = "config_digest_changed"
-                    elif row_seq <= stale_seq:
-                        eff_state = Layer2State.UNKNOWN
-                        inv_reason = "policy_restored"
-                probes.append(
-                    Sp2Layer2HarnessProbe(
-                        harness_id=hid,
-                        recorded_state=rec_state,
-                        effective_state=eff_state,
-                        recorded_host_version=rec_ver,
-                        recorded_config_digest=rec_dig,
-                        observed_host_version=obs_ver,
-                        observed_config_digest=obs_dig,
-                        invalidated_reason=inv_reason,
-                    )
-                )
-    except (BrainError, sqlite3.Error, ValueError) as exc:
-        errors.append(f"policy layer2 read error: {exc}")
-        return (), False
-    finally:
-        if db is not None:
-            db.close()
-
-    by_id = {p.harness_id: p for p in probes}
-    eligible = bool(active_non_cli) and all(
-        hid in by_id and by_id[hid].effective_state is Layer2State.VERIFIED for hid in active_non_cli
-    )
-    return tuple(probes), eligible
-
-
-def run_sp2_doctor_probes(
-    data_root: Path,
-    *,
-    outbox_dir: Path | None = None,
-    checkout_root: Path | None = None,
-    observed_host_versions: Mapping[str, str] | None = None,
-    host_version_resolver: Callable[[str], str | None] | None = None,
-    os_: OsAdapters,
-    now: datetime | None = None,
-) -> Sp2DoctorReport:
-    """Run all SP2 read-only diagnostic probes across outbox, ``brain.db``, ``policy.db`` & checkout."""
-    root = DataRoot.at(data_root)
-    eff_now = now if now is not None else os_.clock.now()
-    errors: list[str] = []
-    outbox = (
-        probe_outbox_readonly(outbox_dir)
-        if outbox_dir is not None
-        else Sp2OutboxStatus(False, 0, 0, 0, 0)
-    )
-    raw_tmp = os_.traits.resolved_temp_dir()
-    temp_base = str(raw_tmp) if raw_tmp is not None else None
-    scratch = Path(tempfile.mkdtemp(prefix="sb-sp2doc-", dir=temp_base))
-    try:
-        try:
-            os_.paths.reject_links(data_root)
-            if is_link_path(data_root):
-                errors.append("data_root is an unsafe link")
-                return Sp2DoctorReport(
-                    outbox, Sp2GapStatus(0, 0, 0), Sp2SessionStatus(0, 0, 0, 0, 0, 0), (), False, tuple(errors)
-                )
-        except BrainError as exc:
-            errors.append(f"data_root unsafe: {exc}")
-            return Sp2DoctorReport(
-                outbox, Sp2GapStatus(0, 0, 0), Sp2SessionStatus(0, 0, 0, 0, 0, 0), (), False, tuple(errors)
-            )
-        gaps, sessions = probe_sp2_store_readonly(root.store_db, scratch, now=eff_now, errors=errors)
-        l2_probes, term_eff = probe_sp2_layer2_readonly(
-            root.policy_db,
-            scratch,
-            checkout_root=checkout_root,
-            observed_host_versions=observed_host_versions,
-            host_version_resolver=host_version_resolver,
-            os_=os_,
-            errors=errors,
-        )
-        return Sp2DoctorReport(
-            outbox=outbox,
-            gaps=gaps,
-            sessions=sessions,
-            layer2_harnesses=l2_probes,
-            terminal_channel_eligible_effective=term_eff,
-            integrity_errors=tuple(errors),
-        )
-    finally:
-        shutil.rmtree(scratch, ignore_errors=True)
-
-
-def reconcile_harness_layer2_in_policy(
-    policy: PolicyStore,
-    *,
-    harness_id: str,
-    checkout_root: Path,
-    observed_host_version: str | None,
-    os_: OsAdapters,
-    receipt: NativeHostReceipt | None = None,
-) -> tuple[Layer2State, str]:
-    """Record a verified ``NativeHostReceipt`` or automatically downgrade drifted Layer-2 state in ``policy.db``."""
-    cfg_dig = compute_harness_config_digest(harness_id, checkout_root, os_)
-    if receipt is not None:
-        verdict = verify_native_host_receipt(
-            receipt,
-            current_host_version=observed_host_version,
-            current_config_digest=cfg_dig,
-            expected_harness_id=harness_id,
-        )
-        eff_ver = (
-            observed_host_version
-            if isinstance(observed_host_version, str) and OPAQUE_ID_RE.fullmatch(observed_host_version)
-            else receipt.host_version
-        )
-        eff_dig = cfg_dig if cfg_dig is not None else receipt.config_digest
-        policy.set_layer2_state(
-            harness_id=harness_id,
-            host_version=eff_ver,
-            config_digest=eff_dig,
-            state=verdict.state,
-        )
-        if verdict.state is Layer2State.VERIFIED and cfg_dig is not None:
-            policy.record_configured_layer2_checkout(
-                harness_id=harness_id,
-                checkout_path=str(checkout_root),
-            )
-        return verdict.state, verdict.reason
-
-    latest = policy.layer2_state(harness_id)
-    if latest is None:
-        return Layer2State.UNKNOWN, "receipt_missing"
-    _, rec_ver, rec_dig, rec_state = latest
-    reason = rec_state.value
-    if rec_state is Layer2State.VERIFIED:
-        if rec_ver != observed_host_version:
-            reason = "host_version_changed"
-        elif rec_dig != cfg_dig:
-            reason = "config_digest_changed"
-        else:
-            reason = "verified"
-    next_state, _ = policy.reconcile_layer2_binding(
-        harness_id=harness_id,
-        current_host_version=observed_host_version,
-        current_config_digest=cfg_dig,
-    )
-    return next_state, reason
-
+M1_CHECK_SURFACES: tuple[str, ...] = (
+    M1_SURFACE_DEEP_HEALTH,
+    M1_SURFACE_PERMISSIONS,
+    M1_SURFACE_CAPTURE,
+    M1_SURFACE_LAYER2,
+    M1_SURFACE_BOOTSTRAP_DRIFT,
+)
 
 __all__ = [
-    "Sp2DoctorReport",
-    "Sp2GapStatus",
-    "Sp2Layer2HarnessProbe",
-    "Sp2OutboxStatus",
-    "Sp2SessionStatus",
-    "probe_outbox_readonly",
-    "probe_sp2_layer2_readonly",
-    "probe_sp2_store_readonly",
-    "reconcile_harness_layer2_in_policy",
-    "run_sp2_doctor_probes",
+    "CaptureDoctorProbePort",
+    "CaptureDoctorProbeResult",
+    "CaptureDoctorSnapshot",
+    "CaptureHarnessDoctorStatus",
+    "KernelPrivacyScanner",
+    "M1_CHECK_SURFACES",
+    "M1_SURFACE_BOOTSTRAP_DRIFT",
+    "M1_SURFACE_CAPTURE",
+    "M1_SURFACE_DEEP_HEALTH",
+    "M1_SURFACE_LAYER2",
+    "M1_SURFACE_PERMISSIONS",
+    "OutboxReplayPort",
+    "OutboxReplayResult",
+    "PrivacyScannerPort",
+    "Sp2CaptureProbeAdapter",
+    "SupervisorControlPort",
+    "SupervisorRestartResult",
+    "build_sp2_capture_probe",
+    "evaluate_m1_surfaces",
+    "run_m1_handover_probe",
 ]
+
+_STATUS_RANK = STATUS_RANK
+_DEGRADED_LAYER2 = DEGRADED_LAYER2
+_StatusLit = StatusLit
+_SurfaceState = SurfaceState
+_norm_status = norm_status
+_sanitize = sanitize_text
+_surface_entry = surface_entry
+_pick_worse = pick_worse
+_serialize_harnesses = serialize_harnesses
+
+
+def _classify_provenance(
+    capture_snapshot: CaptureDoctorSnapshot | None,
+    cap_res: CaptureDoctorProbeResult | None,
+    *,
+    layer2_harnesses: tuple[DoctorLayer2HarnessStatus, ...] = (),
+    expected_scope: Mapping[str, JsonValue] | None = None,
+) -> tuple[str, bool]:
+    return classify_capture_provenance(
+        capture_snapshot, cap_res, layer2_harnesses=layer2_harnesses, expected_scope=expected_scope
+    )
+
+
+class Sp2CaptureProbeAdapter(CaptureDoctorProbePort):
+    """Wrap an SP2 ``CaptureDoctorSnapshot`` callback into ``CaptureDoctorProbePort``."""
+
+    def __init__(
+        self,
+        snapshot_fn: Callable[[Path], CaptureDoctorSnapshot],
+        *,
+        require_native_receipts: bool = False,
+        privacy_scanner: PrivacyScannerPort | None = None,
+    ) -> None:
+        if not callable(snapshot_fn) or not isinstance(require_native_receipts, bool):
+            raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+        self._snapshot_fn = snapshot_fn
+        self._require_native_receipts = require_native_receipts
+        self._scanner: PrivacyScannerPort = privacy_scanner if privacy_scanner is not None else KernelPrivacyScanner()
+        self._lock = threading.Lock()
+        self._last_snapshot: tuple[Path, CaptureDoctorSnapshot] | None = None
+
+    def probe_snapshot(self, data_root: Path) -> CaptureDoctorSnapshot:
+        """Read and validate the raw ``CaptureDoctorSnapshot`` for ``data_root``."""
+        if not isinstance(data_root, Path):
+            raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+        snap = self._snapshot_fn(data_root)
+        if not isinstance(snap, CaptureDoctorSnapshot):
+            raise BrainError(ErrorCode.INTEGRITY_FAILURE, "capture probe returned invalid snapshot")
+        return snap
+
+    def _consume_last_snapshot(self, data_root: Path) -> CaptureDoctorSnapshot | None:
+        with self._lock:
+            cached = self._last_snapshot
+            self._last_snapshot = None
+        return cached[1] if cached is not None and cached[0] == data_root else None
+
+    def _probe_result_for_snapshot(self, snap: CaptureDoctorSnapshot) -> CaptureDoctorProbeResult:
+        harnesses = snap.harnesses
+        total_backlog = sum(max(0, h.outbox_backlog) for h in harnesses)
+        total_gaps = sum(max(0, h.capture_gaps) for h in harnesses)
+        total_dead = sum(max(0, h.dead_letters) for h in harnesses)
+        last_event_at = max((h.last_event_at for h in harnesses if h.last_event_at), default=None)
+        layers = {h.active_layer for h in harnesses if h.active_layer}
+        active_layer = next(iter(layers)) if len(layers) == 1 else ("mixed" if layers else None)
+
+        def _make(
+            reason: str,
+            detail: str,
+            remediation: str,
+            *,
+            available: bool = True,
+            status: _StatusLit = "WARN",
+            with_counts: bool = True,
+        ) -> CaptureDoctorProbeResult:
+            return CaptureDoctorProbeResult(
+                available=available, status=status, reason=reason, detail=detail, remediation=remediation,
+                outbox_backlog=total_backlog if with_counts else 0,
+                capture_gaps=total_gaps if with_counts else 0,
+                dead_letters=total_dead if with_counts else 0,
+                last_event_at=last_event_at, active_layer=active_layer,
+            )
+
+        if not snap.available:
+            reason = _sanitize(snap.unavailable_reason, self._scanner) or "probe_unavailable"
+            return _make(
+                reason, "SP2 capture probe reported unavailable.",
+                "Start or repair capture service and re-run brain doctor.", available=False,
+            )
+        if not harnesses:
+            return _make(
+                "no_harnesses_reported", "SP2 capture probe reported zero harnesses.",
+                "Verify at least one native capture harness before M1 handover.", with_counts=False,
+            )
+        err_ids = [h.harness_id for h in harnesses if h.probe_error]
+        if err_ids:
+            ids = _sanitize(",".join(sorted(err_ids)), self._scanner)
+            return _make(
+                "harness_probe_error", f"Capture probe error reported for: {ids}.",
+                "Inspect harness capture spool and run brain doctor --fix.", status="FAIL",
+            )
+        inv_ids = [h.harness_id for h in harnesses if h.host_invalidated]
+        if inv_ids:
+            ids = _sanitize(",".join(sorted(inv_ids)), self._scanner)
+            return _make(
+                "host_invalidated", f"Host invalidated capture integration for: {ids}.",
+                "Re-verify host bootstrap and capture hooks.",
+            )
+
+        # Kind only (native vs fixture): binding receipts to platform, host, config and checkout needs the run's
+        # scope and Layer-2 state, which only ``evaluate_m1_surfaces`` has.
+        provenance, _bound = _classify_provenance(snap, None)
+        nat_ok = provenance == "native"
+        counts = (
+            f"harnesses={len(harnesses)}, receipt_provenance={provenance}, "
+            f"outbox_backlog={total_backlog}, capture_gaps={total_gaps}, dead_letters={total_dead}"
+        )
+        for cnt, reason, rem in (
+            (total_dead, "dead_letters_present", "Inspect dead-lettered capture items and replay outbox."),
+            (total_gaps, "capture_gaps_present", "Drain pending capture sequence gaps via `brain doctor --fix`."),
+            (total_backlog, "outbox_backlog_present", "Replay pending outbox events via `brain doctor --fix`."),
+        ):
+            if cnt > 0:
+                return _make(reason, counts, rem)
+
+        if self._require_native_receipts and not nat_ok:
+            reason = (
+                "fixture_receipt_not_native" if provenance in ("fixture", "mixed") else "receipt_provenance_unverified"
+            )
+            return _make(
+                reason, f"receipt_provenance={provenance}; native capture receipts required.",
+                "Replace fixture receipts with verified native capture receipts.", with_counts=False,
+            )
+        return CaptureDoctorProbeResult(
+            available=True, status="PASS", reason="ok",
+            detail=f"harnesses={len(harnesses)}, receipt_provenance={provenance}",
+            last_event_at=last_event_at, active_layer=active_layer,
+        )
+
+    def probe_capture(self, data_root: Path) -> CaptureDoctorProbeResult:
+        """Execute bounded aggregation and provenance validation for ``CaptureDoctorProbePort``."""
+        if not isinstance(data_root, Path):
+            raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+        try:
+            snap = self.probe_snapshot(data_root)
+        except TimeoutError:
+            with self._lock:
+                self._last_snapshot = None
+            return CaptureDoctorProbeResult(
+                available=False,
+                timed_out=True,
+                status="WARN",
+                reason="timeout_exceeded",
+                detail="SP2 capture probe timed out.",
+                remediation="Inspect capture daemon responsiveness and outbox spool.",
+            )
+        except Exception:  # noqa: BLE001 - fail closed without leaking provider trace text
+            with self._lock:
+                self._last_snapshot = None
+            return CaptureDoctorProbeResult(
+                available=False,
+                status="WARN",
+                reason="probe_error",
+                detail="SP2 capture probe failed cleanly.",
+                remediation="Inspect capture service logs and repair outbox state.",
+            )
+        with self._lock:
+            self._last_snapshot = (data_root, snap)
+        return self._probe_result_for_snapshot(snap)
+
+
+def build_sp2_capture_probe(
+    snapshot_fn: Callable[[Path], CaptureDoctorSnapshot],
+    *,
+    require_native_receipts: bool = False,
+) -> Sp2CaptureProbeAdapter:
+    """Build an ``Sp2CaptureProbeAdapter`` from an SP2 snapshot provider callable."""
+    return Sp2CaptureProbeAdapter(snapshot_fn, require_native_receipts=require_native_receipts)
+
+
+def _eval_deep_health(
+    deep_health: Mapping[str, JsonValue] | None,
+    snapshot: DoctorSnapshot,
+    scanner: PrivacyScannerPort,
+) -> dict[str, JsonValue]:
+    surf = M1_SURFACE_DEEP_HEALTH
+    if deep_health is None:
+        return _surface_entry(surf, "WARN", "deep_health_missing", "get_health(deep=true) response missing", scanner)
+    if deep_health.get("ready") is not True:
+        return _surface_entry(surf, "WARN", "deep_health_not_ready", "get_health(deep=true) ready is false", scanner)
+    run_id = deep_health.get("doctor_run_id")
+    if not isinstance(run_id, str) or not run_id or deep_health.get("job_id") is not None:
+        return _surface_entry(surf, "WARN", "doctor_run_pending", "get_health(deep=true) run incomplete", scanner)
+    # Bind the response to the inspected store and writer generation; missing identity on either side never binds.
+    store_id = deep_health.get("store_id")
+    if not isinstance(store_id, str) or not store_id or not snapshot.store_id:
+        return _surface_entry(surf, "WARN", "deep_health_unbound", "deep health store identity unverified", scanner)
+    if store_id != snapshot.store_id:
+        return _surface_entry(surf, "FAIL", "store_id_mismatch", "get_health(deep=true) store_id mismatch", scanner)
+    epoch = deep_health.get("writer_epoch")
+    live_epoch = snapshot.daemon_stats.writer_epoch if snapshot.daemon_stats is not None else None
+    if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch <= 0 or live_epoch is None:
+        return _surface_entry(surf, "WARN", "deep_health_unbound", "deep health writer epoch unverified", scanner)
+    if epoch != live_epoch:
+        detail = "get_health(deep=true) writer_epoch differs from writer.lock"
+        return _surface_entry(surf, "WARN", "writer_epoch_mismatch", detail, scanner)
+    age_s = deep_health.get("age_s")
+    bad_age = isinstance(age_s, bool) or not isinstance(age_s, (int, float)) or not math.isfinite(float(age_s))
+    if bad_age or float(cast(float, age_s)) < 0.0 or float(cast(float, age_s)) > 900.0:
+        return _surface_entry(surf, "WARN", "deep_health_stale", "deep health snapshot stale or invalid", scanner)
+    degraded = deep_health.get("degraded_codes")
+    if not isinstance(degraded, (list, tuple)) or len(degraded) > 0:
+        return _surface_entry(surf, "WARN", "degraded_codes_present", "deep health reports degraded_codes", scanner)
+    overall = deep_health.get("overall_status")
+    if isinstance(overall, str) and overall.lower() != "pass":
+        st: _StatusLit = "FAIL" if overall.lower() == "fail" else "WARN"
+        detail = f"get_health(deep=true) overall_status={overall.lower()}"
+        return _surface_entry(surf, st, "deep_health_degraded", detail, scanner)
+    return _surface_entry(surf, "PASS", "ok", "get_health(deep=true) ready and fresh", scanner)
+
+
+def _eval_permissions(
+    report: DoctorReport,
+    snapshot: DoctorSnapshot,
+    scanner: PrivacyScannerPort,
+) -> dict[str, JsonValue]:
+    state: _SurfaceState = ("PASS", "ok", "owner-only data root verified", None)
+    for chk in report.checks:
+        if chk.group == "permissions":
+            state = _pick_worse(state, chk.status, chk.reason, chk.detail, chk.remediation)
+    if snapshot.permission_problems or snapshot.ancestor_permission_problems or snapshot.backup_permission_problems:
+        state = _pick_worse(state, "FAIL", "insecure_permissions", "unsafe permissions on data_root tree or ancestors")
+    return _surface_entry(M1_SURFACE_PERMISSIONS, state[0], state[1], state[2], scanner, remediation=state[3])
+
+
+def _eval_capture(
+    report: DoctorReport,
+    snapshot: DoctorSnapshot,
+    capture_snapshot: CaptureDoctorSnapshot | None,
+    *,
+    provenance: str,
+    native_verified: bool,
+    require_native_receipts: bool,
+    scanner: PrivacyScannerPort,
+) -> dict[str, JsonValue]:
+    state: _SurfaceState = ("PASS", "ok", f"capture verified ({provenance})", None)
+    cap = snapshot.capture_probe_result
+    if cap is None:
+        state = _pick_worse(state, "WARN", "capture_probe_unattached", "SP2 capture probe was not attached")
+    elif cap.timed_out:
+        state = _pick_worse(state, "WARN", "timeout_exceeded", cap.detail or "capture timed out", cap.remediation)
+    elif not cap.available:
+        st = "FAIL" if cap.status == "FAIL" else "WARN"
+        detail = cap.detail or "capture probe unavailable"
+        state = _pick_worse(state, st, cap.reason or "probe_unavailable", detail, cap.remediation)
+    elif cap.dead_letters > 0 or cap.capture_gaps > 0 or cap.outbox_backlog > 0:
+        st = "FAIL" if cap.status == "FAIL" else "WARN"
+        detail = cap.detail or "capture backlog/gaps/dead letters present"
+        state = _pick_worse(state, st, cap.reason or "capture_degraded", detail, cap.remediation)
+    elif cap.status != "PASS":
+        state = _pick_worse(state, cap.status, cap.reason, cap.detail or "capture probe degraded", cap.remediation)
+
+    for chk in report.checks:
+        if chk.group == "capture" and chk.status != "PASS":
+            state = _pick_worse(state, chk.status, chk.reason, chk.detail, chk.remediation)
+
+    if capture_snapshot is not None:
+        if not capture_snapshot.available:
+            reason = capture_snapshot.unavailable_reason or "probe_unavailable"
+            state = _pick_worse(state, "WARN", reason, "SP2 capture snapshot unavailable")
+        elif not capture_snapshot.harnesses:
+            state = _pick_worse(state, "WARN", "no_harnesses_reported", "zero capture harnesses reported")
+        else:
+            if any(h.probe_error for h in capture_snapshot.harnesses):
+                state = _pick_worse(state, "FAIL", "harness_probe_error", "capture harness probe_error set")
+            if any(h.host_invalidated for h in capture_snapshot.harnesses):
+                state = _pick_worse(state, "WARN", "host_invalidated", "capture harness host_invalidated set")
+            if sum(max(0, h.dead_letters) for h in capture_snapshot.harnesses) > 0:
+                state = _pick_worse(state, "WARN", "dead_letters_present", "capture dead letters non-zero")
+            if sum(max(0, h.capture_gaps) for h in capture_snapshot.harnesses) > 0:
+                state = _pick_worse(state, "WARN", "capture_gaps_present", "capture gaps non-zero")
+            if sum(max(0, h.outbox_backlog) for h in capture_snapshot.harnesses) > 0:
+                state = _pick_worse(state, "WARN", "outbox_backlog_present", "capture backlog non-zero")
+
+    if require_native_receipts and not native_verified:
+        reason = "fixture_receipt_not_native" if provenance in ("fixture", "mixed") else "receipt_provenance_unverified"
+        detail = f"native capture receipts required (observed provenance={provenance})"
+        state = _pick_worse(state, "WARN", reason, detail)
+
+    return _surface_entry(M1_SURFACE_CAPTURE, state[0], state[1], state[2], scanner, remediation=state[3])
+
+
+def _eval_layer2(report: DoctorReport, snapshot: DoctorSnapshot, scanner: PrivacyScannerPort) -> dict[str, JsonValue]:
+    state: _SurfaceState = ("PASS", "ok", f"{len(snapshot.layer2_harnesses)} verified Layer-2 harness(es)", None)
+    for chk in report.checks:
+        if chk.group == "harness" and chk.name not in ("harness.proposals", "harness.bootstrap_drift"):
+            if chk.status != "PASS":
+                state = _pick_worse(state, chk.status, chk.reason, chk.detail, chk.remediation)
+        elif chk.name == "identity.credentials" and chk.status != "PASS":
+            state = _pick_worse(state, chk.status, chk.reason, chk.detail, chk.remediation)
+
+    ident = snapshot.identity_stats
+    if ident is not None:
+        if ident.error is not None:
+            state = _pick_worse(state, "WARN", "identity_probe_unavailable", ident.error)
+        if ident.missing_harness_credentials:
+            miss = ", ".join(ident.missing_harness_credentials)
+            state = _pick_worse(state, "WARN", "missing_harness_credentials", f"missing credentials: {miss}")
+        verified_ids = {h.harness_id for h in snapshot.layer2_harnesses if h.state == Layer2State.VERIFIED}
+        missing_l2 = sorted({h for h in ident.active_harness_ids if h != CLI_HARNESS_ID} - verified_ids)
+        if missing_l2:
+            miss_l2 = ", ".join(missing_l2)
+            state = _pick_worse(state, "WARN", "missing_layer2_state", f"missing Layer-2 state: {miss_l2}")
+
+    if not snapshot.layer2_harnesses:
+        state = _pick_worse(state, "WARN", "no_layer2_harnesses", "no Layer-2 harness state registered")
+    for h in snapshot.layer2_harnesses:
+        val = h.state.value if hasattr(h.state, "value") else str(h.state)
+        if val == Layer2State.UNSUPPORTED.value:
+            state = _pick_worse(state, "FAIL", "layer2_unsupported", f"{h.harness_id} Layer-2 unsupported")
+        elif val in _DEGRADED_LAYER2 or val != Layer2State.VERIFIED.value:
+            state = _pick_worse(state, "WARN", "layer2_unverified", f"{h.harness_id} Layer-2 state={val}")
+
+    return _surface_entry(M1_SURFACE_LAYER2, state[0], state[1], state[2], scanner, remediation=state[3])
+
+
+def _eval_bootstrap_drift(
+    report: DoctorReport,
+    snapshot: DoctorSnapshot,
+    scanner: PrivacyScannerPort,
+    *,
+    applied_count: int | None = None,
+) -> dict[str, JsonValue]:
+    state: _SurfaceState = ("PASS", "ok", "0 drifted targets, pending proposals, or incomplete journals", None)
+    for chk in report.checks:
+        if chk.name in ("harness.bootstrap_drift", "harness.proposals", "storage.incomplete_journals"):
+            if chk.status != "PASS":
+                state = _pick_worse(state, chk.status, chk.reason, chk.detail, chk.remediation)
+    if snapshot.incomplete_journals:
+        cnt = len(snapshot.incomplete_journals)
+        state = _pick_worse(state, "WARN", "incomplete_apply_journals", f"{cnt} incomplete ApplyJournal(s)")
+    if snapshot.bootstrap_drifts:
+        cnt = len(snapshot.bootstrap_drifts)
+        state = _pick_worse(state, "WARN", "bootstrap_drift_detected", f"{cnt} drifted target(s)")
+    if snapshot.pending_proposals:
+        cnt = len(snapshot.pending_proposals)
+        state = _pick_worse(state, "WARN", "pending_proposals_present", f"{cnt} pending proposal(s)")
+    if applied_count is None:
+        state = _pick_worse(
+            state,
+            "WARN",
+            "bootstrap_evidence_unverified",
+            "no registered checkout to verify applied bootstrap against",
+            "Pass the registered checkout (--checkout) to verify its applied bootstrap.",
+        )
+    elif applied_count == 0:
+        state = _pick_worse(
+            state,
+            "WARN",
+            "no_bootstrap_applied",
+            "no applied bootstrap evidence found for checkout",
+            "Run brain proposal bootstrap to apply baseline configurations.",
+        )
+    return _surface_entry(M1_SURFACE_BOOTSTRAP_DRIFT, state[0], state[1], state[2], scanner, remediation=state[3])
+
+
+def evaluate_m1_surfaces(
+    report: DoctorReport,
+    snapshot: DoctorSnapshot,
+    *,
+    capture_snapshot: CaptureDoctorSnapshot | None = None,
+    deep_health: Mapping[str, JsonValue] | None = None,
+    require_native_receipts: bool = True,
+    privacy_scanner: PrivacyScannerPort | None = None,
+    applied_bootstrap_count: int | None = None,
+    expected_scope: Mapping[str, JsonValue] | None = None,
+) -> dict[str, JsonValue]:
+    """Evaluate the five M1 handover verification surfaces against doctor and capture state."""
+    if not isinstance(report, DoctorReport) or not isinstance(snapshot, DoctorSnapshot):
+        raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+    scanner: PrivacyScannerPort = privacy_scanner if privacy_scanner is not None else KernelPrivacyScanner()
+    provenance, native_verified = _classify_provenance(
+        capture_snapshot,
+        snapshot.capture_probe_result,
+        layer2_harnesses=snapshot.layer2_harnesses,
+        expected_scope=expected_scope,
+    )
+
+    surfaces: dict[str, dict[str, JsonValue]] = {
+        M1_SURFACE_DEEP_HEALTH: _eval_deep_health(deep_health, snapshot, scanner),
+        M1_SURFACE_PERMISSIONS: _eval_permissions(report, snapshot, scanner),
+        M1_SURFACE_CAPTURE: _eval_capture(
+            report,
+            snapshot,
+            capture_snapshot,
+            provenance=provenance,
+            native_verified=native_verified,
+            require_native_receipts=require_native_receipts,
+            scanner=scanner,
+        ),
+        M1_SURFACE_LAYER2: _eval_layer2(report, snapshot, scanner),
+        M1_SURFACE_BOOTSTRAP_DRIFT: _eval_bootstrap_drift(
+            report, snapshot, scanner, applied_count=applied_bootstrap_count
+        ),
+    }
+
+    missing_surfaces: list[JsonValue] = [n for n in M1_CHECK_SURFACES if surfaces[n]["status"] != "PASS"]
+    statuses = {surfaces[n]["status"] for n in M1_CHECK_SURFACES}
+    if "FAIL" in statuses or report.overall_status == "fail":
+        overall_status = "fail"
+    elif missing_surfaces:
+        overall_status = "warn"
+    else:
+        overall_status = "pass"
+
+    m1_ready = (
+        len(missing_surfaces) == 0
+        and overall_status == "pass"
+        and ((not require_native_receipts) or native_verified)
+    )
+    return {
+        "m1_ready": m1_ready,
+        "overall_status": overall_status,
+        "surfaces": cast(dict[str, JsonValue], surfaces),
+        "missing_surfaces": missing_surfaces,
+        "native_verified": native_verified,
+        "receipt_provenance": provenance,
+        "harnesses": _serialize_harnesses(capture_snapshot, scanner),
+        "store_id": _sanitize(snapshot.store_id, scanner) if snapshot.store_id else None,
+        "require_native_receipts": require_native_receipts,
+        "doctor_overall_status": report.overall_status,
+    }
+
+
+def run_m1_handover_probe(
+    config_or_profile_path: Path,
+    *,
+    is_profile: bool = False,
+    checkout_root: Path | None = None,
+    os_: OsAdapters | None = None,
+    capture_probe: Sp2CaptureProbeAdapter | CaptureDoctorProbePort | None = None,
+    deep_health: Mapping[str, JsonValue] | None = None,
+    require_native_receipts: bool = True,
+    privacy_scanner: PrivacyScannerPort | None = None,
+) -> dict[str, JsonValue]:
+    """Read doctor snapshot for ``config_or_profile_path`` and evaluate M1 handover readiness."""
+    if not isinstance(config_or_profile_path, Path):
+        raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+    adapters = os_ if os_ is not None else os_adapters()
+    scanner: PrivacyScannerPort = privacy_scanner if privacy_scanner is not None else KernelPrivacyScanner()
+
+    if is_profile:
+        prof = read_client_profile(config_or_profile_path, adapters)
+        data_root = prof.endpoint_path.parent
+        expected_store_id = prof.expected_store_id
+        if checkout_root is not None and prof.workspace is not None:
+            verify_launch_checkout(prof.workspace.checkout_path, checkout_root, adapters)
+        resolved_checkout = (
+            checkout_root if checkout_root is not None else (prof.workspace.checkout_path if prof.workspace else None)
+        )
+    else:
+        cfg = read_daemon_config(config_or_profile_path, adapters)
+        data_root = cfg.data_root
+        expected_store_id = cfg.expected_store_id
+        resolved_checkout = checkout_root
+
+    snapshot = read_doctor_snapshot(
+        data_root,
+        adapters,
+        checkout_root=resolved_checkout,
+        expected_store_id=expected_store_id,
+        privacy_scanner=scanner,
+        capture_probe=capture_probe,
+    )
+    report = inspect_doctor_snapshot(snapshot, privacy_scanner=scanner)
+
+    cap_snapshot: CaptureDoctorSnapshot | None = None
+    cap_res = snapshot.capture_probe_result
+    if isinstance(capture_probe, Sp2CaptureProbeAdapter):
+        cap_snapshot = capture_probe._consume_last_snapshot(data_root)
+        if cap_snapshot is None and cap_res is not None and cap_res.available and not cap_res.timed_out:
+            try:
+                cap_snapshot = capture_probe.probe_snapshot(data_root)
+            except Exception:  # noqa: BLE001
+                cap_snapshot = None
+    elif capture_probe is not None and cap_res is not None and cap_res.available and not cap_res.timed_out:
+        probe_fn = getattr(capture_probe, "probe_snapshot", None)
+        if callable(probe_fn):
+            try:
+                cand = probe_fn(data_root)
+                if isinstance(cand, CaptureDoctorSnapshot):
+                    cap_snapshot = cand
+            except Exception:  # noqa: BLE001
+                cap_snapshot = None
+
+    applied_count: int | None = None
+    expected_scope: Mapping[str, JsonValue] | None = None
+    if resolved_checkout is not None:
+        root_data = DataRoot.at(data_root)
+        expected_scope = resolve_checkout_scope(root_data.policy_db, resolved_checkout)
+        if expected_scope is not None:
+            applied_count = count_applied_bootstrap_evidence(root_data.store_db, root_data.cas_dir, resolved_checkout)
+
+    return evaluate_m1_surfaces(
+        report,
+        snapshot,
+        capture_snapshot=cap_snapshot,
+        deep_health=deep_health,
+        require_native_receipts=require_native_receipts,
+        privacy_scanner=scanner,
+        applied_bootstrap_count=applied_count,
+        expected_scope=expected_scope,
+    )

@@ -32,7 +32,7 @@ from superbrain.adapters.harness_config.bootstrap_templates import (
 )
 from superbrain.adapters.os import os_adapters
 from superbrain.composition._daemon_session import build_default_handoff_domain
-from superbrain.composition.doctor_probes_sp2 import (
+from superbrain.composition.doctor_probes_sp2_store import (
     reconcile_harness_layer2_in_policy,
     run_sp2_doctor_probes,
 )

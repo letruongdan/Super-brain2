@@ -3,10 +3,15 @@
 import os
 import stat
 import sys
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
+from superbrain.core._fs_walk import (
+    MAX_TRANSIENT_WALK_ATTEMPTS,
+    classify_below_root_failure,
+    stat_reparse_or_link,
+)
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.ports.os import PermissionProblem
 
@@ -18,60 +23,141 @@ _NOT_FOUND_ERRORS = (2, 3)  # ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND
 _ORIG_PATH_IS_SYMLINK = Path.is_symlink
 
 
+def _is_reparse_or_link(st: os.stat_result) -> bool:
+    return stat_reparse_or_link(st)
+
+
 def _inspect_error(path: Path, err: BaseException) -> BrainError:
     return BrainError(ErrorCode.INSECURE_PERMISSIONS, f"cannot inspect permissions of {path}: {err}")
 
 
+def _scandir_walk_entries(current: Path, root: Path) -> list[os.DirEntry[str]] | None:
+    """List ``current`` retrying transient not-found-then-recreate races strictly below ``root``."""
+    for attempt in range(MAX_TRANSIENT_WALK_ATTEMPTS):
+        try:
+            with os.scandir(current) as it:
+                return list(it)
+        except OSError as err:
+            failed = Path(err.filename or current)
+            state = classify_below_root_failure(failed, root, err)
+            if state == "vanished":
+                return None
+            if state == "recreated_link":
+                raise BrainError(ErrorCode.UNSAFE_PATH, f"unsafe link: {failed}") from err
+            if state == "recreated" and attempt + 1 < MAX_TRANSIENT_WALK_ATTEMPTS:
+                continue
+            raise _inspect_error(failed, err) from err
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+def _iter_non_link_paths(root: Path, *, check_path_is_symlink: bool) -> Iterator[Path]:
+    """Yield ``root`` and non-link descendants, tolerating transient vanish/recreate strictly below ``root``."""
+    try:
+        root_st = os.lstat(root)
+    except FileNotFoundError as err:
+        if check_path_is_symlink:
+            yield root
+            return
+        raise _inspect_error(root, err) from err
+    except OSError as err:
+        if check_path_is_symlink:
+            yield root
+            return
+        raise _inspect_error(root, err) from err
+
+    root_is_link = (check_path_is_symlink and root.is_symlink()) or _is_reparse_or_link(root_st)
+    if check_path_is_symlink:
+        yield root
+        if root_is_link or not stat.S_ISDIR(root_st.st_mode):
+            return
+    else:
+        if root_is_link:
+            return
+        yield root
+        if not stat.S_ISDIR(root_st.st_mode):
+            return
+
+    stack: list[Path] = [root]
+    while stack:
+        current = stack.pop()
+        raw_entries = _scandir_walk_entries(current, root)
+        if raw_entries is None:
+            continue
+        children: list[Path] = []
+        subdirs: list[Path] = []
+        for entry in raw_entries:
+            epath = Path(entry.path)
+            if entry.is_symlink() or (check_path_is_symlink and epath.is_symlink()):
+                continue
+            try:
+                est = entry.stat(follow_symlinks=False)
+            except OSError as err:
+                state = classify_below_root_failure(epath, root, err)
+                if state == "vanished":
+                    continue  # removed after it was listed
+                if state == "recreated_link":
+                    raise BrainError(ErrorCode.UNSAFE_PATH, f"unsafe link: {epath}") from err
+                if state == "recreated":
+                    try:
+                        est = os.lstat(epath)
+                    except FileNotFoundError:
+                        continue
+                    except OSError as lstat_err:
+                        raise _inspect_error(epath, lstat_err) from lstat_err
+                    if _is_reparse_or_link(est) or (check_path_is_symlink and epath.is_symlink()):
+                        raise BrainError(ErrorCode.UNSAFE_PATH, f"unsafe link: {epath}") from err
+                else:
+                    raise _inspect_error(epath, err) from err
+            if _is_reparse_or_link(est):
+                continue
+            children.append(epath)
+            if stat.S_ISDIR(est.st_mode):
+                subdirs.append(epath)
+        yield from children
+        stack.extend(reversed(subdirs))
+
+
 def _tree(root: Path) -> Iterator[Path]:
     """``root`` and everything below it, without following links; unreadable directories raise."""
-
-    def fail(err: OSError) -> None:
-        raise _inspect_error(Path(err.filename or root), err)
-
-    yield root
-    if root.is_symlink() or not root.is_dir():
-        return
-    for directory, dirnames, filenames in os.walk(root, onerror=fail):
-        for name in (*dirnames, *filenames):
-            yield Path(directory) / name
+    yield from _iter_non_link_paths(root, check_path_is_symlink=True)
 
 
 def _non_symlink_tree(root: Path) -> Iterator[Path]:
     """Yield non-symlink paths under ``root`` via ``scandir`` when ``Path.is_symlink`` is unpatched."""
     if Path.is_symlink is not _ORIG_PATH_IS_SYMLINK:
         for path in _tree(root):
-            if not path.is_symlink():
+            try:
+                st = path.lstat()
+            except OSError:
+                st = None
+            if not path.is_symlink() and (st is None or not _is_reparse_or_link(st)):
                 yield path
         return
-    try:
-        st = os.lstat(root)
-    except FileNotFoundError as err:
-        raise _inspect_error(root, err) from err
-    except OSError as err:
-        raise _inspect_error(root, err) from err
-    if stat.S_ISLNK(st.st_mode):
-        return
-    yield root
-    if not stat.S_ISDIR(st.st_mode):
-        return
-    stack: list[str] = [os.fspath(root)]
-    while stack:
-        current = stack.pop()
-        children: list[str] = []
-        subdirs: list[str] = []
-        try:
-            with os.scandir(current) as it:
-                for entry in it:
-                    if entry.is_symlink():
-                        continue
-                    children.append(entry.path)
-                    if entry.is_dir(follow_symlinks=False):
-                        subdirs.append(entry.path)
-        except OSError as err:
-            raise _inspect_error(Path(err.filename or current), err) from err
-        for child in children:
-            yield Path(child)
-        stack.extend(reversed(subdirs))
+    yield from _iter_non_link_paths(root, check_path_is_symlink=False)
+
+
+def _collect_problems(
+    paths: Iterator[Path],
+    root: Path,
+    inspect_entry: Callable[[Path], list[PermissionProblem]],
+) -> list[PermissionProblem]:
+    """Inspect walked entries, skipping vanished ones and re-verifying recreated entries below ``root``."""
+    found: list[PermissionProblem] = []
+    for path in paths:
+        for attempt in range(MAX_TRANSIENT_WALK_ATTEMPTS):
+            try:
+                found.extend(inspect_entry(path))
+                break
+            except BrainError as exc:
+                state = classify_below_root_failure(path, root, exc)
+                if state == "vanished":
+                    break
+                if state == "recreated_link":
+                    raise BrainError(ErrorCode.UNSAFE_PATH, f"unsafe link: {path}") from exc
+                if state == "recreated" and attempt + 1 < MAX_TRANSIENT_WALK_ATTEMPTS:
+                    continue
+                raise
+    return found
 
 
 def _ancestors(path: Path) -> list[Path]:
@@ -95,7 +181,7 @@ if sys.platform != "win32":
                 raise BrainError(ErrorCode.INSECURE_PERMISSIONS, f"cannot restrict {path}: {err}") from err
 
         def problems(self, root: Path) -> list[PermissionProblem]:
-            return [problem for path in _tree(root) for problem in self.object_problems(path)]
+            return _collect_problems(_tree(root), root, self.object_problems)
 
         def object_problems(self, path: Path) -> list[PermissionProblem]:
             try:
@@ -264,17 +350,21 @@ if sys.platform == "win32":
                     None,
                 )
             except pywintypes.error as err:
+                if err.winerror in _NOT_FOUND_ERRORS:
+                    fnf = FileNotFoundError(str(path))
+                    fnf.__cause__ = err
+                    raise BrainError(ErrorCode.INSECURE_PERMISSIONS, f"cannot restrict {path}: {err}") from fnf
                 raise BrainError(ErrorCode.INSECURE_PERMISSIONS, f"cannot restrict {path}: {err}") from err
 
         def problems(self, root: Path) -> list[PermissionProblem]:
             user = _current_user_sid()
             allowed = {user, _SYSTEM_SID}
-            found: list[PermissionProblem] = []
-            for path in _non_symlink_tree(root):
+
+            def inspect_entry(path: Path) -> list[PermissionProblem]:
                 reason = self._entry_problem(path, user, allowed)
-                if reason:
-                    found.append(PermissionProblem(path, reason))
-            return found
+                return [PermissionProblem(path, reason)] if reason else []
+
+            return _collect_problems(_non_symlink_tree(root), root, inspect_entry)
 
         def object_problems(self, path: Path) -> list[PermissionProblem]:
             user = _current_user_sid()

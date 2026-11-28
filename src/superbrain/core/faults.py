@@ -56,6 +56,9 @@ KNOWN_CRASHPOINTS: frozenset[str] = frozenset({
     # SP2-4: handoff commit + C5 response flush crashpoints
     "handoff.after_commit_before_ack",
     "artifact_send.after_pending_before_flush",
+    # I4-4: doctor --fix safe-repair crashpoints
+    "doctor.fix.before_projection_swap",
+    "doctor.fix.after_log_rotate_stage",
 })
 
 KNOWN_PAUSEPOINTS: frozenset[str] = KNOWN_CRASHPOINTS | {"writer.held"}

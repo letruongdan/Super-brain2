@@ -35,6 +35,7 @@ _HELPERS = frozenset(
         "_PATH_SPLIT",
         "_WORD_BOUNDARY",
         "_KEY_WORD_SPLIT",
+        "_ASCII_WORD_SPLIT",
         "_ID_SEGMENTS",
     }
 )

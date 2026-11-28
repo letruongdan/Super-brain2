@@ -38,6 +38,23 @@ class BrainError(Exception):
         self.message = message
 
 
+def describe_exception(exc: BaseException) -> str:
+    """A stable label for ``exc`` that never includes its message text, which may carry paths or secrets."""
+    if isinstance(exc, BrainError):
+        return exc.code.value
+    parts = [type(exc).__name__]
+    if isinstance(exc, OSError):
+        if exc.errno is not None:
+            parts.append(f"errno={exc.errno}")
+        winerror = getattr(exc, "winerror", None)
+        if isinstance(winerror, int):
+            parts.append(f"winerror={winerror}")
+    errname = getattr(exc, "sqlite_errorname", None)
+    if isinstance(errname, str):
+        parts.append(errname)
+    return " ".join(parts)
+
+
 _DEFAULT_WIRE_MESSAGES: dict[ErrorCode, str] = {
     ErrorCode.INVALID_INPUT: "invalid input",
     ErrorCode.IDENTITY_MISMATCH: "identity mismatch",

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
@@ -9,20 +10,27 @@ from pathlib import Path
 from superbrain.adapters.harness.layer2_probe import compute_harness_config_digest
 from superbrain.core._kernel_approval import CLI_HARNESS_ID, Layer2State
 from superbrain.core._kernel_base import OPAQUE_ID_RE
+from superbrain.core.errors import BrainError
 from superbrain.core.jsonvalue import JsonValue
 from superbrain.core.kernel import WorkspaceBinding
 from superbrain.ports.os import OsAdapters
 from superbrain.storage.policy_store import PolicyStore
+from superbrain.storage.store import Store
 
 _HOST_VERSION_DRIFT_UNSET = object()
+_LOGGER = logging.getLogger(__name__)
 
 
 def has_harness_config_presence(checkout_root: Path, harness_id: str) -> bool:
-    """Return True when ``checkout_root`` has files/links (including dangling symlinks) for ``harness_id``."""
+    """Return True when ``checkout_root`` has the host config directory (even a dangling link) for ``harness_id``.
+
+    Only the directories whose files feed ``config_digest`` count: ``CLAUDE.md``/``AGENTS.md`` are often committed to
+    a repo that was never bootstrapped and are not part of the digest, so they prove nothing about host config.
+    """
     if harness_id == "claude-code":
-        return os.path.lexists(checkout_root / ".claude") or os.path.lexists(checkout_root / "CLAUDE.md")
+        return os.path.lexists(checkout_root / ".claude")
     if harness_id == "codex":
-        return os.path.lexists(checkout_root / ".codex") or os.path.lexists(checkout_root / "AGENTS.md")
+        return os.path.lexists(checkout_root / ".codex")
     return False
 
 
@@ -60,8 +68,20 @@ def verify_live_layer2_harness(
     reported_host_version: object = _HOST_VERSION_DRIFT_UNSET,
     host_version_resolver: Callable[[str], str | None] | None = None,
     seen_configured: set[tuple[str, str]] | None = None,
+    on_recorded: Callable[[], None] | None = None,
 ) -> tuple[str, str] | None:
-    """Verify live ``(host_version, config_digest)`` for ``harness_id``, downgrading to ``UNKNOWN`` on drift."""
+    """Verify live ``(host_version, config_digest)`` for ``harness_id``, downgrading to ``UNKNOWN`` on drift.
+
+    ``on_recorded`` runs after a downgrade intent is recorded so the caller can apply it to ``brain.db``.
+    """
+
+    def _downgrade(host_version: str, config_digest: str) -> None:
+        policy.set_layer2_state(
+            harness_id=harness_id, host_version=host_version, config_digest=config_digest, state=Layer2State.UNKNOWN
+        )
+        if on_recorded is not None:
+            on_recorded()
+
     latest = policy.layer2_state(harness_id)
     if latest is None or latest[3] is not Layer2State.VERIFIED:
         return None
@@ -73,21 +93,11 @@ def verify_live_layer2_harness(
         except Exception:  # noqa: BLE001
             obs_ver = _HOST_VERSION_DRIFT_UNSET
         if not isinstance(obs_ver, str) or not OPAQUE_ID_RE.fullmatch(obs_ver) or obs_ver != recorded_ver:
-            policy.set_layer2_state(
-                harness_id=harness_id,
-                host_version=_safe_opaque_version(obs_ver, recorded_ver),
-                config_digest=recorded_dig,
-                state=Layer2State.UNKNOWN,
-            )
+            _downgrade(_safe_opaque_version(obs_ver, recorded_ver), recorded_dig)
             return None
 
     if reported_host_version is not _HOST_VERSION_DRIFT_UNSET and reported_host_version != recorded_ver:
-        policy.set_layer2_state(
-            harness_id=harness_id,
-            host_version=_safe_opaque_version(reported_host_version, recorded_ver),
-            config_digest=recorded_dig,
-            state=Layer2State.UNKNOWN,
-        )
+        _downgrade(_safe_opaque_version(reported_host_version, recorded_ver), recorded_dig)
         return None
 
     snap = policy.snapshot()
@@ -101,12 +111,7 @@ def verify_live_layer2_harness(
         track_key = (harness_id, binding.checkout_id)
         if actual_dig is not None:
             if actual_dig != recorded_dig:
-                policy.set_layer2_state(
-                    harness_id=harness_id,
-                    host_version=recorded_ver,
-                    config_digest=actual_dig,
-                    state=Layer2State.UNKNOWN,
-                )
+                _downgrade(recorded_ver, actual_dig)
                 return None
             if norm not in configured_paths:
                 policy.record_configured_layer2_checkout(harness_id=harness_id, checkout_path=str(chk_path))
@@ -118,12 +123,7 @@ def verify_live_layer2_harness(
             or norm in configured_paths
             or (seen_configured is not None and track_key in seen_configured)
         ):
-            policy.set_layer2_state(
-                harness_id=harness_id,
-                host_version=recorded_ver,
-                config_digest=recorded_dig,
-                state=Layer2State.UNKNOWN,
-            )
+            _downgrade(recorded_ver, recorded_dig)
             return None
 
     return (recorded_ver, recorded_dig)
@@ -132,11 +132,16 @@ def verify_live_layer2_harness(
 def reconcile_live_layer2_all(
     policy: PolicyStore,
     *,
+    store: Store,
     os_: OsAdapters,
     host_version_resolver: Callable[[str], str | None] | None = None,
     seen_configured: set[tuple[str, str]] | None = None,
 ) -> None:
-    """Re-verify every active non-CLI harness against live host version and checkout configs."""
+    """Re-verify every active non-CLI harness against live host version and checkout configs.
+
+    Downgrades are applied to ``brain.db`` before return; the caller must not hold a ``store`` transaction.
+    """
+    recorded: list[bool] = []
     snap = policy.snapshot()
     harnesses = sorted(
         {
@@ -152,7 +157,20 @@ def reconcile_live_layer2_all(
             os_=os_,
             host_version_resolver=host_version_resolver,
             seen_configured=seen_configured,
+            on_recorded=lambda: recorded.append(True),
         )
+    if recorded:
+        store.reconcile_policy()
+
+
+def apply_recorded_layer2(store: Store, recorded: Sequence[bool]) -> None:
+    """Apply downgrades recorded during a request to ``brain.db``; on failure they stay in ``policy.db`` for startup."""
+    if not recorded:
+        return
+    try:
+        store.reconcile_policy()
+    except BrainError as err:
+        _LOGGER.warning("layer2 downgrade apply deferred to next start (code=%s)", err.code.value)
 
 
 def batch_reported_host_version(
@@ -186,6 +204,7 @@ def make_live_layer2_lookup(
     os_: OsAdapters,
     host_version_resolver: Callable[[str], str | None] | None = None,
     seen_configured: set[tuple[str, str]] | None = None,
+    on_recorded: Callable[[], None] | None = None,
 ) -> Callable[[str], tuple[str, str] | None]:
     """Return a batch-scoped Layer-2 lookup closure and eagerly downgrade any reported drift."""
     reported_hv = batch_reported_host_version(policy, events, harness_id)
@@ -199,6 +218,7 @@ def make_live_layer2_lookup(
             reported_host_version=reported_hv,
             host_version_resolver=host_version_resolver,
             seen_configured=seen_configured,
+            on_recorded=on_recorded,
         )
 
     def _lookup(req_harness_id: str) -> tuple[str, str] | None:
@@ -211,6 +231,7 @@ def make_live_layer2_lookup(
             reported_host_version=reported_hv if req_harness_id == harness_id else _HOST_VERSION_DRIFT_UNSET,
             host_version_resolver=host_version_resolver,
             seen_configured=seen_configured,
+            on_recorded=on_recorded,
         )
 
     return _lookup

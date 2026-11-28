@@ -5,9 +5,8 @@ from __future__ import annotations
 import sys
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from superbrain.adapters.os import os_adapters
 from superbrain.adapters.os.daemon_config import (
     read_client_ca,
     read_client_credential,
@@ -15,19 +14,15 @@ from superbrain.adapters.os.daemon_config import (
     read_client_profile,
 )
 from superbrain.adapters.os.workspaces import verify_launch_checkout
-from superbrain.cli_api.loopback import (
-    LoopbackClient,
-    LoopbackTarget,
-    LoopbackTransportError,
-)
-from superbrain.core.canonical import canonical_json
+from superbrain.core._kernel_base import Scope
 from superbrain.core.client_profile import ClientProfile, SelectedWorkspace
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.jsonvalue import JsonValue
-from superbrain.core.kernel import CallResult, Scope, ToolCommand
-from superbrain.core.wire import make_error_envelope, normalize_shim_args
-from superbrain.mcp.stdio import ToolCaller, ToolCallUncertain
-from superbrain.ports.os import OsAdapters
+
+if TYPE_CHECKING:
+    from superbrain.core.kernel import CallResult
+    from superbrain.mcp.stdio import ToolCaller
+    from superbrain.ports.os import OsAdapters
 
 __all__ = ["build_tool_caller", "main", "read_status", "select_workspace"]
 
@@ -71,6 +66,14 @@ def build_tool_caller(
     token = read_client_credential(profile.credential_file, os_)
 
     def _call(tool: str, arguments: dict[str, JsonValue]) -> CallResult:
+        from superbrain.cli_api.loopback import (
+            LoopbackClient,
+            LoopbackTarget,
+            LoopbackTransportError,
+        )
+        from superbrain.core.kernel import ToolCommand
+        from superbrain.core.wire import make_error_envelope, normalize_shim_args
+
         try:
             norm_args = normalize_shim_args(tool, arguments, selected)
         except BrainError as err:
@@ -84,7 +87,12 @@ def build_tool_caller(
                 ca_pem=ca_pem,
                 leaf_cert_sha256=profile.leaf_cert_sha256,
             )
-            scope_for_call = None if tool == "get_health" else (selected.scope if selected is not None else None)
+            deep_health = tool == "get_health" and norm_args.get("deep") is True
+            scope_for_call = (
+                None
+                if (tool == "get_health" and not deep_health)
+                else (selected.scope if selected is not None else None)
+            )
             command = ToolCommand(
                 tool=tool,
                 arguments=norm_args,
@@ -94,6 +102,8 @@ def build_tool_caller(
             result = LoopbackClient(monotonic_ns=os_.monotonic.monotonic_ns).call(target, command)
         except LoopbackTransportError as err:
             if err.request_may_have_run:
+                from superbrain.mcp.stdio import ToolCallUncertain
+
                 raise ToolCallUncertain() from err
             return make_error_envelope(BrainError(err.code, err.message))
         except BrainError as err:
@@ -115,6 +125,14 @@ def build_tool_caller(
 
 def read_status(profile_path: Path, os_: OsAdapters) -> dict[str, Any]:
     """Execute a global shallow ``get_health`` probe using ``profile_path`` without workspace CWD binding."""
+    from superbrain.cli_api.loopback import (
+        LoopbackClient,
+        LoopbackTarget,
+        LoopbackTransportError,
+    )
+    from superbrain.core.kernel import ToolCommand
+    from superbrain.core.wire import make_error_envelope
+
     try:
         if not isinstance(profile_path, Path):
             raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
@@ -165,6 +183,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         except OSError:
             pass
         return 2
+
+    from superbrain.adapters.os import os_adapters
+    from superbrain.core.canonical import canonical_json
 
     envelope = read_status(profile_path, os_adapters())
     try:

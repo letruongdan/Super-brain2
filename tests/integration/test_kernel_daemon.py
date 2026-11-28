@@ -1954,7 +1954,21 @@ def test_get_job_uses_owner_scope(
             ).result(timeout=BOUND_WAIT_S)
             assert denied == {"ok": False, "error": {"code": "not_found", "message": "not found"}}
 
-        # 3. Unimplemented SP3 business tools return capability_unavailable after auth/validation.
+        # 3. Deep health succeeds in production mode; unimplemented SP3 business tools return capability_unavailable.
+        deep_health_res = loop.submit(
+            ToolCommand(
+                "get_health",
+                {"schema_version": "2.0", "deep": True, "idempotency_key": "idem-deep-health-0001"},
+                token=tok_dan,
+            ),
+            dl_ns,
+        ).result(timeout=BOUND_WAIT_S)
+        assert deep_health_res["ok"] is True
+        deep_data = cast(dict[str, JsonValue], deep_health_res["data"])
+        assert deep_data["ready"] is True
+        assert "doctor_run_id" in deep_data and "job_id" in deep_data
+        assert (deep_data["doctor_run_id"] is not None) or (deep_data["job_id"] is not None)
+
         unsupported_calls: tuple[tuple[str, dict[str, JsonValue], Scope | None], ...] = (
             (
                 "search_knowledge",
@@ -4241,13 +4255,16 @@ def test_stop_during_due_jobs_before_claim_commit_leaves_due_job_queued_at_attem
     close_returned = threading.Event()
     handler_ran = threading.Event()
 
-    orig_due_jobs = cast(Callable[[KernelTx, dt.datetime, int], tuple[JobRecord, ...]], tx_cls.due_jobs)
+    # the executor's claim query: every due job except system.doctor (the doctor runner owns those)
+    orig_due_jobs = cast(Callable[..., tuple[JobRecord, ...]], tx_cls.due_jobs_by_kinds)
     paused_due = False
 
-    def _due_jobs(tx: KernelTx, now: dt.datetime, limit: int) -> tuple[JobRecord, ...]:
+    def _due_jobs(
+        tx: KernelTx, now: dt.datetime, kinds: Sequence[str], limit: int, *, exclude: bool = False
+    ) -> tuple[JobRecord, ...]:
         nonlocal paused_due
-        rows = orig_due_jobs(tx, now, limit)
-        if not paused_due and rows and rows[0].job_id == due.job_id:
+        rows = orig_due_jobs(tx, now, kinds, limit, exclude=exclude)
+        if exclude and not paused_due and rows and rows[0].job_id == due.job_id:
             paused_due = True
             in_due_query.set()
             assert release_due_query.wait(BOUND_WAIT_S), "due_jobs barrier timed out"
@@ -4257,7 +4274,7 @@ def test_stop_during_due_jobs_before_claim_commit_leaves_due_job_queued_at_attem
         handler_ran.set()
         return ()
 
-    monkeypatch.setattr(tx_cls, "due_jobs", _due_jobs)
+    monkeypatch.setattr(tx_cls, "due_jobs_by_kinds", _due_jobs)
     _observe_executor_close(monkeypatch, close_entered, close_returned)
 
     loop = create_daemon_owner_loop(
@@ -4343,13 +4360,13 @@ def test_claim_admitted_before_stop_skips_handler_and_recovers_on_next_epoch(
     close_returned = threading.Event()
     handler_ran = threading.Event()
 
-    orig_lease_next = JobService.lease_next
+    orig_lease_next = JobService.lease_next_for_kinds  # the executor's claim (it excludes system.doctor)
     paused_claim = False
 
-    def _lease_next(service: JobService, epoch: int, now: dt.datetime) -> JobLease | None:
+    def _lease_next(service: JobService, epoch: int, now: dt.datetime, *a: Any, **kw: Any) -> JobLease | None:
         nonlocal paused_claim
-        lease = orig_lease_next(service, epoch, now)
-        if not paused_claim and lease is not None and lease.job_id == admitted.job_id:
+        lease = orig_lease_next(service, epoch, now, *a, **kw)
+        if kw.get("exclude") and not paused_claim and lease is not None and lease.job_id == admitted.job_id:
             paused_claim = True
             claim_admitted.set()
             assert release_after_claim.wait(BOUND_WAIT_S), "post-claim barrier timed out"
@@ -4359,7 +4376,7 @@ def test_claim_admitted_before_stop_skips_handler_and_recovers_on_next_epoch(
         handler_ran.set()
         return ()
 
-    monkeypatch.setattr(JobService, "lease_next", _lease_next)
+    monkeypatch.setattr(JobService, "lease_next_for_kinds", _lease_next)
     _observe_executor_close(monkeypatch, close_entered, close_returned)
 
     loop_1 = create_daemon_owner_loop(
@@ -4919,22 +4936,22 @@ def test_concurrent_future_cancel_and_unexpected_owner_exit_keep_loop_safe(
 
     step_entered = threading.Event()
     release_boom = threading.Event()
-    orig_lease_next = JobService.lease_next
+    orig_lease_next = JobService.lease_next_for_kinds  # the executor's claim (it excludes system.doctor)
     crashed_once = False
 
-    def _boom_lease_next(service: JobService, epoch: int, now: dt.datetime) -> JobLease | None:
+    def _boom_lease_next(service: JobService, epoch: int, now: dt.datetime, *a: Any, **kw: Any) -> JobLease | None:
         nonlocal crashed_once
-        if not crashed_once:
+        if kw.get("exclude") and not crashed_once:
             crashed_once = True
             step_entered.set()
             assert release_boom.wait(BOUND_WAIT_S), "unexpected-exit barrier timed out"
             raise RuntimeError("injected unexpected owner step failure")
-        return orig_lease_next(service, epoch, now)
+        return orig_lease_next(service, epoch, now, *a, **kw)
 
     def _noop_job_handler(_spec: JobSpec, _ctx: JobContext) -> tuple[ObjectRef, ...]:
         return ()
 
-    monkeypatch.setattr(JobService, "lease_next", _boom_lease_next)
+    monkeypatch.setattr(JobService, "lease_next_for_kinds", _boom_lease_next)
     loop_b = create_daemon_owner_loop(
         os_=adapters_b,
         clock=clock_b,

@@ -10,15 +10,13 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import json
 import os
-import socket
-import ssl
 import struct
 import sys
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
@@ -30,7 +28,7 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from superbrain.adapters.harness_config.markdown_blocks import merge_markdown_block
 from superbrain.adapters.harness_config.merger import SharedConfigMergerAdapter
 from superbrain.adapters.os import os_adapters
-from superbrain.adapters.os.daemon_config import read_daemon_config
+from superbrain.adapters.os.daemon_config import read_client_endpoint, read_daemon_config
 from superbrain.application import maintenance
 from superbrain.application.review_apply import ReviewApplyService, TargetWriteInput
 from superbrain.composition import daemon_entry, init_entry, owner_entry
@@ -52,10 +50,11 @@ from superbrain.core.proposals import ManagedFormat
 from superbrain.ports.os import OsAdapters, PermissionGuard, PermissionProblem
 from superbrain.storage.backup import create_policy_backup, create_store_backup
 from superbrain.storage.kernel_schema import KERNEL_POLICY_MIGRATIONS, KERNEL_STORE_MIGRATIONS
+from superbrain.storage.layout import DataRoot
 from superbrain.storage.proposals import PolicyApplyAuthority, StoreProposalAdapter
 from tests.support.clock import FakeClock
 from tests.support.inc2_fixture import reopen_kernel_job_runtime
-from tests.support.inc2_transport import FakeMonotonicClock, read_raw_http_response
+from tests.support.inc2_transport import FakeMonotonicClock, post_tls_http_json
 
 OWNER = "dan"
 MACHINE = "r2-box"
@@ -147,30 +146,7 @@ def _daemon(cfg: DaemonConfig, os_: OsAdapters, clock: FakeClock, mono: FakeMono
 
 
 def _post_tls(ready: Ready, ca_pem: str, path: str, token: str, body_obj: object) -> tuple[int, dict[str, Any]]:
-    host = f"{ready.endpoint.host}:{ready.endpoint.port}"
-    body = json.dumps(body_obj).encode("utf-8")
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    ctx.load_verify_locations(cadata=ca_pem)
-    ctx.check_hostname = True
-    with (
-        socket.create_connection((ready.endpoint.host, ready.endpoint.port), timeout=2.0) as raw,
-        ctx.wrap_socket(raw, server_hostname="127.0.0.1") as sock,
-    ):
-        sock.settimeout(3.0)
-        sock.sendall(f"GET /v2/identity HTTP/1.1\r\nHost: {host}\r\n\r\n".encode("ascii"))
-        assert read_raw_http_response(sock, timeout=3.0).startswith(b"HTTP/1.1 200 ")
-        hdr = (
-            f"POST {path} HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer {token}\r\n"
-            f"X-Store-Id: {ready.identity.store_id}\r\nX-Writer-Epoch: {ready.identity.writer_epoch}\r\n"
-            f"X-Superbrain-Instance: {ready.identity.instance_id}\r\n"
-            f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n\r\n"
-        ).encode("iso-8859-1")
-        sock.sendall(hdr + body)
-        resp = read_raw_http_response(sock, timeout=5.0)
-    head, sep, data = resp.partition(b"\r\n\r\n")
-    assert sep and head.startswith(b"HTTP/1.1 "), resp[:200]
-    status = int(head.splitlines()[0].split()[1])
-    return status, cast(dict[str, Any], json.loads(data))
+    return post_tls_http_json(ready, ca_pem, path, token, body_obj)
 
 
 def _make_dir_link(link: Path, target: Path) -> None:
@@ -481,13 +457,22 @@ def test_r06_and_n4_online_policy_restore_reconciles_partial_journal_and_forward
         )
         assert exec_env.get("ok") is True and exec_env["data"]["trust_generation"] == 2
 
+        # Bumped post-restore writer_epoch is reflected on disk & live LoopbackServer; stale epoch is refused.
+        post_ep = read_client_endpoint(DataRoot.at(cfg.data_root).endpoint_path, os_)
+        assert post_ep.writer_epoch == int(exec_env["data"]["new_epoch"]) > ready.identity.writer_epoch
+        post_ready = replace(ready, endpoint=post_ep, identity=post_ep.identity)
+        st_stale, env_stale = _post_tls(
+            ready, ca_pem, "/v2/operator/proposal/show", cli_token, {"proposal_id": prop.proposal_id}
+        )
+        assert st_stale == 409 and env_stale["error"]["code"] == ErrorCode.IDENTITY_MISMATCH.value
+
         # R06: WITHOUT daemon restart, proposal & active journal transitioned to RECOVERY_REQUIRED!
         st_after, env_after = _post_tls(
-            ready, ca_pem, "/v2/operator/proposal/show", cli_token, {"proposal_id": prop.proposal_id}
+            post_ready, ca_pem, "/v2/operator/proposal/show", cli_token, {"proposal_id": prop.proposal_id}
         )
         assert st_after == 200 and env_after["data"]["proposal"]["status"] == "recovery_required"
         _, cont_env = _post_tls(
-            ready, ca_pem, "/v2/operator/proposal/continue", cli_token, {"proposal_id": prop.proposal_id}
+            post_ready, ca_pem, "/v2/operator/proposal/continue", cli_token, {"proposal_id": prop.proposal_id}
         )
         assert cont_env.get("ok") is False
         assert cont_env["error"]["code"] == ErrorCode.REVISION_CONFLICT.value

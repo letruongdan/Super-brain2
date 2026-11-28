@@ -11,7 +11,7 @@ from collections import deque
 from collections.abc import Callable
 from concurrent.futures import Future
 from dataclasses import replace
-from typing import Protocol, TypeVar
+from typing import Protocol, TypeVar, runtime_checkable
 
 from superbrain.application import _owner_loop_queue
 from superbrain.application._auth_gate import AuthGate
@@ -109,6 +109,12 @@ class OwnerSession(Protocol):
     def adopt_after_owner_exit(self, exited_owner: threading.Thread) -> None: ...
 
 
+@runtime_checkable
+class _DoctorOwnerSession(Protocol):
+    def poll_doctor_settled(self, wake_event: threading.Event) -> bool: ...
+    def next_doctor_wake_wait_s(self) -> float | None: ...
+
+
 OwnerSessionFactory = Callable[[DaemonConfig, Callable[[], None], Callable[[], None]], OwnerSession]
 
 
@@ -153,7 +159,7 @@ class OwnerLoop:
         with self._lifecycle_lock:
             if self._stopping or self._ready_value is None or self._session is None:
                 return None
-            rdy = self._ready_value
+            rdy = self._session.ready
             clk = self._session.clock
         try:
             now_utc, _ = require_aware_utc(clk.now())
@@ -246,6 +252,38 @@ class OwnerLoop:
         if not callable(action):
             raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
         return self._enqueue_internal(lambda _s: action())
+
+    def wait_doctor_settled(self, timeout: float = 5.0) -> bool:
+        """Wait up to ``timeout`` seconds for startup/scheduled/pending ``system.doctor`` work to settle."""
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or not math.isfinite(timeout)
+            or timeout < 0
+        ):
+            raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+        with self._lifecycle_lock:
+            if not self._started or self._session is None:
+                raise _unavailable_error()
+            if self._stopping or self._closed_done.is_set():
+                return False
+        deadline = time.perf_counter() + float(timeout)
+        while True:
+            ev = threading.Event()
+            rem = max(0.0, deadline - time.perf_counter())
+
+            def _poll(s: OwnerSession, wake: threading.Event = ev) -> bool:
+                return s.poll_doctor_settled(wake) if isinstance(s, _DoctorOwnerSession) else True
+
+            try:
+                settled = self._enqueue_internal(_poll).result(timeout=rem)
+            except (TimeoutError, BrainError):
+                return False
+            if settled:
+                return True
+            rem_wait = deadline - time.perf_counter()
+            if rem_wait <= 0.0 or not ev.wait(timeout=rem_wait):
+                return False
 
     def _trigger_overrun(self, session: OwnerSession) -> int:
         reply_thunks: tuple[Callable[[], None], ...] = ()
@@ -481,8 +519,18 @@ class OwnerLoop:
                         session.step_owner_work(allow_new_jobs=False)
                     break
 
-                if session.has_job_handlers and not self._stopping:
-                    self._owner_wake.wait(timeout=_WORKER_IDLE_POLL_S)
+                wait_s: float | None = (
+                    _WORKER_IDLE_POLL_S if (session.has_job_handlers and not self._stopping) else None
+                )
+                doctor_wait_s = (
+                    session.next_doctor_wake_wait_s()
+                    if (not self._stopping and isinstance(session, _DoctorOwnerSession))
+                    else None
+                )
+                if doctor_wait_s is not None:
+                    wait_s = doctor_wait_s if wait_s is None else min(wait_s, doctor_wait_s)
+                if wait_s is not None:
+                    self._owner_wake.wait(timeout=wait_s)
                 else:
                     self._owner_wake.wait()
         except Exception as err:  # noqa: BLE001

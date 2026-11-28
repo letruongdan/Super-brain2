@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from collections.abc import Callable, Mapping
 from concurrent.futures import Future
 from dataclasses import dataclass
@@ -16,6 +17,7 @@ from superbrain.application.dispatch import KernelToolDomain, PreparedEffect
 from superbrain.application.jobs import JobService
 from superbrain.application.owner_loop import AuthGate, OwnerSession
 from superbrain.composition import _daemon_session_work
+from superbrain.composition._daemon_doctor import DaemonDoctorRunner
 from superbrain.composition._daemon_handoff_factory import build_default_handoff_domain as build_default_handoff_domain
 from superbrain.composition._daemon_handoff_factory import (
     make_default_handoff_domain_factory as make_default_handoff_domain_factory,
@@ -95,7 +97,8 @@ _STORED_REF_TOOL: dict[str, str] = {
 
 
 class _DaemonCompositeDomain:
-    """Serves ``get_job``, SP2-4 handoff tools, and any injected test/business domain tools."""
+    """Serves ``get_job``, ``get_health(deep=True)`` via the doctor runner, SP2-4 handoff tools, and any injected
+    test/business domain tools."""
 
     def __init__(
         self,
@@ -104,11 +107,16 @@ class _DaemonCompositeDomain:
         *,
         fallback: KernelToolDomain | None = None,
         fallback_factory: Callable[[], KernelToolDomain | None] | None = None,
+        doctor_runner: DaemonDoctorRunner | None = None,
     ) -> None:
         self._job_service = job_service
         self._delegate = delegate
         self._fallback = fallback
         self._fallback_factory = fallback_factory
+        self._doctor_runner = doctor_runner
+
+    def bind_doctor_runner(self, doctor_runner: DaemonDoctorRunner) -> None:
+        self._doctor_runner = doctor_runner
 
     def _get_fallback(self) -> KernelToolDomain | None:
         if self._fallback is None and self._fallback_factory is not None:
@@ -150,6 +158,8 @@ class _DaemonCompositeDomain:
     def supports_tool(self, tool: str, *, deep: bool = False) -> bool:
         if tool == "get_job" and not deep:
             return True
+        if tool == "get_health" and deep and self._doctor_runner is not None:
+            return True
         if self._delegate is not None and self._delegate.supports_tool(tool, deep=deep):
             return True
         if self._fallback is not None:
@@ -180,6 +190,8 @@ class _DaemonCompositeDomain:
 
     def prepare_mutation(self, call: Call, ctx: CallContext, *, now: datetime) -> PreparedEffect:
         deep = call.tool == "get_health" and bool(call.arguments.get("deep"))
+        if call.tool == "get_health" and self._doctor_runner is not None:
+            return self._doctor_runner.prepare_deep_health(call, ctx, now=now)
         if self._delegate is not None and self._delegate.supports_tool(call.tool, deep=deep):
             return self._delegate.prepare_mutation(call, ctx, now=now)
         if self._fallback is not None or (
@@ -210,6 +222,10 @@ class _DaemonCompositeDomain:
         *,
         selected_scope: Scope | None,
     ) -> dict[str, JsonValue]:
+        if result.refs and result.refs[0].kind in {"doctor_run", "get_health_descriptor"}:
+            if self._doctor_runner is None:
+                raise BrainError(ErrorCode.CAPABILITY_UNAVAILABLE, "capability unavailable")
+            return self._doctor_runner.render_deep_health(result, principal, selected_scope=selected_scope)
         target = self._stored_target(result)
         if target is None:
             raise BrainError(ErrorCode.CAPABILITY_UNAVAILABLE, "capability unavailable")
@@ -247,6 +263,7 @@ class _AdmittedOwnerSession(OwnerSession):
         reply_meta_lock: threading.Lock,
         reply_meta: dict[str, tuple[AuthGrantStamp | None, SendAttemptCompletion | None]],
         operator: OperatorHandle | None = None,
+        doctor_runner: DaemonDoctorRunner | None = None,
     ) -> None:
         self._rt = rt
         self._ready = ready
@@ -263,6 +280,7 @@ class _AdmittedOwnerSession(OwnerSession):
         self._reply_meta_lock = reply_meta_lock
         self._reply_meta = reply_meta
         self._operator = operator
+        self._doctor_runner = doctor_runner
         self._claim_lock = threading.Lock()
         self._claim_closed = False
         self._metrics_lock = threading.Lock()
@@ -282,6 +300,24 @@ class _AdmittedOwnerSession(OwnerSession):
         )
         self._next_continuity_scan: datetime | None = None
         self._bridge.on_continuity_tasks = self._schedule_continuity_tasks
+
+    def poll_doctor_settled(self, wake_event: threading.Event) -> bool:
+        if self._doctor_runner is None:
+            return True
+        return self._doctor_runner.poll_settled(wake_event)
+
+    def next_doctor_wake_wait_s(self) -> float | None:
+        if self._doctor_runner is None:
+            return None
+        return self._doctor_runner.next_wake_wait_s()
+
+    def begin_restore_doctor_fence(self) -> None:
+        if self._doctor_runner is not None:
+            self._doctor_runner.fence_on_restore()
+
+    def finish_restore_doctor_reconcile(self) -> None:
+        if self._doctor_runner is not None:
+            self._doctor_runner.finish_restore_reconcile()
 
     @property
     def ready(self) -> Ready:
@@ -319,6 +355,13 @@ class _AdmittedOwnerSession(OwnerSession):
             self._ready = ready
         self._bridge.rebind_stores(store=rt.store, policy=rt.policy, writer_epoch=rt.lease.epoch)
         self._continuity_worker.rebind(rt=rt, job_service=job_service)
+        if self._doctor_runner is not None:
+            self._doctor_runner.rebind_after_restore(
+                rt=rt,
+                job_store=job_store,
+                job_service=job_service,
+                tls_not_after=self._ready.tls_not_after,
+            )
 
     @property
     def clock(self) -> Clock:
@@ -384,6 +427,13 @@ class _AdmittedOwnerSession(OwnerSession):
         with self._metrics_lock:
             return self._stopping
 
+    def _is_doctor_claim_open(self) -> bool:
+        with self._claim_lock:
+            return (not self._claim_closed) and (not self._is_stopping())
+
+    def doctor_claim_guard(self) -> bool:
+        return self._is_doctor_claim_open()
+
     def _is_claim_open(self) -> bool:
         if self._executor is None:
             return False
@@ -432,7 +482,9 @@ class _AdmittedOwnerSession(OwnerSession):
         with self._metrics_lock:
             drained = self._drained_requests
             join_failed = self._worker_join_failed
-        worker_drained = self._executor is None or (not join_failed and self._executor.is_drained)
+        exec_drained = self._executor is None or self._executor.is_drained
+        doc_drained = self._doctor_runner is None or self._doctor_runner.is_drained
+        worker_drained = (not join_failed) and exec_drained and doc_drained
         return drained, worker_drained
 
     def begin_stop(self) -> None:
@@ -440,11 +492,15 @@ class _AdmittedOwnerSession(OwnerSession):
         self._auth_gate.close()
         self._bridge.close_admissions()
         self._close_claim_gate()
+        if self._doctor_runner is not None:
+            self._doctor_runner.begin_stop()
 
     def join_worker(self, timeout_s: float) -> bool:
-        if self._executor is None:
-            return True
-        drained = self._executor.close(max(0.0, timeout_s))
+        deadline_mono = time.monotonic() + max(0.0, timeout_s)
+        exec_ok = True if self._executor is None else self._executor.close(max(0.0, timeout_s))
+        rem = max(0.0, deadline_mono - time.monotonic())
+        doc_ok = True if self._doctor_runner is None else self._doctor_runner.join(rem)
+        drained = exec_ok and doc_ok
         if not drained:
             with self._metrics_lock:
                 self._worker_join_failed = True

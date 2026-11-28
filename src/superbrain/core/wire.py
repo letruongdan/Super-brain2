@@ -26,6 +26,7 @@ from superbrain.core._wire_jsonrpc import (
     JSONRPC_PARSE_ERROR,
     JSONRPC_VERSION,
     MAX_JSONRPC_ID_BYTES,
+    MCP_PROTOCOL_VERSION,
     JsonRpcError,
     JsonRpcId,
     build_jsonrpc_result,
@@ -93,7 +94,6 @@ __all__ = [
     "validate_jsonrpc_id",
 ]
 
-MCP_PROTOCOL_VERSION = "2025-06-18"
 SCHEMA_VERSION = "2.0"
 
 DEFAULT_CONTEXT_BUDGET_TOKENS = 4_000

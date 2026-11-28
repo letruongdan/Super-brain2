@@ -16,8 +16,8 @@ from superbrain.adapters.harness_config.json_hook_groups import (
 from superbrain.adapters.harness_config.json_keys import _parse_json_root, merge_json_keys, remove_json_keys
 from superbrain.adapters.harness_config.markdown_blocks import merge_markdown_block, remove_markdown_block
 from superbrain.adapters.harness_config.toml_tables import merge_toml_table, remove_toml_table
+from superbrain.core._json_parse import parse_json
 from superbrain.core.proposals import ManagedFormat
-from superbrain.core.wire import parse_json
 from superbrain.ports.proposals import ConfigMergerPort, MergeOutput
 
 __all__ = ["SharedConfigMergerAdapter"]

@@ -1394,12 +1394,13 @@ def test_ci_three_jobs_workflow_contract() -> None:
     worker_job = jobs["gate-windows-worker"]
     assert worker_job.get("runs-on") == "windows-2022"
     assert ci_matrix_list("python", "gate-windows-worker") == ["3.11", "3.14"]
-    assert ci_matrix_list("partition", "gate-windows-worker") == ["0", "1"]
+    # Owner decision 2026-11-26 (I4 handoff section C, "Topology Windows hosted"): four hosted Windows workers.
+    assert ci_matrix_list("partition", "gate-windows-worker") == ["0", "1", "2", "3"]
     worker_steps = ci_steps("gate-windows-worker")
     w_gate_at = next((i for i, s in enumerate(worker_steps) if "scripts/gate.py" in s), None)
     assert w_gate_at is not None
     w_step = worker_steps[w_gate_at]
-    assert "--partition" in w_step and "${{ matrix.partition }}/2" in w_step
+    assert "--partition ${{ matrix.partition }}/4" in w_step, w_step
     w_uploads = [s for s in worker_steps if "upload-artifact" in s]
     assert any("gate-worker-windows-" in s and "if: always()" in s for s in w_uploads), (
         "Windows worker must upload partition evidence artifact unconditionally"
@@ -1415,7 +1416,18 @@ def test_ci_three_jobs_workflow_contract() -> None:
     agg_at = next((i for i, s in enumerate(agg_steps) if "scripts/gate.py aggregate" in s), None)
     assert agg_at is not None
     agg_step = agg_steps[agg_at]
-    assert "--partition-count 2" in agg_step or "--partition-count" in agg_step
+    assert "--partition-count 4" in agg_step, agg_step
+    worker_downloads = [s for s in agg_steps if "download-artifact" in s and "gate-worker-windows-" in s]
+    parts = sorted(
+        n
+        for n in "0123456789"
+        for s in worker_downloads
+        if f"gate-worker-windows-${{{{ matrix.python }}}}-part-{n}" in s
+        and f"agg-workers-${{{{ matrix.python }}}}/part-{n}" in s
+    )
+    assert parts == ["0", "1", "2", "3"] and len(worker_downloads) == 4, (
+        f"aggregate must download exactly the four worker partitions: parts={parts}, steps={len(worker_downloads)}"
+    )
     agg_bench_at = next((i for i, s in enumerate(agg_steps) if "tests.integration.test_kernel_performance" in s), None)
     assert agg_bench_at is not None and agg_bench_at > agg_at
     agg_uploads = [s for s in agg_steps if "upload-artifact" in s]

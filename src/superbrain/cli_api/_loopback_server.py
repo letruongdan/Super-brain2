@@ -244,6 +244,16 @@ class LoopbackServer:
         for sock in socks:
             _abort_socket(sock)
 
+    def _live_ready(self) -> Ready:
+        rdy = self._owner.ready
+        if rdy is not None:
+            with self._lock:
+                if rdy.identity.writer_epoch > self._ready.identity.writer_epoch:
+                    self._ready = rdy
+            return rdy
+        with self._lock:
+            return self._ready
+
     def _is_quiesced(self) -> bool:
         with self._lock:
             return self._quiesced or self._stop_event.is_set()

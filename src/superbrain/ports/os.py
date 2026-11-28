@@ -142,6 +142,15 @@ class LockFactory(Protocol):
         ...
 
 
+class LockProbePort(Protocol):
+    def probe_held(self, path: Path) -> bool:
+        """Return True iff another process holds an exclusive writer lock on ``path`` without acquiring one.
+
+        Never creates or modifies ``path``; returns False if missing and raises ``UNSAFE_PATH`` on symlinks/links.
+        """
+        ...
+
+
 @dataclass(frozen=True)
 class PlatformTraits:
     sqlite_full_fsync: bool
@@ -149,6 +158,7 @@ class PlatformTraits:
     default_scratch_base: Path | Callable[[], Path | None] | None = None
     resolve_temp_links: bool = False
     temp_dir: Path | Callable[[], Path] | None = None
+    stage_private_dirs: bool = False
 
     def resolved_default_scratch_base(self) -> Path | None:
         """Evaluate ``default_scratch_base`` when callable, or return it directly."""

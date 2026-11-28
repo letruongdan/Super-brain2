@@ -10,10 +10,10 @@ an exception text or a decimal amount.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import datetime
 
-from superbrain.core.canonical import digest_bytes
+from superbrain.application import _jobs_settlement
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.faults import crashpoint
 from superbrain.core.ids import new_id
@@ -23,7 +23,6 @@ from superbrain.core.kernel import (
     MAX_JOB_ATTEMPTS,
     RECOVERY_BATCH,
     TERMINAL_JOB_STATES,
-    InvocationState,
     JobErrorCode,
     JobLease,
     JobOutcome,
@@ -49,10 +48,7 @@ from superbrain.core.kernel import (
     require_aware_utc,
     require_opaque_id,
     require_positive_int,
-    reservation_descriptor,
-    result_descriptor,
     retry_backoff,
-    usage_descriptor,
 )
 from superbrain.ports.clock import Clock
 from superbrain.ports.kernel import (
@@ -92,6 +88,13 @@ def _lease_meta(lease: JobLease) -> dict[str, JsonValue]:
 def _row_fence(row: JobRecord) -> dict[str, JsonValue]:
     return {"job_id": row.job_id, "attempt": row.attempt, "writer_epoch": row.writer_epoch, "lease_id": row.lease_id}
 
+
+# A blob read that may succeed later; anything else about an unreadable payload is permanent.
+_TRANSIENT_PAYLOAD_READ = frozenset({ErrorCode.IO_ERROR, ErrorCode.FILESYSTEM_BUSY, ErrorCode.STORAGE_FULL})
+# Raised by a payload read/verify when the stored entry itself is broken; retrying the same payload cannot help.
+_PERMANENT_PAYLOAD_FAULT = frozenset(
+    {ErrorCode.INTEGRITY_FAILURE, ErrorCode.UNSAFE_PATH, ErrorCode.INSECURE_PERMISSIONS}
+)
 
 class JobService:
     """Owner-side job state machine over one admitted store at ``writer_epoch`` (the only writer of jobs)."""
@@ -159,12 +162,37 @@ class JobService:
 
     def lease_next(self, epoch: int, now: datetime) -> JobLease | None:
         """Lease the first due queued job in ``(retry_at, job_id)`` order; leasing never changes ``attempt``."""
+        return self._lease_first(epoch, now, lambda tx, dt: tx.due_jobs(dt, 1), emit_crashpoints=True)
+
+    def lease_next_for_kinds(
+        self,
+        epoch: int,
+        now: datetime,
+        kinds: Sequence[str],
+        *,
+        emit_crashpoints: bool = True,
+        exclude: bool = False,
+        commit_guard: Callable[[], bool] | None = None,
+    ) -> JobLease | None:
+        """Lease the first due queued job matching (or excluding) ``kinds`` in ``(retry_at, job_id)`` order."""
+        if type(emit_crashpoints) is not bool or type(exclude) is not bool:
+            raise _invalid()
+        kind_tuple = self._checked_kinds(kinds)
+        return self._lease_first(
+            epoch, now, lambda tx, dt: tx.due_jobs_by_kinds(dt, kind_tuple, 1, exclude=exclude),
+            emit_crashpoints=emit_crashpoints, commit_guard=commit_guard,
+        )
+
+    def _lease_first(
+        self, epoch: int, now: datetime, fetch: Callable[[KernelTx, datetime], tuple[JobRecord, ...]],
+        *, emit_crashpoints: bool, commit_guard: Callable[[], bool] | None = None,
+    ) -> JobLease | None:
         self._require_epoch(epoch)
         now_utc, _ = require_aware_utc(now)
-        guard = self._claim_commit_guard
+        guard = self._claim_commit_guard if commit_guard is None else commit_guard
 
         def lease(tx: KernelTx) -> JobLease | None:
-            due = tx.due_jobs(now_utc, 1)
+            due = fetch(tx, now_utc)
             if not due:
                 return None
             if guard is not None and not guard():
@@ -174,9 +202,38 @@ class JobService:
             return claimed
 
         claimed = self._store.transact(lease)
-        if claimed is not None:
+        if claimed is not None and emit_crashpoints:
             crashpoint("jobs.after_lease")
         return claimed
+
+    def cancel_jobs_by_kinds(self, kinds: Sequence[str]) -> tuple[str, ...]:
+        """Cancel all queued/leased/running jobs matching ``kinds`` under ``system:doctor`` (e.g. restore fence)."""
+        kind_tuple = self._checked_kinds(kinds)
+        _, now = require_aware_utc(self._clock.now())
+        cancelled: list[str] = []
+
+        def cancel_batch(tx: KernelTx) -> list[tuple[str, JobState]]:
+            rows = tx.active_jobs_by_kinds(kind_tuple, RECOVERY_BATCH)
+            done: list[tuple[str, JobState]] = []
+            for row in rows:
+                self._terminal(tx, row, JobState.CANCELLED, now, actor="system:doctor")
+                done.append((row.job_id, row.state))
+            return done
+
+        while True:
+            batch = self._store.transact(cancel_batch)
+            for job_id, prior in batch:
+                cancelled.append(job_id)
+                if prior is not JobState.QUEUED and self._cancel_signal is not None:
+                    self._cancel_signal(job_id)
+            if len(batch) < RECOVERY_BATCH:
+                return tuple(cancelled)
+
+    @staticmethod
+    def _checked_kinds(kinds: Sequence[str]) -> tuple[str, ...]:
+        if isinstance(kinds, (str, bytes)) or not isinstance(kinds, Sequence) or not (1 <= len(kinds) <= 32):
+            raise _invalid()
+        return tuple(require_opaque_id(kind, label="kind") for kind in kinds)
 
     def start(self, lease: JobLease) -> None:
         """``leased -> running`` under exactly ``lease``."""
@@ -221,22 +278,25 @@ class JobService:
 
         return self._store.transact(read)
 
-    def resolve_leased_spec(self, lease: JobLease) -> JobSpec | None:
-        """Read ``JobSpec`` for a ``LEASED`` job, or fail it fenced with ``INVALID_PAYLOAD`` if policy-blocked."""
-        self._require_current(lease)
-        _, now = require_aware_utc(self._clock.now())
+    def resolve_leased_spec(self, lease: JobLease, *, fail_missing_payload: bool = False) -> JobSpec | None:
+        """Read ``JobSpec`` for a ``LEASED`` job, or settle the job in the same transaction and return ``None``.
 
-        def resolve(tx: KernelTx) -> JobSpec | None:
-            row = self._fenced(tx, lease, JobState.LEASED)
-            if tx.holder_tombstoned(row.job_id) or tx.blob_restricted(row.payload_digest):
-                self._terminal(tx, row, JobState.FAILED, now, reason=JobErrorCode.INVALID_PAYLOAD)
-                return None
-            payload = tx.read_held_blob(row.payload_digest, holder_id=row.job_id)
-            if payload is None:
-                raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
-            return JobSpec(row.kind, row.owner_id, payload, repo_id=row.repo_id, checkout_id=row.checkout_id)
+        A job that can no longer read its payload through its own hold (tombstoned, restricted, or its hold released
+        while the bytes are intact) fails with ``INVALID_PAYLOAD``. A transient failure in any payload read is retried
+        with backoff up to the attempt cap, then dead-lettered. Missing or corrupt bytes raise ``INTEGRITY_FAILURE``
+        and leave the job leased, unless ``fail_missing_payload`` (the doctor runner) fails it with ``INVALID_PAYLOAD``;
+        with that flag a permanent fault raised by the read (``_PERMANENT_PAYLOAD_FAULT``) fails the job the same way.
+        """
+        return self._resolve_claimed_spec(lease, JobState.LEASED, fail_missing_payload=fail_missing_payload)
 
-        return self._store.transact(resolve)
+    def resolve_started_doctor_spec(self, lease: JobLease) -> JobSpec | None:
+        """Resume an already committed doctor start; settle unusable payloads under the running lease."""
+        return self._resolve_claimed_spec(lease, JobState.RUNNING, fail_missing_payload=True)
+
+    def _resolve_claimed_spec(
+        self, lease: JobLease, state: JobState, *, fail_missing_payload: bool
+    ) -> JobSpec | None:
+        return _jobs_settlement._resolve_claimed_spec(self, lease, state, fail_missing_payload=fail_missing_payload)
 
     def complete(
         self,
@@ -246,31 +306,7 @@ class JobService:
         on_complete_in_tx: Callable[[KernelTx, JobRecord, JobOutcome], None] | None = None,
     ) -> None:
         """Finish the running attempt: succeeded, failed (nonretryable), queued again with backoff, or dead letter."""
-        self._require_current(lease)
-        if not isinstance(result, JobOutcome):
-            raise _invalid()
-        descriptor = None
-        if result.succeeded and result.result_refs:
-            descriptor = result_descriptor(lease.job_id, result.result_refs)
-            self._stager.stage_blob(descriptor)
-        now_utc, now = require_aware_utc(self._clock.now())
-
-        def complete(tx: KernelTx) -> None:
-            row = self._fenced(tx, lease, JobState.RUNNING)
-            if result.succeeded:
-                digest = None if descriptor is None else tx.hold_blob(descriptor, holder_id=lease.job_id)
-                self._terminal(tx, row, JobState.SUCCEEDED, now, result_digest=digest)
-                if on_complete_in_tx is not None:
-                    on_complete_in_tx(tx, row, result)
-            elif not result.retryable:
-                self._terminal(tx, row, JobState.FAILED, now, reason=result.error_code)
-            else:
-                assert result.error_code is not None
-                exhausted = row.attempt >= MAX_JOB_ATTEMPTS
-                retry_at = now if exhausted else require_aware_utc(now_utc + retry_backoff(row.attempt))[1]
-                self._retry_or_dead_letter(tx, row, result.error_code, retry_at=retry_at, now=now)
-
-        self._store.transact(complete)
+        _jobs_settlement.complete(self, lease, result, on_complete_in_tx=on_complete_in_tx)
 
     def apply_command(
         self,
@@ -296,98 +332,11 @@ class JobService:
 
     def reserve_invocation(self, lease: JobLease, reservation: UsageReservation) -> str:
         """Durably record a new invocation and its max reservation under the running fence; its ID."""
-        self._require_current(lease)
-        if not isinstance(reservation, UsageReservation):
-            raise _invalid()
-        row = self._store.transact(lambda tx: self._fenced(tx, lease, JobState.RUNNING))
-        invocation_id = new_id()
-        acct = self._accounting_active()
-        if acct is not None:
-            acct.reserve_accounting_invocation(
-                invocation_id=invocation_id,
-                job_id=lease.job_id,
-                owner_id=row.owner_id,
-                writer_epoch=lease.writer_epoch,
-                max_amount=reservation.max_amount,
-                now=self._clock.now(),
-            )
-        descriptor = reservation_descriptor(invocation_id, lease.job_id, reservation)
-        self._stager.stage_blob(descriptor)
-
-        def reserve(tx: KernelTx) -> None:
-            self._fenced(tx, lease, JobState.RUNNING)
-            digest = tx.hold_blob(descriptor, holder_id=invocation_id)
-            meta = {"invocation_id": invocation_id, **_lease_meta(lease), "reservation_digest": digest}
-            tx.append_record(KernelRecord("provider.reserved", meta))
-
-        self._store.transact(reserve)
-        crashpoint("jobs.after_invocation_reserve")
-        return invocation_id
+        return _jobs_settlement.reserve_invocation(self, lease, reservation)
 
     def settle_usage(self, invocation_id: str, usage: UsageRecord) -> None:
         """Record nonfinal unknown usage or commit the first final usage of an invocation; identical retry no-op."""
-        descriptor = usage_descriptor(invocation_id, usage)
-        usage_digest = digest_bytes(descriptor)
-
-        def _precheck(tx: KernelTx) -> bool:
-            invocation = tx.read_invocation(invocation_id)
-            if invocation is None:
-                raise _not_found()
-            if invocation.state is InvocationState.SETTLED:
-                if usage.complete and invocation.usage_digest == usage_digest:
-                    return False
-                raise BrainError(ErrorCode.IDEMPOTENCY_CONFLICT, "idempotency conflict")
-            if (
-                not usage.complete
-                and invocation.state is InvocationState.OUTCOME_UNKNOWN
-                and invocation.usage_complete is False
-            ):
-                if invocation.usage_digest == usage_digest:
-                    return False
-                raise BrainError(ErrorCode.IDEMPOTENCY_CONFLICT, "idempotency conflict")
-            return True
-
-        if not self._store.transact(_precheck):
-            return
-        acct = self._accounting_active()
-        if acct is not None:
-            acct.settle_accounting_invocation(
-                invocation_id=invocation_id,
-                amount=usage.amount,
-                complete=usage.complete,
-                now=self._clock.now(),
-            )
-        self._stager.stage_blob(descriptor)
-
-        def settle(tx: KernelTx) -> bool:
-            invocation = tx.read_invocation(invocation_id)
-            if invocation is None:
-                raise _not_found()
-            if invocation.state is InvocationState.SETTLED:
-                if usage.complete and invocation.usage_digest == usage_digest:
-                    return False
-                raise BrainError(ErrorCode.IDEMPOTENCY_CONFLICT, "idempotency conflict")
-            if not usage.complete:
-                if invocation.state is InvocationState.OUTCOME_UNKNOWN and invocation.usage_complete is False:
-                    if invocation.usage_digest == usage_digest:
-                        return False
-                    raise BrainError(ErrorCode.IDEMPOTENCY_CONFLICT, "idempotency conflict")
-                prior_usage_digest: str | None = None
-            else:
-                prior_usage_digest = invocation.usage_digest
-            tx.hold_blob(descriptor, holder_id=invocation_id)
-            meta: dict[str, JsonValue] = {
-                "invocation_id": invocation_id,
-                "prior_state": invocation.state.value,
-                "prior_usage_digest": prior_usage_digest,
-                "usage_digest": usage_digest,
-                "complete": usage.complete,
-            }
-            tx.append_record(KernelRecord("provider.settled", meta))
-            return True
-
-        if self._store.transact(settle):
-            crashpoint("jobs.after_usage_settle_commit")
+        _jobs_settlement.settle_usage(self, invocation_id, usage)
 
     # --- authorized reads and cancellation ----------------------------------------------------------------------
 

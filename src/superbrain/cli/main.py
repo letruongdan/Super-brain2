@@ -5,13 +5,12 @@ from __future__ import annotations
 import contextlib
 import os
 import signal
-import subprocess
 import sys
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from superbrain.core.errors import ErrorCode
+from superbrain.core.errors import ErrorCode, safe_wire_message
 
 __all__ = ["main"]
 
@@ -20,6 +19,20 @@ def _write_stderr(code: str) -> None:
     try:
         sys.stderr.write(f"{code}\n")
         sys.stderr.flush()
+    except OSError:
+        pass
+
+
+def _write_json_error(code: ErrorCode) -> None:
+    import json
+
+    payload = json.dumps(
+        {"ok": False, "error": {"code": code.value, "message": safe_wire_message(code)}},
+        sort_keys=True,
+    )
+    try:
+        sys.stdout.write(payload + "\n")
+        sys.stdout.flush()
     except OSError:
         pass
 
@@ -71,11 +84,20 @@ def _parse_bootstrap_args(args: list[str]) -> tuple[str, list[str]] | None:
     return ("superbrain.composition.bootstrap_entry", args)
 
 
+def _is_valid_wait_ms(raw: str) -> bool:
+    if not raw or not raw.isascii() or not raw.isdigit():
+        return False
+    return 0 <= int(raw, 10) <= 10_000
+
+
 def _parse_doctor_args(args: list[str]) -> tuple[str, list[str]] | None:
     has_config = False
     has_profile = False
     has_checkout = False
     has_outbox = False
+    has_offline = False
+    has_fix = False
+    has_wait_ms = False
     has_json = False
     i = 1
     while i < len(args):
@@ -85,6 +107,21 @@ def _parse_doctor_args(args: list[str]) -> tuple[str, list[str]] | None:
                 return None
             has_json = True
             i += 1
+        elif tok == "--offline":
+            if has_offline:
+                return None
+            has_offline = True
+            i += 1
+        elif tok == "--fix":
+            if has_fix:
+                return None
+            has_fix = True
+            i += 1
+        elif tok == "--wait-ms":
+            if has_wait_ms or i + 1 >= len(args) or not _is_valid_wait_ms(args[i + 1]):
+                return None
+            has_wait_ms = True
+            i += 2
         elif tok == "--config":
             if has_config or has_profile or i + 1 >= len(args) or not _is_valid_abs_path(args[i + 1]):
                 return None
@@ -308,6 +345,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     raw_args = list(sys.argv[1:] if argv is None else argv)
     parsed = _parse_cli_args(raw_args)
     if parsed is None:
+        if raw_args and raw_args[0] == "doctor" and "--json" in raw_args[1:]:
+            _write_json_error(ErrorCode.INVALID_INPUT)
         _write_stderr(ErrorCode.INVALID_INPUT.value)
         return 2
 
@@ -335,6 +374,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 pass
     try:
         try:
+            import subprocess
+
             proc = subprocess.Popen(cmd, shell=False)
         except OSError:
             _write_stderr(ErrorCode.IO_ERROR.value)

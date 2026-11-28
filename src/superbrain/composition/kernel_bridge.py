@@ -20,7 +20,7 @@ from superbrain.application.deadlines import (
 from superbrain.application.dispatch import KernelDispatcher, KernelToolDomain
 from superbrain.application.idempotency import is_idempotency_expired
 from superbrain.application.privacy import PrivacyFilter
-from superbrain.composition._layer2_live import make_live_layer2_lookup
+from superbrain.composition._layer2_live import apply_recorded_layer2, make_live_layer2_lookup
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.ids import new_id
 from superbrain.core.jsonvalue import JsonValue
@@ -572,20 +572,16 @@ class KernelBridge(KernelBlobStagePort):
             or chk.repo_id != command.repo_id or chk.machine_id != live_p.machine_id
         ):
             raise BrainError(ErrorCode.IDENTITY_MISMATCH, "principal identity mismatch")
+        l2_recorded: list[bool] = []
         try:
             bind_fn, link_fn, touched = capture_continuity_hooks(
                 self._store, self._policy, principal_id=live_p.principal_id, repo_id=command.repo_id,
                 checkout_id=command.checkout_id, now=self._clock.now(),
             ) if repo_pol.automatic_capture_enabled else (None, None, [])
             layer2_lookup = make_live_layer2_lookup(
-                self._policy,
-                events=command.events,
-                harness_id=live_p.harness_id,
-                repo_id=command.repo_id,
-                checkout_id=command.checkout_id,
-                os_=self._os,
-                host_version_resolver=self._host_version_resolver,
-                seen_configured=self._seen_l2,
+                self._policy, events=command.events, harness_id=live_p.harness_id, repo_id=command.repo_id,
+                checkout_id=command.checkout_id, os_=self._os, host_version_resolver=self._host_version_resolver,
+                seen_configured=self._seen_l2, on_recorded=lambda: l2_recorded.append(True),
             )
             ack = self._capture_ingest.ingest_batch(
                 command, principal=live_p, repo_policy=repo_pol, layer2_lookup=layer2_lookup,
@@ -595,5 +591,6 @@ class KernelBridge(KernelBlobStagePort):
                 self.on_continuity_tasks(tuple(touched))
             return ack
         finally:
+            apply_recorded_layer2(self._store, l2_recorded)  # ingest's transaction is closed here
             if self._on_capture_gaps_changed is not None:
                 self._on_capture_gaps_changed(self._capture_store.has_gaps())

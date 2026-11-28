@@ -15,6 +15,7 @@ from superbrain.adapters.auth.ssh_sig import SshSigVerifier
 from superbrain.adapters.os import find_ssh_keygen, os_adapters
 from superbrain.application.approvals import (
     BootstrapProposalHandler,
+    DoctorOperatorHandler,
     OperatorHandle,
     OperatorService,
     PreparedOperatorCall,
@@ -31,6 +32,10 @@ from superbrain.core.kernel import CallResult
 from superbrain.core.wire import make_error_envelope, make_success_envelope
 from superbrain.ports.approval import ApprovalPolicyPort, SshApprovalVerifierPort, WebAuthnApprovalVerifierPort
 from superbrain.ports.os import OsAdapters
+from superbrain.storage.layout import ensure_private_directory_tree
+
+if TYPE_CHECKING:
+    from superbrain.adapters.auth.webauthn_verifier import WebAuthnResult
 
 if TYPE_CHECKING:
     from superbrain.adapters.auth.webauthn_verifier import WebAuthnResult
@@ -39,6 +44,8 @@ __all__ = ["build_operator_service", "make_default_bootstrap_handler", "make_ope
 
 _T = TypeVar("_T")
 _SLICE_S = 0.005
+# A doctor fix stops this long before the request deadline so its "interrupted" answer still reaches the client.
+DOCTOR_FIX_CUTOFF_RESERVE_NS = 500_000_000
 
 
 def _verified_ssh_scratch_dir(adapters: OsAdapters) -> Path:
@@ -53,35 +60,12 @@ def _verified_ssh_scratch_dir(adapters: OsAdapters) -> Path:
         adapters.paths.reject_unsafe_path(str(base))
         base = Path(os.path.abspath(base))
     scratch = base / "ssh-verify"
-    adapters.paths.reject_unsafe_path(str(scratch))
-    adapters.paths.reject_links(scratch)
-    if adapters.permissions.check_ancestors(scratch):
-        raise BrainError(ErrorCode.INSECURE_PERMISSIONS, "insecure permissions")
-
-    missing: list[Path] = []
-    for candidate in (scratch, *scratch.parents):
-        if os.path.lexists(candidate):
-            break
-        missing.append(candidate)
-    for directory in reversed(missing):
-        try:
-            directory.mkdir(mode=0o700)
-        except FileExistsError:
-            pass
-        adapters.paths.reject_links(directory)
-        if not directory.is_dir():
-            raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
-        adapters.permissions.secure_directory(directory)
-        if adapters.permissions.object_problems(directory):
-            raise BrainError(ErrorCode.INSECURE_PERMISSIONS, "insecure permissions")
-
-    adapters.paths.reject_links(scratch)
-    if adapters.permissions.check_ancestors(scratch):
-        raise BrainError(ErrorCode.INSECURE_PERMISSIONS, "insecure permissions")
-    if not scratch.is_dir():
-        raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
-    if adapters.permissions.object_problems(scratch):
-        raise BrainError(ErrorCode.INSECURE_PERMISSIONS, "insecure permissions")
+    ensure_private_directory_tree(
+        scratch,
+        adapters,
+        label="ssh scratch directory",
+        ancestor_label="scratch ancestor is not trusted",
+    )
     return scratch
 
 
@@ -139,6 +123,7 @@ class _LocalhostWebAuthnVerifier(WebAuthnApprovalVerifierPort):
         match = _LOCALHOST_ORIGIN_RE.match(origin)
         if match is None or not 1 <= int(match.group(1)) <= 65535:
             raise BrainError(ErrorCode.UNAUTHENTICATED, "unauthenticated")
+        # Imported on first use: ``webauthn`` adds ~0.15 s to every process that never verifies a WebAuthn approval.
         from superbrain.adapters.auth.webauthn_verifier import WebAuthnApprovalVerifier
 
         return WebAuthnApprovalVerifier(rp_id="localhost", origin=origin).verify(
@@ -158,6 +143,7 @@ def build_operator_service(
     review_apply: ReviewApplyService | None = None,
     restore_handler: RestoreHandler | None = None,
     bootstrap_handler: BootstrapProposalHandler | None = None,
+    doctor_handler: DoctorOperatorHandler | None = None,
     expected_endpoint_path: Path | None = None,
     expected_leaf_cert_sha256: str | None = None,
     server_cert_path: Path | None = None,
@@ -171,6 +157,7 @@ def build_operator_service(
         review_apply=review_apply,
         restore_handler=restore_handler,
         live_layer2_check=live_layer2_check,
+        doctor_handler=doctor_handler,
         bootstrap_handler=(
             bootstrap_handler
             if bootstrap_handler is not None
@@ -224,6 +211,46 @@ def make_operator_executor(
             prepared = _await_owner_future(owner.run_owner_action(_phase1), owner, monotonic_ns, deadline_ns)
             if prepared.immediate is not None:
                 return make_success_envelope(prepared.immediate)
+            if prepared.pending_fix is not None:
+                pending_fix = prepared.pending_fix
+                service = handle.service()
+                if service is None:
+                    raise BrainError(ErrorCode.DAEMON_UNAVAILABLE, "daemon unavailable")
+                cutoff_ns = deadline_ns - DOCTOR_FIX_CUTOFF_RESERVE_NS
+
+                def _fix_should_stop() -> bool:
+                    return owner.is_stopping or int(monotonic_ns()) >= cutoff_ns
+
+                def _fix_on_owner(fn: Callable[[], _T]) -> _T:
+                    # ``fn`` re-checks ``_fix_should_stop`` when the owner starts it, not when it was queued.
+                    return _await_owner_future(owner.run_owner_action(fn), owner, monotonic_ns, deadline_ns)
+
+                return make_success_envelope(
+                    service.execute_doctor_fix(pending_fix, should_stop=_fix_should_stop, run_on_owner=_fix_on_owner)
+                )
+            if prepared.pending_doctor is not None:
+                pending_doc = prepared.pending_doctor
+                _check_live_budget(owner, monotonic_ns, deadline_ns)
+                service = handle.service()
+                if service is None:
+                    raise BrainError(ErrorCode.DAEMON_UNAVAILABLE, "daemon unavailable")
+                rem_s = (deadline_ns - int(monotonic_ns())) / 1_000_000_000.0
+                wait_s = min(pending_doc.wait_timeout_ms / 1000.0, max(0.0, rem_s - 0.5))
+                service.verify_doctor(pending_doc, timeout_s=wait_s)
+
+                _check_live_budget(owner, monotonic_ns, deadline_ns)
+
+                def _phase3_doctor() -> dict[str, JsonValue]:
+                    _check_live_budget(owner, monotonic_ns, deadline_ns)
+                    svc = handle.service()
+                    if svc is None:
+                        raise BrainError(ErrorCode.DAEMON_UNAVAILABLE, "daemon unavailable")
+                    return svc.commit_doctor(pending_doc)
+
+                committed_doc = _await_owner_future(
+                    owner.run_owner_action(_phase3_doctor), owner, monotonic_ns, deadline_ns
+                )
+                return make_success_envelope(committed_doc)
 
             pending = prepared.pending
             assert pending is not None

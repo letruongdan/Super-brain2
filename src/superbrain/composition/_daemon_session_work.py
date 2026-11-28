@@ -11,6 +11,7 @@ from superbrain.composition._daemon_handoff_factory import build_default_handoff
 from superbrain.composition._daemon_handoff_factory import (
     make_default_handoff_domain_factory as make_default_handoff_domain_factory,
 )
+from superbrain.composition._daemon_health import DOCTOR_JOB_KIND
 from superbrain.composition._daemon_job_recovery import UNREADABLE
 from superbrain.composition._endpoint import remove_own_endpoint
 from superbrain.core.errors import BrainError, ErrorCode
@@ -34,6 +35,8 @@ def teardown_on_owner(self: _m._AdmittedOwnerSession, *, overrun: bool, cancelle
     if self._operator is not None:
         self._operator.unbind()
     self._close_claim_gate()
+    if self._doctor_runner is not None:
+        self._doctor_runner.cancel_on_teardown()
     drained, worker_drained = self.shutdown_metrics()
     removed = False
     try:
@@ -95,7 +98,10 @@ def _claim_and_submit_job(self: _m._AdmittedOwnerSession) -> bool:
     if not self._is_claim_open():
         return False
     try:
-        lease = self._job_service.lease_next(self._rt.lease.epoch, self._clock.now())
+        # system.doctor jobs belong to the doctor runner; the generic executor must never lease them
+        lease = self._job_service.lease_next_for_kinds(
+            self._rt.lease.epoch, self._clock.now(), (DOCTOR_JOB_KIND,), exclude=True
+        )
     except BrainError as err:
         if err.code is ErrorCode.POLICY_UNAVAILABLE:
             self._auth_gate.invalidate()
@@ -179,6 +185,10 @@ def step_owner_work(self: _m._AdmittedOwnerSession, *, allow_new_jobs: bool) -> 
         if allow_new_jobs:
             self._scan_continuity_if_due()
             did_work = self._claim_and_submit_job() or did_work
+    if self._doctor_runner is not None and self._doctor_runner.step(allow_new_jobs=allow_new_jobs):
+        did_work = True
     if self._bridge.process_next_queued(block=False):
         did_work = True
+        if allow_new_jobs and self._doctor_runner is not None:
+            did_work = self._doctor_runner.claim_pending_if_idle() or did_work
     return did_work

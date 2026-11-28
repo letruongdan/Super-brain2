@@ -15,7 +15,6 @@ from pathlib import Path
 from typing import Any
 
 from superbrain.core.errors import BrainError, ErrorCode
-from superbrain.core.proposals import normalize_proposal_rel_path, validate_journal_id
 from superbrain.ports.os import OsAdapters, PhysicalFsPort, PhysicalObjectId
 
 __all__ = [
@@ -452,6 +451,8 @@ def verify_physical_target(
     root: Path, rel_path: str, os_: OsAdapters
 ) -> tuple[PhysicalObjectId, PhysicalObjectId | None]:
     """Validate ``root / rel_path`` safety/links/ancestors and return ``(parent_id, target_id_or_None)``."""
+    from superbrain.core.proposals import normalize_proposal_rel_path
+
     _reject_path_spelling(str(root), os_)
     if not root.is_absolute():
         raise BrainError(ErrorCode.UNSAFE_PATH, "unsafe path")
@@ -499,6 +500,8 @@ def select_apply_staging_dir(
     target_root: Path, data_root: Path, journal_id: str, owner_id: str, os_: OsAdapters
 ) -> Path:
     """Validate link/permission safety BEFORE creating same-volume or cross-volume apply staging directory."""
+    from superbrain.core.proposals import validate_journal_id
+
     _reject_path_spelling(str(target_root), os_)
     _reject_path_spelling(str(data_root), os_)
     if not target_root.is_absolute() or not data_root.is_absolute():
