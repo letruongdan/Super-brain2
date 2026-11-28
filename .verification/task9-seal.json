@@ -185,6 +185,7 @@
     "tests/storage/test_outbox_durability_and_limits.py": "sha256:d68e35064f1f0990e79ae8a31fc6cde36dcdabd22bae417c6684399e336faf5b",
     "tests/storage/test_outbox_r10_ack_durability.py": "sha256:718cd2cd0f44059b2a7774d4761d6c8b8d16532386209603402a194ed49e53ec",
     "tests/storage/test_outbox_r12_findings.py": "sha256:c3f3cafde2a95a26dbc68a138a99879935d14e89cb809239141bd839681b61aa",
+    "tests/storage/test_outbox_r13_findings.py": "sha256:0f80813a63a7c7e46c65e65f676f6a961f064d58039b98974e1a4e378ce88c11",
     "tests/storage/test_outbox_r8_migration_and_limits.py": "sha256:09ba609a50bcce8015a55b21f7c158ae35e5f5a676be10b626ac7f09cd5ab6ec",
     "tests/storage/test_outbox_r9_ack_cursor_bounds.py": "sha256:f3d4e2e2b68dfd9fbebbaa211b25bbfe6c752d953c1e53a0fb066baaa9869feb",
     "tests/storage/test_policy_accounting.py": "sha256:01937c38af1219900b87a9f2c772ac1234d50e591cc78e8feb87363330b64fd0",
