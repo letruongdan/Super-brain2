@@ -131,4 +131,17 @@ def sync_dir(directory: Path) -> None:
         else:
             _fallback_sync_dir(directory)
     except OSError as err:
-        raise BrainError(ErrorCode.IO_ERROR, "cannot sync outbox directory") from err
+        raise raise_storage_error(err, "cannot sync outbox directory") from err
+
+
+_ENOSPC_WINERROR = 112
+
+
+def raise_storage_error(err: OSError, message: str) -> BrainError:
+    """One mapping for every outbox write: a full disk is STORAGE_FULL (the hook then records an outbox_full gap)."""
+    winerr = getattr(err, "winerror", None)
+    if err.errno in (errno.ENOSPC, errno.EDQUOT) or winerr == _ENOSPC_WINERROR:
+        return BrainError(ErrorCode.STORAGE_FULL, "storage full")
+    if getattr(errno, "ELOOP", None) is not None and err.errno == errno.ELOOP:
+        return BrainError(ErrorCode.UNSAFE_PATH, f"symlink detected in outbox: {err}")
+    return BrainError(ErrorCode.IO_ERROR, f"{message}: {err}")

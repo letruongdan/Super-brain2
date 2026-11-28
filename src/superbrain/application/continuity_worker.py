@@ -36,6 +36,7 @@ from superbrain.ports.continuity import (
     pop_worker_observed_output,
     stage_worker_observed_output,
 )
+from superbrain.ports.doctor import DOCTOR_JOB_KIND
 from superbrain.ports.kernel import KernelBlobStagePort, KernelTx
 
 _DEFAULT_WORKER_BUDGET_NS = 5_000_000_000
@@ -322,7 +323,8 @@ class ContinuityWorkerCoordinator:
         if self._executor is None:
             raise BrainError(ErrorCode.CAPABILITY_UNAVAILABLE, "worker executor unavailable")
         self._job_service.recover(writer_epoch)
-        lease = self._job_service.lease_next(writer_epoch, now)
+        # system.doctor belongs to the doctor runner; every other kind keeps the I2 HANDLER_UNAVAILABLE contract
+        lease = self._job_service.lease_next_for_kinds(writer_epoch, now, (DOCTOR_JOB_KIND,), exclude=True)
         if lease is None:
             return None
         try:

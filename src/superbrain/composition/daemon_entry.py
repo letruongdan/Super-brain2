@@ -213,7 +213,6 @@ def _open_owner_session(
             fallback_factory=(
                 make_default_handoff_domain_factory(
                     rt=rt, clock=resolved_clock, writer_epoch=rt.lease.epoch,
-                    host_version_resolver=resolved_hv_resolver,
                 ) if domain is None else None
             ),
         )

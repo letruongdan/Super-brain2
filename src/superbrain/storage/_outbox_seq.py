@@ -33,6 +33,7 @@ from superbrain.storage._outbox_bindings import (
     parse_binding_row,
     upsert_binding,
 )
+from superbrain.storage._outbox_durable import raise_storage_error
 from superbrain.storage._outbox_io import verify_stream_dir_safe as verify_stream_dir_safe
 from superbrain.storage._outbox_slots import allocate_event_id as allocate_event_id
 from superbrain.storage._outbox_slots import resolve_hook_envelope_slot as resolve_hook_envelope_slot
@@ -243,7 +244,7 @@ def _persist_cursor_payload(stream_dir: Path, payload: bytes, perms: OutboxPermi
     except BrainError:
         raise
     except OSError as err:
-        raise BrainError(ErrorCode.IO_ERROR, f"cannot write stream cursor: {err}") from err
+        raise raise_storage_error(err, "cannot write stream cursor") from err
     finally:
         if fd != -1:
             try:

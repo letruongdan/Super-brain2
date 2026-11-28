@@ -13,9 +13,6 @@ from pathlib import Path
 
 from superbrain.application._doctor_checks import clip_report_str
 from superbrain.application.doctor import DoctorReport
-from superbrain.composition._daemon_deep_health import _live_layer2_degraded as _live_layer2_degraded
-from superbrain.composition._daemon_deep_health import prepare_deep_health as prepare_deep_health
-from superbrain.composition._daemon_deep_health import render_deep_health as render_deep_health
 from superbrain.core._json_parse import parse_json
 from superbrain.core._kernel_jobs import JobRecord
 from superbrain.core.canonical import canonical_json
@@ -32,6 +29,7 @@ from superbrain.core.kernel import (
     parse_canonical_utc,
     require_aware_utc,
 )
+from superbrain.ports.doctor import DOCTOR_JOB_KIND as DOCTOR_JOB_KIND
 from superbrain.ports.doctor import MAX_DOCTOR_RUN_BLOB_BYTES
 from superbrain.ports.kernel import KernelTx
 from superbrain.ports.os import OsAdapters
@@ -43,7 +41,6 @@ from superbrain.storage.retention import RetentionPolicy
 from superbrain.storage.runtime import Runtime
 from superbrain.storage.sqlite import open_readonly
 
-DOCTOR_JOB_KIND = "system.doctor"
 DOCTOR_FRESHNESS_WINDOW = timedelta(hours=24)
 DOCTOR_OPERATOR_WINDOW = timedelta(minutes=15)
 RETENTION_POLICY = RetentionPolicy()

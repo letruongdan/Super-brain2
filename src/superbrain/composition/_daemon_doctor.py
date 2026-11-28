@@ -22,6 +22,7 @@ from superbrain.application._approvals_types import (
 from superbrain.application._privacy_canary import KernelPrivacyScanner
 from superbrain.application.dispatch import PreparedEffect
 from superbrain.application.jobs import JobService
+from superbrain.composition._daemon_deep_health import prepare_deep_health, render_deep_health
 from superbrain.composition._daemon_doctor_commit import (
     DoctorFences,
     _CompletedDoctorProbe,
@@ -30,8 +31,6 @@ from superbrain.composition._daemon_health import (
     DOCTOR_JOB_KIND,
     enqueue_doctor_tx,
     iter_owner_doctor_ledger,
-    prepare_deep_health,
-    render_deep_health,
 )
 from superbrain.composition._doctor_fix_wiring import (
     DoctorFixHooks,

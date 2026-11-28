@@ -433,8 +433,12 @@ def _install_fake_host_bins(
     os_adapters().permissions.secure_directory(bin_dir)
     _write_fake_host_bin(bin_dir, "claude", f"{claude_ver} (Claude Code)")
     _write_fake_host_bin(bin_dir, "codex", f"codex-cli {codex_ver}")
-    ssh_dir = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "OpenSSH"
-    isolated_path = f"{bin_dir}{os.pathsep}{ssh_dir}" if sys.platform == "win32" else str(bin_dir)
+    ssh_dir = (
+        Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "OpenSSH"
+        if sys.platform == "win32"
+        else Path(shutil.which("ssh-keygen") or "/usr/bin/ssh-keygen").parent  # the SSH approval verifier needs it
+    )
+    isolated_path = f"{bin_dir}{os.pathsep}{ssh_dir}"
     monkeypatch.setenv("PATH", isolated_path)
     return bin_dir
 
@@ -2716,8 +2720,12 @@ def test_r5_finding2_active_host_version_drift_on_terminal_and_doctor(
 
     claude_bin = _write_fake_host_bin(bin_dir, "claude", f"{_CLAUDE_VER} (Claude Code)")
     _write_fake_host_bin(bin_dir, "codex", "codex-cli 0.171.0")
-    ssh_dir = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "OpenSSH"
-    isolated_path = f"{bin_dir}{os.pathsep}{ssh_dir}" if sys.platform == "win32" else str(bin_dir)
+    ssh_dir = (
+        Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "OpenSSH"
+        if sys.platform == "win32"
+        else Path(shutil.which("ssh-keygen") or "/usr/bin/ssh-keygen").parent  # the SSH approval verifier needs it
+    )
+    isolated_path = f"{bin_dir}{os.pathsep}{ssh_dir}"
     monkeypatch.setenv("PATH", isolated_path)
 
     rep = init_entry.init_store(

@@ -1937,3 +1937,31 @@ def test_mixed_batch_commits_live_events_closes_at_cutoff_and_keeps_later_events
     finally:
         executor.close(BOUND_WAIT_S)
         rt.close()
+
+
+def test_claim_and_execute_never_leases_a_system_doctor_job(trusted_tmp: Path) -> None:
+    """``system.doctor`` belongs to the doctor runner: the coordinator leaves it queued, even when it is due first."""
+    from superbrain.application.continuity_worker import ContinuityWorkerCoordinator
+
+    clock = FakeClock(_START)
+    mono = FakeMonotonicClock()
+    os_ = os_adapters(clock=clock, monotonic=mono)
+    rt = _open_rt(trusted_tmp / "doctor-kind", os_, role="sp23-doctor-kind")
+    executor = JobExecutor(PRODUCTION_JOB_HANDLERS, mono.monotonic_ns)
+    executor.start()
+    try:
+        svc, kstore = kernel_job_service(rt, clock)
+        payload = b"{}"
+        kstore.stage_blob(payload)
+        doctor_spec = JobSpec(kind="system.doctor", owner_id="dan", payload=payload)
+        ref = kstore.transact(lambda tx: svc.enqueue(tx, doctor_spec))
+        coord = ContinuityWorkerCoordinator(
+            rt=rt, job_service=svc, executor=executor, clock=clock, mono=mono.monotonic_ns
+        )
+        assert coord.claim_and_execute(writer_epoch=rt.lease.epoch, now=clock.now()) is None
+        row = kstore.transact(lambda tx: tx.read_job(ref.job_id))
+        assert row is not None
+        assert (row.state, row.lease_id, row.reason) == (JobState.QUEUED, None, None), row  # never leased
+    finally:
+        executor.close(BOUND_WAIT_S)
+        rt.close()

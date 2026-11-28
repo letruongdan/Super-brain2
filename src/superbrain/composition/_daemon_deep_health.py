@@ -8,6 +8,7 @@ from typing import cast
 
 from superbrain.application.dispatch import PreparedEffect
 from superbrain.composition import _daemon_health as _m
+from superbrain.composition._layer2_live import layer2_drift_detected
 from superbrain.core._json_parse import parse_json
 from superbrain.core._kernel_approval import CLI_HARNESS_ID
 from superbrain.core.canonical import canonical_json
@@ -105,8 +106,21 @@ def prepare_deep_health(
 
 
 
+# Conditions published as live: their DoctorRun-time copies are dropped and the current state is added.
+_LIVE_CODES = frozenset({"capture_gap_present", "sp2.capture_gaps", "harness.layer2", "sp2.layer2_drift"})
+
+
+def historical_codes(run_doc: dict[str, JsonValue]) -> tuple[str, ...]:
+    """A DoctorRun's degraded codes minus the ones deep health re-evaluates live (they may have cleared since)."""
+    stored = run_doc.get("degraded_codes", [])
+    return tuple(c for c in map(str, cast(list[object], stored)) if c not in _LIVE_CODES)
+
+
 def _live_layer2_degraded(rt: Runtime) -> bool:
-    """Doctor ``harness.layer2`` WARN, read live: a connected non-CLI harness while terminal is not eligible."""
+    """Doctor ``harness.layer2`` WARN, read live: terminal not eligible for a connected non-CLI harness, or a
+    VERIFIED harness whose checkout config changed on disk since (read-only; the next live check records it)."""
+    if layer2_drift_detected(rt.policy, os_=rt.os_):
+        return True
     snap = rt.policy.snapshot()
     machines = {
         c.principal.machine_id
@@ -131,6 +145,10 @@ def render_deep_health(
     # live like clock trust: a gap opened after the latest DoctorRun must still show (SP2-5 deep health contract)
     gaps_now = KernelCaptureStore(rt.store).has_gaps() if rt.store.schema_version >= 6 else False
     l2_now = (_m._LAYER2_CHECK_CODE,) if _live_layer2_degraded(rt) else ()
+    if result.refs and result.refs[0].kind == "health_result":
+        # a result stored by the SP2-5 deep-health producer (before the SP1-I4 merge): same live codes, no run
+        return _live_only(rt, now=now, tls_not_after=tls_not_after, clock_untrusted_fn=clock_untrusted_fn,
+                          gaps_now=gaps_now, l2_now=l2_now, job_id=None)
     desc_ref: ObjectRef | None = None
     run_ref: ObjectRef | None = None
     if len(result.refs) == 1 and result.refs[0].id == result.result_id:
@@ -204,7 +222,7 @@ def render_deep_health(
         if not isinstance(rec_raw, str):
             raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
         age_s = max(0.0, (now_utc - parse_canonical_utc(rec_raw)).total_seconds())
-        extra = tuple(str(c) for c in cast(list[object], run_doc.get("degraded_codes", [])))
+        extra = historical_codes(run_doc)
         ready, degraded = _m.health_status_fields(
             now=now_utc,
             tls_not_after=tls_not_after,
@@ -224,6 +242,22 @@ def render_deep_health(
             "job_id": job_id,
         }
 
+    return _live_only(rt, now=now, tls_not_after=tls_not_after, clock_untrusted_fn=clock_untrusted_fn,
+                      gaps_now=gaps_now, l2_now=l2_now, job_id=job_id)
+
+
+def _live_only(
+    rt: Runtime,
+    *,
+    now: datetime,
+    tls_not_after: datetime,
+    clock_untrusted_fn: Callable[[], bool],
+    gaps_now: bool,
+    l2_now: tuple[str, ...],
+    job_id: object,
+) -> dict[str, JsonValue]:
+    """Deep health without a DoctorRun: only the live clock, TLS, capture-gap and Layer-2 codes."""
+    now_utc, _ = require_aware_utc(now)
     ready, degraded = _m.health_status_fields(
         now=now_utc,
         tls_not_after=tls_not_after,
@@ -240,5 +274,5 @@ def render_deep_health(
         "degraded_codes": degraded,
         "doctor_run_id": None,
         "age_s": None,
-        "job_id": job_id,
+        "job_id": cast(JsonValue, job_id),
     }

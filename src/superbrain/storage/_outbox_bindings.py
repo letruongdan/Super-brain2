@@ -22,6 +22,7 @@ from superbrain.ports.capture import (
     require_capture_sequence,
     require_iso_utc_timestamp,
 )
+from superbrain.storage._outbox_durable import raise_storage_error
 from superbrain.storage._outbox_io import (
     _O_BINARY,
     _O_NOFOLLOW,
@@ -313,7 +314,7 @@ def write_prepared_binding_bucket(
     except BrainError:
         raise
     except OSError as err:
-        raise BrainError(ErrorCode.IO_ERROR, f"cannot write hook binding bucket: {err}") from err
+        raise raise_storage_error(err, "cannot write hook binding bucket") from err
     finally:
         if fd != -1:
             try:

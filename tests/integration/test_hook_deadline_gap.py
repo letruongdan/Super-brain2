@@ -21,7 +21,7 @@ from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.ports.capture import OUTBOX_RECORD_GAP, CaptureEventRecord
 from superbrain.storage.outbox import OutboxSpool
 
-_CAP_NS = 900_000_000
+_CAP_NS = 1_200_000_000  # room for a real (macOS F_FULLFSYNC) gap write after the simulated slow one
 _SLOW_GAP_WRITE_S = 0.2
 
 
@@ -47,7 +47,9 @@ class _StallingSpool(OutboxSpool):
         return super().enqueue_fallback_gap(**kwargs)
 
 
-def _run_main(monkeypatch: pytest.MonkeyPatch, outbox: Path, *, start_ns: int | None = None) -> dict[str, Any]:
+def _run_main(
+    monkeypatch: pytest.MonkeyPatch, outbox: Path, *, start_ns: int | None = None, slow_log_s: float = 0.0
+) -> dict[str, Any]:
     perms = os_adapters().permissions
     seen: dict[str, Any] = {"exit_called": False, "gap_at_exit": None}
 
@@ -65,6 +67,15 @@ def _run_main(monkeypatch: pytest.MonkeyPatch, outbox: Path, *, start_ns: int | 
     monkeypatch.setattr(hook_entry, "_make_spool", lambda d, _f: _StallingSpool(d, permissions=perms))
     monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(_event_stdin())))
     argv = ["--outbox", str(outbox), "--harness", "claude-code"]
+    if slow_log_s:
+        real_log = hook_entry._write_static_log
+
+        def _slow_log(*args: Any, **kwargs: Any) -> None:
+            time.sleep(slow_log_s)  # a contended or slow diagnostic log; the outbox itself is healthy
+            real_log(*args, **kwargs)
+
+        monkeypatch.setattr(hook_entry, "_write_static_log", _slow_log)
+        argv += ["--log", str(outbox.parent / "hook.log")]
     t0 = time.monotonic_ns()
     try:
         rc = hook_entry.main(argv) if start_ns is None else hook_entry.main(argv, start_ns=start_ns)
@@ -95,3 +106,12 @@ def test_the_hard_cap_counts_from_process_entry(trusted_tmp: Path, monkeypatch: 
     assert seen["rc"] == 0
     total_ns = time.monotonic_ns() - started
     assert total_ns < _CAP_NS + 50_000_000, total_ns  # the harness sees the cap, not cap + startup
+
+
+def test_a_slow_diagnostic_log_cannot_spend_the_capture_gap_reserve(
+    trusted_tmp: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen = _run_main(monkeypatch, trusted_tmp / "outbox", slow_log_s=0.35)
+    assert seen["rc"] == 0
+    gaps = seen["gap_at_exit"] if seen["exit_called"] else seen["gaps_after"]
+    assert gaps is not None and len(gaps) == 1, seen  # the gap is written before the log, not after it

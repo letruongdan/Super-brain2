@@ -1362,9 +1362,10 @@ def run_gate(
 
         execution_failed = False
         try:
-            with ThreadPoolExecutor(max_workers=parallel) as pool:
-                for _ in pool.map(run_shard, range(parallel)):
-                    pass
+            if parallel:
+                with ThreadPoolExecutor(max_workers=parallel) as pool:
+                    for _ in pool.map(run_shard, range(parallel)):
+                        pass
             if serial_args:  # alone, after every shard: no contention for the wall-clock deadline tests
                 run_shard(parallel)
         except Exception as err:  # noqa: BLE001 - drained workers still have evidence to collect
@@ -1515,7 +1516,7 @@ def run_gate(
                     timeout = bounded(f"phase {name}", max(cap, time_budget_s) if name == "pytest" else cap)
                     if timeout is None:
                         continue
-                    if name == "pytest" and len(groups) > 1:
+                    if name == "pytest" and (len(groups) > 1 or serial_ids):
                         phase, job_ended = run_sharded_pytest(groups, deadline, serial_ids)
                         phases.append(phase)
                         continue

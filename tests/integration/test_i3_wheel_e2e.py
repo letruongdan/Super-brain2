@@ -9,6 +9,7 @@ import base64
 import hashlib
 import json
 import os
+import shutil
 import socket
 import ssl
 import struct
@@ -801,8 +802,12 @@ def test_i3_wheel_synthetic_lifecycle_e2e(inc2_installed_env: InstalledEnv, trus
             p_bin = bin_dir / host_bin
             p_bin.write_text("#!/bin/sh\nprintf '1.0.0\\n'\n", encoding="utf-8")
             p_bin.chmod(0o755)
-    ssh_dir = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "OpenSSH"
-    fake_path = f"{bin_dir}{os.pathsep}{ssh_dir}" if sys.platform == "win32" else str(bin_dir)
+    ssh_dir = (
+        Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "OpenSSH"
+        if sys.platform == "win32"
+        else Path(shutil.which("ssh-keygen") or "/usr/bin/ssh-keygen").parent  # the SSH approval verifier needs it
+    )
+    fake_path = f"{bin_dir}{os.pathsep}{ssh_dir}"
 
     doc_clean = json.loads(
         run_installed_command(

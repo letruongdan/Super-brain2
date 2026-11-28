@@ -172,6 +172,7 @@ class KernelBridge(KernelBlobStagePort):
         else:
             self._host_version_resolver = host_version_resolver
         self._seen_l2: set[tuple[str, str]] = set() if seen_configured_layer2 is None else seen_configured_layer2
+        self._l2_apply_pending = False
         self.on_continuity_tasks: Callable[[tuple[str, ...]], None] | None = None  # owner thread
         self._wire_stores(store, policy, writer_epoch)
         if recover_pending_on_init:
@@ -591,6 +592,8 @@ class KernelBridge(KernelBlobStagePort):
                 self.on_continuity_tasks(tuple(touched))
             return ack
         finally:
-            apply_recorded_layer2(self._store, l2_recorded)  # ingest's transaction is closed here
+            # ingest's transaction is closed here; a failed apply is retried on the next batch
+            needed = bool(l2_recorded) or self._l2_apply_pending
+            self._l2_apply_pending = not apply_recorded_layer2(self._store, needed)
             if self._on_capture_gaps_changed is not None:
                 self._on_capture_gaps_changed(self._capture_store.has_gaps())

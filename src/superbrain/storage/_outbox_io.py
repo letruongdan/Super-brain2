@@ -30,6 +30,7 @@ from superbrain.storage._outbox_durable import (
 from superbrain.storage._outbox_durable import active_deadline_check as active_deadline_check
 from superbrain.storage._outbox_durable import push_deadline_check as push_deadline_check
 from superbrain.storage._outbox_durable import push_deadline_remaining as push_deadline_remaining
+from superbrain.storage._outbox_durable import raise_storage_error as raise_storage_error
 from superbrain.storage._outbox_durable import replace_file_resilient as replace_file_resilient
 from superbrain.storage._outbox_durable import reset_deadline_check as reset_deadline_check
 from superbrain.storage._outbox_durable import reset_deadline_remaining as reset_deadline_remaining
@@ -50,7 +51,6 @@ _SPOOL_STAGE_MARKER = ".sbstage-"
 FOREIGN_STAGE_MARKER = ".init-"
 _PROCESS_LOCKS_GUARD = threading.Lock()
 _PROCESS_LOCKS: dict[str, threading.RLock] = {}
-_ENOSPC_WINERROR = 112
 _O_BINARY = getattr(os, "O_BINARY", 0)
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _ORIG_PATH_IS_SYMLINK = Path.is_symlink
@@ -118,15 +118,6 @@ def reject_links_upward(path: Path) -> None:
         if parent == cur:
             break
         cur = parent
-
-
-def raise_storage_error(err: OSError, message: str) -> BrainError:
-    winerr = getattr(err, "winerror", None)
-    if err.errno in (errno.ENOSPC, errno.EDQUOT) or winerr == _ENOSPC_WINERROR:
-        return BrainError(ErrorCode.STORAGE_FULL, "storage full")
-    if getattr(errno, "ELOOP", None) is not None and err.errno == errno.ELOOP:
-        return BrainError(ErrorCode.UNSAFE_PATH, f"symlink detected in outbox: {err}")
-    return BrainError(ErrorCode.IO_ERROR, f"{message}: {err}")
 
 
 def maybe_crashpoint(name: str) -> None:

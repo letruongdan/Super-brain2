@@ -23,9 +23,11 @@ from superbrain.composition import init_entry
 from superbrain.composition._layer2_live import reconcile_live_layer2_all
 from superbrain.composition.doctor_probes_sp2_store import reconcile_harness_layer2_in_policy
 from superbrain.core._kernel_approval import Layer2State
+from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.kernel import CaptureBatchCommand
 from superbrain.ports.capture import CaptureEventRecord
 from superbrain.storage.runtime import Runtime
+from superbrain.storage.store import Store
 from tests.integration.test_sp2_5_production_wiring import (
     _CLAUDE_VER,
     _MACHINE,
@@ -127,3 +129,48 @@ def test_capture_batch_host_version_drift_downgrade_is_applied_to_brain_db(
         state, unapplied = loop.run_owner_action(_check).result(timeout=10.0)
         assert state is Layer2State.UNKNOWN  # the reported drift really downgraded
         assert unapplied == []
+
+
+def test_a_failed_downgrade_apply_is_retried_while_the_daemon_serves(
+    trusted_tmp: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _verified_store(trusted_tmp, monkeypatch)
+    real_reconcile = Store.reconcile_policy
+    failures = [1]
+    calls = [0]
+
+    def _busy_once(self: Store) -> int:
+        calls[0] += 1
+        if failures[0]:
+            failures[0] -= 1
+            raise BrainError(ErrorCode.STORE_BUSY, "store busy")
+        return real_reconcile(self)
+
+    with _serve_daemon(env["cfg"], env["os_"], env["clock"], env["mono"]) as (ready, loop):
+        _publish_capture_creds(loop, [(env["cap"], "stream-l2-retry", env["ws"])])
+        target = LoopbackTarget(endpoint=ready.endpoint, expected_store_id=env["rep"].store_id, ca_pem=env["ca_pem"],
+                                leaf_cert_sha256=ready.leaf_cert_sha256)
+        client = CaptureClient(LoopbackClient(monotonic_ns=env["mono"].monotonic_ns))
+        ws = env["ws"]
+
+        def _post(seq: int, meta: dict[str, Any]) -> int:
+            ev = CaptureEventRecord(
+                event_id=f"ev-l2-retry-{seq}", producer_stream="stream-l2-retry", sequence=seq,
+                harness_id="claude-code", kind="command_result", recorded_at="2026-11-28T10:00:00Z",
+                payload={"cmd": "pytest"}, source_metadata=meta,
+            ).to_dict()
+            return client.post_batch(
+                target, CaptureBatchCommand("stream-l2-retry", ws.repo_id, ws.checkout_id, (ev,), env["cap"].token)
+            ).accepted_count
+
+        monkeypatch.setattr(Store, "reconcile_policy", _busy_once)
+        assert _post(1, {"host_version": "9.9.9"}) == 1  # downgrade recorded; its apply hits a busy store
+        assert _post(2, {}) == 1  # no new downgrade: the pending apply must still be retried
+
+        def _unapplied_now() -> list[str]:
+            return _unapplied(cast(Any, loop._session)._rt)
+
+        assert loop.run_owner_action(_unapplied_now).result(timeout=10.0) == []
+        settled = calls[0]
+        assert _post(3, {}) == 1
+        assert calls[0] == settled  # nothing pending: a clean batch never pays the O(intents) reconcile

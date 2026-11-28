@@ -6,6 +6,7 @@ import io
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -522,7 +523,8 @@ def test_r10_f9_write_ack_pages_skips_replace_after_fsync_deadline(
 
     def _expire_during_fsync(fd: int) -> None:
         real_fsync(fd)
-        now[0] = 2_000
+        if stat.S_ISREG(os.fstat(fd).st_mode):  # the ACK page's own fsync; POSIX also fsyncs directories first
+            now[0] = 2_000
 
     with monkeypatch.context() as mp:
         mp.setattr(os, "fsync", _expire_during_fsync)
@@ -708,7 +710,7 @@ def test_r10_f12_cursor_frame_fence_and_eviction_honor_cutoff(
         if calls_c[0] == 1:
             now_c[0] = 2_000
             err = OSError("sharing violation")
-            err.winerror = 32
+            setattr(err, "winerror", 32)  # noqa: B010 - the attribute exists only on Windows
             raise err
         orig_replace(src, dst)
 
@@ -1166,7 +1168,7 @@ def test_r10_f19_ack_cleanup_and_busy_backoff_check_the_cutoff(
         if calls_b[0] == 1:
             now_b[0] = 2_000
             err = OSError("sharing violation")
-            err.winerror = 32
+            setattr(err, "winerror", 32)  # noqa: B010 - the attribute exists only on Windows
             raise err
         orig_replace(src, dst)
 
@@ -1189,7 +1191,7 @@ def test_r10_f19_ack_cleanup_and_busy_backoff_check_the_cutoff(
         if calls_c[0] == 1:
             now_c[0] = 1_000_000_000 - 3_000_000
             err = OSError("sharing violation")
-            err.winerror = 32
+            setattr(err, "winerror", 32)  # noqa: B010 - the attribute exists only on Windows
             raise err
         orig_replace(src, dst)
 

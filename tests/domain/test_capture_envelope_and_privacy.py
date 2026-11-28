@@ -597,7 +597,9 @@ def test_hook_entry_static_log_preserves_concurrent_lines_without_stderr(
     # Part 3: External OUTBOX_FILE_LOCK holder never stalls, drops lines, or writes to stderr.
     held_log = trusted_tmp / "lock_held.log"
     ensure_dir_tree_atomic(held_log.parent, os_.permissions, default_outbox_dir_renamer(), verify_existing=False)
-    held_log.write_bytes(b"seed\n")
+    seed_fd = os.open(held_log, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)  # owner-only, as the outbox requires
+    os.write(seed_fd, b"seed\n")
+    os.close(seed_fd)
     ensure_secure_regular_file_atomic(held_log, os_.permissions)
     held_fd = os.open(held_log, os.O_RDWR, 0o600)
     try:

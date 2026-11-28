@@ -480,6 +480,8 @@ def test_junit_temp_file_is_removed(tmp_path: Path, monkeypatch: pytest.MonkeyPa
 
 
 def _win32_creation_ticks_for_handle(handle: int) -> int | None:
+    if sys.platform != "win32":  # Windows-only helper; lets mypy check it on every platform
+        return None
     import ctypes
     from ctypes import wintypes
 

@@ -165,9 +165,7 @@ class _DaemonCompositeDomain:
         if self._fallback is not None:
             return self._fallback.supports_tool(tool, deep=deep)
         if self._fallback_factory is not None:
-            return (tool == "get_health" and deep) or (
-                tool in {"prepare_task", "get_artifact", "submit_episode"} and not deep
-            )
+            return tool in {"prepare_task", "get_artifact", "submit_episode"} and not deep
         return False
 
     def execute_readonly(self, call: Call, ctx: CallContext) -> dict[str, JsonValue]:
@@ -222,7 +220,8 @@ class _DaemonCompositeDomain:
         *,
         selected_scope: Scope | None,
     ) -> dict[str, JsonValue]:
-        if result.refs and result.refs[0].kind in {"doctor_run", "get_health_descriptor"}:
+        # every deep-health render (doctor-backed, or replayed from SP2-5) goes through the one doctor renderer
+        if result.refs and result.refs[0].kind in {"doctor_run", "get_health_descriptor", "health_result"}:
             if self._doctor_runner is None:
                 raise BrainError(ErrorCode.CAPABILITY_UNAVAILABLE, "capability unavailable")
             return self._doctor_runner.render_deep_health(result, principal, selected_scope=selected_scope)

@@ -109,3 +109,21 @@ def test_a_serial_run_that_reports_nothing_refuses_the_attempt(
     _, receipt = _run_shards(tmp_path, monkeypatch, _SerialAwareRunner(drop_serial=True))
     assert receipt["accepted"] is False
     assert any("pytest-serial" in reason for reason in receipt["reasons"]), receipt["reasons"]
+
+
+@pytest.mark.parametrize(
+    ("prefixes", "parallel_calls"),
+    [(("t/test_b.py",), 1), (("t/test_a.py", "t/test_b.py"), 0)],
+    ids=["one-parallel-group", "serial-only"],
+)
+def test_the_serial_phase_runs_with_one_or_no_parallel_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, prefixes: tuple[str, ...], parallel_calls: int
+) -> None:
+    monkeypatch.setattr(gate, "SERIAL_NODE_PREFIXES", prefixes)
+    runner = _SerialAwareRunner()
+    _, receipt = _run_shards(tmp_path, monkeypatch, runner)
+    assert receipt["accepted"] is True, receipt["reasons"]
+    calls = _pytest_calls(runner)
+    assert sum(1 for c in calls if not _named(c.argv)) == parallel_calls
+    assert sum(1 for c in calls if _named(c.argv)) == 1
+    assert sorted(receipt["outcomes"]) == sorted(ALL_SHARD_IDS)

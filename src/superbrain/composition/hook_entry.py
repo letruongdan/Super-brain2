@@ -216,7 +216,7 @@ def run_hook(
         spool.enqueue_event(sanitized, deadline_ns=work_deadline_ns)
         return 0
     except BrainError as err:
-        _write_static_log(log_path, phase="hook", code=err.code.value)
+        # the CaptureGap comes first: a slow or locked diagnostic log must not spend the gap's reserve (spec 7.1)
         raw_ok = effective_raw_sid is None or (
             isinstance(effective_raw_sid, str)
             and isinstance(normalized, CaptureEventRecord)
@@ -246,6 +246,7 @@ def run_hook(
                 _write_static_log(log_path, phase="hook_gap", code=gap_err.code.value)
             except Exception:  # noqa: BLE001
                 _write_static_log(log_path, phase="hook_gap", code=ErrorCode.IO_ERROR.value)
+        _write_static_log(log_path, phase="hook", code=err.code.value)
         return 0
     except Exception:  # noqa: BLE001
         _write_static_log(log_path, phase="hook", code=ErrorCode.INTEGRITY_FAILURE.value)

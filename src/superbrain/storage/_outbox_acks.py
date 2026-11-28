@@ -12,6 +12,7 @@ from pathlib import Path
 from superbrain.core.canonical import canonical_json, digest_bytes
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.ports.capture import OutboxDirRenamer, OutboxPermissionsPort
+from superbrain.storage._outbox_durable import raise_storage_error
 from superbrain.storage._outbox_io import (
     _O_BINARY,
     _O_NOFOLLOW,
@@ -431,7 +432,7 @@ def write_ack_pages(
         except BrainError:
             raise
         except OSError as err:
-            raise BrainError(ErrorCode.IO_ERROR, f"cannot write ack page: {err}") from err
+            raise raise_storage_error(err, "cannot write ack page") from err
         finally:
             if fd != -1:
                 try:

@@ -69,13 +69,17 @@ def verify_live_layer2_harness(
     host_version_resolver: Callable[[str], str | None] | None = None,
     seen_configured: set[tuple[str, str]] | None = None,
     on_recorded: Callable[[], None] | None = None,
+    dry_run: bool = False,
 ) -> tuple[str, str] | None:
     """Verify live ``(host_version, config_digest)`` for ``harness_id``, downgrading to ``UNKNOWN`` on drift.
 
     ``on_recorded`` runs after a downgrade intent is recorded so the caller can apply it to ``brain.db``.
+    ``dry_run`` only reports drift (``None``): it writes nothing to the policy store.
     """
 
     def _downgrade(host_version: str, config_digest: str) -> None:
+        if dry_run:
+            return
         policy.set_layer2_state(
             harness_id=harness_id, host_version=host_version, config_digest=config_digest, state=Layer2State.UNKNOWN
         )
@@ -113,7 +117,7 @@ def verify_live_layer2_harness(
             if actual_dig != recorded_dig:
                 _downgrade(recorded_ver, actual_dig)
                 return None
-            if norm not in configured_paths:
+            if norm not in configured_paths and not dry_run:
                 policy.record_configured_layer2_checkout(harness_id=harness_id, checkout_path=str(chk_path))
                 configured_paths.add(norm)
             if seen_configured is not None:
@@ -127,6 +131,25 @@ def verify_live_layer2_harness(
             return None
 
     return (recorded_ver, recorded_dig)
+
+
+def layer2_drift_detected(policy: PolicyStore, *, os_: OsAdapters) -> bool:
+    """Read-only: does any VERIFIED connected harness no longer match its checkout config on disk?
+
+    No host binary is spawned and nothing is recorded; the next live check records the downgrade.
+    """
+    snap = policy.snapshot()
+    harnesses = sorted(
+        {c.principal.harness_id for c in snap.credentials.values() if not c.revoked}
+        - {CLI_HARNESS_ID}
+    )
+    for harness_id in harnesses:
+        latest = policy.layer2_state(harness_id)
+        if latest is not None and latest[3] is Layer2State.VERIFIED and (
+            verify_live_layer2_harness(policy, harness_id=harness_id, os_=os_, dry_run=True) is None
+        ):
+            return True
+    return False
 
 
 def reconcile_live_layer2_all(
@@ -163,14 +186,19 @@ def reconcile_live_layer2_all(
         store.reconcile_policy()
 
 
-def apply_recorded_layer2(store: Store, recorded: Sequence[bool]) -> None:
-    """Apply downgrades recorded during a request to ``brain.db``; on failure they stay in ``policy.db`` for startup."""
-    if not recorded:
-        return
+def apply_recorded_layer2(store: Store, needed: bool) -> bool:
+    """Apply downgrades recorded during a request to ``brain.db``; ``False`` when the apply must be retried.
+
+    A failed apply leaves the intent durable in ``policy.db``; the caller retries on its next request.
+    """
+    if not needed:
+        return True
     try:
         store.reconcile_policy()
     except BrainError as err:
-        _LOGGER.warning("layer2 downgrade apply deferred to next start (code=%s)", err.code.value)
+        _LOGGER.warning("layer2 downgrade apply deferred (code=%s)", err.code.value)
+        return False
+    return True
 
 
 def batch_reported_host_version(
@@ -240,6 +268,7 @@ def make_live_layer2_lookup(
 __all__ = [
     "batch_reported_host_version",
     "has_harness_config_presence",
+    "layer2_drift_detected",
     "make_live_layer2_lookup",
     "reconcile_live_layer2_all",
     "verify_live_layer2_harness",
