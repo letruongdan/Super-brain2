@@ -8,6 +8,8 @@ import os
 import sys
 import threading
 import time
+
+_PROCESS_T0_NS = time.monotonic_ns()  # as close to process entry as Python allows: the cap is the harness's view
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -88,7 +90,8 @@ def run_hook(
         _write_static_log(log_path, phase="hook", code=ErrorCode.INVALID_INPUT.value)
         return 0
     hard_deadline_ns = start_ns + cap_ns
-    reserve_ns = min(max(1, cap_ns // 10), 50_000_000)
+    # the fallback CaptureGap needs room for its own durable write once the work deadline passes (spec 7.1)
+    reserve_ns = max(1, min(cap_ns // 2, _GAP_RESERVE_NS))
     work_deadline_ns = start_ns + max(1, cap_ns - reserve_ns)
     normalized: CaptureEventRecord | ProducerCaptureGap | None = None
     slot_known = False  # True once ``normalized.sequence`` is the slot the spool assigned or the producer chose
@@ -248,8 +251,12 @@ def run_hook(
         return 0
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    """CLI entry point for ``python -I -m superbrain.composition.hook_entry``."""
+def main(argv: Sequence[str] | None = None, *, start_ns: int | None = None) -> int:
+    """CLI entry point for ``python -I -m superbrain.composition.hook_entry``.
+
+    ``start_ns`` is the process entry time; the hard cap counts from it so the harness never waits longer.
+    """
+    start_ns = time.monotonic_ns() if start_ns is None else start_ns
     parser = argparse.ArgumentParser(description="Bounded Super-brain2 capture hook entry point")
     parser.add_argument("--outbox", required=True, type=Path, help="Local outbox spool directory")
     parser.add_argument("--log", default=None, type=Path, help="Optional static diagnostic log file")
@@ -258,7 +265,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--profile", default=None, type=Path, help="Pinned harness ClientProfile JSON path")
     parser.add_argument("--producer-stream", default=None, help="Optional default producer_stream")
     parser.add_argument("--sequence", default=None, type=int, help="Optional sequence number when omitted")
-    start_ns = time.monotonic_ns()
     args = parser.parse_args(list(argv) if argv is not None else None)
     done = threading.Event()
 
@@ -270,7 +276,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             except OSError:
                 _write_static_log(args.log, phase="hook_stdin", code=ErrorCode.IO_ERROR.value)
                 return
-            remaining_ns = HOOK_HARD_CAP_NS - (time.monotonic_ns() - start_ns)
+            # run_hook (and its fallback gap) must finish before the watchdog stops waiting for it
+            remaining_ns = HOOK_HARD_CAP_NS - _WATCHDOG_EXIT_RESERVE_NS - (time.monotonic_ns() - start_ns)
             if remaining_ns <= 0:
                 _write_static_log(args.log, phase="hook_stdin", code=ErrorCode.DEADLINE_EXCEEDED.value)
                 return
@@ -311,6 +318,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 _WATCHDOG_EXIT_RESERVE_NS = 150_000_000
 """Part of the hard cap kept for the timeout log and process exit."""
 _WATCHDOG_EXIT_MARGIN_NS = 20_000_000
+_GAP_RESERVE_NS = 300_000_000
+"""Part of the hook budget kept for the fallback CaptureGap write after the work deadline."""
 
 
 def _hard_exit(code: int) -> None:
@@ -318,4 +327,4 @@ def _hard_exit(code: int) -> None:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(start_ns=_PROCESS_T0_NS))

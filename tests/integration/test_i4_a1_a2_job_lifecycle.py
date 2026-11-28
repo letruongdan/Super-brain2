@@ -2110,7 +2110,8 @@ def test_p2_12_periodic_schedule_dedup_backward_clock_and_restore_reset(
             _assert_backward_jump_defers_schedule(
                 clk, root, spies, wait_spy, due_utc=due_utc, interval_s=interval_s, label=case
             )
-            clk.resume(cap_utc=None)
+            # past due but short of the next period, so the oracle sees exactly this period under any load
+            clk.resume(cap_utc=due_utc + timedelta(seconds=interval_s / 2))
             _assert_periodic_schedule_settled(root, pokes, d, label=case)
         return
 
@@ -2195,7 +2196,8 @@ def test_p2_12_backward_clock_jump_slow_startup_uncommitted_and_due_boundary(
             _assert_backward_jump_defers_schedule(
                 clk, root, spies, wait_spy, due_utc=due_utc, interval_s=interval_s, label=edge_case
             )
-            clk.resume(cap_utc=None)
+            # past due but short of the next period, so the oracle sees exactly this period under any load
+            clk.resume(cap_utc=due_utc + timedelta(seconds=interval_s / 2))
             _assert_periodic_schedule_settled(root, pokes, d, label=edge_case)
         return
 
