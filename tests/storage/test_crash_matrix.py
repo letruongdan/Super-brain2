@@ -22,6 +22,9 @@ from tests.support.crash_cases import (
     I3_4_CRASH_CASES,
     I4_4_CRASH_CASES,
     KERNEL_CRASH_CASES,
+    SP2_2_CRASH_CASES,
+    SP2_3_CRASH_CASES,
+    SP2_4_CRASH_CASES,
     CrashCase,
     crash,
     parse_crash_table,
@@ -29,6 +32,7 @@ from tests.support.crash_cases import (
 from tests.support.inc3_crash_cases import I3_3_CRASHPOINTS
 from tests.support.inc3_i34_crash_cases import I3_4_CRASHPOINTS
 from tests.support.inc4_crash_cases import I4_4_CRASHPOINTS
+from tests.support.sp2_crash_cases import SP2_2_CRASHPOINTS, SP2_3_CRASHPOINTS, SP2_4_CRASHPOINTS
 
 I1_CRASHPOINTS = frozenset(
     {
@@ -81,6 +85,9 @@ def test_every_known_crashpoint_has_a_case_and_a_doc_row() -> None:
         + [c.crashpoint for c in KERNEL_CRASH_CASES]
         + [c.crashpoint for c in I3_3_CRASH_CASES]
         + [c.crashpoint for c in I3_4_CRASH_CASES]
+        + [c.crashpoint for c in SP2_2_CRASH_CASES]
+        + [c.crashpoint for c in SP2_3_CRASH_CASES]
+        + [c.crashpoint for c in SP2_4_CRASH_CASES]
         + [c.crashpoint for c in I4_4_CRASH_CASES]
     )
     assert len(names) == len(set(names)), sorted(n for n in names if names.count(n) > 1)  # one case per name
@@ -96,15 +103,30 @@ def test_registry_is_exactly_the_increment_1_names_plus_the_task_8_and_i3_names(
         and len(T8_CRASHPOINTS) == 10
         and len(I3_3_CRASHPOINTS) == 10
         and len(I3_4_CRASHPOINTS) == 1
+        and len(SP2_2_CRASHPOINTS) == 2
+        and len(SP2_3_CRASHPOINTS) == 2
+        and len(SP2_4_CRASHPOINTS) == 2
         and len(I4_4_CRASHPOINTS) == 2
     )
     assert {c.crashpoint for c in CRASH_CASES} == I1_CRASHPOINTS  # every I1 oracle stays, under its old node ID
     assert {c.crashpoint for c in KERNEL_CRASH_CASES} == T8_CRASHPOINTS
     assert {c.crashpoint for c in I3_3_CRASH_CASES} == I3_3_CRASHPOINTS
     assert {c.crashpoint for c in I3_4_CRASH_CASES} == I3_4_CRASHPOINTS
+    assert {c.crashpoint for c in SP2_2_CRASH_CASES} == SP2_2_CRASHPOINTS
+    assert {c.crashpoint for c in SP2_3_CRASH_CASES} == SP2_3_CRASHPOINTS
+    assert {c.crashpoint for c in SP2_4_CRASH_CASES} == SP2_4_CRASHPOINTS
     assert {c.crashpoint for c in I4_4_CRASH_CASES} == I4_4_CRASHPOINTS
-    assert KNOWN_CRASHPOINTS == I1_CRASHPOINTS | T8_CRASHPOINTS | I3_3_CRASHPOINTS | I3_4_CRASHPOINTS | I4_4_CRASHPOINTS
-    assert len(KNOWN_CRASHPOINTS) == 42
+    assert KNOWN_CRASHPOINTS == (
+        I1_CRASHPOINTS
+        | T8_CRASHPOINTS
+        | I3_3_CRASHPOINTS
+        | I3_4_CRASHPOINTS
+        | SP2_2_CRASHPOINTS
+        | SP2_3_CRASHPOINTS
+        | SP2_4_CRASHPOINTS
+        | I4_4_CRASHPOINTS
+    )
+    assert len(KNOWN_CRASHPOINTS) == 48
 
 
 def test_kernel_cases_keep_operation_at_crashpoint_ids_and_all_run() -> None:
@@ -115,6 +137,14 @@ def test_kernel_cases_keep_operation_at_crashpoint_ids_and_all_run() -> None:
     assert i3_ids == [f"{c.operation}@{c.crashpoint}" for c in I3_3_CRASH_CASES] and len(set(i3_ids)) == len(i3_ids)
     i34_ids = [c.node_id for c in I3_4_CRASH_CASES]
     assert i34_ids == [f"{c.operation}@{c.crashpoint}" for c in I3_4_CRASH_CASES] and len(set(i34_ids)) == len(i34_ids)
+    sp2_ids = [c.node_id for c in SP2_2_CRASH_CASES]
+    assert sp2_ids == [f"{c.operation}@{c.crashpoint}" for c in SP2_2_CRASH_CASES] and len(set(sp2_ids)) == len(sp2_ids)
+    sp23_ids = [c.node_id for c in SP2_3_CRASH_CASES]
+    assert sp23_ids == [f"{c.operation}@{c.crashpoint}" for c in SP2_3_CRASH_CASES]
+    assert len(set(sp23_ids)) == len(sp23_ids)
+    sp24_ids = [c.node_id for c in SP2_4_CRASH_CASES]
+    assert sp24_ids == [f"{c.operation}@{c.crashpoint}" for c in SP2_4_CRASH_CASES]
+    assert len(set(sp24_ids)) == len(sp24_ids)
     i44_ids = [c.node_id for c in I4_4_CRASH_CASES]
     assert i44_ids == [f"{c.operation}@{c.crashpoint}" for c in I4_4_CRASH_CASES] and len(set(i44_ids)) == len(i44_ids)
     modes = {"serve", "serve-fixture", "migrate", "serve-jobs", "job-operation"}

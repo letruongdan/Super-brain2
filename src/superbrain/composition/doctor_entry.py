@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -27,6 +27,7 @@ class _ParsedDoctorCli:
     source_path: Path
     is_profile: bool
     checkout_root: Path | None
+    outbox_dir: Path | None
     offline: bool
     fix: bool
     wait_timeout_ms: int
@@ -52,6 +53,7 @@ def _parse_args(args: list[str]) -> _ParsedDoctorCli | None:
     config_raw: str | None = None
     profile_raw: str | None = None
     checkout_raw: str | None = None
+    outbox_raw: str | None = None
     offline = False
     fix = False
     wait_ms: int | None = None
@@ -97,6 +99,11 @@ def _parse_args(args: list[str]) -> _ParsedDoctorCli | None:
                 return None
             checkout_raw = args[i + 1]
             i += 2
+        elif tok == "--outbox":
+            if outbox_raw is not None or i + 1 >= len(args) or not _is_abs(args[i + 1]):
+                return None
+            outbox_raw = args[i + 1]
+            i += 2
         else:
             return None
     if config_raw is None and profile_raw is None:
@@ -105,6 +112,7 @@ def _parse_args(args: list[str]) -> _ParsedDoctorCli | None:
         source_path=Path(profile_raw if profile_raw is not None else str(config_raw)),
         is_profile=profile_raw is not None,
         checkout_root=Path(checkout_raw) if checkout_raw is not None else None,
+        outbox_dir=Path(outbox_raw) if outbox_raw is not None else None,
         offline=offline,
         fix=fix,
         wait_timeout_ms=wait_ms if wait_ms is not None else _DEFAULT_WAIT_TIMEOUT_MS,
@@ -128,6 +136,9 @@ def run_doctor(
     checkout_root: Path | None = None,
     is_profile: bool = False,
     os_: OsAdapters | None = None,
+    outbox_dir: Path | None = None,
+    observed_host_versions: Mapping[str, str] | None = None,
+    host_version_resolver: Callable[[str], str | None] | None = None,
     privacy_scanner: PrivacyScannerPort | None = None,
     capture_probe: CaptureDoctorProbePort | None = None,
     limits: DoctorScanLimits | None = None,
@@ -162,7 +173,20 @@ def run_doctor(
         capture_probe=capture_probe,
         limits=limits,
     )
-    return inspect_doctor_snapshot(snapshot, privacy_scanner=scanner)
+    report = inspect_doctor_snapshot(snapshot, privacy_scanner=scanner)
+    from superbrain.composition.doctor_probes_sp2_store import run_sp2_doctor_probes
+
+    sp2_report = run_sp2_doctor_probes(
+        data_root,
+        outbox_dir=outbox_dir,
+        checkout_root=resolved_checkout,
+        observed_host_versions=observed_host_versions,
+        host_version_resolver=host_version_resolver,
+        os_=adapters,
+    )
+    from superbrain.composition._doctor_sp2_merge import merge_sp2_report
+
+    return merge_sp2_report(report, sp2_report)
 
 
 def _raise_error_from_envelope(env: Mapping[str, JsonValue]) -> None:
@@ -284,6 +308,7 @@ def _execute_cli_doctor(parsed: _ParsedDoctorCli, adapters: OsAdapters) -> dict[
             checkout_root=resolved_checkout,
             is_profile=parsed.is_profile,
             os_=adapters,
+            outbox_dir=parsed.outbox_dir,
         ).to_dict()
 
     if not endpoint_exists:
@@ -297,6 +322,7 @@ def _execute_cli_doctor(parsed: _ParsedDoctorCli, adapters: OsAdapters) -> dict[
             checkout_root=resolved_checkout,
             is_profile=parsed.is_profile,
             os_=adapters,
+            outbox_dir=parsed.outbox_dir,
         ).to_dict()
 
     if parsed.is_profile and profile.workspace is not None and parsed.checkout_root is not None:

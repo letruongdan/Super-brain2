@@ -79,6 +79,8 @@ def _serve(
     cfg: Any, *, os_: OsAdapters, clock: FakeClock, mono: FakeMonotonicClock, **serve_kw: Any
 ) -> Iterator[_Daemon]:
     """``daemon_entry.serve`` in a thread with the live runtime captured; extra kwargs go to ``serve``."""
+    # I4 tests describe a doctor-only daemon; since the SP2 merge production also registers continuity.refresh
+    serve_kw.setdefault("job_handlers", {})
     ready_ev = threading.Event()
     stop_ev = threading.Event()
     box: dict[str, Any] = {}

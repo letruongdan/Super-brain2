@@ -22,7 +22,12 @@ from superbrain.core.kernel import (
 )
 from superbrain.ports.policy import IntentKind
 from superbrain.storage.identity import validate_policy_intent_payload
-from superbrain.storage.kernel_schema import KERNEL_POLICY_MIGRATIONS, POLICY_V2_TABLES, POLICY_V4_TABLES
+from superbrain.storage.kernel_schema import (
+    KERNEL_POLICY_MIGRATIONS,
+    POLICY_V2_TABLES,
+    POLICY_V4_TABLES,
+    POLICY_V5_TABLES,
+)
 from superbrain.storage.kinds import is_uuid
 from superbrain.storage.schema import code_version
 
@@ -55,7 +60,11 @@ def ensure_v2_tables(
             for row in db.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
             if isinstance(row[0], str)
         }
-        if not _REQUIRED_POLICY_TABLES <= tables or (target_sv >= 4 and not POLICY_V4_TABLES <= tables):
+        if (
+            not _REQUIRED_POLICY_TABLES <= tables
+            or (target_sv >= 4 and not POLICY_V4_TABLES <= tables)
+            or (target_sv >= 5 and not POLICY_V5_TABLES <= tables)
+        ):
             raise BrainError(ErrorCode.POLICY_UNAVAILABLE, "policy unavailable")
 
         raw_meta = db.execute("SELECT key, value FROM meta").fetchall()
@@ -306,15 +315,35 @@ def build_policy_snapshot(
             )
 
         repo_policies: dict[str, RepoPolicy] = {}
-        for repo_id, owner_id, egress in db.execute(
-            "SELECT repo_id, owner_id, provider_egress_enabled FROM repo_policy ORDER BY repo_id"
-        ).fetchall():
-            rid = require_stored_opaque_id(repo_id)
-            repo_policies[rid] = RepoPolicy(
-                repo_id=rid,
-                owner_id=require_stored_opaque_id(owner_id),
-                provider_egress_enabled=require_stored_bool_int(egress),
-            )
+        target_sv = (
+            code_version(KERNEL_POLICY_MIGRATIONS) if expected_schema_version is None else expected_schema_version
+        )
+        if target_sv >= 4:
+            for repo_id, owner_id, egress, auto_cap, manual_sub, idx_en, post_rev in db.execute(
+                "SELECT repo_id, owner_id, provider_egress_enabled, automatic_capture_enabled, "
+                "manual_submission_enabled, indexing_enabled, post_session_review_enabled "
+                "FROM repo_policy ORDER BY repo_id"
+            ).fetchall():
+                rid = require_stored_opaque_id(repo_id)
+                repo_policies[rid] = RepoPolicy(
+                    repo_id=rid,
+                    owner_id=require_stored_opaque_id(owner_id),
+                    provider_egress_enabled=require_stored_bool_int(egress),
+                    automatic_capture_enabled=require_stored_bool_int(auto_cap),
+                    manual_submission_enabled=require_stored_bool_int(manual_sub),
+                    indexing_enabled=require_stored_bool_int(idx_en),
+                    post_session_review_enabled=require_stored_bool_int(post_rev),
+                )
+        else:
+            for repo_id, owner_id, egress in db.execute(
+                "SELECT repo_id, owner_id, provider_egress_enabled FROM repo_policy ORDER BY repo_id"
+            ).fetchall():
+                rid = require_stored_opaque_id(repo_id)
+                repo_policies[rid] = RepoPolicy(
+                    repo_id=rid,
+                    owner_id=require_stored_opaque_id(owner_id),
+                    provider_egress_enabled=require_stored_bool_int(egress),
+                )
 
         grant_pairs: set[tuple[str, str]] = set()
         for pid, rid, granted_intent_id in db.execute(

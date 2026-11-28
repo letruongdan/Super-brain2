@@ -180,11 +180,14 @@ def _layer2(policy: PolicyStore, harness: str, version: str, digest: str, state:
 
 
 def test_policy_v4_and_store_v5_schema_tables_flags_and_intent_kinds(ctx: Ctx) -> None:
+    from superbrain.storage.kernel_schema import STORE_V6_MIGRATION
+
     assert (POLICY_V4_MIGRATION.to_version, POLICY_V4_MIGRATION.min_reader_version) == (4, 4)
     assert (STORE_V5_MIGRATION.to_version, STORE_V5_MIGRATION.min_reader_version) == (5, 5)
-    assert code_version(KERNEL_POLICY_MIGRATIONS) == 4
-    assert code_version(KERNEL_STORE_MIGRATIONS) == 5
-    assert ctx.rt.policy.schema_version == 4
+    assert (STORE_V6_MIGRATION.to_version, STORE_V6_MIGRATION.min_reader_version) == (6, 6)
+    assert code_version(KERNEL_POLICY_MIGRATIONS) == 5
+    assert code_version(KERNEL_STORE_MIGRATIONS) == 8
+    assert ctx.rt.policy.schema_version == 5
     expected_kinds = {"signer_reset", "repo_policy_set", "layer2_state_set", "recovery_grant_opened"}
     assert expected_kinds | {"recovery_grant_ended"} <= {k.value for k in IntentKind}
     with ctx.rt.policy._immediate() as db:
@@ -193,8 +196,8 @@ def test_policy_v4_and_store_v5_schema_tables_flags_and_intent_kinds(ctx: Ctx) -
     assert V4_TABLES <= tables
     assert REPO_FLAGS <= columns
     ctx.rt.close()
-    assert read_schema_info(ctx.root / "policy" / "policy.db") == SchemaInfo(4, 4, ctx.store_id)
-    assert read_schema_info(ctx.root / "store" / "brain.db") == SchemaInfo(5, 5, ctx.store_id)
+    assert read_schema_info(ctx.root / "policy" / "policy.db") == SchemaInfo(5, 5, ctx.store_id)
+    assert read_schema_info(ctx.root / "store" / "brain.db") == SchemaInfo(8, 8, ctx.store_id)
 
 
 # --- signers (case 18) ---------------------------------------------------------------------------------------------

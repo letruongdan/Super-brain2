@@ -27,6 +27,7 @@ from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.kernel import Principal
 from superbrain.core.proposals import ApplyTurnIntent, JournalDirection
 from superbrain.ports.os import OsAdapters
+from superbrain.ports.policy import Intent
 from superbrain.storage import _policy_approvals as approvals
 from superbrain.storage import _policy_grants as grants
 from superbrain.storage import _policy_layer2 as layer2
@@ -199,8 +200,74 @@ class PolicyAuthorityMixin:
                 now=self._now(),
             )
 
+    def layer2_state(self, harness_id: str) -> tuple[str, str, str, Layer2State] | None:
+        """Latest ``harness_layer2_state`` tuple for ``harness_id``, or ``None`` if absent/below v4."""
+        self._check()
+        if self._schema_version < _MIN_AUTHORITY_SCHEMA:
+            return None
+        try:
+            return layer2.read_latest_layer2_state(self._db, harness_id=harness_id)
+        except sqlite3.Error as exc:
+            raise sqlite_error("cannot read layer2 state", exc) from exc
+
+    def reconcile_layer2_binding(
+        self,
+        *,
+        harness_id: str,
+        current_host_version: str | None,
+        current_config_digest: str | None,
+    ) -> tuple[Layer2State, bool]:
+        """Downgrade a ``VERIFIED`` harness row to ``UNKNOWN`` if live version or config digest changed."""
+        with self._authority_tx() as db:
+            return layer2.reconcile_layer2_binding(
+                db,
+                harness_id=harness_id,
+                current_host_version=current_host_version,
+                current_config_digest=current_config_digest,
+                now=self._now(),
+            )
+
+    def set_repo_policy(
+        self,
+        repo_id: str,
+        *,
+        automatic_capture_enabled: bool | None = None,
+        manual_submission_enabled: bool | None = None,
+        indexing_enabled: bool | None = None,
+        provider_egress_enabled: bool | None = None,
+        post_session_review_enabled: bool | None = None,
+    ) -> Intent:
+        """Update live repository capture/privacy/egress flags atomically under policy authority."""
+        with self._authority_tx() as db:
+            return layer2.set_repo_policy_flags(
+                db,
+                repo_id=repo_id,
+                automatic_capture_enabled=automatic_capture_enabled,
+                manual_submission_enabled=manual_submission_enabled,
+                indexing_enabled=indexing_enabled,
+                provider_egress_enabled=provider_egress_enabled,
+                post_session_review_enabled=post_session_review_enabled,
+                now=self._now(),
+            )
+
     def terminal_channel_eligible(self, *, machine_id: str) -> bool:
         return layer2.terminal_channel_eligible(self._read(), machine_id)
+
+    def configured_layer2_checkouts(self) -> dict[str, tuple[str, ...]]:
+        """Persisted ``{harness_id: (norm_checkout_path, ...)}`` configured/verified on disk."""
+        self._check()
+        if self._schema_version < _MIN_AUTHORITY_SCHEMA:
+            return {}
+        return layer2.configured_layer2_checkouts(self._db)
+
+    def record_configured_layer2_checkout(self, *, harness_id: str, checkout_path: str) -> None:
+        """Persist ``(harness_id, checkout_path)`` in ``meta`` when harness config is observed."""
+        with self._authority_tx() as db:
+            layer2.record_configured_layer2_checkout(
+                db,
+                harness_id=harness_id,
+                checkout_path=checkout_path,
+            )
 
     # --- recovery grants and signer reset ----------------------------------------------------------------------
 

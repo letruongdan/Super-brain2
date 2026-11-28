@@ -154,7 +154,7 @@ def test_r01_migrate_4_3_to_5_4_preserves_uncheckpointed_wal_and_rejects_corrupt
     rep = migrate_offline(
         cfg, os_, policy_migrations=KERNEL_POLICY_MIGRATIONS, store_migrations=KERNEL_STORE_MIGRATIONS
     )
-    assert (rep.policy_report.to_version, rep.store_report.to_version) == (4, 5)
+    assert (rep.policy_report.to_version, rep.store_report.to_version) == (5, 8)
 
     rt_up = reopen_kernel_job_runtime(wal_root, store_id, os_)
     try:
@@ -240,7 +240,7 @@ def test_r03_policy_restore_carry_forward_wins_over_reconciled_and_reconcile_che
     rt_rec = reopen_kernel_job_runtime(root_path, store_id, os_now)
     try:
         rev0 = rt_rec.policy.policy_revision()
-        epoch0 = read_restore_epoch(layout, schema_version=5, os_=os_now)
+        epoch0 = read_restore_epoch(layout, schema_version=6, os_=os_now)
         subj0 = policy_change_subject_id(
             repo_id_or_global="global",
             base_policy_revision=rev0,
@@ -309,7 +309,7 @@ def test_r03_policy_restore_carry_forward_wins_over_reconciled_and_reconcile_che
         # Also test reconcile_accounting_locks rejects wrong risk_policy_version and wrong resource_digests.
         rev_cur = rt_chk.policy.policy_revision()
         gen_cur = rt_chk.policy.trust_generation()
-        epoch_cur = read_restore_epoch(layout, schema_version=5, os_=os_now)
+        epoch_cur = read_restore_epoch(layout, schema_version=6, os_=os_now)
         subj_cur = policy_change_subject_id(
             repo_id_or_global="global",
             base_policy_revision=rev_cur,

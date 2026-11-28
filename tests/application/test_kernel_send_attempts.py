@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import cast
@@ -51,6 +51,7 @@ from superbrain.storage.idempotency import KernelBlobStager, KernelIdempotencySt
 from superbrain.storage.kernel_schema import KERNEL_POLICY_MIGRATIONS, KERNEL_STORE_MIGRATIONS
 from superbrain.storage.kinds import is_uuid
 from superbrain.storage.runtime import Runtime
+from superbrain.storage.schema import Migration
 from superbrain.storage.send_attempts import (
     KernelSendAttemptStore,
     insert_read_ack_row,
@@ -125,7 +126,12 @@ def _desc(tree: str = TREE_A) -> SnapshotDescriptor:
     )
 
 
-def _open_fixture_runtime(root: Path, os_: OsAdapters) -> Runtime:
+def _open_fixture_runtime(
+    root: Path,
+    os_: OsAdapters,
+    *,
+    store_migrations: Sequence[Migration] | None = None,
+) -> Runtime:
     handlers, kinds = fixture_store_extensions()
     return open_cloned_runtime(
         root,
@@ -133,9 +139,14 @@ def _open_fixture_runtime(root: Path, os_: OsAdapters) -> Runtime:
         role="kernel-b" if root.name in {"root-b", "foreign-root", "other", "b"} else "kernel",
         handlers=handlers,
         kinds=kinds,
-        store_migrations=KERNEL_STORE_MIGRATIONS,
+        store_migrations=KERNEL_STORE_MIGRATIONS if store_migrations is None else store_migrations,
         policy_migrations=KERNEL_POLICY_MIGRATIONS,
     )
+
+
+def _open_store4_runtime(root: Path, os_: OsAdapters) -> Runtime:
+    """Open a pre-v8 fixture runtime whose ``artifact_send_attempt``/``artifact_read_ack`` keep store4 columns."""
+    return _open_fixture_runtime(root, os_, store_migrations=KERNEL_STORE_MIGRATIONS[:-1])
 
 
 def _register_ws(
@@ -2072,7 +2083,7 @@ def test_sp2_1_store4_fail_closed_for_non_default_send_attempt_and_read_ack(
     from superbrain.core.errors import BrainError
 
     mono = FakeMonotonicClock()
-    rt = _open_fixture_runtime(trusted_tmp / "root-s4-neg", os_)
+    rt = _open_store4_runtime(trusted_tmp / "root-s4-neg", os_)
     try:
         seeded = seed_principal_and_credential(rt.policy)
         ws = _register_ws(rt, clock, seeded, alias="ws-main", checkout_dir=trusted_tmp / "chk-s4-neg")
@@ -2324,7 +2335,7 @@ def test_sp2_1_half_migrated_schema_fails_closed_with_integrity_failure(
     """Partial/half-migrated schema on either table must fail closed with INTEGRITY_FAILURE."""
     from superbrain.core.errors import BrainError
 
-    rt = _open_fixture_runtime(trusted_tmp / f"root-half-{table}-{partial_cols[0]}", os_)
+    rt = _open_store4_runtime(trusted_tmp / f"root-half-{table}-{partial_cols[0]}", os_)
     try:
         seeded = seed_principal_and_credential(rt.policy)
         send_store = KernelSendAttemptStore(rt.store, rt.policy, writer_epoch=rt.lease.epoch)
@@ -2403,7 +2414,7 @@ def test_sp2_1_positive_twins_store4_and_extended_schema_round_trip(
     mono = FakeMonotonicClock()
 
     # Twin A: unmodified store4 end-to-end with defaults (decoded level="unknown", epoch=0)
-    rt_s4 = _open_fixture_runtime(trusted_tmp / "root-twin-s4", os_)
+    rt_s4 = _open_store4_runtime(trusted_tmp / "root-twin-s4", os_)
     try:
         seeded_s4 = seed_principal_and_credential(rt_s4.policy)
         _register_ws(rt_s4, clock, seeded_s4, alias="ws-main", checkout_dir=trusted_tmp / "chk-twin-s4")
@@ -2471,7 +2482,7 @@ def test_sp2_1_positive_twins_store4_and_extended_schema_round_trip(
         rt_s4.close()
 
     # Twin B: extended store6-like schema with L1, L2, L0, and backfilled "unknown"
-    rt_ext = _open_fixture_runtime(trusted_tmp / "root-twin-ext", os_)
+    rt_ext = _open_store4_runtime(trusted_tmp / "root-twin-ext", os_)
     try:
         seeded_ext = seed_principal_and_credential(rt_ext.policy)
         ws_ext = _register_ws(rt_ext, clock, seeded_ext, alias="ws-main", checkout_dir=trusted_tmp / "chk-twin-ext")
@@ -2725,7 +2736,7 @@ def test_sp2_1_r2_unknown_store4_legacy_level_and_fixture_domain_level_oracle(
     mono = FakeMonotonicClock()
 
     # Part A: bare SQLite I2-shape store4 rows for L0, L1, L2 requests all decode as 'unknown' & ineligible for L1.
-    rt_s4 = _open_fixture_runtime(trusted_tmp / "root-r2-i2-rows", os_)
+    rt_s4 = _open_store4_runtime(trusted_tmp / "root-r2-i2-rows", os_)
     try:
         seeded_s4 = seed_principal_and_credential(rt_s4.policy)
         _register_ws(rt_s4, clock, seeded_s4, alias="ws-main", checkout_dir=trusted_tmp / "chk-r2-i2-rows")
@@ -2771,7 +2782,7 @@ def test_sp2_1_r2_unknown_store4_legacy_level_and_fixture_domain_level_oracle(
         rt_s4.close()
 
     # Part B: FixtureKernelDomain.describe_artifact_send preserves L0/L1/L2, and only finalized L1 passes L1 check.
-    rt_ext = _open_fixture_runtime(trusted_tmp / "root-r2-domain-levels", os_)
+    rt_ext = _open_store4_runtime(trusted_tmp / "root-r2-domain-levels", os_)
     try:
         seeded_ext = seed_principal_and_credential(rt_ext.policy)
         ws_ext = _register_ws(rt_ext, clock, seeded_ext, alias="ws-main", checkout_dir=trusted_tmp / "chk-r2-domain")
@@ -2867,7 +2878,7 @@ def test_sp2_1_r1_historical_i2_read_ack_hmac_replay_and_tamper_rejection(
 ) -> None:
     """R1 oracle: I2 4-key ReadAck HMAC rows replay cleanly on SP2 6-key ReadAcks iff bound attempt matches."""
     mono = FakeMonotonicClock()
-    rt = _open_fixture_runtime(trusted_tmp / "root-r1-replay", os_)
+    rt = _open_store4_runtime(trusted_tmp / "root-r1-replay", os_)
     try:
         seeded = seed_principal_and_credential(rt.policy)
         foreign = seed_principal_and_credential(rt.policy, harness_id="foreign-harness")
@@ -3225,7 +3236,7 @@ def test_sp2_1_r1_receipt_lookup_errors_propagate_and_malformed_acks_conflict(
     from superbrain.core.errors import BrainError
 
     mono = FakeMonotonicClock()
-    rt = _open_fixture_runtime(trusted_tmp / "root-r1-f1", os_)
+    rt = _open_store4_runtime(trusted_tmp / "root-r1-f1", os_)
     try:
         seeded = seed_principal_and_credential(rt.policy)
         ws = _register_ws(rt, clock, seeded, alias="ws-main", checkout_dir=trusted_tmp / "chk-r1-f1")

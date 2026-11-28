@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import contextlib
+import threading
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
-from superbrain.adapters.harness_config.merger import SharedConfigMergerAdapter
 from superbrain.application.approvals import OperatorHandle, RestoreHandler
+from superbrain.application.continuity_worker import sweep_legacy_continuity_copies
 from superbrain.application.jobs import JobService
 from superbrain.application.journal_recovery import reconcile_and_classify_journals
 from superbrain.application.maintenance import (
@@ -21,6 +23,7 @@ from superbrain.application.maintenance import (
 from superbrain.application.review_apply import ReviewApplyService
 from superbrain.composition._daemon_session import _AdmittedOwnerSession, _DaemonCompositeDomain
 from superbrain.composition._endpoint import publish_endpoint
+from superbrain.composition._layer2_live import Layer2ApplyTracker
 from superbrain.composition._maintenance_wiring import ensure_maintenance_backend
 from superbrain.composition.kernel_projections import kernel_store_extensions
 from superbrain.core._kernel_approval import ApprovalChannel, ApprovalMessage, canonical_utc
@@ -34,8 +37,11 @@ from superbrain.core.kernel import (
     RequestAuthView,
     ShallowHealthMeta,
 )
+from superbrain.core.proposals import ManagedFormat
 from superbrain.ports.clock import Clock
 from superbrain.ports.os import OsAdapters
+from superbrain.ports.proposals import ConfigMergerPort, MergeOutput
+from superbrain.storage.capture_events import KernelCaptureStore
 from superbrain.storage.idempotency import StagedKernelStore
 from superbrain.storage.jobs import has_legacy_incomplete_settled_projections
 from superbrain.storage.kernel_schema import KERNEL_POLICY_MIGRATIONS, KERNEL_STORE_MIGRATIONS
@@ -48,8 +54,58 @@ from superbrain.storage.restore import (
     restore_store,
 )
 from superbrain.storage.runtime import Runtime
+from superbrain.storage.sessions import SessionStore
 from superbrain.storage.store import Store
 from superbrain.workers.executor import JobExecutor
+
+
+class LazyConfigMerger(ConfigMergerPort):
+    """Defer importing harness-config parsers (tomlkit/json) until config slice merge/remove is needed."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._inner: ConfigMergerPort | None = None
+
+    def _get(self) -> ConfigMergerPort:
+        if self._inner is None:
+            with self._lock:
+                if self._inner is None:
+                    from superbrain.adapters.harness_config.merger import SharedConfigMergerAdapter
+
+                    self._inner = SharedConfigMergerAdapter()
+        return self._inner
+
+    def apply_slice(
+        self,
+        existing_text: str | None,
+        *,
+        managed_format: ManagedFormat,
+        slice_id: str,
+        replacement_bytes: bytes,
+        expected_slice_digest: str | None,
+    ) -> MergeOutput:
+        return self._get().apply_slice(
+            existing_text,
+            managed_format=managed_format,
+            slice_id=slice_id,
+            replacement_bytes=replacement_bytes,
+            expected_slice_digest=expected_slice_digest,
+        )
+
+    def remove_slice(
+        self,
+        existing_text: str,
+        *,
+        managed_format: ManagedFormat,
+        slice_id: str,
+        expected_slice_digest: str | None,
+    ) -> MergeOutput:
+        return self._get().remove_slice(
+            existing_text,
+            managed_format=managed_format,
+            slice_id=slice_id,
+            expected_slice_digest=expected_slice_digest,
+        )
 
 
 def build_review_apply_service(
@@ -68,7 +124,7 @@ def build_review_apply_service(
             adapters,
             data_root=root_dir,
             home_dir=Path.home(),
-            config_merger=SharedConfigMergerAdapter(),
+            config_merger=LazyConfigMerger(),
         )
     return None
 
@@ -87,15 +143,21 @@ class DaemonRestoreHandler(RestoreHandler):
         instance_id: str,
         operator: OperatorHandle,
         review_apply_cls: type[ReviewApplyService] = ReviewApplyService,
+        seen_configured_layer2: set[tuple[str, str]] | None = None,
+        layer2_apply: Layer2ApplyTracker | None = None,
+        host_version_resolver: Callable[[str], str | None] | None = None,
     ) -> None:
         self._session = session
         self._adapters = adapters
         self._clock = clock
         self._executor = executor
         self._composite_domain = composite_domain
+        self._host_version_resolver = host_version_resolver
         self._instance_id = instance_id
         self._operator = operator
         self._review_apply_cls = review_apply_cls
+        self._seen_configured_layer2 = seen_configured_layer2
+        self._layer2_apply = layer2_apply
 
     def preview(self, target: Literal["store", "policy"], backup: Path) -> dict[str, JsonValue]:
         rt = self._session.rt
@@ -181,6 +243,8 @@ class DaemonRestoreHandler(RestoreHandler):
             if has_legacy_incomplete_settled_projections(new_rt.store, new_rt.lease):
                 raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
         job_service = self._rebind_live(new_rt)
+        if new_rt.store.schema_version >= 7 and new_rt.policy.schema_version >= 5:
+            sweep_legacy_continuity_copies(job_service, SessionStore(new_rt.store, new_rt.policy))
         job_service.recover(new_rt.lease.epoch)
         self._session.finish_restore_doctor_reconcile()
         if new_rt.store.schema_version >= 5 and new_rt.policy.schema_version >= 4:
@@ -190,7 +254,7 @@ class DaemonRestoreHandler(RestoreHandler):
                 self._adapters,
                 data_root=new_rt.root.root,
                 home_dir=Path.home(),
-                config_merger=SharedConfigMergerAdapter(),
+                config_merger=LazyConfigMerger(),
                 now_utc_fn=lambda: canonical_utc(self._clock.now()),
             )
         return job_service
@@ -296,6 +360,11 @@ class DaemonRestoreHandler(RestoreHandler):
             cancel_signal=self._executor.cancel if self._executor is not None else None,
         )
         self._composite_domain.rebind_job_service(job_service)
+        from superbrain.composition._daemon_session import make_default_handoff_domain_factory
+
+        self._composite_domain.rebind_fallback_factory(
+            make_default_handoff_domain_factory(rt=rt, clock=self._clock, writer_epoch=new_epoch)
+        )
         new_ready: Ready | None = None
         if epoch_bumped:
             new_endpoint = Endpoint(
@@ -308,7 +377,7 @@ class DaemonRestoreHandler(RestoreHandler):
             )
             publish_endpoint(rt.root, rt.lease, new_endpoint, self._adapters)
             new_ready = replace(self._session.ready, endpoint=new_endpoint, identity=new_endpoint.identity)
-        snap = rt.policy.snapshot()
+        snap = self._session.auth_gate.merge_runtime_capabilities(rt.policy.snapshot())
         has_active_cred = any(
             not cred.revoked and snap.principals.get(cred.principal.principal_id) == cred.principal
             for cred in snap.credentials.values()
@@ -323,6 +392,7 @@ class DaemonRestoreHandler(RestoreHandler):
                 policy_schema_version=rt.policy.schema_version,
                 tls_not_after=self._session.ready.tls_not_after,
                 idempotency_clock_untrusted=self._session.bridge_clock_untrusted(),
+                capture_gaps_present=KernelCaptureStore(rt.store).has_gaps() if rt.store.schema_version >= 6 else False,
             )
             view = RequestAuthView(
                 version=self._session.auth_gate.next_version(),
@@ -339,6 +409,10 @@ class DaemonRestoreHandler(RestoreHandler):
         self._session.rebind_after_restore(rt=rt, job_store=job_store, job_service=job_service, ready=new_ready)
         svc = self._operator.service()
         if svc is not None:
+            from superbrain.composition._layer2_live import reconcile_live_layer2_all
+
+            if self._seen_configured_layer2 is not None:
+                self._seen_configured_layer2.clear()
             svc.rebind_authorities(
                 rt.policy,
                 build_review_apply_service(
@@ -347,6 +421,14 @@ class DaemonRestoreHandler(RestoreHandler):
                     rt.root.root,
                     self._adapters,
                     service_cls=self._review_apply_cls,
+                ),
+                live_layer2_check=lambda: reconcile_live_layer2_all(
+                    self._session.rt.policy,
+                    store=self._session.rt.store,
+                    os_=self._adapters,
+                    host_version_resolver=self._host_version_resolver,
+                    seen_configured=self._seen_configured_layer2,
+                    apply_tracker=self._layer2_apply,
                 ),
             )
         return job_service

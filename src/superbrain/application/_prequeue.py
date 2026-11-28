@@ -17,6 +17,7 @@ from superbrain.core.kernel import (
     LOCAL_PHASE_BUDGET_NS,
     AuthSnapshot,
     Call,
+    CredentialCapabilityBinding,
     Principal,
     PrivateRequestAuth,
     QueuedKernelRequest,
@@ -24,10 +25,12 @@ from superbrain.core.kernel import (
     RequestDeadlines,
     ReservationScopeKey,
     Scope,
+    apply_credential_capability_bindings,
     is_strict_int,
     parse_bearer_token,
     require_opaque_id,
     require_positive_int,
+    update_credential_capability_bindings,
 )
 from superbrain.core.wire import canonical_request_payload, normalize_call, parse_json
 from superbrain.ports.kernel import RequestAuthStatePort
@@ -43,6 +46,7 @@ class AtomicRequestAuthState(RequestAuthStatePort):
         self._view: RequestAuthView | None = None
         self._installed_version = 0
         self._issued_version = 0
+        self._credential_bindings: dict[str, CredentialCapabilityBinding] = {}
 
     @property
     def store_id(self) -> str:
@@ -61,6 +65,7 @@ class AtomicRequestAuthState(RequestAuthStatePort):
         if view.auth.store_id != self._expected_store_id:
             with self._lock:
                 self._view = None
+                self._credential_bindings.clear()
             raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
         with self._lock:
             if view.version <= self._installed_version:
@@ -69,7 +74,18 @@ class AtomicRequestAuthState(RequestAuthStatePort):
             self._installed_version = view.version
             if view.version > self._issued_version:
                 self._issued_version = view.version
+            self._credential_bindings = update_credential_capability_bindings(
+                self._credential_bindings, view.auth
+            )
             return view
+
+    def merge_runtime_capabilities(self, snap: AuthSnapshot) -> AuthSnapshot:
+        """Overlay cached runtime credential capabilities onto a freshly loaded policy snapshot."""
+        with self._lock:
+            if not self._credential_bindings:
+                return snap
+            bindings = dict(self._credential_bindings)
+        return apply_credential_capability_bindings(snap, bindings)
 
     def next_version(self) -> int:
         with self._lock:

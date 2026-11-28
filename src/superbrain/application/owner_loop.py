@@ -8,16 +8,16 @@ import math
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from concurrent.futures import Future
 from dataclasses import replace
 from typing import Protocol, TypeVar, runtime_checkable
 
-from superbrain.application._auth_gate import AuthGate, evaluate_shallow_health
+from superbrain.application import _owner_loop_queue
+from superbrain.application._auth_gate import AuthGate
 from superbrain.application._future_notify import (
     AsyncThunkNotifier,
     DeferredCallbackFuture,
-    is_collecting_deferred_callbacks,
     safe_set_exception,
     safe_set_result,
     settle_and_submit_callbacks,
@@ -26,10 +26,10 @@ from superbrain.application._reservation import make_checked_error
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.kernel import (
     DEFAULT_SHUTDOWN_GRACE_S,
-    TOTAL_REQUEST_BUDGET_NS,
     ArtifactSendAttempt,
     BootstrapAuthorization,
     CallResult,
+    CaptureBatchCommand,
     DaemonConfig,
     InvocationRecord,
     JobRecord,
@@ -42,7 +42,6 @@ from superbrain.core.kernel import (
     WorkerCommand,
     WorkspaceBinding,
     WorkspaceRegistration,
-    is_strict_int,
     require_aware_utc,
 )
 from superbrain.ports.clock import Clock, MonotonicClock
@@ -222,78 +221,13 @@ class OwnerLoop:
         return out_fut
 
     def submit_reply(self, command: ToolCommand, deadline_ns: int) -> Future[OwnerReply]:
-        if not isinstance(command, ToolCommand):
-            raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
-        if not is_strict_int(deadline_ns):
-            raise BrainError(ErrorCode.INVALID_INPUT, "boolean not allowed for integer")
+        return _owner_loop_queue.submit_reply(self, command, deadline_ns)
 
-        with self._lifecycle_lock:
-            session = self._session
-            stopping = self._stopping
-
-        if session is None or stopping:
-            return _error_reply_future(ErrorCode.DAEMON_UNAVAILABLE, "daemon unavailable")
-
-        is_shallow_health = command.tool == "get_health" and not (
-            isinstance(command.arguments, Mapping) and command.arguments.get("deep") is True
-        )
-        if is_shallow_health:
-            try:
-                reply = evaluate_shallow_health(
-                    command,
-                    deadline_ns,
-                    auth_gate=session.auth_gate,
-                    clock=session.clock,
-                    monotonic_clock=session.monotonic_clock,
-                    loop_ready=(self.ready is not None),
-                )
-            except BrainError as err:
-                return _error_reply_future(err.code, err.message)
-            return _resolved_reply_future(reply)
-
-        try:
-            now_utc, _ = require_aware_utc(session.clock.now())
-        except BrainError as err:
-            return _error_reply_future(err.code, err.message)
-        if now_utc >= session.ready.tls_not_after:
-            return _error_reply_future(ErrorCode.DAEMON_UNAVAILABLE, "daemon unavailable")
-
-        receive_ns = deadline_ns - TOTAL_REQUEST_BUDGET_NS
-        fut: DeferredCallbackFuture[OwnerReply] = DeferredCallbackFuture()
-        session.submit_queued_reply(command, receive_ns, fut)
-        return fut
+    def submit_capture_batch(self, command: CaptureBatchCommand, deadline_ns: int) -> Future[CallResult]:
+        return _owner_loop_queue.submit_capture_batch(self, command, deadline_ns)
 
     def _enqueue_internal(self, fn: Callable[[OwnerSession], _T]) -> Future[_T]:
-        fut: DeferredCallbackFuture[_T] = DeferredCallbackFuture()
-        with self._lifecycle_lock:
-            session = self._session
-            if session is None or self._stopping:
-                safe_set_exception(fut, _unavailable_error())
-                return fut
-
-            def _task() -> None:
-                if self._expire_drain_if_due(session):
-                    if is_collecting_deferred_callbacks():
-                        safe_set_exception(fut, _unavailable_error())
-                    else:
-                        settle_and_submit_callbacks(
-                            self._notifier,
-                            (lambda: safe_set_exception(fut, _unavailable_error()),),
-                        )
-                    return
-                try:
-                    res = fn(session)
-                except BrainError as err:
-                    safe_set_exception(fut, BrainError(err.code, err.message))
-                except Exception:  # noqa: BLE001
-                    safe_set_exception(fut, BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure"))
-                else:
-                    safe_set_result(fut, res)
-
-            with self._internal_lock:
-                self._internal_queue.append(_task)
-            self._owner_wake.set()
-        return fut
+        return _owner_loop_queue._enqueue_internal(self, fn)
 
     def apply_worker_command(self, cmd: WorkerCommand) -> Future[JobRecord | InvocationRecord]:
         return self._enqueue_internal(lambda s: s.apply_worker_command(cmd))

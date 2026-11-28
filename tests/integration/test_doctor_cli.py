@@ -720,7 +720,7 @@ def test_installed_wheel_doctor_offline_and_online_config_discovery_and_profile(
             off_json.stdout, off_json.stderr, off_json.returncode, expected_store_id=store_id
         )
         assert off_data["overall_status"] == "pass"
-        assert off_data["schema"]["store_version"] == 5 and off_data["schema"]["policy_version"] == 4
+        assert off_data["schema"]["store_version"] == 8 and off_data["schema"]["policy_version"] == 5
 
     off_txt = run_installed_command(
         inc2_installed_env, "brain", ["doctor", "--offline", "--config", str(daemon_cfg)], cwd=cwd

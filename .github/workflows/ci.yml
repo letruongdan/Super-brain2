@@ -27,7 +27,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest]
         python: ["3.11", "3.14"]
 
     steps:
@@ -137,7 +137,7 @@ jobs:
           if-no-files-found: error
 
   gate-windows-worker:
-    name: gate-worker (windows-2022, python ${{ matrix.python }}, part ${{ matrix.partition }}/4)
+    name: gate-worker (windows-2022, python ${{ matrix.python }}, part ${{ matrix.partition }}/6)
     runs-on: windows-2022
     timeout-minutes: 15
     env:
@@ -148,7 +148,7 @@ jobs:
       fail-fast: false
       matrix:
         python: ["3.11", "3.14"]
-        partition: ["0", "1", "2", "3"]
+        partition: ["0", "1", "2", "3", "4", "5"]
 
     steps:
       - uses: actions/checkout@v4
@@ -192,7 +192,7 @@ jobs:
         shell: bash
         run: uv sync --locked --python ${{ matrix.python }}
 
-      - name: Run partitioned worker gate (${{ matrix.partition }}/4)
+      - name: Run partitioned worker gate (${{ matrix.partition }}/6)
         shell: bash
         run: |
           ev="${{ runner.temp }}/gate-evidence"
@@ -200,7 +200,7 @@ jobs:
           out="${{ runner.temp }}/gate.stdout.log"
           err="${{ runner.temp }}/gate.stderr.log"
           set +e
-          uv run --locked --python ${{ matrix.python }} python scripts/gate.py --python ${{ matrix.python }} --partition ${{ matrix.partition }}/4 --evidence-dir "$ev" > "$out" 2> "$err"
+          uv run --locked --python ${{ matrix.python }} python scripts/gate.py --python ${{ matrix.python }} --partition ${{ matrix.partition }}/6 --evidence-dir "$ev" > "$out" 2> "$err"
           code=$?
           [ -f "$out" ] && cat "$out"
           [ -f "$err" ] && cat "$err" >&2
@@ -319,6 +319,20 @@ jobs:
           name: gate-worker-windows-${{ matrix.python }}-part-3
           path: ${{ runner.temp }}/agg-workers-${{ matrix.python }}/part-3
 
+      - name: Download worker partition 4 evidence
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: gate-worker-windows-${{ matrix.python }}-part-4
+          path: ${{ runner.temp }}/agg-workers-${{ matrix.python }}/part-4
+
+      - name: Download worker partition 5 evidence
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: gate-worker-windows-${{ matrix.python }}-part-5
+          path: ${{ runner.temp }}/agg-workers-${{ matrix.python }}/part-5
+
       - name: Run aggregate receipt validation
         shell: bash
         run: |
@@ -328,7 +342,7 @@ jobs:
           out="${{ runner.temp }}/gate-agg.stdout.log"
           err="${{ runner.temp }}/gate-agg.stderr.log"
           set +e
-          uv run --locked --python ${{ matrix.python }} python scripts/gate.py aggregate --python ${{ matrix.python }} --partition-count 4 --workers-dir "$workers" --expected-commit "${{ github.sha }}" --evidence-dir "$ev" > "$out" 2> "$err"
+          uv run --locked --python ${{ matrix.python }} python scripts/gate.py aggregate --python ${{ matrix.python }} --partition-count 6 --workers-dir "$workers" --expected-commit "${{ github.sha }}" --evidence-dir "$ev" > "$out" 2> "$err"
           code=$?
           [ -f "$out" ] && cat "$out"
           [ -f "$err" ] && cat "$err" >&2
@@ -381,5 +395,239 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: seal-evidence-windows-2022-${{ matrix.python }}
+          path: ${{ runner.temp }}/seal-evidence
+          if-no-files-found: error
+
+  gate-macos-worker:
+    name: gate-worker (macos-latest, python ${{ matrix.python }}, part ${{ matrix.partition }}/2)
+    runs-on: macos-latest
+    timeout-minutes: 15
+    env:
+      GIT_CONFIG_COUNT: "1"
+      GIT_CONFIG_KEY_0: core.autocrlf
+      GIT_CONFIG_VALUE_0: "false"
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.14"]
+        partition: ["0", "1"]
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Use reviewed LF bytes in this checkout
+        shell: bash
+        run: |
+          git config core.autocrlf false
+          git checkout-index --force --all
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.12.15"
+
+      - name: Prepare physical temporary directory
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          temporary = Path(os.environ["RUNNER_TEMP"]).resolve()
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as output:
+              for var in ("TMPDIR", "TEMP", "TMP"):
+                  output.write(f"{var}={temporary}\n")
+          PY
+
+      - name: Verify sealed test oracle before acceptance
+        shell: bash
+        run: |
+          mkdir -p "${RUNNER_TEMP}/seal-evidence"
+          python .verification/test_lock.py check \
+            --root . \
+            --manifest .verification/task9-seal.json \
+            --expected-digest "$T9_TEST_SEAL_R19_SHA256" \
+            > "${RUNNER_TEMP}/seal-evidence/before.json" 2>&1
+
+      - name: Sync dependencies for Python ${{ matrix.python }}
+        shell: bash
+        run: uv sync --locked --python ${{ matrix.python }}
+
+      - name: Run partitioned worker gate (${{ matrix.partition }}/2)
+        shell: bash
+        run: |
+          ev="${{ runner.temp }}/gate-evidence"
+          mkdir -p "$ev"
+          out="${{ runner.temp }}/gate.stdout.log"
+          err="${{ runner.temp }}/gate.stderr.log"
+          set +e
+          uv run --locked --python ${{ matrix.python }} python scripts/gate.py --python ${{ matrix.python }} --partition ${{ matrix.partition }}/2 --evidence-dir "$ev" > "$out" 2> "$err"
+          code=$?
+          [ -f "$out" ] && cat "$out"
+          [ -f "$err" ] && cat "$err" >&2
+          echo "$code" > "${{ runner.temp }}/gate.exit"
+          exit $code
+
+      - name: Verify sealed test oracle after acceptance
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p "${RUNNER_TEMP}/seal-evidence"
+          python .verification/test_lock.py check \
+            --root . \
+            --manifest .verification/task9-seal.json \
+            --expected-digest "$T9_TEST_SEAL_R19_SHA256" \
+            > "${RUNNER_TEMP}/seal-evidence/after.json" 2>&1
+
+      - name: Upload partitioned worker evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-worker-macos-${{ matrix.python }}-part-${{ matrix.partition }}
+          path: ${{ runner.temp }}/gate-evidence
+          if-no-files-found: ignore
+
+      - name: Upload seal check evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: seal-evidence-macos-${{ matrix.python }}-part-${{ matrix.partition }}
+          path: ${{ runner.temp }}/seal-evidence
+          if-no-files-found: error
+
+  gate-macos-aggregate:
+    name: gate (macos-latest, python ${{ matrix.python }}, aggregate)
+    needs: [gate-macos-worker]
+    if: always()
+    runs-on: macos-latest
+    timeout-minutes: 15
+    env:
+      GIT_CONFIG_COUNT: "1"
+      GIT_CONFIG_KEY_0: core.autocrlf
+      GIT_CONFIG_VALUE_0: "false"
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.14"]
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Use reviewed LF bytes in this checkout
+        shell: bash
+        run: |
+          git config core.autocrlf false
+          git checkout-index --force --all
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.12.15"
+
+      - name: Prepare physical temporary directory
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          temporary = Path(os.environ["RUNNER_TEMP"]).resolve()
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as output:
+              for var in ("TMPDIR", "TEMP", "TMP"):
+                  output.write(f"{var}={temporary}\n")
+          PY
+
+      - name: Verify sealed test oracle before acceptance
+        shell: bash
+        run: |
+          mkdir -p "${RUNNER_TEMP}/seal-evidence"
+          python .verification/test_lock.py check \
+            --root . \
+            --manifest .verification/task9-seal.json \
+            --expected-digest "$T9_TEST_SEAL_R19_SHA256" \
+            > "${RUNNER_TEMP}/seal-evidence/before.json" 2>&1
+
+      - name: Sync dependencies for Python ${{ matrix.python }}
+        shell: bash
+        run: uv sync --locked --python ${{ matrix.python }}
+
+      - name: Download worker partition 0 evidence
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: gate-worker-macos-${{ matrix.python }}-part-0
+          path: ${{ runner.temp }}/agg-workers-${{ matrix.python }}/part-0
+
+      - name: Download worker partition 1 evidence
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: gate-worker-macos-${{ matrix.python }}-part-1
+          path: ${{ runner.temp }}/agg-workers-${{ matrix.python }}/part-1
+
+      - name: Run aggregate receipt validation
+        shell: bash
+        run: |
+          ev="${{ runner.temp }}/gate-evidence"
+          workers="${{ runner.temp }}/agg-workers-${{ matrix.python }}"
+          mkdir -p "$ev" "$workers"
+          out="${{ runner.temp }}/gate-agg.stdout.log"
+          err="${{ runner.temp }}/gate-agg.stderr.log"
+          set +e
+          uv run --locked --python ${{ matrix.python }} python scripts/gate.py aggregate --python ${{ matrix.python }} --partition-count 2 --workers-dir "$workers" --expected-commit "${{ github.sha }}" --evidence-dir "$ev" > "$out" 2> "$err"
+          code=$?
+          [ -f "$out" ] && cat "$out"
+          [ -f "$err" ] && cat "$err" >&2
+          echo "$code" > "${{ runner.temp }}/gate-agg.exit"
+          exit $code
+
+      - name: Benchmark
+        shell: bash
+        run: |
+          mkdir -p "${{ runner.temp }}/perf-evidence"
+          uv run --locked --python ${{ matrix.python }} python -m tests.integration.test_kernel_performance --evidence-dir "${{ runner.temp }}/perf-evidence"
+
+      - name: Verify sealed test oracle after acceptance
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p "${RUNNER_TEMP}/seal-evidence"
+          python .verification/test_lock.py check \
+            --root . \
+            --manifest .verification/task9-seal.json \
+            --expected-digest "$T9_TEST_SEAL_R19_SHA256" \
+            > "${RUNNER_TEMP}/seal-evidence/after.json" 2>&1
+
+      - name: Upload aggregate gate receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-receipt-macos-latest-${{ matrix.python }}
+          path: .gate/
+          if-no-files-found: ignore
+
+      - name: Upload aggregate gate evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-evidence-macos-latest-${{ matrix.python }}
+          path: ${{ runner.temp }}/gate-evidence
+          if-no-files-found: ignore
+
+      - name: Upload benchmark evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-evidence-macos-latest-${{ matrix.python }}
+          path: ${{ runner.temp }}/perf-evidence
+          if-no-files-found: ignore
+
+      - name: Upload seal check evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: seal-evidence-macos-latest-${{ matrix.python }}
           path: ${{ runner.temp }}/seal-evidence
           if-no-files-found: error

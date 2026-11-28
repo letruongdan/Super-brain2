@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from typing import Protocol, runtime_checkable
 
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.ids import new_id
@@ -28,6 +29,11 @@ __all__ = [
     "record_projected_read_acks",
     "record_read_acks",
 ]
+
+
+@runtime_checkable
+class _TaskScopeReader(Protocol):
+    def read_task_scope(self, task_id: str) -> tuple[str, str, str] | None: ...
 
 
 @dataclass(frozen=True)
@@ -168,12 +174,16 @@ def record_projected_read_acks(
         ):
             raise BrainError(ErrorCode.NOT_FOUND, "not found")
 
-        task_binding = tx.read_task_binding(attempt.task_id)
-        if task_binding is None or (
-            task_binding.owner_id,
-            task_binding.repo_id,
-            task_binding.checkout_id,
-        ) != (
+        if isinstance(tx, _TaskScopeReader):
+            task_scope = tx.read_task_scope(attempt.task_id)
+        else:
+            task_binding = tx.read_task_binding(attempt.task_id)
+            task_scope = (
+                None
+                if task_binding is None
+                else (task_binding.owner_id, task_binding.repo_id, task_binding.checkout_id)
+            )
+        if task_scope != (
             principal.owner_id,
             effective_scope.repo_id,
             effective_scope.checkout_id,

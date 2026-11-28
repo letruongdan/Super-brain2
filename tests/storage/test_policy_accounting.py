@@ -222,7 +222,7 @@ def test_migrate_from_4_3_to_5_4_preserves_existing_provider_invocation_rows(
         key_path=trusted_tmp / "unused.key",
     )
     rep = migrate_offline(cfg, os_)
-    assert (rep.policy_report.to_version, rep.store_report.to_version) == (4, 5)
+    assert (rep.policy_report.to_version, rep.store_report.to_version) == (5, 8)
 
     rt_after = reopen_kernel_job_runtime(root_path, store_id, os_)
     try:
@@ -502,7 +502,7 @@ def test_restore_policy_preview_immediate_locks_carry_forward_and_reconcile_unlo
             is RiskLevel.HIGH
         )
         rev = rt_carried.policy.policy_revision()
-        cur_epoch = read_restore_epoch(layout, schema_version=5, os_=os_)
+        cur_epoch = read_restore_epoch(layout, schema_version=6, os_=os_)
         subj = policy_change_subject_id(
             repo_id_or_global="global",
             base_policy_revision=rev,

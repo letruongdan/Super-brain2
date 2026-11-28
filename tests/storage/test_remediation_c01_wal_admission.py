@@ -30,10 +30,11 @@ from superbrain.storage.cas import RetentionClass
 from superbrain.storage.layout import DataRoot
 from superbrain.storage.restore import restore_policy
 from superbrain.storage.runtime import open_runtime
-from superbrain.storage.schema import read_schema_info
+from superbrain.storage.schema import POLICY_MIGRATIONS, STORE_MIGRATIONS, read_schema_info
 from tests.storage.conftest import maintenance_lease
 from tests.support.crash import CHILD_TIMEOUT, CRASH_EXIT, run_child, run_until_crash
 from tests.support.fs import digest_tree
+from tests.support.inc2_fixture import open_cloned_runtime
 
 NOW = datetime(2026, 10, 31, 12, 0, tzinfo=UTC)
 HOLDER = "0192f3a4-5b6c-7d8e-9f01-0000000c0101"
@@ -99,7 +100,13 @@ def schema_version_of(db: Path, scratch: Path) -> int:
 
 def fresh_root(data_root: Path) -> DataRoot:
     """A data root created by ``open_runtime`` and closed again (store and policy store at schema 1)."""
-    open_runtime(data_root, os_adapters()).close()
+    open_cloned_runtime(
+        data_root,
+        os_adapters(),
+        role="c01-wal-v1",
+        store_migrations=STORE_MIGRATIONS,
+        policy_migrations=POLICY_MIGRATIONS,
+    ).close()
     return DataRoot.at(data_root)
 
 
@@ -197,7 +204,13 @@ def test_policy_restore_issues_a_generation_above_one_committed_only_in_the_live
     WAL) before a crash, above the lock's mark, must not be issued again (spec 5.7: strictly above every earlier
     generation)."""
     data_root = trusted_tmp / "r"
-    rt = open_runtime(data_root, os_adapters())
+    rt = open_cloned_runtime(
+        data_root,
+        os_adapters(),
+        role="c01-wal-v1",
+        store_migrations=STORE_MIGRATIONS,
+        policy_migrations=POLICY_MIGRATIONS,
+    )
     try:
         backup = create_policy_backup(rt.policy, rt.os_, NOW)
         store_id = rt.store.store_id

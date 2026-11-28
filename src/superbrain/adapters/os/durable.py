@@ -107,6 +107,14 @@ def _fsync_directory(path: Path, *, nt: bool = os.name == "nt") -> bool:
         os.close(descriptor)
 
 
+def sync_directory_strict(path: Path) -> None:
+    """Persist directory entries for ``OutboxSpool`` metadata updates. A filesystem that cannot fsync a directory is
+    accepted (``_fsync_directory`` returns ``False``); ``EIO``, ``ENOSPC`` and every other error propagate so the
+    outbox stops before its next publication step. On Windows nothing is flushed here and the outbox renames with
+    ``os.replace`` (no write-through), so the outbox there is ``process_crash_durable`` (spec 7.1)."""
+    _fsync_directory(path)
+
+
 # --------------------------------------------------------------------------------------------------
 # Filesystem detection
 
@@ -322,8 +330,14 @@ class _BasePublisher:
         os.replace(src, dst)
 
     def _rename_dir(self, src: Path, dst: Path) -> None:
-        # The existence check is not atomic against another process; acceptable because the single
-        # writer holds the store lock (spec 5.5).
+        try:
+            _rename_noreplace(src, dst)
+            return
+        except FileExistsError:
+            raise
+        except OSError as err:
+            if err.errno not in (errno.ENOSYS, errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP, 95):
+                raise
         if os.path.lexists(dst):
             raise FileExistsError(errno.EEXIST, "target directory exists", str(dst))
         os.rename(src, dst)

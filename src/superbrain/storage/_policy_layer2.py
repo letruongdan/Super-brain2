@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 import sqlite3
 from datetime import datetime
 
@@ -14,15 +16,18 @@ from superbrain.core._kernel_approval import (
     RecoveryScope,
 )
 from superbrain.core._kernel_base import OPAQUE_ID_RE, require_sha256_digest
+from superbrain.core.canonical import canonical_json
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.ids import new_id
 from superbrain.core.jsonvalue import JsonValue
 from superbrain.ports.policy import Intent, IntentKind
-from superbrain.storage._policy_approvals import OWNER_META_KEY, record_intent_row, refused
+from superbrain.storage._policy_approvals import OWNER_META_KEY, _integrity, record_intent_row, refused
 from superbrain.storage.kinds import is_uuid
 from superbrain.storage.ledger import utc_timestamp
 
 SIGNER_RESET_META_KEY = "signer_reset_recorded"
+LAYER2_STALE_THROUGH_SEQ_KEY = "layer2_stale_through_seq"
+LAYER2_CONFIGURED_CHECKOUTS_KEY = "layer2_configured_checkouts"
 _GRANT_ACTIONS = frozenset({ApprovalAction.APPLY.value, ApprovalAction.ROLLBACK.value})
 _GRANT_COLUMNS = "grant_id, approval_id, journal_id, subject_id, recovery_scope, trust_generation, state, end_reason"
 
@@ -60,6 +65,228 @@ def set_layer2_state(
     return intent
 
 
+def _stale_through_seq(db: sqlite3.Connection) -> int:
+    has_meta = db.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'").fetchone()
+    if has_meta is None:
+        return 0
+    row = db.execute("SELECT value FROM meta WHERE key = ?", (LAYER2_STALE_THROUGH_SEQ_KEY,)).fetchone()
+    if row is None or not isinstance(row[0], str):
+        return 0
+    try:
+        val = int(row[0])
+    except ValueError as err:
+        raise _integrity("layer2_stale_through_seq") from err
+    if val < 0:
+        raise _integrity("layer2_stale_through_seq")
+    return val
+
+
+def layer2_stale_through_seq(db: sqlite3.Connection) -> int:
+    """Return the highest ``harness_layer2_state.seq`` invalidated by ``restore_policy`` (0 if none)."""
+    return _stale_through_seq(db)
+
+
+def configured_layer2_checkouts(db: sqlite3.Connection) -> dict[str, tuple[str, ...]]:
+    """Return persisted ``{harness_id: (norm_checkout_path, ...)}`` observed as configured."""
+    has_meta = db.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'").fetchone()
+    if has_meta is None:
+        return {}
+    row = db.execute("SELECT value FROM meta WHERE key = ?", (LAYER2_CONFIGURED_CHECKOUTS_KEY,)).fetchone()
+    if row is None or not isinstance(row[0], str):
+        return {}
+    try:
+        raw = json.loads(row[0])
+    except ValueError:
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, tuple[str, ...]] = {}
+    for k, vals in raw.items():
+        if isinstance(k, str) and isinstance(vals, list):
+            clean = sorted({os.path.normcase(os.path.abspath(str(v))) for v in vals if isinstance(v, str) and v})
+            if clean:
+                out[k] = tuple(clean)
+    return out
+
+
+def record_configured_layer2_checkout(
+    db: sqlite3.Connection,
+    *,
+    harness_id: str,
+    checkout_path: str,
+) -> None:
+    """Persist ``(harness_id, checkout_path)`` in ``meta`` so restarts detect deleted harness configs."""
+    has_meta = db.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'").fetchone()
+    if has_meta is None or not checkout_path:
+        return
+    norm = os.path.normcase(os.path.abspath(checkout_path))
+    cur = configured_layer2_checkouts(db)
+    existing = set(cur.get(harness_id, ()))
+    if norm in existing:
+        return
+    merged: dict[str, JsonValue] = {hid: list(paths) for hid, paths in cur.items()}
+    next_paths: list[JsonValue] = []
+    next_paths.extend(sorted(existing | {norm}))
+    merged[harness_id] = next_paths
+    db.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+        (LAYER2_CONFIGURED_CHECKOUTS_KEY, canonical_json(merged).decode("utf-8")),
+    )
+
+
+def mark_restored_layer2_stale(db: sqlite3.Connection) -> None:
+    """Invalidate any pre-restore ``VERIFIED`` rows in restored ``policy.db`` until re-verified."""
+    has_l2 = db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'harness_layer2_state'"
+    ).fetchone()
+    has_meta = db.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'").fetchone()
+    if has_l2 is None or has_meta is None:
+        return
+    row = db.execute("SELECT COALESCE(MAX(seq), 0) FROM harness_layer2_state").fetchone()
+    max_seq = int(row[0]) if row is not None and row[0] is not None else 0
+    db.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+        (LAYER2_STALE_THROUGH_SEQ_KEY, str(max_seq)),
+    )
+
+
+def read_latest_layer2_state(
+    db: sqlite3.Connection, *, harness_id: str
+) -> tuple[str, str, str, Layer2State] | None:
+    """Return latest ``(harness_id, host_version, config_digest, state)`` row for ``harness_id``, or ``None``."""
+    if not isinstance(harness_id, str) or not OPAQUE_ID_RE.fullmatch(harness_id):
+        raise _invalid()
+    row = db.execute(
+        "SELECT seq, host_version, config_digest, state FROM harness_layer2_state "
+        "WHERE harness_id = ? ORDER BY seq DESC LIMIT 1",
+        (harness_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    row_seq, host_ver, cfg_dig, state_raw = row
+    if not isinstance(host_ver, str) or not isinstance(cfg_dig, str) or not isinstance(state_raw, str):
+        raise _integrity("harness_layer2_state row")
+    try:
+        state_val = Layer2State(state_raw)
+    except ValueError as err:
+        raise _integrity("harness_layer2_state state") from err
+    if state_val is Layer2State.VERIFIED and int(str(row_seq)) <= _stale_through_seq(db):
+        state_val = Layer2State.UNKNOWN
+    return (harness_id, host_ver, cfg_dig, state_val)
+
+
+def reconcile_layer2_binding(
+    db: sqlite3.Connection,
+    *,
+    harness_id: str,
+    current_host_version: str | None,
+    current_config_digest: str | None,
+    now: datetime,
+) -> tuple[Layer2State, bool]:
+    """Downgrade a ``VERIFIED`` harness row to ``UNKNOWN`` if ``(host_version, config_digest)`` drifted."""
+    latest = read_latest_layer2_state(db, harness_id=harness_id)
+    if latest is None:
+        return Layer2State.UNKNOWN, False
+    _, recorded_ver, recorded_dig, cur_state = latest
+    if cur_state is not Layer2State.VERIFIED:
+        return cur_state, False
+    if recorded_ver == current_host_version and recorded_dig == current_config_digest:
+        return Layer2State.VERIFIED, False
+    eff_ver = (
+        current_host_version
+        if isinstance(current_host_version, str) and OPAQUE_ID_RE.fullmatch(current_host_version)
+        else recorded_ver
+    )
+    eff_dig = recorded_dig
+    if isinstance(current_config_digest, str):
+        try:
+            require_sha256_digest(current_config_digest)
+            eff_dig = current_config_digest
+        except BrainError:
+            eff_dig = recorded_dig
+    set_layer2_state(
+        db,
+        harness_id=harness_id,
+        host_version=eff_ver,
+        config_digest=eff_dig,
+        state=Layer2State.UNKNOWN,
+        now=now,
+    )
+    return Layer2State.UNKNOWN, True
+
+
+def set_repo_policy_flags(
+    db: sqlite3.Connection,
+    *,
+    repo_id: str,
+    automatic_capture_enabled: bool | None = None,
+    manual_submission_enabled: bool | None = None,
+    indexing_enabled: bool | None = None,
+    provider_egress_enabled: bool | None = None,
+    post_session_review_enabled: bool | None = None,
+    now: datetime,
+) -> Intent:
+    """Update per-repo policy flags atomically and record ``REPO_POLICY_SET`` intent."""
+    if not isinstance(repo_id, str) or not OPAQUE_ID_RE.fullmatch(repo_id):
+        raise _invalid()
+    for val in (
+        automatic_capture_enabled,
+        manual_submission_enabled,
+        indexing_enabled,
+        provider_egress_enabled,
+        post_session_review_enabled,
+    ):
+        if val is not None and not isinstance(val, bool):
+            raise _invalid()
+    row = db.execute(
+        "SELECT owner_id, automatic_capture_enabled, manual_submission_enabled, indexing_enabled, "
+        "provider_egress_enabled, post_session_review_enabled FROM repo_policy WHERE repo_id = ?",
+        (repo_id,),
+    ).fetchone()
+    if row is None:
+        raise BrainError(ErrorCode.NOT_FOUND, "not found")
+    owner_id_raw, cur_auto, cur_manual, cur_idx, cur_egress, cur_review = row
+    if not isinstance(owner_id_raw, str):
+        raise _integrity("repo_policy owner_id")
+    for col in (cur_auto, cur_manual, cur_idx, cur_egress, cur_review):
+        if type(col) is not int or col not in (0, 1):
+            raise _integrity("repo_policy flag")
+    next_auto = (cur_auto == 1) if automatic_capture_enabled is None else automatic_capture_enabled
+    next_manual = (cur_manual == 1) if manual_submission_enabled is None else manual_submission_enabled
+    next_idx = (cur_idx == 1) if indexing_enabled is None else indexing_enabled
+    next_egress = (cur_egress == 1) if provider_egress_enabled is None else provider_egress_enabled
+    next_review = (cur_review == 1) if post_session_review_enabled is None else post_session_review_enabled
+    intent = record_intent_row(
+        db,
+        IntentKind.REPO_POLICY_SET,
+        {
+            "repo_id": repo_id,
+            "owner_id": owner_id_raw,
+            "automatic_capture_enabled": next_auto,
+            "manual_submission_enabled": next_manual,
+            "indexing_enabled": next_idx,
+            "provider_egress_enabled": next_egress,
+            "post_session_review_enabled": next_review,
+        },
+        now,
+    )
+    db.execute(
+        "UPDATE repo_policy SET automatic_capture_enabled = ?, manual_submission_enabled = ?, "
+        "indexing_enabled = ?, provider_egress_enabled = ?, post_session_review_enabled = ?, updated_at = ? "
+        "WHERE repo_id = ?",
+        (
+            1 if next_auto else 0,
+            1 if next_manual else 0,
+            1 if next_idx else 0,
+            1 if next_egress else 0,
+            1 if next_review else 0,
+            utc_timestamp(now),
+            repo_id,
+        ),
+    )
+    return intent
+
+
 def terminal_channel_eligible(db: sqlite3.Connection, machine_id: str | None) -> bool:
     """``True`` iff there is at least one connected harness and every one of them has a ``verified`` layer 2.
 
@@ -74,11 +301,13 @@ def terminal_channel_eligible(db: sqlite3.Connection, machine_id: str | None) ->
     harnesses = [str(row[0]) for row in rows]
     if not harnesses:
         return False
+    stale_seq = _stale_through_seq(db)
     for harness_id in harnesses:
         current = db.execute(
-            "SELECT state FROM harness_layer2_state WHERE harness_id = ? ORDER BY seq DESC LIMIT 1", (harness_id,)
+            "SELECT seq, state FROM harness_layer2_state WHERE harness_id = ? ORDER BY seq DESC LIMIT 1",
+            (harness_id,),
         ).fetchone()
-        if current is None or current[0] != Layer2State.VERIFIED.value:
+        if current is None or current[1] != Layer2State.VERIFIED.value or int(current[0]) <= stale_seq:
             return False
     return True
 
@@ -240,6 +469,7 @@ __all__ = [
     "end_recovery_grant",
     "open_recovery_grant",
     "read_recovery_grant",
+    "reconcile_layer2_binding",
     "reset_signers",
     "set_layer2_state",
     "signer_reset_recorded",

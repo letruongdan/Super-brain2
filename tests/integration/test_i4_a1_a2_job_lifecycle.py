@@ -832,7 +832,7 @@ def test_p2_5_sustained_store_busy_retries_with_bounded_cadence_and_recovers(
 
     monkeypatch.setattr(_daemon_doctor, "find_active_doctor_job", _sustained_busy)
     _patch_doctor_timers(monkeypatch, fail=True)
-    handlers: dict[str, JobHandler] | None = {"fixture.noop": lambda _spec, _ctx: ()} if has_handlers else None
+    handlers: dict[str, JobHandler] | None = {"fixture.noop": lambda _spec, _ctx: ()} if has_handlers else {}
 
     with _serve(env.cfg, os_=env.os_, clock=env.clock, mono=env.mono, job_handlers=handlers) as d:
         session = cast(Any, d.loop)._session
@@ -2110,7 +2110,8 @@ def test_p2_12_periodic_schedule_dedup_backward_clock_and_restore_reset(
             _assert_backward_jump_defers_schedule(
                 clk, root, spies, wait_spy, due_utc=due_utc, interval_s=interval_s, label=case
             )
-            clk.resume(cap_utc=None)
+            # past due but short of the next period, so the oracle sees exactly this period under any load
+            clk.resume(cap_utc=due_utc + timedelta(seconds=interval_s / 2))
             _assert_periodic_schedule_settled(root, pokes, d, label=case)
         return
 
@@ -2195,7 +2196,8 @@ def test_p2_12_backward_clock_jump_slow_startup_uncommitted_and_due_boundary(
             _assert_backward_jump_defers_schedule(
                 clk, root, spies, wait_spy, due_utc=due_utc, interval_s=interval_s, label=edge_case
             )
-            clk.resume(cap_utc=None)
+            # past due but short of the next period, so the oracle sees exactly this period under any load
+            clk.resume(cap_utc=due_utc + timedelta(seconds=interval_s / 2))
             _assert_periodic_schedule_settled(root, pokes, d, label=edge_case)
         return
 

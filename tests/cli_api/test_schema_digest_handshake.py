@@ -750,7 +750,7 @@ def test_capture_events_route_capability_separation_and_digest_gate_on_live_serv
     domain = TransportTestDomain(ws_a=ws_a)
     digest = load_catalog().schema_digest
 
-    with open_test_loopback_transport(tpl, name="sp2-1-capture", domain=domain) as h:
+    with open_test_loopback_transport(tpl, name="sp2-1-capture", domain=domain, job_handlers={}) as h:
         # Seed capture_producer and operator_cli credentials into policy & publish capabilities to AuthGate
         cap_cred_holder: list[Any] = []
         cli_cred_holder: list[Any] = []
@@ -814,7 +814,17 @@ def test_capture_events_route_capability_separation_and_digest_gate_on_live_serv
             "producer_stream": "claude-hook-v1",
             "repo_id": ws_a.repo_id,
             "checkout_id": ws_a.checkout_id,
-            "events": [{"event_id": "ev-01", "kind": "stop", "ts": "2026-11-19T00:00:00.000000Z"}],
+            "events": [
+                {
+                    "event_id": "ev-01",
+                    "producer_stream": "claude-hook-v1",
+                    "sequence": 1,
+                    "harness_id": "capture-hook",
+                    "kind": "stop",
+                    "recorded_at": "2026-11-19T00:00:00.000000Z",
+                    "payload": {"ok": True},
+                }
+            ],
             "correlation_id": None,
             "schema_digest": digest,
         }
@@ -876,14 +886,22 @@ def test_capture_events_route_capability_separation_and_digest_gate_on_live_serv
             )
             assert st_m == 409 and body_m["error"]["code"] == "identity_mismatch"
 
-        # 5) Matching capture producer token & binding -> HTTP 200 capability_unavailable stub in SP2-1
+        # 5) Steps 1-4 caused 0 ledger writes; SP2-2 ingest rejects malformed events and commits valid events.
+        assert h.ledger_sequence() == seq_before
+        malformed_capture_payload = {
+            **valid_capture_payload,
+            "events": [{"event_id": "ev-bad", "kind": "stop"}],
+        }
+        st_bad, body_bad = send("/v2/capture/events", malformed_capture_payload, cap_cred.token)
+        assert st_bad == 200
+        assert body_bad["ok"] is False and body_bad["error"]["code"] == "invalid_input"
+        assert h.ledger_sequence() == seq_before
+
         st_ok, body_ok = send("/v2/capture/events", valid_capture_payload, cap_cred.token)
         assert st_ok == 200
-        assert body_ok == {
-            "ok": False,
-            "error": {"code": "capability_unavailable", "message": "capability unavailable"},
-        }
-        assert h.ledger_sequence() == seq_before
+        assert body_ok["ok"] is True
+        assert body_ok["data"]["accepted_count"] == 1
+        assert body_ok["data"]["committed_event_sequences"] == [1]
         assert domain.executed_keys == []
 
 

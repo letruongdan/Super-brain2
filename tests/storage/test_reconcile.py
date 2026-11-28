@@ -7,6 +7,7 @@ from superbrain.storage.cas import RetentionClass
 from superbrain.storage.runtime import open_runtime
 from superbrain.storage.store import Store
 from tests.storage.conftest import Env
+from tests.storage.test_restore import seed_crash_event_root
 from tests.support.crash import run_child, run_until_crash
 from tests.support.fs import digest_tree
 from tests.support.inc2_fixture import open_cloned_runtime
@@ -18,8 +19,7 @@ D = digest_bytes(b"event payload")  # crash_child.EVENT_PAYLOAD
 
 
 def seed_event(data_root: Path) -> None:
-    result = run_child("seed_event", data_root)
-    assert result.returncode == 0, f"seed_event failed:\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    seed_crash_event_root(data_root)
 
 
 def count_entries(store: Store, kind: str) -> int:

@@ -448,15 +448,13 @@ def test_installed_shim_exposes_packaged_catalog_and_calls_daemon(
         health_req_bytes[24:] + b"\r",
         b"\n",
     ]
-    prep_prod_frame = mcp_call_frame(
+    search_prod_frame = mcp_call_frame(
         4,
-        "prepare_task",
+        "search_knowledge",
         {
             "schema_version": "2.0",
-            "idempotency_key": "idem-wheel-prod-0001",
-            "task_id": "task-wheel-prod-1",
-            "harness_id": "claude-code",
-            "description": "verify packaged catalog against production daemon",
+            "workspace_id": shim_bundle.ws_a.repo_id,
+            "query": "verify packaged catalog against production daemon",
         },
     )
 
@@ -506,8 +504,8 @@ def test_installed_shim_exposes_packaged_catalog_and_calls_daemon(
                 assert isinstance(health_data, dict)
                 assert health_data.get("store_id") == shim_bundle.template.store_id
 
-                # 4. prepare_task on production daemon returns capability_unavailable while stdin remains open
-                resp_prep = pipe_sess.send_frames_and_expect_response([prep_prod_frame])
+                # 4. search_knowledge on daemon returns capability_unavailable while stdin remains open
+                resp_prep = pipe_sess.send_frames_and_expect_response([search_prod_frame])
                 assert resp_prep.get("id") == 4
                 prep_res = _extract_tool_result(resp_prep)
                 assert prep_res.get("isError") is True

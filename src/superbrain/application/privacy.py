@@ -23,9 +23,8 @@ from collections.abc import Callable, Iterable, Mapping
 from functools import lru_cache
 from typing import TypeVar
 
+from superbrain.application import _privacy_entropy
 from superbrain.application._privacy_rules import (
-    _BENIGN_CONTAINING_WORDS,
-    _BENIGN_NEXT_WORDS,
     _CONTAINMENT_MIN,
     _DOTTED_PATH_TOKEN,
     _ENTROPY_EDGE,
@@ -34,8 +33,6 @@ from superbrain.application._privacy_rules import (
     _MAX_INT,
     _NODE_OVERHEAD,
     _PATH_TOKEN,
-    _PRINTABLE_AND_WS_BYTES,
-    _PRINTABLE_NON_WS_BYTES,
     _STATUS_VALUE_RE,
     MAX_ARRAY_ITEMS,
     MAX_DEPTH,
@@ -64,20 +61,20 @@ from superbrain.application._privacy_scan import (
     _shipped_rules_active,
     _TextScans,
 )
-from superbrain.core.canonical import canonical_json
-from superbrain.core.errors import BrainError, ErrorCode
-from superbrain.core.jsonvalue import JsonValue
-from superbrain.core.kernel import (
-    OPAQUE_ID_RE,
+from superbrain.core._kernel_base import OPAQUE_ID_RE
+from superbrain.core._kernel_workspace import (
     FilterPolicy,
     RepoFlags,
     SafePayload,
 )
+from superbrain.core.canonical import canonical_json
+from superbrain.core.errors import BrainError, ErrorCode
+from superbrain.core.jsonvalue import JsonValue
 
 _CountKeyT = TypeVar("_CountKeyT", str, int)
 
 try:
-    from _collections import _count_elements  # type: ignore[import-not-found]
+    from _collections import _count_elements as _count_elements  # type: ignore[import-not-found]
 except ImportError:
 
     def _count_elements(mapping: dict[_CountKeyT, int], iterable: Iterable[_CountKeyT]) -> None:
@@ -141,6 +138,10 @@ def _high_entropy(text: str, minimum: float) -> bool:
     return _shannon_from_counts(counts, total) >= minimum
 
 
+_ASCII_LOWER_TABLE = bytes.maketrans(b"ABCDEFGHIJKLMNOPQRSTUVWXYZ", b"abcdefghijklmnopqrstuvwxyz")
+_ASCII_NON_ALNUM_BYTES = bytes(b for b in range(256) if not (48 <= b <= 57 or 65 <= b <= 90 or 97 <= b <= 122))
+
+
 @dataclasses.dataclass(frozen=True)
 class _CompiledPolicy:
     sensitive: frozenset[str]
@@ -150,6 +151,8 @@ class _CompiledPolicy:
     max_words: int
     prefixes: frozenset[str]
     contained: tuple[str, ...]
+    contained_re: re.Pattern[str] | None
+    sensitive_sub_re: re.Pattern[str] | None
     candidate: re.Pattern[str]
     entropy_thresh: float
     entropy_min_distinct: float
@@ -173,6 +176,12 @@ def _compile_policy(policy: FilterPolicy) -> _CompiledPolicy:
     max_words = max((len(_key_words(k)) for k in policy.sensitive_keys), default=1)
     prefixes = frozenset(name[:i] for name in sensitive for i in range(1, len(name) + 1))
     contained = tuple(sorted(name for name in sensitive if len(name) >= _CONTAINMENT_MIN))
+    contained_re = re.compile("|".join(re.escape(name) for name in contained)) if contained else None
+    sensitive_sub_re = (
+        re.compile("|".join(re.escape(name) for name in sorted(sensitive, key=len, reverse=True)))
+        if sensitive
+        else None
+    )
     candidate = re.compile(rf"[\x21-\x7e]{{{policy.entropy_min_length},}}")
     entropy_thresh = 2 ** -(policy.entropy_min_bits + 1e-12)
     entropy_min_distinct = 2 ** (policy.entropy_min_bits - 1e-12)
@@ -195,6 +204,8 @@ def _compile_policy(policy: FilterPolicy) -> _CompiledPolicy:
         max_words=max_words,
         prefixes=prefixes,
         contained=contained,
+        contained_re=contained_re,
+        sensitive_sub_re=sensitive_sub_re,
         candidate=candidate,
         entropy_thresh=entropy_thresh,
         entropy_min_distinct=entropy_min_distinct,
@@ -228,6 +239,8 @@ class _Run(_TextScans):
         self._max_words = compiled.max_words
         self._prefixes = compiled.prefixes
         self._contained = compiled.contained
+        self._contained_re = compiled.contained_re
+        self._sensitive_sub_re = compiled.sensitive_sub_re
         self._candidate = compiled.candidate
         self._entropy_thresh = compiled.entropy_thresh
         self._entropy_min_distinct = compiled.entropy_min_distinct
@@ -299,32 +312,7 @@ class _Run(_TextScans):
 
         Windows are bounded by the longest name and pruned by name prefixes, so the check is linear in the key.
         """
-        words = _key_words(key)
-        word_count = len(words)
-        for start, word in enumerate(words):
-            if (
-                len(word) >= _CONTAINMENT_MIN
-                and word not in _BENIGN_CONTAINING_WORDS
-                and any(name in word for name in self._contained)
-            ):
-                return True
-            if word not in self._prefixes:
-                continue
-            if word not in self._sensitive and (
-                start + 1 == word_count or word + words[start + 1] not in self._prefixes
-            ):
-                continue
-            joined = ""
-            for size in range(1, min(self._max_words, len(words) - start) + 1):
-                joined += words[start + size - 1]
-                if joined not in self._prefixes:
-                    break
-                if joined not in self._sensitive:
-                    continue
-                following = words[start + size] if start + size < len(words) else None
-                if following is None or following not in _BENIGN_NEXT_WORDS.get(joined, frozenset()):
-                    return True
-        return False
+        return _privacy_entropy._sensitive_key(self, key)
 
     def _object(self, item: dict[object, object], depth: int) -> JsonValue:
         if len(item) > MAX_OBJECT_KEYS:
@@ -384,144 +372,7 @@ class _Run(_TextScans):
         Exempt: a run that is (inside surrounding punctuation) a canonical UUID or ``sha256:<64 hex>``. The
         ``[redacted]`` sentinel is a run boundary, never part of a candidate.
         """
-        min_len = self._min_segment
-        if len(text) < min_len:
-            return text
-        masked = text.replace(REDACTED, self._redacted_spaces) if REDACTED in text else text
-        min_bits = self.policy.entropy_min_bits
-        thresh = self._entropy_thresh
-        min_distinct = self._entropy_min_distinct
-        min_u_table = self._min_u
-        count_elements = _count_elements
-        shannon_from_counts = _shannon_from_counts
-        is_structural = _is_structural_id
-        edge = _ENTROPY_EDGE
-        redacted_sentinel = REDACTED
-
-        if masked.isascii():
-            mb = masked.encode("ascii")
-            if not mb.translate(None, _PRINTABLE_AND_WS_BYTES):
-                min_word = self._min_word
-                candidates = [word for word in mb.split() if len(word) >= min_word]
-                if not candidates:
-                    return text
-                parts: list[str] = []
-                append = parts.append
-                cursor = 0
-                search_pos = 0
-                count = 0
-                find = mb.find
-                edge_b = self._edge_bytes
-                w_table = self._w_table
-                thresh_sq = self._thresh_sq
-                p94_tr = _PRINTABLE_NON_WS_BYTES.translate
-                counts_b: dict[int, int] = {}
-                clear_counts = counts_b.clear
-                count_vals = counts_b.values
-                verdict_b = self._entropy_verdict_b
-                verdict_get = verdict_b.get
-                s_len = len
-                use_verdict = self._verdict_hits > 0 or self._verdict_probes < 4
-                for token_b in candidates:
-                    total = s_len(token_b)
-                    idx = find(token_b, search_pos)
-                    search_pos = idx + total
-                    if use_verdict:
-                        cached = verdict_get(token_b)
-                        if cached is not None:
-                            self._verdict_hits += 1
-                            if cached:
-                                append(text[cursor:idx])
-                                append(redacted_sentinel)
-                                cursor = search_pos
-                                count += 1
-                            continue
-                        self._verdict_probes += 1
-                        if self._verdict_hits == 0 and self._verdict_probes >= 4:
-                            use_verdict = False
-                    if total >= 36 and (total == 36 or total == 71 or token_b[0] in edge_b or token_b[-1] in edge_b):
-                        clean_b = token_b.strip(edge_b)
-                        if s_len(clean_b) in (36, 71) and is_structural(clean_b.decode("ascii")):
-                            if use_verdict and s_len(verdict_b) < 512:
-                                verdict_b[token_b] = False
-                            continue
-                    distinct = 94 - s_len(p94_tr(None, token_b))
-                    if distinct < min_distinct:
-                        if use_verdict and s_len(verdict_b) < 512:
-                            verdict_b[token_b] = False
-                        continue
-                    if total <= 256 and distinct >= min_u_table[total]:
-                        if use_verdict and s_len(verdict_b) < 512:
-                            verdict_b[token_b] = True
-                        append(text[cursor:idx])
-                        append(redacted_sentinel)
-                        cursor = search_pos
-                        count += 1
-                        continue
-                    clear_counts()
-                    count_elements(counts_b, token_b)
-                    sq = 0
-                    for c in count_vals():
-                        sq += c * c
-                    if total <= 256:
-                        if sq < thresh_sq[total]:
-                            redact_token = True
-                        else:
-                            weights = w_table[total]
-                            redact_token = -sum([weights[c] for c in count_vals()]) >= min_bits
-                    elif sq < thresh * (total * total):
-                        redact_token = True
-                    else:
-                        redact_token = shannon_from_counts(counts_b, total) >= min_bits
-                    if use_verdict and s_len(verdict_b) < 512:
-                        verdict_b[token_b] = redact_token
-                    if redact_token:
-                        append(text[cursor:idx])
-                        append(redacted_sentinel)
-                        cursor = search_pos
-                        count += 1
-                if not count:
-                    return text
-                append(text[cursor:])
-                self.redacted += count
-                return "".join(parts)
-
-        parts_fb: list[str] = []
-        cursor = 0
-        count = 0
-        for match in self._candidate.finditer(masked):
-            token = match.group(0)
-            total = len(token)
-            if total < min_distinct:
-                continue
-            if total >= 36:
-                clean = token.strip(edge) if (token[0] in edge or token[-1] in edge) else token
-                if is_structural(clean):
-                    continue
-            distinct = len(set(token))
-            if distinct < min_distinct:
-                continue
-            if total <= 256 and distinct >= min_u_table[total]:
-                start, end = match.span()
-                parts_fb.extend((text[cursor:start], redacted_sentinel))
-                cursor = end
-                count += 1
-                continue
-            counts_fb: dict[str, int] = {}
-            count_elements(counts_fb, token)
-            if (
-                sum([c * c for c in counts_fb.values()]) < thresh * (total * total)
-                or shannon_from_counts(counts_fb, total) >= min_bits
-            ):
-                start, end = match.span()
-                parts_fb.extend((text[cursor:start], redacted_sentinel))
-                cursor = end
-                count += 1
-        if not count:
-            return text
-        parts_fb.append(text[cursor:])
-        self.redacted += count
-        return "".join(parts_fb)
+        return _privacy_entropy._entropy(self, text)
 
 
 def _low_entropy_opaque_id(key: str, item: object, policy: FilterPolicy) -> bool:

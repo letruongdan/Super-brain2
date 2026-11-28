@@ -25,6 +25,8 @@ PROBE_TIMEOUT_S = 5.0
 MAX_REPORT_CHECKS = 64
 MAX_REPORT_STRING_LEN = 512
 MAX_LIST_FINDINGS_PER_GROUP = 32
+DOCTOR_JOB_KIND = "system.doctor"
+"""Job kind owned by the daemon doctor runner; no other worker may lease it."""
 MAX_DOCTOR_REPORT_BYTES = 256 * 1024
 MAX_DOCTOR_RUN_BLOB_BYTES = 64 * 1024
 

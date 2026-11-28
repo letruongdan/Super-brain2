@@ -226,6 +226,9 @@ def _call_operator_json(
     return cast(dict[str, Any], res)
 
 
+_FIXTURE_HOST_VERSIONS = {"claude-code": "2.1.0", "codex": "0.55.0"}
+
+
 @contextlib.contextmanager
 def _running_serve_config(
     config_path: Path,
@@ -238,6 +241,9 @@ def _running_serve_config(
     supervisor_control: SupervisorControlPort | None = None,
     hooks: DaemonTestHooks | None = None,
 ) -> Iterator[tuple[Ready, OwnerLoop]]:
+    # SP2-5 live Layer-2 checks the installed host binaries; pin them to the versions these fixtures record
+    if hooks is None or hooks.host_version_resolver is None:
+        hooks = replace(hooks or DaemonTestHooks(), host_version_resolver=_FIXTURE_HOST_VERSIONS.get)
     ready_ev = threading.Event()
     stop_ev = threading.Event()
     box: dict[str, Any] = {}
@@ -879,7 +885,8 @@ def test_m1_all_five_surfaces_end_to_end_daemon_mcp_operator_and_cli(trusted_tmp
 
         # doctor_entry.run_doctor (offline read-only) reflects capture.probe too.
         cli_rep = doctor_entry.run_doctor(
-            rep.daemon_config_path, checkout_root=checkout_a, os_=os_, capture_probe=probe
+            rep.daemon_config_path, checkout_root=checkout_a, os_=os_, capture_probe=probe,
+            host_version_resolver=_FIXTURE_HOST_VERSIONS.get,
         )
         assert cli_rep.overall_status == "pass"
         assert _check_obj_by(cli_rep, "capture", "probe").status == "PASS"

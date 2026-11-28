@@ -8,6 +8,11 @@ import tomlkit
 from tomlkit.exceptions import TOMLKitError
 
 from superbrain.adapters.harness_config._common import digest_json_value, invalid_config, revision_conflict
+from superbrain.adapters.harness_config.json_hook_groups import (
+    HOOK_GROUPS_SLICE,
+    merge_json_slices,
+    remove_json_slices,
+)
 from superbrain.adapters.harness_config.json_keys import _parse_json_root, merge_json_keys, remove_json_keys
 from superbrain.adapters.harness_config.markdown_blocks import merge_markdown_block, remove_markdown_block
 from superbrain.adapters.harness_config.toml_tables import merge_toml_table, remove_toml_table
@@ -51,6 +56,12 @@ class SharedConfigMergerAdapter(ConfigMergerPort):
             )
         if managed_format is ManagedFormat.JSON:
             parsed = parse_json(replacement_bytes)
+            parts = slice_id.split(",")
+            if HOOK_GROUPS_SLICE in parts:
+                if not isinstance(parsed, Mapping) or set(parsed) != set(parts):
+                    raise invalid_config("combined slice payload must map each slice part")
+                return merge_json_slices(existing_text, entries=[(p, parsed[p]) for p in parts],
+                                         expected_slice_digest=expected_slice_digest)
             return merge_json_keys(
                 existing_text,
                 key_path=_dotted_path(slice_id),
@@ -87,6 +98,9 @@ class SharedConfigMergerAdapter(ConfigMergerPort):
                 expected_slice_digest=expected_slice_digest,
             )
         if managed_format is ManagedFormat.JSON:
+            if HOOK_GROUPS_SLICE in slice_id.split(","):
+                return remove_json_slices(existing_text, parts=slice_id.split(","),
+                                          expected_slice_digest=expected_slice_digest)
             if "," in slice_id:
                 slice_parts = [part for part in slice_id.split(",")]
                 paths = [_dotted_path(part) for part in slice_parts]

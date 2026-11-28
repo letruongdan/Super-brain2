@@ -32,6 +32,7 @@ from superbrain.storage.runtime import open_runtime
 from tests.storage.conftest import DEMO_KINDS
 from tests.support.crash import CHILD_TIMEOUT, CRASH_EXIT
 from tests.support.fs import digest_tree
+from tests.support.inc2_fixture import open_cloned_runtime
 
 HOLDER = "0192f3a4-5b6c-7d8e-9f01-0000000c0201"
 PAYLOAD = b"c02: an ACKed and held payload"
@@ -44,7 +45,7 @@ def store_db_files(root: DataRoot) -> list[Path]:
 
 def test_lost_main_db_after_an_acked_hold_blocks_startup(trusted_tmp: Path) -> None:
     data_root = trusted_tmp / "r"
-    rt = open_runtime(data_root, os_adapters())
+    rt = open_cloned_runtime(data_root, os_adapters(), role="c02-lost")
     try:
         digest = rt.store.store_content(PAYLOAD, "event", HOLDER, RetentionClass.EVENT_PAYLOAD, None)
         assert [(kind, holder) for kind, holder, _ in rt.store.cas.holders(digest)] == [("event", HOLDER)]
@@ -159,7 +160,7 @@ def assert_refused_without_replacement(data_root: Path) -> None:
 
 def test_lost_main_db_after_ledger_only_acked_entries_blocks_startup(trusted_tmp: Path) -> None:
     data_root = trusted_tmp / "r"
-    rt = open_runtime(data_root, os_adapters(), kinds=KindRegistry(DEMO_KINDS))
+    rt = open_cloned_runtime(data_root, os_adapters(), role="c02-lost", kinds=KindRegistry(DEMO_KINDS))
     try:
         with rt.store.transaction() as txn:
             txn.append("demo.count", actor="user:cli", owner_id="dan", meta={"n": 1})

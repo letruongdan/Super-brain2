@@ -6,36 +6,30 @@ import contextlib
 import json
 import os
 import sqlite3
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import cast
 
 from superbrain.application._doctor_checks import clip_report_str
-from superbrain.application.dispatch import PreparedEffect
 from superbrain.application.doctor import DoctorReport
 from superbrain.core._json_parse import parse_json
 from superbrain.core._kernel_jobs import JobRecord
 from superbrain.core.canonical import canonical_json
 from superbrain.core.errors import BrainError, ErrorCode
-from superbrain.core.ids import new_id
 from superbrain.core.jsonvalue import JsonValue
 from superbrain.core.kernel import (
+    CAPTURE_GAPS_PRESENT_CODE,
     IDEMPOTENCY_CLOCK_UNTRUSTED_CODE,
     OPAQUE_ID_RE,
     TLS_EXPIRED_CODE,
     TLS_EXPIRING_CODE,
     TLS_EXPIRING_WINDOW,
     KernelRecord,
-    ObjectRef,
-    Principal,
-    RetentionClass,
-    StoredResult,
     parse_canonical_utc,
     require_aware_utc,
-    require_uuid,
 )
+from superbrain.ports.doctor import DOCTOR_JOB_KIND as DOCTOR_JOB_KIND
 from superbrain.ports.doctor import MAX_DOCTOR_RUN_BLOB_BYTES
 from superbrain.ports.kernel import KernelTx
 from superbrain.ports.os import OsAdapters
@@ -43,11 +37,10 @@ from superbrain.storage.cas import read_held_blob_or_none
 from superbrain.storage.errors import sqlite_error
 from superbrain.storage.idempotency import StagedKernelStore
 from superbrain.storage.restore import read_restore_epoch
-from superbrain.storage.retention import RetentionPolicy, default_expiry
+from superbrain.storage.retention import RetentionPolicy
 from superbrain.storage.runtime import Runtime
 from superbrain.storage.sqlite import open_readonly
 
-DOCTOR_JOB_KIND = "system.doctor"
 DOCTOR_FRESHNESS_WINDOW = timedelta(hours=24)
 DOCTOR_OPERATOR_WINDOW = timedelta(minutes=15)
 RETENTION_POLICY = RetentionPolicy()
@@ -81,6 +74,7 @@ def health_status_fields(
     tls_not_after: datetime,
     clock_untrusted: bool,
     extra_codes: tuple[str, ...] = (),
+    capture_gaps_present: bool = False,
 ) -> tuple[bool, list[JsonValue]]:
     """Compute ``(ready, degraded_codes)`` from TLS validity, clock trust, and optional check codes."""
     now_utc, _ = require_aware_utc(now)
@@ -92,6 +86,8 @@ def health_status_fields(
         codes.append(TLS_EXPIRED_CODE)
     elif remaining <= TLS_EXPIRING_WINDOW:
         codes.append(TLS_EXPIRING_CODE)
+    if capture_gaps_present:
+        codes.append(CAPTURE_GAPS_PRESENT_CODE)
     codes.extend(extra_codes)
     ready = (not clock_untrusted) and (remaining > timedelta(0))
     return ready, unique_opaque_codes(codes)
@@ -384,227 +380,7 @@ def find_active_doctor_job(
     return None
 
 
-def prepare_deep_health(
-    rt: Runtime,
-    job_store: StagedKernelStore,
-    *,
-    owner_id: str,
-    now: datetime,
-) -> PreparedEffect:
-    """Prepare idempotent ``get_health(deep=True)`` effect scoped strictly by ``owner_id``."""
-    now_utc, stamp = require_aware_utc(now)
-    exp_at = default_expiry(RetentionClass.EVENT_PAYLOAD, now_utc, RETENTION_POLICY)
-    assert exp_at is not None
-    result_id = new_id()
-
-    latest_res = find_latest_valid_doctor_run(rt, owner_id, now_utc, checkout_root=None)
-    latest_run = latest_res[0] if latest_res is not None else None
-    is_fresh = latest_run is not None and (now_utc - latest_run.recorded_at <= DOCTOR_FRESHNESS_WINDOW)
-    existing_job_id = find_active_doctor_job(rt, job_store, owner_id=owner_id, checkout_root=None)
-
-    target_job_id = existing_job_id if existing_job_id is not None else new_id()
-    if is_fresh and existing_job_id is None:
-        assert latest_run is not None
-        desc_payload: dict[str, JsonValue] = {
-            "schema": 1,
-            "mode": "run",
-            "owner_id": owner_id,
-            "doctor_run_id": latest_run.doctor_run_id,
-            "doctor_run_digest": latest_run.report_digest,
-            "job_id": None,
-        }
-        enqueue_payload: bytes | None = None
-    else:
-        desc_payload = {
-            "schema": 1,
-            "mode": "job",
-            "owner_id": owner_id,
-            "doctor_run_id": latest_run.doctor_run_id if latest_run is not None else None,
-            "doctor_run_digest": latest_run.report_digest if latest_run is not None else None,
-            "job_id": target_job_id,
-        }
-        enqueue_payload = (
-            None if existing_job_id is not None else canonical_json({"schema": 1, "trigger": "get_health"})
-        )
-
-    desc_bytes = canonical_json(desc_payload)
-    blobs = (desc_bytes,) if enqueue_payload is None else (enqueue_payload, desc_bytes)
-
-    def apply_effect(tx: KernelTx) -> StoredResult:
-        if enqueue_payload is not None:
-            enqueue_doctor_tx(
-                tx, job_id=target_job_id, owner_id=owner_id, payload_bytes=enqueue_payload, retry_at=stamp
-            )
-        desc_dig = tx.hold_blob(
-            desc_bytes, holder_id=result_id, retention=RetentionClass.EVENT_PAYLOAD, expires_at=exp_at
-        )
-        refs = (
-            (
-                ObjectRef(
-                    kind="doctor_run",
-                    id=latest_run.doctor_run_id,
-                    revision=1,
-                    digest=latest_run.report_digest,
-                ),
-                ObjectRef(kind="get_health_descriptor", id=result_id, revision=1, digest=desc_dig),
-            )
-            if latest_run is not None
-            else (ObjectRef(kind="doctor_run", id=result_id, revision=1, digest=desc_dig),)
-        )
-        return StoredResult(result_id=result_id, assignment_id=None, refs=refs)
-
-    return PreparedEffect(blobs=blobs, apply=apply_effect)
-
-
-def _require_store_wide_doctor_job(
-    rt: Runtime, job_store: StagedKernelStore, job_id: str, *, owner_id: str
-) -> None:
-    """``job_id`` must be a durable ``system.doctor`` job of ``owner_id`` whose payload scope is store-wide.
-
-    A stored descriptor is not trusted for this: an older binary could record a job picked by owner alone. Any state
-    is accepted, since a replay returns the same answer and a job's scope never changes.
-    """
-    def read(tx: KernelTx) -> tuple[JobRecord | None, bytes | None]:
-        row = tx.read_job(job_id)
-        if row is None:
-            return None, None
-        return row, tx.read_held_blob(row.payload_digest, holder_id=row.job_id)
-
-    row, payload = job_store.transact(read)
-    if row is None or row.owner_id != owner_id:
-        raise BrainError(ErrorCode.NOT_FOUND, "not found")
-    if row.kind != DOCTOR_JOB_KIND:
-        raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
-    if rt.policy.is_quarantined(row.payload_digest):
-        raise BrainError(ErrorCode.QUARANTINED, "quarantined")
-    if payload is None:  # the job's own hold is gone (released, tombstoned) or the blob is not intact
-        raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
-    scope = doctor_payload_scope(payload)
-    if scope is not None and not isinstance(scope, str):
-        raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
-    if scope is not None:
-        raise BrainError(ErrorCode.REVISION_CONFLICT, "revision conflict")
-
-
-def render_deep_health(
-    rt: Runtime,
-    job_store: StagedKernelStore,
-    result: StoredResult,
-    principal: Principal,
-    *,
-    now: datetime,
-    tls_not_after: datetime,
-    clock_untrusted_fn: Callable[[], bool],
-) -> dict[str, JsonValue]:
-    """Render ``get_health(deep=True)`` from CAS descriptor & live policy/quarantine/clock checks."""
-    desc_ref: ObjectRef | None = None
-    run_ref: ObjectRef | None = None
-    if len(result.refs) == 1 and result.refs[0].id == result.result_id:
-        desc_ref = result.refs[0]
-    else:
-        for ref in result.refs:
-            if ref.kind == "get_health_descriptor" and ref.id == result.result_id:
-                desc_ref = ref
-            elif ref.kind == "doctor_run":
-                run_ref = ref
-    if desc_ref is None:
-        raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
-
-    if rt.policy.is_quarantined(desc_ref.digest):
-        raise BrainError(ErrorCode.QUARANTINED, "quarantined")
-    if run_ref is not None and rt.policy.is_quarantined(run_ref.digest):
-        raise BrainError(ErrorCode.QUARANTINED, "quarantined")
-
-    now_utc, _ = require_aware_utc(now)
-    with rt.store.transaction() as txn:
-        desc_bytes = read_held_blob_or_none(
-            txn.db,
-            rt.store.cas,
-            rt.policy,
-            desc_ref.digest,
-            holder_kind="event",
-            holder_id=result.result_id,
-            now=now_utc,
-        )
-        run_bytes: bytes | None = None
-        if desc_bytes is not None and run_ref is not None:
-            run_bytes = read_held_blob_or_none(
-                txn.db,
-                rt.store.cas,
-                rt.policy,
-                run_ref.digest,
-                holder_kind="event",
-                holder_id=run_ref.id,
-                now=now_utc,
-            )
-
-    if desc_bytes is None:
-        raise BrainError(ErrorCode.NOT_FOUND, "not found")
-    desc = parse_json(desc_bytes)
-    if not isinstance(desc, dict) or desc.get("owner_id") != principal.owner_id:
-        raise BrainError(ErrorCode.NOT_FOUND, "not found")
-
-    job_id = desc.get("job_id")
-    if job_id is not None:
-        require_uuid(job_id)
-        _require_store_wide_doctor_job(rt, job_store, cast(str, job_id), owner_id=principal.owner_id)
-    doctor_run_id = desc.get("doctor_run_id")
-
-    if doctor_run_id is not None:
-        if (
-            run_ref is None
-            or doctor_run_id != run_ref.id
-            or desc.get("doctor_run_digest") != run_ref.digest
-        ):
-            raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
-        if run_bytes is None:
-            raise BrainError(ErrorCode.NOT_FOUND, "not found")
-        run_doc = parse_json(run_bytes)
-        if not isinstance(run_doc, dict):
-            raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
-        if not verify_doctor_run_fences(rt, run_doc, owner_id=principal.owner_id):
-            raise BrainError(ErrorCode.REVISION_CONFLICT, "revision conflict")
-        if not _doc_scope_matches(run_doc, None):
-            raise BrainError(ErrorCode.REVISION_CONFLICT, "revision conflict")
-        rec_raw = run_doc.get("recorded_at")
-        if not isinstance(rec_raw, str):
-            raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
-        age_s = max(0.0, (now_utc - parse_canonical_utc(rec_raw)).total_seconds())
-        extra = tuple(str(c) for c in cast(list[object], run_doc.get("degraded_codes", [])))
-        ready, degraded = health_status_fields(
-            now=now_utc,
-            tls_not_after=tls_not_after,
-            clock_untrusted=clock_untrusted_fn(),
-            extra_codes=extra,
-        )
-        return {
-            "ready": ready,
-            "store_id": rt.store.store_id,
-            "writer_epoch": rt.lease.epoch,
-            "schema_version": rt.store.schema_version,
-            "policy_schema_version": rt.policy.schema_version,
-            "degraded_codes": degraded,
-            "doctor_run_id": doctor_run_id,
-            "age_s": age_s,
-            "job_id": job_id,
-        }
-
-    ready, degraded = health_status_fields(
-        now=now_utc,
-        tls_not_after=tls_not_after,
-        clock_untrusted=clock_untrusted_fn(),
-    )
-    return {
-        "ready": ready,
-        "store_id": rt.store.store_id,
-        "writer_epoch": rt.lease.epoch,
-        "schema_version": rt.store.schema_version,
-        "policy_schema_version": rt.policy.schema_version,
-        "degraded_codes": degraded,
-        "doctor_run_id": None,
-        "age_s": None,
-        "job_id": job_id,
-    }
+_LAYER2_CHECK_CODE = "harness.layer2"
 
 
 def doctor_run_dto_from_doc(
@@ -711,3 +487,33 @@ def load_committed_doctor_run_dto(
     except sqlite3.Error as exc:
         raise sqlite_error("load_committed_doctor_run_dto", exc, busy=True) from exc
     raise BrainError(ErrorCode.NOT_FOUND, "not found")
+
+
+def _require_store_wide_doctor_job(
+    rt: Runtime, job_store: StagedKernelStore, job_id: str, *, owner_id: str
+) -> None:
+    """``job_id`` must be a durable ``system.doctor`` job of ``owner_id`` whose payload scope is store-wide.
+
+    A stored descriptor is not trusted for this: an older binary could record a job picked by owner alone. Any state
+    is accepted, since a replay returns the same answer and a job's scope never changes.
+    """
+    def read(tx: KernelTx) -> tuple[JobRecord | None, bytes | None]:
+        row = tx.read_job(job_id)
+        if row is None:
+            return None, None
+        return row, tx.read_held_blob(row.payload_digest, holder_id=row.job_id)
+
+    row, payload = job_store.transact(read)
+    if row is None or row.owner_id != owner_id:
+        raise BrainError(ErrorCode.NOT_FOUND, "not found")
+    if row.kind != DOCTOR_JOB_KIND:
+        raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
+    if rt.policy.is_quarantined(row.payload_digest):
+        raise BrainError(ErrorCode.QUARANTINED, "quarantined")
+    if payload is None:  # the job's own hold is gone (released, tombstoned) or the blob is not intact
+        raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
+    scope = doctor_payload_scope(payload)
+    if scope is not None and not isinstance(scope, str):
+        raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
+    if scope is not None:
+        raise BrainError(ErrorCode.REVISION_CONFLICT, "revision conflict")

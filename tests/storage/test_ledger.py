@@ -163,8 +163,10 @@ def test_callers_of_sees_methods_functions_aliases_and_module_level(tmp_path: Pa
         "_target()\n",
         encoding="utf-8",
     )
+    (tmp_path / "b_adj.py").write_text("def adj():\n    getattr(x, '_tar' 'get')()\n", encoding="utf-8")
+    (tmp_path / "comment_only.py").write_text("# _target\n", encoding="utf-8")
     module = f"<module {(tmp_path / 'a.py').as_posix()}>"
-    assert callers_of("_target", tmp_path) == {"Txn.hold", "Txn.other.inner", "free", module}
+    assert callers_of("_target", tmp_path) == {"Txn.hold", "Txn.other.inner", "free", "adj", module}
 
 
 def test_unknown_kind_creates_nothing(store_factory: StoreFactory) -> None:

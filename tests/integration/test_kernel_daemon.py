@@ -137,6 +137,7 @@ from tests.support.inc2_fixture import (
     open_kernel_job_runtime,
     reopen_kernel_job_runtime,
 )
+from tests.support.inc2_transport import FakeMonotonicClock
 from tests.support.kernel_auth import (
     SeededCredential,
     make_bootstrap_auth,
@@ -1415,6 +1416,7 @@ def test_legacy_projection_and_pending_attempt_recovered_before_ready(
             before_bind=_before_bind,
         ),
         on_listener_bound=bound_listeners.append,
+        job_handlers={},
     )
     try:
         ready = loop.start(cfg)
@@ -1624,8 +1626,8 @@ def test_shallow_health_bypasses_blocked_write_queue(
                 "ready": True,
                 "store_id": _daemon_template.store_id,
                 "writer_epoch": ready.endpoint.writer_epoch,
-                "schema_version": 5,
-                "policy_schema_version": 4,
+                "schema_version": 8,
+                "policy_schema_version": 5,
                 "degraded_codes": [],
             },
         }
@@ -1701,12 +1703,24 @@ def test_tls_expiring_health_uses_clock_and_no_io(
         monotonic_clock=mono,
         domain=domain,
         hooks=DaemonTestHooks(before_bind=_capture_sql_trace),
+        job_handlers={},
     )
     try:
         ready = loop.start(cfg)
         not_after = ready.tls_not_after
         tok_a = _daemon_template.cred_a.token
         tok_b = _daemon_template.cred_b.token
+
+        def _shallow(token: str = tok_a) -> CallResult:
+            return loop.submit(
+                ToolCommand("get_health", {"schema_version": "2.0"}, token=token),
+                mono.now + TOTAL_REQUEST_BUDGET_NS,
+            ).result(timeout=1.0)
+
+        # Allow initial daemon loop startup to settle before arming zero-I/O gate
+        _shallow()
+        loop.run_owner_action(lambda: None).result(timeout=1.0)
+        sql_count[0] = 0
 
         # Arm SQLite statement counter + forbid cert file reads during shallow health & TLS-expired gate.
         arm_sql[0] = True
@@ -1720,12 +1734,6 @@ def test_tls_expiring_health_uses_clock_and_no_io(
             return orig_read_tls(path, os_)
 
         monkeypatch.setattr(tls_material, "_read_owner_only_file", _spy_read_tls)
-
-        def _shallow(token: str = tok_a) -> CallResult:
-            return loop.submit(
-                ToolCommand("get_health", {"schema_version": "2.0"}, token=token),
-                mono.now + TOTAL_REQUEST_BUDGET_NS,
-            ).result(timeout=1.0)
 
         # 1. > 30 days remaining -> ready=True, degraded_codes=[].
         clock.set(not_after - dt.timedelta(days=30, seconds=1))
@@ -1835,7 +1843,7 @@ def test_get_job_uses_owner_scope(
     ws_a = _daemon_template.ws_a
     ws_b = _daemon_template.ws_b
 
-    assert dict(PRODUCTION_JOB_HANDLERS) == {}
+    assert set(PRODUCTION_JOB_HANDLERS) == {"continuity.refresh"}
 
     secret_global = b"secret-global-job-payload-9911"
     secret_scoped = b"secret-scoped-job-payload-9922"
@@ -1872,7 +1880,7 @@ def test_get_job_uses_owner_scope(
         rt_seed.close()
 
     # Start real production OwnerLoop (domain=None, job_handlers=None).
-    loop = create_daemon_owner_loop(os_=adapters, clock=clock, monotonic_clock=mono)
+    loop = create_daemon_owner_loop(os_=adapters, clock=clock, monotonic_clock=mono, job_handlers={})
     try:
         loop.start(cfg)
         dl_ns = mono.now + TOTAL_REQUEST_BUDGET_NS
@@ -1946,7 +1954,7 @@ def test_get_job_uses_owner_scope(
             ).result(timeout=BOUND_WAIT_S)
             assert denied == {"ok": False, "error": {"code": "not_found", "message": "not found"}}
 
-        # 3. Deep health succeeds in production mode while all 6 business tools return capability_unavailable.
+        # 3. Deep health succeeds in production mode; unimplemented SP3 business tools return capability_unavailable.
         deep_health_res = loop.submit(
             ToolCommand(
                 "get_health",
@@ -1963,23 +1971,10 @@ def test_get_job_uses_owner_scope(
 
         unsupported_calls: tuple[tuple[str, dict[str, JsonValue], Scope | None], ...] = (
             (
-                "prepare_task",
-                {
-                    "schema_version": "2.0",
-                    "workspace_id": ws_a.repo_id,
-                    "checkout_id": ws_a.checkout_id,
-                    "description": "task",
-                    "idempotency_key": "idem-cap-prep-0001",
-                },
-                scope_a,
-            ),
-            (
                 "search_knowledge",
                 {"schema_version": "2.0", "workspace_id": ws_a.repo_id, "query": "bug"},
                 scope_a,
             ),
-            ("get_artifact", _artifact_args(ws_a, "idem-cap-art-0001"), scope_a),
-            ("submit_episode", _episode_args(ws_a, "idem-cap-ep-0001"), scope_a),
             (
                 "record_outcome",
                 {
@@ -4260,13 +4255,16 @@ def test_stop_during_due_jobs_before_claim_commit_leaves_due_job_queued_at_attem
     close_returned = threading.Event()
     handler_ran = threading.Event()
 
-    orig_due_jobs = cast(Callable[[KernelTx, dt.datetime, int], tuple[JobRecord, ...]], tx_cls.due_jobs)
+    # the executor's claim query: every due job except system.doctor (the doctor runner owns those)
+    orig_due_jobs = cast(Callable[..., tuple[JobRecord, ...]], tx_cls.due_jobs_by_kinds)
     paused_due = False
 
-    def _due_jobs(tx: KernelTx, now: dt.datetime, limit: int) -> tuple[JobRecord, ...]:
+    def _due_jobs(
+        tx: KernelTx, now: dt.datetime, kinds: Sequence[str], limit: int, *, exclude: bool = False
+    ) -> tuple[JobRecord, ...]:
         nonlocal paused_due
-        rows = orig_due_jobs(tx, now, limit)
-        if not paused_due and rows and rows[0].job_id == due.job_id:
+        rows = orig_due_jobs(tx, now, kinds, limit, exclude=exclude)
+        if exclude and not paused_due and rows and rows[0].job_id == due.job_id:
             paused_due = True
             in_due_query.set()
             assert release_due_query.wait(BOUND_WAIT_S), "due_jobs barrier timed out"
@@ -4276,7 +4274,7 @@ def test_stop_during_due_jobs_before_claim_commit_leaves_due_job_queued_at_attem
         handler_ran.set()
         return ()
 
-    monkeypatch.setattr(tx_cls, "due_jobs", _due_jobs)
+    monkeypatch.setattr(tx_cls, "due_jobs_by_kinds", _due_jobs)
     _observe_executor_close(monkeypatch, close_entered, close_returned)
 
     loop = create_daemon_owner_loop(
@@ -4362,13 +4360,13 @@ def test_claim_admitted_before_stop_skips_handler_and_recovers_on_next_epoch(
     close_returned = threading.Event()
     handler_ran = threading.Event()
 
-    orig_lease_next = JobService.lease_next
+    orig_lease_next = JobService.lease_next_for_kinds  # the executor's claim (it excludes system.doctor)
     paused_claim = False
 
-    def _lease_next(service: JobService, epoch: int, now: dt.datetime) -> JobLease | None:
+    def _lease_next(service: JobService, epoch: int, now: dt.datetime, *a: Any, **kw: Any) -> JobLease | None:
         nonlocal paused_claim
-        lease = orig_lease_next(service, epoch, now)
-        if not paused_claim and lease is not None and lease.job_id == admitted.job_id:
+        lease = orig_lease_next(service, epoch, now, *a, **kw)
+        if kw.get("exclude") and not paused_claim and lease is not None and lease.job_id == admitted.job_id:
             paused_claim = True
             claim_admitted.set()
             assert release_after_claim.wait(BOUND_WAIT_S), "post-claim barrier timed out"
@@ -4378,7 +4376,7 @@ def test_claim_admitted_before_stop_skips_handler_and_recovers_on_next_epoch(
         handler_ran.set()
         return ()
 
-    monkeypatch.setattr(JobService, "lease_next", _lease_next)
+    monkeypatch.setattr(JobService, "lease_next_for_kinds", _lease_next)
     _observe_executor_close(monkeypatch, close_entered, close_returned)
 
     loop_1 = create_daemon_owner_loop(
@@ -4938,22 +4936,22 @@ def test_concurrent_future_cancel_and_unexpected_owner_exit_keep_loop_safe(
 
     step_entered = threading.Event()
     release_boom = threading.Event()
-    orig_lease_next = JobService.lease_next
+    orig_lease_next = JobService.lease_next_for_kinds  # the executor's claim (it excludes system.doctor)
     crashed_once = False
 
-    def _boom_lease_next(service: JobService, epoch: int, now: dt.datetime) -> JobLease | None:
+    def _boom_lease_next(service: JobService, epoch: int, now: dt.datetime, *a: Any, **kw: Any) -> JobLease | None:
         nonlocal crashed_once
-        if not crashed_once:
+        if kw.get("exclude") and not crashed_once:
             crashed_once = True
             step_entered.set()
             assert release_boom.wait(BOUND_WAIT_S), "unexpected-exit barrier timed out"
             raise RuntimeError("injected unexpected owner step failure")
-        return orig_lease_next(service, epoch, now)
+        return orig_lease_next(service, epoch, now, *a, **kw)
 
     def _noop_job_handler(_spec: JobSpec, _ctx: JobContext) -> tuple[ObjectRef, ...]:
         return ()
 
-    monkeypatch.setattr(JobService, "lease_next", _boom_lease_next)
+    monkeypatch.setattr(JobService, "lease_next_for_kinds", _boom_lease_next)
     loop_b = create_daemon_owner_loop(
         os_=adapters_b,
         clock=clock_b,
@@ -5163,7 +5161,8 @@ def test_stop_applies_shared_cutoff_to_arbiter_join_and_reports_overrun_when_arb
     # Part A: Arbiter callback blocked past shared stop() cutoff -> bounded return + ShutdownState.OVERRUN.
     root_a, _, cfg_a = _instantiate_case(trusted_tmp, "r03-arbiter-join-overrun", _daemon_template)
     clock_a = FakeClock(base_now)
-    adapters_a = os_adapters(clock=clock_a)
+    mono_a = FakeMonotonicClock()
+    adapters_a = os_adapters(clock=clock_a, monotonic=mono_a)
 
     rt_seed_a = reopen_kernel_job_runtime(root_a, _daemon_template.store_id, adapters_a)
     try:
@@ -5195,7 +5194,7 @@ def test_stop_applies_shared_cutoff_to_arbiter_join_and_reports_overrun_when_arb
         owner_held_a.set()
         return release_owner_a.wait(BOUND_WAIT_S)
 
-    loop_a = create_daemon_owner_loop(os_=adapters_a, clock=clock_a)
+    loop_a = create_daemon_owner_loop(os_=adapters_a, clock=clock_a, monotonic_clock=mono_a)
     first_rep: ShutdownReport | None = None
     second_rep: ShutdownReport | None = None
     third_rep: ShutdownReport | None = None
@@ -5215,6 +5214,7 @@ def test_stop_applies_shared_cutoff_to_arbiter_join_and_reports_overrun_when_arb
             adapters_a.monotonic.monotonic_ns() + TOTAL_REQUEST_BUDGET_NS,
         )
         expiring_fut_a.add_done_callback(_on_arbiter_done_a)
+        mono_a.advance(TOTAL_REQUEST_BUDGET_NS + 1)
         assert arbiter_cb_entered.wait(timeout=2.5), "deadline arbiter did not settle expiring get_job"
         assert arbiter_cb_threads and all(arbiter_cb_threads[0] is not t for t in (caller_thread, owner_thread_a))
         assert arbiter_cb_envs[0]["ok"] is False
@@ -5223,43 +5223,83 @@ def test_stop_applies_shared_cutoff_to_arbiter_join_and_reports_overrun_when_arb
         release_owner_a.set()
         assert hold_fut_a.result(timeout=1.0) is True
 
+        arbiter_thread_a = arbiter_cb_threads[0]
+        spy_lock = threading.Lock()
+        closed_wait_calls: list[tuple[int, float | None, float]] = []
+        owner_join_calls: list[tuple[int, float | None, float]] = []
+        arbiter_join_calls: list[tuple[int, float | None, float]] = []
+        observed_deadlines: list[float] = []
+        first_cutoff = 0.0
+
+        orig_closed_wait = loop_a._closed_done.wait
+        orig_owner_join = owner_thread_a.join
+        orig_arbiter_join = arbiter_thread_a.join
+
+        def _spy_closed_wait(timeout: float | None = None) -> bool:
+            called_at = time.perf_counter()
+            with spy_lock:
+                closed_wait_calls.append((threading.get_ident(), timeout, called_at))
+            return orig_closed_wait(timeout=timeout)
+
+        def _spy_owner_join(timeout: float | None = None) -> None:
+            called_at = time.perf_counter()
+            with spy_lock:
+                owner_join_calls.append((threading.get_ident(), timeout, called_at))
+            orig_owner_join(timeout=timeout)
+
+        def _spy_arbiter_join(timeout: float | None = None) -> None:
+            called_at = time.perf_counter()
+            with spy_lock:
+                arbiter_join_calls.append((threading.get_ident(), timeout, called_at))
+            orig_arbiter_join(timeout=timeout)
+
         with ThreadPoolExecutor(max_workers=3) as pool:
-            stop_started = time.monotonic()
-            first_stop_fut = pool.submit(loop_a.stop, grace_s=1.30)
-            _wait_until(lambda: loop_a.ready is None, desc="first stop caller to lock shared cutoff")
-            second_stop_fut = pool.submit(loop_a.stop, grace_s=3.0)
-            try:
-                pre_release_deadline = stop_started + 1.65
+            with monkeypatch.context() as hooks_a:
+                hooks_a.setattr(loop_a._closed_done, "wait", _spy_closed_wait)
+                hooks_a.setattr(owner_thread_a, "join", _spy_owner_join)
+                hooks_a.setattr(arbiter_thread_a, "join", _spy_arbiter_join)
+                stop_started = time.monotonic()
+                first_stop_fut = pool.submit(loop_a.stop, grace_s=0.55)
+                _wait_until(lambda: loop_a.ready is None, desc="first stop caller to lock shared cutoff")
+                first_cutoff = loop_a._stop_wall_deadline
+                second_stop_fut = pool.submit(loop_a.stop, grace_s=3.0)
                 try:
-                    first_rep = first_stop_fut.result(
-                        timeout=max(0.01, pre_release_deadline - time.monotonic())
-                    )
-                    first_returned_before_cb_release = (
-                        not cb_released_marker.is_set() and not arbiter_cb_exited.is_set()
-                    )
-                except TimeoutError:
-                    first_returned_before_cb_release = False
-                try:
-                    second_rep = second_stop_fut.result(
-                        timeout=max(0.01, pre_release_deadline - time.monotonic())
-                    )
-                    second_returned_before_cb_release = (
-                        not cb_released_marker.is_set() and not arbiter_cb_exited.is_set()
-                    )
-                except TimeoutError:
-                    second_returned_before_cb_release = False
-                if first_returned_before_cb_release and second_returned_before_cb_release:
-                    third_stop_fut = pool.submit(loop_a.stop, grace_s=0.5)
+                    pre_release_deadline = stop_started + 0.85
                     try:
-                        third_rep = third_stop_fut.result(timeout=0.35)
-                        third_returned_before_cb_release = (
+                        first_rep = first_stop_fut.result(
+                            timeout=max(0.01, pre_release_deadline - time.monotonic())
+                        )
+                        first_returned_before_cb_release = (
                             not cb_released_marker.is_set() and not arbiter_cb_exited.is_set()
                         )
                     except TimeoutError:
-                        third_returned_before_cb_release = False
-            finally:
-                cb_released_marker.set()
-                release_arbiter_cb.set()
+                        first_returned_before_cb_release = False
+                    try:
+                        second_rep = second_stop_fut.result(
+                            timeout=max(0.01, pre_release_deadline - time.monotonic())
+                        )
+                        second_returned_before_cb_release = (
+                            not cb_released_marker.is_set() and not arbiter_cb_exited.is_set()
+                        )
+                    except TimeoutError:
+                        second_returned_before_cb_release = False
+                    observed_deadlines.append(loop_a._stop_wall_deadline)
+                    if first_returned_before_cb_release and second_returned_before_cb_release:
+                        third_start_idx = len(closed_wait_calls)
+                        third_stop_fut = pool.submit(loop_a.stop, grace_s=0.5)
+                        try:
+                            third_rep = third_stop_fut.result(timeout=0.30)
+                            third_returned_before_cb_release = (
+                                not cb_released_marker.is_set() and not arbiter_cb_exited.is_set()
+                            )
+                        except TimeoutError:
+                            third_returned_before_cb_release = False
+                        observed_deadlines.append(loop_a._stop_wall_deadline)
+                    else:
+                        third_start_idx = len(closed_wait_calls)
+                finally:
+                    cb_released_marker.set()
+                    release_arbiter_cb.set()
 
             if first_rep is None:
                 first_rep = first_stop_fut.result(timeout=BOUND_WAIT_S)
@@ -5278,6 +5318,17 @@ def test_stop_applies_shared_cutoff_to_arbiter_join_and_reports_overrun_when_arb
     assert first_returned_before_cb_release is True
     assert second_returned_before_cb_release is True
     assert third_returned_before_cb_release is True
+    assert observed_deadlines == [first_cutoff, first_cutoff]
+    assert len(closed_wait_calls) >= 3
+    for _tid, wait_to, called_at in closed_wait_calls:
+        assert wait_to is not None and 0.0 <= wait_to <= max(0.0, first_cutoff - called_at) + 0.02
+        assert wait_to <= 0.55 + 1e-6
+    third_waits = [wait_to for _tid, wait_to, _ts in closed_wait_calls[third_start_idx:]]
+    assert third_waits and all(w is not None and w <= 0.05 for w in third_waits)
+    assert arbiter_join_calls
+    for _tid, join_to, called_at in (*owner_join_calls, *arbiter_join_calls):
+        assert join_to is not None and join_to <= max(0.01, first_cutoff - called_at) + 0.02
+        assert join_to <= 0.55 + 0.02
     assert first_rep is not None
     assert (first_rep.state, first_rep.error_code) == (ShutdownState.OVERRUN, ErrorCode.DEADLINE_EXCEEDED)
     assert second_rep is not None
@@ -5301,7 +5352,8 @@ def test_stop_applies_shared_cutoff_to_arbiter_join_and_reports_overrun_when_arb
     # Part B: Positive control — arbiter callback releases within remaining shared cutoff -> ShutdownState.STOPPED.
     root_b, _, cfg_b = _instantiate_case(trusted_tmp, "r03-arbiter-join-stopped", _daemon_template)
     clock_b = FakeClock(base_now + dt.timedelta(minutes=1))
-    adapters_b = os_adapters(clock=clock_b)
+    mono_b = FakeMonotonicClock()
+    adapters_b = os_adapters(clock=clock_b, monotonic=mono_b)
 
     rt_seed_b = reopen_kernel_job_runtime(root_b, _daemon_template.store_id, adapters_b)
     try:
@@ -5330,7 +5382,7 @@ def test_stop_applies_shared_cutoff_to_arbiter_join_and_reports_overrun_when_arb
         owner_held_b.set()
         return release_owner_b.wait(BOUND_WAIT_S)
 
-    loop_b = create_daemon_owner_loop(os_=adapters_b, clock=clock_b)
+    loop_b = create_daemon_owner_loop(os_=adapters_b, clock=clock_b, monotonic_clock=mono_b)
     try:
         loop_b.start(cfg_b)
         owner_thread_b = loop_b.run_owner_action(threading.current_thread).result(timeout=1.0)
@@ -5342,6 +5394,7 @@ def test_stop_applies_shared_cutoff_to_arbiter_join_and_reports_overrun_when_arb
             adapters_b.monotonic.monotonic_ns() + TOTAL_REQUEST_BUDGET_NS,
         )
         expiring_fut_b.add_done_callback(_on_arbiter_done_b)
+        mono_b.advance(TOTAL_REQUEST_BUDGET_NS + 1)
         assert arbiter_cb_entered_b.wait(timeout=2.5), "Part B arbiter callback did not fire"
         assert arbiter_cb_threads_b and all(arbiter_cb_threads_b[0] is not t for t in (caller_thread, owner_thread_b))
 
@@ -5383,7 +5436,8 @@ def test_stop_applies_shared_cutoff_to_arbiter_join_and_reports_overrun_when_arb
     # Part C: Foreground serve() waits for both owner & arbiter exit on OVERRUN and returns exit code 1.
     root_c, _, cfg_c = _instantiate_case(trusted_tmp, "r03-arbiter-serve-overrun", _daemon_template)
     clock_c = FakeClock(base_now + dt.timedelta(minutes=2))
-    adapters_c = os_adapters(clock=clock_c)
+    mono_c = FakeMonotonicClock()
+    adapters_c = os_adapters(clock=clock_c, monotonic=mono_c)
 
     rt_seed_c = reopen_kernel_job_runtime(root_c, _daemon_template.store_id, adapters_c)
     try:
@@ -5449,6 +5503,7 @@ def test_stop_applies_shared_cutoff_to_arbiter_join_and_reports_overrun_when_arb
             adapters_c.monotonic.monotonic_ns() + TOTAL_REQUEST_BUDGET_NS,
         )
         expiring_fut_c.add_done_callback(_on_arbiter_done_c)
+        mono_c.advance(TOTAL_REQUEST_BUDGET_NS + 1)
         assert arbiter_cb_entered_c.wait(timeout=2.5), "Part C arbiter callback did not fire"
         assert arbiter_cb_threads_c and all(arbiter_cb_threads_c[0] is not t for t in (caller_thread, owner_thread_c))
 

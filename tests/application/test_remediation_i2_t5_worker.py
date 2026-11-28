@@ -135,7 +135,7 @@ def test_retry_cancel_event_survives_previous_attempt_cleanup(
         if ctx.lease.attempt == 1:
             raise JobHandlerError(JobErrorCode.HANDLER_FAILED, retryable=True)
         attempt2_started.set()
-        if ctx.wait_cancelled(0.3) and ctx.cancelled():
+        if ctx.wait_cancelled(BOUND_WAIT_S) and ctx.cancelled():
             attempt2_observed_cancel.set()
         ctx.report_usage(ctx.invocation_ids[0], UsageRecord("0.4", True))
         return (ObjectRef(kind="fixture_result", id=ctx.lease.job_id, revision=1, digest=digest_bytes(spec.payload)),)

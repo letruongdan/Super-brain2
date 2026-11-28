@@ -799,10 +799,11 @@ def test_tap_write_json_flushes_immediately_and_preserves_tight_client_deadline(
 
                 with monkeypatch.context() as mp:
                     mp.setattr(owner, "_lookup_loopback_client_pid", _slow_120ms)
-                    t_wall_start = time.monotonic_ns()
                     c_start = 10_000_000_000
                     tight_deadline_ns = c_start + 100_000_000
-                    client = h.open_client(monotonic_ns=lambda: c_start + (time.monotonic_ns() - t_wall_start))
+                    wall_start_ns = [time.monotonic_ns()]
+                    client = h.open_client(monotonic_ns=lambda: c_start + (time.monotonic_ns() - wall_start_ns[0]))
+                    wall_start_ns[0] = time.monotonic_ns()
                     t0 = time.monotonic()
                     res = client.call(
                         target,

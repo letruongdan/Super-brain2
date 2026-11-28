@@ -1138,11 +1138,15 @@ def test_expiry_is_30_days_from_original_commit(trusted_tmp: Path) -> None:
         ack_id = new_id()
         with rt.store.transaction() as stxn:
             stxn.db.execute(
-                "INSERT INTO artifact_send_attempt VALUES (?, ?, ?, ?, ?, ?, ?, 'served_only')",
+                "INSERT INTO artifact_send_attempt "
+                "(id, logical_result_id, principal_id, task_id, artifact_id, revision, digests_json, state) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'served_only')",
                 (attempt_id, new_res_id, seeded.principal.principal_id, str(replaced["task_id"]), "art-1", 1, "[]"),
             )
             stxn.db.execute(
-                "INSERT INTO artifact_read_ack VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO artifact_read_ack "
+                "(id, served_receipt_id, principal_id, task_id, revision, digests_json) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
                 (ack_id, attempt_id, seeded.principal.principal_id, str(replaced["task_id"]), 1, "[]"),
             )
         holders_before = _count_rows(rt.store, "p_cas_holders_")
@@ -1462,7 +1466,7 @@ def test_store3_to_store4_migration_min_reader_fence_and_backup_restore(
     mono = Mono()
     assert STORE_V4_MIGRATION.to_version == 4
     assert STORE_V4_MIGRATION.min_reader_version == 4
-    assert code_version(KERNEL_STORE_MIGRATIONS) == 5
+    assert code_version(KERNEL_STORE_MIGRATIONS) == 8
 
     v3_store_migrations = KERNEL_STORE_MIGRATIONS[:3]
     v4_store_migrations = KERNEL_STORE_MIGRATIONS[:4]
@@ -1531,10 +1535,10 @@ def test_store3_to_store4_migration_min_reader_fence_and_backup_restore(
 
     # The I3 binary then upgrades the I2 pair (store=4, policy=3) to (store=5, policy=4).
     top_report = migrate_offline(cfg, os_)
-    assert (top_report.policy_report.status, top_report.policy_report.to_version) == ("migrated", 4)
-    assert (top_report.store_report.from_version, top_report.store_report.to_version) == (4, 5)
-    assert read_schema_info(root / "store" / "brain.db") == SchemaInfo(5, 5, store_id)
-    assert read_schema_info(root / "policy" / "policy.db") == SchemaInfo(4, 4, store_id)
+    assert (top_report.policy_report.status, top_report.policy_report.to_version) == ("migrated", 5)
+    assert (top_report.store_report.from_version, top_report.store_report.to_version) == (4, 8)
+    assert read_schema_info(root / "store" / "brain.db") == SchemaInfo(8, 8, store_id)
+    assert read_schema_info(root / "policy" / "policy.db") == SchemaInfo(5, 5, store_id)
 
     # Open store4, take a policy backup BEFORE adding a new request key, commit an idempotent row, backup & restore.
     rt_v4 = _reopen_fixture_runtime(root, store_id, os_)
@@ -1672,8 +1676,8 @@ def test_i2_committed_result_replays_after_upgrade_to_store5_policy4(
     )
     clock.advance(dt.timedelta(seconds=5))
     report = migrate_offline(cfg, os_)
-    assert (report.policy_report.from_version, report.policy_report.to_version) == (3, 4)
-    assert (report.store_report.from_version, report.store_report.to_version) == (4, 5)
+    assert (report.policy_report.from_version, report.policy_report.to_version) == (3, 5)
+    assert (report.store_report.from_version, report.store_report.to_version) == (4, 8)
 
     rt_i3 = _reopen_fixture_runtime(root, store_id, os_)
     try:

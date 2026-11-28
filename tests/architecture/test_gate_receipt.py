@@ -1,5 +1,6 @@
 """The gate receipt accepts only a complete, source-bound, fully-accounted run."""
 
+import ast
 import errno
 import inspect
 import json
@@ -8,6 +9,7 @@ import os
 import platform
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -15,7 +17,7 @@ import tempfile
 import textwrap
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -296,7 +298,7 @@ def test_parse_junit_maps_real_pytest_output_to_collected_node_ids(tmp_path: Pat
     (project / "pkg").mkdir(parents=True)
     (project / "pkg" / "test_sample.py").write_text(textwrap.dedent(SAMPLE_PROJECT), encoding="utf-8")
     junit = tmp_path / "junit.xml"
-    base = [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "--rootdir", str(project)]
+    base = [sys.executable, "-I", "-m", "pytest", "-p", "no:cacheprovider", "--rootdir", str(project)]
     collected = subprocess.run(
         [*base, "--collect-only", "-q"], cwd=project, capture_output=True, text=True, check=False, timeout=120
     )
@@ -477,15 +479,213 @@ def test_junit_temp_file_is_removed(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     assert not list(tmp_path.glob("*-junit.xml"))
 
 
+def _win32_creation_ticks_for_handle(handle: int) -> int | None:
+    if sys.platform != "win32":  # Windows-only helper; lets mypy check it on every platform
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetProcessTimes.argtypes = [wintypes.HANDLE, *[ctypes.POINTER(wintypes.FILETIME)] * 4]
+    kernel32.GetProcessTimes.restype = wintypes.BOOL
+    times = [wintypes.FILETIME() for _ in range(4)]
+    if not kernel32.GetProcessTimes(wintypes.HANDLE(handle), *(ctypes.byref(t) for t in times)):
+        return None
+    return (int(times[0].dwHighDateTime) << 32) | int(times[0].dwLowDateTime)
+
+
+def _read_started_identity(path: Path) -> tuple[int, str]:
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 2 and lines[0].isdigit() and lines[1], f"malformed started identity at {path}: {lines!r}"
+    return int(lines[0]), lines[1]
+
+
+def _collect_started_identities(*paths: Path) -> list[tuple[int, str]]:
+    """Read every valid ``(pid, token)`` identity already published by started child/descendant probes."""
+    found: list[tuple[int, str]] = []
+    for path in paths:
+        if not path.is_file():
+            continue
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        if len(lines) >= 2 and lines[0].isdigit() and lines[1]:
+            found.append((int(lines[0]), lines[1]))
+    return found
+
+
+def _is_exact_process_alive(pid: int, expected_token: str) -> bool:
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+        kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        ctypes.set_last_error(0)
+        handle = kernel32.OpenProcess(0x00101000, False, pid)  # SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            err = ctypes.get_last_error()
+            if err in (87, 5):  # ERROR_INVALID_PARAMETER (exited) or protected/recycled owner
+                return False
+            raise OSError(err, f"OpenProcess failed for pid={pid}")
+        try:
+            ticks = _win32_creation_ticks_for_handle(int(handle))
+            if ticks is None:
+                return True
+            if str(ticks) != expected_token:
+                return False
+            exit_code = wintypes.DWORD()
+            if kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)) and exit_code.value != 259:
+                return False
+            return bool(kernel32.WaitForSingleObject(handle, 0) != 0)
+        finally:
+            kernel32.CloseHandle(handle)
+
+    stat_path = Path(f"/proc/{pid}/stat")
+    if Path("/proc").is_dir():
+        try:
+            raw = stat_path.read_text(encoding="ascii", errors="replace")
+        except OSError:
+            return False
+        _, _, tail = raw.rpartition(")")
+        fields = tail.split()
+        if len(fields) <= 19:
+            return False
+        return fields[0] != "Z" and fields[19] == expected_token
+
+    out = subprocess.run(["ps", "-o", "stat=,lstart=", "-p", str(pid)], capture_output=True, text=True, check=False)
+    if out.returncode != 0 or not out.stdout.strip():
+        return False
+    parts = out.stdout.strip().split()
+    if len(parts) < 2 or parts[0].startswith("Z"):
+        return False
+    return "_".join(parts[1:]) == expected_token
+
+
+def _wait_process_tree_terminated(identities: Sequence[tuple[int, str]], *, deadline: float) -> list[tuple[int, str]]:
+    while True:
+        alive = [(pid, token) for pid, token in identities if _is_exact_process_alive(pid, token)]
+        if not alive or time.monotonic() >= deadline:
+            return alive
+        time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
+
+
+def _cleanup_exact_processes(identities: Sequence[tuple[int, str]]) -> None:
+    for pid, token in identities:
+        if not _is_exact_process_alive(pid, token):
+            continue
+        if sys.platform == "win32":
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+            kernel32.TerminateProcess.restype = wintypes.BOOL
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            handle = kernel32.OpenProcess(0x0001 | 0x1000, False, pid)
+            if handle:
+                try:
+                    if str(_win32_creation_ticks_for_handle(int(handle))) == token:
+                        kernel32.TerminateProcess(handle, 1)
+                finally:
+                    kernel32.CloseHandle(handle)
+        else:
+            sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
+            try:
+                if _is_exact_process_alive(pid, token):
+                    os.kill(pid, sigkill)
+            except OSError:
+                pass
+
+
+def _process_tree_probe_script(
+    child_started: Path, grand_started: Path, child_marker: Path, grand_marker: Path, *, sleep_s: float
+) -> str:
+    token_fn = textwrap.dedent(
+        """\
+        def _token():
+            if sys.platform == 'win32':
+                import ctypes
+                from ctypes import wintypes
+                k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+                k32.GetCurrentProcess.restype = wintypes.HANDLE
+                k32.GetProcessTimes.argtypes = [wintypes.HANDLE, *[ctypes.POINTER(wintypes.FILETIME)] * 4]
+                k32.GetProcessTimes.restype = wintypes.BOOL
+                ts = [wintypes.FILETIME() for _ in range(4)]
+                assert k32.GetProcessTimes(k32.GetCurrentProcess(), *(ctypes.byref(t) for t in ts))
+                return str((ts[0].dwHighDateTime << 32) | ts[0].dwLowDateTime)
+            sp = Path('/proc/self/stat')
+            if sp.exists():
+                return sp.read_text(encoding='ascii').rpartition(')')[2].split()[19]
+            cmd = ['ps', '-o', 'lstart=', '-p', str(os.getpid())]
+            out = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            return '_'.join(out.stdout.split())
+        def _write_id(target):
+            tmp = target.with_suffix('.tmp')
+            tmp.write_text(f'{os.getpid()}\\n{_token()}\\n', encoding='utf-8')
+            os.replace(tmp, target)
+        """
+    )
+    grand_code = (
+        "import os, subprocess, sys, time; from pathlib import Path\n"
+        + token_fn
+        + f"_write_id(Path({str(grand_started)!r}))\n"
+        + f"time.sleep({sleep_s!r})\n"
+        + f"Path({str(grand_marker)!r}).write_text('x', encoding='utf-8')\n"
+    )
+    return (
+        "import os, subprocess, sys, time; from pathlib import Path\n"
+        + token_fn
+        + f"gp = subprocess.Popen([sys.executable, '-I', '-c', {grand_code!r}], stdin=subprocess.DEVNULL)\n"
+        + f"gs = Path({str(grand_started)!r})\n"
+        + "t_wait = time.monotonic() + 4.0\n"
+        + "while not gs.is_file() and time.monotonic() < t_wait: time.sleep(0.01)\n"
+        + "assert gs.is_file()\n"
+        + f"_write_id(Path({str(child_started)!r}))\n"
+        + "print('STARTED', flush=True)\n"
+        + f"time.sleep({sleep_s!r})\n"
+        + f"Path({str(child_marker)!r}).write_text('x', encoding='utf-8')\n"
+        + "gp.wait()\n"
+    )
+
+
 def test_run_kills_a_process_that_exceeds_its_timeout(tmp_path: Path) -> None:
+    child_started = tmp_path / "child.started"
+    grand_started = tmp_path / "grand.started"
     marker = tmp_path / "survived.txt"
-    code = f"import time; time.sleep(6); open({str(marker)!r}, 'w').write('x')"
+    grand_marker = tmp_path / "grand_survived.txt"
+    code = _process_tree_probe_script(child_started, grand_started, marker, grand_marker, sleep_s=6.0)
+    identities: list[tuple[int, str]] = []
     began = time.monotonic()
-    exit_code, _, _ = gate.run([sys.executable, "-c", code], cwd=tmp_path, timeout_s=1.0)
-    assert exit_code is None
-    assert time.monotonic() - began < 5
-    time.sleep(6)
-    assert not marker.exists()
+    try:
+        exit_code, _, _ = gate.run([sys.executable, "-I", "-c", code], cwd=tmp_path, timeout_s=1.0)
+        cutoff_at = began + 2.5
+        assert exit_code is None
+        assert time.monotonic() < cutoff_at
+        assert child_started.is_file() and grand_started.is_file(), "child process tree never started before timeout"
+        child_pid, child_token = _read_started_identity(child_started)
+        grand_pid, grand_token = _read_started_identity(grand_started)
+        assert child_pid != os.getpid() and grand_pid not in (os.getpid(), child_pid)
+        identities.extend([(child_pid, child_token), (grand_pid, grand_token)])
+        alive = _wait_process_tree_terminated(identities, deadline=cutoff_at)
+        assert alive == [], f"timed-out process tree still alive before cutoff: {alive}"
+        assert time.monotonic() < cutoff_at
+        assert not marker.exists() and not grand_marker.exists()
+    finally:
+        published = _collect_started_identities(child_started, grand_started)
+        _cleanup_exact_processes(list(dict.fromkeys([*identities, *published])))
 
 
 def test_run_does_not_wait_forever_for_a_killed_process(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1175,13 +1375,31 @@ def ci_matrix_list(name: str, job: str = "gate") -> list[str]:
 
 
 def test_ci_three_jobs_workflow_contract() -> None:
-    """The 3-job CI workflow: gate (POSIX), gate-windows-worker (sharded partitions), gate-windows-aggregate."""
+    """CI workflow: gate (Ubuntu), partitioned workers plus an aggregate for Windows and for macOS."""
     jobs = ci_jobs()
-    expected_jobs = {"gate", "gate-windows-worker", "gate-windows-aggregate"}
+    expected_jobs = {
+        "gate", "gate-windows-worker", "gate-windows-aggregate", "gate-macos-worker", "gate-macos-aggregate"
+    }
     assert set(jobs.keys()) == expected_jobs, f"Expected jobs {expected_jobs}, found {set(jobs.keys())}"
 
     # 1. POSIX gate job
-    assert set(ci_matrix_list("os", "gate")) == {"macos-latest", "ubuntu-latest"}
+    # Owner decision 2026-11-28: macOS moved to its own partitioned workers (serial deadline phase, 300 s budget).
+    assert set(ci_matrix_list("os", "gate")) == {"ubuntu-latest"}
+    for os_name, job_os, parts in (("macos", "macos-latest", ["0", "1"]),):
+        assert jobs[f"gate-{os_name}-worker"].get("runs-on") == job_os
+        assert ci_matrix_list("partition", f"gate-{os_name}-worker") == parts
+        assert ci_matrix_list("python", f"gate-{os_name}-worker") == ["3.11", "3.14"]
+        m_worker = next(s for s in ci_steps(f"gate-{os_name}-worker") if "scripts/gate.py" in s)
+        assert f"--partition ${{{{ matrix.partition }}}}/{len(parts)}" in m_worker, m_worker
+        m_agg_job = jobs[f"gate-{os_name}-aggregate"]
+        assert m_agg_job.get("runs-on") == job_os and "always()" in str(m_agg_job.get("if", ""))
+        m_agg_steps = ci_steps(f"gate-{os_name}-aggregate")
+        m_agg = next(s for s in m_agg_steps if "scripts/gate.py aggregate" in s)
+        assert f"--partition-count {len(parts)}" in m_agg, m_agg
+        m_downloads = [s for s in m_agg_steps if "download-artifact" in s and f"gate-worker-{os_name}-" in s]
+        assert len(m_downloads) == len(parts)
+        m_bench = next(i for i, s in enumerate(m_agg_steps) if "tests.integration.test_kernel_performance" in s)
+        assert m_bench > m_agg_steps.index(m_agg)
     assert ci_matrix_list("python", "gate") == ["3.11", "3.14"]
     gate_steps = ci_steps("gate")
     gate_at = next((i for i, s in enumerate(gate_steps) if "scripts/gate.py" in s), None)
@@ -1196,13 +1414,14 @@ def test_ci_three_jobs_workflow_contract() -> None:
     worker_job = jobs["gate-windows-worker"]
     assert worker_job.get("runs-on") == "windows-2022"
     assert ci_matrix_list("python", "gate-windows-worker") == ["3.11", "3.14"]
-    # Owner decision 2026-11-26 (I4 handoff section C, "Topology Windows hosted"): four hosted Windows workers.
-    assert ci_matrix_list("partition", "gate-windows-worker") == ["0", "1", "2", "3"]
+    # Owner decision 2026-11-26 (I4 handoff section C) set four hosted Windows workers; owner decision 2026-11-28
+    # (SP2-5 integration, serial deadline phase) raised it to six so each cell stays under the 300 s budget.
+    assert ci_matrix_list("partition", "gate-windows-worker") == ["0", "1", "2", "3", "4", "5"]
     worker_steps = ci_steps("gate-windows-worker")
     w_gate_at = next((i for i, s in enumerate(worker_steps) if "scripts/gate.py" in s), None)
     assert w_gate_at is not None
     w_step = worker_steps[w_gate_at]
-    assert "--partition ${{ matrix.partition }}/4" in w_step, w_step
+    assert "--partition ${{ matrix.partition }}/6" in w_step, w_step
     w_uploads = [s for s in worker_steps if "upload-artifact" in s]
     assert any("gate-worker-windows-" in s and "if: always()" in s for s in w_uploads), (
         "Windows worker must upload partition evidence artifact unconditionally"
@@ -1218,7 +1437,7 @@ def test_ci_three_jobs_workflow_contract() -> None:
     agg_at = next((i for i, s in enumerate(agg_steps) if "scripts/gate.py aggregate" in s), None)
     assert agg_at is not None
     agg_step = agg_steps[agg_at]
-    assert "--partition-count 4" in agg_step, agg_step
+    assert "--partition-count 6" in agg_step, agg_step
     worker_downloads = [s for s in agg_steps if "download-artifact" in s and "gate-worker-windows-" in s]
     parts = sorted(
         n
@@ -1227,8 +1446,8 @@ def test_ci_three_jobs_workflow_contract() -> None:
         if f"gate-worker-windows-${{{{ matrix.python }}}}-part-{n}" in s
         and f"agg-workers-${{{{ matrix.python }}}}/part-{n}" in s
     )
-    assert parts == ["0", "1", "2", "3"] and len(worker_downloads) == 4, (
-        f"aggregate must download exactly the four worker partitions: parts={parts}, steps={len(worker_downloads)}"
+    assert parts == ["0", "1", "2", "3", "4", "5"] and len(worker_downloads) == 6, (
+        f"aggregate must download exactly the six worker partitions: parts={parts}, steps={len(worker_downloads)}"
     )
     agg_bench_at = next((i for i, s in enumerate(agg_steps) if "tests.integration.test_kernel_performance" in s), None)
     assert agg_bench_at is not None and agg_bench_at > agg_at
@@ -2127,34 +2346,86 @@ def test_shard_files_staggers_storage_vs_non_storage_io(monkeypatch: pytest.Monk
         ), groups2[shard_idx]
 
 
-def test_gate_wheel_fixture_files_and_weights_stay_aligned_with_tests() -> None:
-    import ast
+def _extract_usefixtures_names(node: ast.Call) -> Iterator[str]:
+    for arg in node.args:
+        items = (
+            arg.value.elts
+            if isinstance(arg, ast.Starred) and isinstance(arg.value, (ast.Tuple, ast.List))
+            else [arg]
+        )
+        for item in items:
+            if isinstance(item, ast.Constant) and isinstance(item.value, str):
+                yield item.value
 
-    assert gate.TEST_JOB_BUDGET_S == 300.0
-    repo_root = Path(__file__).resolve().parents[2]
-    tests_root = repo_root / "tests"
+
+def _discover_wheel_fixture_files(tests_root: Path, *, repo_root: Path | None = None) -> set[str]:
+    base = repo_root if repo_root is not None else tests_root.parent
     discovered: set[str] = set()
     for path in sorted(tests_root.rglob("test_*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        rel = path.relative_to(repo_root).as_posix()
+        rel = path.relative_to(base).as_posix()
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 args = [arg.arg for arg in (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs)]
                 if "inc2_installed_env" in args:
                     discovered.add(rel)
-            elif isinstance(node, ast.Call):
-                if isinstance(node.func, ast.Attribute) and node.func.attr == "usefixtures":
-                    for arg in node.args:
-                        if isinstance(arg, ast.Constant) and arg.value == "inc2_installed_env":
-                            discovered.add(rel)
+            elif isinstance(node, ast.Call) and (
+                (isinstance(node.func, ast.Attribute) and node.func.attr == "usefixtures")
+                or (isinstance(node.func, ast.Name) and node.func.id == "usefixtures")
+            ):
+                if "inc2_installed_env" in _extract_usefixtures_names(node):
+                    discovered.add(rel)
+    return discovered
 
-    wheel_cfg = getattr(gate, "_WHEEL_FIXTURE_FILES", None)
-    assert wheel_cfg is not None, "scripts.gate must define _WHEEL_FIXTURE_FILES"
-    configured = set(wheel_cfg)
+
+def _assert_wheel_fixture_files_aligned(
+    configured: set[str], tests_root: Path, *, repo_root: Path | None = None
+) -> set[str]:
+    discovered = _discover_wheel_fixture_files(tests_root, repo_root=repo_root)
     assert configured == discovered, (
         f"_WHEEL_FIXTURE_FILES out of sync with tests using inc2_installed_env: "
         f"missing={sorted(discovered - configured)}, stale={sorted(configured - discovered)}"
     )
+    return discovered
+
+
+def test_gate_wheel_fixture_files_and_weights_stay_aligned_with_tests(tmp_path: Path) -> None:
+    assert gate.TEST_JOB_BUDGET_S == 300.0
+    repo_root = Path(__file__).resolve().parents[2]
+    tests_root = repo_root / "tests"
+    wheel_cfg = getattr(gate, "_WHEEL_FIXTURE_FILES", None)
+    assert wheel_cfg is not None, "scripts.gate must define _WHEEL_FIXTURE_FILES"
+    configured = set(wheel_cfg)
+    _assert_wheel_fixture_files_aligned(configured, tests_root, repo_root=repo_root)
+
+    # Guard against raw-text substring prefilters skipping valid normalized Python literals or aliases.
+    syn_root = tmp_path / "syn"
+    syn_tests = syn_root / "tests"
+    syn_tests.mkdir(parents=True)
+    (syn_tests / "test_adj_literal.py").write_text(
+        'import pytest\n\n@pytest.mark.usefixtures("inc2_installed_" "env")\ndef test_adj() -> None:\n    pass\n',
+        encoding="utf-8",
+    )
+    (syn_tests / "test_direct_usefixtures.py").write_text(
+        'from pytest import mark\nusefixtures = mark.usefixtures\npytestmark = usefixtures("inc2_installed_" "env")\n\n'
+        "def test_mod() -> None:\n    pass\n",
+        encoding="utf-8",
+    )
+    (syn_tests / "test_param.py").write_text(
+        "def test_p(inc2_installed_env: object) -> None:\n    pass\n",
+        encoding="utf-8",
+    )
+    (syn_tests / "test_comment_only.py").write_text(
+        "# inc2_installed_env\ndef test_c() -> None:\n    pass\n",
+        encoding="utf-8",
+    )
+    assert _discover_wheel_fixture_files(syn_tests, repo_root=syn_root) == {
+        "tests/test_adj_literal.py",
+        "tests/test_direct_usefixtures.py",
+        "tests/test_param.py",
+    }
+    with pytest.raises(AssertionError, match=r"tests/test_adj_literal\.py"):
+        _assert_wheel_fixture_files_aligned(set(), syn_tests, repo_root=syn_root)
     heavy_cfg = getattr(gate, "_HEAVY_FILE_COST_MS", None)
     assert isinstance(heavy_cfg, dict) and heavy_cfg, "scripts.gate must define _HEAVY_FILE_COST_MS"
     for rel_path in configured | set(heavy_cfg):
@@ -2561,16 +2832,19 @@ def test_is_worktree_registered_tolerates_broken_unrelated_worktree_entries(
     assert registered_fn(repo, owned) is True
 
 
-def test_win32_job_object_lifecycle_and_non_win32_graceful_noop(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Windows Job Object assigns subprocess, terminates on cleanup, and no-ops gracefully elsewhere."""
+def test_win32_job_object_lifecycle_and_non_win32_graceful_noop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Windows Job Object assigns tree, terminates all members before cutoff, and POSIX exercises killpg path."""
     assign_fn = getattr(gate, "_win32_assign_job", None)
     close_fn = getattr(gate, "_win32_close_job", None)
-    assert callable(assign_fn) and callable(close_fn)
+    kill_tree_fn = getattr(gate, "_kill_tree", None)
+    assert callable(assign_fn) and callable(close_fn) and callable(kill_tree_fn)
 
-    # 1. Non-win32 platform returns None and close is a clean no-op.
+    # 1. Non-win32 platform returns None, closes cleanly, and uses start_new_session + os.killpg in _kill_tree.
     with monkeypatch.context() as mp:
         mp.setattr(sys, "platform", "linux")
-        fake_proc = subprocess.Popen([sys.executable, "-c", "pass"])
+        fake_proc = subprocess.Popen([sys.executable, "-I", "-c", "pass"])
         try:
             assert assign_fn(fake_proc) is None
             close_fn(None, terminate=True)
@@ -2578,24 +2852,92 @@ def test_win32_job_object_lifecycle_and_non_win32_graceful_noop(monkeypatch: pyt
         finally:
             fake_proc.wait()
 
+        pg_calls: list[tuple[int, int]] = []
+        proc_kills: list[int] = []
+        popen_sessions: list[bool] = []
+
+        class _FakePosixProc:
+            pid = 42424
+
+            def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+                if len(proc_kills) == 0:
+                    raise subprocess.TimeoutExpired("cmd", timeout or 0)
+                return "", ""
+
+            def kill(self) -> None:
+                proc_kills.append(self.pid)
+
+        def _fake_killpg(pid: int, sig: int) -> None:
+            pg_calls.append((pid, sig))
+
+        def _fake_popen(*_a: Any, **kw: Any) -> _FakePosixProc:
+            popen_sessions.append(bool(kw.get("start_new_session")))
+            return _FakePosixProc()
+
+        mp.setattr(signal, "SIGKILL", 9, raising=False)
+        mp.setattr(os, "killpg", _fake_killpg, raising=False)
+        mp.setattr(subprocess, "Popen", _fake_popen)
+        exit_code, _, _ = gate.run(["x"], cwd=tmp_path, timeout_s=0.05)
+        assert exit_code is None
+        assert popen_sessions == [True]
+        assert pg_calls == [(42424, 9)] and proc_kills == [42424]
+
+        # A vanished process group (ProcessLookupError) still finishes proc.kill().
+        mp.setattr(os, "killpg", lambda *_a: (_ for _ in ()).throw(ProcessLookupError()), raising=False)
+        proc_kills.clear()
+        kill_tree_fn(_FakePosixProc())
+        assert proc_kills == [42424]
+
     # 2. None job is a safe no-op.
     close_fn(None, terminate=False)
     close_fn(None, terminate=True)
 
-    # 3. On Windows, assigning a real process returns an integer job handle and closing terminates cleanly.
+    # 3. On Windows, assigning a real tree returns a job handle and closing terminates parent + grandchild in time.
     if sys.platform == "win32":
-        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"])
+        child_started = tmp_path / "job_child.started"
+        grand_started = tmp_path / "job_grand.started"
+        child_marker = tmp_path / "job_child.survived"
+        grand_marker = tmp_path / "job_grand.survived"
+        code = _process_tree_probe_script(child_started, grand_started, child_marker, grand_marker, sleep_s=10.0)
+        proc = subprocess.Popen([sys.executable, "-I", "-c", code], cwd=tmp_path)
         job = None
+        identities: list[tuple[int, str]] = []
+        proc_ticks = _win32_creation_ticks_for_handle(int(cast(Any, proc)._handle))
+        if proc_ticks is not None:
+            identities.append((proc.pid, str(proc_ticks)))
         try:
             job = assign_fn(proc)
             assert isinstance(job, int) and job != 0
+            wait_start = time.monotonic() + 3.0
+            while (not child_started.is_file() or not grand_started.is_file()) and time.monotonic() < wait_start:
+                assert proc.poll() is None, f"child exited unexpectedly before starting tree (rc={proc.returncode})"
+                time.sleep(0.01)
+            assert child_started.is_file() and grand_started.is_file(), "Job Object tree did not start"
+            child_pid, child_token = _read_started_identity(child_started)
+            grand_pid, grand_token = _read_started_identity(grand_started)
+            assert child_pid != os.getpid() and grand_pid not in (os.getpid(), child_pid, proc.pid)
+            identities.extend([(child_pid, child_token), (grand_pid, grand_token)])
+
+            began = time.monotonic()
+            close_fn(job, terminate=True)
+            job = None
+            cutoff_at = began + 2.5
+            alive = _wait_process_tree_terminated(identities, deadline=cutoff_at)
+            assert alive == [], f"Win32 Job Object left member(s) alive: {alive}"
+            proc.wait(timeout=max(0.1, cutoff_at - time.monotonic()))
+            assert proc.poll() is not None and time.monotonic() < cutoff_at
+            assert not child_marker.exists() and not grand_marker.exists()
         finally:
             if job is not None:
-                close_fn(job, terminate=True)
-            else:
+                try:
+                    close_fn(job, terminate=True)
+                except RuntimeError:
+                    pass
+            if proc.poll() is None:
                 proc.kill()
             proc.wait(timeout=5)
-            assert proc.poll() is not None
+            published = _collect_started_identities(child_started, grand_started)
+            _cleanup_exact_processes(list(dict.fromkeys([*identities, *published])))
 
         # Boolean handles and invalid handles refuse assignment cleanly.
         class _MockProcBool:

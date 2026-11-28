@@ -6,10 +6,15 @@ import tempfile
 from pathlib import Path
 
 from superbrain.adapters.os.clock import SystemClock, SystemMonotonicClock
-from superbrain.adapters.os.durable import publisher_for
+from superbrain.adapters.os.durable import publisher_for, sync_directory_strict
 from superbrain.adapters.os.locks import OsLockFactory
 from superbrain.adapters.os.paths import OsPathSafety
 from superbrain.adapters.os.physical_fs import OsPhysicalFs
+from superbrain.ports.capture import (
+    register_outbox_dir_renamer,
+    register_outbox_dir_sync,
+    register_outbox_permissions,
+)
 from superbrain.ports.clock import Clock, MonotonicClock
 from superbrain.ports.os import OsAdapters, PermissionGuard, PlatformTraits
 
@@ -24,6 +29,11 @@ else:
 
     def _permission_guard() -> PermissionGuard:
         return PosixPermissionGuard()
+
+
+register_outbox_permissions(_permission_guard())
+register_outbox_dir_renamer(publisher_for(sys.platform).rename_dir)
+register_outbox_dir_sync(sync_directory_strict)
 
 
 def _default_windows_scratch_base() -> Path | None:

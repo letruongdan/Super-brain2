@@ -5,33 +5,25 @@ from __future__ import annotations
 import contextlib
 import logging
 import math
-import queue
-import signal
 import threading
 import time
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Mapping
 from datetime import datetime
 from pathlib import Path
-from types import FrameType
+from typing import TYPE_CHECKING
 
-from superbrain.adapters.harness_config.merger import SharedConfigMergerAdapter
 from superbrain.adapters.os import os_adapters
-from superbrain.adapters.os.daemon_config import read_daemon_config
-from superbrain.adapters.os.tls_material import verify_server_tls_files
 from superbrain.application.approvals import OperatorHandle
 from superbrain.application.deadlines import Reservation
 from superbrain.application.dispatch import KernelToolDomain
-from superbrain.application.jobs import JobService
-from superbrain.application.journal_recovery import reconcile_and_classify_journals
 from superbrain.application.owner_loop import AuthGate, OwnerLoop, OwnerSession
 from superbrain.application.review_apply import ReviewApplyService
-from superbrain.cli_api._loopback_server import LoopbackServer
 from superbrain.composition._daemon_doctor import DaemonDoctorRunner
-from superbrain.composition._daemon_restore import DaemonRestoreHandler, build_review_apply_service
 from superbrain.composition._daemon_session import (
     DaemonTestHooks,
     _AdmittedOwnerSession,
     _DaemonCompositeDomain,
+    make_default_handoff_domain_factory,
 )
 from superbrain.composition._doctor_fix_wiring import DoctorFixHooks
 from superbrain.composition._endpoint import (
@@ -41,9 +33,7 @@ from superbrain.composition._endpoint import (
     publish_endpoint,
     remove_own_endpoint,
 )
-from superbrain.composition.kernel_bridge import KernelBridge
 from superbrain.composition.kernel_projections import kernel_store_extensions
-from superbrain.composition.operator_entry import build_operator_service, make_operator_executor
 from superbrain.core._kernel_approval import canonical_utc
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.faults import crashpoint
@@ -66,11 +56,12 @@ from superbrain.core.kernel import (
 from superbrain.ports.clock import Clock, MonotonicClock
 from superbrain.ports.doctor import CaptureDoctorProbePort, OutboxReplayPort, SupervisorControlPort
 from superbrain.ports.os import OsAdapters
-from superbrain.storage.idempotency import StagedKernelStore
-from superbrain.storage.jobs import has_legacy_incomplete_settled_projections
-from superbrain.storage.proposals import PolicyApplyAuthority, StoreProposalAdapter
-from superbrain.storage.runtime import admit_existing_pair, open_runtime_under_lease
 from superbrain.workers.executor import PRODUCTION_JOB_HANDLERS, JobExecutor, JobHandler
+
+if TYPE_CHECKING:
+    from superbrain.cli_api._loopback_server import LoopbackServer
+from superbrain.composition._daemon_serve_config import _signal_stop_guard as _signal_stop_guard
+from superbrain.composition._daemon_serve_config import serve_config_path as serve_config_path
 
 __all__ = [
     "BoundLoopbackListener",
@@ -110,6 +101,24 @@ def _open_owner_session(
     operator: OperatorHandle | None = None,
     doctor_fix_hooks: DoctorFixHooks | None = None,
 ) -> _AdmittedOwnerSession:
+    from superbrain.adapters.os.tls_material import verify_server_tls_files
+    from superbrain.application.continuity_worker import sweep_legacy_continuity_copies
+    from superbrain.application.jobs import JobService
+    from superbrain.application.journal_recovery import reconcile_and_classify_journals
+    from superbrain.composition._daemon_restore import (
+        DaemonRestoreHandler,
+        LazyConfigMerger,
+        build_review_apply_service,
+    )
+    from superbrain.composition.kernel_bridge import KernelBridge
+    from superbrain.composition.operator_entry import build_operator_service
+    from superbrain.storage.capture_events import KernelCaptureStore
+    from superbrain.storage.idempotency import StagedKernelStore
+    from superbrain.storage.jobs import has_legacy_incomplete_settled_projections
+    from superbrain.storage.proposals import PolicyApplyAuthority, StoreProposalAdapter
+    from superbrain.storage.runtime import admit_existing_pair, open_runtime_under_lease
+    from superbrain.storage.sessions import SessionStore
+
     adapters = os_ if os_ is not None else os_adapters(clock=clock, monotonic=monotonic_clock)
     resolved_clock = clock if clock is not None else adapters.clock
     resolved_mono = monotonic_clock if monotonic_clock is not None else adapters.monotonic
@@ -156,6 +165,8 @@ def _open_owner_session(
 
         if hooks.before_job_recover is not None:
             hooks.before_job_recover(rt)
+        if rt.store.schema_version >= 7 and rt.policy.schema_version >= 5:
+            sweep_legacy_continuity_copies(job_service, SessionStore(rt.store, rt.policy))
         job_service.recover(rt.lease.epoch)
         if rt.store.schema_version >= 5 and rt.policy.schema_version >= 4:
             reconcile_and_classify_journals(
@@ -164,7 +175,7 @@ def _open_owner_session(
                 adapters,
                 data_root=rt.root.root,
                 home_dir=Path.home(),
-                config_merger=SharedConfigMergerAdapter(),
+                config_merger=LazyConfigMerger(),
                 now_utc_fn=lambda: canonical_utc(resolved_clock.now()),
             )
 
@@ -190,26 +201,37 @@ def _open_owner_session(
             elif session_box:
                 session_box[0].record_request_drained()
 
-        composite_domain = _DaemonCompositeDomain(job_service, domain)
+        from superbrain.adapters.harness.host_version import probe_installed_host_version
+        from superbrain.composition._layer2_live import Layer2ApplyTracker, reconcile_live_layer2_all
+
+        seen_configured_layer2: set[tuple[str, str]] = set()
+        l2_apply = Layer2ApplyTracker()  # one per daemon: capture, approval checks and restore share it
+        resolved_hv_resolver = (
+            hooks.host_version_resolver if hooks.host_version_resolver is not None else probe_installed_host_version
+        )
+        composite_domain = _DaemonCompositeDomain(
+            job_service, domain,
+            fallback_factory=(
+                make_default_handoff_domain_factory(
+                    rt=rt, clock=resolved_clock, writer_epoch=rt.lease.epoch,
+                ) if domain is None else None
+            ),
+        )
         bridge = KernelBridge(
-            store=rt.store,
-            policy=rt.policy,
-            clock=resolved_clock,
-            monotonic_clock=resolved_mono,
-            writer_epoch=rt.lease.epoch,
-            instance_id=instance_id,
-            max_queue_size=DAEMON_QUEUE_DEPTH,
-            domain=composite_domain,
-            before_enter_commit=hooks.before_enter_commit,
-            recover_pending_on_init=False,
-            auth_state=auth_gate,
-            before_auth_gate_publish=hooks.before_auth_gate_publish,
-            after_reserve_before_enqueue=hooks.after_reserve_before_enqueue,
-            on_reservation_change=arbiter_wake,
-            on_queue_wake=owner_wake,
-            on_owner_reply_ready=_on_reply_ready,
-            on_owner_finished=_on_owner_finished,
+            store=rt.store, policy=rt.policy, clock=resolved_clock, monotonic_clock=resolved_mono,
+            writer_epoch=rt.lease.epoch, instance_id=instance_id, max_queue_size=DAEMON_QUEUE_DEPTH,
+            domain=composite_domain, before_enter_commit=hooks.before_enter_commit, recover_pending_on_init=False,
+            auth_state=auth_gate, before_auth_gate_publish=hooks.before_auth_gate_publish,
+            after_reserve_before_enqueue=hooks.after_reserve_before_enqueue, on_reservation_change=arbiter_wake,
+            on_queue_wake=owner_wake, on_owner_reply_ready=_on_reply_ready, on_owner_finished=_on_owner_finished,
             on_clock_untrusted_changed=auth_gate.update_clock_untrusted,
+            on_capture_gaps_changed=auth_gate.update_capture_gaps_present, os_=adapters,
+            host_version_resolver=resolved_hv_resolver, seen_configured_layer2=seen_configured_layer2,
+            layer2_apply=l2_apply,
+        )
+        reconcile_live_layer2_all(
+            rt.policy, store=rt.store, os_=adapters, host_version_resolver=resolved_hv_resolver,
+            seen_configured=seen_configured_layer2, apply_tracker=l2_apply,
         )
         bridge.recover_pending_send_attempts()
 
@@ -229,6 +251,7 @@ def _open_owner_session(
             policy_schema_version=rt.policy.schema_version,
             tls_not_after=verified_tls.not_after,
             idempotency_clock_untrusted=bridge.clock_untrusted(),
+            capture_gaps_present=KernelCaptureStore(rt.store).has_gaps() if rt.store.schema_version >= 6 else False,
         )
         initial_view = RequestAuthView(
             version=auth_gate.next_version(),
@@ -271,6 +294,8 @@ def _open_owner_session(
         if executor is not None:
             executor.start()
 
+        from superbrain.composition.doctor_probes_sp2_store import run_sp2_doctor_probes
+
         doctor_runner = DaemonDoctorRunner(
             rt=rt,
             job_store=job_store,
@@ -283,6 +308,10 @@ def _open_owner_session(
             wake_owner=owner_wake,
             claim_guard=lambda: not session_box or session_box[0].doctor_claim_guard(),
             fix_hooks=doctor_fix_hooks,
+            host_version_resolver=resolved_hv_resolver,
+            sp2_probe=lambda data_root, checkout: run_sp2_doctor_probes(
+                data_root, checkout_root=checkout, host_version_resolver=resolved_hv_resolver, os_=adapters
+            ),
         )
         composite_domain.bind_doctor_runner(doctor_runner)
 
@@ -320,14 +349,11 @@ def _open_owner_session(
                 service_cls=ReviewApplyService,
             )
             restore_handler = DaemonRestoreHandler(
-                session=session,
-                adapters=adapters,
-                clock=resolved_clock,
-                executor=executor,
-                composite_domain=composite_domain,
-                instance_id=instance_id,
-                operator=operator,
-                review_apply_cls=ReviewApplyService,
+                session=session, adapters=adapters, clock=resolved_clock, executor=executor,
+                composite_domain=composite_domain, instance_id=instance_id, operator=operator,
+                review_apply_cls=ReviewApplyService, seen_configured_layer2=seen_configured_layer2,
+                layer2_apply=l2_apply,
+                host_version_resolver=resolved_hv_resolver,
             )
             operator.bind(
                 build_operator_service(
@@ -339,6 +365,11 @@ def _open_owner_session(
                     expected_endpoint_path=rt.root.endpoint_path,
                     expected_leaf_cert_sha256=verified_tls.leaf_cert_sha256,
                     server_cert_path=verified_tls.cert_path,
+                    live_layer2_check=lambda: reconcile_live_layer2_all(
+                        session.rt.policy, store=session.rt.store, os_=adapters,
+                        host_version_resolver=resolved_hv_resolver, seen_configured=seen_configured_layer2,
+                        apply_tracker=l2_apply,
+                    ),
                 )
             )
         return session
@@ -402,51 +433,6 @@ def create_daemon_owner_loop(
     return OwnerLoop(_factory)
 
 
-@contextlib.contextmanager
-def _signal_stop_guard(target: threading.Event) -> Iterator[Callable[[], bool]]:
-    """Latch stop signals and request ``target`` asynchronously in every phase; yields ``signalled()``.
-
-    The handler never touches ``target``: CPython runs it on the main thread, which may be inside ``target.wait()``
-    holding its condition lock. It only records the signal and wakes a watcher thread that calls ``target.set()``.
-    """
-    flag = [False]
-    if threading.current_thread() is not threading.main_thread():
-        yield lambda: flag[0]
-        return
-    saved: list[tuple[signal.Signals, Callable[[int, FrameType | None], object] | int | None]] = []
-    wake: queue.SimpleQueue[int | None] = queue.SimpleQueue()
-
-    def _watch() -> None:
-        while wake.get() is not None:
-            target.set()
-
-    watcher = threading.Thread(target=_watch, name="superbrain-stop-signal", daemon=True)
-    watcher.start()
-
-    def _handler(signum: int, _frame: FrameType | None) -> None:
-        flag[0] = True
-        wake.put_nowait(signum)  # SimpleQueue.put is reentrant: documented safe from a signal handler
-
-    candidates: list[signal.Signals] = [signal.SIGINT, signal.SIGTERM]
-    sigbreak = getattr(signal, "SIGBREAK", None)
-    if isinstance(sigbreak, signal.Signals):
-        candidates.append(sigbreak)
-
-    for sig in candidates:
-        with contextlib.suppress(OSError, ValueError):
-            prev = signal.getsignal(sig)
-            signal.signal(sig, _handler)
-            saved.append((sig, prev))
-    try:
-        yield lambda: flag[0]
-    finally:
-        for sig, prev in saved:
-            with contextlib.suppress(OSError, ValueError, TypeError):
-                signal.signal(sig, prev)
-        wake.put_nowait(None)  # after restore: every signal the handler queued is applied before the watcher exits
-        watcher.join(timeout=1.0)
-
-
 def serve(
     config: DaemonConfig,
     *,
@@ -471,6 +457,9 @@ def serve(
     bad_grace = isinstance(shutdown_grace_s, bool) or not isinstance(shutdown_grace_s, (int, float))
     if bad_grace or not math.isfinite(shutdown_grace_s) or shutdown_grace_s <= 0:
         raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+
+    from superbrain.cli_api._loopback_server import LoopbackServer
+    from superbrain.composition.operator_entry import make_operator_executor
 
     adapters = os_ if os_ is not None else os_adapters(clock=clock, monotonic=monotonic_clock)
     resolved_clock = clock if clock is not None else adapters.clock
@@ -565,31 +554,3 @@ def serve(
         return 0 if (report.state is ShutdownState.STOPPED and report.endpoint_removed and transport_ok) else 1
 
 
-def serve_config_path(
-    config_path: Path,
-    *,
-    os_: OsAdapters | None = None,
-    clock: Clock | None = None,
-    monotonic_clock: MonotonicClock | None = None,
-    stop_event: threading.Event | None = None,
-    shutdown_grace_s: float = DEFAULT_SHUTDOWN_GRACE_S,
-    on_ready: Callable[[Ready, OwnerLoop], None] | None = None,
-    domain: KernelToolDomain | None = None,
-    job_handlers: Mapping[str, JobHandler] | None = None,
-    hooks: DaemonTestHooks | None = None,
-    outbox_replay: OutboxReplayPort | None = None,
-    supervisor_control: SupervisorControlPort | None = None,
-    log_quiesce_hook: Callable[[], contextlib.AbstractContextManager[None]] | None = None,
-    capture_probe: CaptureDoctorProbePort | None = None,
-) -> int:
-    """Read and validate ``DaemonConfig`` from ``config_path`` and execute ``serve(...)``."""
-    if not isinstance(config_path, Path):
-        raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
-    adapters = os_ if os_ is not None else os_adapters(clock=clock, monotonic=monotonic_clock)
-    cfg = read_daemon_config(config_path, adapters)
-    return serve(
-        cfg, os_=adapters, clock=clock, monotonic_clock=monotonic_clock, stop_event=stop_event,
-        shutdown_grace_s=shutdown_grace_s, on_ready=on_ready, domain=domain, job_handlers=job_handlers,
-        hooks=hooks, outbox_replay=outbox_replay, supervisor_control=supervisor_control,
-        log_quiesce_hook=log_quiesce_hook, capture_probe=capture_probe, config_path=config_path,
-    )

@@ -58,7 +58,7 @@ def test_unregistered_pausepoint_is_a_programming_error() -> None:
 
 
 def test_registry_contents() -> None:
-    assert len(KNOWN_CRASHPOINTS) == 42
+    assert len(KNOWN_CRASHPOINTS) == 48
     assert "writer.mid_slot_write" in KNOWN_CRASHPOINTS and "migrating.policy.between_renames" in KNOWN_CRASHPOINTS
     for name in (
         "apply.after_policy_turn_intent",
@@ -72,6 +72,12 @@ def test_registry_contents() -> None:
         "rollback.after_restore_last_original",
         "apply.after_policy_grant_ended",
         "restoring.store.after_swap_before_effect_drain",
+        "capture.outbox.after_write_before_fsync",
+        "capture.daemon.after_commit_before_ack",
+        "session.after_policy_bind_before_store_project",
+        "continuity.worker.before_owner_commit",
+        "handoff.after_commit_before_ack",
+        "artifact_send.after_pending_before_flush",
         "doctor.fix.before_projection_swap",
         "doctor.fix.after_log_rotate_stage",
     ):

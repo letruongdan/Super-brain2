@@ -40,7 +40,7 @@ from superbrain.storage.policy_store import PolicyStore
 from superbrain.storage.restore import restore_policy, restore_store
 from superbrain.storage.retention import expire_due
 from superbrain.storage.runtime import admit_existing_pair, open_runtime
-from superbrain.storage.schema import Migration, SchemaInfo, read_schema_info
+from superbrain.storage.schema import Migration, SchemaInfo, code_version, read_schema_info
 from superbrain.storage.swap import recover_interrupted_swaps
 from superbrain.storage.writer import acquire_writer
 from tests.storage.conftest import DEMO_KINDS, maintenance_lease
@@ -121,10 +121,10 @@ def test_store_v5_create_and_lt5_upgrade_seed_zero_and_preserve_data_root_layout
     assert hasattr(layout_v5, "restore_epoch_path") and hasattr(layout_v5, "pending_restore_tombstones_path")
     assert layout_v5.restore_epoch_path.is_file()
     assert json.loads(layout_v5.restore_epoch_path.read_text(encoding="utf-8")) == {"restore_epoch": 0}
-    assert read_restore_epoch(layout_v5, schema_version=5, os_=os_) == 0
-    assert read_schema_info(layout_v5.store_db) == SchemaInfo(5, 5, sid_v5)
+    assert read_restore_epoch(layout_v5, schema_version=6, os_=os_) == 0
+    assert read_schema_info(layout_v5.store_db) == SchemaInfo(8, 8, sid_v5)
 
-    # Pre-v5 store without restore_epoch.json reads as 0; migrating <5 -> 5 writes 0.
+    # Pre-v5 store without restore_epoch.json reads as 0; migrating <5 -> latest writes 0.
     root_v4 = trusted_tmp / "v4-upgrade"
     rt_v4 = open_runtime(
         root_v4,
@@ -156,9 +156,9 @@ def test_store_v5_create_and_lt5_upgrade_seed_zero_and_preserve_data_root_layout
             migrations=KERNEL_STORE_MIGRATIONS,
             now=clock.now(),
         )
-        assert rep.to_version == 5
+        assert rep.to_version == 8
     assert layout_v4.restore_epoch_path.is_file()
-    assert read_restore_epoch(layout_v4, schema_version=5, os_=os_) == 0
+    assert read_restore_epoch(layout_v4, schema_version=6, os_=os_) == 0
 
 
 @pytest.mark.parametrize(
@@ -255,7 +255,7 @@ def test_consecutive_restores_bump_epoch_migrate_preserves_it_and_policy_change_
             rep1 = restore_store(root, lease, os_, backup, pol, clock.now(), migrations=KERNEL_STORE_MIGRATIONS)
         finally:
             pol.close()
-    e1 = read_restore_epoch(layout, schema_version=5, os_=os_)
+    e1 = read_restore_epoch(layout, schema_version=6, os_=os_)
     assert e1 == rep1.new_epoch >= 1
 
     clock.advance(timedelta(minutes=5))
@@ -265,7 +265,7 @@ def test_consecutive_restores_bump_epoch_migrate_preserves_it_and_policy_change_
             rep2 = restore_store(root, lease, os_, backup, pol, clock.now(), migrations=KERNEL_STORE_MIGRATIONS)
         finally:
             pol.close()
-    e2 = read_restore_epoch(layout, schema_version=5, os_=os_)
+    e2 = read_restore_epoch(layout, schema_version=6, os_=os_)
     assert e2 == rep2.new_epoch > e1
 
     # Stale policy_change signed for base_restore_epoch=0 MUST be rejected even though trust_generation == gen0.
@@ -288,12 +288,16 @@ def test_consecutive_restores_bump_epoch_migrate_preserves_it_and_policy_change_
         rt2.close()
 
     # Restore -> Migrate before any takeover preserves restore_epoch == e2 (Case 76).
-    store_v6 = (*KERNEL_STORE_MIGRATIONS, Migration(to_version=6, min_reader_version=6, apply=lambda db: None))
+    next_store_ver = code_version(KERNEL_STORE_MIGRATIONS) + 1
+    store_next = (
+        *KERNEL_STORE_MIGRATIONS,
+        Migration(to_version=next_store_ver, min_reader_version=next_store_ver, apply=lambda db: None),
+    )
     clock.advance(timedelta(minutes=5))
     with maintenance_lease(root_path) as (root, lease):
-        mig = migrate_database(root, lease, os_, target="store", migrations=store_v6, now=clock.now())
-        assert mig.to_version == 6
-    assert read_restore_epoch(layout, schema_version=6, os_=os_) == e2
+        mig = migrate_database(root, lease, os_, target="store", migrations=store_next, now=clock.now())
+        assert mig.to_version == next_store_ver
+    assert read_restore_epoch(layout, schema_version=next_store_ver, os_=os_) == e2
 
 
 def test_shared_blob_per_holder_expiry_and_small_evidence_expiry_before_gc(

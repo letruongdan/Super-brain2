@@ -39,6 +39,7 @@ from superbrain.core.kernel import (
 )
 from superbrain.ports.clock import MonotonicClock
 from superbrain.ports.kernel import SnapshotObserver
+from superbrain.workers.executor import JobHandler
 from tests.support.clock import FakeClock
 from tests.support.inc2_cli import write_client_profile_file, write_credential_file
 from tests.support.inc2_kernel_domain import fixture_store_extensions
@@ -83,6 +84,7 @@ def fixture_daemon(
     hooks: DaemonTestHooks | None = None,
     clock: FakeClock | None = None,
     daemon_clock: MonotonicClock | None = None,
+    job_handlers: Mapping[str, JobHandler] | None = None,
 ) -> Iterator[tuple[TransportHarness, FixtureDomainProxy, SendAttemptTracker]]:
     monkeypatch.setattr(daemon_entry, "kernel_store_extensions", fixture_store_extensions)
     cfg = DaemonConfig(
@@ -105,6 +107,7 @@ def fixture_daemon(
         domain=proxy,
         hooks=fixture_hooks(proxy, monotonic_ns=active_clock.monotonic_ns, observer=observer, base=hooks),
         on_listener_bound=bound.append,
+        job_handlers=job_handlers,
     )
     stop_event = threading.Event()
     server: LoopbackServer | None = None

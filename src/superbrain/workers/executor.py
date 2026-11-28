@@ -16,6 +16,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 
+from superbrain.application.continuity_worker import continuity_refresh_handler
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.kernel import (
     JobErrorCode,
@@ -98,8 +99,12 @@ class JobHandlerError(Exception):
         self.retryable = retryable
 
 
-PRODUCTION_JOB_HANDLERS: Mapping[str, JobHandler] = MappingProxyType({})
-"""Production capability registry: empty in Increment 2 (every domain is unavailable)."""
+PRODUCTION_JOB_HANDLERS: Mapping[str, JobHandler] = MappingProxyType(
+    {
+        "continuity.refresh": continuity_refresh_handler,
+    }
+)
+"""Production capability registry: only deterministic SP2-3 continuity refresh is registered."""
 
 
 class JobExecutor:
@@ -209,6 +214,24 @@ class JobExecutor:
                     raise
         if unregistered:
             self._notify_command()
+
+    def submit_work(
+        self,
+        lease: JobLease,
+        spec: JobSpec,
+        *,
+        deadline_ns: int,
+        invocation_ids: tuple[str, ...] = (),
+    ) -> None:
+        """Construct ``WorkItem`` inside ``workers`` and submit it cleanly from ``application``."""
+        self.submit(
+            WorkItem(
+                lease=lease,
+                spec=spec,
+                invocation_ids=invocation_ids,
+                deadline_ns=deadline_ns,
+            )
+        )
 
     def cancel(self, job_id: str) -> None:
         """Signal the cooperative cancel of ``job_id`` (no-op when the worker does not hold it)."""

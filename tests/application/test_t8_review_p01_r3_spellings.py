@@ -49,6 +49,7 @@ CONTROL = "safe prose kept"
 # ------------------------------------------------------------------------------------------------------------------
 
 
+@functools.cache
 def _components(path: str) -> tuple[str, ...]:
     return tuple(part for part in _SEPARATOR.split(path.lower()) if part and part != ".")
 
@@ -56,8 +57,12 @@ def _components(path: str) -> tuple[str, ...]:
 @functools.cache
 def _blocked(spelling: str, patterns: tuple[str, ...]) -> bool:
     parts = _components(spelling)
+    if not parts:
+        return False
     for pattern in patterns:
         chain = _components(pattern)
+        if len(parts) < len(chain):
+            continue
         for start in range(len(parts) - len(chain) + 1):
             if all(fnmatch.fnmatchcase(p, g) for p, g in zip(parts[start : start + len(chain)], chain, strict=True)):
                 return True

@@ -1,0 +1,4642 @@
+"""SP2-4 end-to-end tests: discover, work/resume, C5 ServedReceipt/ReadAck, takeover, replay & scope isolation.
+
+Requirement sources:
+- docs/superpowers/specs/2026-10-30-super-brain2-system-design.md
+  (§6.2, §6.3, §6.5, §7.4, §20 cases 2, 36–39, 41–45, 47–53, 55–61, 63–78)
+- docs/superpowers/plans/2026-11-18-sp2-capture-continuity.md (SP2-4 Step 2)
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import time
+from pathlib import Path
+from typing import Any
+
+from superbrain.adapters.os import os_adapters
+from superbrain.core.canonical import digest_bytes
+from superbrain.core.errors import ErrorCode
+from superbrain.core.jsonvalue import JsonValue
+from superbrain.core.kernel import (
+    HANDLER_RESERVE_NS,
+    CallContext,
+    Identity,
+    PrivateRequestAuth,
+    Scope,
+    SendAttemptState,
+)
+from superbrain.core.wire import SCHEMA_VERSION, normalize_call
+from superbrain.ports.capture import CaptureEventRecord
+from tests.support.clock import FakeClock
+from tests.support.inc2_fixture import open_kernel_job_runtime
+from tests.support.inc2_transport import register_workspace_direct
+from tests.support.kernel_auth import SeededCredential, seed_principal_and_credential, seed_repo_grant
+
+
+def _dispatch_call(
+    bridge: Any,
+    rt: Any,
+    tool: str,
+    args: dict[str, JsonValue],
+    *,
+    cred: SeededCredential,
+    scope: Scope,
+    now_ns: int = 10_000_000_000,
+) -> dict[str, Any]:
+    call = normalize_call(
+        tool,
+        {"schema_version": SCHEMA_VERSION, **args},
+        cred.principal,
+        selected_scope=scope,
+    )
+    ctx = CallContext(
+        principal=cred.principal,
+        identity=Identity(store_id=rt.store.store_id, writer_epoch=rt.lease.epoch, instance_id="inst-sp24-test"),
+        deadline_ns=now_ns + HANDLER_RESERVE_NS + 1_500_000_000,
+        selected_scope=scope,
+    )
+    auth = PrivateRequestAuth(credential_id=cred.credential_id, principal=cred.principal, token=cred.token)
+    res: dict[str, Any] = bridge.dispatch(call, ctx, auth=auth)
+    return res
+
+
+def _call_ok(
+    bridge: Any,
+    rt: Any,
+    tool: str,
+    args: dict[str, JsonValue],
+    *,
+    cred: SeededCredential,
+    scope: Scope,
+) -> dict[str, Any]:
+    env = _dispatch_call(bridge, rt, tool, args, cred=cred, scope=scope)
+    assert env.get("ok") is True, env
+    data = env.get("data")
+    assert isinstance(data, dict)
+    return data
+
+
+def _call_err(
+    bridge: Any,
+    rt: Any,
+    tool: str,
+    args: dict[str, JsonValue],
+    *,
+    cred: SeededCredential,
+    scope: Scope,
+) -> str:
+    env = _dispatch_call(bridge, rt, tool, args, cred=cred, scope=scope)
+    assert env.get("ok") is False, env
+    err = env.get("error")
+    assert isinstance(err, dict)
+    return str(err["code"])
+
+
+def test_discover_work_get_artifact_resume_and_c5_receipts_end_to_end(trusted_tmp: Path) -> None:
+    from superbrain.composition._daemon_session import build_default_handoff_domain
+    from superbrain.composition.kernel_bridge import KernelBridge
+
+    clock = FakeClock(dt.datetime(2026, 11, 26, 4, 0, tzinfo=dt.UTC))
+    adapters = os_adapters(clock=clock)
+    root = trusted_tmp / "e2e-handoff"
+    rt = open_kernel_job_runtime(root / "data", adapters, role="sp24-e2e")
+    try:
+        cred_a = seed_principal_and_credential(rt.policy, owner_id="dan", harness_id="claude-code", machine_id="m1")
+        cred_b = seed_principal_and_credential(rt.policy, owner_id="dan", harness_id="codex", machine_id="m1")
+        ws_a = register_workspace_direct(
+            rt,
+            clock,
+            cred_a.principal,
+            alias="ws-a",
+            checkout_dir=root / "chk-a",
+            remote="https://github.example/dan/repo.git",
+        )
+        ws_b = register_workspace_direct(
+            rt,
+            clock,
+            cred_a.principal,
+            alias="ws-b",
+            checkout_dir=root / "chk-b",
+            remote="https://github.example/dan/repo.git",
+        )
+        seed_repo_grant(rt.policy, principal_id=cred_b.principal.principal_id, repo_id=ws_a.repo_id, owner_id="dan")
+        seed_repo_grant(rt.policy, principal_id=cred_b.principal.principal_id, repo_id=ws_b.repo_id, owner_id="dan")
+        rt.store.reconcile_policy()
+
+        domain = build_default_handoff_domain(rt=rt, clock=clock, writer_epoch=rt.lease.epoch)
+        assert domain is not None
+        assert domain.supports_tool("prepare_task") is True
+        assert domain.supports_tool("get_artifact") is True
+        assert domain.supports_tool("submit_episode") is True
+        assert domain.supports_tool("search_knowledge") is False
+        assert domain.supports_tool("get_health", deep=True) is False
+
+        bridge = KernelBridge(store=rt.store, policy=rt.policy, clock=clock, writer_epoch=rt.lease.epoch, domain=domain)
+        scope_a = Scope(ws_a.repo_id, ws_a.checkout_id)
+        scope_b = Scope(ws_b.repo_id, ws_b.checkout_id)
+
+        # 1. Initial work call mints task + live fence (0, 0), and initial discover has 0 side effects.
+        disc0 = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "discover",
+                "workspace_id": ws_a.repo_id,
+                "checkout_id": ws_a.checkout_id,
+                "context_budget_tokens": 2000,
+            },
+            cred=cred_a,
+            scope=scope_a,
+        )
+        assert disc0["continuity"] == []
+        for code in ("skills_unavailable", "lessons_unavailable", "context_unavailable", "finishing_gates_unavailable"):
+            assert code in disc0["degraded_codes"]
+
+        work1 = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "work",
+                "workspace_id": ws_a.repo_id,
+                "checkout_id": ws_a.checkout_id,
+                "description": "Implement SP2-4 continuity handoff end to end",
+                "context_budget_tokens": 2000,
+                "idempotency_key": "idem-work-1-aaaaaa",
+            },
+            cred=cred_a,
+            scope=scope_a,
+        )
+        task_id = work1["task_id"]
+        assert work1["handoff_live"]["revision"] is None
+        assert work1["handoff_live"]["handoff_revision"] == 0
+        assert work1["handoff_live"]["fence"] == {"restore_epoch": 0, "writer_generation": 0}
+
+        # 2. First submit_episode with takeover + handoff creates revision 1.
+        ep1 = _call_ok(
+            bridge,
+            rt,
+            "submit_episode",
+            {
+                "task_id": task_id,
+                "session_id": "raw-session-a-1",
+                "evidence": [],
+                "base_revision": 0,
+                "fence": {"restore_epoch": 0, "writer_generation": 0},
+                "takeover": {"acknowledge_active": True, "reason": "initial hold"},
+                "handoff": {
+                    "working_goal": "Complete handoff persistence",
+                    "next_action": {"summary": "Serve L1 and takeover from B"},
+                    "task_state": "open",
+                },
+                "idempotency_key": "idem-ep-1-aaaaaaaa",
+            },
+            cred=cred_a,
+            scope=scope_a,
+        )
+        assert ep1["handoff_status"] == "stored"
+        assert ep1["handoff_revision"] == 1
+        assert ep1["writer_status"] == "holder"
+        assert ep1["fence"] == {"restore_epoch": 0, "writer_generation": 1}
+
+        # 3. Privacy leakage rejects fail-closed with ZERO side effects!
+        assert (
+            _call_err(
+                bridge,
+                rt,
+                "submit_episode",
+                {
+                    "task_id": task_id,
+                    "session_id": "raw-session-a-1",
+                    "evidence": [],
+                    "base_revision": 1,
+                    "fence": ep1["fence"],
+                    "handoff": {"working_goal": "<private>unterminated secret"},
+                    "idempotency_key": "idem-priv-fail-111",
+                },
+                cred=cred_a,
+                scope=scope_a,
+            )
+            == ErrorCode.INVALID_INPUT.value
+        )
+
+        # 4. B discovers -> gets L1 -> gets ServedReceipt (served_receipt_id) -> ReadAck -> resumes with read_ack!
+        disc_b = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "discover",
+                "workspace_id": ws_a.repo_id,
+                "checkout_id": ws_a.checkout_id,
+                "context_budget_tokens": 2000,
+            },
+            cred=cred_b,
+            scope=scope_a,
+        )
+        assert len(disc_b["continuity"]) == 1
+        item = disc_b["continuity"][0]
+        assert item["kind"] == "handoff" and item["id"] == task_id and item["revision"] == 1
+        assert "raw-session-a-1" not in item["summary"]
+
+        # Same repo, different checkout B gets NOT_FOUND across discover/get_artifact (cases 2, 41, 48).
+        disc_wrong_chk = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "discover",
+                "workspace_id": ws_b.repo_id,
+                "checkout_id": ws_b.checkout_id,
+                "context_budget_tokens": 2000,
+            },
+            cred=cred_b,
+            scope=scope_b,
+        )
+        assert disc_wrong_chk["continuity"] == []
+        assert (
+            _call_err(
+                bridge,
+                rt,
+                "get_artifact",
+                {
+                    "workspace_id": ws_b.repo_id,
+                    "task_id": task_id,
+                    "artifact_id": task_id,
+                    "revision_epoch": item["revision_epoch"],
+                    "revision": item["revision"],
+                    "level": "L1",
+                    "idempotency_key": "idem-art-b-wrong-1",
+                },
+                cred=cred_b,
+                scope=scope_b,
+            )
+            == ErrorCode.NOT_FOUND.value
+        )
+    finally:
+        rt.close()
+
+
+def test_takeover_fence_idempotency_not_holder_not_stored_policy_and_checkout_isolation(trusted_tmp: Path) -> None:
+    from superbrain.composition._daemon_session import build_default_handoff_domain
+    from superbrain.composition.kernel_bridge import KernelBridge
+
+    clock = FakeClock(dt.datetime(2026, 11, 26, 5, 0, tzinfo=dt.UTC))
+    adapters = os_adapters(clock=clock)
+    root = trusted_tmp / "takeover-e2e"
+    rt = open_kernel_job_runtime(root / "data", adapters, role="sp24-takeover")
+    try:
+        cred_a = seed_principal_and_credential(rt.policy, owner_id="dan", harness_id="claude-code", machine_id="m1")
+        cred_b = seed_principal_and_credential(rt.policy, owner_id="dan", harness_id="codex", machine_id="m1")
+        ws_a = register_workspace_direct(
+            rt,
+            clock,
+            cred_a.principal,
+            alias="ws-a",
+            checkout_dir=root / "chk-a",
+            remote="https://github.example/dan/repo.git",
+        )
+        register_workspace_direct(
+            rt,
+            clock,
+            cred_a.principal,
+            alias="ws-b",
+            checkout_dir=root / "chk-b",
+            remote="https://github.example/dan/repo.git",
+        )
+        seed_repo_grant(rt.policy, principal_id=cred_b.principal.principal_id, repo_id=ws_a.repo_id, owner_id="dan")
+        rt.store.reconcile_policy()
+
+        domain = build_default_handoff_domain(rt=rt, clock=clock, writer_epoch=rt.lease.epoch)
+        assert domain is not None
+        bridge = KernelBridge(store=rt.store, policy=rt.policy, clock=clock, writer_epoch=rt.lease.epoch, domain=domain)
+        scope_a = Scope(ws_a.repo_id, ws_a.checkout_id)
+
+        work1 = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "work",
+                "workspace_id": ws_a.repo_id,
+                "checkout_id": ws_a.checkout_id,
+                "description": "Takeover fence verification",
+                "context_budget_tokens": 2000,
+                "idempotency_key": "idem-take-work-111",
+            },
+            cred=cred_a,
+            scope=scope_a,
+        )
+        tid = work1["task_id"]
+
+        # A holds fence (0, 1), hrev 1.
+        r1 = _call_ok(
+            bridge,
+            rt,
+            "submit_episode",
+            {
+                "task_id": tid,
+                "session_id": "sess-a-hold",
+                "evidence": [],
+                "base_revision": 0,
+                "fence": {"restore_epoch": 0, "writer_generation": 0},
+                "takeover": {"acknowledge_active": True},
+                "handoff": {"working_goal": "A starts"},
+                "idempotency_key": "idem-take-a-111111",
+            },
+            cred=cred_a,
+            scope=scope_a,
+        )
+        assert r1["writer_status"] == "holder" and r1["fence"] == {"restore_epoch": 0, "writer_generation": 1}
+
+        clock.advance(dt.timedelta(seconds=10))
+        # Seeded session A is still active (< 300 s): takeover WITHOUT acknowledge_active=True fails (case 47).
+        assert (
+            _call_err(
+                bridge,
+                rt,
+                "submit_episode",
+                {
+                    "task_id": tid,
+                    "session_id": "sess-b-take",
+                    "evidence": [],
+                    "base_revision": 1,
+                    "fence": {"restore_epoch": 0, "writer_generation": 1},
+                    "takeover": {"acknowledge_active": False, "reason": "No ack"},
+                    "idempotency_key": "idem-take-b-noack1",
+                },
+                cred=cred_b,
+                scope=scope_a,
+            )
+            == ErrorCode.INVALID_INPUT.value
+        )
+
+        # With acknowledge_active=True, B succeeds; takeover-only preserves handoff_revision=1!
+        r2 = _call_ok(
+            bridge,
+            rt,
+            "submit_episode",
+            {
+                "task_id": tid,
+                "session_id": "sess-b-take",
+                "evidence": [],
+                "base_revision": 1,
+                "fence": {"restore_epoch": 0, "writer_generation": 1},
+                "takeover": {"acknowledge_active": True, "reason": "B takes over"},
+                "idempotency_key": "idem-take-b-222222",
+            },
+            cred=cred_b,
+            scope=scope_a,
+        )
+        assert r2["handoff_status"] == "stored"
+        assert r2["handoff_revision"] == 1  # takeover-only does NOT bump handoff_revision (case 68)!
+        assert r2["writer_status"] == "holder"
+        assert r2["fence"] == {"restore_epoch": 0, "writer_generation": 2}
+
+        # Stale non-takeover write by A with old fence fails REVISION_CONFLICT.
+        assert (
+            _call_err(
+                bridge,
+                rt,
+                "submit_episode",
+                {
+                    "task_id": tid,
+                    "session_id": "sess-a-hold",
+                    "evidence": [],
+                    "base_revision": 1,
+                    "fence": {"restore_epoch": 0, "writer_generation": 1},
+                    "handoff": {"working_goal": "A stale write"},
+                    "idempotency_key": "idem-take-a-stale1",
+                },
+                cred=cred_a,
+                scope=scope_a,
+            )
+            == ErrorCode.REVISION_CONFLICT.value
+        )
+
+        # Idempotent replay of r1 AFTER B took over checks idempotency BEFORE base_revision/fence
+        # and returns dynamic writer_status="not_holder" (cases 38, 67, 74)!
+        r1_replay = _call_ok(
+            bridge,
+            rt,
+            "submit_episode",
+            {
+                "task_id": tid,
+                "session_id": "sess-a-hold",
+                "evidence": [],
+                "base_revision": 0,
+                "fence": {"restore_epoch": 0, "writer_generation": 0},
+                "takeover": {"acknowledge_active": True},
+                "handoff": {"working_goal": "A starts"},
+                "idempotency_key": "idem-take-a-111111",
+            },
+            cred=cred_a,
+            scope=scope_a,
+        )
+        assert r1_replay["episode_id"] == r1["episode_id"]
+        assert r1_replay["fence"] == {"restore_epoch": 0, "writer_generation": 1}
+        assert r1_replay["writer_status"] == "not_holder"
+
+        # Plain episode without handoff or takeover returns SubmitEpisodePlainResult (no handoff_status).
+        plain = _call_ok(
+            bridge,
+            rt,
+            "submit_episode",
+            {
+                "task_id": tid,
+                "session_id": "sess-b-take",
+                "evidence": [{"kind": "tool_post", "data": {"step": "lint"}}],
+                "idempotency_key": "idem-plain-ep-1111",
+            },
+            cred=cred_b,
+            scope=scope_a,
+        )
+        assert set(plain) == {"episode_id", "evidence_ids"}
+        assert len(plain["evidence_ids"]) == 1
+
+        # Policy manual_submission=False strips evidence/handoff -> not_stored_policy, header unchanged!
+        rt.policy.set_repo_policy(
+            ws_a.repo_id,
+            automatic_capture_enabled=True,
+            manual_submission_enabled=False,
+        )
+        rt.store.reconcile_policy()
+        blocked = _call_ok(
+            bridge,
+            rt,
+            "submit_episode",
+            {
+                "task_id": tid,
+                "session_id": "sess-b-take",
+                "evidence": [{"kind": "tool_post", "data": {"note": "must not store"}}],
+                "base_revision": 1,
+                "fence": r2["fence"],
+                "handoff": {"working_goal": "Blocked by policy"},
+                "idempotency_key": "idem-policy-block-1",
+            },
+            cred=cred_b,
+            scope=scope_a,
+        )
+        assert blocked["handoff_status"] == "not_stored_policy"
+        assert blocked["handoff_revision"] is None
+        assert blocked["evidence_ids"] == []
+    finally:
+        rt.close()
+
+
+def test_production_loopback_daemon_l0_l1_l2_served_receipt_read_ack_and_resume(trusted_tmp: Path) -> None:
+    from superbrain.core.kernel import ToolCommand
+    from superbrain.storage.sqlite import open_readonly
+    from tests.support.inc2_cli import get_shared_t7_transport_template
+    from tests.support.inc2_transport import open_test_loopback_transport
+
+    tpl = get_shared_t7_transport_template()
+    ws_a = tpl.ws_a
+    ws_b = tpl.ws_b
+    assert ws_a is not None and ws_b is not None
+    scope_a = Scope(ws_a.repo_id, ws_a.checkout_id)
+    scope_b = Scope(ws_b.repo_id, ws_b.checkout_id)
+
+    with open_test_loopback_transport(tpl, name="sp24-loopback", domain=None) as h:
+        client = h.open_client()
+        target = h.make_target()
+
+        def call_loop(tool: str, args: dict[str, JsonValue], *, scope: Scope = scope_a) -> dict[str, Any]:
+            return client.call(
+                target,
+                ToolCommand(
+                    tool=tool,
+                    arguments={"schema_version": SCHEMA_VERSION, **args},
+                    token=tpl.cred.token,
+                    selected_scope=scope,
+                ),
+            )
+
+        def wait_send_state(receipt_id: str, expected: str, *, timeout_s: float = 2.0) -> str | None:
+            deadline = time.perf_counter() + timeout_s
+            while time.perf_counter() < deadline:
+                state = h.get_send_attempt_state(receipt_id)
+                if state == expected:
+                    return state
+                time.sleep(0.005)
+            h.loop.run_owner_action(lambda: None).result(timeout=2.0)
+            return h.get_send_attempt_state(receipt_id)
+
+        # 1. Start work task on production loopback daemon (domain=None -> default HandoffKernelDomain).
+        prep = call_loop(
+            "prepare_task",
+            {
+                "mode": "work",
+                "workspace_id": ws_a.repo_id,
+                "checkout_id": ws_a.checkout_id,
+                "description": "Production daemon continuity lifecycle test",
+                "context_budget_tokens": 3000,
+                "idempotency_key": "idem-prod-prep-0001",
+            },
+        )
+        assert prep.get("ok") is True, prep
+        pdata = prep["data"]
+        tid = pdata["task_id"]
+        assert pdata["handoff_live"] == {
+            "revision": None,
+            "revision_epoch": None,
+            "handoff_revision": 0,
+            "fence": {"restore_epoch": 0, "writer_generation": 0},
+        }
+
+        # 2. Submit initial rich handoff patch (all sections).
+        sub1 = call_loop(
+            "submit_episode",
+            {
+                "task_id": tid,
+                "session_id": "RAW_LOOP_SID_SECRET_001",
+                "workspace_id": ws_a.repo_id,
+                "checkout_id": ws_a.checkout_id,
+                "evidence": [{"kind": "tool_post", "data": {"cmd": "pytest", "passed": True}}],
+                "base_revision": 0,
+                "fence": pdata["handoff_live"]["fence"],
+                "handoff": {
+                    "working_goal": "Verify L0/L1/L2 & ReadAck",
+                    "plan": [{"id": "s-1", "summary": "Serve artifacts", "status": "in_progress"}],
+                    "decisions": [{"id": "d-1", "decision": "Use SQLite v8", "reason": "Epochs"}],
+                    "user_constraints": [{"id": "c-1", "constraint": "No sleeps"}],
+                    "tooling": [{"purpose": "test", "command": "pytest -q"}],
+                    "hypotheses": ["Replay mints fresh served_receipt_id"],
+                    "next_action": {"summary": "Acknowledge L1 digests"},
+                    "task_state": "open",
+                },
+                "idempotency_key": "idem-prod-sub1-0001",
+            },
+        )
+        assert sub1.get("ok") is True, sub1
+        s1 = sub1["data"]
+        assert s1["handoff_status"] == "stored" and s1["handoff_revision"] == 1
+        assert s1["writer_status"] == "holder"
+
+        # 3. Fetch L0, L1, L2; verify ServedReceipt transitions pending -> served_only on HTTP 200.
+        art_l0 = call_loop(
+            "get_artifact",
+            {
+                "workspace_id": ws_a.repo_id,
+                "task_id": tid,
+                "artifact_id": tid,
+                "revision": 1,
+                "level": "L0",
+                "idempotency_key": "idem-prod-l0-000001",
+            },
+        )
+        assert art_l0.get("ok") is True and art_l0["data"]["status"] == "ok", art_l0
+
+        get_l1_args: dict[str, JsonValue] = {
+            "workspace_id": ws_a.repo_id,
+            "task_id": tid,
+            "artifact_id": tid,
+            "revision_epoch": 0,
+            "revision": 1,
+            "level": "L1",
+            "idempotency_key": "idem-prod-l1-000001",
+        }
+        art_l1 = call_loop("get_artifact", get_l1_args)
+        assert art_l1.get("ok") is True and art_l1["data"]["status"] == "ok", art_l1
+        l1_data = art_l1["data"]
+        receipt_1 = l1_data["served_receipt_id"]
+        assert isinstance(receipt_1, str)
+        assert wait_send_state(receipt_1, SendAttemptState.SERVED_ONLY) == SendAttemptState.SERVED_ONLY
+        assert l1_data["resources"][0]["name"] == "handoff_header"
+
+        # Replaying SAME get_artifact idempotency_key mints a DISTINCT served_receipt_id (C5 / case 72)!
+        art_l1_replay = call_loop("get_artifact", get_l1_args)
+        assert art_l1_replay.get("ok") is True
+        receipt_2 = art_l1_replay["data"]["served_receipt_id"]
+        assert isinstance(receipt_2, str)
+        assert receipt_2 != receipt_1
+        assert wait_send_state(receipt_2, SendAttemptState.SERVED_ONLY) == SendAttemptState.SERVED_ONLY
+
+        art_l2 = call_loop(
+            "get_artifact",
+            {
+                "workspace_id": ws_a.repo_id,
+                "task_id": tid,
+                "artifact_id": tid,
+                "revision": 1,
+                "level": "L2",
+                "idempotency_key": "idem-prod-l2-000001",
+            },
+        )
+        assert art_l2.get("ok") is True and art_l2["data"]["status"] == "ok", art_l2
+
+        # 4. Negative ReadAck checks: wrong digest -> INVALID_INPUT; forged receipt -> NOT_FOUND.
+        assert isinstance(l1_data["resources"], list)
+        l1_digests: list[JsonValue] = [
+            {"name": str(r["name"]), "digest": str(r["digest"])} for r in l1_data["resources"]
+        ]
+        wrong_digs: list[JsonValue] = [
+            {"name": str(r["name"]), "digest": digest_bytes(b"wrong")} for r in l1_data["resources"]
+        ]
+        bad_dig_ack = call_loop(
+            "submit_episode",
+            {
+                "task_id": tid,
+                "session_id": "RAW_LOOP_SID_SECRET_001",
+                "workspace_id": ws_a.repo_id,
+                "checkout_id": ws_a.checkout_id,
+                "evidence": [],
+                "read_acks": [
+                    {
+                        "served_receipt_id": receipt_1,
+                        "task_id": tid,
+                        "artifact_id": tid,
+                        "revision_epoch": 0,
+                        "revision": 1,
+                        "resource_digests": wrong_digs,
+                    }
+                ],
+                "idempotency_key": "idem-prod-ack-baddig",
+            },
+        )
+        assert bad_dig_ack == {"ok": False, "error": {"code": "invalid_input", "message": "invalid input"}}
+
+        forged_ack = call_loop(
+            "submit_episode",
+            {
+                "task_id": tid,
+                "session_id": "RAW_LOOP_SID_SECRET_001",
+                "workspace_id": ws_a.repo_id,
+                "checkout_id": ws_a.checkout_id,
+                "evidence": [],
+                "read_acks": [
+                    {
+                        "served_receipt_id": "01999999-9999-7000-8000-999999999999",
+                        "task_id": tid,
+                        "artifact_id": tid,
+                        "revision_epoch": 0,
+                        "revision": 1,
+                        "resource_digests": l1_digests,
+                    }
+                ],
+                "idempotency_key": "idem-prod-ack-forged",
+            },
+        )
+        assert forged_ack == {"ok": False, "error": {"code": "not_found", "message": "not found"}}
+
+        # 5. Valid ReadAck succeeds and records artifact_read_ack; duplicate same-receipt ack is idempotent!
+        good_ack = call_loop(
+            "submit_episode",
+            {
+                "task_id": tid,
+                "session_id": "RAW_LOOP_SID_SECRET_001",
+                "workspace_id": ws_a.repo_id,
+                "checkout_id": ws_a.checkout_id,
+                "evidence": [],
+                "read_acks": [
+                    {
+                        "served_receipt_id": receipt_1,
+                        "task_id": tid,
+                        "artifact_id": tid,
+                        "revision_epoch": 0,
+                        "revision": 1,
+                        "resource_digests": l1_digests,
+                    }
+                ],
+                "idempotency_key": "idem-prod-ack-good01",
+            },
+        )
+        assert good_ack.get("ok") is True, good_ack
+        assert h.count_read_acks() == 1
+
+        dup_ack = call_loop(
+            "submit_episode",
+            {
+                "task_id": tid,
+                "session_id": "RAW_LOOP_SID_SECRET_001",
+                "workspace_id": ws_a.repo_id,
+                "checkout_id": ws_a.checkout_id,
+                "evidence": [],
+                "read_acks": [
+                    {
+                        "served_receipt_id": receipt_1,
+                        "task_id": tid,
+                        "artifact_id": tid,
+                        "revision_epoch": 0,
+                        "revision": 1,
+                        "resource_digests": l1_digests,
+                    }
+                ],
+                "idempotency_key": "idem-prod-ack-good02",
+            },
+        )
+        assert dup_ack.get("ok") is True, dup_ack
+        assert h.count_read_acks() == 1
+
+        # 6. prepare_task(mode="work") with acked resume_ref -> "read_ack"; seen_handoff_refs -> "seen_l0".
+        resumed_work = call_loop(
+            "prepare_task",
+            {
+                "mode": "work",
+                "workspace_id": ws_a.repo_id,
+                "checkout_id": ws_a.checkout_id,
+                "task_id": tid,
+                "resume_ref": {
+                    "served_receipt_id": receipt_1,
+                    "artifact_id": tid,
+                    "revision": 1,
+                    "handoff_revision": 1,
+                    "fence": s1["fence"],
+                },
+                "description": "Resume existing task",
+                "idempotency_key": "idem-prod-resumed-1",
+            },
+        )
+        assert resumed_work.get("ok") is True, resumed_work
+
+        disc_live = call_loop(
+            "prepare_task",
+            {"mode": "discover", "workspace_id": ws_a.repo_id, "checkout_id": ws_a.checkout_id},
+        )
+        assert disc_live.get("ok") is True
+        seen_item = disc_live["data"]["continuity"][0]
+        seen_work = call_loop(
+            "prepare_task",
+            {
+                "mode": "work",
+                "workspace_id": ws_a.repo_id,
+                "checkout_id": ws_a.checkout_id,
+                "seen_handoff_refs": [
+                    {
+                        "artifact_id": seen_item["id"],
+                        "revision_epoch": seen_item["revision_epoch"],
+                        "revision": seen_item["revision"],
+                        "digest": seen_item["digest"],
+                    }
+                ],
+                "description": "New task after reviewing open handoff",
+                "idempotency_key": "idem-prod-seen-work1",
+            },
+        )
+        assert seen_work.get("ok") is True, seen_work
+
+        # Cross-checkout resume_ref & seen_handoff_refs are rejected with NOT_FOUND (case 2, 41, 48).
+        bad_resume = call_loop(
+            "prepare_task",
+            {
+                "mode": "work",
+                "workspace_id": ws_b.repo_id,
+                "checkout_id": ws_b.checkout_id,
+                "task_id": tid,
+                "resume_ref": {
+                    "artifact_id": tid,
+                    "revision": 1,
+                    "handoff_revision": 1,
+                    "fence": s1["fence"],
+                },
+                "description": "Cross checkout attempt",
+                "idempotency_key": "idem-prod-xchk-res-1",
+            },
+            scope=scope_b,
+        )
+        assert bad_resume == {"ok": False, "error": {"code": "not_found", "message": "not found"}}
+
+        # Inspect durable tables (deliveries & absence of raw session ID) via read-only connection.
+        ro_scratch = trusted_tmp / "ro-loop-inspect"
+        ro_scratch.mkdir()
+        with open_readonly(h.data_root / "store" / "brain.db", scratch_dir=ro_scratch) as conn:
+            exp_rows = dict(conn.execute("SELECT delivery_id, exposure_evidence FROM deliveries").fetchall())
+            assert exp_rows[resumed_work["data"]["delivery_id"]] == "read_ack"
+            assert exp_rows[seen_work["data"]["delivery_id"]] == "seen_l0"
+            raw_cells = conn.execute(
+                "SELECT COUNT(*) FROM episodes WHERE session_ref LIKE '%RAW_LOOP_SID%'"
+            ).fetchone()
+            assert raw_cells is not None and int(raw_cells[0]) == 0
+        for blob_path in (h.data_root / "cas").rglob("*"):
+            if blob_path.is_file():
+                assert b"RAW_LOOP_SID_SECRET_001" not in blob_path.read_bytes()
+
+
+def test_continuity_worker_3phase_quarantine_redaction_and_restore_epoch(trusted_tmp: Path) -> None:
+    from superbrain.application.continuity_worker import ContinuityWorkerCoordinator
+    from superbrain.composition._daemon_session import build_default_handoff_domain
+    from superbrain.composition.kernel_bridge import KernelBridge
+    from superbrain.ports.policy import IntentKind
+    from superbrain.storage.backup import create_store_backup
+    from superbrain.storage.handoffs import HandoffStore
+    from superbrain.storage.kernel_schema import KERNEL_POLICY_MIGRATIONS, KERNEL_STORE_MIGRATIONS
+    from superbrain.storage.policy_store import PolicyStore
+    from superbrain.storage.restore import restore_store
+    from superbrain.storage.sessions import SessionStore
+    from superbrain.workers.executor import PRODUCTION_JOB_HANDLERS, JobExecutor
+    from tests.storage.conftest import maintenance_lease
+    from tests.support.inc2_fixture import kernel_job_service
+
+    clock = FakeClock(dt.datetime(2026, 11, 26, 6, 0, tzinfo=dt.UTC))
+    adapters = os_adapters(clock=clock)
+    root = trusted_tmp / "worker-redaction-e2e"
+    rt = open_kernel_job_runtime(root / "data", adapters, role="sp24-worker")
+    try:
+        cred = seed_principal_and_credential(rt.policy, owner_id="dan", harness_id="claude-code", machine_id="m1")
+        ws = register_workspace_direct(rt, clock, cred.principal, alias="ws-w", checkout_dir=root / "chk-w")
+        rt.store.reconcile_policy()
+        scope = Scope(ws.repo_id, ws.checkout_id)
+
+        domain = build_default_handoff_domain(rt=rt, clock=clock, writer_epoch=rt.lease.epoch)
+        assert domain is not None
+        bridge = KernelBridge(store=rt.store, policy=rt.policy, clock=clock, writer_epoch=rt.lease.epoch, domain=domain)
+        work = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "work",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "description": "Worker 3-phase & redaction goal",
+                "idempotency_key": "idem-wrk-prep-00001",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        tid = work["task_id"]
+        sub1 = _call_ok(
+            bridge,
+            rt,
+            "submit_episode",
+            {
+                "task_id": tid,
+                "session_id": "RAW_SID_WORKER_999",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "evidence": [],
+                "base_revision": 0,
+                "fence": work["handoff_live"]["fence"],
+                "handoff": {"working_goal": "Agent state preserved across worker refresh"},
+                "idempotency_key": "idem-wrk-sub1-00001",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        assert sub1["handoff_revision"] == 1
+
+        # Record captured user_message events -> run 3-phase continuity worker -> creates rev 2 preserving hrev 1.
+        hs = HandoffStore(rt.store, rt.policy)
+        ss = SessionStore(rt.store, rt.policy)
+        hdr1 = hs.read_header(tid, principal_id=cred.principal.principal_id, scope=scope)
+        assert hdr1 is not None and hdr1.holder_session_ref is not None
+        ev = CaptureEventRecord(
+            event_id="ev-wrk-msg-1",
+            producer_stream="stream-wrk-1",
+            sequence=1,
+            harness_id="claude-code",
+            kind="user_message",
+            recorded_at="2026-11-26T06:00:05Z",
+            payload={"role": "user", "text": "Please verify UTF-8 redaction without mutating header"},
+            session_ref=hdr1.holder_session_ref,
+        )
+        ss.record_session_event(
+            session_ref=hdr1.holder_session_ref,
+            repo_id=ws.repo_id,
+            checkout_id=ws.checkout_id,
+            task_id=tid,
+            producer_stream="stream-wrk-1",
+            event=ev,
+            now=clock.now(),
+        )
+        svc, _ = kernel_job_service(rt, clock)
+        exec_ = JobExecutor(PRODUCTION_JOB_HANDLERS, lambda: 10_000)
+        exec_.start()
+        try:
+            coord = ContinuityWorkerCoordinator(
+                rt=rt, job_service=svc, executor=exec_, clock=clock, mono=lambda: 10_000
+            )
+            clock.advance(dt.timedelta(seconds=65))
+            assert coord.enqueue_if_due(task_id=tid, now=clock.now()) is not None
+            assert coord.run_next(writer_epoch=rt.lease.epoch, now=clock.now()) is True
+        finally:
+            exec_.close(5.0)
+
+        # Verify handoff_revision_headers recorded revision 2 with handoff_revision still 1!
+        hdr2 = hs.read_revision_header(
+            artifact_id=tid,
+            revision_epoch=0,
+            revision=2,
+            principal_id=cred.principal.principal_id,
+            scope=scope,
+        )
+        assert hdr2 is not None and hdr2.handoff_revision == 1 and hdr2.observed_ref is not None
+
+        # L2 includes conversation excerpt before quarantine.
+        l2_ok = _call_ok(
+            bridge,
+            rt,
+            "get_artifact",
+            {
+                "workspace_id": ws.repo_id,
+                "task_id": tid,
+                "artifact_id": tid,
+                "revision_epoch": 0,
+                "revision": 2,
+                "level": "L2",
+                "idempotency_key": "idem-wrk-l2-ok-00001",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        assert l2_ok["status"] == "ok" and "Please verify UTF-8" in str(l2_ok["resources"])
+
+        # Quarantine event blob digest -> observed excerpt in L2 becomes redacted while handoff remains ok.
+        ev_row = rt.store._db.execute(
+            "SELECT payload_digest FROM session_task_events WHERE task_id = ?", (tid,)
+        ).fetchone()
+        assert ev_row is not None
+        rt.policy.record_intent(IntentKind.QUARANTINE, {"digest": str(ev_row[0])})
+        rt.store.reconcile_policy()
+        l2_ev_red = _call_ok(
+            bridge,
+            rt,
+            "get_artifact",
+            {
+                "workspace_id": ws.repo_id,
+                "task_id": tid,
+                "artifact_id": tid,
+                "revision_epoch": 0,
+                "revision": 2,
+                "level": "L2",
+                "idempotency_key": "idem-wrk-l2-evred-01",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        assert l2_ev_red["status"] == "ok"
+        assert "Please verify UTF-8" not in str(l2_ev_red["resources"])
+        assert '"status":"redacted"' in str(l2_ev_red["resources"])
+
+        bak = create_store_backup(rt.store, adapters, clock.now())
+
+        # Quarantine task goal digest -> get_artifact returns Redacted with 0 resources & NO served_receipt_id!
+        rt.policy.record_intent(IntentKind.QUARANTINE, {"digest": hdr1.goal_ref or ""})
+        rt.store.reconcile_policy()
+        l1_goal_red = _call_ok(
+            bridge,
+            rt,
+            "get_artifact",
+            {
+                "workspace_id": ws.repo_id,
+                "task_id": tid,
+                "artifact_id": tid,
+                "revision_epoch": 0,
+                "revision": 1,
+                "level": "L1",
+                "idempotency_key": "idem-wrk-l1-red-0001",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        assert l1_goal_red["status"] == "redacted"
+        assert l1_goal_red["resources"] == []
+        assert "served_receipt_id" not in l1_goal_red
+    finally:
+        rt.close()
+
+    # Restore store -> restore_epoch bumps -> pre-restore replay flips to not_holder & stale fence rejected!
+    clock.advance(dt.timedelta(seconds=5))
+    with maintenance_lease(root / "data", adapters) as (droot, lease):
+        pol_h = PolicyStore.open(droot, lease, adapters, migrations=KERNEL_POLICY_MIGRATIONS)
+        try:
+            rep = restore_store(
+                droot,
+                lease,
+                adapters,
+                bak,
+                pol_h,
+                clock.now(),
+                migrations=KERNEL_STORE_MIGRATIONS,
+            )
+        finally:
+            pol_h.close()
+    assert rep.new_epoch >= 1
+
+    rt_rest = open_kernel_job_runtime(root / "data", adapters, role="sp24-worker")
+    try:
+        dom2 = build_default_handoff_domain(rt=rt_rest, clock=clock, writer_epoch=rt_rest.lease.epoch)
+        assert dom2 is not None
+        br2 = KernelBridge(
+            store=rt_rest.store,
+            policy=rt_rest.policy,
+            clock=clock,
+            writer_epoch=rt_rest.lease.epoch,
+            domain=dom2,
+        )
+        sub1_post = _call_ok(
+            br2,
+            rt_rest,
+            "submit_episode",
+            {
+                "task_id": tid,
+                "session_id": "RAW_SID_WORKER_999",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "evidence": [],
+                "base_revision": 0,
+                "fence": {"restore_epoch": 0, "writer_generation": 0},
+                "handoff": {"working_goal": "Agent state preserved across worker refresh"},
+                "idempotency_key": "idem-wrk-sub1-00001",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        assert sub1_post["writer_status"] == "not_holder"
+        assert (
+            _call_err(
+                br2,
+                rt_rest,
+                "submit_episode",
+                {
+                    "task_id": tid,
+                    "session_id": "RAW_SID_WORKER_999",
+                    "workspace_id": ws.repo_id,
+                    "checkout_id": ws.checkout_id,
+                    "evidence": [],
+                    "base_revision": 1,
+                    "fence": sub1["fence"],
+                    "handoff": {"working_goal": "Should fail stale epoch"},
+                    "idempotency_key": "idem-wrk-stale-epoch",
+                },
+                cred=cred,
+                scope=scope,
+            )
+            == ErrorCode.REVISION_CONFLICT.value
+        )
+    finally:
+        rt_rest.close()
+
+
+def test_replay_ack_writer_status_requires_live_fence_match_across_siblings(trusted_tmp: Path) -> None:
+    """F1 oracle (§7.4, case 74): replay ACK has writer_status='holder' iff caller holds task AND ACK fence == live."""
+    from superbrain.composition._daemon_session import build_default_handoff_domain
+    from superbrain.composition.kernel_bridge import KernelBridge
+    from superbrain.storage.backup import create_store_backup
+    from superbrain.storage.kernel_schema import KERNEL_POLICY_MIGRATIONS, KERNEL_STORE_MIGRATIONS
+    from superbrain.storage.policy_store import PolicyStore
+    from superbrain.storage.restore import restore_store
+    from tests.storage.conftest import maintenance_lease
+
+    clock = FakeClock(dt.datetime(2026, 11, 26, 6, 0, tzinfo=dt.UTC))
+    adapters = os_adapters(clock=clock)
+    root = trusted_tmp / "f1-replay-fence"
+    rt = open_kernel_job_runtime(root / "data", adapters, role="sp24-f1")
+    try:
+        cred_a = seed_principal_and_credential(rt.policy, owner_id="dan", harness_id="claude-code", machine_id="m1")
+        cred_b = seed_principal_and_credential(rt.policy, owner_id="dan", harness_id="codex", machine_id="m1")
+        ws = register_workspace_direct(
+            rt,
+            clock,
+            cred_a.principal,
+            alias="ws-f1",
+            checkout_dir=root / "chk-f1",
+            remote="https://github.example/dan/repo-f1.git",
+        )
+        seed_repo_grant(rt.policy, principal_id=cred_b.principal.principal_id, repo_id=ws.repo_id, owner_id="dan")
+        rt.store.reconcile_policy()
+
+        domain = build_default_handoff_domain(rt=rt, clock=clock, writer_epoch=rt.lease.epoch)
+        assert domain is not None
+        bridge = KernelBridge(store=rt.store, policy=rt.policy, clock=clock, writer_epoch=rt.lease.epoch, domain=domain)
+        scope = Scope(ws.repo_id, ws.checkout_id)
+
+        prep = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "work",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "description": "Replay writer_status fence probe",
+                "idempotency_key": "idem-sp24-f1-prep-0001",
+            },
+            cred=cred_a,
+            scope=scope,
+        )
+        tid = str(prep["task_id"])
+
+        def sub(cred: SeededCredential, sid: str, key: str, args: dict[str, JsonValue]) -> dict[str, Any]:
+            return _call_ok(
+                bridge,
+                rt,
+                "submit_episode",
+                {
+                    "task_id": tid,
+                    "session_id": sid,
+                    "workspace_id": ws.repo_id,
+                    "evidence": [],
+                    "idempotency_key": key,
+                    **args,
+                },
+                cred=cred,
+                scope=scope,
+            )
+
+        # A initial write -> gen 1, holder.
+        a1_args: dict[str, JsonValue] = {
+            "evidence": [],
+            "base_revision": 0,
+            "fence": {"restore_epoch": 0, "writer_generation": 0},
+            "handoff": {"working_goal": "A gen 1"},
+        }
+        a_g1 = sub(cred_a, "SID_A_F1", "idem-sp24-f1-a1-0001", a1_args)
+        assert a_g1["writer_status"] == "holder"
+        assert a_g1["fence"] == {"restore_epoch": 0, "writer_generation": 1}
+
+        # B takeover -> gen 2, holder; replay of A gen 1 -> not_holder.
+        b_g2 = sub(
+            cred_b,
+            "SID_B_F1",
+            "idem-sp24-f1-b2-0001",
+            {
+                "evidence": [],
+                "base_revision": 1,
+                "fence": a_g1["fence"],
+                "takeover": {"acknowledge_active": True},
+                "handoff": {"working_goal": "B gen 2"},
+            },
+        )
+        assert b_g2["writer_status"] == "holder"
+        assert b_g2["fence"] == {"restore_epoch": 0, "writer_generation": 2}
+        assert sub(cred_a, "SID_A_F1", "idem-sp24-f1-a1-0001", a1_args)["writer_status"] == "not_holder"
+
+        # A (same principal & same session) takes over -> gen 3, holder.
+        a3_args: dict[str, JsonValue] = {
+            "evidence": [],
+            "base_revision": 2,
+            "fence": b_g2["fence"],
+            "takeover": {"acknowledge_active": True},
+            "handoff": {"working_goal": "A gen 3"},
+        }
+        a_g3 = sub(cred_a, "SID_A_F1", "idem-sp24-f1-a3-0001", a3_args)
+        assert a_g3["writer_status"] == "holder"
+        assert a_g3["fence"] == {"restore_epoch": 0, "writer_generation": 3}
+
+        # Case 74 exact probe: replay A's stale gen 1 ACK while A holds gen 3 MUST report not_holder!
+        a_g1_replay = sub(cred_a, "SID_A_F1", "idem-sp24-f1-a1-0001", a1_args)
+        assert a_g1_replay["episode_id"] == a_g1["episode_id"]
+        assert a_g1_replay["fence"] == {"restore_epoch": 0, "writer_generation": 1}
+        assert a_g1_replay["writer_status"] == "not_holder"
+        assert sub(cred_a, "SID_A_F1", "idem-sp24-f1-a3-0001", a3_args)["writer_status"] == "holder"
+
+        # Takeover-only sibling: B takeover-only -> gen 4 (handoff_revision stays 3), A -> gen 5, B -> gen 6.
+        b4_args: dict[str, JsonValue] = {
+            "evidence": [],
+            "base_revision": 3,
+            "fence": a_g3["fence"],
+            "takeover": {"acknowledge_active": True},
+        }
+        b_g4_to = sub(cred_b, "SID_B_F1", "idem-sp24-f1-b4-0001", b4_args)
+        assert b_g4_to["writer_status"] == "holder"
+        assert b_g4_to["handoff_revision"] == 3
+        assert b_g4_to["fence"] == {"restore_epoch": 0, "writer_generation": 4}
+        a_g5_to = sub(
+            cred_a,
+            "SID_A_F1",
+            "idem-sp24-f1-a5-0001",
+            {"evidence": [], "base_revision": 3, "fence": b_g4_to["fence"], "takeover": {"acknowledge_active": True}},
+        )
+        b6_args: dict[str, JsonValue] = {
+            "evidence": [],
+            "base_revision": 3,
+            "fence": a_g5_to["fence"],
+            "takeover": {"acknowledge_active": True},
+        }
+        b_g6_to = sub(cred_b, "SID_B_F1", "idem-sp24-f1-b6-0001", b6_args)
+        assert sub(cred_b, "SID_B_F1", "idem-sp24-f1-b4-0001", b4_args)["writer_status"] == "not_holder"
+        assert sub(cred_b, "SID_B_F1", "idem-sp24-f1-b6-0001", b6_args)["writer_status"] == "holder"
+
+        # not_stored_policy sibling: holder gets holder at live fence; once fence moves past it, replay flips.
+        rt.policy.set_repo_policy(ws.repo_id, manual_submission_enabled=False)
+        bpol_args: dict[str, JsonValue] = {
+            "evidence": [],
+            "base_revision": 3,
+            "fence": b_g6_to["fence"],
+            "handoff": {"working_goal": "Blocked by policy"},
+        }
+        b_pol = sub(cred_b, "SID_B_F1", "idem-sp24-f1-bpol-01", bpol_args)
+        assert b_pol["handoff_status"] == "not_stored_policy"
+        assert b_pol["handoff_revision"] is None
+        assert b_pol["fence"] == {"restore_epoch": 0, "writer_generation": 6}
+        assert b_pol["writer_status"] == "holder"
+        assert sub(cred_b, "SID_B_F1", "idem-sp24-f1-bpol-01", bpol_args)["writer_status"] == "holder"
+
+        apol_args: dict[str, JsonValue] = {
+            "evidence": [],
+            "base_revision": 3,
+            "fence": b_g6_to["fence"],
+            "takeover": {"acknowledge_active": True},
+        }
+        a_pol = sub(cred_a, "SID_A_F1", "idem-sp24-f1-apol-01", apol_args)
+        assert a_pol["handoff_status"] == "not_stored_policy"
+        assert a_pol["writer_status"] == "not_holder"
+
+        rt.policy.set_repo_policy(ws.repo_id, manual_submission_enabled=True)
+        a_g7 = sub(
+            cred_a,
+            "SID_A_F1",
+            "idem-sp24-f1-a7-0001",
+            {"evidence": [], "base_revision": 3, "fence": b_g6_to["fence"], "takeover": {"acknowledge_active": True}},
+        )
+        b8_args: dict[str, JsonValue] = {
+            "evidence": [],
+            "base_revision": 3,
+            "fence": a_g7["fence"],
+            "takeover": {"acknowledge_active": True},
+        }
+        b_g8 = sub(cred_b, "SID_B_F1", "idem-sp24-f1-b8-0001", b8_args)
+        assert b_g8["writer_status"] == "holder"
+        assert b_g8["fence"] == {"restore_epoch": 0, "writer_generation": 8}
+        assert sub(cred_b, "SID_B_F1", "idem-sp24-f1-bpol-01", bpol_args)["writer_status"] == "not_holder"
+        assert sub(cred_a, "SID_A_F1", "idem-sp24-f1-apol-01", apol_args)["writer_status"] == "not_holder"
+
+        bak = create_store_backup(rt.store, adapters, clock.now())
+    finally:
+        rt.close()
+
+    # Restore sibling: pre-restore ACK (epoch 0) stays not_holder both before and after B retakes holder at epoch 1.
+    clock.advance(dt.timedelta(seconds=5))
+    with maintenance_lease(root / "data", adapters) as (droot, lease):
+        pol_h = PolicyStore.open(droot, lease, adapters, migrations=KERNEL_POLICY_MIGRATIONS)
+        try:
+            rep = restore_store(
+                droot,
+                lease,
+                adapters,
+                bak,
+                pol_h,
+                clock.now(),
+                migrations=KERNEL_STORE_MIGRATIONS,
+            )
+        finally:
+            pol_h.close()
+    assert rep.new_epoch >= 1
+
+    rt_rest = open_kernel_job_runtime(root / "data", adapters, role="sp24-f1-post")
+    try:
+        dom2 = build_default_handoff_domain(rt=rt_rest, clock=clock, writer_epoch=rt_rest.lease.epoch)
+        assert dom2 is not None
+        br2 = KernelBridge(
+            store=rt_rest.store,
+            policy=rt_rest.policy,
+            clock=clock,
+            writer_epoch=rt_rest.lease.epoch,
+            domain=dom2,
+        )
+        b8_replay_req: dict[str, JsonValue] = {
+            "task_id": tid,
+            "session_id": "SID_B_F1",
+            "workspace_id": ws.repo_id,
+            "idempotency_key": "idem-sp24-f1-b8-0001",
+            **b8_args,
+        }
+        assert (
+            _call_ok(br2, rt_rest, "submit_episode", b8_replay_req, cred=cred_b, scope=scope)["writer_status"]
+            == "not_holder"
+        )
+        b_ep1 = _call_ok(
+            br2,
+            rt_rest,
+            "submit_episode",
+            {
+                "task_id": tid,
+                "session_id": "SID_B_F1",
+                "workspace_id": ws.repo_id,
+                "evidence": [],
+                "base_revision": 3,
+                "fence": {"restore_epoch": rep.new_epoch, "writer_generation": 8},
+                "takeover": {"acknowledge_active": True},
+                "idempotency_key": "idem-sp24-f1-b9-rest",
+            },
+            cred=cred_b,
+            scope=scope,
+        )
+        assert b_ep1["writer_status"] == "holder"
+        assert b_ep1["fence"] == {"restore_epoch": rep.new_epoch, "writer_generation": 9}
+        assert (
+            _call_ok(br2, rt_rest, "submit_episode", b8_replay_req, cred=cred_b, scope=scope)["writer_status"]
+            == "not_holder"
+        )
+    finally:
+        rt_rest.close()
+
+
+def test_prepare_task_description_privacy_filter_manual_submission_and_rejection(trusted_tmp: Path) -> None:
+    """F2 oracle (§14.2): prepare_task filters description before staging goal CAS blob across all flag paths."""
+    from superbrain.composition._daemon_session import build_default_handoff_domain
+    from superbrain.composition.kernel_bridge import KernelBridge
+    from superbrain.storage.cas import blob_path
+
+    clock = FakeClock(dt.datetime(2026, 11, 26, 6, 30, tzinfo=dt.UTC))
+    adapters = os_adapters(clock=clock)
+    root = trusted_tmp / "f2-goal-privacy"
+    rt = open_kernel_job_runtime(root / "data", adapters, role="sp24-f2")
+    cas_dir = root / "data" / "store" / "cas"
+
+    def _cas_files() -> set[Path]:
+        return {p for p in cas_dir.rglob("*") if p.is_file()} if cas_dir.exists() else set()
+
+    def _blob_bytes_for_digest(digest: str) -> bytes:
+        return blob_path(cas_dir, digest).read_bytes()
+
+    try:
+        cred = seed_principal_and_credential(rt.policy, owner_id="dan", harness_id="claude-code", machine_id="m1")
+        ws = register_workspace_direct(
+            rt,
+            clock,
+            cred.principal,
+            alias="ws-f2",
+            checkout_dir=root / "chk-f2",
+            remote="https://github.example/dan/repo-f2.git",
+        )
+        rt.store.reconcile_policy()
+        domain = build_default_handoff_domain(rt=rt, clock=clock, writer_epoch=rt.lease.epoch)
+        assert domain is not None
+        bridge = KernelBridge(store=rt.store, policy=rt.policy, clock=clock, writer_epoch=rt.lease.epoch, domain=domain)
+        scope = Scope(ws.repo_id, ws.checkout_id)
+
+        # 1. Positive twin: normal description under manual_submission=True is stored verbatim & renders in L0/L1/L2.
+        pos = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "work",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "description": "Implement UTF-8 byte budget verification",
+                "idempotency_key": "idem-sp24-f2-pos-01",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        pos_tid = str(pos["task_id"])
+        with rt.store.transaction() as txn:
+            prow = txn.db.execute("SELECT goal_ref FROM task_handoffs WHERE task_id = ?", (pos_tid,)).fetchone()
+            assert prow is not None and isinstance(prow[0], str)
+            pos_goal_ref = prow[0]
+        assert _blob_bytes_for_digest(pos_goal_ref) == b"Implement UTF-8 byte budget verification"
+        cas_before_replay = _cas_files()
+        assert (
+            _call_ok(
+                bridge,
+                rt,
+                "prepare_task",
+                {
+                    "mode": "work",
+                    "workspace_id": ws.repo_id,
+                    "checkout_id": ws.checkout_id,
+                    "description": "Implement UTF-8 byte budget verification",
+                    "idempotency_key": "idem-sp24-f2-pos-01",
+                },
+                cred=cred,
+                scope=scope,
+            )
+            == pos
+        )
+        assert _cas_files() == cas_before_replay
+
+        # 2. Redaction under manual_submission=True: <private>...</private> and secret redacted BEFORE hold_blob.
+        priv = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "work",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "description": "Goal <private>SP24_GOAL_PRIVATE_CANARY</private> password=SP24_PWD_CANARY end",
+                "idempotency_key": "idem-sp24-f2-priv-01",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        priv_tid = str(priv["task_id"])
+        with rt.store.transaction() as txn:
+            r_priv = txn.db.execute("SELECT goal_ref FROM task_handoffs WHERE task_id = ?", (priv_tid,)).fetchone()
+            assert r_priv is not None and isinstance(r_priv[0], str)
+            priv_goal_ref = r_priv[0]
+        priv_blob = _blob_bytes_for_digest(priv_goal_ref)
+        assert b"[redacted]" in priv_blob
+        assert b"SP24_GOAL_PRIVATE_CANARY" not in priv_blob
+        assert b"SP24_PWD_CANARY" not in priv_blob
+
+        # Render L1 -> task_goal is filtered too (no raw canary).
+        sub_priv = _call_ok(
+            bridge,
+            rt,
+            "submit_episode",
+            {
+                "task_id": priv_tid,
+                "session_id": "SID_F2_PRIV",
+                "workspace_id": ws.repo_id,
+                "evidence": [],
+                "base_revision": 0,
+                "fence": priv["handoff_live"]["fence"],
+                "handoff": {"working_goal": "Check filtered goal rendering"},
+                "idempotency_key": "idem-sp24-f2-sub-01",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        assert sub_priv["handoff_revision"] == 1
+        l1_priv = _call_ok(
+            bridge,
+            rt,
+            "get_artifact",
+            {
+                "workspace_id": ws.repo_id,
+                "task_id": priv_tid,
+                "artifact_id": priv_tid,
+                "revision": 1,
+                "level": "L1",
+                "idempotency_key": "idem-sp24-f2-l1-001",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        assert "SP24_GOAL_PRIVATE_CANARY" not in str(l1_priv)
+        assert "[redacted]" in str(l1_priv)
+
+        # 3. manual_submission=False: metadata-only work task (0 new CAS blobs, NULL goal_ref, replay identical).
+        rt.policy.set_repo_policy(ws.repo_id, manual_submission_enabled=False)
+        cas_before_off = _cas_files()
+        man_off = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "work",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "description": "Manual off <private>SP24_MANUAL_OFF_CANARY</private> goal",
+                "idempotency_key": "idem-sp24-f2-moff-01",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        off_tid = str(man_off["task_id"])
+        assert _cas_files() == cas_before_off
+        with rt.store.transaction() as txn:
+            t_off = txn.db.execute(
+                "SELECT goal_ref, goal_holder_id FROM tasks WHERE task_id = ?", (off_tid,)
+            ).fetchone()
+            h_off = txn.db.execute(
+                "SELECT goal_ref, goal_holder_id FROM task_handoffs WHERE task_id = ?", (off_tid,)
+            ).fetchone()
+            assert t_off == (None, None)
+            assert h_off == (None, None)
+        assert (
+            _call_ok(
+                bridge,
+                rt,
+                "prepare_task",
+                {
+                    "mode": "work",
+                    "workspace_id": ws.repo_id,
+                    "checkout_id": ws.checkout_id,
+                    "description": "Manual off <private>SP24_MANUAL_OFF_CANARY</private> goal",
+                    "idempotency_key": "idem-sp24-f2-moff-01",
+                },
+                cred=cred,
+                scope=scope,
+            )
+            == man_off
+        )
+        assert _cas_files() == cas_before_off
+
+        # 4. Filter-rejected input (unclosed <private>) fails closed under both manual_submission=False and True.
+        for label, enabled, target_tid in (
+            ("manoff_new", False, None),
+            ("manon_new", True, None),
+            ("manon_existing", True, pos_tid),
+        ):
+            rt.policy.set_repo_policy(ws.repo_id, manual_submission_enabled=enabled)
+            cas_pre = _cas_files()
+            with rt.store.transaction() as txn:
+                deliv_pre = int(txn.db.execute("SELECT COUNT(*) FROM deliveries").fetchone()[0])
+                tasks_pre = int(txn.db.execute("SELECT COUNT(*) FROM tasks").fetchone()[0])
+            req_args: dict[str, JsonValue] = {
+                "mode": "work",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "description": f"Bad <private>SP24_REJECT_UNCLOSED_CANARY_{label}",
+                "idempotency_key": f"idem-sp24-f2-rj-{label}",
+            }
+            if target_tid is not None:
+                req_args["task_id"] = target_tid
+            err_env = _dispatch_call(bridge, rt, "prepare_task", req_args, cred=cred, scope=scope)
+            assert err_env.get("ok") is False, err_env
+            assert err_env["error"]["code"] == ErrorCode.INVALID_INPUT.value
+            assert "SP24_REJECT_UNCLOSED_CANARY" not in str(err_env)
+            assert _cas_files() == cas_pre
+            with rt.store.transaction() as txn:
+                assert int(txn.db.execute("SELECT COUNT(*) FROM deliveries").fetchone()[0]) == deliv_pre
+                assert int(txn.db.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]) == tasks_pre
+
+        for p in (root / "data" / "store").rglob("*"):
+            if p.is_file():
+                raw_b = p.read_bytes()
+                assert b"SP24_GOAL_PRIVATE_CANARY" not in raw_b
+                assert b"SP24_PWD_CANARY" not in raw_b
+                assert b"SP24_MANUAL_OFF_CANARY" not in raw_b
+                assert b"SP24_REJECT_UNCLOSED_CANARY" not in raw_b
+    finally:
+        rt.close()
+
+
+def test_delivery_replay_pins_committed_revision_and_rechecks_live_policy_and_restore(trusted_tmp: Path) -> None:
+    """R2-F1 oracle (§6.3, §7.4): replay renders pinned delivery revision under live policy and live fence."""
+    from superbrain.application.continuity_worker import ContinuityWorkerCoordinator
+    from superbrain.composition._daemon_session import build_default_handoff_domain
+    from superbrain.composition.kernel_bridge import KernelBridge
+    from superbrain.ports.policy import IntentKind
+    from superbrain.storage.backup import create_store_backup
+    from superbrain.storage.handoffs import HandoffStore
+    from superbrain.storage.kernel_schema import KERNEL_POLICY_MIGRATIONS, KERNEL_STORE_MIGRATIONS
+    from superbrain.storage.policy_store import PolicyStore
+    from superbrain.storage.restore import restore_store
+    from superbrain.storage.sessions import SessionStore
+    from superbrain.workers.executor import PRODUCTION_JOB_HANDLERS, JobExecutor
+    from tests.storage.conftest import maintenance_lease
+    from tests.support.inc2_fixture import kernel_job_service
+
+    clock = FakeClock(dt.datetime(2026, 11, 26, 7, 0, tzinfo=dt.UTC))
+    adapters = os_adapters(clock=clock)
+    root = trusted_tmp / "r2-f1-replay"
+    rt = open_kernel_job_runtime(root / "data", adapters, role="sp24-r2-f1")
+    try:
+        cred = seed_principal_and_credential(rt.policy, owner_id="dan", harness_id="claude-code", machine_id="m1")
+        ws = register_workspace_direct(
+            rt,
+            clock,
+            cred.principal,
+            alias="ws-r2f1",
+            checkout_dir=root / "chk-r2f1",
+            remote="https://github.example/dan/repo-r2f1.git",
+        )
+        rt.store.reconcile_policy()
+        domain = build_default_handoff_domain(rt=rt, clock=clock, writer_epoch=rt.lease.epoch)
+        assert domain is not None
+        bridge = KernelBridge(store=rt.store, policy=rt.policy, clock=clock, writer_epoch=rt.lease.epoch, domain=domain)
+        scope = Scope(ws.repo_id, ws.checkout_id)
+
+        # 1. Initial delivery D0 (rev 0 -> no continuity). After agent patch rev 1, D0 replay STILL has continuity=[].
+        d0_args: dict[str, JsonValue] = {
+            "mode": "work",
+            "workspace_id": ws.repo_id,
+            "checkout_id": ws.checkout_id,
+            "description": "Pinned delivery replay goal",
+            "idempotency_key": "idem-r2f1-d0-00001",
+        }
+        d0 = _call_ok(bridge, rt, "prepare_task", d0_args, cred=cred, scope=scope)
+        tid = str(d0["task_id"])
+        assert d0["continuity"] == []
+        assert d0["handoff_live"]["revision"] is None
+
+        s1 = _call_ok(
+            bridge,
+            rt,
+            "submit_episode",
+            {
+                "task_id": tid,
+                "session_id": "SID_R2F1_01",
+                "workspace_id": ws.repo_id,
+                "evidence": [],
+                "base_revision": 0,
+                "fence": d0["handoff_live"]["fence"],
+                "handoff": {"working_goal": "Working goal at rev 1"},
+                "idempotency_key": "idem-r2f1-sub1-00001",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        assert s1["handoff_revision"] == 1
+        d0_replay = _call_ok(bridge, rt, "prepare_task", d0_args, cred=cred, scope=scope)
+        assert d0_replay["delivery_id"] == d0["delivery_id"]
+        assert d0_replay["continuity"] == []
+        assert d0_replay["handoff_live"]["revision"] == 1
+
+        # 2. Fresh Delivery D1 at rev 1; backup rev-1 state before later revisions for restore/reuse test.
+        d1_args: dict[str, JsonValue] = {
+            "mode": "work",
+            "workspace_id": ws.repo_id,
+            "checkout_id": ws.checkout_id,
+            "task_id": tid,
+            "description": "Delivery D1 pinned at rev 1",
+            "idempotency_key": "idem-r2f1-d1-00001",
+        }
+        d1 = _call_ok(bridge, rt, "prepare_task", d1_args, cred=cred, scope=scope)
+        assert len(d1["continuity"]) == 1
+        assert d1["continuity"][0]["revision_epoch"] == 0
+        assert d1["continuity"][0]["revision"] == 1
+        d1_digest = d1["continuity"][0]["digest"]
+        assert "Working goal at rev 1" in d1["continuity"][0]["summary"]
+        bak_rev1 = create_store_backup(rt.store, adapters, clock.now())
+
+        # 3. Observed-only refresh creates rev 2 (handoff_revision stays 1) -> D1 replay stays on rev 1!
+        hs = HandoffStore(rt.store, rt.policy)
+        ss = SessionStore(rt.store, rt.policy)
+        hdr1 = hs.read_header(tid, principal_id=cred.principal.principal_id, scope=scope)
+        assert hdr1 is not None and hdr1.holder_session_ref is not None
+        assert hdr1.agent_ref is not None
+        rev1_agent_ref = hdr1.agent_ref
+        ss.record_session_event(
+            session_ref=hdr1.holder_session_ref,
+            repo_id=ws.repo_id,
+            checkout_id=ws.checkout_id,
+            task_id=tid,
+            producer_stream="stream-r2f1",
+            event=CaptureEventRecord(
+                event_id="ev-r2f1-obs-1",
+                producer_stream="stream-r2f1",
+                sequence=1,
+                harness_id="claude-code",
+                kind="user_message",
+                recorded_at="2026-11-26T07:00:05Z",
+                payload={"role": "user", "text": "Observed update at rev 2"},
+                session_ref=hdr1.holder_session_ref,
+            ),
+            now=clock.now(),
+        )
+        svc, _ = kernel_job_service(rt, clock)
+        exec_ = JobExecutor(PRODUCTION_JOB_HANDLERS, lambda: 10_000)
+        exec_.start()
+        try:
+            coord = ContinuityWorkerCoordinator(
+                rt=rt, job_service=svc, executor=exec_, clock=clock, mono=lambda: 10_000
+            )
+            clock.advance(dt.timedelta(seconds=65))
+            assert coord.enqueue_if_due(task_id=tid, now=clock.now()) is not None
+            assert coord.run_next(writer_epoch=rt.lease.epoch, now=clock.now()) is True
+        finally:
+            exec_.close(5.0)
+
+        d1_after_obs = _call_ok(bridge, rt, "prepare_task", d1_args, cred=cred, scope=scope)
+        assert d1_after_obs["delivery_id"] == d1["delivery_id"]
+        assert d1_after_obs["handoff_live"]["revision"] == 2
+        assert len(d1_after_obs["continuity"]) == 1
+        assert d1_after_obs["continuity"][0]["revision"] == 1
+        assert d1_after_obs["continuity"][0]["digest"] == d1_digest
+
+        # 4. Agent patch advances to rev 3 (handoff_revision=2), plus Delivery D2 pinned at rev 3.
+        s3 = _call_ok(
+            bridge,
+            rt,
+            "submit_episode",
+            {
+                "task_id": tid,
+                "session_id": "SID_R2F1_01",
+                "workspace_id": ws.repo_id,
+                "evidence": [],
+                "base_revision": 1,
+                "fence": s1["fence"],
+                "handoff": {"working_goal": "Working goal updated to rev 3"},
+                "idempotency_key": "idem-r2f1-sub3-00001",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        assert s3["handoff_revision"] == 2
+        d2_args: dict[str, JsonValue] = {
+            "mode": "work",
+            "workspace_id": ws.repo_id,
+            "checkout_id": ws.checkout_id,
+            "task_id": tid,
+            "description": "Delivery D2 pinned at rev 3",
+            "idempotency_key": "idem-r2f1-d2-00001",
+        }
+        d2 = _call_ok(bridge, rt, "prepare_task", d2_args, cred=cred, scope=scope)
+        assert d2["continuity"][0]["revision"] == 3
+
+        d1_after_rev3 = _call_ok(bridge, rt, "prepare_task", d1_args, cred=cred, scope=scope)
+        assert d1_after_rev3["delivery_id"] == d1["delivery_id"]
+        assert d1_after_rev3["handoff_live"]["revision"] == 3
+        assert d1_after_rev3["continuity"][0]["revision"] == 1
+        assert d1_after_rev3["continuity"][0]["digest"] == d1_digest
+
+        # 5. Quarantine rev 3's agent_ref: D2 replay MUST return redacted while D1 (rev 1) stays ok!
+        hdr3 = hs.read_header(tid, principal_id=cred.principal.principal_id, scope=scope)
+        assert hdr3 is not None and hdr3.agent_ref is not None
+        assert hdr3.agent_ref != rev1_agent_ref
+        rt.policy.record_intent(IntentKind.QUARANTINE, {"digest": hdr3.agent_ref})
+        rt.store.reconcile_policy()
+        d2_quar = _call_ok(bridge, rt, "prepare_task", d2_args, cred=cred, scope=scope)
+        assert d2_quar["delivery_id"] == d2["delivery_id"]
+        assert d2_quar["handoff_live"]["revision"] == 3
+        assert d2_quar["continuity"] == [
+            {"kind": "handoff", "id": tid, "status": "redacted", "reason": "quarantined"}
+        ]
+        d1_still_ok = _call_ok(bridge, rt, "prepare_task", d1_args, cred=cred, scope=scope)
+        assert d1_still_ok["continuity"][0]["status"] == "ok"
+        assert d1_still_ok["continuity"][0]["revision"] == 1
+    finally:
+        rt.close()
+
+    # 6. Restore to rev-1 backup (bumps restore_epoch -> 1), then reuse rev 2 on epoch 1 -> D1 stays (0, 1),
+    #    handoff_live reports (1, 2), and (0, 2) never aliases (1, 2)!
+    clock.advance(dt.timedelta(seconds=5))
+    with maintenance_lease(root / "data", adapters) as (droot, lease):
+        pol_h = PolicyStore.open(droot, lease, adapters, migrations=KERNEL_POLICY_MIGRATIONS)
+        try:
+            rep = restore_store(
+                droot, lease, adapters, bak_rev1, pol_h, clock.now(), migrations=KERNEL_STORE_MIGRATIONS
+            )
+        finally:
+            pol_h.close()
+    assert rep.new_epoch >= 1
+
+    rt2 = open_kernel_job_runtime(root / "data", adapters, role="sp24-r2-f1-rest")
+    try:
+        dom2 = build_default_handoff_domain(rt=rt2, clock=clock, writer_epoch=rt2.lease.epoch)
+        assert dom2 is not None
+        br2 = KernelBridge(store=rt2.store, policy=rt2.policy, clock=clock, writer_epoch=rt2.lease.epoch, domain=dom2)
+        d1_post_rest = _call_ok(br2, rt2, "prepare_task", d1_args, cred=cred, scope=scope)
+        assert d1_post_rest["continuity"][0]["revision_epoch"] == 0
+        assert d1_post_rest["continuity"][0]["revision"] == 1
+        assert d1_post_rest["handoff_live"]["fence"]["restore_epoch"] == rep.new_epoch
+
+        sub_ep1 = _call_ok(
+            br2,
+            rt2,
+            "submit_episode",
+            {
+                "task_id": tid,
+                "session_id": "SID_R2F1_REST",
+                "workspace_id": ws.repo_id,
+                "evidence": [],
+                "base_revision": 1,
+                "fence": d1_post_rest["handoff_live"]["fence"],
+                "takeover": {"acknowledge_active": True},
+                "handoff": {"working_goal": "Post-restore reused rev 2"},
+                "idempotency_key": "idem-r2f1-sub2-ep1",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        assert sub_ep1["handoff_revision"] == 2
+        d2_ep1_args: dict[str, JsonValue] = {
+            "mode": "work",
+            "workspace_id": ws.repo_id,
+            "checkout_id": ws.checkout_id,
+            "task_id": tid,
+            "description": "Delivery D2_ep1 pinned at (1, 2)",
+            "idempotency_key": "idem-r2f1-d2-ep1-1",
+        }
+        d2_ep1 = _call_ok(br2, rt2, "prepare_task", d2_ep1_args, cred=cred, scope=scope)
+        assert d2_ep1["continuity"][0]["revision_epoch"] == rep.new_epoch
+        assert d2_ep1["continuity"][0]["revision"] == 2
+
+        d1_reused = _call_ok(br2, rt2, "prepare_task", d1_args, cred=cred, scope=scope)
+        assert d1_reused["continuity"][0]["revision_epoch"] == 0
+        assert d1_reused["continuity"][0]["revision"] == 1
+        assert "Working goal at rev 1" in d1_reused["continuity"][0]["summary"]
+        assert d1_reused["handoff_live"]["revision_epoch"] == rep.new_epoch
+        assert d1_reused["handoff_live"]["revision"] == 2
+
+        # Quarantine rev 1's agent_ref post-restore: D1 (0, 1) becomes redacted while D2_ep1 (1, 2) remains ok!
+        rt2.policy.record_intent(IntentKind.QUARANTINE, {"digest": rev1_agent_ref})
+        rt2.store.reconcile_policy()
+        d1_ep_quar = _call_ok(br2, rt2, "prepare_task", d1_args, cred=cred, scope=scope)
+        assert d1_ep_quar["continuity"] == [
+            {"kind": "handoff", "id": tid, "status": "redacted", "reason": "quarantined"}
+        ]
+        d2_ep1_ok = _call_ok(br2, rt2, "prepare_task", d2_ep1_args, cred=cred, scope=scope)
+        assert d2_ep1_ok["continuity"][0]["status"] == "ok"
+        assert d2_ep1_ok["continuity"][0]["revision"] == 2
+
+        hs2 = HandoffStore(rt2.store, rt2.policy)
+        old_alias = hs2.render_delivery_handoff_l0(
+            task_id=tid,
+            owner_id="dan",
+            repo_id=ws.repo_id,
+            checkout_id=ws.checkout_id,
+            revision_epoch=0,
+            revision=2,
+            served_digest=None,
+            now=clock.now(),
+        )
+        assert old_alias.status == "redacted" and old_alias.reason == "not_found"
+    finally:
+        rt2.close()
+
+
+def test_resume_exposure_evidence_distinguishes_unknown_served_only_read_ack_and_receipt_guards(
+    trusted_tmp: Path,
+) -> None:
+    """R2-F2 oracle (§7.4, cases 36, 63, 69): resume sets exposure_evidence to unknown / served_only / read_ack."""
+    from superbrain.application.continuity_worker import ContinuityWorkerCoordinator
+    from superbrain.composition._daemon_session import build_default_handoff_domain
+    from superbrain.composition.kernel_bridge import KernelBridge
+    from superbrain.storage.handoffs import HandoffStore
+    from superbrain.storage.sessions import SessionStore
+    from superbrain.workers.executor import PRODUCTION_JOB_HANDLERS, JobExecutor
+    from tests.support.inc2_fixture import kernel_job_service
+
+    clock = FakeClock(dt.datetime(2026, 11, 26, 8, 0, tzinfo=dt.UTC))
+    adapters = os_adapters(clock=clock)
+    root = trusted_tmp / "r2-f2-resume"
+    rt = open_kernel_job_runtime(root / "data", adapters, role="sp24-r2-f2")
+    try:
+        cred_a = seed_principal_and_credential(rt.policy, owner_id="dan", harness_id="claude-code", machine_id="m1")
+        cred_b = seed_principal_and_credential(rt.policy, owner_id="dan", harness_id="codex", machine_id="m1")
+        ws = register_workspace_direct(
+            rt,
+            clock,
+            cred_a.principal,
+            alias="ws-r2f2",
+            checkout_dir=root / "chk-r2f2",
+            remote="https://github.example/dan/repo-r2f2.git",
+        )
+        seed_repo_grant(rt.policy, principal_id=cred_b.principal.principal_id, repo_id=ws.repo_id, owner_id="dan")
+        rt.store.reconcile_policy()
+
+        domain = build_default_handoff_domain(rt=rt, clock=clock, writer_epoch=rt.lease.epoch)
+        assert domain is not None
+        bridge = KernelBridge(store=rt.store, policy=rt.policy, clock=clock, writer_epoch=rt.lease.epoch, domain=domain)
+        scope = Scope(ws.repo_id, ws.checkout_id)
+
+        prep_a = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "work",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "description": "Primary task for resume exposure test",
+                "idempotency_key": "idem-r2f2-prep-a-01",
+            },
+            cred=cred_a,
+            scope=scope,
+        )
+        tid = str(prep_a["task_id"])
+        sub1 = _call_ok(
+            bridge,
+            rt,
+            "submit_episode",
+            {
+                "task_id": tid,
+                "session_id": "SID_R2F2_A",
+                "workspace_id": ws.repo_id,
+                "evidence": [],
+                "base_revision": 0,
+                "fence": prep_a["handoff_live"]["fence"],
+                "handoff": {"working_goal": "Verify resume exposure levels"},
+                "idempotency_key": "idem-r2f2-sub1-a-01",
+            },
+            cred=cred_a,
+            scope=scope,
+        )
+        assert sub1["handoff_revision"] == 1
+
+        # Second task on same checkout to verify cross-task receipt rejection.
+        prep_other = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "work",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "description": "Other task for cross-task receipt guard",
+                "idempotency_key": "idem-r2f2-prep-oth-1",
+            },
+            cred=cred_a,
+            scope=scope,
+        )
+        tid_other = str(prep_other["task_id"])
+        _call_ok(
+            bridge,
+            rt,
+            "submit_episode",
+            {
+                "task_id": tid_other,
+                "session_id": "SID_R2F2_OTH",
+                "workspace_id": ws.repo_id,
+                "evidence": [],
+                "base_revision": 0,
+                "fence": prep_other["handoff_live"]["fence"],
+                "handoff": {"working_goal": "Other task goal"},
+                "idempotency_key": "idem-r2f2-sub-oth-01",
+            },
+            cred=cred_a,
+            scope=scope,
+        )
+
+        # Serve L0, L1 (acked), L1 (served_only), L1 (pending), and other-task L1.
+        def serve_and_finalize(key: str, *, target_tid: str, level: str, finalize: bool = True) -> dict[str, Any]:
+            res = _call_ok(
+                bridge,
+                rt,
+                "get_artifact",
+                {
+                    "workspace_id": ws.repo_id,
+                    "task_id": target_tid,
+                    "artifact_id": target_tid,
+                    "revision_epoch": 0,
+                    "revision": 1,
+                    "level": level,
+                    "idempotency_key": key,
+                },
+                cred=cred_a,
+                scope=scope,
+            )
+            if finalize:
+                bridge.finalize_send_attempt(bridge.build_send_completion(str(res["served_receipt_id"])))
+            return res
+
+        l0_res = serve_and_finalize("idem-r2f2-get-l0-01", target_tid=tid, level="L0")
+        l0_receipt_id = str(l0_res["served_receipt_id"])
+        l1_ack_res = serve_and_finalize("idem-r2f2-get-l1-a1", target_tid=tid, level="L1")
+        l1_acked_id = str(l1_ack_res["served_receipt_id"])
+        l1_served_res = serve_and_finalize("idem-r2f2-get-l1-a2", target_tid=tid, level="L1")
+        l1_served_only_id = str(l1_served_res["served_receipt_id"])
+        l1_pending_res = serve_and_finalize("idem-r2f2-get-l1-pd", target_tid=tid, level="L1", finalize=False)
+        l1_pending_id = str(l1_pending_res["served_receipt_id"])
+        other_l1_res = serve_and_finalize("idem-r2f2-get-l1-ot", target_tid=tid_other, level="L1")
+        other_l1_id = str(other_l1_res["served_receipt_id"])
+
+        l1_digs: list[JsonValue] = [
+            {"name": str(r["name"]), "digest": str(r["digest"])} for r in l1_ack_res["resources"]
+        ]
+        _call_ok(
+            bridge,
+            rt,
+            "submit_episode",
+            {
+                "task_id": tid,
+                "session_id": "SID_R2F2_A",
+                "workspace_id": ws.repo_id,
+                "evidence": [],
+                "read_acks": [
+                    {
+                        "served_receipt_id": l1_acked_id,
+                        "task_id": tid,
+                        "artifact_id": tid,
+                        "revision_epoch": 0,
+                        "revision": 1,
+                        "resource_digests": l1_digs,
+                    }
+                ],
+                "idempotency_key": "idem-r2f2-readack-01",
+            },
+            cred=cred_a,
+            scope=scope,
+        )
+
+        # Level 1: resume without receipt -> exposure_evidence == "unknown".
+        deliv_unk = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "work",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "task_id": tid,
+                "resume_ref": {
+                    "artifact_id": tid,
+                    "revision": 1,
+                    "handoff_revision": 1,
+                    "fence": sub1["fence"],
+                },
+                "description": "Resume without receipt",
+                "idempotency_key": "idem-r2f2-res-unk-01",
+            },
+            cred=cred_a,
+            scope=scope,
+        )
+
+        # Level 2: resume with finalized L1 receipt (no ReadAck) -> exposure_evidence == "served_only".
+        deliv_srv = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "work",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "task_id": tid,
+                "resume_ref": {
+                    "served_receipt_id": l1_served_only_id,
+                    "artifact_id": tid,
+                    "revision": 1,
+                    "handoff_revision": 1,
+                    "fence": sub1["fence"],
+                },
+                "description": "Resume with served_only receipt",
+                "idempotency_key": "idem-r2f2-res-srv-01",
+            },
+            cred=cred_a,
+            scope=scope,
+        )
+
+        # Level 3: resume with acked L1 receipt -> exposure_evidence == "read_ack".
+        deliv_ack = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "work",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "task_id": tid,
+                "resume_ref": {
+                    "served_receipt_id": l1_acked_id,
+                    "artifact_id": tid,
+                    "revision": 1,
+                    "handoff_revision": 1,
+                    "fence": sub1["fence"],
+                },
+                "description": "Resume with read_ack receipt",
+                "idempotency_key": "idem-r2f2-res-ack-01",
+            },
+            cred=cred_a,
+            scope=scope,
+        )
+
+        with rt.store.transaction() as txn:
+            rows = {
+                str(r[0]): (str(r[1]), None if r[2] is None else str(r[2]))
+                for r in txn.db.execute(
+                    "SELECT delivery_id, exposure_evidence, resume_receipt_id FROM deliveries"
+                ).fetchall()
+            }
+        assert rows[str(deliv_unk["delivery_id"])] == ("unknown", None)
+        assert rows[str(deliv_srv["delivery_id"])] == ("served_only", l1_served_only_id)
+        assert rows[str(deliv_ack["delivery_id"])] == ("read_ack", l1_acked_id)
+
+        # Negative guards: missing, wrong principal, wrong task, L0 receipt, pending receipt, wrong handoff_revision.
+        assert (
+            _call_err(
+                bridge,
+                rt,
+                "prepare_task",
+                {
+                    "mode": "work",
+                    "workspace_id": ws.repo_id,
+                    "checkout_id": ws.checkout_id,
+                    "task_id": tid,
+                    "resume_ref": {
+                        "served_receipt_id": "01999999-9999-7000-8000-000000000099",
+                        "artifact_id": tid,
+                        "revision": 1,
+                        "handoff_revision": 1,
+                        "fence": sub1["fence"],
+                    },
+                    "description": "Bad missing receipt",
+                    "idempotency_key": "idem-r2f2-bad-miss01",
+                },
+                cred=cred_a,
+                scope=scope,
+            )
+            == ErrorCode.NOT_FOUND.value
+        )
+        assert (
+            _call_err(
+                bridge,
+                rt,
+                "prepare_task",
+                {
+                    "mode": "work",
+                    "workspace_id": ws.repo_id,
+                    "checkout_id": ws.checkout_id,
+                    "task_id": tid,
+                    "resume_ref": {
+                        "served_receipt_id": l1_acked_id,
+                        "artifact_id": tid,
+                        "revision": 1,
+                        "handoff_revision": 1,
+                        "fence": sub1["fence"],
+                    },
+                    "description": "Bad wrong principal receipt",
+                    "idempotency_key": "idem-r2f2-bad-prin01",
+                },
+                cred=cred_b,
+                scope=scope,
+            )
+            == ErrorCode.NOT_FOUND.value
+        )
+        assert (
+            _call_err(
+                bridge,
+                rt,
+                "prepare_task",
+                {
+                    "mode": "work",
+                    "workspace_id": ws.repo_id,
+                    "checkout_id": ws.checkout_id,
+                    "task_id": tid,
+                    "resume_ref": {
+                        "served_receipt_id": other_l1_id,
+                        "artifact_id": tid,
+                        "revision": 1,
+                        "handoff_revision": 1,
+                        "fence": sub1["fence"],
+                    },
+                    "description": "Bad wrong task receipt",
+                    "idempotency_key": "idem-r2f2-bad-task01",
+                },
+                cred=cred_a,
+                scope=scope,
+            )
+            == ErrorCode.NOT_FOUND.value
+        )
+        assert (
+            _call_err(
+                bridge,
+                rt,
+                "prepare_task",
+                {
+                    "mode": "work",
+                    "workspace_id": ws.repo_id,
+                    "checkout_id": ws.checkout_id,
+                    "task_id": tid,
+                    "resume_ref": {
+                        "served_receipt_id": l0_receipt_id,
+                        "artifact_id": tid,
+                        "revision": 1,
+                        "handoff_revision": 1,
+                        "fence": sub1["fence"],
+                    },
+                    "description": "Bad L0 receipt",
+                    "idempotency_key": "idem-r2f2-bad-l0-001",
+                },
+                cred=cred_a,
+                scope=scope,
+            )
+            == ErrorCode.NOT_FOUND.value
+        )
+        assert (
+            _call_err(
+                bridge,
+                rt,
+                "prepare_task",
+                {
+                    "mode": "work",
+                    "workspace_id": ws.repo_id,
+                    "checkout_id": ws.checkout_id,
+                    "task_id": tid,
+                    "resume_ref": {
+                        "served_receipt_id": l1_pending_id,
+                        "artifact_id": tid,
+                        "revision": 1,
+                        "handoff_revision": 1,
+                        "fence": sub1["fence"],
+                    },
+                    "description": "Bad pending receipt",
+                    "idempotency_key": "idem-r2f2-bad-pend01",
+                },
+                cred=cred_a,
+                scope=scope,
+            )
+            == ErrorCode.IN_PROGRESS.value
+        )
+        assert (
+            _call_err(
+                bridge,
+                rt,
+                "prepare_task",
+                {
+                    "mode": "work",
+                    "workspace_id": ws.repo_id,
+                    "checkout_id": ws.checkout_id,
+                    "task_id": tid,
+                    "resume_ref": {
+                        "served_receipt_id": l1_acked_id,
+                        "artifact_id": tid,
+                        "revision": 1,
+                        "handoff_revision": 2,
+                        "fence": sub1["fence"],
+                    },
+                    "description": "Bad handoff_revision mismatch",
+                    "idempotency_key": "idem-r2f2-bad-hrev01",
+                },
+                cred=cred_a,
+                scope=scope,
+            )
+            == ErrorCode.REVISION_CONFLICT.value
+        )
+
+        # Case 63: observed-only update allows rev 1 resume with observed_newer; agent update blocks it as stale.
+        hs = HandoffStore(rt.store, rt.policy)
+        ss = SessionStore(rt.store, rt.policy)
+        hdr1 = hs.read_header(tid, principal_id=cred_a.principal.principal_id, scope=scope)
+        assert hdr1 is not None and hdr1.holder_session_ref is not None
+        ss.record_session_event(
+            session_ref=hdr1.holder_session_ref,
+            repo_id=ws.repo_id,
+            checkout_id=ws.checkout_id,
+            task_id=tid,
+            producer_stream="stream-r2f2",
+            event=CaptureEventRecord(
+                event_id="ev-r2f2-obs-1",
+                producer_stream="stream-r2f2",
+                sequence=1,
+                harness_id="claude-code",
+                kind="user_message",
+                recorded_at="2026-11-26T08:00:05Z",
+                payload={"role": "user", "text": "Observed update during resume"},
+                session_ref=hdr1.holder_session_ref,
+            ),
+            now=clock.now(),
+        )
+        svc, _ = kernel_job_service(rt, clock)
+        exec_ = JobExecutor(PRODUCTION_JOB_HANDLERS, lambda: 10_000)
+        exec_.start()
+        try:
+            coord = ContinuityWorkerCoordinator(
+                rt=rt, job_service=svc, executor=exec_, clock=clock, mono=lambda: 10_000
+            )
+            clock.advance(dt.timedelta(seconds=65))
+            assert coord.enqueue_if_due(task_id=tid, now=clock.now()) is not None
+            assert coord.run_next(writer_epoch=rt.lease.epoch, now=clock.now()) is True
+        finally:
+            exec_.close(5.0)
+
+        deliv_obs = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "work",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "task_id": tid,
+                "resume_ref": {
+                    "served_receipt_id": l1_acked_id,
+                    "artifact_id": tid,
+                    "revision": 1,
+                    "handoff_revision": 1,
+                    "fence": sub1["fence"],
+                },
+                "description": "Resume after observed-only update",
+                "idempotency_key": "idem-r2f2-res-obs1",
+            },
+            cred=cred_a,
+            scope=scope,
+        )
+        assert "observed_newer" in deliv_obs["degraded_codes"]
+        with rt.store.transaction() as txn:
+            ev_obs = txn.db.execute(
+                "SELECT exposure_evidence FROM deliveries WHERE delivery_id = ?", (str(deliv_obs["delivery_id"]),)
+            ).fetchone()
+            assert ev_obs == ("read_ack",)
+
+        _call_ok(
+            bridge,
+            rt,
+            "submit_episode",
+            {
+                "task_id": tid,
+                "session_id": "SID_R2F2_A",
+                "workspace_id": ws.repo_id,
+                "evidence": [],
+                "base_revision": 1,
+                "fence": sub1["fence"],
+                "handoff": {"working_goal": "Agent advance invalidates rev 1 resume"},
+                "idempotency_key": "idem-r2f2-sub2-a-01",
+            },
+            cred=cred_a,
+            scope=scope,
+        )
+        assert (
+            _call_err(
+                bridge,
+                rt,
+                "prepare_task",
+                {
+                    "mode": "work",
+                    "workspace_id": ws.repo_id,
+                    "checkout_id": ws.checkout_id,
+                    "task_id": tid,
+                    "resume_ref": {
+                        "served_receipt_id": l1_acked_id,
+                        "artifact_id": tid,
+                        "revision": 1,
+                        "handoff_revision": 1,
+                        "fence": sub1["fence"],
+                    },
+                    "description": "Resume stale after agent patch",
+                    "idempotency_key": "idem-r2f2-bad-stale1",
+                },
+                cred=cred_a,
+                scope=scope,
+            )
+            == ErrorCode.REVISION_CONFLICT.value
+        )
+    finally:
+        rt.close()
+
+
+def test_prepare_task_degraded_codes_discover_work_resume_and_replay(trusted_tmp: Path) -> None:
+    import json
+
+    import jsonschema
+
+    from superbrain.application.continuity_worker import ContinuityWorkerCoordinator
+    from superbrain.application.lineage import register_snapshot
+    from superbrain.composition._daemon_session import build_default_handoff_domain
+    from superbrain.composition.kernel_bridge import KernelBridge
+    from superbrain.core.kernel import SnapshotDescriptor
+    from superbrain.storage.handoffs import HandoffStore
+    from superbrain.storage.sessions import SessionStore
+    from superbrain.workers.executor import PRODUCTION_JOB_HANDLERS, JobExecutor
+    from tests.support.inc2_fixture import kernel_job_service
+
+    unavailable_codes = [
+        "skills_unavailable",
+        "lessons_unavailable",
+        "context_unavailable",
+        "finishing_gates_unavailable",
+    ]
+    schema_path = Path(__file__).resolve().parents[2] / "schemas" / "mcp-tools-v2.json"
+    schema_catalog = json.loads(schema_path.read_text(encoding="utf-8"))
+    discover_validator = jsonschema.Draft202012Validator(
+        {"$defs": schema_catalog["$defs"], "$ref": "#/$defs/PrepareTaskDiscoverResult"}
+    )
+    work_validator = jsonschema.Draft202012Validator(
+        {"$defs": schema_catalog["$defs"], "$ref": "#/$defs/PrepareTaskWorkResult"}
+    )
+
+    clock = FakeClock(dt.datetime(2026, 11, 26, 9, 0, tzinfo=dt.UTC))
+    rt = open_kernel_job_runtime(trusted_tmp / "r3-degraded" / "data", os_adapters(clock=clock), role="sp24-r3")
+    try:
+        cred = seed_principal_and_credential(rt.policy, owner_id="dan", harness_id="claude-code", machine_id="m1")
+        ws = register_workspace_direct(
+            rt,
+            clock,
+            cred.principal,
+            alias="ws-r3",
+            checkout_dir=trusted_tmp / "r3-degraded" / "chk",
+            remote="https://github.example/dan/r3.git",
+        )
+        rt.store.reconcile_policy()
+        scope = Scope(ws.repo_id, ws.checkout_id)
+        domain = build_default_handoff_domain(rt=rt, clock=clock, writer_epoch=rt.lease.epoch)
+        assert domain is not None
+        bridge = KernelBridge(store=rt.store, policy=rt.policy, clock=clock, writer_epoch=rt.lease.epoch, domain=domain)
+
+        svc, kstore = kernel_job_service(rt, clock)
+        desc = SnapshotDescriptor(
+            kind="git",
+            tree_or_head_digest="sha256:" + "a" * 64,
+            dirty=False,
+            dirty_digest=None,
+            observed_at="2026-11-26T09:00:00.000000Z",
+        )
+        kstore.stage_blob(desc.content_bytes())
+        snap_id = kstore.transact(lambda tx: register_snapshot(tx, ws, desc))
+
+        # 1. Empty checkout: discover (sufficient & tiny budget) & work (without/with snapshot) emit accurate codes.
+        disc_empty = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "discover",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "context_budget_tokens": 2000,
+            },
+            cred=cred,
+            scope=scope,
+        )
+        assert disc_empty["continuity"] == []
+        assert disc_empty["degraded_codes"] == unavailable_codes
+        discover_validator.validate(disc_empty)
+
+        disc_empty_small = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {"mode": "discover", "workspace_id": ws.repo_id, "checkout_id": ws.checkout_id, "context_budget_tokens": 1},
+            cred=cred,
+            scope=scope,
+        )
+        assert disc_empty_small["continuity"] == []
+        assert disc_empty_small["degraded_codes"] == unavailable_codes
+        discover_validator.validate(disc_empty_small)
+
+        work_empty_unavail = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "work",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "description": "Task 1 empty checkout without snapshot",
+                "idempotency_key": "idem-r3-empty-unavail",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        assert work_empty_unavail["snapshot_status"] == "unavailable"
+        assert work_empty_unavail["continuity"] == []
+        assert work_empty_unavail["degraded_codes"] == ["snapshot_unavailable", *unavailable_codes]
+        work_validator.validate(work_empty_unavail)
+        task_1 = str(work_empty_unavail["task_id"])
+
+        work_empty_snap = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "work",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "source_snapshot_id": snap_id,
+                "description": "Empty checkout with explicit snapshot",
+                "idempotency_key": "idem-r3-empty-snap01",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        assert work_empty_snap["snapshot_status"] == "available"
+        assert work_empty_snap["source_snapshot_id"] == snap_id
+        assert work_empty_snap["degraded_codes"] == unavailable_codes
+        work_validator.validate(work_empty_snap)
+
+        # 2. Commit an open handoff revision 1 on task_1.
+        sub1 = _call_ok(
+            bridge,
+            rt,
+            "submit_episode",
+            {
+                "task_id": task_1,
+                "session_id": "SID_R3_1",
+                "workspace_id": ws.repo_id,
+                "evidence": [],
+                "base_revision": 0,
+                "fence": work_empty_unavail["handoff_live"]["fence"],
+                "takeover": {"acknowledge_active": True, "reason": "r3 open handoff"},
+                "handoff": {"working_goal": "Open handoff on checkout", "task_state": "open"},
+                "idempotency_key": "idem-r3-sub-t1-0001",
+            },
+            cred=cred,
+            scope=scope,
+        )
+
+        disc_open_ok = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "discover",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "context_budget_tokens": 2000,
+            },
+            cred=cred,
+            scope=scope,
+        )
+        assert len(disc_open_ok["continuity"]) == 1
+        assert disc_open_ok["degraded_codes"] == unavailable_codes
+        discover_validator.validate(disc_open_ok)
+        item_1 = disc_open_ok["continuity"][0]
+
+        disc_open_trunc = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {"mode": "discover", "workspace_id": ws.repo_id, "checkout_id": ws.checkout_id, "context_budget_tokens": 1},
+            cred=cred,
+            scope=scope,
+        )
+        assert disc_open_trunc["continuity"] == []
+        assert "handoff_discover_truncated" not in disc_open_trunc["degraded_codes"]
+        assert disc_open_trunc["degraded_codes"] == [*unavailable_codes, "continuity_truncated"]
+        discover_validator.validate(disc_open_trunc)
+
+        disc_tid_ok = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "discover",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "task_id": task_1,
+                "context_budget_tokens": 2000,
+            },
+            cred=cred,
+            scope=scope,
+        )
+        assert len(disc_tid_ok["continuity"]) == 1
+        assert disc_tid_ok["degraded_codes"] == unavailable_codes
+
+        disc_tid_trunc = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "discover",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "task_id": task_1,
+                "context_budget_tokens": 1,
+            },
+            cred=cred,
+            scope=scope,
+        )
+        assert disc_tid_trunc["continuity"] == []
+        assert disc_tid_trunc["degraded_codes"] == [*unavailable_codes, "continuity_truncated"]
+
+        # Work without task_id on checkout with open handoffs -> includes open_handoffs_present.
+        work_open_no_tid = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "work",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "description": "New work ignoring open handoff",
+                "idempotency_key": "idem-r3-no-tid-open",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        expected_no_tid_open = ["snapshot_unavailable", *unavailable_codes, "open_handoffs_present"]
+        assert work_open_no_tid["continuity"] == []
+        assert work_open_no_tid["degraded_codes"] == expected_no_tid_open
+        work_validator.validate(work_open_no_tid)
+
+        work_open_no_tid_snap = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "work",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "source_snapshot_id": snap_id,
+                "description": "New work with snapshot and open handoff",
+                "idempotency_key": "idem-r3-no-tid-snap",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        assert work_open_no_tid_snap["degraded_codes"] == [*unavailable_codes, "open_handoffs_present"]
+        work_validator.validate(work_open_no_tid_snap)
+
+        work_open_seen = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "work",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "seen_handoff_refs": [
+                    {
+                        "artifact_id": item_1["id"],
+                        "revision_epoch": item_1["revision_epoch"],
+                        "revision": item_1["revision"],
+                        "digest": item_1["digest"],
+                    }
+                ],
+                "description": "New work declaring seen_handoff_refs",
+                "idempotency_key": "idem-r3-no-tid-seen",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        assert work_open_seen["continuity"] == []
+        assert work_open_seen["degraded_codes"] == expected_no_tid_open
+        work_validator.validate(work_open_seen)
+
+        # Work WITH existing or explicit new task_id -> must NOT emit open_handoffs_present.
+        work_existing_tid = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "work",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "task_id": task_1,
+                "description": "Work targeting existing open task",
+                "idempotency_key": "idem-r3-exist-tid-01",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        assert len(work_existing_tid["continuity"]) == 1
+        assert work_existing_tid["degraded_codes"] == ["snapshot_unavailable", *unavailable_codes]
+        work_validator.validate(work_existing_tid)
+
+        work_explicit_new_tid = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "work",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "task_id": "explicit-new-task-r3",
+                "description": "Work with explicit new task_id",
+                "idempotency_key": "idem-r3-new-tid-0001",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        assert work_explicit_new_tid["continuity"] == []
+        assert work_explicit_new_tid["degraded_codes"] == ["snapshot_unavailable", *unavailable_codes]
+
+        with rt.store.transaction() as txn:
+            rows = {
+                str(r[0]): (str(r[1]), json.loads(str(r[2])))
+                for r in txn.db.execute(
+                    "SELECT delivery_id, exposure_evidence, degraded_codes_json "
+                    "FROM deliveries WHERE delivery_id IN (?, ?, ?)",
+                    (
+                        str(work_open_no_tid["delivery_id"]),
+                        str(work_open_seen["delivery_id"]),
+                        str(work_explicit_new_tid["delivery_id"]),
+                    ),
+                ).fetchall()
+            }
+            assert rows[str(work_open_no_tid["delivery_id"])] == ("unreviewed_open_handoffs", expected_no_tid_open)
+            assert rows[str(work_open_seen["delivery_id"])] == ("seen_l0", expected_no_tid_open)
+            assert rows[str(work_explicit_new_tid["delivery_id"])][1] == ["snapshot_unavailable", *unavailable_codes]
+
+        # 3. Observed-only update on task_1: rev 1 resume gets observed_newer and survives close on replay.
+        hs = HandoffStore(rt.store, rt.policy)
+        ss = SessionStore(rt.store, rt.policy)
+        hdr1 = hs.read_header(task_1, principal_id=cred.principal.principal_id, scope=scope)
+        assert hdr1 is not None and hdr1.holder_session_ref is not None
+        ss.record_session_event(
+            session_ref=hdr1.holder_session_ref,
+            repo_id=ws.repo_id,
+            checkout_id=ws.checkout_id,
+            task_id=task_1,
+            producer_stream="stream-r3",
+            event=CaptureEventRecord(
+                event_id="ev-r3-obs-1",
+                producer_stream="stream-r3",
+                sequence=1,
+                harness_id="claude-code",
+                kind="user_message",
+                recorded_at="2026-11-26T09:00:05Z",
+                payload={"role": "user", "text": "Observed update during r3 test"},
+                session_ref=hdr1.holder_session_ref,
+            ),
+            now=clock.now(),
+        )
+        exec_ = JobExecutor(PRODUCTION_JOB_HANDLERS, lambda: 10_000)
+        exec_.start()
+        try:
+            coord = ContinuityWorkerCoordinator(
+                rt=rt, job_service=svc, executor=exec_, clock=clock, mono=lambda: 10_000
+            )
+            clock.advance(dt.timedelta(seconds=65))
+            assert coord.enqueue_if_due(task_id=task_1, now=clock.now()) is not None
+            assert coord.run_next(writer_epoch=rt.lease.epoch, now=clock.now()) is True
+        finally:
+            exec_.close(5.0)
+
+        work_resume_obs = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "work",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "task_id": task_1,
+                "source_snapshot_id": snap_id,
+                "resume_ref": {
+                    "artifact_id": task_1,
+                    "revision": 1,
+                    "handoff_revision": 1,
+                    "fence": sub1["fence"],
+                },
+                "description": "Resume with observed_newer and available snapshot",
+                "idempotency_key": "idem-r3-resume-obs1",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        expected_resume = [*unavailable_codes, "observed_newer"]
+        assert work_resume_obs["degraded_codes"] == expected_resume
+        work_validator.validate(work_resume_obs)
+
+        # Close task_1 so checkout no longer has open handoffs.
+        _call_ok(
+            bridge,
+            rt,
+            "submit_episode",
+            {
+                "task_id": task_1,
+                "session_id": "SID_R3_1",
+                "workspace_id": ws.repo_id,
+                "evidence": [],
+                "base_revision": 1,
+                "fence": sub1["fence"],
+                "handoff": {"task_state": "done"},
+                "idempotency_key": "idem-r3-close-t1-1",
+            },
+            cred=cred,
+            scope=scope,
+        )
+
+        # Replay preserves exact committed degraded_codes even after task_1 closed.
+        replay_open = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "work",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "description": "New work ignoring open handoff",
+                "idempotency_key": "idem-r3-no-tid-open",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        assert replay_open["delivery_id"] == work_open_no_tid["delivery_id"]
+        assert replay_open["degraded_codes"] == expected_no_tid_open
+
+        replay_resume = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "work",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "task_id": task_1,
+                "source_snapshot_id": snap_id,
+                "resume_ref": {
+                    "artifact_id": task_1,
+                    "revision": 1,
+                    "handoff_revision": 1,
+                    "fence": sub1["fence"],
+                },
+                "description": "Resume with observed_newer and available snapshot",
+                "idempotency_key": "idem-r3-resume-obs1",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        assert replay_resume["delivery_id"] == work_resume_obs["delivery_id"]
+        assert replay_resume["degraded_codes"] == expected_resume
+
+        # Fresh work without task_id after task_1 closed -> no open_handoffs_present.
+        work_after_close = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "work",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "description": "Work after all handoffs closed",
+                "idempotency_key": "idem-r3-after-close1",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        assert work_after_close["degraded_codes"] == ["snapshot_unavailable", *unavailable_codes]
+
+        # Closed handoff still reachable directly via discover(task_id=task_1) and obeys budget truncation code.
+        disc_closed_ok = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "discover",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "task_id": task_1,
+                "context_budget_tokens": 2000,
+            },
+            cred=cred,
+            scope=scope,
+        )
+        assert len(disc_closed_ok["continuity"]) == 1
+        assert disc_closed_ok["degraded_codes"] == unavailable_codes
+
+        disc_closed_trunc = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "discover",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "task_id": task_1,
+                "context_budget_tokens": 1,
+            },
+            cred=cred,
+            scope=scope,
+        )
+        assert disc_closed_trunc["continuity"] == []
+        assert disc_closed_trunc["degraded_codes"] == [*unavailable_codes, "continuity_truncated"]
+
+        # 4. 14-day recency window parity between discover and open_handoffs_present.
+        work_stale_prep = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "work",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "task_id": "task-r3-stale-open",
+                "description": "Task to test 14-day window",
+                "idempotency_key": "idem-r3-stale-prep0",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        _call_ok(
+            bridge,
+            rt,
+            "submit_episode",
+            {
+                "task_id": "task-r3-stale-open",
+                "session_id": "SID_R3_2",
+                "workspace_id": ws.repo_id,
+                "evidence": [],
+                "base_revision": 0,
+                "fence": work_stale_prep["handoff_live"]["fence"],
+                "takeover": {"acknowledge_active": True, "reason": "stale window test"},
+                "handoff": {"working_goal": "Open handoff about to age out", "task_state": "open"},
+                "idempotency_key": "idem-r3-stale-sub1",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        work_before_age = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "work",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "description": "Before 14d expiry",
+                "idempotency_key": "idem-r3-before-age",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        assert "open_handoffs_present" in work_before_age["degraded_codes"]
+
+        clock.advance(dt.timedelta(days=15))
+        disc_aged = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "discover",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "context_budget_tokens": 2000,
+            },
+            cred=cred,
+            scope=scope,
+        )
+        assert disc_aged["continuity"] == []
+        work_aged = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "work",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "description": "After 14d expiry",
+                "idempotency_key": "idem-r3-after-age1",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        assert work_aged["degraded_codes"] == ["snapshot_unavailable", *unavailable_codes]
+    finally:
+        rt.close()
+
+
+def test_get_artifact_l1_l2_header_refs_served_receipt_and_revision_history_across_restore(
+    trusted_tmp: Path,
+) -> None:
+    import json
+
+    from superbrain.application.continuity_worker import ContinuityWorkerCoordinator
+    from superbrain.composition._daemon_session import build_default_handoff_domain
+    from superbrain.composition.kernel_bridge import KernelBridge
+    from superbrain.domain.continuity.budget import HANDOFF_L1_RESOURCE_MAX_BYTES, HANDOFF_L2_MAX_BYTES, utf8_len
+    from superbrain.storage.backup import create_store_backup
+    from superbrain.storage.handoffs import HandoffStore
+    from superbrain.storage.kernel_schema import KERNEL_POLICY_MIGRATIONS, KERNEL_STORE_MIGRATIONS
+    from superbrain.storage.policy_store import PolicyStore
+    from superbrain.storage.restore import restore_store
+    from superbrain.storage.sessions import SessionStore
+    from superbrain.workers.executor import PRODUCTION_JOB_HANDLERS, JobExecutor
+    from tests.storage.conftest import maintenance_lease
+    from tests.support.inc2_fixture import kernel_job_service
+
+    def _find_header(data: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+        hdr_res = next(r for r in data["resources"] if r["name"] == "handoff_header")
+        return hdr_res, json.loads(str(hdr_res["content"]))
+
+    def _extract_l2_revs(data: dict[str, Any]) -> list[dict[str, Any]]:
+        revs: list[dict[str, Any]] = []
+        total_b = 0
+        for r in data["resources"]:
+            content = str(r["content"])
+            assert utf8_len(content) <= HANDOFF_L1_RESOURCE_MAX_BYTES
+            total_b += utf8_len(content)
+            parsed = json.loads(content)
+            name = str(r["name"])
+            if name.startswith("l2_history_"):
+                revs.extend(parsed[0]["revision_history"])
+            elif name.startswith("l2_revisions_"):
+                revs.extend(parsed["revision_history"])
+        assert total_b <= HANDOFF_L2_MAX_BYTES
+        return revs
+
+    def _receipt_hdr_digest(rt_obj: Any, delivery_dict: dict[str, Any], art_id: str, rev: int, level: str) -> str:
+        receipt_id = str(delivery_dict["served_receipt_id"])
+        row = rt_obj.store._db.execute(
+            "SELECT digests_json FROM artifact_send_attempt "
+            "WHERE id = ? AND artifact_id = ? AND revision = ? AND level = ?",
+            (receipt_id, art_id, rev, level),
+        ).fetchone()
+        assert row is not None, f"missing send attempt {receipt_id} for {art_id} rev={rev} level={level}"
+        digs = {item["name"]: item["digest"] for item in json.loads(str(row[0]))}
+        return str(digs["handoff_header"])
+
+    clock = FakeClock(dt.datetime(2026, 11, 26, 10, 0, tzinfo=dt.UTC))
+    os_ = os_adapters(clock=clock)
+    data_root = trusted_tmp / "r4-l1l2" / "data"
+    rt = open_kernel_job_runtime(data_root, os_, role="sp24-r4")
+    try:
+        cred = seed_principal_and_credential(rt.policy, owner_id="dan", harness_id="claude-code", machine_id="m1")
+        ws = register_workspace_direct(
+            rt,
+            clock,
+            cred.principal,
+            alias="ws-r4",
+            checkout_dir=trusted_tmp / "r4-l1l2" / "chk",
+            remote="https://github.example/dan/r4.git",
+        )
+        ws2 = register_workspace_direct(
+            rt,
+            clock,
+            cred.principal,
+            alias="ws-r4-other",
+            checkout_dir=trusted_tmp / "r4-l1l2" / "chk2",
+            remote="https://github.example/dan/r4.git",
+        )
+        rt.store.reconcile_policy()
+        scope = Scope(ws.repo_id, ws.checkout_id)
+        scope2 = Scope(ws2.repo_id, ws2.checkout_id)
+        domain = build_default_handoff_domain(rt=rt, clock=clock, writer_epoch=rt.lease.epoch)
+        assert domain is not None
+        bridge = KernelBridge(store=rt.store, policy=rt.policy, clock=clock, writer_epoch=rt.lease.epoch, domain=domain)
+        hs = HandoffStore(rt.store, rt.policy)
+        ss = SessionStore(rt.store, rt.policy)
+
+        # Task A: agent-only patch -> agent_ref populated, observed_ref is None.
+        prep_a = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "work",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "description": "Task A agent only",
+                "idempotency_key": "idem-r4-v000-prep-a",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        task_a = str(prep_a["task_id"])
+        _call_ok(
+            bridge,
+            rt,
+            "submit_episode",
+            {
+                "task_id": task_a,
+                "session_id": "SID_R4_A",
+                "workspace_id": ws.repo_id,
+                "evidence": [],
+                "base_revision": 0,
+                "fence": prep_a["handoff_live"]["fence"],
+                "takeover": {"acknowledge_active": True, "reason": "task A agent hold"},
+                "handoff": {"working_goal": "Task A goal v1", "task_state": "open"},
+                "idempotency_key": "idem-r4-v000-sub-a1",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        hdr_a1 = hs.read_revision_header(
+            artifact_id=task_a,
+            revision_epoch=0,
+            revision=1,
+            principal_id=cred.principal.principal_id,
+            scope=scope,
+        )
+        assert hdr_a1 is not None and hdr_a1.agent_ref is not None and hdr_a1.observed_ref is None
+        a_l1 = _call_ok(
+            bridge,
+            rt,
+            "get_artifact",
+            {
+                "workspace_id": ws.repo_id,
+                "task_id": task_a,
+                "artifact_id": task_a,
+                "revision_epoch": 0,
+                "revision": 1,
+                "level": "L1",
+                "idempotency_key": "idem-r4-v000-get-a-l1",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        a_l2 = _call_ok(
+            bridge,
+            rt,
+            "get_artifact",
+            {
+                "workspace_id": ws.repo_id,
+                "task_id": task_a,
+                "artifact_id": task_a,
+                "revision_epoch": 0,
+                "revision": 1,
+                "level": "L2",
+                "idempotency_key": "idem-r4-v000-get-a-l2",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        a_l1_hres, a_l1_hdr = _find_header(a_l1)
+        a_l2_hres, a_l2_hdr = _find_header(a_l2)
+        assert a_l1_hdr["agent_ref"] == hdr_a1.agent_ref and a_l1_hdr["observed_ref"] is None
+        assert a_l2_hdr == a_l1_hdr
+        assert a_l1_hres["digest"] == digest_bytes(str(a_l1_hres["content"]).encode("utf-8"))
+        assert _receipt_hdr_digest(rt, a_l1, task_a, 1, "L1") == a_l1_hres["digest"]
+        assert _receipt_hdr_digest(rt, a_l2, task_a, 1, "L2") == a_l2_hres["digest"]
+
+        # Task B: observed-only rev 1 -> agent patch rev 2 -> agent patch rev 3.
+        prep_b = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "work",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "description": "Task B full lifecycle",
+                "idempotency_key": "idem-r4-v000-prep-b",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        task_b = str(prep_b["task_id"])
+        sref_b = ss.bind_session(
+            principal_id=cred.principal.principal_id,
+            repo_id=ws.repo_id,
+            checkout_id=ws.checkout_id,
+            harness_id="claude-code",
+            raw_session_id="SID_R4_B",
+            now=clock.now(),
+        ).session_ref
+        ss.record_session_event(
+            session_ref=sref_b,
+            repo_id=ws.repo_id,
+            checkout_id=ws.checkout_id,
+            task_id=task_b,
+            producer_stream="stream-r4-b",
+            event=CaptureEventRecord(
+                event_id="ev-r4-obs-1",
+                producer_stream="stream-r4-b",
+                sequence=1,
+                harness_id="claude-code",
+                kind="user_message",
+                recorded_at="2026-11-26T10:00:05Z",
+                payload={"role": "user", "text": "Observed event on Task B"},
+                session_ref=sref_b,
+            ),
+            now=clock.now(),
+        )
+        svc, _ = kernel_job_service(rt, clock)
+        exec_ = JobExecutor(PRODUCTION_JOB_HANDLERS, lambda: 10_000)
+        exec_.start()
+        try:
+            coord = ContinuityWorkerCoordinator(
+                rt=rt, job_service=svc, executor=exec_, clock=clock, mono=lambda: 10_000
+            )
+            clock.advance(dt.timedelta(seconds=65))
+            assert coord.enqueue_if_due(task_id=task_b, now=clock.now()) is not None
+            assert coord.run_next(writer_epoch=rt.lease.epoch, now=clock.now()) is True
+        finally:
+            exec_.close(5.0)
+
+        hdr_b1 = hs.read_revision_header(
+            artifact_id=task_b,
+            revision_epoch=0,
+            revision=1,
+            principal_id=cred.principal.principal_id,
+            scope=scope,
+        )
+        assert hdr_b1 is not None and hdr_b1.agent_ref is None and hdr_b1.observed_ref is not None
+        b1_l1 = _call_ok(
+            bridge,
+            rt,
+            "get_artifact",
+            {
+                "workspace_id": ws.repo_id,
+                "task_id": task_b,
+                "artifact_id": task_b,
+                "revision_epoch": 0,
+                "revision": 1,
+                "level": "L1",
+                "idempotency_key": "idem-r4-v000-get-b1l1",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        _, b1_hdr = _find_header(b1_l1)
+        assert b1_hdr["agent_ref"] is None and b1_hdr["observed_ref"] == hdr_b1.observed_ref
+
+        live_b1 = hs.read_header(task_b, principal_id=cred.principal.principal_id, scope=scope)
+        assert live_b1 is not None
+        sub_b2 = _call_ok(
+            bridge,
+            rt,
+            "submit_episode",
+            {
+                "task_id": task_b,
+                "session_id": "SID_R4_B",
+                "workspace_id": ws.repo_id,
+                "evidence": [],
+                "base_revision": 0,
+                "fence": live_b1.handoff_live.fence.to_dict(),
+                "takeover": {"acknowledge_active": True, "reason": "claim after observed rev 1"},
+                "handoff": {"working_goal": "Task B goal rev 2", "task_state": "open"},
+                "idempotency_key": "idem-r4-v000-sub-b2",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        hdr_b2 = hs.read_revision_header(
+            artifact_id=task_b,
+            revision_epoch=0,
+            revision=2,
+            principal_id=cred.principal.principal_id,
+            scope=scope,
+        )
+        assert hdr_b2 is not None and hdr_b2.agent_ref is not None and hdr_b2.observed_ref == hdr_b1.observed_ref
+
+        # Pin historical (0, 2) L1 & L2 calls before creating backup and rev 3 ("Branch X").
+        b2_l1 = _call_ok(
+            bridge,
+            rt,
+            "get_artifact",
+            {
+                "workspace_id": ws.repo_id,
+                "task_id": task_b,
+                "artifact_id": task_b,
+                "revision_epoch": 0,
+                "revision": 2,
+                "level": "L1",
+                "idempotency_key": "idem-r4-v000-get-b2l1",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        b2_l2 = _call_ok(
+            bridge,
+            rt,
+            "get_artifact",
+            {
+                "workspace_id": ws.repo_id,
+                "task_id": task_b,
+                "artifact_id": task_b,
+                "revision_epoch": 0,
+                "revision": 2,
+                "level": "L2",
+                "idempotency_key": "idem-r4-v000-get-b2l2",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        _, b2_l1_hdr = _find_header(b2_l1)
+        assert b2_l1_hdr["agent_ref"] == hdr_b2.agent_ref and b2_l1_hdr["observed_ref"] == hdr_b2.observed_ref
+        assert [(h["revision_epoch"], h["revision"]) for h in _extract_l2_revs(b2_l2)] == [(0, 2), (0, 1)]
+
+        bak_b2 = create_store_backup(rt.store, os_, clock.now())
+
+        _call_ok(
+            bridge,
+            rt,
+            "submit_episode",
+            {
+                "task_id": task_b,
+                "session_id": "SID_R4_B",
+                "workspace_id": ws.repo_id,
+                "evidence": [],
+                "base_revision": 1,
+                "fence": sub_b2["fence"],
+                "handoff": {"working_goal": "Task B branch X rev 3"},
+                "idempotency_key": "idem-r4-v000-sub-b3x",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        hdr_b3x = hs.read_revision_header(
+            artifact_id=task_b,
+            revision_epoch=0,
+            revision=3,
+            principal_id=cred.principal.principal_id,
+            scope=scope,
+        )
+        assert hdr_b3x is not None and hdr_b3x.agent_ref is not None and hdr_b3x.agent_ref != hdr_b2.agent_ref
+
+        b3x_l2 = _call_ok(
+            bridge,
+            rt,
+            "get_artifact",
+            {
+                "workspace_id": ws.repo_id,
+                "task_id": task_b,
+                "artifact_id": task_b,
+                "revision_epoch": 0,
+                "revision": 3,
+                "level": "L2",
+                "idempotency_key": "idem-r4-v000-get-b3xl2",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        _, b3x_hdr = _find_header(b3x_l2)
+        assert b3x_hdr["agent_ref"] == hdr_b3x.agent_ref and b3x_hdr["observed_ref"] == hdr_b3x.observed_ref
+        b3x_revs = _extract_l2_revs(b3x_l2)
+        assert [(h["revision_epoch"], h["revision"]) for h in b3x_revs] == [(0, 3), (0, 2), (0, 1)]
+        assert [h["agent_ref"] for h in b3x_revs] == [hdr_b3x.agent_ref, hdr_b2.agent_ref, None]
+        assert all(h["artifact_id"] == task_b for h in b3x_revs)
+
+        # Reading historical (0, 2) must not include (0, 3).
+        b2_hist_l2 = _call_ok(
+            bridge,
+            rt,
+            "get_artifact",
+            {
+                "workspace_id": ws.repo_id,
+                "task_id": task_b,
+                "artifact_id": task_b,
+                "revision_epoch": 0,
+                "revision": 2,
+                "level": "L2",
+                "idempotency_key": "idem-r4-v000-get-b2hist",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        assert [(h["revision_epoch"], h["revision"]) for h in _extract_l2_revs(b2_hist_l2)] == [(0, 2), (0, 1)]
+
+        # Cross-scope L2 lookup fails closed with NOT_FOUND.
+        assert (
+            _call_err(
+                bridge,
+                rt,
+                "get_artifact",
+                {
+                    "workspace_id": ws2.repo_id,
+                    "task_id": task_b,
+                    "artifact_id": task_b,
+                    "revision_epoch": 0,
+                    "revision": 3,
+                    "level": "L2",
+                    "idempotency_key": "idem-r4-v000-get-xscope",
+                },
+                cred=cred,
+                scope=scope2,
+            )
+            == ErrorCode.NOT_FOUND.value
+        )
+    finally:
+        rt.close()
+
+    # Restore backup at (0, 2) -> restore_epoch=1; take over and create (1, 3) Branch Y and (1, 4).
+    with maintenance_lease(data_root, os_) as (root_obj, lease):
+        pol_handle = PolicyStore.open(root_obj, lease, os_, migrations=KERNEL_POLICY_MIGRATIONS)
+        try:
+            rep = restore_store(
+                root_obj,
+                lease,
+                os_,
+                bak_b2,
+                pol_handle,
+                clock.now(),
+                migrations=KERNEL_STORE_MIGRATIONS,
+            )
+            post_ep = rep.new_epoch
+            assert post_ep > 0
+        finally:
+            pol_handle.close()
+
+    rt2 = open_kernel_job_runtime(data_root, os_, role="sp24-r4")
+    try:
+        domain2 = build_default_handoff_domain(rt=rt2, clock=clock, writer_epoch=rt2.lease.epoch)
+        assert domain2 is not None
+        bridge2 = KernelBridge(
+            store=rt2.store, policy=rt2.policy, clock=clock, writer_epoch=rt2.lease.epoch, domain=domain2
+        )
+        hs2 = HandoffStore(rt2.store, rt2.policy)
+        live_after_res = hs2.read_header(task_b, principal_id=cred.principal.principal_id, scope=scope)
+        assert live_after_res is not None
+        assert live_after_res.handoff_live.fence.restore_epoch == post_ep
+
+        sub_b3y = _call_ok(
+            bridge2,
+            rt2,
+            "submit_episode",
+            {
+                "task_id": task_b,
+                "session_id": "SID_R4_B_Y",
+                "workspace_id": ws.repo_id,
+                "evidence": [],
+                "base_revision": 1,
+                "fence": live_after_res.handoff_live.fence.to_dict(),
+                "takeover": {"acknowledge_active": True, "reason": "post-restore branch Y"},
+                "handoff": {"working_goal": "Task B branch Y rev 3"},
+                "idempotency_key": "idem-r4-v000-sub-b3y",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        sub_b4y = _call_ok(
+            bridge2,
+            rt2,
+            "submit_episode",
+            {
+                "task_id": task_b,
+                "session_id": "SID_R4_B_Y",
+                "workspace_id": ws.repo_id,
+                "evidence": [],
+                "base_revision": 2,
+                "fence": sub_b3y["fence"],
+                "handoff": {"working_goal": "Task B branch Y rev 4"},
+                "idempotency_key": "idem-r4-v000-sub-b4y",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        assert sub_b4y["handoff_status"] == "stored"
+
+        hdr_b3y = hs2.read_revision_header(
+            artifact_id=task_b,
+            revision_epoch=post_ep,
+            revision=3,
+            principal_id=cred.principal.principal_id,
+            scope=scope,
+        )
+        hdr_b4y = hs2.read_revision_header(
+            artifact_id=task_b,
+            revision_epoch=post_ep,
+            revision=4,
+            principal_id=cred.principal.principal_id,
+            scope=scope,
+        )
+        assert hdr_b3y is not None and hdr_b4y is not None
+        assert hdr_b3y.agent_ref is not None and hdr_b3y.agent_ref != hdr_b3x.agent_ref
+
+        # Seed a duplicate (0, 3) Branch X header row + durable CAS blob to verify branch isolation on rev 3.
+        from superbrain.core.canonical import canonical_json
+        from superbrain.core.ids import new_id
+        from superbrain.ports._handoff_types import HandoffAgentState
+        from superbrain.storage.kinds import RetentionClass
+
+        bx_bytes = canonical_json(HandoffAgentState(working_goal="Task B branch X archived").to_dict())
+        bx_dig = digest_bytes(bx_bytes)
+        bx_hid = new_id()
+        rt2.store.cas.put(bx_bytes)
+        with rt2.store.transaction() as txn:
+            txn.hold(bx_dig, "event", bx_hid, RetentionClass.DURABLE, None)
+            txn.db.execute(
+                "INSERT INTO handoff_revision_headers ("
+                "artifact_id, revision_epoch, revision, handoff_revision, task_id, task_state, task_state_source, "
+                "holder_restore_epoch, writer_generation, holder_harness_id, holder_principal, holder_session_ref, "
+                "session_state, agent_ref, agent_holder_id, observed_ref, agent_updated_at, observed_through, "
+                "recorded_at"
+                ") VALUES (?, 0, 3, 2, ?, 'open', 'agent', 0, 1, 'claude-code', ?, ?, 'active', ?, ?, ?, "
+                "?, ?, ?)",
+                (
+                    task_b,
+                    task_b,
+                    cred.principal.principal_id,
+                    hdr_b3x.holder_session_ref,
+                    bx_dig,
+                    bx_hid,
+                    hdr_b3x.observed_ref,
+                    hdr_b3x.agent_updated_at,
+                    hdr_b3x.observed_through,
+                    "2026-11-26T10:02:00Z",
+                ),
+            )
+
+        # Replay pre-restore (0, 2) keeps epoch-0 fence and refs while handoff_live reports live epoch.
+        rep_b2_l2 = _call_ok(
+            bridge2,
+            rt2,
+            "get_artifact",
+            {
+                "workspace_id": ws.repo_id,
+                "task_id": task_b,
+                "artifact_id": task_b,
+                "revision_epoch": 0,
+                "revision": 2,
+                "level": "L2",
+                "idempotency_key": "idem-r4-v000-get-b2l2",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        _, rep_b2_hdr = _find_header(rep_b2_l2)
+        assert rep_b2_hdr["agent_ref"] == hdr_b2.agent_ref
+        assert rep_b2_hdr["observed_ref"] == hdr_b2.observed_ref
+        assert rep_b2_hdr["fence"]["restore_epoch"] == 0
+        assert rep_b2_l2["handoff_live"]["fence"]["restore_epoch"] == post_ep
+        assert [(h["revision_epoch"], h["revision"]) for h in _extract_l2_revs(rep_b2_l2)] == [(0, 2), (0, 1)]
+
+        # Reading post-restore rev 4 includes Branch Y (post_ep, 3) and pre-restore (0, 2), (0, 1), never (0, 3).
+        b4y_l2 = _call_ok(
+            bridge2,
+            rt2,
+            "get_artifact",
+            {
+                "workspace_id": ws.repo_id,
+                "task_id": task_b,
+                "artifact_id": task_b,
+                "revision_epoch": post_ep,
+                "revision": 4,
+                "level": "L2",
+                "idempotency_key": "idem-r4-v000-get-b4yl2",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        b4y_hres, b4y_hdr = _find_header(b4y_l2)
+        assert b4y_hdr["agent_ref"] == hdr_b4y.agent_ref and b4y_hdr["observed_ref"] == hdr_b4y.observed_ref
+        assert b4y_hdr["fence"]["restore_epoch"] == post_ep
+        assert _receipt_hdr_digest(rt2, b4y_l2, task_b, 4, "L2") == b4y_hres["digest"]
+        b4y_revs = _extract_l2_revs(b4y_l2)
+        assert [(h["revision_epoch"], h["revision"]) for h in b4y_revs] == [
+            (post_ep, 4),
+            (post_ep, 3),
+            (0, 2),
+            (0, 1),
+        ]
+        assert [h["agent_ref"] for h in b4y_revs] == [
+            hdr_b4y.agent_ref,
+            hdr_b3y.agent_ref,
+            hdr_b2.agent_ref,
+            None,
+        ]
+
+        # Reading archived Branch X (0, 3) excludes all epoch-1 revisions.
+        b3x_post_l2 = _call_ok(
+            bridge2,
+            rt2,
+            "get_artifact",
+            {
+                "workspace_id": ws.repo_id,
+                "task_id": task_b,
+                "artifact_id": task_b,
+                "revision_epoch": 0,
+                "revision": 3,
+                "level": "L2",
+                "idempotency_key": "idem-r4-v000-get-b3xpost",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        b3x_post_revs = _extract_l2_revs(b3x_post_l2)
+        assert [(h["revision_epoch"], h["revision"]) for h in b3x_post_revs] == [(0, 3), (0, 2), (0, 1)]
+        assert b3x_post_revs[0]["agent_ref"] == bx_dig
+    finally:
+        rt2.close()
+
+
+def test_get_artifact_l1_l2_pins_observed_ref_sources_and_events_since_agent_across_restore(
+    trusted_tmp: Path,
+) -> None:
+    import json
+
+    from superbrain.application.continuity_worker import ContinuityWorkerCoordinator
+    from superbrain.composition._daemon_session import build_default_handoff_domain
+    from superbrain.composition.kernel_bridge import KernelBridge
+    from superbrain.ports.policy import IntentKind
+    from superbrain.storage.backup import create_store_backup
+    from superbrain.storage.handoffs import HandoffStore
+    from superbrain.storage.kernel_schema import KERNEL_POLICY_MIGRATIONS, KERNEL_STORE_MIGRATIONS
+    from superbrain.storage.policy_store import PolicyStore
+    from superbrain.storage.restore import restore_store
+    from superbrain.storage.sessions import SessionStore
+    from superbrain.workers.executor import PRODUCTION_JOB_HANDLERS, JobExecutor
+    from tests.storage.conftest import maintenance_lease
+    from tests.support.inc2_fixture import kernel_job_service
+
+    def _extract_obs_and_conv(
+        data: dict[str, Any],
+    ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+        obs_meta: dict[str, Any] = {}
+        obs_items: list[dict[str, Any]] = []
+        conv_items: list[dict[str, Any]] = []
+        for res in data["resources"]:
+            name = str(res["name"])
+            parsed = json.loads(str(res["content"]))
+            if name.startswith("observed_"):
+                assert isinstance(parsed, list)
+                for entry in parsed:
+                    if isinstance(entry, dict) and "events_since_agent" in entry:
+                        obs_meta = entry
+                    else:
+                        obs_items.append(entry)
+            elif name.startswith("l2_history_"):
+                conv_items.extend(parsed[0]["conversation_excerpts"])
+            elif name.startswith("l2_conversation_"):
+                conv_items.extend(parsed["conversation_excerpts"])
+        return obs_meta, obs_items, conv_items
+
+    clock = FakeClock(dt.datetime(2026, 11, 26, 11, 0, tzinfo=dt.UTC))
+    os_ = os_adapters(clock=clock)
+    data_root = trusted_tmp / "r5-obs" / "data"
+    rt = open_kernel_job_runtime(data_root, os_, role="sp24-r5")
+    try:
+        cred = seed_principal_and_credential(rt.policy, owner_id="dan", harness_id="claude-code", machine_id="m1")
+        ws = register_workspace_direct(
+            rt,
+            clock,
+            cred.principal,
+            alias="ws-r5",
+            checkout_dir=trusted_tmp / "r5-obs" / "chk",
+            remote="https://github.example/dan/r5.git",
+        )
+        rt.store.reconcile_policy()
+        scope = Scope(ws.repo_id, ws.checkout_id)
+        domain = build_default_handoff_domain(rt=rt, clock=clock, writer_epoch=rt.lease.epoch)
+        assert domain is not None
+        bridge = KernelBridge(store=rt.store, policy=rt.policy, clock=clock, writer_epoch=rt.lease.epoch, domain=domain)
+        hs = HandoffStore(rt.store, rt.policy)
+        ss = SessionStore(rt.store, rt.policy)
+
+        # 1. Agent rev 1 (observed_ref=None) + later uncommitted Event 1 -> rev 1 must stay empty with count=0.
+        prep = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "work",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "description": "Pinned observed ref task",
+                "idempotency_key": "idem-r5-0000-prep-1",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        tid = str(prep["task_id"])
+        sub1 = _call_ok(
+            bridge,
+            rt,
+            "submit_episode",
+            {
+                "task_id": tid,
+                "session_id": "SID_R5_1",
+                "workspace_id": ws.repo_id,
+                "evidence": [],
+                "base_revision": 0,
+                "fence": prep["handoff_live"]["fence"],
+                "takeover": {"acknowledge_active": True, "reason": "initial hold"},
+                "handoff": {"working_goal": "Agent goal rev 1", "task_state": "open"},
+                "idempotency_key": "idem-r5-0000-sub-01",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        hdr1 = hs.read_revision_header(
+            artifact_id=tid,
+            revision_epoch=0,
+            revision=1,
+            principal_id=cred.principal.principal_id,
+            scope=scope,
+        )
+        assert hdr1 is not None and hdr1.observed_ref is None and hdr1.holder_session_ref is not None
+        sref = hdr1.holder_session_ref
+
+        clock.advance(dt.timedelta(seconds=5))
+        ev1_rec = CaptureEventRecord(
+            event_id="ev-r5-001",
+            producer_stream="stream-r5",
+            sequence=1,
+            harness_id="claude-code",
+            kind="user_message",
+            recorded_at="2026-11-26T11:00:05Z",
+            payload={"role": "user", "text": "Event 1 committed in rev 2"},
+            session_ref=sref,
+        )
+        ss.record_session_event(
+            session_ref=sref,
+            repo_id=ws.repo_id,
+            checkout_id=ws.checkout_id,
+            task_id=tid,
+            producer_stream="stream-r5",
+            event=ev1_rec,
+            now=clock.now(),
+        )
+
+        r1_l1 = _call_ok(
+            bridge,
+            rt,
+            "get_artifact",
+            {
+                "workspace_id": ws.repo_id,
+                "task_id": tid,
+                "artifact_id": tid,
+                "revision_epoch": 0,
+                "revision": 1,
+                "level": "L1",
+                "idempotency_key": "idem-r5-0000-r1-l1",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        r1_l2 = _call_ok(
+            bridge,
+            rt,
+            "get_artifact",
+            {
+                "workspace_id": ws.repo_id,
+                "task_id": tid,
+                "artifact_id": tid,
+                "revision_epoch": 0,
+                "revision": 1,
+                "level": "L2",
+                "idempotency_key": "idem-r5-0000-r1-l2",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        for res_dict in (r1_l1, r1_l2):
+            meta, obs, conv = _extract_obs_and_conv(res_dict)
+            assert meta["events_since_agent"] == 0
+            assert obs == []
+            assert conv == []
+            assert "Event 1 committed in rev 2" not in str(res_dict["resources"])
+
+        # 2. Run worker -> rev 2 pins observed_ref covering Event 1 (events_since_agent == 1).
+        svc, _ = kernel_job_service(rt, clock)
+        exec_ = JobExecutor(PRODUCTION_JOB_HANDLERS, lambda: 10_000)
+        exec_.start()
+        try:
+            coord = ContinuityWorkerCoordinator(
+                rt=rt, job_service=svc, executor=exec_, clock=clock, mono=lambda: 10_000
+            )
+            clock.advance(dt.timedelta(seconds=65))
+            assert coord.enqueue_if_due(task_id=tid, now=clock.now()) is not None
+            assert coord.run_next(writer_epoch=rt.lease.epoch, now=clock.now()) is True
+        finally:
+            exec_.close(5.0)
+
+        r2_l1 = _call_ok(
+            bridge,
+            rt,
+            "get_artifact",
+            {
+                "workspace_id": ws.repo_id,
+                "task_id": tid,
+                "artifact_id": tid,
+                "revision_epoch": 0,
+                "revision": 2,
+                "level": "L1",
+                "idempotency_key": "idem-r5-0000-r2-l1",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        r2_l2 = _call_ok(
+            bridge,
+            rt,
+            "get_artifact",
+            {
+                "workspace_id": ws.repo_id,
+                "task_id": tid,
+                "artifact_id": tid,
+                "revision_epoch": 0,
+                "revision": 2,
+                "level": "L2",
+                "idempotency_key": "idem-r5-0000-r2-l2",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        m2_l1, o2_l1, _ = _extract_obs_and_conv(r2_l1)
+        m2_l2, o2_l2, c2_l2 = _extract_obs_and_conv(r2_l2)
+        assert m2_l1["events_since_agent"] == 1 and m2_l2["events_since_agent"] == 1
+        assert [i["source_event_id"] for i in o2_l1] == ["ev-r5-001"]
+        assert [i["source_event_id"] for i in o2_l2] == ["ev-r5-001"]
+        assert [i["source_event_id"] for i in c2_l2] == ["ev-r5-001"]
+        assert "Event 1 committed in rev 2" in str(o2_l1[0])
+
+        bak_r2 = create_store_backup(rt.store, os_, clock.now())
+
+        # Add Event 2 WITHOUT running worker -> neither replay nor fresh read of rev 2 may include Event 2.
+        clock.advance(dt.timedelta(seconds=5))
+        ss.record_session_event(
+            session_ref=sref,
+            repo_id=ws.repo_id,
+            checkout_id=ws.checkout_id,
+            task_id=tid,
+            producer_stream="stream-r5",
+            event=CaptureEventRecord(
+                event_id="ev-r5-002",
+                producer_stream="stream-r5",
+                sequence=2,
+                harness_id="claude-code",
+                kind="user_message",
+                recorded_at="2026-11-26T11:01:15Z",
+                payload={"role": "user", "text": "Event 2 uncommitted secret"},
+                session_ref=sref,
+            ),
+            now=clock.now(),
+        )
+        for lvl, ikey in (
+            ("L1", "idem-r5-0000-r2-l1"),
+            ("L2", "idem-r5-0000-r2-l2"),
+            ("L1", "idem-r5-0000-r2f-l1"),
+            ("L2", "idem-r5-0000-r2f-l2"),
+        ):
+            r2_chk = _call_ok(
+                bridge,
+                rt,
+                "get_artifact",
+                {
+                    "workspace_id": ws.repo_id,
+                    "task_id": tid,
+                    "artifact_id": tid,
+                    "revision_epoch": 0,
+                    "revision": 2,
+                    "level": lvl,
+                    "idempotency_key": ikey,
+                },
+                cred=cred,
+                scope=scope,
+            )
+            m_chk, o_chk, c_chk = _extract_obs_and_conv(r2_chk)
+            assert m_chk["events_since_agent"] == 1
+            assert [i["source_event_id"] for i in o_chk] == ["ev-r5-001"]
+            assert "Event 2 uncommitted secret" not in str(r2_chk["resources"])
+            if lvl == "L2":
+                assert [i["source_event_id"] for i in c_chk] == ["ev-r5-001"]
+
+        # 3. Subsequent agent patch rev 3 resets events_since_agent to 0 on rev 3 while rev 2 keeps 1.
+        _call_ok(
+            bridge,
+            rt,
+            "submit_episode",
+            {
+                "task_id": tid,
+                "session_id": "SID_R5_1",
+                "workspace_id": ws.repo_id,
+                "evidence": [],
+                "base_revision": 1,
+                "fence": sub1["fence"],
+                "handoff": {"working_goal": "Agent goal rev 3"},
+                "idempotency_key": "idem-r5-0000-sub-03",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        r3_l1 = _call_ok(
+            bridge,
+            rt,
+            "get_artifact",
+            {
+                "workspace_id": ws.repo_id,
+                "task_id": tid,
+                "artifact_id": tid,
+                "revision_epoch": 0,
+                "revision": 3,
+                "level": "L1",
+                "idempotency_key": "idem-r5-0000-r3-l1",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        m3, o3, _ = _extract_obs_and_conv(r3_l1)
+        assert m3["events_since_agent"] == 0
+        assert [i["source_event_id"] for i in o3] == ["ev-r5-001"]
+        assert "Event 2 uncommitted secret" not in str(r3_l1["resources"])
+
+        # 4. Live quarantine on Event 1 redacts Event 1 in rev 2 without leaking Event 2.
+        ev1_dig_row = rt.store._db.execute(
+            "SELECT payload_digest FROM session_task_events WHERE task_id = ? AND event_id = 'ev-r5-001'",
+            (tid,),
+        ).fetchone()
+        assert ev1_dig_row is not None
+        rt.policy.record_intent(IntentKind.QUARANTINE, {"digest": str(ev1_dig_row[0])})
+        rt.store.reconcile_policy()
+        for lvl, ikey in (("L1", "idem-r5-0000-q1-l1"), ("L2", "idem-r5-0000-q1-l2")):
+            rq = _call_ok(
+                bridge,
+                rt,
+                "get_artifact",
+                {
+                    "workspace_id": ws.repo_id,
+                    "task_id": tid,
+                    "artifact_id": tid,
+                    "revision_epoch": 0,
+                    "revision": 2,
+                    "level": lvl,
+                    "idempotency_key": ikey,
+                },
+                cred=cred,
+                scope=scope,
+            )
+            mq, oq, cq = _extract_obs_and_conv(rq)
+            assert mq["events_since_agent"] == 1
+            assert len(oq) == 1 and oq[0]["source_event_id"] == "ev-r5-001" and oq[0]["status"] == "redacted"
+            assert "Event 1 committed in rev 2" not in str(rq["resources"])
+            assert "Event 2 uncommitted secret" not in str(rq["resources"])
+            if lvl == "L2":
+                assert len(cq) == 1 and cq[0]["status"] == "redacted"
+    finally:
+        rt.close()
+
+    # 5. Restore backup from rev 2 -> advance restore_epoch, add Event 3 -> worker rev 3 -> Event 4 uncommitted,
+    #    then test archived (0, 2), live (post_ep, 3), Event 3 source-only expiry, and observed_ref blob expiry.
+    with maintenance_lease(data_root, os_) as (root_obj, lease):
+        pol_handle = PolicyStore.open(root_obj, lease, os_, migrations=KERNEL_POLICY_MIGRATIONS)
+        try:
+            rep = restore_store(
+                root_obj,
+                lease,
+                os_,
+                bak_r2,
+                pol_handle,
+                clock.now(),
+                migrations=KERNEL_STORE_MIGRATIONS,
+            )
+            post_ep = rep.new_epoch
+            assert post_ep > 0
+        finally:
+            pol_handle.close()
+
+    rt2 = open_kernel_job_runtime(data_root, os_, role="sp24-r5")
+    try:
+        domain2 = build_default_handoff_domain(rt=rt2, clock=clock, writer_epoch=rt2.lease.epoch)
+        assert domain2 is not None
+        bridge2 = KernelBridge(
+            store=rt2.store, policy=rt2.policy, clock=clock, writer_epoch=rt2.lease.epoch, domain=domain2
+        )
+        ss2 = SessionStore(rt2.store, rt2.policy)
+        hs2 = HandoffStore(rt2.store, rt2.policy)
+
+        clock.advance(dt.timedelta(seconds=5))
+        ss2.record_session_event(
+            session_ref=sref,
+            repo_id=ws.repo_id,
+            checkout_id=ws.checkout_id,
+            task_id=tid,
+            producer_stream="stream-r5",
+            event=CaptureEventRecord(
+                event_id="ev-r5-003",
+                producer_stream="stream-r5",
+                sequence=3,
+                harness_id="claude-code",
+                kind="user_message",
+                recorded_at="2026-11-26T11:01:20Z",
+                payload={"role": "user", "text": "Event 3 post-restore"},
+                session_ref=sref,
+            ),
+            now=clock.now(),
+        )
+        # Advance 10 days before committing obs_post so Event 3 expires 10 days before observed_ref_post!
+        clock.advance(dt.timedelta(days=10))
+        svc2, _ = kernel_job_service(rt2, clock)
+        exec2 = JobExecutor(PRODUCTION_JOB_HANDLERS, lambda: 10_000)
+        exec2.start()
+        try:
+            coord2 = ContinuityWorkerCoordinator(
+                rt=rt2, job_service=svc2, executor=exec2, clock=clock, mono=lambda: 10_000
+            )
+            assert coord2.enqueue_if_due(task_id=tid, now=clock.now()) is not None
+            assert coord2.run_next(writer_epoch=rt2.lease.epoch, now=clock.now()) is True
+        finally:
+            exec2.close(5.0)
+
+        # Record uncommitted Event 4 after post-restore worker rev 3.
+        clock.advance(dt.timedelta(seconds=5))
+        ss2.record_session_event(
+            session_ref=sref,
+            repo_id=ws.repo_id,
+            checkout_id=ws.checkout_id,
+            task_id=tid,
+            producer_stream="stream-r5",
+            event=CaptureEventRecord(
+                event_id="ev-r5-004",
+                producer_stream="stream-r5",
+                sequence=4,
+                harness_id="claude-code",
+                kind="user_message",
+                recorded_at="2026-11-26T11:01:25Z",
+                payload={"role": "user", "text": "Event 4 post uncommitted"},
+                session_ref=sref,
+            ),
+            now=clock.now(),
+        )
+
+        # Post-restore (post_ep, 3) pins [ev-r5-003] (worker batch 2 after rev 1 agent write -> cumulative 2).
+        r3y_l2 = _call_ok(
+            bridge2,
+            rt2,
+            "get_artifact",
+            {
+                "workspace_id": ws.repo_id,
+                "task_id": tid,
+                "artifact_id": tid,
+                "revision_epoch": post_ep,
+                "revision": 3,
+                "level": "L2",
+                "idempotency_key": "idem-r5-0000-r3y-l2",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        m3y, o3y, c3y = _extract_obs_and_conv(r3y_l2)
+        assert m3y["events_since_agent"] == 2
+        assert [i["source_event_id"] for i in o3y] == ["ev-r5-003"]
+        assert [i["source_event_id"] for i in c3y] == ["ev-r5-003"]
+        assert "Event 3 post-restore" in str(o3y[0])
+        assert "Event 4 post uncommitted" not in str(r3y_l2["resources"])
+
+        # Archived (0, 2) still pins ONLY [ev-r5-001] (redacted by policy), never Event 3 or 4.
+        r02_post = _call_ok(
+            bridge2,
+            rt2,
+            "get_artifact",
+            {
+                "workspace_id": ws.repo_id,
+                "task_id": tid,
+                "artifact_id": tid,
+                "revision_epoch": 0,
+                "revision": 2,
+                "level": "L1",
+                "idempotency_key": "idem-r5-0000-r02p",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        m02, o02, _ = _extract_obs_and_conv(r02_post)
+        assert m02["events_since_agent"] == 1
+        assert len(o02) == 1 and o02[0]["source_event_id"] == "ev-r5-001" and o02[0]["status"] == "redacted"
+
+        # Advance 82 days (total 92d since Event 3, 82d since obs_post): Event 3 expired, obs_post still live.
+        clock.advance(dt.timedelta(days=82))
+        hdr_p3 = hs2.read_revision_header(
+            artifact_id=tid,
+            revision_epoch=post_ep,
+            revision=3,
+            principal_id=cred.principal.principal_id,
+            scope=scope,
+        )
+        assert hdr_p3 is not None and hdr_p3.observed_ref is not None
+        r3y_exp_ev = _call_ok(
+            bridge2,
+            rt2,
+            "get_artifact",
+            {
+                "workspace_id": ws.repo_id,
+                "task_id": tid,
+                "artifact_id": tid,
+                "revision_epoch": post_ep,
+                "revision": 3,
+                "level": "L2",
+                "idempotency_key": "idem-r5-0000-r3ye",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        m_ee, o_ee, c_ee = _extract_obs_and_conv(r3y_exp_ev)
+        assert m_ee["events_since_agent"] == 2
+        assert len(o_ee) == 1 and o_ee[0]["source_event_id"] == "ev-r5-003" and o_ee[0]["status"] == "expired"
+        assert len(c_ee) == 1 and c_ee[0]["status"] == "expired"
+        assert "Event 3 post-restore" not in str(r3y_exp_ev["resources"])
+        assert "Event 4 post uncommitted" not in str(r3y_exp_ev["resources"])
+
+        # Advance 12 more days (104d since Event 3, 94d since obs_post): observed_ref expired -> count stays 2.
+        clock.advance(dt.timedelta(days=12))
+        r3y_exp_ref = _call_ok(
+            bridge2,
+            rt2,
+            "get_artifact",
+            {
+                "workspace_id": ws.repo_id,
+                "task_id": tid,
+                "artifact_id": tid,
+                "revision_epoch": post_ep,
+                "revision": 3,
+                "level": "L2",
+                "idempotency_key": "idem-r5-0000-r3yo",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        m_eo, o_eo, c_eo = _extract_obs_and_conv(r3y_exp_ref)
+        assert m_eo["events_since_agent"] == 2
+        assert o_eo == [
+            {
+                "kind": "observed_summary",
+                "source_event_id": hdr_p3.observed_ref,
+                "source_digest": hdr_p3.observed_ref,
+                "status": "expired",
+                "reason": "expired",
+            }
+        ]
+        assert c_eo == []
+    finally:
+        rt2.close()
+
+
+def test_events_since_agent_accumulates_across_worker_batches_takeover_retries_and_restore(
+    trusted_tmp: Path,
+) -> None:
+    import json
+
+    from superbrain.application.continuity_worker import ContinuityWorkerCoordinator
+    from superbrain.composition._daemon_session import build_default_handoff_domain
+    from superbrain.composition.kernel_bridge import KernelBridge
+    from superbrain.core.canonical import canonical_json
+    from superbrain.core.ids import new_id
+    from superbrain.ports.policy import IntentKind
+    from superbrain.storage.backup import create_store_backup
+    from superbrain.storage.handoffs import HandoffStore
+    from superbrain.storage.kernel_schema import KERNEL_POLICY_MIGRATIONS, KERNEL_STORE_MIGRATIONS
+    from superbrain.storage.policy_store import PolicyStore
+    from superbrain.storage.restore import restore_store
+    from superbrain.storage.sessions import SessionStore
+    from superbrain.workers.executor import PRODUCTION_JOB_HANDLERS, JobExecutor
+    from tests.storage.conftest import maintenance_lease
+    from tests.support.inc2_fixture import kernel_job_service
+
+    def _obs_meta_and_items(data: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        obs_meta: dict[str, Any] = {}
+        obs_items: list[dict[str, Any]] = []
+        for res in data["resources"]:
+            name = str(res["name"])
+            if name.startswith("observed_"):
+                parsed = json.loads(str(res["content"]))
+                for entry in parsed:
+                    if isinstance(entry, dict) and "events_since_agent" in entry:
+                        obs_meta = entry
+                    else:
+                        obs_items.append(entry)
+        return obs_meta, obs_items
+
+    def _l2_history(data: dict[str, Any]) -> list[dict[str, Any]]:
+        revs: list[dict[str, Any]] = []
+        for res in data["resources"]:
+            name = str(res["name"])
+            if name.startswith("l2_history_"):
+                revs.extend(json.loads(str(res["content"]))[0]["revision_history"])
+            elif name.startswith("l2_revisions_"):
+                revs.extend(json.loads(str(res["content"]))["revision_history"])
+        return revs
+
+    clock = FakeClock(dt.datetime(2026, 11, 26, 12, 0, tzinfo=dt.UTC))
+    os_ = os_adapters(clock=clock)
+    data_root = trusted_tmp / "r6-cnt" / "data"
+    rt = open_kernel_job_runtime(data_root, os_, role="sp24-r6")
+    try:
+        cred = seed_principal_and_credential(rt.policy, owner_id="dan", harness_id="claude-code", machine_id="m1")
+        ws = register_workspace_direct(
+            rt,
+            clock,
+            cred.principal,
+            alias="ws-r6",
+            checkout_dir=trusted_tmp / "r6-cnt" / "chk",
+            remote="https://github.example/dan/r6.git",
+        )
+        rt.store.reconcile_policy()
+        scope = Scope(ws.repo_id, ws.checkout_id)
+        domain = build_default_handoff_domain(rt=rt, clock=clock, writer_epoch=rt.lease.epoch)
+        assert domain is not None
+        bridge = KernelBridge(store=rt.store, policy=rt.policy, clock=clock, writer_epoch=rt.lease.epoch, domain=domain)
+        hs = HandoffStore(rt.store, rt.policy)
+        ss = SessionStore(rt.store, rt.policy)
+
+        prep = _call_ok(
+            bridge,
+            rt,
+            "prepare_task",
+            {
+                "mode": "work",
+                "workspace_id": ws.repo_id,
+                "checkout_id": ws.checkout_id,
+                "description": "Cumulative events_since_agent test",
+                "idempotency_key": "idem-r6-0000-prep-1",
+            },
+            cred=cred,
+            scope=scope,
+        )
+        tid = str(prep["task_id"])
+        sref = ss.bind_session(
+            principal_id=cred.principal.principal_id,
+            repo_id=ws.repo_id,
+            checkout_id=ws.checkout_id,
+            harness_id="claude-code",
+            raw_session_id="RAW_SID_R6_1",
+            now=clock.now(),
+        ).session_ref
+
+        svc, _ = kernel_job_service(rt, clock)
+        exec_ = JobExecutor(PRODUCTION_JOB_HANDLERS, lambda: 10_000)
+        exec_.start()
+        try:
+            coord = ContinuityWorkerCoordinator(
+                rt=rt, job_service=svc, executor=exec_, clock=clock, mono=lambda: 10_000
+            )
+
+            def _record(seq: int, text: str, *, eid_prefix: str = "ev-r6") -> CaptureEventRecord:
+                clock.advance(dt.timedelta(seconds=5))
+                rec = CaptureEventRecord(
+                    event_id=f"{eid_prefix}-{seq:03d}",
+                    producer_stream="stream-r6",
+                    sequence=seq,
+                    harness_id="claude-code",
+                    kind="user_message",
+                    recorded_at=clock.now().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    payload={"role": "user", "text": text},
+                    session_ref=sref,
+                )
+                ss.record_session_event(
+                    session_ref=sref,
+                    repo_id=ws.repo_id,
+                    checkout_id=ws.checkout_id,
+                    task_id=tid,
+                    producer_stream="stream-r6",
+                    event=rec,
+                    now=clock.now(),
+                )
+                return rec
+
+            def _run_worker_batch() -> None:
+                clock.advance(dt.timedelta(seconds=65))
+                assert coord.enqueue_if_due(task_id=tid, now=clock.now()) is not None
+                assert coord.run_next(writer_epoch=rt.lease.epoch, now=clock.now()) is True
+
+            # 1. Worker-only revisions (no agent write yet): batch 1 (1 ev -> 1), batch 2 (2 evs -> 3).
+            _record(1, "Worker-only seq 1")
+            _run_worker_batch()
+            _record(2, "Worker-only seq 2")
+            _record(3, "Worker-only seq 3")
+            _run_worker_batch()
+            for lvl, ikey in (("L1", "idem-r6-0000-r2-l1"), ("L2", "idem-r6-0000-r2-l2")):
+                r2 = _call_ok(
+                    bridge,
+                    rt,
+                    "get_artifact",
+                    {
+                        "workspace_id": ws.repo_id,
+                        "task_id": tid,
+                        "artifact_id": tid,
+                        "revision_epoch": 0,
+                        "revision": 2,
+                        "level": lvl,
+                        "idempotency_key": ikey,
+                    },
+                    cred=cred,
+                    scope=scope,
+                )
+                m2, _ = _obs_meta_and_items(r2)
+                assert m2["events_since_agent"] == 3
+
+            # Record pre-patch seq 4 (still unsummarized) BEFORE agent write, then agent patch rev 3 resets to 0.
+            _record(4, "Pre-patch unsummarized seq 4")
+            hdr2 = hs.read_header(tid, principal_id=cred.principal.principal_id, scope=scope)
+            assert hdr2 is not None
+            _call_ok(
+                bridge,
+                rt,
+                "submit_episode",
+                {
+                    "task_id": tid,
+                    "session_id": "RAW_SID_R6_1",
+                    "workspace_id": ws.repo_id,
+                    "evidence": [],
+                    "base_revision": hdr2.handoff_revision,
+                    "fence": hdr2.handoff_live.fence.to_dict(),
+                    "takeover": {"acknowledge_active": True, "reason": "claim agent hold"},
+                    "handoff": {"working_goal": "Agent goal rev 3", "task_state": "open"},
+                    "idempotency_key": "idem-r6-0000-sub-3",
+                },
+                cred=cred,
+                scope=scope,
+            )
+            r3 = _call_ok(
+                bridge,
+                rt,
+                "get_artifact",
+                {
+                    "workspace_id": ws.repo_id,
+                    "task_id": tid,
+                    "artifact_id": tid,
+                    "revision_epoch": 0,
+                    "revision": 3,
+                    "level": "L1",
+                    "idempotency_key": "idem-r6-0000-r3-l1",
+                },
+                cred=cred,
+                scope=scope,
+            )
+            assert _obs_meta_and_items(r3)[0]["events_since_agent"] == 0
+
+            # 2. Multi-batch worker refreshes after agent patch (exact reviewer probe):
+            #    Batch 1 picks up pre-patch seq 4 + post-patch seq 5 -> ONLY seq 5 counts (1).
+            #    Batch 2 picks up post-patch seq 6 -> cumulative count becomes 2 (handoff_revision stays 1)!
+            ev5 = _record(5, "Post-patch batch 1 seq 5")
+            _run_worker_batch()
+            hdr4 = hs.read_revision_header(
+                artifact_id=tid,
+                revision_epoch=0,
+                revision=4,
+                principal_id=cred.principal.principal_id,
+                scope=scope,
+            )
+            assert hdr4 is not None and hdr4.handoff_revision == 1
+            bak_rev4 = create_store_backup(rt.store, os_, clock.now())
+
+            ev6 = _record(6, "Post-patch batch 2 seq 6")
+            _run_worker_batch()
+            hdr5 = hs.read_revision_header(
+                artifact_id=tid,
+                revision_epoch=0,
+                revision=5,
+                principal_id=cred.principal.principal_id,
+                scope=scope,
+            )
+            assert hdr5 is not None and hdr5.handoff_revision == 1
+
+            for rev_n, exp_cnt, prefix in ((4, 1, "rev4"), (5, 2, "rev5")):
+                for lvl in ("L1", "L2"):
+                    fresh = _call_ok(
+                        bridge,
+                        rt,
+                        "get_artifact",
+                        {
+                            "workspace_id": ws.repo_id,
+                            "task_id": tid,
+                            "artifact_id": tid,
+                            "revision_epoch": 0,
+                            "revision": rev_n,
+                            "level": lvl,
+                            "idempotency_key": f"idem-r6-0000-{prefix}-{lvl.lower()}-f",
+                        },
+                        cred=cred,
+                        scope=scope,
+                    )
+                    assert _obs_meta_and_items(fresh)[0]["events_since_agent"] == exp_cnt
+                    replay = _call_ok(
+                        bridge,
+                        rt,
+                        "get_artifact",
+                        {
+                            "workspace_id": ws.repo_id,
+                            "task_id": tid,
+                            "artifact_id": tid,
+                            "revision_epoch": 0,
+                            "revision": rev_n,
+                            "level": lvl,
+                            "idempotency_key": f"idem-r6-0000-{prefix}-{lvl.lower()}-f",
+                        },
+                        cred=cred,
+                        scope=scope,
+                    )
+                    assert _obs_meta_and_items(replay)[0]["events_since_agent"] == exp_cnt
+                    if lvl == "L2" and rev_n == 5:
+                        hist = _l2_history(fresh)
+                        assert [(h["revision"], h["events_since_agent"]) for h in hist[:5]] == [
+                            (5, 2),
+                            (4, 1),
+                            (3, 0),
+                            (2, 3),
+                            (1, 1),
+                        ]
+
+            # 3. Takeover-only (no agent patch) MUST preserve cumulative count (still 2) at rev 6!
+            hdr_live5 = hs.read_header(tid, principal_id=cred.principal.principal_id, scope=scope)
+            assert hdr_live5 is not None
+            _call_ok(
+                bridge,
+                rt,
+                "submit_episode",
+                {
+                    "task_id": tid,
+                    "session_id": "RAW_SID_R6_2",
+                    "workspace_id": ws.repo_id,
+                    "evidence": [],
+                    "base_revision": hdr_live5.handoff_revision,
+                    "fence": hdr_live5.handoff_live.fence.to_dict(),
+                    "takeover": {"acknowledge_active": True, "reason": "takeover without patch"},
+                    "idempotency_key": "idem-r6-0000-take-6",
+                },
+                cred=cred,
+                scope=scope,
+            )
+            for lvl in ("L1", "L2"):
+                r6 = _call_ok(
+                    bridge,
+                    rt,
+                    "get_artifact",
+                    {
+                        "workspace_id": ws.repo_id,
+                        "task_id": tid,
+                        "artifact_id": tid,
+                        "revision_epoch": 0,
+                        "revision": 6,
+                        "level": lvl,
+                        "idempotency_key": f"idem-r6-0000-r6-{lvl.lower()}",
+                    },
+                    cred=cred,
+                    scope=scope,
+                )
+                assert _obs_meta_and_items(r6)[0]["events_since_agent"] == 2
+
+            # 4. Duplicate event recording does not enqueue/double-count; worker commit with overlapping
+            #    already-summarized tuple + duplicate new tuple counts new event seq 7 ONLY ONCE -> 3.
+            ss.record_session_event(
+                session_ref=sref,
+                repo_id=ws.repo_id,
+                checkout_id=ws.checkout_id,
+                task_id=tid,
+                producer_stream="stream-r6",
+                event=ev6,
+                now=clock.now(),
+            )
+            clock.advance(dt.timedelta(seconds=65))
+            assert coord.enqueue_if_due(task_id=tid, now=clock.now()) is None
+
+            ev7 = _record(7, "Post-takeover seq 7")
+            dup_summary: dict[str, Any] = {
+                "source_events": [
+                    ["stream-r6", 6, ev6.event_id, digest_bytes(canonical_json(ev6.payload))],
+                    ["stream-r6", 7, ev7.event_id, digest_bytes(canonical_json(ev7.payload))],
+                    ["stream-r6", 7, ev7.event_id, digest_bytes(canonical_json(ev7.payload))],
+                ],
+                "items": [["user_message", ev7.event_id, "Post-takeover seq 7"]],
+                "last_event_at": ev7.recorded_at,
+                "long_running_source": None,
+            }
+            dup_bytes = canonical_json(dup_summary)
+            dup_dig = digest_bytes(dup_bytes)
+            rt.store.cas.put(dup_bytes)
+            out7 = svc._store.transact(
+                lambda ktx: ss.apply_worker_commit_in_tx(
+                    ktx,
+                    task_id=tid,
+                    job_id=new_id(),
+                    observed_digest=dup_dig,
+                    observed_summary=dup_summary,
+                    now=clock.now(),
+                    cutoff_order=7,
+                )
+            )
+            assert out7.current_revision == 7
+            r7 = _call_ok(
+                bridge,
+                rt,
+                "get_artifact",
+                {
+                    "workspace_id": ws.repo_id,
+                    "task_id": tid,
+                    "artifact_id": tid,
+                    "revision_epoch": 0,
+                    "revision": 7,
+                    "level": "L1",
+                    "idempotency_key": "idem-r6-0000-r7-l1",
+                },
+                cred=cred,
+                scope=scope,
+            )
+            assert _obs_meta_and_items(r7)[0]["events_since_agent"] == 3
+
+            # 5. Quarantine seq 5 while committed rev 5 (2) & rev 7 (3) remain intact with redacted content.
+            ev5_dig = digest_bytes(canonical_json(ev5.payload))
+            rt.policy.record_intent(IntentKind.QUARANTINE, {"digest": ev5_dig})
+            rt.store.reconcile_policy()
+            r5_q = _call_ok(
+                bridge,
+                rt,
+                "get_artifact",
+                {
+                    "workspace_id": ws.repo_id,
+                    "task_id": tid,
+                    "artifact_id": tid,
+                    "revision_epoch": 0,
+                    "revision": 5,
+                    "level": "L2",
+                    "idempotency_key": "idem-r6-0000-r5-q",
+                },
+                cred=cred,
+                scope=scope,
+            )
+            m5q, o5q = _obs_meta_and_items(r5_q)
+            assert m5q["events_since_agent"] == 2
+            assert any(i["source_event_id"] == ev6.event_id and i["status"] == "ok" for i in o5q)
+        finally:
+            exec_.close(5.0)
+    finally:
+        rt.close()
+
+    # 6. Restore backup from rev 4 (count=1), advance epoch, commit post-restore worker batch -> 2,
+    #    then agent patch -> 0, then worker batch -> 1.
+    with maintenance_lease(data_root, os_) as (root_obj, lease):
+        pol_h = PolicyStore.open(root_obj, lease, os_, migrations=KERNEL_POLICY_MIGRATIONS)
+        try:
+            rep = restore_store(
+                root_obj, lease, os_, bak_rev4, pol_h, clock.now(), migrations=KERNEL_STORE_MIGRATIONS
+            )
+            post_ep = rep.new_epoch
+            assert post_ep > 0
+        finally:
+            pol_h.close()
+
+    rt2 = open_kernel_job_runtime(data_root, os_, role="sp24-r6")
+    try:
+        domain2 = build_default_handoff_domain(rt=rt2, clock=clock, writer_epoch=rt2.lease.epoch)
+        assert domain2 is not None
+        bridge2 = KernelBridge(
+            store=rt2.store, policy=rt2.policy, clock=clock, writer_epoch=rt2.lease.epoch, domain=domain2
+        )
+        hs2 = HandoffStore(rt2.store, rt2.policy)
+        ss2 = SessionStore(rt2.store, rt2.policy)
+        svc2, _ = kernel_job_service(rt2, clock)
+        exec2 = JobExecutor(PRODUCTION_JOB_HANDLERS, lambda: 10_000)
+        exec2.start()
+        try:
+            coord2 = ContinuityWorkerCoordinator(
+                rt=rt2, job_service=svc2, executor=exec2, clock=clock, mono=lambda: 10_000
+            )
+            # Archived (0, 4) preserves 1.
+            r04 = _call_ok(
+                bridge2,
+                rt2,
+                "get_artifact",
+                {
+                    "workspace_id": ws.repo_id,
+                    "task_id": tid,
+                    "artifact_id": tid,
+                    "revision_epoch": 0,
+                    "revision": 4,
+                    "level": "L1",
+                    "idempotency_key": "idem-r6-0000-r04-p",
+                },
+                cred=cred,
+                scope=scope,
+            )
+            assert _obs_meta_and_items(r04)[0]["events_since_agent"] == 1
+
+            clock.advance(dt.timedelta(seconds=5))
+            ss2.record_session_event(
+                session_ref=sref,
+                repo_id=ws.repo_id,
+                checkout_id=ws.checkout_id,
+                task_id=tid,
+                producer_stream="stream-r6",
+                event=CaptureEventRecord(
+                    event_id="ev-r6-post-001",
+                    producer_stream="stream-r6",
+                    sequence=8,
+                    harness_id="claude-code",
+                    kind="user_message",
+                    recorded_at=clock.now().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    payload={"role": "user", "text": "Post-restore event 8"},
+                    session_ref=sref,
+                ),
+                now=clock.now(),
+            )
+            clock.advance(dt.timedelta(seconds=65))
+            assert coord2.enqueue_if_due(task_id=tid, now=clock.now()) is not None
+            assert coord2.run_next(writer_epoch=rt2.lease.epoch, now=clock.now()) is True
+
+            # Accumulates from restored anchor rev 4 (1 + 1 = 2)!
+            r5p = _call_ok(
+                bridge2,
+                rt2,
+                "get_artifact",
+                {
+                    "workspace_id": ws.repo_id,
+                    "task_id": tid,
+                    "artifact_id": tid,
+                    "revision_epoch": post_ep,
+                    "revision": 5,
+                    "level": "L2",
+                    "idempotency_key": "idem-r6-0000-r5p-l2",
+                },
+                cred=cred,
+                scope=scope,
+            )
+            assert _obs_meta_and_items(r5p)[0]["events_since_agent"] == 2
+            assert [(h["revision_epoch"], h["revision"], h["events_since_agent"]) for h in _l2_history(r5p)] == [
+                (post_ep, 5, 2),
+                (0, 4, 1),
+                (0, 3, 0),
+                (0, 2, 3),
+                (0, 1, 1),
+            ]
+
+            # Post-restore agent patch resets to 0, then subsequent worker batch starts fresh at 1.
+            hdr_p5 = hs2.read_header(tid, principal_id=cred.principal.principal_id, scope=scope)
+            assert hdr_p5 is not None
+            _call_ok(
+                bridge2,
+                rt2,
+                "submit_episode",
+                {
+                    "task_id": tid,
+                    "session_id": "RAW_SID_R6_1",
+                    "workspace_id": ws.repo_id,
+                    "evidence": [],
+                    "base_revision": hdr_p5.handoff_revision,
+                    "fence": hdr_p5.handoff_live.fence.to_dict(),
+                    "takeover": {"acknowledge_active": True, "reason": "post-restore agent reset"},
+                    "handoff": {"working_goal": "Post-restore agent goal", "task_state": "open"},
+                    "idempotency_key": "idem-r6-0000-sub-p6",
+                },
+                cred=cred,
+                scope=scope,
+            )
+            r6p = _call_ok(
+                bridge2,
+                rt2,
+                "get_artifact",
+                {
+                    "workspace_id": ws.repo_id,
+                    "task_id": tid,
+                    "artifact_id": tid,
+                    "revision_epoch": post_ep,
+                    "revision": 6,
+                    "level": "L1",
+                    "idempotency_key": "idem-r6-0000-r6p-l1",
+                },
+                cred=cred,
+                scope=scope,
+            )
+            assert _obs_meta_and_items(r6p)[0]["events_since_agent"] == 0
+
+            clock.advance(dt.timedelta(seconds=5))
+            ss2.record_session_event(
+                session_ref=sref,
+                repo_id=ws.repo_id,
+                checkout_id=ws.checkout_id,
+                task_id=tid,
+                producer_stream="stream-r6",
+                event=CaptureEventRecord(
+                    event_id="ev-r6-post-002",
+                    producer_stream="stream-r6",
+                    sequence=9,
+                    harness_id="claude-code",
+                    kind="user_message",
+                    recorded_at=clock.now().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    payload={"role": "user", "text": "Post-restore event 9"},
+                    session_ref=sref,
+                ),
+                now=clock.now(),
+            )
+            clock.advance(dt.timedelta(seconds=65))
+            assert coord2.enqueue_if_due(task_id=tid, now=clock.now()) is not None
+            assert coord2.run_next(writer_epoch=rt2.lease.epoch, now=clock.now()) is True
+            r7p = _call_ok(
+                bridge2,
+                rt2,
+                "get_artifact",
+                {
+                    "workspace_id": ws.repo_id,
+                    "task_id": tid,
+                    "artifact_id": tid,
+                    "revision_epoch": post_ep,
+                    "revision": 7,
+                    "level": "L1",
+                    "idempotency_key": "idem-r6-0000-r7p-l1",
+                },
+                cred=cred,
+                scope=scope,
+            )
+            assert _obs_meta_and_items(r7p)[0]["events_since_agent"] == 1
+        finally:
+            exec2.close(5.0)
+    finally:
+        rt2.close()

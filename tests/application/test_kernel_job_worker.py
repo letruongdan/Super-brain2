@@ -419,7 +419,8 @@ def test_fixture_job_runs_on_the_worker_and_owner_applies_typed_commands(
 def test_production_registry_is_empty_and_client_kind_never_selects_the_fixture(
     rt: Runtime, clock: FakeClock, executor_factory: Callable[..., JobExecutor]
 ) -> None:
-    assert dict(PRODUCTION_JOB_HANDLERS) == {}
+    assert set(PRODUCTION_JOB_HANDLERS) == {"continuity.refresh"}
+    assert FIXTURE_JOB_KIND not in PRODUCTION_JOB_HANDLERS
     with pytest.raises(TypeError):
         PRODUCTION_JOB_HANDLERS[FIXTURE_JOB_KIND] = fixture_job_handler  # type: ignore[index]
     for path in SRC.rglob("*.py"):

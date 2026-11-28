@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
+import shlex
 import stat
+import subprocess
+import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-from superbrain.adapters.harness_config.json_keys import merge_json_keys, merge_json_multi_keys
-from superbrain.adapters.harness_config.markdown_blocks import merge_markdown_block
-from superbrain.adapters.harness_config.toml_tables import merge_toml_table
 from superbrain.core._kernel_approval import RiskResource
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.jsonvalue import JsonValue
@@ -26,6 +27,7 @@ __all__ = [
     "HANDOFF_UPDATE_MOMENTS",
     "HandoffTakeoverEditDecision",
     "LAYER1_RULE_TEXT",
+    "build_capture_hook_command",
     "evaluate_takeover_edit_gate",
     "plan_claude_bootstrap",
     "plan_codex_bootstrap",
@@ -240,16 +242,73 @@ def _guidance_body(profile_path: Path) -> str:
     return f"{LAYER1_RULE_TEXT}\n\n{HANDOFF_RULE_TEXT}\n\nProfile: {profile_path}"
 
 
-def _nonblocking_hooks_payload(profile_path: Path) -> dict[str, JsonValue]:
-    ask_cmds: list[JsonValue] = list(AUTHORITY_ASK_COMMANDS)
-    return {
-        "super_brain": {
-            "mode": "remind",
-            "non_blocking": True,
-            "profile": str(profile_path),
-            "authority_ask_commands": ask_cmds,
-        }
-    }
+def _checkout_capture_paths(
+    harness_id: str,
+    checkout_root: Path,
+    profile_path: Path,
+) -> tuple[Path, Path]:
+    chk_tag = hashlib.sha256(f"{harness_id}:{checkout_root}".encode()).hexdigest()[:12]
+    base = profile_path.parent
+    return (
+        base / "capture-outbox" / f"{harness_id}-{chk_tag}",
+        base / "capture-logs" / f"{harness_id}-{chk_tag}.log",
+    )
+
+
+# Host hook events the capture adapters map (tool use and tool result); one matcher group per event, all tools.
+MANAGED_HOOK_EVENTS: tuple[str, ...] = ("PreToolUse", "PostToolUse")
+_HOOK_TIMEOUT_S = 10  # seconds: the hook stops itself at its 2 s hard cap; this only bounds interpreter start-up
+
+
+def _capture_handler(harness_id: str, argv: tuple[str, ...]) -> dict[str, JsonValue]:
+    """One ``type: command`` handler in the host's own schema."""
+    if harness_id == "claude-code":
+        # exec form: Claude Code spawns ``command`` with ``args`` directly, no shell, so no quoting is involved
+        return {"type": "command", "command": argv[0], "args": list(argv[1:]), "timeout": _HOOK_TIMEOUT_S}
+    # Codex takes a command string; Windows reads ``commandWindows``
+    return {"type": "command", "command": shlex.join(argv), "commandWindows": subprocess.list2cmdline(list(argv)),
+            "timeout": _HOOK_TIMEOUT_S}
+
+
+def _managed_hook_groups(
+    profile_path: Path,
+    *,
+    harness_id: str,
+    checkout_root: Path,
+    outbox_dir: Path | None = None,
+    log_path: Path | None = None,
+    python_executable: str | None = None,
+) -> dict[str, JsonValue]:
+    """The managed ``hooks#super-brain`` slice: per event, one all-tools matcher group running the capture hook."""
+    default_outbox, default_log = _checkout_capture_paths(harness_id, checkout_root, profile_path)
+    hook_cmd = build_capture_hook_command(
+        harness_id,
+        outbox_dir=outbox_dir if outbox_dir is not None else default_outbox,
+        log_path=log_path if log_path is not None else default_log,
+        python_executable=python_executable or sys.executable or "python",
+        checkout_root=checkout_root,
+        profile_path=profile_path,
+    )
+    handler = _capture_handler(harness_id, hook_cmd)
+    return {event: [{"matcher": "*", "hooks": [handler]}] for event in MANAGED_HOOK_EVENTS}
+
+
+def _adopt_legacy(
+    existing_text: str | None,
+    expected_slice_digests: Mapping[tuple[str, str], str] | None,
+    rel_path: str,
+    legacy_slice_id: str,
+    parts: tuple[str, ...],
+) -> bool:
+    """``True`` when an earlier bootstrap's slice is on record and still holds exactly what it applied (verified by
+    its stored digest; a mismatch raises a conflict); ``False`` when there is no such record."""
+    from superbrain.adapters.harness_config.json_hook_groups import verify_legacy_slice
+
+    legacy = _expected_digest(expected_slice_digests, rel_path, legacy_slice_id)
+    if legacy is None:
+        return False
+    verify_legacy_slice(existing_text, parts=parts, expected_digest=legacy)
+    return True
 
 
 def _expected_digest(
@@ -269,6 +328,10 @@ def plan_claude_bootstrap(
     expected_slice_digests: Mapping[tuple[str, str], str] | None = None,
 ) -> BootstrapPlan:
     """Build checkout-scoped D3 bootstrap plan for Claude Code (`.mcp.json`, `CLAUDE.md`, `settings.local.json`)."""
+    from superbrain.adapters.harness_config.json_hook_groups import HOOK_GROUPS_SLICE, merge_json_slices
+    from superbrain.adapters.harness_config.json_keys import merge_json_keys
+    from superbrain.adapters.harness_config.markdown_blocks import merge_markdown_block
+
     mcp_merge = merge_json_keys(
         _read_existing(checkout_root, ".mcp.json"),
         key_path=("mcpServers", "super-brain"),
@@ -282,13 +345,17 @@ def plan_claude_bootstrap(
         expected_slice_digest=_expected_digest(expected_slice_digests, "CLAUDE.md", "super-brain-layer1"),
     )
     ask_rules = [f"Bash({cmd} *)" for cmd in AUTHORITY_ASK_COMMANDS]
-    hooks_val = _nonblocking_hooks_payload(profile_path)
-    settings_existing = _read_existing(checkout_root, ".claude", "settings.local.json")
-    settings_merge = merge_json_multi_keys(
-        settings_existing,
-        entries=[(("permissions", "ask"), ask_rules), (("hooks", "PreToolUse"), hooks_val)],
-        expected_slice_digest=_expected_digest(
-            expected_slice_digests, ".claude/settings.local.json", "permissions.ask,hooks.PreToolUse"
+    hook_groups = _managed_hook_groups(profile_path, harness_id="claude-code", checkout_root=checkout_root)
+    settings_slice = f"permissions.ask,{HOOK_GROUPS_SLICE}"
+    settings_text = _read_existing(checkout_root, ".claude", "settings.local.json")
+    settings_expected = _expected_digest(expected_slice_digests, ".claude/settings.local.json", settings_slice)
+    settings_merge = merge_json_slices(
+        settings_text,
+        entries=[("permissions.ask", list(ask_rules)), (HOOK_GROUPS_SLICE, hook_groups)],
+        expected_slice_digest=settings_expected,
+        adopt_existing=settings_expected is None and _adopt_legacy(
+            settings_text, expected_slice_digests, ".claude/settings.local.json",
+            "permissions.ask,hooks.PreToolUse", ("permissions.ask", "hooks.PreToolUse"),
         ),
     )
     return BootstrapPlan(
@@ -314,7 +381,7 @@ def plan_claude_bootstrap(
             BootstrapTargetPlan(
                 rel_path=".claude/settings.local.json",
                 managed_format=ManagedFormat.JSON,
-                slice_id="permissions.ask,hooks.PreToolUse",
+                slice_id=settings_slice,
                 slice_digest=settings_merge.slice_digest,
                 preview_text=settings_merge.updated_text,
             ),
@@ -329,6 +396,10 @@ def plan_codex_bootstrap(
     expected_slice_digests: Mapping[tuple[str, str], str] | None = None,
 ) -> BootstrapPlan:
     """Build checkout-scoped D3 bootstrap plan for Codex (`AGENTS.md`, `.codex/config.toml`, `.codex/hooks.json`)."""
+    from superbrain.adapters.harness_config.json_hook_groups import HOOK_GROUPS_SLICE, merge_json_slices
+    from superbrain.adapters.harness_config.markdown_blocks import merge_markdown_block
+    from superbrain.adapters.harness_config.toml_tables import merge_toml_table
+
     md_merge = merge_markdown_block(
         _read_existing(checkout_root, "AGENTS.md"),
         slice_id="super-brain-layer1",
@@ -343,11 +414,16 @@ def plan_codex_bootstrap(
             expected_slice_digests, ".codex/config.toml", "mcp_servers.super-brain"
         ),
     )
-    hooks_merge = merge_json_keys(
-        _read_existing(checkout_root, ".codex", "hooks.json"),
-        key_path=("hooks", "PreToolUse"),
-        value=_nonblocking_hooks_payload(profile_path),
-        expected_slice_digest=_expected_digest(expected_slice_digests, ".codex/hooks.json", "hooks.PreToolUse"),
+    hooks_text = _read_existing(checkout_root, ".codex", "hooks.json")
+    hooks_expected = _expected_digest(expected_slice_digests, ".codex/hooks.json", HOOK_GROUPS_SLICE)
+    if hooks_expected is None:  # a stored legacy digest must still match before its object is upgraded
+        _adopt_legacy(hooks_text, expected_slice_digests, ".codex/hooks.json", "hooks.PreToolUse",
+                      ("hooks.PreToolUse",))
+    hooks_merge = merge_json_slices(
+        hooks_text,
+        entries=[(HOOK_GROUPS_SLICE, _managed_hook_groups(profile_path, harness_id="codex",
+                                                          checkout_root=checkout_root))],
+        expected_slice_digest=hooks_expected,
     )
     return BootstrapPlan(
         harness_id="codex",
@@ -372,12 +448,45 @@ def plan_codex_bootstrap(
             BootstrapTargetPlan(
                 rel_path=".codex/hooks.json",
                 managed_format=ManagedFormat.JSON,
-                slice_id="hooks.PreToolUse",
+                slice_id=HOOK_GROUPS_SLICE,
                 slice_digest=hooks_merge.slice_digest,
                 preview_text=hooks_merge.updated_text,
             ),
         ),
     )
+
+
+def build_capture_hook_command(
+    harness_id: str,
+    *,
+    outbox_dir: Path,
+    log_path: Path | None = None,
+    python_executable: str = "python",
+    checkout_root: Path | None = None,
+    profile_path: Path | None = None,
+) -> tuple[str, ...]:
+    """Build bounded isolated CLI args invoking ``superbrain.composition.hook_entry``."""
+    if harness_id not in {"claude-code", "codex"}:
+        raise BrainError(ErrorCode.INVALID_INPUT, "unsupported hook harness")
+    if not isinstance(python_executable, str) or not python_executable.strip():
+        raise BrainError(ErrorCode.INVALID_INPUT, "invalid python executable")
+    args: list[str] = [
+        python_executable,
+        "-I",
+        "-m",
+        "superbrain.composition.hook_entry",
+        "--outbox",
+        str(outbox_dir),
+        "--harness",
+        harness_id,
+    ]
+    if checkout_root is not None:
+        args.extend(["--checkout", str(checkout_root)])
+    if profile_path is not None:
+        args.extend(["--profile", str(profile_path)])
+    if log_path is not None:
+        args.extend(["--log", str(log_path)])
+    return tuple(args)
 
 
 class AdapterBootstrapPlanner(BootstrapPlannerPort):

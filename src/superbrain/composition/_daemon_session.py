@@ -2,23 +2,28 @@
 
 from __future__ import annotations
 
-import contextlib
 import logging
 import threading
 import time
 from collections.abc import Callable, Mapping
 from concurrent.futures import Future
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 
-from superbrain.application._future_notify import safe_set_result
 from superbrain.application.approvals import OperatorHandle
+from superbrain.application.continuity_worker import ContinuityWorkerCoordinator
 from superbrain.application.deadlines import Reservation
 from superbrain.application.dispatch import KernelToolDomain, PreparedEffect
 from superbrain.application.jobs import JobService
 from superbrain.application.owner_loop import AuthGate, OwnerSession
+from superbrain.composition import _daemon_session_work
 from superbrain.composition._daemon_doctor import DaemonDoctorRunner
-from superbrain.composition._endpoint import BoundLoopbackListener, remove_own_endpoint
+from superbrain.composition._daemon_handoff_factory import build_default_handoff_domain as build_default_handoff_domain
+from superbrain.composition._daemon_handoff_factory import (
+    make_default_handoff_domain_factory as make_default_handoff_domain_factory,
+)
+from superbrain.composition._daemon_job_recovery import LeasedAttempts
+from superbrain.composition._endpoint import BoundLoopbackListener
 from superbrain.composition.kernel_bridge import KernelBridge
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.jsonvalue import JsonValue
@@ -30,6 +35,7 @@ from superbrain.core.kernel import (
     Call,
     CallContext,
     CallResult,
+    CaptureBatchCommand,
     Endpoint,
     InvocationRecord,
     JobRecord,
@@ -40,22 +46,26 @@ from superbrain.core.kernel import (
     Scope,
     SendAttemptCompletion,
     ShutdownReport,
-    ShutdownState,
     StoredResult,
     ToolCommand,
     WorkerCommand,
+    WorkerCompleted,
+    WorkerFailed,
     WorkerUsage,
     WorkspaceBinding,
     WorkspaceRegistration,
 )
+from superbrain.core.wire import encode_envelope, make_success_envelope
 from superbrain.ports.clock import Clock, MonotonicClock
+from superbrain.ports.continuity import CONTINUITY_REFRESH_JOB_KIND
 from superbrain.ports.policy import Intent
 from superbrain.storage.idempotency import StagedKernelStore
 from superbrain.storage.runtime import Runtime
-from superbrain.workers.executor import JobExecutor, WorkItem
+from superbrain.workers.executor import JobExecutor
 
 _DAEMON_WORKER_ITEM_BUDGET_NS = 60_000_000_000
 _LOGGER = logging.getLogger(__name__)
+_CONTINUITY_SCAN_INTERVAL = timedelta(seconds=1)
 
 
 @dataclass(frozen=True)
@@ -68,31 +78,70 @@ class DaemonTestHooks:
     before_bind: Callable[[Runtime], None] | None = None
     before_endpoint_publish: Callable[[Endpoint], None] | None = None
     after_endpoint_publish_before_final_tls_check: Callable[[Endpoint], None] | None = None
+    before_continuity_worker_commit: Callable[[Runtime], None] | None = None
     before_auth_gate_publish: Callable[[RequestAuthView], None] | None = None
     before_enter_commit: Callable[[Reservation | None], None] | None = None
     after_reserve_before_enqueue: Callable[[Reservation], None] | None = None
     before_runtime_close: Callable[[Runtime], None] | None = None
+    host_version_resolver: Callable[[str], str | None] | None = None
+
+
+_DEFAULT_HANDOFF_TOOLS: frozenset[str] = frozenset({"prepare_task", "get_artifact", "submit_episode", "get_health"})
+
+_STORED_REF_TOOL: dict[str, str] = {
+    "delivery_result": "prepare_task",
+    "artifact_result": "get_artifact",
+    "episode_result": "submit_episode",
+    "health_result": "get_health",
+}
 
 
 class _DaemonCompositeDomain:
-    """Serves ``get_job``, ``get_health(deep=True)``, and delegates any injected test/business domain tools."""
+    """Serves ``get_job``, ``get_health(deep=True)`` via the doctor runner, SP2-4 handoff tools, and any injected
+    test/business domain tools."""
 
     def __init__(
         self,
         job_service: JobService,
         delegate: KernelToolDomain | None,
+        *,
+        fallback: KernelToolDomain | None = None,
+        fallback_factory: Callable[[], KernelToolDomain | None] | None = None,
         doctor_runner: DaemonDoctorRunner | None = None,
     ) -> None:
         self._job_service = job_service
         self._delegate = delegate
+        self._fallback = fallback
+        self._fallback_factory = fallback_factory
         self._doctor_runner = doctor_runner
 
     def bind_doctor_runner(self, doctor_runner: DaemonDoctorRunner) -> None:
         self._doctor_runner = doctor_runner
 
+    def _get_fallback(self) -> KernelToolDomain | None:
+        if self._fallback is None and self._fallback_factory is not None:
+            self._fallback = self._fallback_factory()
+            self._fallback_factory = None
+        return self._fallback
+
     def rebind_job_service(self, job_service: JobService) -> None:
         """Point subsequent job queries at the post-restore ``JobService``."""
         self._job_service = job_service
+
+    def rebind_fallback(self, fallback: KernelToolDomain | None) -> None:
+        """Point SP2-4 continuity tools at the post-restore ``HandoffKernelDomain``."""
+        if self._delegate is None:
+            self._fallback = fallback
+            self._fallback_factory = None
+
+    def rebind_fallback_factory(
+        self,
+        factory: Callable[[], KernelToolDomain | None] | None,
+    ) -> None:
+        """Reset SP2-4 continuity fallback to a post-restore lazy factory."""
+        if self._delegate is None:
+            self._fallback = None
+            self._fallback_factory = factory
 
     @property
     def store(self) -> object:
@@ -108,14 +157,16 @@ class _DaemonCompositeDomain:
 
     def supports_tool(self, tool: str, *, deep: bool = False) -> bool:
         if tool == "get_job" and not deep:
-            if self._delegate is not None and self._delegate.supports_tool(tool, deep=deep):
-                return True
             return True
         if tool == "get_health" and deep and self._doctor_runner is not None:
             return True
-        if self._delegate is None:
-            return False
-        return self._delegate.supports_tool(tool, deep=deep)
+        if self._delegate is not None and self._delegate.supports_tool(tool, deep=deep):
+            return True
+        if self._fallback is not None:
+            return self._fallback.supports_tool(tool, deep=deep)
+        if self._fallback_factory is not None:
+            return tool in {"prepare_task", "get_artifact", "submit_episode"} and not deep
+        return False
 
     def execute_readonly(self, call: Call, ctx: CallContext) -> dict[str, JsonValue]:
         if call.tool == "get_job":
@@ -125,16 +176,42 @@ class _DaemonCompositeDomain:
             if not isinstance(job_id, str):
                 raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
             return self._job_service.get_job(job_id, ctx.principal, selected_scope=ctx.selected_scope).to_dict()
-        if self._delegate is None:
-            raise BrainError(ErrorCode.CAPABILITY_UNAVAILABLE, "capability unavailable")
-        return self._delegate.execute_readonly(call, ctx)
+        if self._delegate is not None and self._delegate.supports_tool(call.tool, deep=False):
+            return self._delegate.execute_readonly(call, ctx)
+        if self._fallback is not None or (
+            self._fallback_factory is not None and call.tool in _DEFAULT_HANDOFF_TOOLS
+        ):
+            fb = self._get_fallback()
+            if fb is not None and fb.supports_tool(call.tool, deep=False):
+                return fb.execute_readonly(call, ctx)
+        raise BrainError(ErrorCode.CAPABILITY_UNAVAILABLE, "capability unavailable")
 
     def prepare_mutation(self, call: Call, ctx: CallContext, *, now: datetime) -> PreparedEffect:
+        deep = call.tool == "get_health" and bool(call.arguments.get("deep"))
         if call.tool == "get_health" and self._doctor_runner is not None:
             return self._doctor_runner.prepare_deep_health(call, ctx, now=now)
-        if self._delegate is None:
-            raise BrainError(ErrorCode.CAPABILITY_UNAVAILABLE, "capability unavailable")
-        return self._delegate.prepare_mutation(call, ctx, now=now)
+        if self._delegate is not None and self._delegate.supports_tool(call.tool, deep=deep):
+            return self._delegate.prepare_mutation(call, ctx, now=now)
+        if self._fallback is not None or (
+            self._fallback_factory is not None and call.tool in _DEFAULT_HANDOFF_TOOLS
+        ):
+            fb = self._get_fallback()
+            if fb is not None and fb.supports_tool(call.tool, deep=deep):
+                return fb.prepare_mutation(call, ctx, now=now)
+        raise BrainError(ErrorCode.CAPABILITY_UNAVAILABLE, "capability unavailable")
+
+    def _stored_target(self, result: StoredResult) -> KernelToolDomain | None:
+        tool = _STORED_REF_TOOL.get(result.refs[0].kind) if result.refs else None
+        deep = tool == "get_health"
+        if self._delegate is not None and (tool is None or self._delegate.supports_tool(tool, deep=deep)):
+            return self._delegate
+        if tool is not None and (
+            self._fallback is not None or (self._fallback_factory is not None and tool in _DEFAULT_HANDOFF_TOOLS)
+        ):
+            fb = self._get_fallback()
+            if fb is not None and fb.supports_tool(tool, deep=deep):
+                return fb
+        return self._delegate
 
     def render_stored(
         self,
@@ -143,13 +220,15 @@ class _DaemonCompositeDomain:
         *,
         selected_scope: Scope | None,
     ) -> dict[str, JsonValue]:
-        if result.refs and result.refs[0].kind in {"doctor_run", "get_health_descriptor"}:
+        # every deep-health render (doctor-backed, or replayed from SP2-5) goes through the one doctor renderer
+        if result.refs and result.refs[0].kind in {"doctor_run", "get_health_descriptor", "health_result"}:
             if self._doctor_runner is None:
                 raise BrainError(ErrorCode.CAPABILITY_UNAVAILABLE, "capability unavailable")
             return self._doctor_runner.render_deep_health(result, principal, selected_scope=selected_scope)
-        if self._delegate is None:
+        target = self._stored_target(result)
+        if target is None:
             raise BrainError(ErrorCode.CAPABILITY_UNAVAILABLE, "capability unavailable")
-        return self._delegate.render_stored(result, principal, selected_scope=selected_scope)
+        return target.render_stored(result, principal, selected_scope=selected_scope)
 
     def describe_artifact_send(
         self,
@@ -159,9 +238,10 @@ class _DaemonCompositeDomain:
         *,
         selected_scope: Scope | None,
     ) -> ArtifactSendSpec | None:
-        if self._delegate is None:
+        target = self._stored_target(result)
+        if target is None:
             return None
-        return self._delegate.describe_artifact_send(result, rendered, principal, selected_scope=selected_scope)
+        return target.describe_artifact_send(result, rendered, principal, selected_scope=selected_scope)
 
 
 class _AdmittedOwnerSession(OwnerSession):
@@ -190,6 +270,7 @@ class _AdmittedOwnerSession(OwnerSession):
         self._bridge = bridge
         self._job_store = job_store
         self._job_service = job_service
+        self._leased = LeasedAttempts(lambda: self._job_service)
         self._executor = executor
         self._listener = listener
         self._clock = clock
@@ -207,6 +288,17 @@ class _AdmittedOwnerSession(OwnerSession):
         self._drained_requests = 0
         self._worker_join_failed = False
         self._job_service.set_claim_commit_guard(self._admit_claim_commit)
+        cw_hook = hooks.before_continuity_worker_commit
+        self._continuity_worker = ContinuityWorkerCoordinator(
+            rt=rt,
+            job_service=job_service,
+            executor=executor,
+            clock=clock,
+            mono=monotonic_clock.monotonic_ns,
+            before_commit_hook=(lambda: cw_hook(self._rt)) if cw_hook is not None else None,
+        )
+        self._next_continuity_scan: datetime | None = None
+        self._bridge.on_continuity_tasks = self._schedule_continuity_tasks
 
     def poll_doctor_settled(self, wake_event: threading.Event) -> bool:
         if self._doctor_runner is None:
@@ -261,6 +353,7 @@ class _AdmittedOwnerSession(OwnerSession):
         if ready is not None:
             self._ready = ready
         self._bridge.rebind_stores(store=rt.store, policy=rt.policy, writer_epoch=rt.lease.epoch)
+        self._continuity_worker.rebind(rt=rt, job_service=job_service)
         if self._doctor_runner is not None:
             self._doctor_runner.rebind_after_restore(
                 rt=rt,
@@ -299,27 +392,25 @@ class _AdmittedOwnerSession(OwnerSession):
             on_reserved=holder.append,
         )
 
+    def ingest_capture_batch(
+        self,
+        command: CaptureBatchCommand,
+        *,
+        deadline_ns: int | None = None,
+    ) -> CallResult:
+        """Process one capture batch on the owner thread and return an encoded ``CallResult``."""
+        ack = self._bridge.ingest_capture_batch(command, deadline_ns=deadline_ns)
+        envelope = make_success_envelope(ack.to_dict())
+        encode_envelope(envelope)
+        return envelope
+
     def _resolve_reply_future(
         self,
         future: Future[OwnerReply],
         holder: list[Reservation],
         envelope: CallResult,
     ) -> None:
-        stamp: AuthGrantStamp | None = None
-        completion: SendAttemptCompletion | None = None
-        if holder:
-            with self._reply_meta_lock:
-                meta = self._reply_meta.pop(holder[0].reservation_id, None)
-            if envelope.get("ok") is True and meta is not None:
-                stamp, completion = meta
-        safe_set_result(
-            future,
-            OwnerReply(
-                envelope=envelope,
-                grant_stamp=stamp,
-                send_completion=completion,
-            ),
-        )
+        _daemon_session_work._resolve_reply_future(self, future, holder, envelope)
 
     def arbitrate_deadlines(self) -> bool:
         self._bridge.arbitrate_deadlines()
@@ -329,23 +420,7 @@ class _AdmittedOwnerSession(OwnerSession):
         return self._bridge.next_deadline_ns()
 
     def step_owner_work(self, *, allow_new_jobs: bool) -> bool:
-        did_work = False
-        if self._executor is not None:
-            while (wcmd := self._executor.next_command(0.0)) is not None:
-                if self._bridge.reservations.expire_shutdown_if_due():
-                    break
-                with contextlib.suppress(BrainError):
-                    self._job_service.apply_command(wcmd)
-                did_work = True
-            if allow_new_jobs:
-                did_work = self._claim_and_submit_job() or did_work
-        if self._doctor_runner is not None and self._doctor_runner.step(allow_new_jobs=allow_new_jobs):
-            did_work = True
-        if self._bridge.process_next_queued(block=False):
-            did_work = True
-            if allow_new_jobs and self._doctor_runner is not None:
-                did_work = self._doctor_runner.claim_pending_if_idle() or did_work
-        return did_work
+        return _daemon_session_work.step_owner_work(self, allow_new_jobs=allow_new_jobs)
 
     def _is_stopping(self) -> bool:
         with self._metrics_lock:
@@ -381,44 +456,7 @@ class _AdmittedOwnerSession(OwnerSession):
                 self._executor.close(0.0)
 
     def _claim_and_submit_job(self) -> bool:
-        assert self._executor is not None
-        if self._is_stopping() or self._executor.is_closed or self._executor.in_flight != 0:
-            return False
-        if not self._is_claim_open():
-            return False
-        try:
-            lease = self._job_service.lease_next(self._rt.lease.epoch, self._clock.now())
-        except BrainError as err:
-            if err.code is ErrorCode.POLICY_UNAVAILABLE:
-                self._auth_gate.invalidate()
-            _LOGGER.warning("daemon job lease failed (code=%s)", err.code.value)
-            return False
-        if lease is None:
-            return False
-        if not self._can_start_claimed_job():
-            return True
-        try:
-            spec = self._job_service.resolve_leased_spec(lease)
-            if spec is None:
-                return True
-            if not self._can_start_claimed_job():
-                return True
-            self._job_service.start(lease)
-            item = WorkItem(
-                lease=lease,
-                spec=spec,
-                invocation_ids=(),
-                deadline_ns=self._monotonic_clock.monotonic_ns() + _DAEMON_WORKER_ITEM_BUDGET_NS,
-            )
-            self._executor.submit(item)
-            return True
-        except BrainError as err:
-            if err.code in (ErrorCode.REVISION_CONFLICT, ErrorCode.DAEMON_UNAVAILABLE):
-                return True
-            if err.code is ErrorCode.POLICY_UNAVAILABLE:
-                self._auth_gate.invalidate()
-            _LOGGER.warning("daemon job claim failed (code=%s)", err.code.value)
-            return False
+        return _daemon_session_work._claim_and_submit_job(self)
 
     def has_pending_owner_work(self) -> bool:
         return self._bridge.queue_depth() > 0
@@ -475,8 +513,40 @@ class _AdmittedOwnerSession(OwnerSession):
     def cancel_uncommitted_for_shutdown(self) -> int:
         return self._bridge.cancel_uncommitted_for_shutdown()
 
-    def apply_worker_command(self, cmd: WorkerCommand) -> JobRecord | InvocationRecord:
+    def _schedule_continuity_tasks(self, task_ids: tuple[str, ...]) -> None:
+        now = self._clock.now()
+        for task_id in task_ids:
+            try:
+                self._continuity_worker.enqueue_if_due(task_id=task_id, now=now)
+            except BrainError as err:
+                # The durable scan retries; the capture ACK already committed.
+                _LOGGER.warning("continuity schedule failed (code=%s)", err.code.value)
+
+    def _scan_continuity_if_due(self) -> None:
+        """Durable wake: committed-but-unsummarized events are rescheduled after a crash and at the 60 s mark."""
+        now = self._clock.now()
+        if self._next_continuity_scan is not None and now < self._next_continuity_scan:
+            return
+        self._next_continuity_scan = now + _CONTINUITY_SCAN_INTERVAL
+        try:
+            self._continuity_worker.enqueue_due(now=now)
+        except BrainError as err:
+            _LOGGER.warning("continuity scan failed (code=%s)", err.code.value)
+
+    def _dispatch_worker_command(self, cmd: WorkerCommand) -> None:
+        if isinstance(cmd, (WorkerCompleted, WorkerFailed)):
+            row = self._job_store.transact(lambda tx: tx.read_job(cmd.lease.job_id))
+            if row is not None and row.kind == CONTINUITY_REFRESH_JOB_KIND:
+                spec = self._leased.take_spec(cmd.lease) or self._job_service.job_spec(cmd.lease)
+                if isinstance(cmd, WorkerCompleted):
+                    self._continuity_worker.commit_worker_completed(cmd, now=self._clock.now(), spec=spec)
+                else:
+                    self._continuity_worker.handle_worker_failed(cmd, now=self._clock.now(), spec=spec)
+                return
         self._job_service.apply_command(cmd)
+
+    def apply_worker_command(self, cmd: WorkerCommand) -> JobRecord | InvocationRecord:
+        self._dispatch_worker_command(cmd)
         if isinstance(cmd, WorkerUsage):
             inv = self._job_store.transact(lambda tx: tx.read_invocation(cmd.invocation_id))
             if inv is None:
@@ -504,65 +574,7 @@ class _AdmittedOwnerSession(OwnerSession):
         return self._bridge.register_workspace(registration, authorization)
 
     def teardown_on_owner(self, *, overrun: bool, cancelled_requests: int = 0) -> ShutdownReport:
-        self._listener.close()
-        self._auth_gate.close()
-        if self._operator is not None:
-            self._operator.unbind()
-        self._close_claim_gate()
-        if self._doctor_runner is not None:
-            self._doctor_runner.cancel_on_teardown()
-        drained, worker_drained = self.shutdown_metrics()
-        removed = False
-        try:
-            removed = remove_own_endpoint(self._rt.root, self._rt.lease, self._ready.endpoint, self._rt.os_)
-        except BrainError as err:
-            return ShutdownReport(
-                state=ShutdownState.CLOSE_FAILED,
-                drained_requests=drained,
-                cancelled_requests=cancelled_requests,
-                worker_drained=worker_drained,
-                endpoint_removed=False,
-                error_code=err.code,
-            )
-        try:
-            if self._hooks.before_runtime_close is not None:
-                self._hooks.before_runtime_close(self._rt)
-            self._rt.close()
-        except BrainError as err:
-            return ShutdownReport(
-                state=ShutdownState.CLOSE_FAILED,
-                drained_requests=drained,
-                cancelled_requests=cancelled_requests,
-                worker_drained=worker_drained,
-                endpoint_removed=removed,
-                error_code=err.code,
-            )
-        except Exception:  # noqa: BLE001
-            return ShutdownReport(
-                state=ShutdownState.CLOSE_FAILED,
-                drained_requests=drained,
-                cancelled_requests=cancelled_requests,
-                worker_drained=worker_drained,
-                endpoint_removed=removed,
-                error_code=ErrorCode.IO_ERROR,
-            )
-        if overrun:
-            return ShutdownReport(
-                state=ShutdownState.OVERRUN,
-                drained_requests=drained,
-                cancelled_requests=cancelled_requests,
-                worker_drained=worker_drained,
-                endpoint_removed=removed,
-                error_code=ErrorCode.DEADLINE_EXCEEDED,
-            )
-        return ShutdownReport(
-            state=ShutdownState.STOPPED,
-            drained_requests=drained,
-            cancelled_requests=cancelled_requests,
-            worker_drained=worker_drained,
-            endpoint_removed=removed,
-            error_code=None,
-        )
+        return _daemon_session_work.teardown_on_owner(self, overrun=overrun, cancelled_requests=cancelled_requests)
 
     def adopt_after_owner_exit(self, exited_owner: threading.Thread) -> None:
         if exited_owner.ident is None or exited_owner.is_alive():

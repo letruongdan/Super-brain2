@@ -294,3 +294,26 @@ def test_select_apply_staging_dir_same_and_cross_volume_keeps_git_clean(trusted_
     with pytest.raises(BrainError) as bad_exc:
         select_apply_staging_dir(sym_checkout, data_root, new_id(), "dan", cross_os)
     assert bad_exc.value.code in {ErrorCode.UNSAFE_PATH, ErrorCode.INSECURE_PERMISSIONS}
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX lockf path")
+def test_posix_append_never_drops_a_record_when_its_lock_stays_contended(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """macOS lets a whole-file flock (the outbox lock) block the append's lockf; a record is then written with one
+    O_APPEND write (atomic for regular files) instead of being dropped."""
+    import errno
+    import importlib
+
+    from superbrain.adapters.os.physical_fs import atomic_append_no_follow
+
+    fcntl = importlib.import_module("fcntl")
+    target = tmp_path / "hook.log"
+    target.write_bytes(b"seed\n")
+
+    def _contended(*_args: object, **_kwargs: object) -> None:
+        raise OSError(errno.EAGAIN, "Resource temporarily unavailable")
+
+    monkeypatch.setattr(fcntl, "lockf", _contended)
+    atomic_append_no_follow(target, b"phase=hook error.code=invalid_input\n", timeout_s=0.05)
+    assert target.read_bytes() == b"seed\nphase=hook error.code=invalid_input\n"

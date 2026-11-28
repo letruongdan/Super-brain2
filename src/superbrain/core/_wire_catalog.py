@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import copy
 import hashlib
-import importlib.resources
-import tomllib
 from collections.abc import Callable
 from pathlib import Path
 from types import MappingProxyType
@@ -37,11 +35,18 @@ _CACHED_CATALOG: ToolCatalog | None = None
 
 def _read_schema_bytes() -> bytes:
     """Read packaged wheel schema first; fallback only to verified super-brain2 source root."""
-    packaged = importlib.resources.files("superbrain.core").joinpath("data", "mcp-tools-v2.json")
-    if packaged.is_file():
-        return packaged.read_bytes()
-
     module_path = Path(__file__).resolve()
+    local_packaged = module_path.parent / "data" / "mcp-tools-v2.json"
+    if not local_packaged.is_symlink() and local_packaged.is_file():
+        return local_packaged.read_bytes()
+
+    if not module_path.is_file():
+        import importlib.resources
+
+        packaged = importlib.resources.files("superbrain.core").joinpath("data", "mcp-tools-v2.json")
+        if packaged.is_file():
+            return packaged.read_bytes()
+
     if len(module_path.parents) < 4:
         raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
     repo_root = module_path.parents[3]
@@ -58,6 +63,8 @@ def _read_schema_bytes() -> bytes:
         or not schema_path.is_file()
     ):
         raise BrainError(ErrorCode.INTEGRITY_FAILURE, "integrity failure")
+
+    import tomllib
 
     try:
         pyproject_data = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))

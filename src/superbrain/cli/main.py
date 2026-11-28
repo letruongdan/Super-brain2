@@ -94,6 +94,7 @@ def _parse_doctor_args(args: list[str]) -> tuple[str, list[str]] | None:
     has_config = False
     has_profile = False
     has_checkout = False
+    has_outbox = False
     has_offline = False
     has_fix = False
     has_wait_ms = False
@@ -135,6 +136,11 @@ def _parse_doctor_args(args: list[str]) -> tuple[str, list[str]] | None:
             if has_checkout or i + 1 >= len(args) or not _is_valid_abs_path(args[i + 1]):
                 return None
             has_checkout = True
+            i += 2
+        elif tok == "--outbox":
+            if has_outbox or i + 1 >= len(args) or not _is_valid_abs_path(args[i + 1]):
+                return None
+            has_outbox = True
             i += 2
         else:
             return None

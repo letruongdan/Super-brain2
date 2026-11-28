@@ -19,9 +19,11 @@ from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.faults import crashpoint
 from superbrain.core.jsonvalue import JsonValue
 from superbrain.core.kernel import (
+    CAPTURE_GAPS_PRESENT_CODE,
     HANDLER_RESERVE_NS,
     IDEMPOTENCY_CLOCK_UNTRUSTED_CODE,
     ArtifactSendSpec,
+    AuthSnapshot,
     Call,
     CallContext,
     CallResult,
@@ -48,6 +50,7 @@ _PLACEHOLDER_RECEIPT_ID = "00000000-0000-7000-8000-000000000000"
 _STORED_KIND_ACTIONS: dict[str, str] = {
     "delivery_result": "prepare_task",
     "artifact_result": "get_artifact",
+    "episode_result": "submit_episode",
     "outcome_result": "record_outcome",
     "doctor_run": "get_health",
 }
@@ -114,6 +117,8 @@ class KernelDispatcher:
         send_attempts: KernelSendAttemptPort | None = None,
         before_enter_commit: Callable[[Reservation | None], None] | None = None,
         on_commit_completed: Callable[[StoredResult], None] | None = None,
+        has_capture_gaps: Callable[[], bool] | None = None,
+        effective_snapshot: Callable[[], AuthSnapshot] | None = None,
     ) -> None:
         require_opaque_id(store_id, label="store_id")
         self._store_id = store_id
@@ -129,10 +134,24 @@ class KernelDispatcher:
         self._send_attempts = send_attempts
         self._before_enter_commit = before_enter_commit
         self._on_commit_completed = on_commit_completed
+        self._has_capture_gaps = has_capture_gaps
+        self._effective_snapshot = effective_snapshot
 
-    def dispatch(self, call: Call, ctx: CallContext, *, auth: PrivateRequestAuth) -> CallResult:
+    def _current_snapshot(self) -> AuthSnapshot:
+        return self._effective_snapshot() if self._effective_snapshot is not None else self._policy.snapshot()
+
+    def dispatch(
+        self,
+        call: Call,
+        ctx: CallContext,
+        *,
+        auth: PrivateRequestAuth,
+        enforce_effective: bool = False,
+    ) -> CallResult:
         """Execute ``call`` on the owner thread and return a validated v2 ``CallResult`` envelope."""
-        return self.dispatch_reserved(call, ctx, auth=auth, reservation=None)
+        return self.dispatch_reserved(
+            call, ctx, auth=auth, reservation=None, enforce_effective=enforce_effective
+        )
 
     def dispatch_reserved(
         self,
@@ -141,10 +160,13 @@ class KernelDispatcher:
         *,
         auth: PrivateRequestAuth,
         reservation: Reservation | None = None,
+        enforce_effective: bool = False,
     ) -> CallResult:
         """Execute ``call`` on the owner thread gated by ``reservation`` and ``enter_commit`` (Task 4b)."""
         try:
-            data = self._dispatch_data(call, ctx, auth=auth, reservation=reservation)
+            data = self._dispatch_data(
+                call, ctx, auth=auth, reservation=reservation, enforce_effective=enforce_effective
+            )
             envelope = make_success_envelope(data)
             encode_envelope(envelope)
             return envelope
@@ -159,10 +181,15 @@ class KernelDispatcher:
             raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
         if selected_scope is not None and not isinstance(selected_scope, Scope):
             raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
-        if not self._policy.allows(principal, None, action="get_health"):
+        snap = self._current_snapshot() if self._effective_snapshot is not None else None
+        if not self._policy.allows(principal, None, action="get_health") or (
+            snap is not None and not snap.allows(principal, None, action="get_health")
+        ):
             raise BrainError(ErrorCode.NOT_FOUND, "not found")
-        if selected_scope is not None and not self._policy.allows(
-            principal, selected_scope, action=_scope_action_for_stored(result)
+        action = _scope_action_for_stored(result)
+        if selected_scope is not None and (
+            not self._policy.allows(principal, selected_scope, action=action)
+            or (snap is not None and not snap.allows(principal, selected_scope, action=action))
         ):
             raise BrainError(ErrorCode.NOT_FOUND, "not found")
         if self._domain is None:
@@ -204,7 +231,23 @@ class KernelDispatcher:
         attempt = self._send_attempts.record_pending_attempt(spec)
         return {**rendered, "served_receipt_id": attempt.served_receipt_id}
 
-    def _verify_owner_auth_and_scope(self, call: Call, ctx: CallContext, auth: PrivateRequestAuth) -> Principal:
+    def _verify_owner_auth_and_scope(
+        self,
+        call: Call,
+        ctx: CallContext,
+        auth: PrivateRequestAuth,
+        *,
+        enforce_effective: bool = False,
+    ) -> Principal:
+        if enforce_effective and self._effective_snapshot is not None:
+            return verify_effective_mcp_auth(
+                store_id=self._store_id,
+                policy=self._policy,
+                effective_snapshot=self._effective_snapshot,
+                call=call,
+                ctx=ctx,
+                auth=auth,
+            )
         if not isinstance(call, Call) or not isinstance(ctx, CallContext) or not isinstance(auth, PrivateRequestAuth):
             raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
         if ctx.identity.store_id != self._store_id or ctx.selected_scope != call.selected_scope:
@@ -279,8 +322,11 @@ class KernelDispatcher:
         *,
         auth: PrivateRequestAuth,
         reservation: Reservation | None = None,
+        enforce_effective: bool = False,
     ) -> dict[str, JsonValue]:
-        live_principal = self._verify_owner_auth_and_scope(call, ctx, auth)
+        live_principal = self._verify_owner_auth_and_scope(
+            call, ctx, auth, enforce_effective=enforce_effective
+        )
         self._check_handler_budget(ctx, reservation)
 
         uses_idem = tool_uses_idempotency(call)
@@ -295,6 +341,8 @@ class KernelDispatcher:
             if is_shallow_health:
                 untrusted = self._idempotency.clock_untrusted()
                 degraded: list[JsonValue] = [IDEMPOTENCY_CLOCK_UNTRUSTED_CODE] if untrusted else []
+                if self._has_capture_gaps is not None and self._has_capture_gaps():
+                    degraded.append(CAPTURE_GAPS_PRESENT_CODE)
                 return {
                     "ready": not untrusted,
                     "store_id": self._store_id,
@@ -361,6 +409,8 @@ class KernelDispatcher:
         )
         if not was_raced_replay:
             crashpoint("kernel.after_commit_before_response")
+            if call.tool == "submit_episode" and ("handoff" in call.arguments or "takeover" in call.arguments):
+                crashpoint("handoff.after_commit_before_ack")
             if self._on_commit_completed is not None:
                 try:
                     self._on_commit_completed(stored)
@@ -382,6 +432,34 @@ class KernelDispatcher:
 
     def _check_raced_row(self, row: IdempotencyRow, call: Call, *, now: datetime) -> bool:
         return self._verify_retained_row(row, call, now=now)
+
+
+def verify_effective_mcp_auth(
+    *,
+    store_id: str,
+    policy: KernelPolicyPort,
+    effective_snapshot: Callable[[], AuthSnapshot],
+    call: Call,
+    ctx: CallContext,
+    auth: PrivateRequestAuth,
+) -> Principal:
+    """Authenticate bearer token against live policy first, then enforce runtime MCP capabilities."""
+    if not isinstance(call, Call) or not isinstance(ctx, CallContext) or not isinstance(auth, PrivateRequestAuth):
+        raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+    if ctx.identity.store_id != store_id or ctx.selected_scope != call.selected_scope:
+        raise BrainError(ErrorCode.IDENTITY_MISMATCH, "principal identity mismatch")
+    parsed_cred_id, _ = parse_bearer_token(auth.token)
+    if parsed_cred_id != auth.credential_id:
+        raise BrainError(ErrorCode.UNAUTHENTICATED, "unauthenticated")
+    live_principal = policy.resolve_credential(auth.token)
+    if live_principal != auth.principal or live_principal != ctx.principal:
+        raise BrainError(ErrorCode.IDENTITY_MISMATCH, "principal identity mismatch")
+    snap = effective_snapshot()
+    effective_principal = snap.resolve_credential(auth.token)
+    if effective_principal != live_principal:
+        raise BrainError(ErrorCode.IDENTITY_MISMATCH, "principal identity mismatch")
+    authorize_call_against_snapshot(snap, live_principal, call)
+    return live_principal
 
 
 def dispatch(

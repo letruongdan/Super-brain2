@@ -55,22 +55,36 @@ _BATCH = 1000  # below the filter's 1024-item array limit
 _SUFFIXES = ("", " ü")  # ASCII text, and text with a non-ASCII character elsewhere
 
 
-def _components(path: str) -> list[str]:
-    return [part for part in _SEPARATOR.split(path.lower()) if part and part != "."]
+@functools.cache
+def _components(path: str) -> tuple[str, ...]:
+    return tuple(part for part in _SEPARATOR.split(path.lower()) if part and part != ".")
 
 
 @functools.cache
+def _pattern_chains(patterns: tuple[str, ...]) -> tuple[tuple[str, ...], ...]:
+    return tuple(_components(p) for p in patterns)
+
+
+@functools.cache
+def _match_part(p: str, g: str) -> bool:
+    if "*" not in g and "?" not in g and "[" not in g:
+        return p == g
+    return fnmatch.fnmatchcase(p, g)
+
+
+@functools.lru_cache(maxsize=65536)
 def _spec_blocked(spelling: str, patterns: tuple[str, ...]) -> bool:
     parts = _components(spelling)
-    for pattern in patterns:
-        chain = _components(pattern)
-        for start in range(len(parts) - len(chain) + 1):
-            if all(fnmatch.fnmatchcase(p, g) for p, g in zip(parts[start : start + len(chain)], chain, strict=True)):
+    len_parts = len(parts)
+    for chain in _pattern_chains(patterns):
+        len_chain = len(chain)
+        for start in range(len_parts - len_chain + 1):
+            if all(_match_part(p, g) for p, g in zip(parts[start : start + len_chain], chain, strict=True)):
                 return True
     return False
 
 
-@functools.cache
+@functools.lru_cache(maxsize=65536)
 def _token_outcomes(token: str, patterns: tuple[str, ...]) -> frozenset[str] | None:
     """Acceptable replacements of one token, or ``None`` when no spelling of it is blocked."""
     lead_max = len(token) - len(token.lstrip(LEAD))
@@ -89,42 +103,80 @@ def _token_outcomes(token: str, patterns: tuple[str, ...]) -> frozenset[str] | N
     return outcomes or None
 
 
-def _expected(text: str, patterns: tuple[str, ...]) -> tuple[set[str], int]:
+def _expected_cached(text: str, patterns: tuple[str, ...]) -> tuple[frozenset[str], int]:
     """Every acceptable filtered form of ``text`` and the exact number of redactions."""
-    pieces: list[frozenset[str] | set[str]] = []
+    pieces: list[frozenset[str]] = []
+    single_pieces: list[str] | None = []
     cursor = count = 0
     for match in _TOKEN.finditer(text):
-        pieces.append({text[cursor : match.start()]})
+        gap = text[cursor : match.start()]
         outcomes = _token_outcomes(match.group(0), patterns)
-        count += outcomes is not None
-        pieces.append(outcomes or {match.group(0)})
+        if outcomes is None:
+            piece_val = match.group(0)
+            if single_pieces is not None:
+                single_pieces.extend((gap, piece_val))
+            else:
+                pieces.extend((frozenset({gap}), frozenset({piece_val})))
+        else:
+            count += 1
+            if single_pieces is not None and len(outcomes) == 1:
+                single_pieces.extend((gap, next(iter(outcomes))))
+            else:
+                if single_pieces is not None:
+                    pieces = [frozenset({p}) for p in single_pieces]
+                    single_pieces = None
+                pieces.extend((frozenset({gap}), outcomes))
         cursor = match.end()
-    pieces.append({text[cursor:]})
-    return {"".join(parts) for parts in itertools.product(*pieces)}, count
+    tail = text[cursor:]
+    if single_pieces is not None:
+        single_pieces.append(tail)
+        return frozenset({"".join(single_pieces)}), count
+    pieces.append(frozenset({tail}))
+    return frozenset("".join(parts) for parts in itertools.product(*pieces)), count
 
 
-def _wrappers(chars: str, *, inner: int, full: bool) -> list[str]:
+def _expected(text: str, patterns: tuple[str, ...]) -> tuple[set[str], int]:
+    """Every acceptable filtered form of ``text`` and the exact number of redactions."""
+    forms, count = _expected_cached(text, patterns)
+    return set(forms), count
+
+
+def _redaction_count(text: str, patterns: tuple[str, ...]) -> int:
+    """The exact number of redactions in ``text`` under ``patterns``."""
+    return sum(1 for match in _TOKEN.finditer(text) if _token_outcomes(match.group(0), patterns) is not None)
+
+
+@functools.cache
+def _wrappers(chars: str, *, inner: int, full: bool) -> tuple[str, ...]:
     """No wrapper, each character, each pair; ``inner`` is the index of a pair's character next to the token."""
     pairs = (a + b for a in chars for b in chars)
-    return ["", *chars, *(pair for pair in pairs if full or pair[inner] not in _BOUNDARY)]
+    return ("", *chars, *(pair for pair in pairs if full or pair[inner] not in _BOUNDARY))
+
+
+def _wrapped_tuple(base: str, *, full: bool = False) -> tuple[str, ...]:
+    leads = _wrappers(LEAD, inner=1, full=full)
+    trails = _wrappers(TRAIL, inner=0, full=full)
+    return tuple(f"see {lead}{base}{trail} now" for lead in leads for trail in trails)
 
 
 def _wrapped(base: str, *, full: bool = False) -> Iterator[str]:
     """``base`` bare and inside the combinations of 0-2 leading and 0-2 trailing wrapper characters."""
-    for lead in _wrappers(LEAD, inner=1, full=full):
-        for trail in _wrappers(TRAIL, inner=0, full=full):
-            yield f"see {lead}{base}{trail} now"
+    return iter(_wrapped_tuple(base, full=full))
 
 
+@functools.cache
 def _policy(patterns: tuple[str, ...]) -> FilterPolicy:
     return FilterPolicy(blocked_path_patterns=patterns, entropy_min_length=4096)  # entropy cannot mask a miss
+
+
+_REUSABLE_FILTER = PrivacyFilter()
 
 
 def _apply(texts: list[str], policy: FilterPolicy) -> tuple[list[str], int]:
     got: list[str] = []
     redacted = 0
     for start in range(0, len(texts), _BATCH):
-        safe = PrivacyFilter().apply({"items": list(texts[start : start + _BATCH]), "ok": "safe prose kept"}, policy)
+        safe = _REUSABLE_FILTER.apply({"items": list(texts[start : start + _BATCH]), "ok": "safe prose kept"}, policy)
         assert isinstance(safe.value, dict) and safe.value["ok"] == "safe prose kept"  # positive control
         assert safe.stripped_keys_count == 0
         items = safe.value["items"]
@@ -138,9 +190,27 @@ def _check(
     texts: list[str], patterns: tuple[str, ...], *, want_blocked: bool, suffixes: tuple[str, ...] = _SUFFIXES
 ) -> None:
     policy = _policy(patterns)
+    base_expected: list[tuple[frozenset[str], int]] | None = None
     for suffix in suffixes:
         batch = [text + suffix for text in texts]
-        expected = [_expected(text, patterns) for text in batch]
+        if not suffix:
+            if base_expected is None:
+                base_expected = [_expected_cached(text, patterns) for text in texts]
+            expected = base_expected
+        elif suffix[0].isspace() and _expected_cached(suffix, patterns) == (frozenset({suffix}), 0):
+            if base_expected is None:
+                base_expected = [_expected_cached(text, patterns) for text in texts]
+            expected = [
+                (
+                    frozenset({next(iter(forms)) + suffix})
+                    if len(forms) == 1
+                    else frozenset(form + suffix for form in forms),
+                    count,
+                )
+                for forms, count in base_expected
+            ]
+        else:
+            expected = [_expected_cached(text, patterns) for text in batch]
         for text, (_forms, count) in zip(batch, expected, strict=True):
             assert (count >= 1) is want_blocked, f"oracle fixture is on the wrong side: {text!r}"
         got, redacted = _apply(batch, policy)
@@ -200,7 +270,7 @@ def test_p01_reported_wrapped_token_is_redacted_and_keeps_its_wrapper(
 ) -> None:
     # In each of these texts exactly one spelling is blocked, so the result is fixed by §14.2.
     assert _expected(text + suffix, (pattern,)) == ({expected + suffix}, 1)
-    safe = PrivacyFilter().apply({"note": text + suffix, "ok": "safe prose kept"}, _policy((pattern,)))
+    safe = _REUSABLE_FILTER.apply({"note": text + suffix, "ok": "safe prose kept"}, _policy((pattern,)))
     assert safe.value == {"note": expected + suffix, "ok": "safe prose kept"}
     assert safe.redacted_count == 1 and safe.stripped_keys_count == 0
 
@@ -251,7 +321,7 @@ def test_p01_near_miss_stays_under_every_wrapper_combination_with_a_blocked_twin
     patterns = (pattern,)
     kept: list[str] = []
     for token in tokens:
-        texts = [text for text in _wrapped(token) if _expected(text, patterns)[1] == 0]
+        texts = [text for text in _wrapped(token) if _redaction_count(text, patterns) == 0]
         assert len(texts) >= 43, f"near miss {token!r} is blocked under most wrappers; pick another fixture"
         kept += texts
     for suffix in _SUFFIXES:

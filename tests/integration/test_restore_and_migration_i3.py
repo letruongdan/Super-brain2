@@ -303,7 +303,7 @@ def test_case_93_restore_interrupted_apply_journal_after_ended_grant_never_reviv
     try:
         from superbrain.storage.restore import read_restore_epoch
 
-        assert read_restore_epoch(DataRoot.at(root), schema_version=5, os_=os_) >= 1
+        assert read_restore_epoch(DataRoot.at(root), schema_version=6, os_=os_) >= 1
         assert rt2.policy.recovery_grant(grant.grant_id).state == "ended"
         reconcile_and_classify_journals(
             StoreProposalAdapter(rt2.store, os_),

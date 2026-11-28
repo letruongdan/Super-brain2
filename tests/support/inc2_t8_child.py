@@ -100,8 +100,16 @@ def _serve(config_path: Path, *, mode: str, args: Sequence[str]) -> int:
         use_fixture_store_extensions()
         proxy = FixtureDomainProxy()
         hooks = fixture_hooks(proxy, monotonic_ns=adapters.monotonic.monotonic_ns)
+        # No job handlers: the template's queued jobs must not be claimed while a request-path crash
+        # oracle compares durable state (job claiming is covered by ``serve-jobs``).
         return serve_config_path(
-            config_path, os_=adapters, on_ready=_on_ready, stop_event=stop, domain=proxy, hooks=hooks
+            config_path,
+            os_=adapters,
+            on_ready=_on_ready,
+            stop_event=stop,
+            domain=proxy,
+            hooks=hooks,
+            job_handlers={},
         )
     finally:
         shutil.rmtree(scratch_base, ignore_errors=True)

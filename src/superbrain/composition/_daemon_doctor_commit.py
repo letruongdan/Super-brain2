@@ -8,6 +8,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from superbrain.application._privacy_canary import KernelPrivacyScanner
 from superbrain.application.doctor import inspect_doctor_snapshot
@@ -17,6 +18,7 @@ from superbrain.composition._daemon_health import (
     health_status_fields,
     load_committed_doctor_run_dto,
 )
+from superbrain.composition._doctor_sp2_merge import merge_sp2_report
 from superbrain.core._json_parse import parse_json
 from superbrain.core.canonical import digest_bytes
 from superbrain.core.errors import BrainError, ErrorCode
@@ -42,6 +44,9 @@ from superbrain.storage.restore import read_restore_epoch
 from superbrain.storage.retention import default_expiry
 from superbrain.storage.runtime import Runtime
 
+if TYPE_CHECKING:
+    from superbrain.composition.doctor_probes_sp2_store import Sp2DoctorReport
+
 DOCTOR_ACTOR = "system:doctor"
 VALID_DOCTOR_TRIGGERS = frozenset({"startup", "schedule", "get_health", "cli", "fix", "manual"})
 
@@ -64,6 +69,7 @@ class _CompletedDoctorProbe:
     snapshot: DoctorSnapshot | None
     fences: DoctorFences
     transient: bool = False
+    sp2: Sp2DoctorReport | None = None
 
 
 def parse_doctor_payload(payload: bytes) -> tuple[str, Path | None]:
@@ -99,9 +105,12 @@ def commit_doctor_run_snapshot(
     tls_not_after: datetime,
     clock_untrusted: bool,
     is_stale_fn: Callable[[], bool],
+    sp2: Sp2DoctorReport | None = None,
 ) -> str:
     """Inspect ``snapshot``, hold bounded ``DoctorRun`` + descriptor blobs, and commit ``job.terminal`` atomically."""
     report = inspect_doctor_snapshot(snapshot, privacy_scanner=scanner)
+    if sp2 is not None:
+        report = merge_sp2_report(report, sp2)
     non_pass_codes = tuple(c.name for c in report.checks if c.status != "PASS")
     now_utc, now_str = require_aware_utc(now)
     _, degraded_codes = health_status_fields(

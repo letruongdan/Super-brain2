@@ -24,6 +24,7 @@ from superbrain.adapters.harness_config.bootstrap_templates import (
     plan_claude_bootstrap,
     plan_codex_bootstrap,
 )
+from superbrain.adapters.harness_config.json_hook_groups import is_managed_group
 from superbrain.adapters.harness_config.merger import SharedConfigMergerAdapter
 from superbrain.adapters.os import os_adapters
 from superbrain.application.approvals import OperatorService
@@ -372,6 +373,19 @@ def test_f2_not_stored_policy_with_not_holder_ack_pair_decides_by_context() -> N
     rr.assert_not_stored_policy_not_holder_ack_pair()
 
 
+
+def _hook_strings(hooks: dict[str, Any]) -> list[str]:
+    """Every string a managed hook handler carries (exec-form args and command strings)."""
+    out: list[str] = []
+    for groups in hooks.values():
+        for group in groups if isinstance(groups, list) else []:
+            if not is_managed_group(group):
+                continue
+            for h in group["hooks"]:
+                out.extend(x for x in [h.get("command"), h.get("commandWindows"), *h.get("args", [])]
+                           if isinstance(x, str))
+    return out
+
 def test_f4_manifest_driven_rebootstrap_preserves_u1_and_blocks_in_slice_tamper(trusted_tmp: Path) -> None:
     """F4: manifest-driven re-bootstrap updates across MD/JSON/TOML preserving U1, & blocks in-slice tamper."""
     with _open_ctx(trusted_tmp / "f4", "f4") as ctx:
@@ -395,12 +409,12 @@ def test_f4_manifest_driven_rebootstrap_preserves_u1_and_blocks_in_slice_tamper(
         p1_c = plan_claude_bootstrap(checkout_root=co_c, profile_path=c_prof1, expected_slice_digests=None)
         assert {(t.rel_path, t.slice_id) for t in p1_c.targets} == {
             ("CLAUDE.md", "super-brain-layer1"), (".mcp.json", "mcpServers.super-brain"),
-            (".claude/settings.local.json", "permissions.ask,hooks.PreToolUse"),
+            (".claude/settings.local.json", "permissions.ask,hooks#super-brain"),
         }
         p1_x = plan_codex_bootstrap(checkout_root=co_x, profile_path=x_prof1, expected_slice_digests=None)
         assert {(t.rel_path, t.slice_id) for t in p1_x.targets} == {
             ("AGENTS.md", "super-brain-layer1"), (".codex/config.toml", "mcp_servers.super-brain"),
-            (".codex/hooks.json", "hooks.PreToolUse"),
+            (".codex/hooks.json", "hooks#super-brain"),
         }
 
         ctx.apply(ctx.propose("claude-code", co_c, c_prof1).proposal_id)
@@ -423,10 +437,11 @@ def test_f4_manifest_driven_rebootstrap_preserves_u1_and_blocks_in_slice_tamper(
             o.update(userSibling="keep"), o["mcpServers"].update({"user-extra": {"command": "true"}})))
         _jedit(co_c / ".claude" / "settings.local.json", lambda o: (
             o["permissions"].update(allow=["Bash(git status *)"]),
-            o["hooks"].update(PostToolUse=[{"type": "user-post"}])))
+            o["hooks"].setdefault("PostToolUse", []).append({"type": "user-post"})))
         _append(co_x / "AGENTS.md", "\n## Agents Prose After\nKeep me.\n")
         _append(co_x / ".codex" / "config.toml", '\n# U1 post-apply comment\n[profiles.u1]\nowner = "keep"\n')
-        _jedit(co_x / ".codex" / "hooks.json", lambda o: o["hooks"].update(PostToolUse=[{"type": "codex-post"}]))
+        _jedit(co_x / ".codex" / "hooks.json",
+               lambda o: o["hooks"].setdefault("PostToolUse", []).append({"type": "codex-post"}))
         # Rotate to c_prof2 / x_prof2 -> re-bootstrap updates cleanly and preserves 100% of U1 edits & TOML comments!
         ctx.apply(ctx.propose("claude-code", co_c, c_prof2).proposal_id)
         ctx.apply(_prop_id(op.handle(
@@ -443,8 +458,8 @@ def test_f4_manifest_driven_rebootstrap_preserves_u1_and_blocks_in_slice_tamper(
         assert str(c_prof2) in mcp2["mcpServers"]["super-brain"]["args"]
         set2 = json.loads((co_c / ".claude" / "settings.local.json").read_text("utf-8"))
         assert set2["theme"] == "dark" and set2["permissions"]["allow"] == ["Bash(git status *)"]
-        assert set2["hooks"]["PostToolUse"] == [{"type": "user-post"}]
-        assert set2["hooks"]["PreToolUse"]["super_brain"]["profile"] == str(c_prof2)
+        assert [g for g in set2["hooks"]["PostToolUse"] if not is_managed_group(g)] == [{"type": "user-post"}]
+        assert str(c_prof2) in _hook_strings(set2["hooks"]) and str(c_prof1) not in _hook_strings(set2["hooks"])
 
         x_md2 = (co_x / "AGENTS.md").read_text("utf-8")
         assert "# Codex Base" in x_md2 and "## Agents Prose After" in x_md2
@@ -455,14 +470,17 @@ def test_f4_manifest_driven_rebootstrap_preserves_u1_and_blocks_in_slice_tamper(
         assert toml2["profiles"]["dev"]["keep"] is True and toml2["profiles"]["u1"]["owner"] == "keep"
         assert str(x_prof2) in toml2["mcp_servers"]["super-brain"]["args"]
         xhook2 = json.loads((co_x / ".codex" / "hooks.json").read_text("utf-8"))
-        assert xhook2["userTop"] == 1 and xhook2["hooks"]["PostToolUse"] == [{"type": "codex-post"}]
-        assert xhook2["hooks"]["PreToolUse"]["super_brain"]["profile"] == str(x_prof2)
+        assert xhook2["userTop"] == 1
+        assert [g for g in xhook2["hooks"]["PostToolUse"] if not is_managed_group(g)] == [{"type": "codex-post"}]
+        assert any(str(x_prof2) in s for s in _hook_strings(xhook2["hooks"]))
 
         def _mut_json(key1: str, key2: str, val: Any) -> Callable[[str], str]:
             def _fn(txt: str) -> str:
                 obj = json.loads(txt)
-                if key2 == "non_blocking":
-                    obj[key1]["PreToolUse"]["super_brain"][key2] = val
+                if key2 == "managed_timeout":
+                    for group in obj[key1]["PreToolUse"]:
+                        if is_managed_group(group):
+                            group["hooks"][0]["timeout"] = val
                 else:
                     obj[key1][key2] = val
                 return json.dumps(obj, indent=2) + "\n"
@@ -486,14 +504,14 @@ def test_f4_manifest_driven_rebootstrap_preserves_u1_and_blocks_in_slice_tamper(
             (co_c / "CLAUDE.md", lambda t: t.replace("Session Handoff Protocol", "Tampered Handoff Protocol")),
             (co_c / ".mcp.json", lambda t: t.replace(c_prof2.name, c_prof1.name)),
             (co_c / ".claude" / "settings.local.json", _mut_json("permissions", "ask", ["Bash(tampered *)"])),
-            (co_c / ".claude" / "settings.local.json", _mut_json("hooks", "non_blocking", False)),
+            (co_c / ".claude" / "settings.local.json", _mut_json("hooks", "managed_timeout", 99)),
         ):
             _check_tamper(path, mut_fn, co_c, lambda: ctx.propose("claude-code", co_c, c_prof1))
         body_x = {"harness": "codex", "checkout_root": str(co_x), "harness_profile_path": str(x_prof1)}
         for path, mut_fn in (
             (co_x / "AGENTS.md", lambda t: t.replace("Session Handoff Protocol", "Tampered Agents Handoff")),
             (co_x / ".codex" / "config.toml", lambda t: t.replace(x_prof2.name, x_prof1.name)),
-            (co_x / ".codex" / "hooks.json", lambda t: t.replace('"remind"', '"tampered"')),
+            (co_x / ".codex" / "hooks.json", lambda t: t.replace('"timeout": 10', '"timeout": 99', 1)),
         ):
             _check_tamper(
                 path, mut_fn, co_x,

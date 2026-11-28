@@ -33,9 +33,10 @@ from superbrain.storage.schema import POLICY_MIGRATIONS, STORE_MIGRATIONS, read_
 from superbrain.storage.store import Store
 from superbrain.storage.writer import WriterLease
 from tests.storage.conftest import CLOCK_START, DEMO_KINDS, Env, maintenance_lease
+from tests.storage.test_restore import seed_crash_event_root
 from tests.storage.test_retention import hold_event
 from tests.support.clock import FakeClock
-from tests.support.crash import run_child, run_until_crash
+from tests.support.crash import run_until_crash
 from tests.support.fs import corrupt_bytes, digest_tree, set_mtime
 from tests.support.inc2_fixture import open_cloned_runtime
 
@@ -93,8 +94,7 @@ def seed_orphan_blob(data_root: Path) -> str:
 
 
 def seed_event(data_root: Path) -> None:
-    result = run_child("seed_event", data_root)
-    assert result.returncode == 0, f"seed_event failed:\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    seed_crash_event_root(data_root)
 
 
 def full_backup(data_root: Path, clock: FakeClock) -> Path:

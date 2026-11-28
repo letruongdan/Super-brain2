@@ -8,7 +8,7 @@ import hmac
 import re
 import uuid
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from types import MappingProxyType
@@ -37,6 +37,8 @@ _DUMMY_SECRET_DIGEST = "sha256:" + ("0" * 64)
 CAPABILITY_MCP_TOOL = "mcp_tool"
 CAPABILITY_CAPTURE_PRODUCER = "capture_producer"
 CAPABILITY_OPERATOR_CLI = "operator_cli"
+_DEFAULT_MCP_CAPABILITIES: frozenset[str] = frozenset({CAPABILITY_MCP_TOOL})
+CredentialCapabilityBinding = tuple[Principal, str, frozenset[str], "CaptureProducerBinding | None"]
 VALID_CREDENTIAL_CAPABILITIES: frozenset[str] = frozenset(
     {
         CAPABILITY_MCP_TOOL,
@@ -350,12 +352,23 @@ class RepoPolicy:
     repo_id: str
     owner_id: str
     provider_egress_enabled: bool = False
+    automatic_capture_enabled: bool = True
+    manual_submission_enabled: bool = True
+    indexing_enabled: bool = True
+    post_session_review_enabled: bool = True
 
     def __post_init__(self) -> None:
         require_opaque_id(self.repo_id, label="repo_id")
         require_opaque_id(self.owner_id, label="owner_id")
-        if not isinstance(self.provider_egress_enabled, bool):
-            raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
+        for flag in (
+            self.provider_egress_enabled,
+            self.automatic_capture_enabled,
+            self.manual_submission_enabled,
+            self.indexing_enabled,
+            self.post_session_review_enabled,
+        ):
+            if not isinstance(flag, bool):
+                raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
 
 
 @dataclass(frozen=True)
@@ -460,6 +473,93 @@ class AuthSnapshot:
             ):
                 return False
         return True
+
+    def is_active_mcp_credential(self, credential_id: str) -> bool:
+        """Return True iff ``credential_id`` is unrevoked, bound to its principal, and holds ``mcp_tool``."""
+        cred = self.credentials.get(credential_id)
+        return (
+            cred is not None
+            and not cred.revoked
+            and CAPABILITY_MCP_TOOL in cred.capabilities
+            and self.principals.get(cred.principal.principal_id) == cred.principal
+        )
+
+    def matches_persisted_policy(self, policy_auth: AuthSnapshot) -> bool:
+        """Return True iff all persisted policy fields match ``policy_auth`` (allowing runtime capabilities)."""
+        if not isinstance(policy_auth, AuthSnapshot):
+            return False
+        if (
+            self.store_id != policy_auth.store_id
+            or self.trust_generation != policy_auth.trust_generation
+            or self.principals != policy_auth.principals
+            or self.repo_policies != policy_auth.repo_policies
+            or self.grants != policy_auth.grants
+            or self.checkouts != policy_auth.checkouts
+            or self.credentials.keys() != policy_auth.credentials.keys()
+        ):
+            return False
+        for cid, cur in self.credentials.items():
+            pol = policy_auth.credentials[cid]
+            if (
+                cur.credential_id != pol.credential_id
+                or cur.principal != pol.principal
+                or cur.secret_digest != pol.secret_digest
+                or cur.revoked != pol.revoked
+            ):
+                return False
+            if (pol.capabilities != _DEFAULT_MCP_CAPABILITIES or pol.capture_binding is not None) and (
+                cur.capabilities != pol.capabilities or cur.capture_binding != pol.capture_binding
+            ):
+                return False
+        return True
+
+
+def collect_credential_capability_bindings(snap: AuthSnapshot) -> dict[str, CredentialCapabilityBinding]:
+    """Extract non-default credential capability/capture bindings keyed by ``credential_id``."""
+    return {
+        cid: (rec.principal, rec.secret_digest, rec.capabilities, rec.capture_binding)
+        for cid, rec in snap.credentials.items()
+        if rec.capabilities != _DEFAULT_MCP_CAPABILITIES or rec.capture_binding is not None
+    }
+
+
+def apply_credential_capability_bindings(
+    snap: AuthSnapshot,
+    bindings: Mapping[str, CredentialCapabilityBinding],
+) -> AuthSnapshot:
+    """Re-attach runtime credential capabilities onto matching policy-backed credentials."""
+    if not bindings:
+        return snap
+    merged: dict[str, CredentialRecord] | None = None
+    for cid, rec in snap.credentials.items():
+        bound = bindings.get(cid)
+        if bound is None:
+            continue
+        stored_principal, stored_digest, caps, cap_binding = bound
+        if (
+            rec.principal == stored_principal
+            and rec.secret_digest == stored_digest
+            and rec.capabilities == _DEFAULT_MCP_CAPABILITIES
+            and rec.capture_binding is None
+        ):
+            if merged is None:
+                merged = dict(snap.credentials)
+            merged[cid] = replace(rec, capabilities=caps, capture_binding=cap_binding)
+    return snap if merged is None else replace(snap, credentials=merged)
+
+
+def update_credential_capability_bindings(
+    existing: Mapping[str, CredentialCapabilityBinding],
+    snap: AuthSnapshot,
+) -> dict[str, CredentialCapabilityBinding]:
+    """Update cached non-MCP bindings from ``snap`` while retaining bindings for absent credentials."""
+    updated = dict(existing)
+    for cid, rec in snap.credentials.items():
+        if rec.capabilities != _DEFAULT_MCP_CAPABILITIES or rec.capture_binding is not None:
+            updated[cid] = (rec.principal, rec.secret_digest, rec.capabilities, rec.capture_binding)
+        else:
+            updated.pop(cid, None)
+    return updated
 
 
 @dataclass(frozen=True)

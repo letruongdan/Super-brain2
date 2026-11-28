@@ -72,9 +72,10 @@ class DoctorReport:
     active_turn_intents: tuple[DoctorTurnIntentInfo, ...] = ()
     incomplete_journals: tuple[DoctorJournalInfo, ...] = ()
     permission_problems: tuple[str, ...] = ()
+    sp2: dict[str, JsonValue] | None = None
 
     def to_dict(self) -> dict[str, JsonValue]:
-        return {
+        out: dict[str, JsonValue] = {
             "overall_status": self.overall_status,
             "data_root": clip_report_str(self.data_root),
             "store_id": None if self.store_id is None else clip_report_str(self.store_id),
@@ -177,6 +178,12 @@ class DoctorReport:
             ],
             "permission_problems": [clip_report_str(p) for p in self.permission_problems[:MAX_LIST_FINDINGS_PER_GROUP]],
         }
+        if self.sp2 is not None:
+            out["sp2"] = dict(self.sp2)
+            for key in ("outbox", "gaps", "sessions", "terminal_channel_eligible_effective"):
+                if key in self.sp2 and key not in out:
+                    out[key] = self.sp2[key]
+        return out
 
 
 def _fit_report_budget(report: DoctorReport) -> DoctorReport:

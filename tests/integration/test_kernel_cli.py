@@ -459,10 +459,10 @@ def test_installed_migrate_respects_offline_lease(
     assert data1.get("store_id") == store_id
     assert data1.get("migrated") is True
     assert data1.get("noop") is False
-    assert data1.get("policy_schema_version") == 4
-    assert data1.get("store_schema_version") == 5
-    assert data1.get("policy") == {"status": "migrated", "from_version": 2, "to_version": 4}
-    assert data1.get("store") == {"status": "migrated", "from_version": 2, "to_version": 5}
+    assert data1.get("policy_schema_version") == 5
+    assert data1.get("store_schema_version") == 8
+    assert data1.get("policy") == {"status": "migrated", "from_version": 2, "to_version": 5}
+    assert data1.get("store") == {"status": "migrated", "from_version": 2, "to_version": 8}
     epoch1 = data1.get("writer_epoch")
     assert type(epoch1) is int and epoch1 >= 2
     assert res_mig1.stdout == canonical_json(mig1_env) + b"\n"
@@ -470,8 +470,8 @@ def test_installed_migrate_respects_offline_lease(
 
     p_after = read_schema_info(layout.policy_db)
     s_after = read_schema_info(layout.store_db)
-    assert p_after is not None and p_after.store_id == store_id and p_after.schema_version == 4
-    assert s_after is not None and s_after.store_id == store_id and s_after.schema_version == 5
+    assert p_after is not None and p_after.store_id == store_id and p_after.schema_version == 5
+    assert s_after is not None and s_after.store_id == store_id and s_after.schema_version == 8
 
     # 4. Repeat `brain migrate --config <abs> --offline` (alternate flag order) is a clean no-op.
     rc_mig2, out_mig2, err_mig2 = _run_inproc_entry(
@@ -488,10 +488,10 @@ def test_installed_migrate_respects_offline_lease(
     assert data2.get("store_id") == store_id
     assert data2.get("migrated") is False
     assert data2.get("noop") is True
-    assert data2.get("policy_schema_version") == 4
-    assert data2.get("store_schema_version") == 5
-    assert data2.get("policy") == {"status": "skipped", "from_version": 4, "to_version": 4}
-    assert data2.get("store") == {"status": "skipped", "from_version": 5, "to_version": 5}
+    assert data2.get("policy_schema_version") == 5
+    assert data2.get("store_schema_version") == 8
+    assert data2.get("policy") == {"status": "skipped", "from_version": 5, "to_version": 5}
+    assert data2.get("store") == {"status": "skipped", "from_version": 8, "to_version": 8}
     assert data2.get("writer_epoch") == epoch1 + 1
     assert is_writer_lock_held(legacy_root) is False
 

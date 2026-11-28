@@ -22,6 +22,7 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from superbrain.adapters.harness_config.bootstrap_templates import (
     AUTHORITY_ASK_COMMANDS,
     LAYER1_RULE_TEXT,
+    MANAGED_HOOK_EVENTS,
     plan_claude_bootstrap,
     plan_codex_bootstrap,
 )
@@ -185,11 +186,15 @@ def test_bootstrap_templates_embed_section_7_4_handoff_rules_and_nonblocking_hoo
         assert_not_stored_policy_not_holder_ack_pair()
         assert "# User Prose" in md_text or "# Agents Prose" in md_text
         hook_text = by_rel[hook_name].preview_text
-        for cmd in AUTHORITY_ASK_COMMANDS:
-            assert cmd in hook_text
         hook_json = json.loads(hook_text)
-        assert "hooks" in hook_json
-        assert "non_blocking" in hook_text or "remind" in hook_text.lower()
+        if hook_name == ".claude/settings.local.json":
+            for cmd in AUTHORITY_ASK_COMMANDS:
+                assert cmd in hook_text
+        # host schema: matcher groups whose command handler runs the capture hook (which never blocks: exit 0)
+        for event in MANAGED_HOOK_EVENTS:
+            groups = hook_json["hooks"][event]
+            assert [h["type"] for g in groups for h in g["hooks"]] == ["command"]
+            assert "superbrain.composition.hook_entry" in json.dumps(groups)
 
 
 def test_takeover_edit_gate_scopes_not_stored_policy_to_open_handoff_takeover() -> None:
@@ -596,7 +601,7 @@ def test_doctor_strictly_readonly_and_surfaces_handover_states_drift_and_locks(
     snap_checkout_before = digest_tree(checkout)
 
     report = doctor_entry.run_doctor(cfg_path, checkout_root=checkout, os_=os_)
-    assert report.schema.store_version == 5 and report.schema.policy_version == 4
+    assert report.schema.store_version == 8 and report.schema.policy_version == 5
     assert report.restore_epoch == 0
     assert report.trust_generation is not None and report.trust_generation >= 3
     assert report.signer_reset_recorded is True
@@ -613,7 +618,7 @@ def test_doctor_strictly_readonly_and_surfaces_handover_states_drift_and_locks(
     out_json = json.loads(capfd.readouterr().out)
     assert out_json["ok"] is True
     d = out_json["data"]
-    assert d["schema"]["store_version"] == 5 and d["schema"]["policy_version"] == 4
+    assert d["schema"]["store_version"] == 8 and d["schema"]["policy_version"] == 5
     assert d["signer_reset_recorded"] is True
     assert d["terminal_channel_eligible"] is False
     assert len(d["unresolved_accounting_locks"]) >= 1

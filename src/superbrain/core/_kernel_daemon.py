@@ -31,6 +31,7 @@ DEFAULT_SHUTDOWN_GRACE_S = 5.0
 TLS_EXPIRING_WINDOW = timedelta(days=30)
 TLS_EXPIRING_CODE = "tls_expiring"
 TLS_EXPIRED_CODE = "tls_expired"
+CAPTURE_GAPS_PRESENT_CODE = "capture_gap_present"
 
 _ENDPOINT_FIELDS: frozenset[str] = frozenset(
     {
@@ -274,6 +275,7 @@ class ShallowHealthMeta:
     policy_schema_version: int
     tls_not_after: datetime
     idempotency_clock_untrusted: bool = False
+    capture_gaps_present: bool = False
 
     def __post_init__(self) -> None:
         require_opaque_id(self.store_id, label="store_id")
@@ -282,7 +284,9 @@ class ShallowHealthMeta:
         require_positive_int(self.schema_version)
         require_positive_int(self.policy_schema_version)
         _require_utc_datetime(self.tls_not_after)
-        if not isinstance(self.idempotency_clock_untrusted, bool):
+        if not isinstance(self.idempotency_clock_untrusted, bool) or not isinstance(
+            self.capture_gaps_present, bool
+        ):
             raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
 
 

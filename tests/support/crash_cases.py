@@ -21,7 +21,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -55,6 +55,8 @@ from tests.storage.conftest import DEMO_KINDS, STORE_ID
 from tests.storage.test_backup import only_backup_dir, verify_store
 from tests.storage.test_migrate import POLICY_V2, STORE_V2
 from tests.storage.test_restore import (
+    _copy_seed_tree,
+    _is_fresh_seed_target,
     count_entries,
     every_original_dir_still_exists,
     generation_in,
@@ -86,7 +88,7 @@ from tests.support.inc2_cli import (
     write_daemon_config_file,
     write_owner_only_bytes,
 )
-from tests.support.inc2_fixture import InstalledEnv, open_cloned_runtime
+from tests.support.inc2_fixture import InstalledEnv, ensure_template_base, open_cloned_runtime
 from tests.support.inc2_t8_job_cases import (
     cancel_args,
     expect_cancel,
@@ -146,6 +148,29 @@ def parse_crash_table(path: Path) -> list[str]:
 
 # --- seeding -----------------------------------------------------------------------------------------------------
 
+_I1_SEED_LOCK = threading.Lock()
+_I1_SEED_CACHE: dict[str, tuple[Path, "SeedState"]] = {}
+
+
+def _seed_cached(key: str, data_root: Path, builder: Callable[[Path], "SeedState"]) -> "SeedState":
+    if not _is_fresh_seed_target(data_root):
+        return builder(data_root)
+    with _I1_SEED_LOCK:
+        cached = _I1_SEED_CACHE.get(key)
+        if cached is None or not cached[0].is_dir():
+            base = ensure_template_base() / "i1-crash-seeds"
+            base.mkdir(parents=True, exist_ok=True)
+            tpl = base / key
+            if tpl.exists():
+                import shutil
+
+                shutil.rmtree(tpl, ignore_errors=True)
+            state = builder(tpl)
+            _I1_SEED_CACHE[key] = (tpl, state)
+            cached = (tpl, state)
+    _copy_seed_tree(cached[0], data_root)
+    return cached[1]
+
 
 def capture(data_root: Path) -> SeedState:
     """Open the seeded data root once and record what the expectations compare against."""
@@ -158,9 +183,7 @@ def capture(data_root: Path) -> SeedState:
         rt.close()
 
 
-def seed_named_store(data_root: Path) -> SeedState:
-    """A policy store and an empty main store bound to ``STORE_ID``, the id the ``append_demo`` and
-    ``put_and_hold`` children open the store with."""
+def _build_named_store(data_root: Path) -> SeedState:
     os_ = os_adapters()
     root = prepare_data_root(data_root, os_)
     with acquire_writer(root, os_) as lease:
@@ -173,8 +196,13 @@ def seed_named_store(data_root: Path) -> SeedState:
     return capture(data_root)
 
 
-def seed_event(data_root: Path) -> SeedState:
-    """The event payload held by ``("event", EVENT_ID)``, as ``crash_child.seed_event`` does."""
+def seed_named_store(data_root: Path) -> SeedState:
+    """A policy store and an empty main store bound to ``STORE_ID``, the id the ``append_demo`` and
+    ``put_and_hold`` children open the store with."""
+    return _seed_cached("named_store", data_root, _build_named_store)
+
+
+def _build_event(data_root: Path) -> SeedState:
     rt = open_cloned_runtime(data_root, os_adapters(), role="crash-seed-event")
     try:
         rt.store.store_content(EVENT_PAYLOAD, "event", EVENT_ID, RetentionClass.EVENT_PAYLOAD, None)
@@ -183,8 +211,12 @@ def seed_event(data_root: Path) -> SeedState:
     return capture(data_root)
 
 
-def seed_quarantined_event(data_root: Path) -> SeedState:
-    """The event payload, held and then quarantined: the intent is recorded and applied to the store."""
+def seed_event(data_root: Path) -> SeedState:
+    """The event payload held by ``("event", EVENT_ID)``, as ``crash_child.seed_event`` does."""
+    return _seed_cached("event", data_root, _build_event)
+
+
+def _build_quarantined_event(data_root: Path) -> SeedState:
     rt = open_cloned_runtime(data_root, os_adapters(), role="crash-seed-quarantine")
     try:
         rt.store.store_content(EVENT_PAYLOAD, "event", EVENT_ID, RetentionClass.EVENT_PAYLOAD, None)
@@ -195,19 +227,36 @@ def seed_quarantined_event(data_root: Path) -> SeedState:
     return capture(data_root)
 
 
-def seed_runtime(data_root: Path) -> SeedState:
+def seed_quarantined_event(data_root: Path) -> SeedState:
+    """The event payload, held and then quarantined: the intent is recorded and applied to the store."""
+    return _seed_cached("quarantined_event", data_root, _build_quarantined_event)
+
+
+def _build_runtime(data_root: Path) -> SeedState:
     open_cloned_runtime(data_root, os_adapters(), role="crash-seed-runtime").close()
     return capture(data_root)
 
 
-def seed_restore(data_root: Path) -> SeedState:
+def seed_runtime(data_root: Path) -> SeedState:
+    return _seed_cached("runtime", data_root, _build_runtime)
+
+
+def _build_restore(data_root: Path) -> SeedState:
     seed_before_backup_after(data_root)
     return capture(data_root)
 
 
-def seed_policy_restore(data_root: Path) -> SeedState:
+def seed_restore(data_root: Path) -> SeedState:
+    return _seed_cached("restore", data_root, _build_restore)
+
+
+def _build_policy_restore(data_root: Path) -> SeedState:
     assert seed_policy_backup(data_root) == 5
     return capture(data_root)
+
+
+def seed_policy_restore(data_root: Path) -> SeedState:
+    return _seed_cached("policy_restore", data_root, _build_policy_restore)
 
 
 # --- shared checks -----------------------------------------------------------------------------------------------
@@ -876,6 +925,20 @@ def shim_health_and_job(
 # --- kernel seeds --------------------------------------------------------------------------------------------------
 
 
+_DAEMON_TPL_INFO: tuple[int, dict[str, list[tuple[object, ...]]]] | None = None
+
+
+def _get_daemon_root_info(tpl: TransportTemplate) -> tuple[int, dict[str, list[tuple[object, ...]]]]:
+    global _DAEMON_TPL_INFO
+    if _DAEMON_TPL_INFO is None:
+        epoch = lock_epoch(tpl.root)
+        scratch = tpl.root.parent / "ro-scratch-tpl"
+        snapshot = store_rows(tpl.root, scratch)
+        assert snapshot["ledger"], "the seeded root must hold ACKed ledger entries"
+        _DAEMON_TPL_INFO = (epoch, snapshot)
+    return _DAEMON_TPL_INFO
+
+
 def _seed_daemon_root(ctx: KernelCrashContext, *, stale_endpoint: bool) -> KernelSeed:
     """A clone of the session's admitted (store 4, policy 3) template: credentials, workspaces, two ACKed jobs."""
     tpl = ctx.template
@@ -888,7 +951,7 @@ def _seed_daemon_root(ctx: KernelCrashContext, *, stale_endpoint: bool) -> Kerne
         cert_path=tpl.tls.cert_path,
         key_path=tpl.tls.key_path,
     )
-    epoch = lock_epoch(data_root)
+    epoch, snapshot = _get_daemon_root_info(tpl)
     stale = None
     if stale_endpoint:
         stale = Endpoint(
@@ -900,8 +963,6 @@ def _seed_daemon_root(ctx: KernelCrashContext, *, stale_endpoint: bool) -> Kerne
             instance_id=new_id(),
         )
         write_owner_only_bytes(DataRoot.at(data_root).endpoint_path, stale.encode_canonical())
-    snapshot = store_rows(data_root, ctx.case_dir / "ro-scratch")
-    assert snapshot["ledger"], "the seeded root must hold ACKed ledger entries"
     return KernelSeed(data_root, config, tpl.store_id, epoch, snapshot, stale)
 
 
@@ -913,14 +974,36 @@ def seed_daemon_root(ctx: KernelCrashContext) -> KernelSeed:
     return _seed_daemon_root(ctx, stale_endpoint=False)
 
 
-def seed_legacy_pair(ctx: KernelCrashContext) -> KernelSeed:
-    """An increment 1 pair at (store 2, policy 2): two durable blobs, a quarantine intent applied to the store, an
-    active credential, and TLS material for its own store id."""
+@dataclass(frozen=True)
+class _LegacyPairTemplate:
+    data_root: Path
+    tls_dir: Path
+    store_id: str
+    token: str
+    snapshot: dict[str, list[tuple[object, ...]]]
+    cert_name: str
+    key_name: str
+    ca_cert_name: str
+    leaf_cert_sha256: str
+    lock_epoch: int
+
+
+_LEGACY_PAIR_TEMPLATE: _LegacyPairTemplate | None = None
+
+
+def _get_legacy_pair_template() -> _LegacyPairTemplate:
+    global _LEGACY_PAIR_TEMPLATE
+    if _LEGACY_PAIR_TEMPLATE is not None and _LEGACY_PAIR_TEMPLATE.data_root.is_dir():
+        return _LEGACY_PAIR_TEMPLATE
+    import uuid
+
+    tpl_base = ensure_template_base() / f"legacy-pair-tpl-{uuid.uuid4().hex}"
+    tpl_base.mkdir(parents=True, exist_ok=True)
     clock = FakeClock(dt.datetime.now(dt.UTC).replace(microsecond=0) - dt.timedelta(minutes=5))
     adapters = os_adapters(clock=clock)
-    data_root = ctx.case_dir / "data"
+    tpl_data = tpl_base / "data"
     rt = open_cloned_runtime(
-        data_root,
+        tpl_data,
         adapters,
         role="crash-v2",
         store_migrations=KERNEL_STORE_MIGRATIONS[:2],
@@ -937,6 +1020,7 @@ def seed_legacy_pair(ctx: KernelCrashContext) -> KernelSeed:
         store_id, generation = rt.store.store_id, rt.policy.trust_generation()
     finally:
         rt.close()
+    tpl_tls = tpl_base / "tls"
     auth = make_bootstrap_auth(
         store_id=store_id,
         owner_id="dan",
@@ -944,29 +1028,61 @@ def seed_legacy_pair(ctx: KernelCrashContext) -> KernelSeed:
         subject_id=store_id,
         trust_generation=generation,
         expires_at=clock.now() + dt.timedelta(hours=2),
-        destination=ctx.case_dir / "tls",
+        destination=tpl_tls,
     )
-    tls = create_store_tls(store_id, ctx.case_dir / "tls", auth, clock, adapters)
+    tls = create_store_tls(store_id, tpl_tls, auth, clock, adapters)
+    snapshot = pair_rows(tpl_data, tpl_base / "ro-scratch")
+    assert snapshot["intents"] and snapshot["quarantine"] and snapshot["credential"] and snapshot["ledger"]
+    _LEGACY_PAIR_TEMPLATE = _LegacyPairTemplate(
+        data_root=tpl_data,
+        tls_dir=tpl_tls,
+        store_id=store_id,
+        token=credential.token,
+        snapshot=snapshot,
+        cert_name=tls.cert_path.name,
+        key_name=tls.key_path.name,
+        ca_cert_name=tls.ca_cert_path.name,
+        leaf_cert_sha256=tls.leaf_cert_sha256,
+        lock_epoch=lock_epoch(tpl_data),
+    )
+    return _LEGACY_PAIR_TEMPLATE
+
+
+def seed_legacy_pair(ctx: KernelCrashContext) -> KernelSeed:
+    """An increment 1 pair at (store 2, policy 2): two durable blobs, a quarantine intent applied to the store, an
+    active credential, and TLS material for its own store id."""
+    tpl = _get_legacy_pair_template()
+    data_root = ctx.case_dir / "data"
+    clone_owner_only_tree(tpl.data_root, data_root)
+    clone_owner_only_tree(tpl.tls_dir, ctx.case_dir / "tls")
+    cert_path = ctx.case_dir / "tls" / tpl.cert_name
+    key_path = ctx.case_dir / "tls" / tpl.key_name
+    ca_cert_path = ctx.case_dir / "tls" / tpl.ca_cert_name
+
     config = write_daemon_config_file(
         ctx.case_dir / "daemon-config.json",
         data_root=data_root,
-        expected_store_id=store_id,
-        cert_path=tls.cert_path,
-        key_path=tls.key_path,
+        expected_store_id=tpl.store_id,
+        cert_path=cert_path,
+        key_path=key_path,
     )
-    credential_file = write_credential_file(ctx.case_dir / "client" / "legacy-credential.txt", credential.token)
+    credential_file = write_credential_file(ctx.case_dir / "client" / "legacy-credential.txt", tpl.token)
     write_client_profile_file(
         ctx.case_dir / "client" / "legacy-health-profile.json",
         endpoint_path=DataRoot.at(data_root).endpoint_path,
-        expected_store_id=store_id,
-        ca_file=tls.ca_cert_path,
-        leaf_cert_sha256=tls.leaf_cert_sha256,
+        expected_store_id=tpl.store_id,
+        ca_file=ca_cert_path,
+        leaf_cert_sha256=tpl.leaf_cert_sha256,
         credential_file=credential_file,
     )
     assert schema_versions(data_root) == (2, 2)
-    snapshot = pair_rows(data_root, ctx.case_dir / "ro-scratch")
-    assert snapshot["intents"] and snapshot["quarantine"] and snapshot["credential"] and snapshot["ledger"]
-    return KernelSeed(data_root, config, store_id, lock_epoch(data_root), snapshot)
+    assert (
+        tpl.snapshot["intents"]
+        and tpl.snapshot["quarantine"]
+        and tpl.snapshot["credential"]
+        and tpl.snapshot["ledger"]
+    )
+    return KernelSeed(data_root, config, tpl.store_id, tpl.lock_epoch, tpl.snapshot)
 
 
 # --- kernel expectations -------------------------------------------------------------------------------------------
@@ -1079,7 +1195,7 @@ def expect_crash_after_policy_swap(ctx: KernelCrashContext, seed: KernelSeed, ru
     resumes only the store, a repeat is a no-op, and neither run fires the hook again although its env stays set."""
     data_root, scratch = seed.data_root, ctx.case_dir / "ro-scratch"
     root = DataRoot.at(data_root)
-    assert schema_versions(data_root) == (4, 2)
+    assert schema_versions(data_root) == (5, 2)
     aside = sorted(p.name.split("-")[0] for p in data_root.iterdir() if p.name.startswith(("policy.", "store.")))
     assert aside == ["policy.replaced"], aside  # the store migration never started
     assert pair_rows(data_root, scratch) == seed.snapshot
@@ -1092,19 +1208,19 @@ def expect_crash_after_policy_swap(ctx: KernelCrashContext, seed: KernelSeed, ru
     )
     assert refused.result.stdout == "" and refused.ready is None
     assert not root.endpoint_path.exists() and endpoint_stages(data_root) == []
-    assert schema_versions(data_root) == (4, 2) and pair_rows(data_root, scratch) == seed.snapshot
+    assert schema_versions(data_root) == (5, 2) and pair_rows(data_root, scratch) == seed.snapshot
 
     hook_env = {"SUPERBRAIN_CRASHPOINT": run.result.hit or ""}
     migrate = ("migrate", "--offline", "--config", str(seed.config))
     resumed = _owner_envelope(run_installed_command(ctx.env, "brain", migrate, cwd=ctx.cwd, extra_env=hook_env))
-    assert resumed["policy"] == {"status": "skipped", "from_version": 4, "to_version": 4}, resumed
-    assert resumed["store"] == {"status": "migrated", "from_version": 2, "to_version": 5}, resumed
+    assert resumed["policy"] == {"status": "skipped", "from_version": 5, "to_version": 5}, resumed
+    assert resumed["store"] == {"status": "migrated", "from_version": 2, "to_version": 8}, resumed
     assert (resumed["store_id"], resumed["noop"]) == (seed.store_id, False), resumed
-    assert schema_versions(data_root) == (4, 5) and pair_rows(data_root, scratch) == seed.snapshot
+    assert schema_versions(data_root) == (5, 8) and pair_rows(data_root, scratch) == seed.snapshot
 
     repeat = _owner_envelope(run_installed_command(ctx.env, "brain", migrate, cwd=ctx.cwd, extra_env=hook_env))
-    assert repeat["policy"] == {"status": "skipped", "from_version": 4, "to_version": 4}, repeat
-    assert repeat["store"] == {"status": "skipped", "from_version": 5, "to_version": 5}, repeat
+    assert repeat["policy"] == {"status": "skipped", "from_version": 5, "to_version": 5}, repeat
+    assert repeat["store"] == {"status": "skipped", "from_version": 8, "to_version": 8}, repeat
     assert repeat["noop"] is True and pair_rows(data_root, scratch) == seed.snapshot
 
     def assert_recovered_owner_ready(current: Endpoint) -> None:
@@ -1190,14 +1306,50 @@ def open_fixture_runtime(data_root: Path, store_id: str) -> Runtime:
     )
 
 
-def seed_fixture_root(ctx: KernelCrashContext) -> KernelSeed:
-    """The admitted template plus the fixture scenario (three artifacts of ``ws-a``), seeded before any daemon."""
+@dataclass(frozen=True)
+class _FixtureRootTemplate:
+    data_root: Path
+    lock_epoch: int
+    snapshot: dict[str, list[tuple[object, ...]]]
+
+
+_FIXTURE_ROOT_TEMPLATE: _FixtureRootTemplate | None = None
+
+
+def _get_fixture_root_template(tpl: TransportTemplate) -> _FixtureRootTemplate:
+    global _FIXTURE_ROOT_TEMPLATE
+    if _FIXTURE_ROOT_TEMPLATE is not None and _FIXTURE_ROOT_TEMPLATE.data_root.is_dir():
+        return _FIXTURE_ROOT_TEMPLATE
+    import uuid
+
     from tests.support.inc2_kernel_domain import FixtureKernelDomain
     from tests.support.inc2_t8_domain import seed_scenario
 
+    fixture_base = ensure_template_base() / f"fixture-tpl-{uuid.uuid4().hex}"
+    fixture_data = fixture_base / "data"
+    clone_owner_only_tree(tpl.root, fixture_data)
+    rt = open_fixture_runtime(fixture_data, tpl.store_id)
+    try:
+        seed_scenario(FixtureKernelDomain(store=rt.store, policy=rt.policy, clock=rt.os_.clock), rt)
+    finally:
+        rt.close()
+    snapshot = fixture_rows(fixture_data, fixture_base / "ro-scratch")
+    assert snapshot["ledger"] and len(snapshot["artifacts"]) == 3, "the scenario was not seeded"
+    assert snapshot["deliveries"] == [] and snapshot["idempotency"] == [] and snapshot["task_bindings"] == []
+    _FIXTURE_ROOT_TEMPLATE = _FixtureRootTemplate(
+        data_root=fixture_data,
+        lock_epoch=lock_epoch(fixture_data),
+        snapshot=snapshot,
+    )
+    return _FIXTURE_ROOT_TEMPLATE
+
+
+def seed_fixture_root(ctx: KernelCrashContext) -> KernelSeed:
+    """The admitted template plus the fixture scenario (three artifacts of ``ws-a``), seeded before any daemon."""
     tpl = ctx.template
+    fixture_tpl = _get_fixture_root_template(tpl)
     data_root = ctx.case_dir / "data"
-    clone_owner_only_tree(tpl.root, data_root)
+    clone_owner_only_tree(fixture_tpl.data_root, data_root)
     config = write_daemon_config_file(
         ctx.case_dir / "daemon-config.json",
         data_root=data_root,
@@ -1205,15 +1357,7 @@ def seed_fixture_root(ctx: KernelCrashContext) -> KernelSeed:
         cert_path=tpl.tls.cert_path,
         key_path=tpl.tls.key_path,
     )
-    rt = open_fixture_runtime(data_root, tpl.store_id)
-    try:
-        seed_scenario(FixtureKernelDomain(store=rt.store, policy=rt.policy, clock=rt.os_.clock), rt)
-    finally:
-        rt.close()
-    snapshot = fixture_rows(data_root, ctx.case_dir / "ro-scratch")
-    assert snapshot["ledger"] and len(snapshot["artifacts"]) == 3, "the scenario was not seeded"
-    assert snapshot["deliveries"] == [] and snapshot["idempotency"] == [] and snapshot["task_bindings"] == []
-    return KernelSeed(data_root, config, tpl.store_id, lock_epoch(data_root), snapshot)
+    return KernelSeed(data_root, config, tpl.store_id, fixture_tpl.lock_epoch, fixture_tpl.snapshot)
 
 
 def _ws_profile(ctx: KernelCrashContext, seed: KernelSeed, name: str, token: str) -> Path:
@@ -1277,13 +1421,36 @@ def content(result: dict[str, JsonValue]) -> dict[str, JsonValue]:
     return sc
 
 
+def _assert_transport_uncertain(result: dict[str, JsonValue], error: Mapping[str, JsonValue]) -> None:
+    """Post-POST transport drop: ``daemon_unavailable`` with ``_meta.superbrain/request_may_have_run=True``."""
+    assert error.get("code") == ErrorCode.DAEMON_UNAVAILABLE.value, result
+    assert error.get("message") == "daemon unavailable", result
+    assert result.get("_meta") == {"superbrain/request_may_have_run": True}, result
+
+
+def _assert_in_commit_cutoff_unknown(result: dict[str, JsonValue], error: Mapping[str, JsonValue]) -> None:
+    """Spec 6.5 in-commit cutoff before process exit: ``commit_outcome_unknown`` without transport ``_meta``."""
+    assert error.get("code") == ErrorCode.COMMIT_OUTCOME_UNKNOWN.value, result
+    assert error.get("message") == "commit outcome unknown", result
+    assert "_meta" not in result, result
+
+
 def assert_uncertain(result: dict[str, JsonValue]) -> None:
-    """The old shim sent the request and got no success: an uncertain ``daemon_unavailable`` tool error."""
+    """The old shim sent an in-commit request and got either post-POST transport loss
+    (``daemon_unavailable`` + ``_meta.superbrain/request_may_have_run=True``) or spec 6.5 in-commit
+    deadline cutoff (``commit_outcome_unknown`` without transport ``_meta``)."""
     assert result.get("isError") is True, result
-    meta = result.get("_meta")
-    assert isinstance(meta, dict) and meta.get("superbrain/request_may_have_run") is True, result
-    error = content(result).get("error")
-    assert isinstance(error, dict) and error.get("code") == ErrorCode.DAEMON_UNAVAILABLE.value, result
+    sc = content(result)
+    assert sc.get("ok") is False, result
+    error = sc.get("error")
+    assert isinstance(error, dict), result
+    code = error.get("code")
+    if code == ErrorCode.DAEMON_UNAVAILABLE.value:
+        _assert_transport_uncertain(result, error)
+    elif code == ErrorCode.COMMIT_OUTCOME_UNKNOWN.value:
+        _assert_in_commit_cutoff_unknown(result, error)
+    else:
+        raise AssertionError(f"unexpected non-uncertain trigger result: {result!r}")
 
 
 def ok_data(result: dict[str, JsonValue]) -> dict[str, JsonValue]:
@@ -1535,3 +1702,6 @@ KERNEL_CRASH_CASES: tuple[KernelCrashCase, ...] = (
 from tests.support.inc3_crash_cases import I3_3_CRASH_CASES as I3_3_CRASH_CASES  # noqa: E402, F401
 from tests.support.inc3_i34_crash_cases import I3_4_CRASH_CASES as I3_4_CRASH_CASES  # noqa: E402, F401
 from tests.support.inc4_crash_cases import I4_4_CRASH_CASES as I4_4_CRASH_CASES  # noqa: E402, F401
+from tests.support.sp2_crash_cases import SP2_2_CRASH_CASES as SP2_2_CRASH_CASES  # noqa: E402, F401
+from tests.support.sp2_crash_cases import SP2_3_CRASH_CASES as SP2_3_CRASH_CASES  # noqa: E402, F401
+from tests.support.sp2_crash_cases import SP2_4_CRASH_CASES as SP2_4_CRASH_CASES  # noqa: E402, F401

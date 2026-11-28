@@ -230,6 +230,7 @@ def test_rename_dir_io_error_is_brain_error(
     (tmp_path / "s").mkdir()
     monkeypatch.setattr(os, "rename", raising(OSError(errno.EIO, "io")))
     monkeypatch.setattr(durable, "_move_file_ex", raising(OSError(errno.EIO, "io")))
+    monkeypatch.setattr(durable, "_rename_noreplace", raising(OSError(errno.EIO, "io")))  # POSIX kernel no-replace path
     with pytest.raises(BrainError) as e:
         publisher.rename_dir(tmp_path / "s", tmp_path / "d")
     assert_io_error(e)

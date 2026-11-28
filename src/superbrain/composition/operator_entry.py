@@ -37,6 +37,9 @@ from superbrain.storage.layout import ensure_private_directory_tree
 if TYPE_CHECKING:
     from superbrain.adapters.auth.webauthn_verifier import WebAuthnResult
 
+if TYPE_CHECKING:
+    from superbrain.adapters.auth.webauthn_verifier import WebAuthnResult
+
 __all__ = ["build_operator_service", "make_default_bootstrap_handler", "make_operator_executor"]
 
 _T = TypeVar("_T")
@@ -144,6 +147,7 @@ def build_operator_service(
     expected_endpoint_path: Path | None = None,
     expected_leaf_cert_sha256: str | None = None,
     server_cert_path: Path | None = None,
+    live_layer2_check: Callable[[], None] | None = None,
 ) -> OperatorService:
     """The operator service over ``policy`` with real SSH, localhost WebAuthn, and bootstrap wiring."""
     return OperatorService(
@@ -152,6 +156,7 @@ def build_operator_service(
         webauthn_verifier=webauthn_verifier if webauthn_verifier is not None else _LocalhostWebAuthnVerifier(),
         review_apply=review_apply,
         restore_handler=restore_handler,
+        live_layer2_check=live_layer2_check,
         doctor_handler=doctor_handler,
         bootstrap_handler=(
             bootstrap_handler

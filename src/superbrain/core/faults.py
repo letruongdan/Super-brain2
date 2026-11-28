@@ -47,6 +47,15 @@ KNOWN_CRASHPOINTS: frozenset[str] = frozenset({
     "apply.after_policy_grant_ended",
     # I3-4: restore post-swap before effect drain crashpoint
     "restoring.store.after_swap_before_effect_drain",
+    # SP2-2: capture outbox + daemon ingest crashpoints
+    "capture.outbox.after_write_before_fsync",
+    "capture.daemon.after_commit_before_ack",
+    # SP2-3: dual-store session binding + 3-phase continuity worker crashpoints
+    "session.after_policy_bind_before_store_project",
+    "continuity.worker.before_owner_commit",
+    # SP2-4: handoff commit + C5 response flush crashpoints
+    "handoff.after_commit_before_ack",
+    "artifact_send.after_pending_before_flush",
     # I4-4: doctor --fix safe-repair crashpoints
     "doctor.fix.before_projection_swap",
     "doctor.fix.after_log_rotate_stage",

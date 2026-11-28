@@ -185,7 +185,7 @@ def run_i34_crash_case(ctx: KernelCrashContext, case: I34CrashCase) -> I34Seed:
     layout = DataRoot.at(seed.data_root)
     assert list(seed.data_root.glob("store.replaced-*"))
     assert layout.pending_restore_tombstones_path.is_file()
-    restored_epoch = read_restore_epoch(layout, schema_version=5, os_=os_adapters())
+    restored_epoch = read_restore_epoch(layout, schema_version=6, os_=os_adapters())
     assert restored_epoch >= 1
 
     ro_policy = open_readonly(layout.policy_db)
@@ -217,7 +217,7 @@ def run_i34_crash_case(ctx: KernelCrashContext, case: I34CrashCase) -> I34Seed:
     rt = reopen_kernel_job_runtime(seed.data_root, seed.store_id, adapters)
     try:
         assert rt.policy.is_tombstoned("evidence", seed.evidence_id)
-        assert read_restore_epoch(layout, schema_version=5, os_=adapters) == restored_epoch
+        assert read_restore_epoch(layout, schema_version=6, os_=adapters) == restored_epoch
         with rt.store.transaction() as txn:
             assert held_digests(txn.db, "evidence", seed.evidence_id) == []
             assert active_held_digests(txn.db, "evidence", seed.evidence_id, now=seed.restore_time) == []

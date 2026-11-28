@@ -5,29 +5,21 @@ Started through ``runpy`` under ``python -I``: it imports only ``superbrain`` an
 to stdout and exits 1; success exits 0. Later tasks add the operations their tests need to ``OPERATIONS``.
 """
 
+from __future__ import annotations
+
 import sqlite3
 import sys
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import superbrain
-from superbrain.adapters.os import os_adapters
 from superbrain.core.errors import BrainError
-from superbrain.core.faults import pausepoint
-from superbrain.ports.policy import Intent, IntentKind
-from superbrain.storage.backup import create_store_backup
-from superbrain.storage.cas import RetentionClass
-from superbrain.storage.kinds import CORE_KINDS, EntryKind, FieldType, KindRegistry
-from superbrain.storage.layout import prepare_data_root, secure_subdirectories
-from superbrain.storage.migrate import migrate_database
-from superbrain.storage.restore import restore_policy, restore_store
-from superbrain.storage.runtime import open_runtime
-from superbrain.storage.schema import POLICY_MIGRATIONS, STORE_MIGRATIONS, Migration
-from superbrain.storage.store import Store
-from superbrain.storage.swap import recover_interrupted_swaps
-from superbrain.storage.writer import acquire_writer
+from superbrain.storage.kinds import CORE_KINDS, EntryKind, FieldType
+
+if TYPE_CHECKING:
+    from superbrain.ports.policy import Intent
 
 # Mirrors tests/storage/conftest.py DEMO_KINDS (this file must not import tests).
 _DEMO_KINDS = (*CORE_KINDS, EntryKind("demo.count", 1, {"n": FieldType.INT}, {}))
@@ -57,6 +49,10 @@ def ping(data_root: Path, args: list[str]) -> None:
 
 
 def acquire_writer_once(data_root: Path, args: list[str]) -> None:
+    from superbrain.adapters.os import os_adapters
+    from superbrain.storage.layout import prepare_data_root
+    from superbrain.storage.writer import acquire_writer
+
     os_ = os_adapters()
     root = prepare_data_root(data_root, os_)
     with acquire_writer(root, os_):
@@ -64,6 +60,11 @@ def acquire_writer_once(data_root: Path, args: list[str]) -> None:
 
 
 def acquire_writer_and_pause(data_root: Path, args: list[str]) -> None:
+    from superbrain.adapters.os import os_adapters
+    from superbrain.core.faults import pausepoint
+    from superbrain.storage.layout import prepare_data_root
+    from superbrain.storage.writer import acquire_writer
+
     os_ = os_adapters()
     root = prepare_data_root(data_root, os_)
     with acquire_writer(root, os_):
@@ -72,6 +73,12 @@ def acquire_writer_and_pause(data_root: Path, args: list[str]) -> None:
 
 def create_store(data_root: Path, args: list[str]) -> None:
     """args: ``<store_id>``. Create an empty store with no projection handlers."""
+    from superbrain.adapters.os import os_adapters
+    from superbrain.storage.kinds import KindRegistry
+    from superbrain.storage.layout import prepare_data_root, secure_subdirectories
+    from superbrain.storage.store import Store
+    from superbrain.storage.writer import acquire_writer
+
     os_ = os_adapters()
     root = prepare_data_root(data_root, os_)
     with acquire_writer(root, os_) as lease:
@@ -81,6 +88,12 @@ def create_store(data_root: Path, args: list[str]) -> None:
 
 def append_demo(data_root: Path, args: list[str]) -> None:
     """args: ``<store_id>``. Open the store and append one ``demo.count`` entry with ``n = 1``."""
+    from superbrain.adapters.os import os_adapters
+    from superbrain.storage.kinds import KindRegistry
+    from superbrain.storage.layout import prepare_data_root, secure_subdirectories
+    from superbrain.storage.store import Store
+    from superbrain.storage.writer import acquire_writer
+
     os_ = os_adapters()
     root = prepare_data_root(data_root, os_)
     with acquire_writer(root, os_) as lease:
@@ -93,6 +106,13 @@ def append_demo(data_root: Path, args: list[str]) -> None:
 
 def put_and_hold(data_root: Path, args: list[str]) -> None:
     """args: ``<store_id>``. Open the store and ``store_content(b"payload")`` held by event ``PUT_AND_HOLD_ID``."""
+    from superbrain.adapters.os import os_adapters
+    from superbrain.storage.cas import RetentionClass
+    from superbrain.storage.kinds import KindRegistry
+    from superbrain.storage.layout import prepare_data_root, secure_subdirectories
+    from superbrain.storage.store import Store
+    from superbrain.storage.writer import acquire_writer
+
     os_ = os_adapters()
     root = prepare_data_root(data_root, os_)
     with acquire_writer(root, os_) as lease:
@@ -104,6 +124,10 @@ def put_and_hold(data_root: Path, args: list[str]) -> None:
 
 def seed_event(data_root: Path, args: list[str]) -> None:
     """Create the runtime and ``store_content(EVENT_PAYLOAD)`` held by ``("event", EVENT_ID)``."""
+    from superbrain.adapters.os import os_adapters
+    from superbrain.storage.cas import RetentionClass
+    from superbrain.storage.runtime import open_runtime
+
     runtime = open_runtime(data_root, os_adapters())
     try:
         runtime.store.store_content(EVENT_PAYLOAD, "event", EVENT_ID, RetentionClass.EVENT_PAYLOAD, None)
@@ -113,6 +137,10 @@ def seed_event(data_root: Path, args: list[str]) -> None:
 
 def tombstone_event(data_root: Path, args: list[str]) -> None:
     """Open the runtime, record a TOMBSTONE intent for ``("event", EVENT_ID)``, then reconcile the store."""
+    from superbrain.adapters.os import os_adapters
+    from superbrain.ports.policy import IntentKind
+    from superbrain.storage.runtime import open_runtime
+
     runtime = open_runtime(data_root, os_adapters())
     try:
         runtime.policy.record_intent(IntentKind.TOMBSTONE, {"holder_kind": "event", "holder_id": EVENT_ID})
@@ -123,6 +151,10 @@ def tombstone_event(data_root: Path, args: list[str]) -> None:
 
 def backup_store(data_root: Path, args: list[str]) -> None:
     """Open the runtime and take a ``store`` backup (the crash tests stop it at a ``backup.*`` crashpoint)."""
+    from superbrain.adapters.os import os_adapters
+    from superbrain.storage.backup import create_store_backup
+    from superbrain.storage.runtime import open_runtime
+
     runtime = open_runtime(data_root, os_adapters())
     try:
         create_store_backup(runtime.store, runtime.os_, datetime.now(UTC))
@@ -131,6 +163,9 @@ def backup_store(data_root: Path, args: list[str]) -> None:
 
 
 def open_runtime_once(data_root: Path, args: list[str]) -> None:
+    from superbrain.adapters.os import os_adapters
+    from superbrain.storage.runtime import open_runtime
+
     open_runtime(data_root, os_adapters()).close()
 
 
@@ -148,6 +183,10 @@ def _latest_backup(backups_dir: Path, kinds: tuple[str, ...]) -> Path:
 
 def restore_from_latest(data_root: Path, args: list[str]) -> None:
     """Open the runtime, close its store and restore the newest ``store``/``store_full`` backup under its lease."""
+    from superbrain.adapters.os import os_adapters
+    from superbrain.storage.restore import restore_store
+    from superbrain.storage.runtime import open_runtime
+
     runtime = open_runtime(data_root, os_adapters())
     try:
         runtime.store.close()
@@ -159,6 +198,10 @@ def restore_from_latest(data_root: Path, args: list[str]) -> None:
 
 def restore_policy_from_latest(data_root: Path, args: list[str]) -> None:
     """Open the runtime, close both stores and restore the newest ``policy`` backup under its lease."""
+    from superbrain.adapters.os import os_adapters
+    from superbrain.storage.restore import restore_policy
+    from superbrain.storage.runtime import open_runtime
+
     runtime = open_runtime(data_root, os_adapters())
     try:
         store_id = runtime.store.store_id
@@ -176,6 +219,13 @@ def _add_table(db: sqlite3.Connection) -> None:
 
 def _migrate_to_v2(data_root: Path, target: Literal["store", "policy"]) -> None:
     """Migrate ``target`` to a v2 that adds a table, under a maintenance lease (no Store or PolicyStore is opened)."""
+    from superbrain.adapters.os import os_adapters
+    from superbrain.storage.layout import prepare_data_root, secure_subdirectories
+    from superbrain.storage.migrate import migrate_database
+    from superbrain.storage.schema import POLICY_MIGRATIONS, STORE_MIGRATIONS, Migration
+    from superbrain.storage.swap import recover_interrupted_swaps
+    from superbrain.storage.writer import acquire_writer
+
     os_ = os_adapters()
     root = prepare_data_root(data_root, os_)
     v2 = Migration(to_version=2, min_reader_version=1, apply=_add_table)

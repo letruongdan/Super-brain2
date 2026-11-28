@@ -16,7 +16,7 @@ from superbrain.ports.maintenance import PolicyRestoreAuthorityDiff
 from superbrain.ports.os import OsAdapters
 from superbrain.storage import _policy_approvals as approvals
 from superbrain.storage._policy_accounting import ensure_accounting_schema
-from superbrain.storage._policy_layer2 import SIGNER_RESET_META_KEY
+from superbrain.storage._policy_layer2 import SIGNER_RESET_META_KEY, mark_restored_layer2_stale
 from superbrain.storage.backup import BackupManifest, verify_backup
 from superbrain.storage.errors import sqlite_error
 from superbrain.storage.layout import DataRoot
@@ -248,6 +248,7 @@ def stage_policy_restore_effects(
                 )
             if live_carry_forward and live_path is not None:
                 _carry_forward_from_live(live_path, staged_db)
+            mark_restored_layer2_stale(staged_db)
             staged_db.execute("COMMIT")
         except BaseException:
             if staged_db.in_transaction:

@@ -15,6 +15,7 @@ from pathlib import Path
 from superbrain.adapters.os.durable import full_fsync, map_os_error
 from superbrain.adapters.os.paths import OsPathSafety
 from superbrain.core.errors import BrainError, ErrorCode
+from superbrain.ports.capture import register_outbox_file_lock
 
 _LOCK_REGION = 1  # byte 0; the payload starts right after it
 _REPARSE_POINT = 0x400
@@ -239,3 +240,23 @@ class OsLockFactory:
         if stat.S_ISLNK(st.st_mode) or bool(getattr(st, "st_file_attributes", 0) & _REPARSE_POINT):
             raise BrainError(ErrorCode.UNSAFE_PATH, f"lock path {path} must not be a symlink or reparse point")
         return _probe_held_os(path)
+
+class _OsOutboxFileLock:
+    def try_lock_fd(self, fd: int) -> bool:
+        try:
+            _lock(fd)
+            return True
+        except OSError as err:
+            if err.errno in _HELD_ERRNOS:
+                return False
+            raise map_os_error(err, "locking the outbox") from err
+
+    def unlock_fd(self, fd: int) -> None:
+        try:
+            _unlock(fd)
+        except OSError:
+            pass
+
+
+OUTBOX_FILE_LOCK = _OsOutboxFileLock()
+register_outbox_file_lock(OUTBOX_FILE_LOCK)

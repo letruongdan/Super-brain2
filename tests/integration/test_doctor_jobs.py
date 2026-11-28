@@ -209,7 +209,8 @@ def _running_owner_loop(
     clock: FakeClock,
     mono: FakeMonotonicClock,
 ) -> Iterator[tuple[Ready, OwnerLoop]]:
-    loop = create_daemon_owner_loop(os_=os_, clock=clock, monotonic_clock=mono)
+    # doctor-only daemon as in SP1-I4; since the SP2 merge production also registers continuity.refresh
+    loop = create_daemon_owner_loop(os_=os_, clock=clock, monotonic_clock=mono, job_handlers={})
     ready = loop.start(cfg)
     try:
         yield ready, loop
@@ -631,9 +632,10 @@ def test_get_health_deep_quarantined_descriptor_and_blob_fail_closed_on_replay(t
 def test_due_jobs_by_kinds_and_lease_next_for_kinds_bounds_and_isolation(
     trusted_tmp: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``due_jobs_by_kinds`` / ``lease_next_for_kinds`` isolate ``system.doctor``; prod handlers stay empty."""
-    assert PRODUCTION_JOB_HANDLERS == MappingProxyType({})
-    assert dict(PRODUCTION_JOB_HANDLERS) == {}
+    """``due_jobs_by_kinds`` / ``lease_next_for_kinds`` isolate ``system.doctor``; no prod handler runs it."""
+    assert isinstance(PRODUCTION_JOB_HANDLERS, MappingProxyType)
+    # SP2-3 registers only continuity.refresh; system.doctor stays with the doctor runner
+    assert set(PRODUCTION_JOB_HANDLERS) == {"continuity.refresh"}
     with pytest.raises(TypeError):
         PRODUCTION_JOB_HANDLERS["system.doctor"] = lambda _s, _c: ()  # type: ignore[index]
 

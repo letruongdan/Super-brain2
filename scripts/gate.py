@@ -273,12 +273,34 @@ def parse_collected(text: str) -> list[str]:
     return ids
 
 
+# Tests asserting wall-clock product deadlines (hook 2 s cap, request budgets, short doctor periods). Parallel
+# shards deselect them and one serial pytest runs them after the shards, inside the same test-job deadline, so a
+# loaded machine cannot fail them by contention. Deadlines and assertions in the tests stay unchanged.
+SERIAL_NODE_PREFIXES: tuple[str, ...] = (
+    "tests/integration/test_hook_deadline_gap.py",
+    "tests/integration/test_sp2_5_production_wiring.py::test_p1_finding2_bootstrap_and_installed_hook_adapters_end_to_end",
+    "tests/integration/test_sp2_5_production_wiring.py::test_r5_finding1_observed_host_payloads_consecutive_retry_and_ws_switch",
+    "tests/integration/test_sp2_5_production_wiring.py::test_r6_finding1_hook_binding_survives_pre_and_post_publish_crashes_and_post_ack_retry",
+    "tests/integration/test_i4_a1_a2_job_lifecycle.py::test_p2_12_",
+    "tests/integration/test_kernel_crash_recovery.py::test_crash_before_commit_leaves_no_effect_and_one_retry_applies",
+    "tests/integration/test_doctor_sp2_probes.py::test_m1_incomplete_journal_drift_permissions_deep_health_and_cross_owner_checkout_isolation",
+)
+
+
+def split_serial(collected_ids: Sequence[str]) -> tuple[list[str], list[str]]:
+    """``(parallel_ids, serial_ids)``: node IDs under ``SERIAL_NODE_PREFIXES`` run in the serial phase."""
+    serial = [nid for nid in collected_ids if nid.startswith(SERIAL_NODE_PREFIXES)]
+    chosen = set(serial)
+    return [nid for nid in collected_ids if nid not in chosen], serial
+
+
 _WHEEL_SETUP_COST_MS = 3_000
 _DEFAULT_CASE_COST_MS = 20
 _WHEEL_FIXTURE_FILES: frozenset[str] = frozenset(
     {
         "tests/contract/test_mcp_v2_schema.py",
         "tests/integration/test_apply_journal_crash_matrix.py",
+        "tests/integration/test_capture_ack_and_crash_matrix.py",
         "tests/integration/test_doctor_cli.py",
         "tests/integration/test_doctor_fix.py",
         "tests/integration/test_i3_wheel_e2e.py",
@@ -293,217 +315,242 @@ _WHEEL_FIXTURE_FILES: frozenset[str] = frozenset(
         "tests/integration/test_t9_benchmark_scratch.py",
     }
 )
-# Calibrated across all collected test files using measured Windows Python 3.14.3 4-shard JUnit timings
-# on 951b6b7 (plus _WHEEL_SETUP_COST_MS=3000) so wheel and non-wheel workloads stay within ~13 ms LPT spread
-# on both 4-shard local and 8-shard runs while preserving storage I/O staggering and 300s hosted defaults.
+# Calibrated across all 181 collected test files using hosted windows-2022 CI measurements
+# (run 44705523078 shard-0, baseline 035a4cd, and Azure 2.43x storage scaling for new/updated storage modules)
+# plus session wheel setup overhead across the two wheel shards. _WHEEL_SETUP_COST_MS=3000 and 300s budget intact.
+# Recalibrated on 2026-11-25 from Python 3.14 and 3.11 Windows 6-shard diagnostic runs
+# (diag-remediate-v11/py3.14 and py3.11 on commit 4ce42af) across all 194 collected test files.
+# Integration with main (SP1-I4): its doctor/I4 files keep main's measured weights.
 _HEAVY_FILE_COST_MS: dict[str, int] = {
+    "tests/integration/test_kernel_crash_recovery.py": 70022,
+    "tests/integration/test_apply_journal_crash_matrix.py": 63762,
+    "tests/integration/test_kernel_daemon.py": 48682,
+    "tests/integration/test_kernel_native_receipt_contract.py": 44594,
+    "tests/integration/test_i3_rereview_init_and_accounting.py": 39926,
+    "tests/integration/test_sp2_i2_wheel_compat.py": 38145,
+    "tests/integration/test_i3_wheel_e2e.py": 36243,
+    "tests/application/test_continuity_worker_scheduling.py": 34942,
+    "tests/storage/test_kernel_revocation.py": 30970,
+    "tests/integration/test_capture_ack_and_crash_matrix.py": 24254,
+    "tests/architecture/test_gate_receipt.py": 23730,
+    "tests/storage/test_restore.py": 20921,
+    "tests/integration/test_kernel_cli.py": 20442,
+    "tests/integration/test_restore_and_migration_i3.py": 19335,
+    "tests/domain/test_capture_envelope_and_privacy.py": 18810,
+    "tests/storage/test_kernel_migration.py": 18305,
+    "tests/storage/test_crash_matrix.py": 18197,
+    "tests/integration/test_i3_rereview_bootstrap_and_handoff.py": 16662,
+    "tests/integration/test_kernel_shim.py": 16085,
+    "tests/storage/test_backup.py": 15496,
+    "tests/storage/test_runtime.py": 15372,
+    "tests/storage/test_remediation_i2_t5.py": 14356,
+    "tests/integration/test_kernel_receipts.py": 13584,
+    "tests/application/test_t8_review_p01_r2_edge_globs.py": 13448,
+    "tests/integration/test_t9_signal_stop_conversion.py": 13198,
+    "tests/storage/test_ledger.py": 12102,
+    "tests/application/test_t8_review_p01_wrapped_paths.py": 11747,
+    "tests/storage/test_remediation_i2_t3_lineage.py": 11725,
+    "tests/integration/test_kernel_transport.py": 11442,
+    "tests/integration/test_sp2_daemon_leased_attempt_retry.py": 11260,
+    "tests/integration/test_sp2_store_v7_shape_and_refs.py": 11182,
+    "tests/storage/test_kernel_idempotency.py": 10279,
+    "tests/storage/test_cas.py": 10172,
+    "tests/integration/test_sp2_continuity_authority_read_errors.py": 9790,
+    "tests/contract/test_mcp_v2_schema.py": 9698,
+    "tests/application/test_kernel_send_attempts.py": 9316,
+    "tests/integration/test_kernel_privacy_persistence.py": 9274,
+    "tests/storage/test_outbox_durability_and_limits.py": 9017,
+    "tests/storage/test_recovery_grant_and_turn_intent.py": 8496,
+    "tests/integration/test_sp2_store_v7_migration.py": 8225,
+    "tests/storage/test_restore_epoch_and_expiry.py": 8163,
+    "tests/application/test_i3_5_bootstrap_doctor_regressions.py": 7741,
+    "tests/application/test_bootstrap_and_doctor.py": 7604,
+    "tests/storage/test_kernel_workspaces.py": 7508,
+    "tests/integration/test_t9_socket_readiness.py": 7497,
+    "tests/storage/test_remediation_i2_os01.py": 7436,
+    "tests/integration/test_kernel_performance.py": 7086,
+    "tests/integration/test_cli_init_and_authority.py": 7053,
+    "tests/storage/test_remediation_c02_r6_restore_marker.py": 6933,
+    "tests/support/test_bounded_worker.py": 6764,
+    "tests/integration/test_i2_close_01_canonical_compat.py": 6452,
+    "tests/architecture/test_t9_ci_checkout_bytes.py": 6404,
+    "tests/storage/test_migrate.py": 6054,
+    "tests/integration/test_i3_1_review_regressions.py": 5984,
+    "tests/storage/test_dual_store_session_binding.py": 5932,
+    "tests/storage/test_writer.py": 5766,
+    "tests/application/test_t8_review_p01_r3_spellings.py": 5317,
+    "tests/integration/test_apply_journal_e2e.py": 5046,
+    "tests/adapters/test_durable.py": 4994,
+    "tests/storage/test_kernel_identity.py": 4919,
+    "tests/storage/test_policy_accounting.py": 4770,
+    "tests/storage/test_remediation_i2_t3_mirror_history.py": 4754,
+    "tests/architecture/test_remediation_c06_gate_xpass.py": 4656,
+    "tests/storage/test_kernel_jobs.py": 4583,
+    "tests/integration/test_i2_close_01_transport_stdio.py": 4581,
+    "tests/application/test_i3_3_review_regressions.py": 4437,
+    "tests/integration/test_i2_close_01_wire_replay.py": 4232,
+    "tests/cli_api/test_schema_digest_handshake.py": 4197,
+    "tests/storage/test_policy_store.py": 4027,
+    "tests/application/test_kernel_job_worker.py": 3966,
+    "tests/architecture/test_imports.py": 3915,
+    "tests/storage/test_remediation_i2_t4a.py": 3839,
+    "tests/storage/test_remediation_c01_wal_admission.py": 3684,
+    "tests/application/test_kernel_deadlines.py": 3666,
+    "tests/integration/test_review_apply_cli_and_operator.py": 3617,
+    "tests/support/test_crash_harness.py": 3600,
+    "tests/application/test_i3_2_journal_regressions.py": 3540,
+    "tests/application/test_i3_2_rollback_and_schema_regressions.py": 3513,
+    "tests/integration/test_kernel_serve_signal_lifecycle.py": 3217,
+    "tests/integration/test_i3_4_restore_regressions.py": 3193,
+    "tests/storage/test_reconcile.py": 3111,
+    "tests/application/test_t8_review_p01_n04_short_spellings.py": 3033,
+    "tests/storage/test_i3_4_storage_regressions.py": 2978,
+    "tests/architecture/test_t8_review_w02_canonical_payload_source.py": 2919,
+    "tests/application/test_t8_review_p01_n01_linear.py": 2873,
+    "tests/storage/test_remediation_c04_r8_backup_files.py": 2808,
+    "tests/storage/test_remediation_c02_lost_main_db.py": 2751,
+    "tests/adapters/test_client_profile.py": 2708,
+    "tests/storage/test_swap.py": 2654,
+    "tests/integration/test_t9_signal_stop_guard.py": 2589,
+    "tests/integration/test_t9_r22_stop_completion.py": 2570,
+    "tests/application/test_remediation_i2_t4bc.py": 2535,
+    "tests/cli_api/test_review_web.py": 2488,
+    "tests/application/test_change_proposal_and_journal.py": 2465,
+    "tests/storage/test_signer_and_layer2_authority.py": 2424,
+    "tests/application/test_t8_review_p01_r4_oracle_fixes.py": 2390,
+    "tests/integration/test_t9_benchmark_scratch.py": 2375,
+    "tests/architecture/test_remediation_c08_r13_unavailable_drive.py": 2282,
+    "tests/storage/test_remediation_c04_cas_shard_boundary.py": 2131,
+    "tests/application/test_kernel_daemon_worker.py": 2094,
+    "tests/application/test_t8_review_p01_n03_r2_inner_literals.py": 2071,
+    "tests/application/test_t8_closure_privacy_r2.py": 2067,
+    "tests/storage/test_schema.py": 1903,
+    "tests/architecture/test_remediation_i2_os01.py": 1829,
+    "tests/application/test_t8_review_p01_n03_edge_cost.py": 1809,
+    "tests/application/test_t8_review_p01_n01_r2_edges.py": 1775,
+    "tests/integration/test_t9_startup_signal_latch.py": 1736,
+    "tests/storage/test_remediation_c04_r9_imported_backup_ancestors.py": 1734,
+    "tests/cli_api/test_t9_tcp_latency.py": 1732,
+    "tests/storage/test_remediation_c04_r6_backup_container_perms.py": 1648,
+    "tests/storage/test_remediation_c01_r4_reading_leftovers.py": 1647,
+    "tests/application/test_t8_review_w02_private_large_blocks.py": 1626,
+    "tests/support/test_inc2_process_cleanup.py": 1586,
+    "tests/architecture/test_remediation_c08_r11_raw_path_admission.py": 1552,
+    "tests/storage/test_remediation_c02_r8_restore_carryover.py": 1533,
+    "tests/application/test_t8_closure_privacy.py": 1523,
+    "tests/storage/test_t9_endpoint_casefold.py": 1458,
+    "tests/storage/test_errors.py": 1457,
+    "tests/storage/test_retention.py": 1445,
+    "tests/application/test_t8_review_w01_private_equivalence.py": 1405,
+    "tests/adapters/test_approval_verifiers.py": 1385,
+    "tests/storage/test_remediation_i2_t5_residual.py": 1330,
+    "tests/support/test_init_clone.py": 1314,
+    "tests/integration/test_i3_2_operator_cli_regressions.py": 1308,
+    "tests/storage/test_remediation_c04_r2_cas_siblings.py": 1283,
+    "tests/integration/test_t9_client_sighting.py": 1252,
+    "tests/storage/test_remediation_c01_r5_policy_wal_reader.py": 1252,
+    "tests/storage/test_remediation_c05_r2_resync.py": 1252,
+    "tests/application/test_t8_review_w01_canonical_reuse.py": 1251,
+    "tests/cli_api/test_i3_5_review_web_regressions.py": 1206,
+    "tests/application/test_remediation_i2_t5_worker.py": 1167,
+    "tests/cli_api/test_loopback_client.py": 1148,
+    "tests/storage/test_cas_gc.py": 1085,
+    "tests/integration/test_t9_r21_shutdown_wait.py": 1014,
+    "tests/application/test_i3_4_accounting_regressions.py": 938,
+    "tests/storage/test_remediation_c05_shard_parent_sync.py": 934,
+    "tests/core/test_faults.py": 859,
+    "tests/application/test_i3_3_r3_regressions.py": 852,
+    "tests/application/test_t8_privacy_performance_equivalence.py": 808,
+    "tests/architecture/test_t9_ci_seal.py": 807,
+    "tests/application/test_kernel_privacy.py": 753,
+    "tests/application/test_operator_service_and_verifiers_r2.py": 750,
+    "tests/adapters/test_physical_fs_and_no_replace.py": 705,
+    "tests/storage/test_flush_routing.py": 676,
+    "tests/mcp/test_stdio.py": 647,
+    "tests/core/test_ids.py": 638,
+    "tests/storage/test_remediation_c03_handler_downgrade.py": 616,
+    "tests/cli_api/test_loopback_frames.py": 576,
+    "tests/storage/test_remediation_c02_r4_intents_signal.py": 553,
+    "tests/cli_api/test_t8_closure_wire.py": 538,
+    "tests/storage/test_layout.py": 484,
+    "tests/storage/test_i3_3_authority_regressions.py": 428,
+    "tests/architecture/test_t9_gate_job_drain.py": 404,
+    "tests/application/test_t8_closure_privacy_r2_gates.py": 403,
+    "tests/architecture/test_remediation_c08_r8_root_links.py": 388,
+    "tests/storage/test_remediation_c02_r7_live_marker.py": 378,
+    "tests/architecture/test_t9_gate_environment_isolation.py": 339,
+    "tests/architecture/test_remediation_c08_r4_preflight_failures.py": 323,
+    "tests/storage/test_remediation_c04_r5_backup_cas_link.py": 304,
+    "tests/architecture/test_remediation_c08_r6_root_itself.py": 294,
+    "tests/storage/test_t9_reserved_sibling_casefold.py": 238,
+    "tests/architecture/test_remediation_c08_r9_missing_root_linked_parent.py": 184,
+    "tests/application/test_t9_privacy_non_retention.py": 151,
+    "tests/integration/test_t9_libproc_client_pid.py": 138,
+    "tests/adapters/test_permissions.py": 130,
+    "tests/adapters/test_paths.py": 129,
+    "tests/composition/test_client_scope.py": 126,
+    "tests/architecture/test_remediation_c08_r2_real_probe.py": 119,
+    "tests/application/test_t8_closure_privacy_r5_shapes.py": 108,
+    "tests/architecture/test_remediation_c08_gate_environment.py": 107,
+    "tests/adapters/test_i3_2_hygiene_regressions.py": 102,
+    "tests/application/test_t8_review_r01_path_enforcement.py": 101,
+    "tests/application/test_t8_closure_privacy_r5_paths.py": 98,
+    "tests/integration/test_t8_closure_perf_probe_r5.py": 91,
+    "tests/application/test_remediation_i2_t3_privacy.py": 83,
+    "tests/storage/test_kinds.py": 80,
+    "tests/integration/test_t9_process_sighting.py": 54,
+    "tests/adapters/test_shared_config_mergers.py": 39,
+    "tests/application/test_t8_closure_privacy_r4_literals.py": 35,
+    "tests/core/test_canonical.py": 33,
+    "tests/integration/test_t8_review_20261112_perf_replay.py": 28,
+    "tests/application/test_t8_review_p02_rule_gates.py": 26,
+    "tests/support/test_fs.py": 24,
+    "tests/application/test_t8_closure_prequeue.py": 21,
+    "tests/core/test_approval_message.py": 20,
+    "tests/domain/test_exposure_and_worker_rules.py": 20,
+    "tests/integration/test_t8_review_20261112_perf_attribution.py": 20,
+    "tests/core/test_t8_closure_normalize.py": 18,
+    "tests/application/test_t8_closure_privacy_r3_casefold.py": 16,
+    "tests/application/test_kernel_lineage.py": 15,
+    "tests/integration/test_t8_closure_perf_probe.py": 11,
+    "tests/storage/test_t9_checkout_spelling.py": 11,
+    "tests/application/test_t8_review_p02_r2_rule_discovery.py": 2,
+    "tests/integration/test_t9_linux_scan_budget.py": 0,
+    "tests/integration/test_handoff_lifecycle_and_takeover.py": 3560,
+    "tests/storage/test_handoff_restore_and_epochs.py": 1860,
+    "tests/domain/test_handoff_limits_and_budget.py": 100,
+    "tests/integration/test_sp2_5_production_wiring.py": 120000,
+    "tests/integration/test_capture_mcp_coexistence_r2.py": 2000,
+    "tests/integration/test_capture_mcp_coexistence.py": 1800,
+    "tests/storage/test_outbox_r9_ack_cursor_bounds.py": 1100,
+    "tests/integration/test_layer2_invalidation.py": 900,
+    "tests/storage/test_outbox_r8_migration_and_limits.py": 850,
+    "tests/adapters/test_claude_and_codex_capture_adapters.py": 350,
+    "tests/storage/test_outbox_r10_ack_durability.py": 1600,
+    # SP1-I4 files merged from main (main's calibration, 2026-11-28 integration)
     "tests/integration/test_doctor_fix.py": 78365,
     "tests/integration/test_doctor_cli.py": 65325,
-    "tests/integration/test_kernel_crash_recovery.py": 51973,
     "tests/integration/test_i4_r3_remediation.py": 43434,
-    "tests/integration/test_apply_journal_crash_matrix.py": 42859,
     "tests/integration/test_i4_f4_f8_remediation.py": 39295,
-    "tests/integration/test_sp2_i2_wheel_compat.py": 36834,
-    "tests/integration/test_kernel_daemon.py": 32351,
-    "tests/integration/test_kernel_native_receipt_contract.py": 29432,
     "tests/integration/test_i4_r5_legacy_job_replay.py": 25171,
-    "tests/integration/test_i3_rereview_init_and_accounting.py": 24330,
-    "tests/architecture/test_gate_receipt.py": 23278,
-    "tests/integration/test_i3_wheel_e2e.py": 22626,
     "tests/integration/test_i4_rereview_remediation.py": 20242,
     "tests/integration/test_i4_a1_a2_job_lifecycle.py": 62300,
     "tests/integration/test_i4_r6_maintenance_snapshot.py": 12000,
     "tests/integration/test_i4_r4_remediation.py": 20018,
-    "tests/storage/test_kernel_revocation.py": 18657,
     "tests/integration/test_doctor_sp2_probes.py": 18137,
-    "tests/application/test_t8_review_p01_r2_edge_globs.py": 17806,
-    "tests/storage/test_crash_matrix.py": 17151,
-    "tests/application/test_t8_review_p01_wrapped_paths.py": 16449,
     "tests/integration/test_i4_r6_job_payload_holder.py": 15548,
-    "tests/integration/test_restore_and_migration_i3.py": 14802,
-    "tests/integration/test_kernel_cli.py": 13828,
-    "tests/storage/test_runtime.py": 13747,
-    "tests/integration/test_t9_signal_stop_conversion.py": 13529,
     "tests/integration/test_i4_r7_leased_payload_settlement.py": 13293,
-    "tests/storage/test_backup.py": 12649,
     "tests/storage/test_doctor_snapshot.py": 12530,
     "tests/integration/test_doctor_jobs.py": 12410,
-    "tests/integration/test_i3_rereview_bootstrap_and_handoff.py": 11973,
-    "tests/integration/test_kernel_shim.py": 11635,
-    "tests/storage/test_restore.py": 11316,
-    "tests/integration/test_kernel_receipts.py": 11111,
     "tests/integration/test_i4_r9_doctor_payload_fault_classification.py": 10786,
     "tests/integration/test_i4_r8_doctor_integrity_settle.py": 10567,
-    "tests/integration/test_kernel_transport.py": 9378,
     "tests/integration/test_i4_review_remediation.py": 9195,
-    "tests/storage/test_remediation_i2_t3_lineage.py": 8509,
-    "tests/storage/test_ledger.py": 8398,
     "tests/integration/test_i4_owner_thread_remediation.py": 8307,
-    "tests/storage/test_kernel_migration.py": 8131,
-    "tests/storage/test_remediation_i2_t5.py": 7511,
-    "tests/application/test_kernel_send_attempts.py": 7207,
     "tests/integration/test_i4_r8_blob_verify_transient.py": 6942,
-    "tests/integration/test_kernel_privacy_persistence.py": 6872,
-    "tests/integration/test_kernel_performance.py": 6633,
-    "tests/support/test_bounded_worker.py": 6474,
-    "tests/storage/test_cas.py": 6382,
-    "tests/application/test_bootstrap_and_doctor.py": 5938,
-    "tests/storage/test_reconcile.py": 5812,
-    "tests/storage/test_recovery_grant_and_turn_intent.py": 5773,
-    "tests/integration/test_t9_socket_readiness.py": 5690,
-    "tests/storage/test_kernel_idempotency.py": 5650,
-    "tests/application/test_i3_5_bootstrap_doctor_regressions.py": 5551,
-    "tests/integration/test_cli_init_and_authority.py": 5290,
-    "tests/integration/test_i3_1_review_regressions.py": 5122,
-    "tests/contract/test_mcp_v2_schema.py": 5053,
-    "tests/integration/test_i2_close_01_canonical_compat.py": 4934,
-    "tests/storage/test_writer.py": 4905,
-    "tests/storage/test_restore_epoch_and_expiry.py": 4751,
-    "tests/storage/test_remediation_i2_os01.py": 4705,
-    "tests/storage/test_kernel_workspaces.py": 4418,
-    "tests/storage/test_remediation_c02_r6_restore_marker.py": 4364,
-    "tests/storage/test_migrate.py": 4238,
-    "tests/architecture/test_t9_ci_checkout_bytes.py": 4135,
-    "tests/application/test_t8_review_p01_r3_spellings.py": 4052,
-    "tests/integration/test_i2_close_01_wire_replay.py": 4040,
-    "tests/adapters/test_durable.py": 3801,
-    "tests/integration/test_apply_journal_e2e.py": 3722,
-    "tests/storage/test_remediation_i2_t3_mirror_history.py": 3622,
-    "tests/integration/test_i2_close_01_transport_stdio.py": 3582,
     "tests/integration/test_i4_r10_claim_reconciliation.py": 3512,
-    "tests/support/test_crash_harness.py": 3407,
-    "tests/storage/test_remediation_c01_wal_admission.py": 3317,
-    "tests/application/test_i3_3_review_regressions.py": 3315,
-    "tests/architecture/test_remediation_c06_gate_xpass.py": 3266,
-    "tests/cli_api/test_schema_digest_handshake.py": 3250,
-    "tests/application/test_kernel_deadlines.py": 3143,
-    "tests/storage/test_kernel_identity.py": 3138,
-    "tests/storage/test_policy_store.py": 2999,
-    "tests/integration/test_t9_benchmark_scratch.py": 2845,
-    "tests/application/test_i3_2_journal_regressions.py": 2755,
-    "tests/architecture/test_imports.py": 2744,
-    "tests/application/test_t8_review_p01_n04_short_spellings.py": 2697,
-    "tests/storage/test_kernel_jobs.py": 2661,
-    "tests/integration/test_i3_4_restore_regressions.py": 2619,
-    "tests/application/test_t8_review_p01_n01_linear.py": 2508,
-    "tests/storage/test_i3_4_storage_regressions.py": 2496,
-    "tests/storage/test_remediation_i2_t4a.py": 2391,
-    "tests/integration/test_t9_signal_stop_guard.py": 2371,
-    "tests/integration/test_review_apply_cli_and_operator.py": 2325,
-    "tests/integration/test_kernel_serve_signal_lifecycle.py": 2279,
-    "tests/storage/test_policy_accounting.py": 2255,
-    "tests/application/test_t8_review_p01_r4_oracle_fixes.py": 2144,
-    "tests/cli_api/test_review_web.py": 2097,
-    "tests/adapters/test_client_profile.py": 2090,
-    "tests/integration/test_t9_r22_stop_completion.py": 2030,
-    "tests/storage/test_swap.py": 1955,
-    "tests/application/test_kernel_job_worker.py": 1932,
-    "tests/storage/test_schema.py": 1926,
-    "tests/application/test_change_proposal_and_journal.py": 1870,
-    "tests/application/test_t8_review_p01_n03_r2_inner_literals.py": 1762,
-    "tests/application/test_i3_2_rollback_and_schema_regressions.py": 1759,
-    "tests/application/test_kernel_daemon_worker.py": 1732,
-    "tests/application/test_t8_closure_privacy_r2.py": 1720,
-    "tests/storage/test_remediation_c02_lost_main_db.py": 1667,
-    "tests/storage/test_remediation_c04_r8_backup_files.py": 1649,
-    "tests/architecture/test_t8_review_w02_canonical_payload_source.py": 1645,
-    "tests/application/test_t8_review_p01_n01_r2_edges.py": 1621,
-    "tests/storage/test_remediation_c01_r4_reading_leftovers.py": 1606,
-    "tests/storage/test_remediation_c04_r9_imported_backup_ancestors.py": 1447,
-    "tests/storage/test_signer_and_layer2_authority.py": 1388,
-    "tests/application/test_remediation_i2_t4bc.py": 1378,
-    "tests/integration/test_t9_r21_shutdown_wait.py": 1371,
     "tests/integration/test_i4_vanished_entry_walk.py": 1350,
-    "tests/application/test_t8_review_p01_n03_edge_cost.py": 1332,
-    "tests/integration/test_i3_2_operator_cli_regressions.py": 1258,
-    "tests/architecture/test_remediation_i2_os01.py": 1239,
-    "tests/architecture/test_remediation_c08_r13_unavailable_drive.py": 1210,
-    "tests/application/test_t8_closure_privacy.py": 1197,
-    "tests/support/test_init_clone.py": 1184,
-    "tests/storage/test_remediation_c05_r2_resync.py": 1161,
-    "tests/architecture/test_remediation_c08_r11_raw_path_admission.py": 1150,
-    "tests/storage/test_remediation_c04_cas_shard_boundary.py": 1145,
-    "tests/integration/test_t9_startup_signal_latch.py": 1143,
-    "tests/storage/test_remediation_c02_r8_restore_carryover.py": 1118,
-    "tests/storage/test_remediation_c04_r6_backup_container_perms.py": 1099,
-    "tests/storage/test_errors.py": 1092,
-    "tests/application/test_t8_review_w01_private_equivalence.py": 999,
-    "tests/integration/test_t9_client_sighting.py": 985,
-    "tests/storage/test_cas_gc.py": 976,
-    "tests/storage/test_t9_endpoint_casefold.py": 956,
-    "tests/application/test_t8_review_w02_private_large_blocks.py": 942,
-    "tests/cli_api/test_loopback_client.py": 942,
-    "tests/storage/test_retention.py": 932,
-    "tests/storage/test_remediation_i2_t5_residual.py": 860,
-    "tests/adapters/test_approval_verifiers.py": 856,
-    "tests/application/test_i3_4_accounting_regressions.py": 830,
-    "tests/storage/test_remediation_c01_r5_policy_wal_reader.py": 820,
-    "tests/storage/test_flush_routing.py": 818,
-    "tests/storage/test_remediation_c04_r2_cas_siblings.py": 818,
-    "tests/cli_api/test_t9_tcp_latency.py": 780,
-    "tests/support/test_inc2_process_cleanup.py": 708,
     "tests/integration/test_i4_r7_remediation.py": 1500,
-    "tests/cli_api/test_i3_5_review_web_regressions.py": 679,
-    "tests/application/test_t8_privacy_performance_equivalence.py": 675,
-    "tests/application/test_t8_review_w01_canonical_reuse.py": 660,
-    "tests/application/test_i3_3_r3_regressions.py": 659,
-    "tests/core/test_faults.py": 627,
-    "tests/application/test_remediation_i2_t5_worker.py": 619,
-    "tests/application/test_operator_service_and_verifiers_r2.py": 540,
-    "tests/architecture/test_t9_ci_seal.py": 538,
-    "tests/application/test_kernel_privacy.py": 526,
-    "tests/application/test_t9_privacy_non_retention.py": 513,
-    "tests/storage/test_remediation_c02_r4_intents_signal.py": 466,
-    "tests/storage/test_remediation_c05_shard_parent_sync.py": 442,
-    "tests/architecture/test_t9_gate_job_drain.py": 441,
-    "tests/storage/test_layout.py": 435,
-    "tests/adapters/test_physical_fs_and_no_replace.py": 425,
-    "tests/mcp/test_stdio.py": 424,
-    "tests/storage/test_remediation_c03_handler_downgrade.py": 419,
-    "tests/cli_api/test_t8_closure_wire.py": 377,
-    "tests/storage/test_remediation_c02_r7_live_marker.py": 360,
-    "tests/cli_api/test_loopback_frames.py": 341,
-    "tests/storage/test_i3_3_authority_regressions.py": 313,
-    "tests/application/test_t8_closure_privacy_r2_gates.py": 309,
-    "tests/architecture/test_remediation_c08_r4_preflight_failures.py": 266,
-    "tests/core/test_ids.py": 263,
-    "tests/integration/test_t9_libproc_client_pid.py": 224,
-    "tests/storage/test_remediation_c04_r5_backup_cas_link.py": 183,
-    "tests/architecture/test_t9_gate_environment_isolation.py": 179,
-    "tests/architecture/test_remediation_c08_r8_root_links.py": 168,
-    "tests/architecture/test_remediation_c08_r6_root_itself.py": 143,
     "tests/architecture/test_gate_time_budget.py": 142,
-    "tests/storage/test_t9_reserved_sibling_casefold.py": 124,
-    "tests/adapters/test_paths.py": 87,
-    "tests/architecture/test_remediation_c08_r9_missing_root_linked_parent.py": 87,
-    "tests/application/test_t8_closure_privacy_r5_shapes.py": 83,
-    "tests/architecture/test_remediation_c08_gate_environment.py": 81,
-    "tests/application/test_t8_closure_privacy_r5_paths.py": 74,
-    "tests/adapters/test_permissions.py": 72,
-    "tests/storage/test_kinds.py": 67,
-    "tests/composition/test_client_scope.py": 62,
-    "tests/adapters/test_i3_2_hygiene_regressions.py": 59,
-    "tests/application/test_t8_review_r01_path_enforcement.py": 58,
-    "tests/integration/test_t8_closure_perf_probe_r5.py": 56,
-    "tests/application/test_remediation_i2_t3_privacy.py": 53,
-    "tests/architecture/test_remediation_c08_r2_real_probe.py": 49,
-    "tests/integration/test_t9_process_sighting.py": 38,
-    "tests/core/test_canonical.py": 33,
-    "tests/application/test_t8_closure_privacy_r4_literals.py": 31,
-    "tests/integration/test_t8_review_20261112_perf_replay.py": 21,
-    "tests/adapters/test_shared_config_mergers.py": 20,
-    "tests/application/test_kernel_lineage.py": 20,
-    "tests/application/test_t8_closure_prequeue.py": 20,
-    "tests/application/test_t8_closure_privacy_r3_casefold.py": 20,
-    "tests/application/test_t8_review_p02_r2_rule_discovery.py": 20,
-    "tests/application/test_t8_review_p02_rule_gates.py": 20,
-    "tests/core/test_approval_message.py": 20,
-    "tests/core/test_t8_closure_normalize.py": 20,
-    "tests/integration/test_t8_closure_perf_probe.py": 20,
-    "tests/integration/test_t8_review_20261112_perf_attribution.py": 20,
-    "tests/integration/test_t9_linux_scan_budget.py": 20,
-    "tests/storage/test_t9_checkout_spelling.py": 20,
-    "tests/support/test_fs.py": 20,
 }
 
 
@@ -539,6 +586,12 @@ def _order_bucket_for_io_stagger(shard_idx: int, group: list[str]) -> list[str]:
         return [*wheel, *non_storage, *storage]
     if shard_idx == 1:
         return [*storage, *non_storage, *wheel]
+    if shard_idx >= 3 and shard_idx % 2 == 1:
+        if len(non_storage) >= 2:
+            staggered_ns = [non_storage[1], non_storage[0], *reversed(non_storage[2:])]
+        else:
+            staggered_ns = list(non_storage)
+        return [*staggered_ns, *storage, *wheel]
     return [*non_storage, *storage, *wheel]
 
 
@@ -1273,37 +1326,56 @@ def run_gate(
                 extra.append(f"{prefix}: {node} is XPASS in the terminal but {observed[node]} in JUnit")
         return ids, observed
 
-    def run_sharded_pytest(groups: list[list[str]], deadline: float) -> tuple[PhaseResult, float]:
+    def run_sharded_pytest(
+        groups: list[list[str]], deadline: float, serial_ids: Sequence[str] = ()
+    ) -> tuple[PhaseResult, float]:
         started = time.monotonic()
-        paths = [junit.with_name(f"{junit.stem}-shard-{index}.xml") for index in range(len(groups))]
+        parallel = len(groups)
+        serial_args = sorted({p for p in SERIAL_NODE_PREFIXES if any(n.startswith(p) for n in serial_ids)})
+        # shards deselect by prefix; the serial run names each node (pytest takes no partial node ID as a path)
+        all_groups = [*groups, sorted(serial_ids)] if serial_args else list(groups)
+        names = [f"pytest-shard-{i}" for i in range(parallel)] + (["pytest-serial"] if serial_args else [])
+        paths = [junit.with_name(f"{junit.stem}-{name.removeprefix('pytest-')}.xml") for name in names]
         junit_paths.extend(paths)
-        results: list[tuple[int | None, str, float, str | None] | None] = [None] * len(groups)
+        results: list[tuple[int | None, str, float, str | None] | None] = [None] * len(all_groups)
+        serial_set = set(serial_ids)
+        expected: list[set[str]] = [set() for _ in all_groups]
+        for node in target_ids:
+            if node in serial_set:
+                expected[-1].add(node)
+                continue
+            file = node.split("::", 1)[0]
+            expected[next(i for i in range(parallel) if file in groups[i])].add(node)
 
         def run_shard(index: int) -> None:
             timeout = min(max(PHASE_TIMEOUTS_S["pytest"], time_budget_s), deadline - time.monotonic())
             if timeout <= 0:
                 return
-            cmd = _uv(worktree, python, "pytest", f"--junitxml={paths[index]}", "-q", "-rfEX", *groups[index])
-            result = step(f"pytest-shard-{index}", cmd, worktree, timeout)
+            deselect = [] if index >= parallel else [
+                f"--deselect={p}" for p in serial_args if p.split("::", 1)[0] in groups[index]
+            ]
+            cmd = _uv(worktree, python, "pytest", f"--junitxml={paths[index]}", "-q", "-rfEX", *deselect,
+                      *all_groups[index])
+            result = step(names[index], cmd, worktree, timeout)
             with record_lock:
                 results[index] = result
 
         execution_failed = False
         try:
-            with ThreadPoolExecutor(max_workers=len(groups)) as pool:
-                for _ in pool.map(run_shard, range(len(groups))):
-                    pass
+            if parallel:
+                with ThreadPoolExecutor(max_workers=parallel) as pool:
+                    for _ in pool.map(run_shard, range(parallel)):
+                        pass
+            if serial_args:  # alone, after every shard: no contention for the wall-clock deadline tests
+                run_shard(parallel)
         except Exception as err:  # noqa: BLE001 - drained workers still have evidence to collect
             execution_failed = True
             extra.append(f"phase pytest shard launch or execution failed: {type(err).__name__}: {err}")
         ended = time.monotonic()
         codes: list[int | None] = []
         runner_error = execution_failed
-        expected: dict[str, set[str]] = {file: set() for group in groups for file in group}
-        for node in target_ids:
-            expected[node.split("::", 1)[0]].add(node)
         for index, result in enumerate(results):
-            name = f"pytest-shard-{index}"
+            name = names[index]
             if result is None:
                 reason = (
                     "shard execution failed"
@@ -1327,11 +1399,12 @@ def run_gate(
             if code != 0:
                 log.append(f"--- {name} (exit {code}) ---\n{output[-4000:]}")
             try:
-                ids, observed = read_report(paths[index], f"junit-shard-{index}.xml", output, shard=name)
+                evidence_name = f"junit-{name.removeprefix('pytest-')}.xml"
+                ids, observed = read_report(paths[index], evidence_name, output, shard=name)
             except OSError as err:
                 extra.append(f"junit {name}: the report could not be read: {err}")
                 continue
-            if set(ids) != set().union(*(expected[file] for file in groups[index])):
+            if set(ids) != expected[index]:
                 extra.append(f"inventory {name}: JUnit node IDs differ from this shard's collected IDs")
             duplicates = outcomes.keys() & observed.keys()
             if duplicates:
@@ -1361,7 +1434,9 @@ def run_gate(
             extra.append(f"source identity could not be read at start: {type(err).__name__}: {err}")
         if start is not None:
             code, output, _, error = step(
-                "uv-sync", ["uv", "sync", "--locked", "--project", str(worktree), "--python", python], worktree,
+                "uv-sync",
+                ["uv", "sync", "--locked", "--project", str(worktree), "--python", python],
+                worktree,
                 SYNC_TIMEOUT_S,
             )
             if code != 0:
@@ -1434,14 +1509,15 @@ def run_gate(
                     target_ids = [nid for nid in collected if nid.split("::", 1)[0] in selected_set]
                     ev.write("collected-full.json", canonical_json(sorted(collected)))
                     ev.write("collected-partition.json", canonical_json(sorted(target_ids)))
-                groups = shard_files(target_ids, shards)
+                parallel_ids, serial_ids = split_serial(target_ids) if shards > 1 else (target_ids, [])
+                groups = shard_files(parallel_ids, shards)
                 for name in REQUIRED_PHASES:
                     cap = PHASE_TIMEOUTS_S[name]
                     timeout = bounded(f"phase {name}", max(cap, time_budget_s) if name == "pytest" else cap)
                     if timeout is None:
                         continue
-                    if name == "pytest" and len(groups) > 1:
-                        phase, job_ended = run_sharded_pytest(groups, deadline)
+                    if name == "pytest" and (len(groups) > 1 or serial_ids):
+                        phase, job_ended = run_sharded_pytest(groups, deadline, serial_ids)
                         phases.append(phase)
                         continue
                     if name == "pytest" and partition is not None and not groups:

@@ -6,7 +6,9 @@ from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
 from typing import Protocol, TypeVar, cast
 
+from superbrain.adapters.os import os_adapters
 from superbrain.adapters.os.clock import SystemMonotonicClock
+from superbrain.application.capture_ingest import CaptureBatchAck, CaptureIngestService
 from superbrain.application.deadlines import (
     DEFAULT_MAX_QUEUE_DEPTH,
     AtomicRequestAuthState,
@@ -17,16 +19,20 @@ from superbrain.application.deadlines import (
 )
 from superbrain.application.dispatch import KernelDispatcher, KernelToolDomain
 from superbrain.application.idempotency import is_idempotency_expired
+from superbrain.application.privacy import PrivacyFilter
+from superbrain.composition._layer2_live import Layer2ApplyTracker, make_live_layer2_lookup
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.ids import new_id
 from superbrain.core.jsonvalue import JsonValue
 from superbrain.core.kernel import (
     ArtifactSendAttempt,
     AuthGrantStamp,
+    AuthSnapshot,
     BootstrapAuthorization,
     Call,
     CallContext,
     CallResult,
+    CaptureBatchCommand,
     Identity,
     Principal,
     PrivateRequestAuth,
@@ -43,11 +49,14 @@ from superbrain.core.kernel import (
 from superbrain.core.wire import encode_envelope, make_error_envelope
 from superbrain.ports.clock import Clock, MonotonicClock
 from superbrain.ports.kernel import KernelBlobStagePort, KernelStorePort, RequestAuthStatePort
+from superbrain.ports.os import OsAdapters
 from superbrain.ports.policy import Intent, IntentKind
 from superbrain.storage._pair_admission import verify_admitted_store_pair
+from superbrain.storage.capture_events import KernelCaptureStore
 from superbrain.storage.idempotency import KernelBlobStager, KernelIdempotencyStore, StrictKernelStore
 from superbrain.storage.policy_store import PolicyStore
 from superbrain.storage.send_attempts import KernelSendAttemptStore
+from superbrain.storage.sessions import capture_continuity_hooks
 from superbrain.storage.store import Store
 
 _T = TypeVar("_T")
@@ -69,6 +78,14 @@ class _MutableRequestAuthState(RequestAuthStatePort, Protocol):
     def next_version(self) -> int: ...
 
     def clear(self) -> None: ...
+
+    def merge_runtime_capabilities(self, snap: AuthSnapshot) -> AuthSnapshot: ...
+
+
+def _encoded_error(err: BrainError) -> CallResult:
+    envelope = make_error_envelope(err)
+    encode_envelope(envelope)
+    return envelope
 
 
 def _verify_domain_pair(domain: KernelToolDomain | None, *, store: Store, policy: PolicyStore) -> None:
@@ -104,12 +121,15 @@ class KernelBridge(KernelBlobStagePort):
         after_reserve_before_enqueue: Callable[[Reservation], None] | None = None,
         on_reservation_change: Callable[[], None] | None = None,
         on_queue_wake: Callable[[], None] | None = None,
-        on_owner_reply_ready: Callable[
-            [Reservation, AuthGrantStamp | None, SendAttemptCompletion | None], None
-        ]
+        on_owner_reply_ready: Callable[[Reservation, AuthGrantStamp | None, SendAttemptCompletion | None], None]
         | None = None,
         on_owner_finished: Callable[[Reservation, bool], None] | None = None,
         on_clock_untrusted_changed: Callable[[bool], None] | None = None,
+        on_capture_gaps_changed: Callable[[bool], None] | None = None,
+        os_: OsAdapters | None = None,
+        host_version_resolver: Callable[[str], str | None] | None = None,
+        seen_configured_layer2: set[tuple[str, str]] | None = None,
+        layer2_apply: Layer2ApplyTracker | None = None,
     ) -> None:
         if not isinstance(recover_pending_on_init, bool):
             raise BrainError(ErrorCode.INVALID_INPUT, "invalid input")
@@ -144,6 +164,17 @@ class KernelBridge(KernelBlobStagePort):
         self._before_auth_gate_publish = before_auth_gate_publish
         self._on_owner_reply_ready = on_owner_reply_ready
         self._on_clock_untrusted_changed = on_clock_untrusted_changed
+        self._on_capture_gaps_changed = on_capture_gaps_changed
+        self._os = os_ if os_ is not None else os_adapters(clock=clock, monotonic=resolved_mono)
+        if host_version_resolver is None:
+            from superbrain.adapters.harness.host_version import probe_installed_host_version
+
+            self._host_version_resolver: Callable[[str], str | None] = probe_installed_host_version
+        else:
+            self._host_version_resolver = host_version_resolver
+        self._seen_l2: set[tuple[str, str]] = set() if seen_configured_layer2 is None else seen_configured_layer2
+        self._l2_apply = layer2_apply if layer2_apply is not None else Layer2ApplyTracker()
+        self.on_continuity_tasks: Callable[[tuple[str, ...]], None] | None = None  # owner thread
         self._wire_stores(store, policy, writer_epoch)
         if recover_pending_on_init:
             self._send_attempts.recover_pending_attempts()
@@ -168,22 +199,19 @@ class KernelBridge(KernelBlobStagePort):
         self._policy = policy
         self._writer_epoch = writer_epoch
         self._owner_identity = Identity(
-            store_id=store.store_id,
-            writer_epoch=writer_epoch,
-            instance_id=self._instance_id,
+            store_id=store.store_id, writer_epoch=writer_epoch, instance_id=self._instance_id
         )
         self._blob_stager = KernelBlobStager(store)
         self._idempotency = KernelIdempotencyStore(
-            store,
-            policy,
-            policy_view=policy,
-            writer_epoch=writer_epoch,
-            is_expired=is_idempotency_expired,
+            store, policy, policy_view=policy, writer_epoch=writer_epoch, is_expired=is_idempotency_expired
         )
-        self._send_attempts = KernelSendAttemptStore(
-            store,
-            policy,
-            writer_epoch=writer_epoch,
+        self._send_attempts = KernelSendAttemptStore(store, policy, writer_epoch=writer_epoch)
+        self._capture_store = KernelCaptureStore(store)
+        self._capture_ingest = CaptureIngestService(
+            capture_store=self._capture_store,
+            privacy_filter=PrivacyFilter(monotonic_ns=self._monotonic_clock.monotonic_ns),
+            clock=self._clock,
+            monotonic_ns=self._monotonic_clock.monotonic_ns,
         )
         self._dispatcher = KernelDispatcher(
             store_id=store.store_id,
@@ -199,13 +227,19 @@ class KernelBridge(KernelBlobStagePort):
             send_attempts=self._send_attempts,
             before_enter_commit=self._before_enter_commit,
             on_commit_completed=self._on_commit_completed,
+            has_capture_gaps=self.capture_gaps_present,
+            effective_snapshot=self._effective_policy_snapshot,
         )
+
+    def _effective_policy_snapshot(self) -> AuthSnapshot:
+        return self._auth_state.merge_runtime_capabilities(self._policy.snapshot())
 
     def rebind_stores(self, *, store: Store, policy: PolicyStore, writer_epoch: int) -> None:
         """Rebind the bridge to reopened ``Store`` / ``PolicyStore`` handles after an online restore."""
         require_positive_int(writer_epoch)
         verify_admitted_store_pair(store, policy, writer_epoch=writer_epoch)
         _verify_domain_pair(self._domain, store=store, policy=policy)
+        self._seen_l2.clear()
         self._wire_stores(store, policy, writer_epoch)
         self._coordinator.rebind_writer_epoch(writer_epoch)
 
@@ -222,30 +256,23 @@ class KernelBridge(KernelBlobStagePort):
         return self._policy.schema_version
 
     def _run_reserved_on_owner(
-        self,
-        call: Call,
-        ctx: CallContext,
-        auth: PrivateRequestAuth,
-        reservation: Reservation,
+        self, call: Call, ctx: CallContext, auth: PrivateRequestAuth, reservation: Reservation
     ) -> CallResult:
         try:
             self._check_live_pair()
         except BrainError as err:
             if err.code in (ErrorCode.IDENTITY_MISMATCH, ErrorCode.POLICY_UNAVAILABLE, ErrorCode.INTEGRITY_FAILURE):
                 self._auth_state.clear()
-            err_envelope = make_error_envelope(err)
-            encode_envelope(err_envelope)
-            return err_envelope
-        result = self._dispatcher.dispatch_reserved(call, ctx, auth=auth, reservation=reservation)
+            return _encoded_error(err)
+        result = self._dispatcher.dispatch_reserved(
+            call, ctx, auth=auth, reservation=reservation, enforce_effective=True
+        )
         if self._on_clock_untrusted_changed is not None:
             self._on_clock_untrusted_changed(self._idempotency.clock_untrusted())
         if result.get("ok") is False:
             err_obj = result.get("error")
             err_code = err_obj.get("code") if isinstance(err_obj, Mapping) else None
-            if err_code in (
-                ErrorCode.IDENTITY_MISMATCH.value,
-                ErrorCode.POLICY_UNAVAILABLE.value,
-            ):
+            if err_code in (ErrorCode.IDENTITY_MISMATCH.value, ErrorCode.POLICY_UNAVAILABLE.value):
                 self._auth_state.clear()
             elif err_code == ErrorCode.UNAUTHENTICATED.value:
                 self._clear_auth_if_diverged(auth.credential_id)
@@ -261,6 +288,20 @@ class KernelBridge(KernelBlobStagePort):
             self._on_owner_reply_ready(reservation, stamp, completion)
         return result
 
+    def _verified_auth_view(self) -> RequestAuthView | None:
+        try:
+            view = self._auth_state.current()
+            if view is None:
+                return None
+            live_snap = self._policy.snapshot()
+        except BrainError:
+            self._auth_state.clear()
+            return None
+        if not view.auth.matches_persisted_policy(live_snap):
+            self._auth_state.clear()
+            return None
+        return view
+
     def _clear_auth_if_diverged(self, credential_id: str) -> None:
         try:
             view = self._auth_state.current()
@@ -269,40 +310,14 @@ class KernelBridge(KernelBlobStagePort):
             return
         if view is None:
             return
-        cred = view.auth.credentials.get(credential_id)
-        if (
-            cred is not None
-            and not cred.revoked
-            and view.auth.principals.get(cred.principal.principal_id) == cred.principal
-        ):
+        if view.auth.is_active_mcp_credential(credential_id):
             self._auth_state.clear()
             return
-        try:
-            live_snap = self._policy.snapshot()
-        except BrainError:
-            self._auth_state.clear()
-            return
-        if view.auth != live_snap:
-            self._auth_state.clear()
+        self._verified_auth_view()
 
     def _mint_owner_grant_stamp(self, credential_id: str) -> AuthGrantStamp | None:
-        try:
-            view = self._auth_state.current()
-        except BrainError:
-            self._auth_state.clear()
-            return None
-        if view is None:
-            return None
-        try:
-            live_snap = self._policy.snapshot()
-        except BrainError:
-            self._auth_state.clear()
-            return None
-        if view.auth != live_snap:
-            self._auth_state.clear()
-            return None
-        cred = view.auth.credentials.get(credential_id)
-        if cred is None or cred.revoked or view.auth.principals.get(cred.principal.principal_id) != cred.principal:
+        view = self._verified_auth_view()
+        if view is None or not view.auth.is_active_mcp_credential(credential_id):
             return None
         return AuthGrantStamp(
             credential_id=credential_id,
@@ -326,7 +341,7 @@ class KernelBridge(KernelBlobStagePort):
         """Load snapshot + active request HMAC key on the owner thread and publish atomically into RAM (C3)."""
         try:
             self._check_live_pair()
-            snap = self._policy.snapshot()
+            snap = self._auth_state.merge_runtime_capabilities(self._policy.snapshot())
             key_id, key_bytes = self._policy.request_digest_key()
             version = self._auth_state.next_version()
             view = RequestAuthView(
@@ -432,9 +447,7 @@ class KernelBridge(KernelBlobStagePort):
     def close_admissions(self) -> None:
         self._coordinator.close_admissions()
 
-    def prepare_cancel_uncommitted_for_shutdown(
-        self,
-    ) -> tuple[int, tuple[Callable[[], None], ...]]:
+    def prepare_cancel_uncommitted_for_shutdown(self) -> tuple[int, tuple[Callable[[], None], ...]]:
         return self._coordinator.prepare_cancel_uncommitted_for_shutdown()
 
     def cancel_uncommitted_for_shutdown(self) -> int:
@@ -459,10 +472,14 @@ class KernelBridge(KernelBlobStagePort):
         try:
             self._check_live_pair()
         except BrainError as err:
-            err_envelope = make_error_envelope(err)
-            encode_envelope(err_envelope)
-            return err_envelope
-        return self._dispatcher.dispatch(call, ctx, auth=auth)
+            return _encoded_error(err)
+        result = self._dispatcher.dispatch(call, ctx, auth=auth, enforce_effective=True)
+        if result.get("ok") is False:
+            err_obj = result.get("error")
+            err_code = err_obj.get("code") if isinstance(err_obj, Mapping) else None
+            if err_code == ErrorCode.UNAUTHENTICATED.value:
+                self._clear_auth_if_diverged(auth.credential_id)
+        return result
 
     def render_current(self, result: StoredResult, principal: Principal, *, selected_scope: Scope | None) -> JsonValue:
         self._check_live_pair()
@@ -503,16 +520,10 @@ class KernelBridge(KernelBlobStagePort):
         if attempt is None:
             raise BrainError(ErrorCode.NOT_FOUND, "not found")
         return SendAttemptCompletion(
-            send_attempt_id=attempt.send_attempt_id,
-            logical_result_id=attempt.logical_result_id,
-            principal_id=attempt.principal_id,
-            task_id=attempt.task_id,
-            artifact_id=attempt.artifact_id,
-            revision=attempt.revision,
-            resource_digests=attempt.resource_digests,
-            identity=self._owner_identity,
-            level=attempt.level,
-            revision_epoch=attempt.revision_epoch,
+            send_attempt_id=attempt.send_attempt_id, logical_result_id=attempt.logical_result_id,
+            principal_id=attempt.principal_id, task_id=attempt.task_id, artifact_id=attempt.artifact_id,
+            revision=attempt.revision, resource_digests=attempt.resource_digests,
+            identity=self._owner_identity, level=attempt.level, revision_epoch=attempt.revision_epoch,
         )
 
     def finalize_send_attempt(self, completion: SendAttemptCompletion) -> ArtifactSendAttempt:
@@ -526,3 +537,63 @@ class KernelBridge(KernelBlobStagePort):
     def recover_pending_send_attempts(self) -> int:
         self._check_live_pair()
         return self._send_attempts.recover_pending_attempts()
+
+    def capture_gaps_present(self) -> bool:
+        self._check_live_pair()
+        return self._capture_store.has_gaps()
+
+    def ingest_capture_batch(self, command: CaptureBatchCommand, *, deadline_ns: int | None = None) -> CaptureBatchAck:
+        """Authorize, privacy-filter, attribute, and commit one ``POST /v2/capture/events`` batch."""
+        self._check_live_pair()
+        if deadline_ns is not None and self._monotonic_clock.monotonic_ns() >= deadline_ns:
+            raise BrainError(ErrorCode.DEADLINE_EXCEEDED, "deadline exceeded")
+        view = self._auth_state.current()
+        if view is None:
+            raise BrainError(ErrorCode.POLICY_UNAVAILABLE, "policy unavailable")
+        ram_p = view.auth.authorize_capture_producer(
+            command.token,
+            producer_stream=command.producer_stream,
+            repo_id=command.repo_id,
+            checkout_id=command.checkout_id,
+        )
+        try:
+            live_p = self._policy.resolve_credential(command.token)
+        except BrainError as err:
+            if err.code is ErrorCode.UNAUTHENTICATED:
+                self._verified_auth_view()
+            raise
+        if live_p != ram_p:
+            raise BrainError(ErrorCode.IDENTITY_MISMATCH, "principal identity mismatch")
+        snap = self._policy.snapshot()
+        repo_pol = snap.repo_policies.get(command.repo_id)
+        chk = snap.checkouts.get(command.checkout_id)
+        if (
+            repo_pol is None or chk is None or snap.principals.get(live_p.principal_id) != live_p
+            or (live_p.principal_id, command.repo_id) not in snap.grants
+            or repo_pol.owner_id != live_p.owner_id or chk.owner_id != live_p.owner_id
+            or chk.repo_id != command.repo_id or chk.machine_id != live_p.machine_id
+        ):
+            raise BrainError(ErrorCode.IDENTITY_MISMATCH, "principal identity mismatch")
+        l2_recorded: list[bool] = []
+        try:
+            bind_fn, link_fn, touched = capture_continuity_hooks(
+                self._store, self._policy, principal_id=live_p.principal_id, repo_id=command.repo_id,
+                checkout_id=command.checkout_id, now=self._clock.now(),
+            ) if repo_pol.automatic_capture_enabled else (None, None, [])
+            layer2_lookup = make_live_layer2_lookup(
+                self._policy, events=command.events, harness_id=live_p.harness_id, repo_id=command.repo_id,
+                checkout_id=command.checkout_id, os_=self._os, host_version_resolver=self._host_version_resolver,
+                seen_configured=self._seen_l2, on_recorded=lambda: l2_recorded.append(True),
+            )
+            ack = self._capture_ingest.ingest_batch(
+                command, principal=live_p, repo_policy=repo_pol, layer2_lookup=layer2_lookup,
+                deadline_ns=deadline_ns, before_commit=bind_fn, on_event_committed_in_tx=link_fn,
+            )
+            if touched and self.on_continuity_tasks is not None:
+                self.on_continuity_tasks(tuple(touched))
+            return ack
+        finally:
+            # ingest's transaction is closed here; a failed apply is retried on the next batch
+            self._l2_apply.apply(self._store, bool(l2_recorded), quiet=True)
+            if self._on_capture_gaps_changed is not None:
+                self._on_capture_gaps_changed(self._capture_store.has_gaps())

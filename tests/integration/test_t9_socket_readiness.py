@@ -49,7 +49,7 @@ def test_socket_readiness_causal_barrier_waits_for_slow_lookup_and_preserves_sig
         monkeypatch.setenv("SUPERBRAIN_TEST_SOCKET_READINESS", token)
         eq_live: queue.Queue[dict[str, Any] | None] = queue.Queue()
         os_pid = os.getpid()
-        orig_handle_ident: Any = _loopback_server.handle_identity_request  # type: ignore[attr-defined]
+        orig_handle_ident: Any = _loopback_server.handle_identity_request
         ident_seen_before_lookup: list[bool] = []
         lookup_finished_ev = threading.Event()
         lookup_observed: dict[str, Any] = {}
@@ -414,10 +414,11 @@ def test_socket_readiness_timeout_strictly_bounded_by_connect_deadline_ns(
 
                 with monkeypatch.context() as mp:
                     mp.setattr(owner, "_lookup_loopback_client_pid", _blocked_lookup)
-                    t_wall_start = time.monotonic_ns()
+                    t_wall_start = [time.monotonic_ns()]
                     c_start = 10_000_000_000
                     tight_deadline_ns = c_start + 80_000_000
-                    client = h.open_client(monotonic_ns=lambda: c_start + (time.monotonic_ns() - t_wall_start))
+                    client = h.open_client(monotonic_ns=lambda: c_start + (time.monotonic_ns() - t_wall_start[0]))
+                    t_wall_start[0] = time.monotonic_ns()
                     t0 = time.monotonic()
                     with pytest.raises(LoopbackTransportError):
                         client.call(

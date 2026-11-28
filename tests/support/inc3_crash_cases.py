@@ -255,7 +255,6 @@ def prepare_i33_seed(
 
     tpl = _seed_template(adapters, clock, base_time)
     clone_owner_only_tree(tpl.root / "data", data_root)
-    clone_owner_only_tree(tpl.root / "tls", ctx.case_dir / "tls")
     rt = reopen_kernel_job_runtime(data_root, tpl.store_id, adapters)
     try:
         proposals = StoreProposalAdapter(rt.store, adapters)
@@ -337,8 +336,8 @@ def prepare_i33_seed(
         cfg_dir / "daemon.json",
         data_root=data_root,
         expected_store_id=tpl.store_id,
-        cert_path=ctx.case_dir / "tls" / tpl.cert_name,
-        key_path=ctx.case_dir / "tls" / tpl.key_name,
+        cert_path=tpl.root / "tls" / tpl.cert_name,
+        key_path=tpl.root / "tls" / tpl.key_name,
     )
     payload_path = _write_payload(
         ctx.case_dir / "op-payload.json",

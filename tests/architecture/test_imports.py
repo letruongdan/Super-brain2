@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import ast
-import warnings
 from collections.abc import Iterator, Mapping
 from pathlib import Path
 
@@ -177,9 +176,9 @@ def test_package_graph_is_acyclic() -> None:
     assert find_package_cycles(SRC / "superbrain") == []
 
 
-def test_report_files_over_600_lines() -> None:
-    for path, count in files_over(SRC, 600):
-        warnings.warn(f"{path} has {count} lines (>600)", stacklevel=1)
+def test_no_src_file_is_over_600_lines() -> None:
+    # owner rule (2026-11-23): every src/ file stays within 600 lines; a warning let an over-long file pass the gate
+    assert [(str(path), count) for path, count in files_over(SRC, 600)] == []
 
 
 def test_checker_detects_cycle_between_packages_in_one_layer(tmp_path: Path) -> None:
@@ -215,7 +214,14 @@ def test_checker_reports_no_cycle_for_one_way_package_import(tmp_path: Path) -> 
     assert find_package_cycles(pkg / "superbrain") == []
 
 
-FAULT_FREE_ENTRIES = ("mcp", "cli", "composition/shim_entry.py", "composition/client_entry.py")
+FAULT_FREE_ENTRIES = (
+    "mcp",
+    "cli",
+    "composition/shim_entry.py",
+    "composition/client_entry.py",
+    "composition/hook_entry.py",
+    "composition/capture_drain_entry.py",
+)
 """Client-side code: no crash or pause hook may be reachable from these files, however it is spelled."""
 FAULT_MODULE = f"{ROOT}.core.faults"
 FAULT_STRINGS = (FAULT_MODULE, "SUPERBRAIN_CRASHPOINT", "SUPERBRAIN_PAUSEPOINT")
@@ -256,6 +262,8 @@ def test_fault_hook_scanner_catches_aliases_relative_and_dynamic_imports(tmp_pat
             "superbrain/composition/client_entry.py": (
                 "import importlib\nm = importlib.import_module('superbrain.core.faults')\n"
             ),
+            "superbrain/composition/hook_entry.py": "",
+            "superbrain/composition/capture_drain_entry.py": "",
             "superbrain/composition/daemon_entry.py": "from superbrain.core.faults import crashpoint\n",
             "superbrain/storage/x.py": "from superbrain.core.faults import crashpoint\n",
             "superbrain/core/faults.py": "def crashpoint(name):\n    pass\n",

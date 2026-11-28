@@ -10,16 +10,7 @@ from pathlib import Path
 from typing import Literal
 
 from superbrain.adapters.os import os_adapters
-from superbrain.adapters.os.daemon_config import read_daemon_config, read_owner_json_object
-from superbrain.application.maintenance import (
-    outcome_to_json,
-    restore_offline,
-    restore_offline_preview_payload,
-)
-from superbrain.composition._maintenance_wiring import ensure_maintenance_backend
-from superbrain.composition.daemon_entry import serve
-from superbrain.composition.migrate_entry import migrate_offline
-from superbrain.composition.operator_entry import make_lazy_ssh_verifier
+from superbrain.adapters.os.daemon_config import read_daemon_config
 from superbrain.core.canonical import canonical_json
 from superbrain.core.errors import BrainError, ErrorCode
 from superbrain.core.ids import new_id
@@ -149,6 +140,8 @@ def _explicit_owner_adapters(config_path: Path) -> tuple[DaemonConfig, OsAdapter
 
 
 def _run_serve(config_path: Path) -> int:
+    from superbrain.composition.daemon_entry import serve
+
     cfg, adapters, scratch_base = _explicit_owner_adapters(config_path)
     try:
         return serve(
@@ -161,6 +154,8 @@ def _run_serve(config_path: Path) -> int:
 
 
 def _run_migrate(config_path: Path) -> int:
+    from superbrain.composition.migrate_entry import migrate_offline
+
     cfg, adapters, scratch_base = _explicit_owner_adapters(config_path)
     try:
         report = migrate_offline(cfg, os_=adapters)
@@ -191,6 +186,15 @@ def _run_migrate(config_path: Path) -> int:
 
 
 def _run_restore(opts: _OfflineRestoreArgs) -> int:
+    from superbrain.adapters.os.daemon_config import read_owner_json_object
+    from superbrain.application.maintenance import (
+        outcome_to_json,
+        restore_offline,
+        restore_offline_preview_payload,
+    )
+    from superbrain.composition._maintenance_wiring import ensure_maintenance_backend
+    from superbrain.composition.operator_entry import make_lazy_ssh_verifier
+
     backend = ensure_maintenance_backend()
     cfg, adapters, scratch_base = _explicit_owner_adapters(opts.config)
     try:

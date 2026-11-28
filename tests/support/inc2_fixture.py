@@ -216,6 +216,7 @@ def open_inc2_installed_env(scratch: Path) -> Iterator[InstalledEnv]:
             "--offline",
             "--no-deps",
             "--link-mode=copy",
+            "--compile-bytecode",
             "--python",
             str(venv_python),
             str(wheel_path),
@@ -225,10 +226,16 @@ def open_inc2_installed_env(scratch: Path) -> Iterator[InstalledEnv]:
 
     purelib_dir = Path(
         subprocess.check_output(
-            [str(venv_python), "-I", "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"],
+            [
+                str(venv_python),
+                "-I",
+                "-c",
+                "import sysconfig; print(sysconfig.get_path('purelib'))",
+            ],
+            cwd=scratch,
             text=True,
             encoding="utf-8",
-            timeout=30.0,
+            timeout=60.0,
         ).strip()
     )
     hook_src = Path(__file__).resolve().with_name("_socket_readiness_hook.py").read_bytes()

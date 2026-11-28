@@ -29,9 +29,9 @@ from superbrain.core.errors import ErrorCode
 from superbrain.core.kernel import Endpoint, WorkspaceBinding
 from superbrain.core.wire import load_catalog, parse_json
 from superbrain.storage.kernel_schema import KERNEL_POLICY_MIGRATIONS, KERNEL_STORE_MIGRATIONS
-from superbrain.storage.runtime import open_runtime
 from tests.support.clock import FakeClock
 from tests.support.inc2_cli import (
+    InstalledMcpPipeSession,
     InstalledServeProcess,
     decode_stdio_frames,
     encode_stdio_frames,
@@ -53,6 +53,7 @@ from tests.support.inc2_fixture import (
     _clean_subprocess_env,
     _cleanup_dir,
     _make_trusted_session_dir,
+    open_cloned_runtime,
 )
 from tests.support.inc2_transport import read_raw_http_response, register_workspace_direct
 from tests.support.kernel_auth import (
@@ -160,9 +161,7 @@ def frozen_i2_installed_env(tmp_path_factory: pytest.TempPathFactory) -> Iterato
             cwd=src_dir,
             extra_env={"UV_PROJECT_ENVIRONMENT": str(venv_dir)},
         )
-        venv_python = (
-            venv_dir / "Scripts" / "python.exe" if sys.platform == "win32" else venv_dir / "bin" / "python"
-        )
+        venv_python = venv_dir / "Scripts" / "python.exe" if sys.platform == "win32" else venv_dir / "bin" / "python"
         _run_offline(
             [
                 "uv",
@@ -171,6 +170,7 @@ def frozen_i2_installed_env(tmp_path_factory: pytest.TempPathFactory) -> Iterato
                 "--offline",
                 "--no-deps",
                 "--link-mode=copy",
+                "--compile-bytecode",
                 "--python",
                 str(venv_python),
                 str(wheel_path),
@@ -180,10 +180,16 @@ def frozen_i2_installed_env(tmp_path_factory: pytest.TempPathFactory) -> Iterato
 
         purelib_dir = Path(
             subprocess.check_output(
-                [str(venv_python), "-I", "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"],
+                [
+                    str(venv_python),
+                    "-I",
+                    "-c",
+                    "import sysconfig; print(sysconfig.get_path('purelib'))",
+                ],
+                cwd=scratch,
                 text=True,
                 encoding="utf-8",
-                timeout=30.0,
+                timeout=60.0,
             ).strip()
         )
         hook_src = (REPO_ROOT / "tests" / "support" / "_socket_readiness_hook.py").read_bytes()
@@ -239,10 +245,11 @@ def _seed_daemon_root(scratch: Path, label: str, *, frozen_i2: bool) -> _LiveWhe
     adapters = os_adapters(clock=clock)
 
     extensions, kinds = kernel_store_extensions()
-    store_version, policy_version = (4, 3) if frozen_i2 else (5, 4)
-    rt = open_runtime(
+    store_version, policy_version = (4, 3) if frozen_i2 else (8, 5)
+    rt = open_cloned_runtime(
         data_root,
         adapters,
+        role=f"wheel-compat-{'i2' if frozen_i2 else 'sp2'}",
         handlers=extensions,
         kinds=kinds,
         store_migrations=tuple(m for m in KERNEL_STORE_MIGRATIONS if m.to_version <= store_version),
@@ -448,6 +455,42 @@ def _call_installed_mcp(
     sc = res["structuredContent"]
     assert isinstance(sc, dict)
     return dict(sc)
+
+
+class _InstalledMcpCaller:
+    """Persistent open-pipe ``brain-mcp`` caller reusing one MCP stdio session across sequential calls."""
+
+    def __init__(self, env: InstalledEnv, *, profile_path: Path, cwd: Path) -> None:
+        self._session = InstalledMcpPipeSession(env, "brain-mcp", ["--profile", str(profile_path)], cwd=cwd)
+        self._init_done = False
+        self._next_id = 2
+
+    def __enter__(self) -> _InstalledMcpCaller:
+        init_frame, initialized_frame = mcp_init_frames(1)
+        resp = self._session.send_frames_and_expect_response([init_frame], timeout=15.0)
+        assert resp.get("id") == 1
+        self._initialized = initialized_frame
+        return self
+
+    def call(self, tool: str, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        req_id = self._next_id
+        self._next_id += 1
+        call_frame = mcp_call_frame(req_id, tool, dict(arguments))
+        frames = [call_frame] if self._init_done else [self._initialized, call_frame]
+        self._init_done = True
+        resp = self._session.send_frames_and_expect_response(frames, timeout=15.0)
+        res = resp["result"]
+        assert isinstance(res, dict)
+        sc = res["structuredContent"]
+        assert isinstance(sc, dict)
+        return dict(sc)
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        if exc_type is None:
+            rc, stderr_bytes = self._session.finish(timeout=10.0)
+            assert rc == 0, f"brain-mcp failed ({rc}): stderr={stderr_bytes!r}"
+        else:
+            self._session.close()
 
 
 def _call_installed_status(
@@ -1157,111 +1200,88 @@ def test_i2_to_sp2_daemon_upgrade_replays_read_acks_and_marks_store4_attempts_un
         )
         try:
             i2_proc.wait_ready(timeout=15.0)
-            prep_res = _call_installed_mcp(
-                frozen_i2_installed_env,
-                script_name="brain-mcp",
-                prefix_args=[],
-                profile_path=profile_path,
-                cwd=client_cwd,
-                tool="prepare_task",
-                arguments={
-                    "schema_version": "2.0",
-                    "workspace_hint": ws_a.alias,
-                    "description": "I2 pre-upgrade commit",
-                    "idempotency_key": "idem-upg-prep-0001",
-                },
-            )
-            assert prep_res["ok"] is True
-            prep_data = cast(dict[str, Any], prep_res["data"])
-            task_id = str(prep_data["task_id"])
-            delivery_id = str(prep_data["delivery_id"])
-
-            receipts: list[tuple[str, str, str, str]] = []
-            for idx, (art_id, lvl) in enumerate(
-                (("art-upg-l1-ep", "L1"), ("art-upg-l1-out", "L1"), ("art-upg-l0", "L0"), ("art-upg-l2", "L2")),
-                start=1,
-            ):
-                art_res = _call_installed_mcp(
-                    frozen_i2_installed_env,
-                    script_name="brain-mcp",
-                    prefix_args=[],
-                    profile_path=profile_path,
-                    cwd=client_cwd,
-                    tool="get_artifact",
-                    arguments={
+            with _InstalledMcpCaller(
+                frozen_i2_installed_env, profile_path=profile_path, cwd=client_cwd
+            ) as mcp_i2:
+                prep_res = mcp_i2.call(
+                    "prepare_task",
+                    {
                         "schema_version": "2.0",
-                        "workspace_id": ws_a.repo_id,
-                        "task_id": task_id,
-                        "artifact_id": art_id,
-                        "revision": 1,
-                        "level": lvl,
-                        "idempotency_key": f"idem-upg-art-{idx:04d}",
+                        "workspace_hint": ws_a.alias,
+                        "description": "I2 pre-upgrade commit",
+                        "idempotency_key": "idem-upg-prep-0001",
                     },
                 )
-                assert art_res["ok"] is True
-                art_data = cast(dict[str, Any], art_res["data"])
-                rcpt = str(art_data["served_receipt_id"])
-                dig = str(cast(list[dict[str, Any]], art_data["resources"])[0]["digest"])
-                _wait_send_attempt_served(db_path, rcpt)
-                receipts.append((art_id, lvl, rcpt, dig))
+                assert prep_res["ok"] is True
+                prep_data = cast(dict[str, Any], prep_res["data"])
+                task_id = str(prep_data["task_id"])
+                delivery_id = str(prep_data["delivery_id"])
 
-            receipt_ep, digest_ep = receipts[0][2], receipts[0][3]
-            receipt_out, digest_out = receipts[1][2], receipts[1][3]
+                receipts: list[tuple[str, str, str, str]] = []
+                for idx, (art_id, lvl) in enumerate(
+                    (("art-upg-l1-ep", "L1"), ("art-upg-l1-out", "L1"), ("art-upg-l0", "L0"), ("art-upg-l2", "L2")),
+                    start=1,
+                ):
+                    art_res = mcp_i2.call(
+                        "get_artifact",
+                        {
+                            "schema_version": "2.0",
+                            "workspace_id": ws_a.repo_id,
+                            "task_id": task_id,
+                            "artifact_id": art_id,
+                            "revision": 1,
+                            "level": lvl,
+                            "idempotency_key": f"idem-upg-art-{idx:04d}",
+                        },
+                    )
+                    assert art_res["ok"] is True
+                    art_data = cast(dict[str, Any], art_res["data"])
+                    rcpt = str(art_data["served_receipt_id"])
+                    dig = str(cast(list[dict[str, Any]], art_data["resources"])[0]["digest"])
+                    _wait_send_attempt_served(db_path, rcpt)
+                    receipts.append((art_id, lvl, rcpt, dig))
 
-            legacy_ack_ep: dict[str, Any] = {
-                "served_receipt_id": receipt_ep,
-                "task_id": task_id,
-                "revision": 1,
-                "resource_digests": [{"name": "L1.md", "digest": digest_ep}],
-            }
-            ep_args_i2: dict[str, Any] = {
-                "schema_version": "2.0",
-                "workspace_id": ws_a.repo_id,
-                "checkout_id": ws_a.checkout_id,
-                "task_id": task_id,
-                "session_id": "sess-upg-0001",
-                "evidence": [{"kind": "context", "data": {"step": "i2-commit"}}],
-                "read_acks": [legacy_ack_ep],
-                "idempotency_key": "idem-upg-ep-00001",
-            }
-            ep_res_i2 = _call_installed_mcp(
-                frozen_i2_installed_env,
-                script_name="brain-mcp",
-                prefix_args=[],
-                profile_path=profile_path,
-                cwd=client_cwd,
-                tool="submit_episode",
-                arguments=ep_args_i2,
-            )
-            assert ep_res_i2["ok"] is True
-            i2_ep_data = cast(dict[str, Any], ep_res_i2["data"])
+                receipt_ep, digest_ep = receipts[0][2], receipts[0][3]
+                receipt_out, digest_out = receipts[1][2], receipts[1][3]
 
-            legacy_ack_out: dict[str, Any] = {
-                "served_receipt_id": receipt_out,
-                "task_id": task_id,
-                "revision": 1,
-                "resource_digests": [{"name": "L1.md", "digest": digest_out}],
-            }
-            out_args_i2: dict[str, Any] = {
-                "schema_version": "2.0",
-                "workspace_id": ws_a.repo_id,
-                "delivery_id": delivery_id,
-                "outcome": "success",
-                "applied_refs": [{"kind": "skill", "id": "art-upg-l1-out", "revision": 1, "digest": digest_out}],
-                "read_acks": [legacy_ack_out],
-                "idempotency_key": "idem-upg-out-0001",
-            }
-            out_res_i2 = _call_installed_mcp(
-                frozen_i2_installed_env,
-                script_name="brain-mcp",
-                prefix_args=[],
-                profile_path=profile_path,
-                cwd=client_cwd,
-                tool="record_outcome",
-                arguments=out_args_i2,
-            )
-            assert out_res_i2["ok"] is True
-            i2_out_data = cast(dict[str, Any], out_res_i2["data"])
+                legacy_ack_ep: dict[str, Any] = {
+                    "served_receipt_id": receipt_ep,
+                    "task_id": task_id,
+                    "revision": 1,
+                    "resource_digests": [{"name": "L1.md", "digest": digest_ep}],
+                }
+                ep_args_i2: dict[str, Any] = {
+                    "schema_version": "2.0",
+                    "workspace_id": ws_a.repo_id,
+                    "checkout_id": ws_a.checkout_id,
+                    "task_id": task_id,
+                    "session_id": "sess-upg-0001",
+                    "evidence": [{"kind": "context", "data": {"step": "i2-commit"}}],
+                    "read_acks": [legacy_ack_ep],
+                    "idempotency_key": "idem-upg-ep-00001",
+                }
+                ep_res_i2 = mcp_i2.call("submit_episode", ep_args_i2)
+                assert ep_res_i2["ok"] is True
+                i2_ep_data = cast(dict[str, Any], ep_res_i2["data"])
+
+                legacy_ack_out: dict[str, Any] = {
+                    "served_receipt_id": receipt_out,
+                    "task_id": task_id,
+                    "revision": 1,
+                    "resource_digests": [{"name": "L1.md", "digest": digest_out}],
+                }
+                out_args_i2: dict[str, Any] = {
+                    "schema_version": "2.0",
+                    "workspace_id": ws_a.repo_id,
+                    "delivery_id": delivery_id,
+                    "outcome": "success",
+                    "applied_refs": [{"kind": "skill", "id": "art-upg-l1-out", "revision": 1, "digest": digest_out}],
+                    "read_acks": [legacy_ack_out],
+                    "idempotency_key": "idem-upg-out-0001",
+                }
+                out_res_i2 = mcp_i2.call("record_outcome", out_args_i2)
+                assert out_res_i2["ok"] is True
+                i2_out_data = cast(dict[str, Any], out_res_i2["data"])
         finally:
             i2_proc.close()
 
@@ -1284,7 +1304,7 @@ def test_i2_to_sp2_daemon_upgrade_replays_read_acks_and_marks_store4_attempts_un
         assert migration.returncode == 0, migration.stderr
         from superbrain.storage.schema import read_schema_info
 
-        for path, expected in ((db_path, 5), (data_root / "policy" / "policy.db", 4)):
+        for path, expected in ((db_path, 8), (data_root / "policy" / "policy.db", 5)):
             info = read_schema_info(path)
             assert info is not None and info.store_id == i2.store_id and info.schema_version == expected
 
@@ -1297,78 +1317,49 @@ def test_i2_to_sp2_daemon_upgrade_replays_read_acks_and_marks_store4_attempts_un
         )
         try:
             sp2_proc.wait_ready(timeout=15.0)
-            sp2_ack_ep = {**legacy_ack_ep, "artifact_id": "art-upg-l1-ep", "revision_epoch": 0}
-            sp2_ep_args = {**ep_args_i2, "read_acks": [sp2_ack_ep]}
-            ep_replay = _call_installed_mcp(
-                inc2_installed_env,
-                script_name="brain-mcp",
-                prefix_args=[],
-                profile_path=profile_path,
-                cwd=client_cwd,
-                tool="submit_episode",
-                arguments=sp2_ep_args,
-            )
-            assert ep_replay["ok"] is True
-            assert ep_replay["data"] == i2_ep_data
+            with _InstalledMcpCaller(
+                inc2_installed_env, profile_path=profile_path, cwd=client_cwd
+            ) as mcp_sp2:
+                sp2_ack_ep = {**legacy_ack_ep, "artifact_id": "art-upg-l1-ep", "revision_epoch": 0}
+                sp2_ep_args = {**ep_args_i2, "read_acks": [sp2_ack_ep]}
+                ep_replay = mcp_sp2.call("submit_episode", sp2_ep_args)
+                assert ep_replay["ok"] is True
+                assert ep_replay["data"] == i2_ep_data
 
-            sp2_ack_out = {**legacy_ack_out, "artifact_id": "art-upg-l1-out", "revision_epoch": 0}
-            sp2_out_args = {**out_args_i2, "read_acks": [sp2_ack_out]}
-            out_replay = _call_installed_mcp(
-                inc2_installed_env,
-                script_name="brain-mcp",
-                prefix_args=[],
-                profile_path=profile_path,
-                cwd=client_cwd,
-                tool="record_outcome",
-                arguments=sp2_out_args,
-            )
-            assert out_replay["ok"] is True
-            assert out_replay["data"] == i2_out_data
+                sp2_ack_out = {**legacy_ack_out, "artifact_id": "art-upg-l1-out", "revision_epoch": 0}
+                sp2_out_args = {**out_args_i2, "read_acks": [sp2_ack_out]}
+                out_replay = mcp_sp2.call("record_outcome", sp2_out_args)
+                assert out_replay["ok"] is True
+                assert out_replay["data"] == i2_out_data
 
-            tamper_dig = digest_bytes(b"tampered upgrade payload\n")
-            ep_tampers = (
-                {**ep_args_i2, "read_acks": [{**sp2_ack_ep, "artifact_id": "art-wrong"}]},
-                {**ep_args_i2, "read_acks": [{**sp2_ack_ep, "revision_epoch": 1}]},
-                {
-                    **ep_args_i2,
-                    "read_acks": [{**sp2_ack_ep, "resource_digests": [{"name": "L1.md", "digest": tamper_dig}]}],
-                },
-                {**sp2_ep_args, "evidence": [{"kind": "context", "data": {"step": "tampered"}}]},
-            )
-            for bad_ep in ep_tampers:
-                err_ep = _call_installed_mcp(
-                    inc2_installed_env,
-                    script_name="brain-mcp",
-                    prefix_args=[],
-                    profile_path=profile_path,
-                    cwd=client_cwd,
-                    tool="submit_episode",
-                    arguments=bad_ep,
+                tamper_dig = digest_bytes(b"tampered upgrade payload\n")
+                ep_tampers = (
+                    {**ep_args_i2, "read_acks": [{**sp2_ack_ep, "artifact_id": "art-wrong"}]},
+                    {**ep_args_i2, "read_acks": [{**sp2_ack_ep, "revision_epoch": 1}]},
+                    {
+                        **ep_args_i2,
+                        "read_acks": [{**sp2_ack_ep, "resource_digests": [{"name": "L1.md", "digest": tamper_dig}]}],
+                    },
+                    {**sp2_ep_args, "evidence": [{"kind": "context", "data": {"step": "tampered"}}]},
                 )
-                assert err_ep["ok"] is False
-                assert cast(dict[str, Any], err_ep["error"])["code"] == ErrorCode.IDEMPOTENCY_CONFLICT.value
+                for bad_ep in ep_tampers:
+                    err_ep = mcp_sp2.call("submit_episode", bad_ep)
+                    assert err_ep["ok"] is False
+                    assert cast(dict[str, Any], err_ep["error"])["code"] == ErrorCode.IDEMPOTENCY_CONFLICT.value
 
-            out_tampers = (
-                {**out_args_i2, "read_acks": [{**sp2_ack_out, "artifact_id": "art-wrong"}]},
-                {**out_args_i2, "read_acks": [{**sp2_ack_out, "revision_epoch": 1}]},
-                {
-                    **out_args_i2,
-                    "read_acks": [{**sp2_ack_out, "resource_digests": [{"name": "L1.md", "digest": tamper_dig}]}],
-                },
-                {**sp2_out_args, "outcome": "failure"},
-            )
-            for bad_out in out_tampers:
-                err_out = _call_installed_mcp(
-                    inc2_installed_env,
-                    script_name="brain-mcp",
-                    prefix_args=[],
-                    profile_path=profile_path,
-                    cwd=client_cwd,
-                    tool="record_outcome",
-                    arguments=bad_out,
+                out_tampers = (
+                    {**out_args_i2, "read_acks": [{**sp2_ack_out, "artifact_id": "art-wrong"}]},
+                    {**out_args_i2, "read_acks": [{**sp2_ack_out, "revision_epoch": 1}]},
+                    {
+                        **out_args_i2,
+                        "read_acks": [{**sp2_ack_out, "resource_digests": [{"name": "L1.md", "digest": tamper_dig}]}],
+                    },
+                    {**sp2_out_args, "outcome": "failure"},
                 )
-                assert err_out["ok"] is False
-                assert cast(dict[str, Any], err_out["error"])["code"] == ErrorCode.IDEMPOTENCY_CONFLICT.value
+                for bad_out in out_tampers:
+                    err_out = mcp_sp2.call("record_outcome", bad_out)
+                    assert err_out["ok"] is False
+                    assert cast(dict[str, Any], err_out["error"])["code"] == ErrorCode.IDEMPOTENCY_CONFLICT.value
         finally:
             sp2_proc.close()
 
